@@ -4595,7 +4595,7 @@ impl SymForgeServer {
         }
 
         if let Some(result) = self.proxy_tool_call("get_file_content", &input).await {
-            return result;
+            return format::cap_file_content_output(result);
         }
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
@@ -4648,7 +4648,7 @@ impl SymForgeServer {
                 // no-op unless SYMFORGE_FRECENCY=1. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                format!("{}{}", mode_annotation, output)
+                format::cap_file_content_output(format!("{}{}", mode_annotation, output))
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -4670,7 +4670,7 @@ impl SymForgeServer {
                                 // fallback branch (non-indexed source files);
                                 // no-op unless SYMFORGE_FRECENCY=1.
                                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                                return format!("{}{}", mode_annotation, body);
+                                return format::cap_file_content_output(format!("{}{}", mode_annotation, body));
                             }
                             Err(e) => {
                                 return format!("{} [error: could not read file: {e}]", input.path);

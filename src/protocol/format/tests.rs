@@ -3261,3 +3261,70 @@ fn test_auto_summarize_uses_capitalized_heuristic_phrase() {
         super::auto_summarize("fn capture_context_bundle_view() -> String {\n    String::new()\n}");
     assert_eq!(summary, "Captures Context bundle view");
 }
+
+// ── cap_file_content_output tests ──────────────────────────────────────────
+
+#[test]
+fn test_cap_under_limit_unchanged() {
+    let s = "hello\nworld\n".to_string();
+    let result = super::cap_file_content_output(s.clone());
+    assert_eq!(result, s);
+}
+
+#[test]
+fn test_cap_exactly_at_limit_unchanged() {
+    let s = "x".repeat(super::GET_FILE_CONTENT_MAX_BYTES);
+    let result = super::cap_file_content_output(s.clone());
+    assert_eq!(result.len(), super::GET_FILE_CONTENT_MAX_BYTES);
+    assert!(!result.contains("truncated"), "should not add footer at exact cap");
+}
+
+#[test]
+fn test_cap_over_limit_truncates_and_adds_footer() {
+    let line = "a".repeat(100) + "\n";
+    let s = line.repeat(800); // ~80 KB
+    let result = super::cap_file_content_output(s);
+    assert!(
+        result.len() <= super::GET_FILE_CONTENT_MAX_BYTES,
+        "capped output should be <= cap, got {} bytes",
+        result.len()
+    );
+    assert!(result.contains("truncated"), "should contain truncation footer");
+    assert!(result.contains("chunk_index"), "footer should suggest chunk_index");
+}
+
+#[test]
+fn test_cap_truncates_at_line_boundary() {
+    // Build output that crosses the cap mid-line
+    let before_cap = "line\n".repeat(super::GET_FILE_CONTENT_MAX_BYTES / 5 + 1);
+    let result = super::cap_file_content_output(before_cap);
+    assert!(result.contains("truncated"), "should be truncated");
+    // The truncated portion (before footer) should end with a newline
+    let footer_start = result.find("\n[Output truncated").unwrap_or(result.len());
+    let body = &result[..footer_start];
+    assert!(
+        body.ends_with('\n'),
+        "body before footer should end at line boundary"
+    );
+}
+
+#[test]
+fn test_cap_single_giant_line_truncates_at_byte_boundary() {
+    // No newlines — should still truncate without panic
+    let s = "x".repeat(super::GET_FILE_CONTENT_MAX_BYTES + 1000);
+    let result = super::cap_file_content_output(s);
+    assert!(
+        result.len() <= super::GET_FILE_CONTENT_MAX_BYTES,
+        "should be capped even with no newlines"
+    );
+    assert!(result.contains("truncated"));
+}
+
+#[test]
+fn test_cap_idempotent() {
+    let line = "b".repeat(100) + "\n";
+    let s = line.repeat(800);
+    let once = super::cap_file_content_output(s);
+    let twice = super::cap_file_content_output(once.clone());
+    assert_eq!(once, twice, "cap helper should be idempotent");
+}

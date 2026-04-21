@@ -1840,6 +1840,33 @@ fn render_numbered_around_line_excerpt(
         .join("\n")
 }
 
+/// Hard byte cap for `get_file_content` output. Anchored to the Claude Code
+/// token-optimizer hook trip point (~25K tokens). ASCII source ≈ 3–4 chars/token
+/// → 60 KB ≈ 15–20K tokens (well under trip). Exposed as a const for easy tuning.
+pub const GET_FILE_CONTENT_MAX_BYTES: usize = 60_000;
+
+/// Apply the hard byte cap to `get_file_content` output.
+/// Returns `output` unchanged when `output.len() <= GET_FILE_CONTENT_MAX_BYTES`.
+/// Otherwise truncates at the last `\n` boundary under the cap and appends a
+/// footer suggesting narrower read modes. Idempotent.
+pub fn cap_file_content_output(output: String) -> String {
+    if output.len() <= GET_FILE_CONTENT_MAX_BYTES {
+        return output;
+    }
+    // Reserve ~300 bytes for footer; find last newline within budget.
+    let budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(300);
+    let truncate_at = match output[..budget].rfind('\n') {
+        Some(pos) => pos + 1, // keep the newline
+        None => budget,       // no newline — truncate at byte boundary
+    };
+    let truncated = &output[..truncate_at];
+    let original_bytes = output.len();
+    format!(
+        "{truncated}\n[Output truncated: {original_bytes} bytes exceeds {GET_FILE_CONTENT_MAX_BYTES}-byte cap. \
+Use chunk_index + max_lines, around_line, or around_symbol to read a smaller window.]"
+    )
+}
+
 /// "File not found: {path}"
 pub fn not_found_file(path: &str) -> String {
     format!("File not found: {path}")
