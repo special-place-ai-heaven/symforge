@@ -1246,9 +1246,9 @@ fn normalize_file_content_aliases(input: &mut GetFileContentInput) -> Result<(),
     }
 
     let offset = input.offset.unwrap_or(0);
-    input.start_line = Some(offset + 1);
+    input.start_line = Some(offset.saturating_add(1));
     if let Some(limit) = input.limit {
-        input.end_line = Some(offset + limit);
+        input.end_line = Some(offset.saturating_add(limit));
     }
     input.offset = None;
     input.limit = None;
@@ -11607,6 +11607,16 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("`start_line`"), "got: {err}");
+    }
+
+    #[test]
+    fn test_normalize_aliases_rejects_conflict_with_end_line() {
+        let mut input = make_alias_input(Some(10), Some(5));
+        input.end_line = Some(20);
+        let err = super::normalize_file_content_aliases(&mut input)
+            .err()
+            .unwrap();
+        assert!(err.contains("`end_line`"), "got: {err}");
     }
 
     #[test]

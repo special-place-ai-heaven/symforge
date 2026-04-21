@@ -1853,17 +1853,20 @@ pub fn cap_file_content_output(output: String) -> String {
     if output.len() <= GET_FILE_CONTENT_MAX_BYTES {
         return output;
     }
-    // Reserve ~300 bytes for footer; find last newline within budget.
-    let budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(300);
+    // Reserve ~300 bytes for footer; align budget to a UTF-8 char boundary.
+    let mut budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(300);
+    while budget > 0 && !output.is_char_boundary(budget) {
+        budget -= 1;
+    }
     let truncate_at = match output[..budget].rfind('\n') {
         Some(pos) => pos + 1, // keep the newline
-        None => budget,       // no newline — truncate at byte boundary
+        None => budget,       // no newline — truncate at char boundary
     };
     let truncated = &output[..truncate_at];
     let original_bytes = output.len();
     format!(
         "{truncated}\n[Output truncated: {original_bytes} bytes exceeds {GET_FILE_CONTENT_MAX_BYTES}-byte cap. \
-Use chunk_index + max_lines, around_line, or around_symbol to read a smaller window.]"
+Use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window.]"
     )
 }
 
