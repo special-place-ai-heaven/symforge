@@ -242,7 +242,7 @@ fn no_parameterized_tool_has_empty_properties() {
     // Tools with zero parameters (like context_inventory) are allowed to have
     // empty properties. This test catches tools that *should* have properties
     // but accidentally lost them.
-    let zero_param_tools = ["context_inventory", "conventions", "health"];
+    let zero_param_tools = ["context_inventory", "conventions", "health", "health_compact"];
     for tool in SymForgeServer::tool_definitions() {
         if zero_param_tools.contains(&tool.name.as_ref()) {
             continue;
