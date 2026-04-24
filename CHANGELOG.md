@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.6.1](https://github.com/special-place-administrator/symforge/compare/v7.6.0...v7.6.1) (2026-04-24)
+
+
+### Bug Fixes
+
+* **daemon:** fix spawn_blocking/governor races and stale PID cleanup ([f58afbc](https://github.com/special-place-administrator/symforge/commit/f58afbc72ca942cdeb05bc5cba75c49b330c5ae3))
+
 ## [7.6.0](https://github.com/special-place-administrator/symforge/compare/v7.5.2...v7.6.0) (2026-04-21)
 
 
