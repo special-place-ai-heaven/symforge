@@ -43,6 +43,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "edit_plan",
     "context_inventory",
     "investigation_suggest",
+    "health_compact",
 ];
 
 // ---------------------------------------------------------------------------
@@ -260,6 +261,7 @@ fn all_tools_have_annotations() {
         "edit_plan",
         "investigation_suggest",
         "context_inventory",
+        "health_compact",
     ];
 
     const DESTRUCTIVE_WRITE: &[&str] = &[
