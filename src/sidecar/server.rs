@@ -18,13 +18,18 @@ use crate::live_index::store::SharedIndex;
 ///
 /// 1. Reads `SYMFORGE_SIDECAR_BIND` env var (default `"127.0.0.1"`).
 /// 2. Calls `port_file::check_stale(bind_host)` to clean up any stale files.
-/// 3. Binds `TcpListener::bind("{bind_host}:0")` (OS assigns the port).
-/// 4. Writes port and PID files via `port_file`.
-/// 5. Creates `SidecarState` with `TokenStats` and empty symbol cache.
-/// 6. Builds the axum router via `router::build_router`.
-/// 7. Spawns `axum::serve` with graceful shutdown wired to a oneshot channel.
-/// 8. After the server completes, calls `port_file::cleanup_files()`.
-/// 9. Returns `SidecarHandle { port, shutdown_tx }`.
+/// 3. Creates a `socket2::Socket`, sets `SO_REUSEADDR`, binds to
+///    `{bind_host}:0` (OS assigns the port), then listens with backlog 1024.
+///    `SO_REUSEADDR` lets the bind succeed when the chosen ephemeral port is
+///    still in TIME_WAIT from a recently-closed listener; this keeps rapid
+///    daemon restarts and parallel test fan-out from racing on Windows.
+/// 4. Hands the socket to `tokio::net::TcpListener::from_std`.
+/// 5. Writes port and PID files via `port_file`.
+/// 6. Creates `SidecarState` with `TokenStats` and empty symbol cache.
+/// 7. Builds the axum router via `router::build_router`.
+/// 8. Spawns `axum::serve` with graceful shutdown wired to a oneshot channel.
+/// 9. After the server completes, calls `port_file::cleanup_files()`.
+/// 10. Returns `SidecarHandle { port, shutdown_tx, server_join, token_stats }`.
 pub async fn spawn_sidecar(
     index: SharedIndex,
     bind_host: &str,
@@ -39,9 +44,23 @@ pub async fn spawn_sidecar(
     // Ensure local sidecar mode does not inherit a daemon session routing file.
     port_file::cleanup_session_file();
 
-    // Bind to an OS-assigned ephemeral port.
-    let addr = format!("{resolved_host}:0");
-    let listener = TcpListener::bind(&addr).await?;
+    // Bind to an OS-assigned ephemeral port with SO_REUSEADDR so a TIME_WAIT
+    // socket on the picked port does not block the bind. On Windows this
+    // matters under parallel test fan-out and on rapid daemon restarts; on
+    // Linux it permits the same with comparable semantics.
+    let std_addr: std::net::SocketAddr = format!("{resolved_host}:0").parse()?;
+    let domain = if std_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&std_addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = TcpListener::from_std(std_listener)?;
     let port = listener.local_addr()?.port();
 
     // Write port and PID files so hook scripts can locate the sidecar.
@@ -79,8 +98,10 @@ pub async fn spawn_sidecar(
     // Create graceful shutdown channel.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Spawn the server task.
-    tokio::spawn(async move {
+    // Spawn the server task. The returned `JoinHandle` is surfaced on
+    // `SidecarHandle::server_join` so callers can deterministically await
+    // listener drop via `shutdown_and_join`.
+    let server_join = tokio::spawn(async move {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
         };
@@ -100,6 +121,57 @@ pub async fn spawn_sidecar(
     Ok(SidecarHandle {
         port,
         shutdown_tx,
+        server_join,
         token_stats,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression: SO_REUSEADDR on the listener bind path must allow rebinding
+    /// to a port that was just released. Without this, parallel test fan-out
+    /// on Windows can race a previous listener's TIME_WAIT slot and fail with
+    /// WSAEADDRINUSE.
+    ///
+    /// We can't reliably synthesize a TIME_WAIT state in a unit test, but we
+    /// can exercise the bind helper code path twice on the same explicit port
+    /// to prove the listener-creation flow does not reject a fresh
+    /// SO_REUSEADDR bind on a recently-freed port.
+    #[test]
+    fn so_reuseaddr_listener_rebinds_on_recently_freed_port() {
+        fn bind_reuse(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+            let domain = if addr.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            };
+            let socket = socket2::Socket::new(
+                domain,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(16)?;
+            Ok(socket.into())
+        }
+
+        // First bind: ephemeral port assignment.
+        let ephemeral: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse addr");
+        let first = bind_reuse(ephemeral).expect("first bind");
+        let bound_port = first.local_addr().expect("local_addr").port();
+        drop(first);
+
+        // Immediate rebind on the same port via SO_REUSEADDR must succeed.
+        // Without SO_REUSEADDR on Windows, this is the failure mode that
+        // surfaces under rapid spawn_sidecar churn.
+        let explicit: std::net::SocketAddr =
+            format!("127.0.0.1:{bound_port}").parse().expect("parse explicit");
+        let second = bind_reuse(explicit).expect("rebind on freed port");
+        assert_eq!(
+            second.local_addr().expect("local_addr").port(),
+            bound_port,
+            "rebind must hold the same port"
+        );
+    }
 }

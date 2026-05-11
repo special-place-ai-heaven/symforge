@@ -285,7 +285,7 @@ async fn test_health_contract_golden() {
     let normalized = normalize_health_json(&body);
     assert_golden("health.json", &normalized);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -313,7 +313,7 @@ async fn test_stats_contract_golden() {
     let normalized = normalize_stats_json(&body);
     assert_golden("stats.json", &normalized);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -353,7 +353,7 @@ async fn test_outline_contract_golden() {
     );
     assert_golden("outline.txt", &canonical);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -408,7 +408,7 @@ async fn test_impact_edit_contract_golden() {
     );
     assert_golden("impact.txt", &canonical);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -443,7 +443,7 @@ async fn test_impact_new_file_contract_golden() {
         .expect("GET /impact?new_file=true");
     assert_golden("impact_new_file.txt", &body);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -488,7 +488,7 @@ async fn test_symbol_context_contract_golden() {
     );
     assert_golden("symbol_context.txt", &canonical);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -525,7 +525,7 @@ async fn test_repo_map_contract_golden() {
     );
     assert_golden("repo_map.txt", &canonical);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -564,6 +564,6 @@ async fn test_prompt_context_contract_golden() {
     );
     assert_golden("prompt_context.txt", &canonical);
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }

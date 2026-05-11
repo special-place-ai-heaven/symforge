@@ -2136,6 +2136,7 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "sha2",
+ "socket2",
  "streaming-iterator",
  "tempfile",
  "thiserror",

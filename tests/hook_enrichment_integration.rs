@@ -209,7 +209,7 @@ async fn test_read_hook_returns_formatted_outline() {
         "outline must contain 'gamma'; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -240,7 +240,7 @@ async fn test_read_hook_noop_for_missing_file() {
         "missing file must return 404; status: {status_line}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -292,7 +292,7 @@ async fn test_read_hook_budget_enforced() {
         "response with tiny budget must contain 'truncated'; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -338,7 +338,7 @@ async fn test_edit_hook_impact_diff() {
         "impact response must contain diff labels (Added/Changed/Removed/Impact); body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -393,7 +393,7 @@ async fn test_edit_hook_shows_callers() {
         "impact response must have token savings footer; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -444,7 +444,7 @@ async fn test_write_hook_confirms_index() {
         "new_file response must mention symbols or language info; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -503,7 +503,7 @@ async fn test_grep_hook_annotates_matches() {
         "must annotate enclosing function 'run'; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -546,7 +546,7 @@ async fn test_grep_hook_caps_at_10() {
         "response with >10 matches must indicate cap or truncation; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -600,7 +600,7 @@ async fn test_session_start_repo_map() {
         "repo-map must mention symbol counts; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -644,7 +644,7 @@ async fn test_repo_map_under_500_tokens() {
         body.len()
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -705,7 +705,7 @@ async fn test_token_stats_after_hooks() {
         "edit_fires must be >= 1 after /impact call; got {edit_fires}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }
 
@@ -746,6 +746,6 @@ async fn test_token_savings_footer() {
         "outline response must contain '[~N tokens saved]' footer; body: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     std::env::set_current_dir(&original).unwrap();
 }

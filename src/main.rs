@@ -297,8 +297,9 @@ async fn run_local_mcp_server_async(
     tracing::info!(port = sidecar_handle.port, "HTTP sidecar started");
 
     // Share the sidecar's TokenStats Arc with the MCP server so the health tool
-    // can display token savings without an HTTP round-trip.
-    let token_stats = Some(sidecar_handle.token_stats);
+    // can display token savings without an HTTP round-trip. Clone the Arc so
+    // `sidecar_handle` remains intact for `shutdown_and_join` below.
+    let token_stats = Some(Arc::clone(&sidecar_handle.token_stats));
 
     // Create MCP server and serve on stdio transport.
     let server = protocol::SymForgeServer::new(
@@ -331,8 +332,8 @@ async fn run_local_mcp_server_async(
     }
 
     // Shutdown the sidecar now that the MCP server has exited.
-    let _ = sidecar_handle.shutdown_tx.send(());
-    tracing::info!("sidecar shutdown signal sent");
+    sidecar_handle.shutdown_and_join().await;
+    tracing::info!("sidecar shutdown complete");
 
     Ok(())
 }

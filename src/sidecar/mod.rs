@@ -19,14 +19,34 @@ use crate::live_index::store::SharedIndex;
 
 /// Handle returned by `spawn_sidecar`. Dropping this or sending on `shutdown_tx`
 /// gracefully stops the background axum server and cleans up port/PID files.
+///
+/// Prefer `shutdown_and_join().await` over a bare `shutdown_tx.send(())`: the
+/// helper awaits the server task's completion so the listener is fully dropped
+/// before the caller proceeds. This matters in tests where rapid teardown +
+/// rebind cycles must not race a still-open listener.
 pub struct SidecarHandle {
     /// The ephemeral port the sidecar bound to.
     pub port: u16,
     /// Send `()` on this channel to initiate graceful shutdown.
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// Join handle for the spawned axum-serve task. Awaiting this after sending
+    /// on `shutdown_tx` guarantees the listener has been dropped.
+    pub server_join: tokio::task::JoinHandle<()>,
     /// Shared token stats for the sidecar session.
     /// Pass this `Arc` to `SymForgeServer::new()` so the health tool can report savings.
     pub token_stats: Arc<TokenStats>,
+}
+
+impl SidecarHandle {
+    /// Signal graceful shutdown and await server-task completion.
+    ///
+    /// Consumes the handle; the listener and port/PID files are fully released
+    /// by the time this returns. Tests should prefer this over a bare
+    /// `shutdown_tx.send(())` followed by an arbitrary sleep.
+    pub async fn shutdown_and_join(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.server_join.await;
+    }
 }
 
 // ---------------------------------------------------------------------------

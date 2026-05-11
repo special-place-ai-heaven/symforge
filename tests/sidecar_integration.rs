@@ -150,9 +150,8 @@ async fn test_sidecar_binds_ephemeral_port() {
     let pid_file = tmp.path().join(".symforge/sidecar.pid");
     assert!(pid_file.exists(), "sidecar.pid file must exist");
 
-    // Send shutdown and wait briefly for async cleanup.
-    let _ = handle.shutdown_tx.send(());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Send shutdown and await server-task completion (listener fully dropped).
+    handle.shutdown_and_join().await;
 
     assert!(
         !port_file.exists(),
@@ -209,7 +208,7 @@ async fn test_health_endpoint_responds() {
     );
     assert_eq!(parsed["file_count"], 2, "file_count must match index");
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -247,7 +246,7 @@ async fn test_outline_endpoint() {
         "outline should include the token savings footer"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -275,7 +274,7 @@ async fn test_workflow_source_read_endpoint_matches_outline() {
         "workflow source-read adapter should stay identical to the canonical outline route"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -330,7 +329,7 @@ async fn test_shared_index_mutation() {
         "new file symbol must be visible through sidecar"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -365,7 +364,7 @@ async fn test_hook_binary_latency() {
         elapsed
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -507,7 +506,7 @@ async fn test_repo_map_endpoint() {
         "repo-map should include the src directory bucket"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -539,7 +538,7 @@ async fn test_workflow_repo_start_endpoint_matches_repo_map() {
         "workflow repo-start adapter should stay identical to the canonical repo-map route"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -573,7 +572,7 @@ async fn test_prompt_context_endpoint_prefers_file_hint() {
         "prompt context should include the hinted file symbol"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -602,7 +601,7 @@ async fn test_workflow_prompt_context_endpoint_matches_prompt_context() {
         "workflow prompt-context adapter should stay identical to the canonical prompt-context route"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -768,7 +767,7 @@ async fn test_prompt_context_endpoint_extensionless_path_line_hint_disambiguates
         "extensionless path alias should exclude unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -934,7 +933,7 @@ async fn test_prompt_context_endpoint_module_alias_line_hint_disambiguates_exact
         "module alias should exclude unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1088,7 +1087,7 @@ async fn test_prompt_context_endpoint_module_alias_without_line_prefers_exact_fi
         "module alias without line should exclude unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1219,7 +1218,7 @@ async fn test_prompt_context_endpoint_slash_module_alias_without_line_prefers_ex
         "slash module aliases without line should exclude unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1362,7 +1361,7 @@ async fn test_prompt_context_endpoint_slash_module_alias_line_hint_disambiguates
         "slash module aliases with line hints should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1467,7 +1466,7 @@ async fn test_prompt_context_endpoint_qualified_symbol_alias_prefers_exact_selec
         "qualified symbol aliases should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1594,7 +1593,7 @@ async fn test_prompt_context_endpoint_dotted_qualified_symbol_alias_prefers_exac
         "dotted qualified symbol aliases should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1721,7 +1720,7 @@ async fn test_prompt_context_endpoint_slash_qualified_symbol_alias_prefers_exact
         "slash qualified symbol aliases should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -1865,7 +1864,7 @@ async fn test_prompt_context_endpoint_slash_qualified_symbol_alias_line_hint_dis
         "slash qualified symbol aliases with line hints should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2009,7 +2008,7 @@ async fn test_prompt_context_endpoint_dotted_qualified_symbol_alias_line_hint_di
         "dotted qualified symbol aliases with line hints should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2114,7 +2113,7 @@ async fn test_prompt_context_endpoint_combined_hint_uses_exact_selector() {
         "combined prompt should drop unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2223,7 +2222,7 @@ async fn test_prompt_context_endpoint_line_hint_disambiguates_exact_selector() {
         "line hint should still produce symbol context output: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2332,7 +2331,7 @@ async fn test_prompt_context_endpoint_path_line_hint_disambiguates_exact_selecto
         "path:line hint should still produce symbol context output: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2441,7 +2440,7 @@ async fn test_prompt_context_endpoint_basename_line_hint_disambiguates_exact_sel
         "basename:line hint should still produce symbol context output: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
 
@@ -2584,6 +2583,6 @@ async fn test_prompt_context_endpoint_extensionless_alias_line_hint_disambiguate
         "extensionless alias should exclude unrelated same-name hits: {body}"
     );
 
-    let _ = handle.shutdown_tx.send(());
+    handle.shutdown_and_join().await;
     restore_cwd(&original);
 }
