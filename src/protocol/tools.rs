@@ -334,6 +334,14 @@ pub struct SearchTextInput {
     /// When true, include test files in the result set.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_tests: Option<bool>,
+    /// When true, include vendored/third-party paths (vendor/, node_modules/, third_party/).
+    /// Default false -- vendor noise dominates results in repos with embedded grammars.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_vendor: Option<bool>,
+    /// When true, include personal tooling paths (.claude/gsd-*).
+    /// Default false -- personal sidecars rarely answer code questions.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_personal_tooling: Option<bool>,
     /// Optional repo-relative include glob, for example `src/**/*.ts`.
     pub glob: Option<String>,
     /// Optional repo-relative exclude glob, for example `**/*.spec.ts`.
@@ -725,7 +733,7 @@ pub struct InspectMatchInput {
 }
 
 /// Input for `explore`.
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 pub struct ExploreInput {
     /// Natural-language concept or topic to explore (e.g., "error handling", "concurrency", "database").
     pub query: String,
@@ -741,6 +749,14 @@ pub struct ExploreInput {
     /// By default these are hidden to reduce noise (default false).
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_noise: Option<bool>,
+    /// When true, surface vendored/third-party paths (additive with `include_noise`).
+    /// Default false.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_vendor: Option<bool>,
+    /// When true, surface personal tooling paths (.claude/gsd-*; additive with `include_noise`).
+    /// Default false.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_personal_tooling: Option<bool>,
     /// Optional canonical language name filter (e.g., "Rust", "TypeScript", "C#").
     pub language: Option<String>,
     /// Optional relative path prefix scope (e.g., "src/", "backend/").
@@ -2100,14 +2116,28 @@ fn explore_should_skip_path_boost(
     path: &str,
     classification: &crate::domain::index::FileClassification,
     include_noise: bool,
+    include_vendor: bool,
+    include_personal_tooling: bool,
 ) -> bool {
-    if include_noise {
+    let suppress_vendor = !(include_noise || include_vendor);
+    let suppress_personal = !(include_noise || include_personal_tooling);
+    let suppress_other = !include_noise;
+    if !suppress_vendor && !suppress_personal && !suppress_other {
         return false;
     }
-    explore_is_test_like_path(path, Some(classification))
-        || classification.is_vendor
-        || classification.is_generated
-        || classification.is_config
+    if suppress_other && explore_is_test_like_path(path, Some(classification)) {
+        return true;
+    }
+    if suppress_personal && crate::live_index::query::is_personal_tooling_path(path) {
+        return true;
+    }
+    if suppress_vendor && classification.is_vendor {
+        return true;
+    }
+    if suppress_other && (classification.is_generated || classification.is_config) {
+        return true;
+    }
+    false
 }
 
 fn explore_path_penalty(
@@ -2273,6 +2303,37 @@ fn render_diff_symbols_output(
     let output =
         format::diff_symbols_result_view(base, target, changed_files, repo, compact, summary_only);
     format!("{envelope}\n\n{output}")
+}
+
+/// Strip vendor / personal-tooling paths from a `TextSearchResult` per the
+/// caller's `include_vendor` / `include_personal_tooling` flags. Suppressed
+/// match counts feed `suppressed_by_noise`, which renders into the existing
+/// "N noise-filtered match(es) suppressed" envelope footer.
+fn apply_path_predicate_filter(
+    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
+    include_vendor: bool,
+    include_personal_tooling: bool,
+) {
+    if include_vendor && include_personal_tooling {
+        return;
+    }
+    if let Ok(r) = result {
+        let mut filtered: usize = 0;
+        r.files.retain(|file| {
+            if !include_vendor && crate::live_index::query::is_vendor_path(&file.path) {
+                filtered += file.matches.len();
+                return false;
+            }
+            if !include_personal_tooling
+                && crate::live_index::query::is_personal_tooling_path(&file.path)
+            {
+                filtered += file.matches.len();
+                return false;
+            }
+            true
+        });
+        r.suppressed_by_noise = r.suppressed_by_noise.saturating_add(filtered);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3539,11 +3600,16 @@ impl SymForgeServer {
                 Ok(o) => o,
                 Err(message) => return message,
             };
-            let result = {
+            let mut result = {
                 let guard = self.index.read();
                 loading_guard!(guard);
                 search::search_structural(&guard, pattern, &options)
             };
+            apply_path_predicate_filter(
+                &mut result,
+                params.0.include_vendor.unwrap_or(false),
+                params.0.include_personal_tooling.unwrap_or(false),
+            );
             let output = render_search_text_output(
                 self,
                 result,
@@ -3618,7 +3684,7 @@ impl SymForgeServer {
             }
         }
 
-        let result = {
+        let mut result = {
             let guard = self.index.read();
             loading_guard!(guard);
             let mut r = search::search_text_with_options(
@@ -3637,6 +3703,11 @@ impl SymForgeServer {
             }
             r
         };
+        apply_path_predicate_filter(
+            &mut result,
+            params.0.include_vendor.unwrap_or(false),
+            params.0.include_personal_tooling.unwrap_or(false),
+        );
 
         // Auto-correct double-escaped regex patterns: if regex=true and the
         // result is InvalidRegex or Ok-but-empty, try fixing common
@@ -3651,7 +3722,7 @@ impl SymForgeServer {
                 && let Some(ref query) = original_query
                 && let Some(fixed) = fix_common_double_escapes(query)
             {
-                let retry_result = {
+                let mut retry_result = {
                     let guard = self.index.read();
                     loading_guard!(guard);
                     let mut r = search::search_text_with_options(
@@ -3669,6 +3740,11 @@ impl SymForgeServer {
                     }
                     r
                 };
+                apply_path_predicate_filter(
+                    &mut retry_result,
+                    params.0.include_vendor.unwrap_or(false),
+                    params.0.include_personal_tooling.unwrap_or(false),
+                );
                 // Use the retry result if it actually produced matches
                 if let Ok(ref retry_ok) = retry_result
                     && !retry_ok.files.is_empty()
@@ -5517,6 +5593,14 @@ impl SymForgeServer {
         };
         let limit = params.0.limit.unwrap_or(10) as usize;
         let include_noise = params.0.include_noise.unwrap_or(false);
+        let include_vendor = params.0.include_vendor.unwrap_or(false);
+        let include_personal_tooling = params.0.include_personal_tooling.unwrap_or(false);
+        // B1 additive: vendor surfaces when include_noise OR include_vendor is true;
+        // personal-tooling surfaces when include_noise OR include_personal_tooling.
+        let suppress_vendor = !(include_noise || include_vendor);
+        let suppress_personal = !(include_noise || include_personal_tooling);
+        let suppress_other_noise = !include_noise;
+        let any_suppression = suppress_vendor || suppress_personal || suppress_other_noise;
         let guard = self.index.read();
         loading_guard!(guard);
 
@@ -5573,7 +5657,13 @@ impl SymForgeServer {
         for term in &boost_terms {
             let term_lower = term.to_ascii_lowercase();
             for (file_path, file) in guard.all_files() {
-                if explore_should_skip_path_boost(file_path, &file.classification, include_noise) {
+                if explore_should_skip_path_boost(
+                    file_path,
+                    &file.classification,
+                    include_noise,
+                    include_vendor,
+                    include_personal_tooling,
+                ) {
                     continue;
                 }
                 let segments: Vec<&str> = file_path.split(&['/', '\\'][..]).collect();
@@ -5682,17 +5772,29 @@ impl SymForgeServer {
             });
         }
 
-        if !include_noise {
-            let noise_policy = search::NoisePolicy::hide_classified_noise();
+        if any_suppression {
             file_signals.retain(|path, _| {
                 let Some(file) = guard.get_file(path) else {
                     return false;
                 };
-                if explore_is_test_like_path(path, Some(&file.classification)) {
+                if suppress_other_noise
+                    && explore_is_test_like_path(path, Some(&file.classification))
+                {
+                    return false;
+                }
+                if suppress_personal
+                    && crate::live_index::query::is_personal_tooling_path(path)
+                {
                     return false;
                 }
                 let class = search::NoisePolicy::classify_path(path, None);
-                !noise_policy.should_hide(class)
+                match class {
+                    search::NoiseClass::Vendor => !suppress_vendor,
+                    search::NoiseClass::Generated | search::NoiseClass::Ignored => {
+                        !suppress_other_noise
+                    }
+                    search::NoiseClass::None => true,
+                }
             });
         }
 
@@ -5879,22 +5981,38 @@ impl SymForgeServer {
         let symbol_hits: Vec<(String, String, String)> =
             ranked.into_iter().map(|(k, _)| k).collect();
 
-        // Noise filtering: hide vendor/generated/gitignored files by default.
+        // Noise filtering: hide vendor / generated / gitignored / personal-tooling
+        // by default. include_noise is the umbrella; include_vendor and
+        // include_personal_tooling are additive finer-grained overrides per B1.
         let mut noise_hidden: usize = 0;
-        let (symbol_hits, text_hits) = if !include_noise {
-            let noise_policy = search::NoisePolicy::hide_classified_noise();
+        let should_hide_path = |path: &str| -> bool {
+            let Some(file) = guard.get_file(path) else {
+                return true;
+            };
+            if suppress_other_noise
+                && explore_is_test_like_path(path, Some(&file.classification))
+            {
+                return true;
+            }
+            if suppress_personal
+                && crate::live_index::query::is_personal_tooling_path(path)
+            {
+                return true;
+            }
+            let class = search::NoisePolicy::classify_path(path, None);
+            match class {
+                search::NoiseClass::Vendor => suppress_vendor,
+                search::NoiseClass::Generated | search::NoiseClass::Ignored => {
+                    suppress_other_noise
+                }
+                search::NoiseClass::None => false,
+            }
+        };
+        let (symbol_hits, text_hits) = if any_suppression {
             let filtered_symbols: Vec<(String, String, String)> = symbol_hits
                 .into_iter()
                 .filter(|(_, _, path)| {
-                    let Some(file) = guard.get_file(path) else {
-                        return false;
-                    };
-                    if explore_is_test_like_path(path, Some(&file.classification)) {
-                        noise_hidden += 1;
-                        return false;
-                    }
-                    let class = search::NoisePolicy::classify_path(path, None);
-                    let hide = noise_policy.should_hide(class);
+                    let hide = should_hide_path(path);
                     if hide {
                         noise_hidden += 1;
                     }
@@ -5904,15 +6022,7 @@ impl SymForgeServer {
             let filtered_text: Vec<(String, String, usize)> = text_hits
                 .into_iter()
                 .filter(|(path, _, _)| {
-                    let Some(file) = guard.get_file(path) else {
-                        return false;
-                    };
-                    if explore_is_test_like_path(path, Some(&file.classification)) {
-                        noise_hidden += 1;
-                        return false;
-                    }
-                    let class = search::NoisePolicy::classify_path(path, None);
-                    let hide = noise_policy.should_hide(class);
+                    let hide = should_hide_path(path);
                     if hide {
                         noise_hidden += 1;
                     }
@@ -6273,6 +6383,8 @@ impl SymForgeServer {
                     limit: None,
                     depth: Some(2),
                     include_noise: None,
+                    include_vendor: None,
+                    include_personal_tooling: None,
                     language: None,
                     path_prefix: None,
                     estimate: None,
@@ -6332,6 +6444,8 @@ impl SymForgeServer {
                     ranked: None,
                     include_generated: None,
                     include_tests: None,
+                    include_vendor: None,
+                    include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
                     structural: None,
@@ -6373,6 +6487,8 @@ impl SymForgeServer {
                     limit: None,
                     depth: Some(2),
                     include_noise: None,
+                    include_vendor: None,
+                    include_personal_tooling: None,
                     language: None,
                     path_prefix: None,
                     estimate: None,
@@ -7572,6 +7688,34 @@ mod tests {
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
         index
+    }
+
+    /// Build an index seeded with one src, one vendor, and one personal-tooling
+    /// file -- each containing the literal `noisy_token`. Used by Task 2.2 tests
+    /// to exercise the default-suppress / opt-in surfacing semantics in
+    /// `search_text` and `explore`.
+    fn make_live_index_ready_with_vendor_file() -> LiveIndex {
+        let content = b"// noisy_token marker for path-filter tests\n";
+        let sym = SymbolRecord {
+            name: "anchor".to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (src_key, src_file) = make_file("src/normal.rs", content, vec![sym.clone()]);
+        let (vendor_key, vendor_file) =
+            make_file("vendor/foo/bar.rs", content, vec![sym.clone()]);
+        let (personal_key, personal_file) =
+            make_file(".claude/gsd-local-patches/foo.rs", content, vec![sym]);
+        make_live_index_ready(vec![
+            (src_key, src_file),
+            (vendor_key, vendor_file),
+            (personal_key, personal_file),
+        ])
     }
 
     fn make_live_index_empty() -> LiveIndex {
@@ -9240,6 +9384,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         assert!(
@@ -9305,6 +9451,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9350,6 +9498,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         assert!(
@@ -9400,6 +9550,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9442,6 +9594,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9496,6 +9650,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9550,6 +9706,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9596,6 +9754,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9645,6 +9805,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9685,6 +9847,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9737,6 +9901,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -9775,6 +9941,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
 
@@ -11863,6 +12031,8 @@ mod tests {
                 limit: None,
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -11893,6 +12063,8 @@ mod tests {
                 limit: Some(5),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -11932,6 +12104,8 @@ mod tests {
                 limit: Some(5),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -11989,6 +12163,8 @@ mod tests {
                 limit: Some(5),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12013,6 +12189,8 @@ mod tests {
                 limit: Some(5),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12034,6 +12212,8 @@ mod tests {
                 limit: None,
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12067,6 +12247,8 @@ mod tests {
                 limit: Some(5),
                 depth: Some(2),
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12104,6 +12286,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12151,6 +12335,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12206,6 +12392,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12299,6 +12487,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12351,6 +12541,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12391,6 +12583,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12424,6 +12618,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12457,6 +12653,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12503,6 +12701,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12540,6 +12740,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: Some(true),
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12573,6 +12775,8 @@ mod tests {
                 limit: Some(10),
                 depth: None,
                 include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 language: None,
                 path_prefix: None,
                 estimate: None,
@@ -12583,6 +12787,130 @@ mod tests {
             result.contains("vendor/generated files hidden")
                 && result.contains("include_noise=true"),
             "should show noise hint when results are hidden: {result}"
+        );
+    }
+
+    // --- Task 2.2 path-filter tests --------------------------------------
+
+    #[tokio::test]
+    async fn test_search_text_hides_vendor_paths_by_default() {
+        let server = make_server(make_live_index_ready_with_vendor_file());
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("noisy_token".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            !result.contains("vendor/foo/bar.rs"),
+            "vendor paths must be suppressed by default; got:\n{result}"
+        );
+        assert!(
+            result.contains("noise-filtered"),
+            "filtered-count footer expected; got:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_includes_vendor_when_flag_true() {
+        let server = make_server(make_live_index_ready_with_vendor_file());
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("noisy_token".to_string()),
+                include_vendor: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            result.contains("vendor/foo/bar.rs"),
+            "vendor paths must appear when include_vendor=true; got:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_hides_personal_tooling_paths_by_default() {
+        let server = make_server(make_live_index_ready_with_vendor_file());
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("noisy_token".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            !result.contains(".claude/gsd-local-patches/"),
+            "personal tooling paths must be suppressed by default; got:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_includes_personal_tooling_when_flag_true() {
+        let server = make_server(make_live_index_ready_with_vendor_file());
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("noisy_token".to_string()),
+                include_personal_tooling: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            result.contains(".claude/gsd-local-patches/"),
+            "personal tooling paths must appear when include_personal_tooling=true; got:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_suppression_footer_counts_vendor() {
+        let server = make_server(make_live_index_ready_with_vendor_file());
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("noisy_token".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        // Fixture seeds 3 files (src + vendor + personal-tooling), each with one
+        // match for `noisy_token`. Default-suppress hides 2 (vendor + personal),
+        // so the envelope footer must report at least 2 noise-filtered matches.
+        assert!(
+            result.contains("noise-filtered match(es) suppressed"),
+            "footer must report noise-filtered count; got:\n{result}"
+        );
+        let count_ok = result.contains("2 noise-filtered")
+            || result.contains("3 noise-filtered");
+        assert!(
+            count_ok,
+            "footer must report >=2 suppressed matches (vendor + personal-tooling); got:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explore_finer_grained_include_vendor_flag() {
+        // B1 additive: include_vendor=true alone, include_noise unset, must surface vendor.
+        // Mirrors the fixture from test_explore_includes_vendor_when_include_noise_true so
+        // the concept-query "error handling" finds `VendorError` via the "Error" token.
+        let vendor_content = b"pub struct VendorError {}\n";
+        let vendor_sym = SymbolRecord {
+            name: "VendorError".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, vendor_content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (vkey, vfile) = make_file("vendor/somelib/lib.rs", vendor_content, vec![vendor_sym]);
+        let server = make_server(make_live_index_ready(vec![(vkey, vfile)]));
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "error handling".to_string(),
+                limit: Some(10),
+                include_vendor: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            result.contains("VendorError"),
+            "include_vendor=true alone must surface vendor (B1 additive); got: {result}"
         );
     }
 
@@ -13450,6 +13778,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         assert!(
@@ -13491,6 +13821,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         // With group_by: "symbol", should show symbol name and match count
@@ -13533,6 +13865,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         // Should exclude the "use" import line
@@ -13611,6 +13945,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         // Should show that connect() is called by handler() in src/api.rs
@@ -13655,6 +13991,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
             }))
             .await;
         // follow_refs ran but found no cross-references — should signal this explicitly
@@ -14746,6 +15084,8 @@ mod tests {
                 max_per_file: None,
                 include_tests: None,
                 include_generated: None,
+                include_vendor: None,
+                include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
                 structural: None,

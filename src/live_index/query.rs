@@ -775,8 +775,6 @@ fn is_filtered_name(name: &str, language: &LanguageId) -> bool {
 /// Returns true when `path` lives under a vendored / third-party directory.
 /// Delegates to `NoisePolicy::classify_path` so the vendor-set stays
 /// single-sourced with the indexer's noise classifier.
-// Wired into search_text / explore output filtering in Task 2.2.
-#[allow(dead_code)]
 pub(crate) fn is_vendor_path(path: &str) -> bool {
     matches!(NoisePolicy::classify_path(path, None), NoiseClass::Vendor)
 }
@@ -785,8 +783,6 @@ pub(crate) fn is_vendor_path(path: &str) -> bool {
 /// `.claude/gsd-*` or `.claude/get-shit-done/`. Excludes shared agent
 /// infrastructure like `.claude/CLAUDE.md`, `.claude/commands/`,
 /// `.claude/skills/`, `.claude/hooks/`, `.claude/agents/`.
-// Wired into search_text / explore output filtering in Task 2.2.
-#[allow(dead_code)]
 pub(crate) fn is_personal_tooling_path(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
     lower.starts_with(".claude/gsd-") || lower.starts_with(".claude/get-shit-done/")
