@@ -1081,6 +1081,7 @@ pub fn health_report_from_published_state(
         partial_parse_files: published.partial_parse_files.clone(),
         failed_files: published.failed_files.clone(),
         tier_counts: published.tier_counts,
+        local_empty_reason: published.local_empty_reason.clone(),
     };
     // Preserve the existing formatter shape by reusing HealthStats.
     if matches!(stats.watcher_state, crate::watcher::WatcherState::Off) {
@@ -1201,6 +1202,15 @@ pub fn health_report_from_stats(status: &str, stats: &HealthStats) -> String {
         watcher_line,
         admission_section
     );
+
+    if let Some(reason) = stats.local_empty_reason.as_deref()
+        && stats.file_count == 0
+    {
+        let banner = format!(
+            "\n\n⚠ Empty index — {reason}\n  Recovery: call index_folder(path=\"<your-project-root>\") or restart with --root <path>"
+        );
+        output.push_str(&banner);
+    }
 
     if stats.partial_parse_count > 0 && stats.failed_count == 0 {
         output.push_str(

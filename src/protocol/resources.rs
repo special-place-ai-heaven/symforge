@@ -465,6 +465,7 @@ mod tests {
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();

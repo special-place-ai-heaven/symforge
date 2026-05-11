@@ -367,6 +367,9 @@ pub struct PublishedIndexState {
     pub is_empty: bool,
     /// Admission tier counts: (Tier1 indexed, Tier2 metadata-only, Tier3 hard-skipped).
     pub tier_counts: (usize, usize, usize),
+    /// Reason the index is empty at startup (LocalEmpty branch). Surfaced as
+    /// a banner in `health` output. `None` when the index has files.
+    pub local_empty_reason: Option<String>,
 }
 
 /// The in-memory index: file contents and parsed symbols for all discovered files.
@@ -400,6 +403,10 @@ pub struct LiveIndex {
     pub(crate) gitignore: Option<ignore::gitignore::Gitignore>,
     /// Files that were not fully indexed (Tier 2 metadata-only or Tier 3 hard-skipped).
     pub(crate) skipped_files: Vec<SkippedFile>,
+    /// Reason this index started empty, if any. Set at construction time by
+    /// the startup-plan branch; surfaced in `health` output as an actionable
+    /// banner. `None` when the index has files or after a reload.
+    pub(crate) local_empty_reason: Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 /// Lightweight snapshot of a symbol for pre-update diffing in `analyze_file_impact`.
@@ -673,6 +680,12 @@ impl SharedIndexHandle {
     pub fn update_git_temporal(&self, index: super::git_temporal::GitTemporalIndex) {
         self.git_temporal.store(Arc::new(index));
     }
+
+    /// Set the empty-index reason on the live LiveIndex. Used by the startup
+    /// LocalEmpty branch so `health` can surface why the index is empty.
+    pub fn set_local_empty_reason(&self, reason: Option<String>) {
+        self.live.load().set_local_empty_reason(reason);
+    }
 }
 
 impl<'a> Deref for SharedIndexWriteGuard<'a> {
@@ -735,6 +748,7 @@ impl PublishedIndexState {
             snapshot_verify_state: index.snapshot_verify_state,
             is_empty: index.is_empty,
             tier_counts: stats.tier_counts,
+            local_empty_reason: stats.local_empty_reason,
         }
     }
 
@@ -1084,6 +1098,7 @@ impl LiveIndex {
             trigram_index,
             gitignore,
             skipped_files,
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -1114,8 +1129,20 @@ impl LiveIndex {
             trigram_index: super::trigram::TrigramIndex::new(),
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         };
         SharedIndexHandle::shared(index)
+    }
+
+    /// Set the reason this index is empty (for `health` banner). Call at startup
+    /// from the LocalEmpty branch.
+    pub fn set_local_empty_reason(&self, reason: Option<String>) {
+        *self.local_empty_reason.write() = reason;
+    }
+
+    /// Read the empty-index reason, if any.
+    pub fn local_empty_reason(&self) -> Option<String> {
+        self.local_empty_reason.read().clone()
     }
 
     pub fn add_skipped_file(&mut self, sf: SkippedFile) {
@@ -2034,6 +2061,7 @@ mod tests {
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 

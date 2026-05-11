@@ -265,7 +265,9 @@ async fn run_local_mcp_server_async(
         (index, name, Some(root))
     } else {
         tracing::info!("{}", local_empty_reason(should_auto_index));
-        (live_index::LiveIndex::empty(), "project".to_string(), None)
+        let live = live_index::LiveIndex::empty();
+        live.set_local_empty_reason(Some(local_empty_reason(should_auto_index).to_string()));
+        (live, "project".to_string(), None)
     };
 
     // Spawn file watcher after initial load (only when auto-index is enabled).
@@ -364,6 +366,7 @@ mod tests {
             snapshot_verify_state: SnapshotVerifyState::NotNeeded,
             is_empty: false,
             tier_counts: (0, 0, 0),
+            local_empty_reason: None,
         }
     }
 

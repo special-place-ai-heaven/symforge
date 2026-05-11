@@ -91,6 +91,7 @@ fn make_index(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         trigram_index,
         gitignore: None,
         skipped_files: Vec::new(),
+        local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
     };
     index.rebuild_path_indices();
     index
@@ -681,6 +682,7 @@ fn test_health_report_empty_state() {
         trigram_index: crate::live_index::trigram::TrigramIndex::new(),
         gitignore: None,
         skipped_files: Vec::new(),
+        local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
     };
     let result = health_report(&index);
     assert!(result.contains("Status: Empty"), "got: {result}");
@@ -807,6 +809,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
             ("src/worse.rs".to_string(), "lexer panic".to_string()),
         ],
         tier_counts: (4, 0, 0),
+        local_empty_reason: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -856,6 +859,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         ],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
+        local_empty_reason: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -904,6 +908,7 @@ fn test_health_report_lists_partial_parse_files() {
         ],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
+        local_empty_reason: None,
     };
     let report = health_report_from_stats("Ready", &stats);
     assert!(
@@ -948,6 +953,7 @@ fn test_health_report_caps_partial_list_at_10() {
         partial_parse_files,
         failed_files: vec![],
         tier_counts: (50, 0, 0),
+        local_empty_reason: None,
     };
     let report = health_report_from_stats("Ready", &stats);
     assert!(
@@ -985,6 +991,7 @@ fn test_health_report_shows_tier_breakdown() {
         partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (8200, 1280, 20),
+        local_empty_reason: None,
     };
     let report = health_report_from_stats("Ready", &stats);
     assert!(
@@ -1028,6 +1035,7 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (1, 0, 0),
+        local_empty_reason: None,
     };
 
     let report = health_report_from_stats("Ready", &stats);
@@ -1035,6 +1043,58 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
     assert!(report.contains("reconcile repairs: 5"), "got: {report}");
     assert!(report.contains("last overflow:"), "got: {report}");
     assert!(report.contains("last reconcile:"), "got: {report}");
+}
+
+#[test]
+fn test_health_report_shows_empty_index_banner_with_reason() {
+    let stats = HealthStats {
+        file_count: 0,
+        symbol_count: 0,
+        parsed_count: 0,
+        partial_parse_count: 0,
+        failed_count: 0,
+        load_duration: std::time::Duration::ZERO,
+        watcher_state: crate::watcher::WatcherState::Off,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        stale_files_found: 0,
+        last_overflow_at: None,
+        last_reconcile_at: None,
+        partial_parse_files: vec![],
+        failed_files: vec![],
+        tier_counts: (0, 0, 0),
+        local_empty_reason: Some(
+            "no safe project root found — starting with empty index".to_string(),
+        ),
+    };
+    let report = health_report_from_stats("Ready", &stats);
+    assert!(
+        report.contains("Empty index"),
+        "report should announce empty-index state; got:\n{report}"
+    );
+    assert!(
+        report.contains("no safe project root"),
+        "report must surface the reason verbatim; got:\n{report}"
+    );
+    assert!(
+        report.contains("index_folder") || report.contains("--root"),
+        "report should suggest a recovery; got:\n{report}"
+    );
+}
+
+#[test]
+fn test_health_report_omits_empty_banner_when_index_populated() {
+    let sym = make_symbol("foo", SymbolKind::Function, 0, 1, 3);
+    let file = make_file("src/lib.rs", b"fn foo() {}\n", vec![sym]);
+    let index = make_index(vec![file]);
+    let stats = index.health_stats();
+    let report = health_report_from_stats("Ready", &stats);
+    assert!(
+        !report.contains("Empty index"),
+        "report must not show empty-index banner when files exist; got:\n{report}"
+    );
 }
 
 #[test]
@@ -1719,6 +1779,7 @@ fn make_index_with_reverse(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         trigram_index,
         gitignore: None,
         skipped_files: Vec::new(),
+        local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
     };
     index.rebuild_reverse_index();
     index.rebuild_path_indices();

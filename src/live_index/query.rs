@@ -846,6 +846,9 @@ pub struct HealthStats {
     pub failed_files: Vec<(String, String)>,
     /// Admission tier counts: (Tier1 indexed, Tier2 metadata-only, Tier3 hard-skipped).
     pub tier_counts: (usize, usize, usize),
+    /// Reason the index is empty at startup (e.g. no safe root, auto-index off).
+    /// Surfaced as a banner in `health` output so MCP clients see why no symbols loaded.
+    pub local_empty_reason: Option<String>,
 }
 
 /// Owned entry used to render the repo outline after releasing the index lock.
@@ -2488,6 +2491,7 @@ impl LiveIndex {
             partial_parse_files,
             failed_files,
             tier_counts: self.tier_counts(),
+            local_empty_reason: self.local_empty_reason(),
         }
     }
 
@@ -3116,6 +3120,7 @@ mod tests {
         CircuitBreakerState, IndexState, IndexedFile, LiveIndex, ParseStatus,
     };
     use crate::watcher::{WatcherInfo, WatcherState};
+    use std::sync::Arc;
     use std::collections::HashMap;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -3190,6 +3195,7 @@ mod tests {
             trigram_index,
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         };
         // Rebuild the reverse index so xref query tests work.
         index.rebuild_reverse_index();
@@ -4329,6 +4335,7 @@ impl Actor for MyActor {
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         };
         assert!(!index.is_ready());
     }
@@ -4365,6 +4372,7 @@ impl Actor for MyActor {
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
             skipped_files: Vec::new(),
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
         };
 
         match index.index_state() {
