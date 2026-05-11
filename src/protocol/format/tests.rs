@@ -1098,6 +1098,87 @@ fn test_health_report_omits_empty_banner_when_index_populated() {
 }
 
 #[test]
+fn test_health_report_idle_watcher_shows_reconcile_repairs() {
+    let stats = HealthStats {
+        file_count: 100,
+        symbol_count: 1000,
+        parsed_count: 100,
+        partial_parse_count: 0,
+        failed_count: 0,
+        load_duration: std::time::Duration::from_millis(500),
+        watcher_state: crate::watcher::WatcherState::Active,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        stale_files_found: 7,
+        last_overflow_at: None,
+        last_reconcile_at: Some(std::time::SystemTime::now()),
+        partial_parse_files: vec![],
+        failed_files: vec![],
+        tier_counts: (100, 0, 0),
+        local_empty_reason: None,
+    };
+    let report = health_report_from_stats("Ready", &stats);
+    assert!(
+        report.contains("active (idle; debounce: 200ms"),
+        "idle-but-reconciled arm did not fire; rendered: {report}"
+    );
+    assert!(
+        report.contains("reconcile repairs: 7"),
+        "reconcile counter not rendered; rendered: {report}"
+    );
+    assert!(
+        !report.contains("(event-driven;"),
+        "verbose arm fired instead of idle-but-reconciled; rendered: {report}"
+    );
+}
+
+#[test]
+fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
+    use crate::live_index::store::{
+        IndexLoadSource, PublishedIndexState, PublishedIndexStatus, SnapshotVerifyState,
+    };
+    use crate::watcher::{WatcherInfo, WatcherState};
+    use std::time::{Duration, SystemTime};
+
+    let published = PublishedIndexState {
+        generation: 1,
+        status: PublishedIndexStatus::Ready,
+        degraded_summary: None,
+        file_count: 100,
+        parsed_count: 100,
+        partial_parse_count: 0,
+        failed_count: 0,
+        symbol_count: 1000,
+        loaded_at_system: SystemTime::now(),
+        load_duration: Duration::from_millis(500),
+        load_source: IndexLoadSource::FreshLoad,
+        snapshot_verify_state: SnapshotVerifyState::NotNeeded,
+        is_empty: false,
+        partial_parse_files: vec![],
+        failed_files: vec![],
+        tier_counts: (100, 0, 0),
+        local_empty_reason: None,
+    };
+    let watcher = WatcherInfo {
+        state: WatcherState::Active,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        last_overflow_at: None,
+        stale_files_found: 7,
+        last_reconcile_at: Some(SystemTime::now()),
+    };
+    let report = health_report_compact_from_published_state(&published, &watcher);
+    assert!(
+        report.contains("repairs: 7"),
+        "compact idle watcher line must surface reconcile repairs even when no events fired; got:\n{report}"
+    );
+}
+
+#[test]
 fn test_around_match_occurrence_selects_requested_match() {
     let content = b"line one\nTODO first\nline three\nTODO second\nline five";
     let (key, file) = make_file("src/main.rs", content, vec![]);

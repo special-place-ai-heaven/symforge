@@ -1098,7 +1098,11 @@ pub fn health_report_compact_from_published_state(
     use crate::watcher::WatcherState;
 
     let watcher_label = match &watcher.state {
-        WatcherState::Active if watcher.events_processed == 0 && watcher.overflow_count == 0 => {
+        WatcherState::Active
+            if watcher.events_processed == 0
+                && watcher.overflow_count == 0
+                && watcher.stale_files_found == 0 =>
+        {
             "active/idle".to_string()
         }
         WatcherState::Active => format!(
@@ -1160,6 +1164,17 @@ pub fn health_report_from_stats(status: &str, stats: &HealthStats) -> String {
             format!(
                 "Watcher: active (idle; event-driven, waiting for filesystem changes, debounce: {}ms)",
                 stats.debounce_window_ms
+            )
+        }
+        WatcherState::Active
+            if stats.events_processed == 0 && stats.last_event_at.is_none() =>
+        {
+            format!(
+                "Watcher: active (idle; debounce: {}ms, overflows: {}, reconcile repairs: {}, last reconcile: {})",
+                stats.debounce_window_ms,
+                stats.overflow_count,
+                stats.stale_files_found,
+                relative_age(stats.last_reconcile_at)
             )
         }
         WatcherState::Active => format!(
