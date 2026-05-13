@@ -29,7 +29,7 @@ use super::store::SharedIndex;
 /// it into the shared handle. Non-blocking — returns immediately.
 ///
 /// Call after `LiveIndex::load()` or `SharedIndexHandle::reload()` completes.
-pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf) {
+pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf, expected_gen: u64) {
     // Guard: only spawn if a tokio runtime is available (not the case in some sync tests).
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -38,11 +38,19 @@ pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf) {
     // If data is already Ready, keep serving it while we recompute in the background.
     let was_ready = index.git_temporal().state == GitTemporalState::Ready;
 
-    if !was_ready {
-        index.update_git_temporal(GitTemporalIndex {
-            state: GitTemporalState::Computing,
-            ..GitTemporalIndex::pending()
-        });
+    if !was_ready
+        && !index.update_git_temporal_at_generation(
+            GitTemporalIndex {
+                state: GitTemporalState::Computing,
+                ..GitTemporalIndex::pending()
+            },
+            expected_gen,
+        )
+    {
+        tracing::trace!(
+            expected_gen,
+            "stale git temporal computing-state publication skipped"
+        );
     }
 
     tokio::spawn(async move {
@@ -52,20 +60,37 @@ pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf) {
 
         match result {
             Ok(temporal) => {
-                tracing::info!(
-                    files = temporal.files.len(),
-                    commits = temporal.stats.total_commits_analyzed,
-                    duration_ms = temporal.stats.compute_duration.as_millis() as u64,
-                    "git temporal index computed"
-                );
-                index.update_git_temporal(temporal);
+                let files = temporal.files.len();
+                let commits = temporal.stats.total_commits_analyzed;
+                let duration_ms = temporal.stats.compute_duration.as_millis() as u64;
+                if index.update_git_temporal_at_generation(temporal, expected_gen) {
+                    tracing::info!(
+                        files,
+                        commits,
+                        duration_ms,
+                        "git temporal index computed"
+                    );
+                } else {
+                    tracing::trace!(
+                        expected_gen,
+                        files,
+                        commits,
+                        duration_ms,
+                        "stale git temporal publication skipped"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!("git temporal computation panicked: {error}");
                 if !was_ready {
-                    index.update_git_temporal(GitTemporalIndex::unavailable(format!(
-                        "computation panicked: {error}"
-                    )));
+                    let unavailable =
+                        GitTemporalIndex::unavailable(format!("computation panicked: {error}"));
+                    if !index.update_git_temporal_at_generation(unavailable, expected_gen) {
+                        tracing::trace!(
+                            expected_gen,
+                            "stale git temporal panic-state publication skipped"
+                        );
+                    }
                 }
             }
         }

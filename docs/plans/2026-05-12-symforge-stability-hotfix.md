@@ -545,9 +545,13 @@ cargo clippy -- -D warnings
 **Files (allowed):**
 
 - Modify: `src/live_index/store.rs` — add `update_git_temporal_at_generation(index, expected_gen) -> bool` method on `SharedIndexHandle`.
-- Modify: `src/live_index/git_temporal.rs` — `spawn_git_temporal_computation` and any internal publication sites use the fenced API.
+- Modify: `src/live_index/git_temporal.rs` — `spawn_git_temporal_computation` accepts `expected_gen: u64` and consumes the fenced API.
+- Modify: `src/daemon.rs` — call-site updates only at `activate` (line 1064) and `reload` (line 1106). Capture `expected_gen = index.current_project_generation()` immediately after the reload's project_generation bump and pass through. No other daemon.rs changes permitted.
+- Modify: `src/main.rs` — call-site update only at `run_local_mcp_server_async` (line 287). Capture and pass `expected_gen`. No other main.rs changes permitted.
+- Modify: `src/protocol/mod.rs` — call-site update only at `ensure_local_index` (line 362). Capture and pass `expected_gen`. No other protocol/mod.rs changes permitted (do NOT touch `SymForgeServer` struct, `new`, `new_daemon_proxy`, or any other symbol).
+- Modify: `src/protocol/tools.rs` — call-site update only at `index_folder` (line 4524). Capture and pass `expected_gen`. No other tools.rs changes permitted (do NOT touch any other tool handler, freshen helper, or sibling code paths).
 - Create: `tests/git_temporal_generation_fence.rs` — deterministic generation-fence tests for the git_temporal publication path.
-- Forbidden: `src/daemon.rs`, `src/watcher/mod.rs`, `src/protocol/tools.rs`, sidecar files. No caller migration outside the named two source files.
+- Forbidden: `src/watcher/mod.rs`, sidecar files, all other source files. Within the 4 caller-files-with-extended-access, the ONLY permitted change is the single-line `expected_gen` capture + pass-through at the named call site; treat the rest of each file as forbidden.
 
 **Context:** `ProjectInstance::reload` (`src/daemon.rs:1101-1104`) calls `spawn_git_temporal_computation` after `index.reload` completes. The git_temporal computation is async + long-running (git log/diff walks) and publishes results via `SharedIndexHandle::update_git_temporal` at `src/live_index/store.rs:680-682`, which is a single atomic `ArcSwap::store`. A doomed computation that started under root A continues running after `ProjectInstance::reload` swaps in root B, then publishes A's temporal data into B's `SharedIndexHandle::git_temporal` field. Result: temporal data is stale-for-wrong-root for one update cycle until the new computation publishes. Affects: `analyze_file_impact` churn scores, `search_files(rank_by="path+cochange")` (Phase 3), `health` git-temporal output.
 

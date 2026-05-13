@@ -1062,9 +1062,11 @@ impl ProjectInstance {
         );
 
         // Kick off background git temporal analysis (non-blocking).
+        let expected_gen = self.index.current_project_generation();
         live_index::git_temporal::spawn_git_temporal_computation(
             Arc::clone(&self.index),
             self.canonical_root.clone(),
+            expected_gen,
         );
 
         self.activation_state = ActivationState::Active;
@@ -1104,9 +1106,11 @@ impl ProjectInstance {
         );
 
         // Refresh git temporal data after reload.
+        let expected_gen = self.index.current_project_generation();
         live_index::git_temporal::spawn_git_temporal_computation(
             Arc::clone(&self.index),
             canonical_root.to_path_buf(),
+            expected_gen,
         );
 
         Ok((file_count, symbol_count))

@@ -285,7 +285,12 @@ async fn run_local_mcp_server_async(
 
     // Kick off background git temporal analysis (non-blocking).
     if let Some(ref root) = watcher_root {
-        live_index::git_temporal::spawn_git_temporal_computation(Arc::clone(&index), root.clone());
+        let expected_gen = index.current_project_generation();
+        live_index::git_temporal::spawn_git_temporal_computation(
+            Arc::clone(&index),
+            root.clone(),
+            expected_gen,
+        );
     }
 
     // Spawn HTTP sidecar after watcher, before MCP serve.

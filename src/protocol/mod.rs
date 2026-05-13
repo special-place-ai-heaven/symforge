@@ -360,9 +360,11 @@ impl SymForgeServer {
 
                     // Spawn git temporal computation so co-change queries work
                     // after daemon degradation (mirrors index_folder behaviour).
+                    let expected_gen = self.index.current_project_generation();
                     crate::live_index::git_temporal::spawn_git_temporal_computation(
                         Arc::clone(&self.index),
                         root,
+                        expected_gen,
                     );
                 }
                 Err(error) => {

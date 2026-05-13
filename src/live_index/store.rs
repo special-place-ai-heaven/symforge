@@ -834,6 +834,28 @@ impl SharedIndexHandle {
         self.git_temporal.store(Arc::new(index));
     }
 
+    pub fn update_git_temporal_at_generation(
+        &self,
+        index: super::git_temporal::GitTemporalIndex,
+        expected_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                expected_gen,
+                current_gen,
+                "rejecting stale git temporal publication"
+            );
+            return false;
+        }
+
+        self.git_temporal.store(Arc::new(index));
+        true
+    }
+
     /// Set the empty-index reason on the live LiveIndex. Used by the startup
     /// LocalEmpty branch so `health` can surface why the index is empty.
     pub fn set_local_empty_reason(&self, reason: Option<String>) {

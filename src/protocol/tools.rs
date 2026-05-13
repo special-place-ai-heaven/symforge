@@ -4522,9 +4522,11 @@ impl SymForgeServer {
                 tracing::info!(root = %root.display(), "file watcher restarted after index_folder");
 
                 // Refresh git temporal data for the new root.
+                let expected_gen = self.index.current_project_generation();
                 crate::live_index::git_temporal::spawn_git_temporal_computation(
                     Arc::clone(&self.index),
                     root,
+                    expected_gen,
                 );
 
                 let output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
