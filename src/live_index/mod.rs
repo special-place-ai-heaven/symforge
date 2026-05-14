@@ -2,6 +2,7 @@ pub mod coupling;
 pub mod frecency;
 pub mod git_temporal;
 pub mod persist;
+pub(crate) mod qualified_usages;
 pub mod query;
 pub mod rank_signals;
 pub mod search;

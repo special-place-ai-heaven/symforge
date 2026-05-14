@@ -209,9 +209,11 @@ where
     }
 }
 
-use crate::domain::LanguageId;
+use crate::domain::{LanguageId, ReferenceKind};
+use crate::live_index::qualified_usages::{self, QualifiedUsage};
 use crate::live_index::{
-    IndexedFile, SearchFilesHit, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
+    FindReferencesView, IndexedFile, ReferenceContextLineView, ReferenceFileView, ReferenceHitView,
+    SearchFilesHit, SearchFilesResolveView, SearchFilesTier, SearchFilesView, search,
     store::{IndexState, LiveIndex},
 };
 use crate::protocol::edit;
@@ -2125,6 +2127,92 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
         .take(3)
         .collect();
     anchored_search_evidence(anchors, "reference anchors")
+}
+
+fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
+    match kind_filter {
+        Some("call") => Some(ReferenceKind::Call),
+        Some("import") => Some(ReferenceKind::Import),
+        Some("type_usage") => Some(ReferenceKind::TypeUsage),
+        Some("macro_use") => Some(ReferenceKind::MacroUse),
+        Some("all") | None => None,
+        _ => None,
+    }
+}
+
+fn should_collect_qualified_usages(input: &FindReferencesInput) -> bool {
+    input.path.is_none()
+        && !input.name.is_empty()
+        && matches!(
+            input.kind.as_deref(),
+            None | Some("all") | Some("type_usage")
+        )
+}
+
+fn qualified_usage_hit_view(usage: &QualifiedUsage) -> ReferenceHitView {
+    let confidence = if usage.confident {
+        "confident"
+    } else {
+        "uncertain"
+    };
+    let annotation = format!("[qualified-path scan: {confidence}]");
+
+    ReferenceHitView {
+        context_lines: vec![ReferenceContextLineView {
+            line_number: usage.line,
+            text: usage.line_text.clone(),
+            is_reference_line: true,
+            enclosing_annotation: Some(annotation),
+        }],
+    }
+}
+
+fn merge_qualified_usages_into_view(
+    view: &mut FindReferencesView,
+    mut usages: Vec<QualifiedUsage>,
+    mut seen_ranges: HashSet<(String, (u32, u32))>,
+) {
+    let mut known_files: HashSet<String> = seen_ranges
+        .iter()
+        .map(|(file_path, _)| file_path.clone())
+        .collect();
+    known_files.extend(view.files.iter().map(|file| file.file_path.clone()));
+
+    usages.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.line.cmp(&b.line))
+            .then(a.byte_range.0.cmp(&b.byte_range.0))
+    });
+
+    let mut added = 0usize;
+    for usage in usages {
+        let range_key = (usage.file_path.clone(), usage.byte_range);
+        if !seen_ranges.insert(range_key) {
+            continue;
+        }
+        let hit = qualified_usage_hit_view(&usage);
+        if let Some(file_view) = view
+            .files
+            .iter_mut()
+            .find(|file| file.file_path == usage.file_path)
+        {
+            file_view.hits.push(hit);
+        } else {
+            view.files.push(ReferenceFileView {
+                file_path: usage.file_path.clone(),
+                hits: vec![hit],
+            });
+        }
+        known_files.insert(usage.file_path);
+        added += 1;
+    }
+
+    if added > 0 {
+        view.total_refs += added;
+        view.total_files = known_files.len();
+        view.files.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+    }
 }
 
 fn implementations_parse_state_for_paths(
@@ -5080,28 +5168,59 @@ impl SymForgeServer {
 
         let limits =
             format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
-        let result = {
+        let collect_qualified_usages = should_collect_qualified_usages(input);
+        let (result, indexed_ranges, qualified_usages) = {
             let guard = self.index.read();
             loading_guard!(guard);
             if let Some(path) = input.path.as_deref() {
-                guard.capture_find_references_view_for_symbol(
-                    path,
-                    &input.name,
-                    input.symbol_kind.as_deref(),
-                    input.symbol_line,
-                    input.kind.as_deref(),
-                    limits.total_hits,
+                (
+                    guard.capture_find_references_view_for_symbol(
+                        path,
+                        &input.name,
+                        input.symbol_kind.as_deref(),
+                        input.symbol_line,
+                        input.kind.as_deref(),
+                        limits.total_hits,
+                    ),
+                    HashSet::new(),
+                    Vec::new(),
                 )
             } else {
-                Ok(guard.capture_find_references_view(
-                    &input.name,
-                    input.kind.as_deref(),
-                    limits.total_hits,
-                ))
+                let kind_filter = find_references_kind_filter(input.kind.as_deref());
+                let refs = guard.find_references_for_name(&input.name, kind_filter, false);
+                let indexed_ranges = refs
+                    .iter()
+                    .map(|(file_path, reference)| ((*file_path).to_string(), reference.byte_range))
+                    .collect();
+                let qualified_usages = if collect_qualified_usages {
+                    let files = guard.files.iter().filter_map(|(path, file)| {
+                        (file.language == LanguageId::Rust).then_some(
+                            qualified_usages::QualifiedFileContent {
+                                file_path: path.as_str(),
+                                content: file.content.as_slice(),
+                            },
+                        )
+                    });
+                    qualified_usages::collect_qualified_usages(&input.name, files)
+                } else {
+                    Vec::new()
+                };
+                (
+                    Ok(guard.capture_find_references_view(
+                        &input.name,
+                        input.kind.as_deref(),
+                        limits.total_hits,
+                    )),
+                    indexed_ranges,
+                    qualified_usages,
+                )
             }
         };
         match result {
-            Ok(view) => {
+            Ok(mut view) => {
+                if collect_qualified_usages {
+                    merge_qualified_usages_into_view(&mut view, qualified_usages, indexed_ranges);
+                }
                 let envelope = if !view.files.is_empty() {
                     let guard = self.index.read();
                     Some(search_format::format_search_envelope(
@@ -7632,6 +7751,8 @@ impl SymForgeServer {
 
 #[cfg(test)]
 mod tests {
+    mod find_references;
+
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;

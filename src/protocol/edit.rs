@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::index::{LanguageId, SymbolKind, SymbolRecord};
 use crate::live_index::SharedIndex;
+use crate::live_index::qualified_usages;
 use crate::live_index::query::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
@@ -1588,20 +1589,18 @@ pub(crate) fn execute_batch_rename(
     // Uncertain entries also carry the display context string for the warning block.
     let mut qualified_uncertain: Vec<(String, u32, String)> = Vec::new(); // (path, line, context)
 
-    for (file_path, content_bytes) in &file_contents {
-        let source = match std::str::from_utf8(content_bytes) {
-            Ok(s) => s,
-            Err(_) => continue, // skip non-UTF-8 files
-        };
-        let matches = find_qualified_usages(&input.name, source);
-        for m in matches {
-            let end = m.offset + input.name.len();
-            let range = (m.offset as u32, end as u32);
-            if m.confident {
-                qualified_confident.push((file_path.clone(), range));
-            } else {
-                qualified_uncertain.push((file_path.clone(), m.line as u32, m.context.clone()));
-            }
+    let qualified_inputs =
+        file_contents
+            .iter()
+            .map(|(path, content)| qualified_usages::QualifiedFileContent {
+                file_path: path.as_str(),
+                content: content.as_slice(),
+            });
+    for usage in qualified_usages::collect_qualified_usages(&input.name, qualified_inputs) {
+        if usage.confident {
+            qualified_confident.push((usage.file_path, usage.byte_range));
+        } else {
+            qualified_uncertain.push((usage.file_path, usage.line, usage.context));
         }
     }
 
@@ -2352,276 +2351,6 @@ pub(crate) fn detect_stale_references(
 }
 
 // ---------------------------------------------------------------------------
-// Qualified path scanner
-// ---------------------------------------------------------------------------
-
-/// A qualified path match with confidence classification.
-#[derive(Debug)]
-pub struct QualifiedMatch {
-    /// Byte offset of the match in the source.
-    pub offset: usize,
-    /// Line number (1-based).
-    pub line: usize,
-    /// The full matched segment (e.g., "MyType::new()").
-    pub context: String,
-    /// Whether the match is confident (code context) or uncertain (string/comment).
-    pub confident: bool,
-}
-
-/// Find qualified path usages of `identifier` in `source`.
-///
-/// Looks for patterns where the identifier appears as a path segment:
-/// - `identifier::method()` — associated function call
-/// - `module::identifier::method()` — deeper nesting
-/// - `use path::identifier` — import path
-/// - `identifier::<T>::method()` — turbofish syntax
-///
-/// Classifies matches as confident (in code) vs uncertain (in strings/comments).
-pub fn find_qualified_usages(identifier: &str, source: &str) -> Vec<QualifiedMatch> {
-    let mut results = Vec::new();
-
-    // Track block comment nesting depth across the whole source.
-    // We scan line by line but need to carry block-comment state.
-    let mut in_block_comment = false;
-    // Track raw string state: None = not in raw string, Some(n) = in raw string with n #s.
-    let mut in_raw_string: Option<usize> = None;
-
-    let mut line_byte_offset = 0usize;
-
-    for (line_num, line) in source.split('\n').enumerate() {
-        let line_num = line_num + 1;
-        // Scan this line for occurrences of `identifier`, updating parse state.
-        let line_bytes = line.as_bytes();
-        let id_len = identifier.len();
-
-        // We walk through the line character by character to find all occurrences
-        // of `identifier` and classify each.
-        let mut col = 0usize; // byte index within line
-
-        while col < line_bytes.len() {
-            // Skip byte positions inside multi-byte UTF-8 sequences.
-            // Identifiers and `::` are ASCII, so no match can start mid-character.
-            if !line.is_char_boundary(col) {
-                col += 1;
-                continue;
-            }
-
-            // --- Update parse state at current col ---
-
-            // Check for raw string start: r" or r#..."#
-            if !in_block_comment && in_raw_string.is_none() && line_bytes[col] == b'r' {
-                // Count leading #s
-                let mut hashes = 0usize;
-                let mut j = col + 1;
-                while j < line_bytes.len() && line_bytes[j] == b'#' {
-                    hashes += 1;
-                    j += 1;
-                }
-                if j < line_bytes.len() && line_bytes[j] == b'"' {
-                    in_raw_string = Some(hashes);
-                    col = j + 1;
-                    continue;
-                }
-            }
-
-            // Check for raw string end or matches inside raw string (uncertain)
-            if let Some(hashes) = in_raw_string {
-                if line_bytes[col] == b'"' {
-                    // Check for matching #s after closing quote
-                    let mut j = col + 1;
-                    let mut count = 0usize;
-                    while j < line_bytes.len() && line_bytes[j] == b'#' && count < hashes {
-                        count += 1;
-                        j += 1;
-                    }
-                    if count == hashes {
-                        in_raw_string = None;
-                        col = j;
-                        continue;
-                    }
-                }
-                // Inside raw string — check for identifier match (uncertain)
-                if col + id_len <= line_bytes.len()
-                    && line.is_char_boundary(col + id_len)
-                    && &line[col..col + id_len] == identifier
-                {
-                    let preceded = col >= 2 && &line[col - 2..col] == "::";
-                    let followed = col + id_len + 2 <= line.len()
-                        && line.is_char_boundary(col + id_len + 2)
-                        && &line[col + id_len..col + id_len + 2] == "::";
-                    if preceded || followed {
-                        let ctx_start = line.floor_char_boundary(col.saturating_sub(20));
-                        let ctx_end = line.ceil_char_boundary((col + id_len + 20).min(line.len()));
-                        results.push(QualifiedMatch {
-                            offset: line_byte_offset + col,
-                            line: line_num,
-                            context: line[ctx_start..ctx_end].to_string(),
-                            confident: false,
-                        });
-                    }
-                }
-                col += 1;
-                continue;
-            }
-
-            // Check for block comment start/end
-            if !in_block_comment {
-                // Check for line comment: rest of line is a comment — scan for matches then break
-                if col + 1 < line_bytes.len()
-                    && line_bytes[col] == b'/'
-                    && line_bytes[col + 1] == b'/'
-                {
-                    // Everything from here to end of line is a line comment (uncertain)
-                    let rest = &line[col..];
-                    let mut search_start = 0usize;
-                    while let Some(pos) = rest[search_start..].find(identifier) {
-                        let abs_col = col + search_start + pos;
-                        // Guard against non-char-boundary slices from multi-byte UTF-8
-                        if !line.is_char_boundary(abs_col) {
-                            search_start += pos + 1;
-                            continue;
-                        }
-                        let preceded = abs_col >= 2
-                            && line.is_char_boundary(abs_col - 2)
-                            && &line[abs_col - 2..abs_col] == "::";
-                        let followed = abs_col + id_len + 2 <= line.len()
-                            && line.is_char_boundary(abs_col + id_len)
-                            && line.is_char_boundary(abs_col + id_len + 2)
-                            && &line[abs_col + id_len..abs_col + id_len + 2] == "::";
-                        if preceded || followed {
-                            let ctx_start = line.floor_char_boundary(abs_col.saturating_sub(20));
-                            let ctx_end =
-                                line.ceil_char_boundary((abs_col + id_len + 20).min(line.len()));
-                            results.push(QualifiedMatch {
-                                offset: line_byte_offset + abs_col,
-                                line: line_num,
-                                context: line[ctx_start..ctx_end].to_string(),
-                                confident: false,
-                            });
-                        }
-                        search_start += pos + 1;
-                    }
-                    break; // rest of line consumed
-                }
-
-                // Block comment start
-                if col + 1 < line_bytes.len()
-                    && line_bytes[col] == b'/'
-                    && line_bytes[col + 1] == b'*'
-                {
-                    in_block_comment = true;
-                    col += 2;
-                    continue;
-                }
-            } else {
-                // Inside block comment — look for end
-                if col + 1 < line_bytes.len()
-                    && line_bytes[col] == b'*'
-                    && line_bytes[col + 1] == b'/'
-                {
-                    in_block_comment = false;
-                    col += 2;
-                    continue;
-                }
-                // Still in block comment — check for identifier match (uncertain)
-                if col + id_len <= line_bytes.len()
-                    && line.is_char_boundary(col + id_len)
-                    && &line[col..col + id_len] == identifier
-                {
-                    let prec2 = col >= 2 && &line[col - 2..col] == "::";
-                    let fol2 = col + id_len + 2 <= line.len()
-                        && line.is_char_boundary(col + id_len + 2)
-                        && &line[col + id_len..col + id_len + 2] == "::";
-                    if prec2 || fol2 {
-                        let ctx_start = line.floor_char_boundary(col.saturating_sub(20));
-                        let ctx_end = line.ceil_char_boundary((col + id_len + 20).min(line.len()));
-                        results.push(QualifiedMatch {
-                            offset: line_byte_offset + col,
-                            line: line_num,
-                            context: line[ctx_start..ctx_end].to_string(),
-                            confident: false,
-                        });
-                    }
-                }
-                col += 1;
-                continue;
-            }
-
-            // Normal code: check for string literal (double-quote)
-            if line_bytes[col] == b'"' {
-                // Scan to closing quote (handling backslash escapes), emit uncertain matches
-                col += 1;
-                while col < line_bytes.len() && line_bytes[col] != b'"' {
-                    if line_bytes[col] == b'\\' {
-                        col += 2; // skip escaped char
-                        continue;
-                    }
-                    // Skip non-char-boundary bytes inside string
-                    if !line.is_char_boundary(col) {
-                        col += 1;
-                        continue;
-                    }
-                    // Check for identifier match inside string
-                    if col + id_len <= line_bytes.len()
-                        && line.is_char_boundary(col + id_len)
-                        && &line[col..col + id_len] == identifier
-                    {
-                        let prec2 = col >= 2 && &line[col - 2..col] == "::";
-                        let fol2 = col + id_len + 2 <= line.len()
-                            && line.is_char_boundary(col + id_len + 2)
-                            && &line[col + id_len..col + id_len + 2] == "::";
-                        if prec2 || fol2 {
-                            let ctx_start = line.floor_char_boundary(col.saturating_sub(20));
-                            let ctx_end =
-                                line.ceil_char_boundary((col + id_len + 20).min(line.len()));
-                            results.push(QualifiedMatch {
-                                offset: line_byte_offset + col,
-                                line: line_num,
-                                context: line[ctx_start..ctx_end].to_string(),
-                                confident: false,
-                            });
-                        }
-                    }
-                    col += 1;
-                }
-                col += 1; // skip closing quote
-                continue;
-            }
-
-            // Normal code: check for identifier match
-            if col + id_len <= line_bytes.len()
-                && line.is_char_boundary(col + id_len)
-                && &line[col..col + id_len] == identifier
-            {
-                let prec2 = col >= 2 && &line[col - 2..col] == "::";
-                let fol2 = col + id_len + 2 <= line.len()
-                    && line.is_char_boundary(col + id_len + 2)
-                    && &line[col + id_len..col + id_len + 2] == "::";
-                if prec2 || fol2 {
-                    let ctx_start = line.floor_char_boundary(col.saturating_sub(20));
-                    let ctx_end = line.ceil_char_boundary((col + id_len + 20).min(line.len()));
-                    results.push(QualifiedMatch {
-                        offset: line_byte_offset + col,
-                        line: line_num,
-                        context: line[ctx_start..ctx_end].to_string(),
-                        confident: true,
-                    });
-                }
-                col += id_len;
-                continue;
-            }
-
-            col += 1;
-        }
-
-        // +1 for the '\n' that split() consumed
-        line_byte_offset += line.len() + 1;
-    }
-
-    results
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2629,6 +2358,7 @@ pub fn find_qualified_usages(identifier: &str, source: &str) -> Vec<QualifiedMat
 mod tests {
     use super::*;
     use crate::domain::index::SymbolKind;
+    use crate::live_index::qualified_usages::find_qualified_usages;
 
     // -- apply_splice --
 
