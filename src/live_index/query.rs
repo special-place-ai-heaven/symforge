@@ -2757,6 +2757,19 @@ impl LiveIndex {
                         reference.kind != ReferenceKind::Import
                             && target_symbol_names.contains(reference.name.as_str())
                             && Self::has_pub_symbol(target_file, &reference.name)
+                            && (reference.kind == ReferenceKind::TypeUsage
+                                || (reference.kind == ReferenceKind::Call
+                                    && (reference.qualified_name.as_deref().is_some_and(|qn| {
+                                        matches_exact_symbol_qualified_name(
+                                            &target_language,
+                                            qn,
+                                            &reference.name,
+                                            module_path.as_deref(),
+                                        )
+                                    }) || (reference.qualified_name.is_none()
+                                        && matching_imports
+                                            .iter()
+                                            .any(|import| import.name == reference.name)))))
                     })
                     .collect();
 
@@ -3804,10 +3817,16 @@ mod tests {
         let importer = make_file_with_refs_and_content(
             "src/app.rs",
             LanguageId::Rust,
-            "use crate::db;\nfn run() { connect(); }\n",
+            "use crate::db;\nfn run() { db::connect(); }\n",
             vec![
                 make_ref("db", Some("crate::db"), ReferenceKind::Import, None, 0),
-                make_ref("connect", None, ReferenceKind::Call, Some(0), 100),
+                make_ref(
+                    "connect",
+                    Some("db::connect"),
+                    ReferenceKind::Call,
+                    Some(0),
+                    100,
+                ),
             ],
             vec![SymbolRecord {
                 name: "run".to_string(),
