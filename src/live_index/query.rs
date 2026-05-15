@@ -368,7 +368,9 @@ fn matches_exact_symbol_reference(
     reference: &ReferenceRecord,
     target_name: &str,
     target_language: &LanguageId,
+    target_kind: SymbolKind,
     module_path: Option<&str>,
+    reference_file: Option<&IndexedFile>,
     kind_filter: Option<ReferenceKind>,
 ) -> bool {
     if let Some(kind_filter) = kind_filter
@@ -377,19 +379,53 @@ fn matches_exact_symbol_reference(
         return false;
     }
 
-    reference.name == target_name
-        || reference
-            .qualified_name
-            .as_deref()
-            .map(|qualified_name| {
-                matches_exact_symbol_qualified_name(
-                    target_language,
-                    qualified_name,
-                    target_name,
-                    module_path,
-                )
-            })
-            .unwrap_or(false)
+    if reference
+        .qualified_name
+        .as_deref()
+        .is_some_and(|qualified_name| {
+            matches_exact_symbol_qualified_name(
+                target_language,
+                qualified_name,
+                target_name,
+                module_path,
+            )
+        })
+    {
+        return true;
+    }
+
+    if reference.name != target_name {
+        return false;
+    }
+
+    if target_kind == SymbolKind::Function && *target_language == LanguageId::Rust {
+        if reference.qualified_name.is_some() {
+            return false;
+        }
+        if is_rust_receiver_method_call(reference_file, reference) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_rust_receiver_method_call(
+    reference_file: Option<&IndexedFile>,
+    reference: &ReferenceRecord,
+) -> bool {
+    if reference.kind != ReferenceKind::Call {
+        return false;
+    }
+    let Some(file) = reference_file else {
+        return false;
+    };
+    if file.language != LanguageId::Rust {
+        return false;
+    }
+
+    let start = reference.byte_range.0 as usize;
+    start > 0 && file.content.get(start - 1) == Some(&b'.')
 }
 
 pub(crate) enum SymbolSelectorMatch<'a> {
@@ -1783,8 +1819,8 @@ impl LiveIndex {
                     "Ambiguous symbol selector for {name} in {path}; pass `symbol_line` to disambiguate. Candidates: {candidate_lines}"
                 ))
             }
-            SymbolSelectorMatch::Selected(_, _) => {
-                Ok(self.collect_exact_symbol_references(path, file, name, kind_filter))
+            SymbolSelectorMatch::Selected(_, symbol) => {
+                Ok(self.collect_exact_symbol_references(path, file, symbol, kind_filter))
             }
         }
     }
@@ -1793,9 +1829,10 @@ impl LiveIndex {
         &'a self,
         path: &'a str,
         file: &'a IndexedFile,
-        target_name: &str,
+        target_symbol: &'a SymbolRecord,
         kind_filter: Option<ReferenceKind>,
     ) -> Vec<(&'a str, &'a ReferenceRecord)> {
+        let target_name = target_symbol.name.as_str();
         let module_path = resolve_module_path(path, &file.language);
         let mut refs: Vec<(&str, &ReferenceRecord)> = file
             .references
@@ -1805,7 +1842,9 @@ impl LiveIndex {
                     reference,
                     target_name,
                     &file.language,
+                    target_symbol.kind,
                     module_path.as_deref(),
+                    Some(file),
                     kind_filter,
                 )
             })
@@ -1815,19 +1854,18 @@ impl LiveIndex {
         let dependent_refs = self.find_dependents_for_file(path);
         let dependent_paths: HashSet<&str> = dependent_refs.iter().map(|(fp, _)| *fp).collect();
 
-        refs.extend(
-            dependent_refs
-                .into_iter()
-                .filter(|(_file_path, reference)| {
-                    matches_exact_symbol_reference(
-                        reference,
-                        target_name,
-                        &file.language,
-                        module_path.as_deref(),
-                        kind_filter,
-                    )
-                }),
-        );
+        refs.extend(dependent_refs.into_iter().filter(|(file_path, reference)| {
+            let reference_file = self.get_file(file_path);
+            matches_exact_symbol_reference(
+                reference,
+                target_name,
+                &file.language,
+                target_symbol.kind,
+                module_path.as_deref(),
+                reference_file,
+                kind_filter,
+            )
+        }));
 
         // Also check the reverse index for the target name.
         for (ref_path, ref_record) in self.find_references_for_name(target_name, kind_filter, false)
@@ -1840,6 +1878,20 @@ impl LiveIndex {
                 .iter()
                 .any(|(p, r)| *p == ref_path && r.byte_range == ref_record.byte_range)
             {
+                continue;
+            }
+
+            let reference_matches = matches_exact_symbol_reference(
+                ref_record,
+                target_name,
+                &file.language,
+                target_symbol.kind,
+                module_path.as_deref(),
+                self.get_file(ref_path),
+                kind_filter,
+            );
+
+            if !reference_matches {
                 continue;
             }
 
@@ -2097,12 +2149,16 @@ impl LiveIndex {
             };
 
         let callers =
-            self.collect_exact_symbol_references(path, file, name, Some(ReferenceKind::Call));
+            self.collect_exact_symbol_references(path, file, sym_rec, Some(ReferenceKind::Call));
         let callees = self.callees_for_symbol(path, sym_idx);
         let callee_pairs: Vec<(&str, &ReferenceRecord)> =
             callees.iter().map(|reference| (path, *reference)).collect();
-        let type_usages =
-            self.collect_exact_symbol_references(path, file, name, Some(ReferenceKind::TypeUsage));
+        let type_usages = self.collect_exact_symbol_references(
+            path,
+            file,
+            sym_rec,
+            Some(ReferenceKind::TypeUsage),
+        );
 
         // Resolve type dependencies: collect type names referenced within this symbol,
         // then find their definitions across the index (recursive, depth-limited to 2).
@@ -6410,7 +6466,7 @@ public class PacketsController {
         let refs = index.collect_exact_symbol_references(
             "src/engine.rs",
             target,
-            "optimize_deterministic",
+            &target.symbols[0],
             None,
         );
 
