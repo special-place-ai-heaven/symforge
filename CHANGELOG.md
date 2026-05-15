@@ -1,5 +1,28 @@
 # Changelog
 
+## [7.8.0](https://github.com/special-place-administrator/symforge/compare/v7.7.0...v7.8.0) (2026-05-15)
+
+
+### Features
+
+* **context:** enforce render budget and collapse test modules for H.6 ([e691f10](https://github.com/special-place-administrator/symforge/commit/e691f106bff565530f5ae45e68dc543f1289914a))
+* **coupling:** H.1f pre-flight generation fence for refresh_on_reconcile_tick ([b0f202b](https://github.com/special-place-administrator/symforge/commit/b0f202b7c53f7c490608f23f6c9c717c65f46c3b))
+* **daemon, watcher:** cooperative cancellation token for watcher reload paths ([4fa5a97](https://github.com/special-place-administrator/symforge/commit/4fa5a9767792de2fcee080c1197fb95961016c81))
+* **find_references:** qualified-path coverage via shared collector for H.5 ([42c8e16](https://github.com/special-place-administrator/symforge/commit/42c8e16b9bbe98e5addf902df0ed0f9698c9666b))
+* **live-index:** add project-generation fence for SharedIndexHandle mutations ([9325fd1](https://github.com/special-place-administrator/symforge/commit/9325fd178d35bcf5fb160c0bb8873428c729ddc0))
+* **temporal:** H.1e generation fence for git_temporal publication ([a2d81bc](https://github.com/special-place-administrator/symforge/commit/a2d81bc63d098694dde95ba0a7bb858086cffb37))
+* **watcher:** close H.1d sibling leak surfaces ([8007a2d](https://github.com/special-place-administrator/symforge/commit/8007a2d20046b775cf39719e6952d49d1e876f84))
+* **watcher:** generation-fence migration + Layer 3 bounded-backoff retry ([3d225be](https://github.com/special-place-administrator/symforge/commit/3d225bef7b41788bac57f4f3a8e93433bee9e197))
+
+
+### Bug Fixes
+
+* **find_dependents:** tighten Pass 2 collision filter for H.4 ([251d7f0](https://github.com/special-place-administrator/symforge/commit/251d7f04b20559c7c8a3afff41c1859e0836b99c))
+* **health:** unify health source-of-truth across full and compact paths for H.2 ([be509a7](https://github.com/special-place-administrator/symforge/commit/be509a78ea0cb6a39bec59e15cd6ffb7097b9fbc))
+* **qualified_usages:** guard prec2 byte-slice with is_char_boundary ([f5de473](https://github.com/special-place-administrator/symforge/commit/f5de473d7cca5507d1525e263551c8db27b0dbc2))
+* **search_text:** emit `structural (ast-grep)` envelope label for B-P1-7 ([4d939f1](https://github.com/special-place-administrator/symforge/commit/4d939f142bb95e51605b4767a8feb728d0dce80e))
+* **search_text:** resolve innermost enclosing symbol as structural label ([71feb4f](https://github.com/special-place-administrator/symforge/commit/71feb4f009a8aaf42c7578328ca478293ebd4236))
+
 ## [7.7.0](https://github.com/special-place-administrator/symforge/compare/v7.6.2...v7.7.0) (2026-05-11)
 
 
