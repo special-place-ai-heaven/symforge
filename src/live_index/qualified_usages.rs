@@ -161,7 +161,8 @@ pub(crate) fn find_qualified_usages(identifier: &str, source: &str) -> Vec<Quali
                     && line.is_char_boundary(col + id_len)
                     && &line[col..col + id_len] == identifier
                 {
-                    let preceded = col >= 2 && &line[col - 2..col] == "::";
+                    let preceded =
+                        col >= 2 && line.is_char_boundary(col - 2) && &line[col - 2..col] == "::";
                     let followed = col + id_len + 2 <= line.len()
                         && line.is_char_boundary(col + id_len + 2)
                         && &line[col + id_len..col + id_len + 2] == "::";
@@ -239,7 +240,8 @@ pub(crate) fn find_qualified_usages(identifier: &str, source: &str) -> Vec<Quali
                     && line.is_char_boundary(col + id_len)
                     && &line[col..col + id_len] == identifier
                 {
-                    let prec2 = col >= 2 && &line[col - 2..col] == "::";
+                    let prec2 =
+                        col >= 2 && line.is_char_boundary(col - 2) && &line[col - 2..col] == "::";
                     let fol2 = col + id_len + 2 <= line.len()
                         && line.is_char_boundary(col + id_len + 2)
                         && &line[col + id_len..col + id_len + 2] == "::";
@@ -274,7 +276,9 @@ pub(crate) fn find_qualified_usages(identifier: &str, source: &str) -> Vec<Quali
                         && line.is_char_boundary(col + id_len)
                         && &line[col..col + id_len] == identifier
                     {
-                        let prec2 = col >= 2 && &line[col - 2..col] == "::";
+                        let prec2 = col >= 2
+                            && line.is_char_boundary(col - 2)
+                            && &line[col - 2..col] == "::";
                         let fol2 = col + id_len + 2 <= line.len()
                             && line.is_char_boundary(col + id_len + 2)
                             && &line[col + id_len..col + id_len + 2] == "::";
@@ -301,7 +305,8 @@ pub(crate) fn find_qualified_usages(identifier: &str, source: &str) -> Vec<Quali
                 && line.is_char_boundary(col + id_len)
                 && &line[col..col + id_len] == identifier
             {
-                let prec2 = col >= 2 && &line[col - 2..col] == "::";
+                let prec2 =
+                    col >= 2 && line.is_char_boundary(col - 2) && &line[col - 2..col] == "::";
                 let fol2 = col + id_len + 2 <= line.len()
                     && line.is_char_boundary(col + id_len + 2)
                     && &line[col + id_len..col + id_len + 2] == "::";
@@ -327,4 +332,48 @@ pub(crate) fn find_qualified_usages(identifier: &str, source: &str) -> Vec<Quali
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn em_dash_before_qualified_path_in_code_does_not_panic() {
+        // The em-dash `—` is 3 UTF-8 bytes. Without a char-boundary guard
+        // on the prec2 `&line[col - 2..col]` slice, scanning a line where
+        // an identifier match begins shortly after a multi-byte char can
+        // panic with "byte index N is not a char boundary".
+        let source = "— foo::bar\n";
+        let _ = find_qualified_usages("foo", source);
+        let _ = find_qualified_usages("bar", source);
+    }
+
+    #[test]
+    fn em_dash_before_qualified_path_in_line_comment_does_not_panic() {
+        let source = "// — foo::bar comment\nfn main() {}\n";
+        let _ = find_qualified_usages("foo", source);
+    }
+
+    #[test]
+    fn em_dash_before_qualified_path_in_block_comment_does_not_panic() {
+        let source = "/* — foo::bar */\n";
+        let _ = find_qualified_usages("foo", source);
+    }
+
+    #[test]
+    fn em_dash_before_qualified_path_in_string_does_not_panic() {
+        let source = "let x = \"— foo::bar\";\n";
+        let _ = find_qualified_usages("foo", source);
+    }
+
+    #[test]
+    fn plan_doc_em_dash_pattern_does_not_panic() {
+        // CI-failure repro: plan-doc bullet with em-dash before `health`.
+        // qualified_usages is a byte scan over every UTF-8 file in the
+        // workspace, including Markdown plan-docs, so the panic surfaced
+        // when batch_rename indirectly scanned a plan-doc.
+        let source = "5. **H.2** — health source-of-truth unification\n";
+        let _ = find_qualified_usages("health", source);
+    }
 }
