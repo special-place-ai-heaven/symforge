@@ -1,5 +1,23 @@
 # Changelog
 
+## [7.7.0](https://github.com/special-place-administrator/symforge/compare/v7.6.2...v7.7.0) (2026-05-11)
+
+
+### Features
+
+* **explore:** append rank-signal footer documenting score composition ([d9eecb5](https://github.com/special-place-administrator/symforge/commit/d9eecb53809adbe8035948cd73034b352f666110))
+* **health:** surface empty-index reason as actionable banner ([9100d8b](https://github.com/special-place-administrator/symforge/commit/9100d8b77ccd48a77a31d9b734ece9d831af9c41))
+* **health:** surface reconcile repairs on idle watcher line ([34e97fb](https://github.com/special-place-administrator/symforge/commit/34e97fb2caa766b29d5bf13f48af442431f39b0c))
+* **query:** add vendor and personal-tooling path predicates ([e8fe429](https://github.com/special-place-administrator/symforge/commit/e8fe4299fbb7ab16fa2a11976cbcde73ad2edfa7))
+* **search:** default-exclude vendor and personal-tooling paths ([f804d21](https://github.com/special-place-administrator/symforge/commit/f804d214636b305c19876b9dea669a8e5d6b003b))
+
+
+### Bug Fixes
+
+* **discovery:** allow projects named tmp/var/home not under filesystem root ([5af8ccc](https://github.com/special-place-administrator/symforge/commit/5af8ccc1519bf77186966eeb8b5c211def5a08af))
+* **frecency:** defer DB open from boot to first commitment bump ([0f2b723](https://github.com/special-place-administrator/symforge/commit/0f2b723ecfa886dfcc2eca00edcd40c01fbf39f2))
+* **sidecar:** SO_REUSEADDR + deterministic shutdown for parallel test fan-out ([e77b009](https://github.com/special-place-administrator/symforge/commit/e77b009a85e5a783d6179e295bfff60bc469009f))
+
 ## [7.6.2](https://github.com/special-place-administrator/symforge/compare/v7.6.1...v7.6.2) (2026-04-24)
 
 
