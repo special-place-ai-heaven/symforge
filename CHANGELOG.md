@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.8.2](https://github.com/special-place-administrator/symforge/compare/v7.8.1...v7.8.2) (2026-05-15)
+
+
+### Bug Fixes
+
+* **frecency:** avoid DB creation during search rerank ([6ee9f6d](https://github.com/special-place-administrator/symforge/commit/6ee9f6dbce89c14967f09aacda5deb7f2e67cc95))
+
 ## [7.8.1](https://github.com/special-place-administrator/symforge/compare/v7.8.0...v7.8.1) (2026-05-15)
 
 
