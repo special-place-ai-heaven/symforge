@@ -1566,8 +1566,7 @@ impl LiveIndex {
         // then driven by `super::rank_signals::combine` as the primary sort key,
         // with within-tier tiebreakers (exact/suffix, shared dir prefix,
         // length, lex) matching the previous per-bucket behavior.
-        let mut candidates: Vec<(String, SearchFilesTier)> =
-            Vec::with_capacity(total_matches);
+        let mut candidates: Vec<(String, SearchFilesTier)> = Vec::with_capacity(total_matches);
         candidates.extend(
             strong_hits
                 .into_iter()
@@ -2152,6 +2151,7 @@ impl LiveIndex {
         kind_filter: Option<&str>,
         symbol_line: Option<u32>,
         sections: Option<&[String]>,
+        _include_tests: bool,
     ) -> TraceSymbolView {
         // Reuse context_bundle for the core symbol + callers + callees + type_usages + deps.
         let bundle = self.capture_context_bundle_view(path, name, kind_filter, symbol_line);
@@ -3149,8 +3149,8 @@ mod tests {
         CircuitBreakerState, IndexState, IndexedFile, LiveIndex, ParseStatus,
     };
     use crate::watcher::{WatcherInfo, WatcherState};
-    use std::sync::Arc;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
     fn make_symbol(name: &str) -> SymbolRecord {
@@ -5869,7 +5869,9 @@ public class PacketsController {
     fn test_is_personal_tooling_path_matches_gsd_variant() {
         use super::is_personal_tooling_path;
         assert!(is_personal_tooling_path(".claude/gsd-something-new/x.md"));
-        assert!(is_personal_tooling_path(".claude/gsd-anything/nested/file.sh"));
+        assert!(is_personal_tooling_path(
+            ".claude/gsd-anything/nested/file.sh"
+        ));
     }
 
     #[test]

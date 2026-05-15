@@ -79,6 +79,90 @@ fn render_file_outline(relative_path: &str, symbols: &[crate::domain::SymbolReco
     lines.join("\n")
 }
 
+pub fn collapse_large_test_modules(
+    text: String,
+    include_tests: bool,
+    sections: Option<&[String]>,
+) -> String {
+    if include_tests || outline_explicitly_requested(sections) {
+        return text;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut collapsed = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+        let Some((module_indent, module_name)) = parse_test_module_outline_line(line) else {
+            collapsed.push(line.to_string());
+            index += 1;
+            continue;
+        };
+
+        let mut cursor = index + 1;
+        let mut test_function_count = 0usize;
+        while cursor < lines.len() {
+            let child = lines[cursor];
+            if child.trim().is_empty() || leading_space_count(child) <= module_indent {
+                break;
+            }
+            if child.trim_start().starts_with("fn") {
+                test_function_count += 1;
+            }
+            cursor += 1;
+        }
+
+        if test_function_count > 100 {
+            collapsed.push(line.to_string());
+            collapsed.push(format!(
+                "{}  ... test module `{}` collapsed: {} functions not shown (pass include_tests=true to expand)",
+                " ".repeat(module_indent),
+                module_name,
+                test_function_count
+            ));
+            index = cursor;
+        } else {
+            collapsed.push(line.to_string());
+            index += 1;
+        }
+    }
+
+    let mut result = collapsed.join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+fn outline_explicitly_requested(sections: Option<&[String]>) -> bool {
+    sections
+        .map(|items| {
+            items
+                .iter()
+                .any(|section| section.eq_ignore_ascii_case("outline"))
+        })
+        .unwrap_or(false)
+}
+
+fn parse_test_module_outline_line(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let mut parts = trimmed.split_whitespace();
+    if parts.next()? != "mod" {
+        return None;
+    }
+    let name = parts.next()?;
+    if name == "tests" || name.ends_with("_tests") || name.ends_with("Tests") {
+        Some((leading_space_count(line), name))
+    } else {
+        None
+    }
+}
+
+fn leading_space_count(line: &str) -> usize {
+    line.bytes().take_while(|byte| *byte == b' ').count()
+}
+
 /// Compatibility renderer for `FileOutlineView`.
 ///
 /// Main hot-path readers should prefer `file_outline_from_indexed_file()`.
@@ -2675,39 +2759,128 @@ pub fn trace_symbol_result_view(
             );
 
             if !found.siblings.is_empty() {
-                output.push_str(&format_siblings(&found.siblings, 0));
+                output.push_str(&format_siblings_with_budget(
+                    &found.siblings,
+                    output.len(),
+                    max_tokens,
+                ));
             }
 
             if !found.dependents.files.is_empty() {
-                output.push_str("\n\n");
                 let dependents_fn = if verbosity == "full" {
                     find_dependents_result_view
                 } else {
                     find_dependents_compact_view
                 };
-                output.push_str(&dependents_fn(
-                    &found.dependents,
-                    &found.context_bundle.file_path,
-                    &OutputLimits::default(),
-                ));
+                let section = format!(
+                    "\n\n{}",
+                    dependents_fn(
+                        &found.dependents,
+                        &found.context_bundle.file_path,
+                        &OutputLimits::default(),
+                    )
+                );
+                append_budgeted_trace_section(
+                    &mut output,
+                    &section,
+                    max_tokens,
+                    "Dependents",
+                    found.dependents.files.len(),
+                );
             }
 
             if !found.implementations.entries.is_empty() {
-                output.push_str("\n\n");
-                output.push_str(&implementations_result_view(
-                    &found.implementations,
-                    name,
-                    &OutputLimits::default(),
-                ));
+                let section = format!(
+                    "\n\n{}",
+                    implementations_result_view(
+                        &found.implementations,
+                        name,
+                        &OutputLimits::default(),
+                    )
+                );
+                append_budgeted_trace_section(
+                    &mut output,
+                    &section,
+                    max_tokens,
+                    "Implementations",
+                    found.implementations.entries.len(),
+                );
             }
 
             if let Some(git) = &found.git_activity {
-                output.push_str(&format_trace_git_activity(git));
+                let section = format_trace_git_activity(git);
+                append_budgeted_trace_section(&mut output, &section, max_tokens, "Git activity", 1);
             }
 
-            output
+            enforce_token_budget(output, max_tokens)
         }
     }
+}
+
+fn max_budget_bytes(max_tokens: Option<u64>) -> Option<usize> {
+    match max_tokens {
+        Some(tokens) if tokens > 0 => Some((tokens as usize).saturating_mul(4)),
+        _ => None,
+    }
+}
+
+fn append_budgeted_trace_section(
+    output: &mut String,
+    section: &str,
+    max_tokens: Option<u64>,
+    label: &str,
+    omitted_count: usize,
+) {
+    let Some(max_bytes) = max_budget_bytes(max_tokens) else {
+        output.push_str(section);
+        return;
+    };
+
+    if output.len().saturating_add(section.len()) <= max_bytes {
+        output.push_str(section);
+        return;
+    }
+
+    output.push_str(&format!(
+        "\n\n{label}: section-truncated ({omitted_count} not shown)"
+    ));
+}
+
+fn format_siblings_with_budget(
+    siblings: &[crate::live_index::SiblingSymbolView],
+    current_bytes: usize,
+    max_tokens: Option<u64>,
+) -> String {
+    let Some(max_bytes) = max_budget_bytes(max_tokens) else {
+        return format_siblings(siblings, 0);
+    };
+
+    let mut section = "\nNearby siblings:".to_string();
+    let mut shown = 0usize;
+    for sib in siblings {
+        let line = format!(
+            "\n  {:<12} {:<30} {}-{}",
+            sib.kind_label, sib.name, sib.line_range.0, sib.line_range.1
+        );
+        if current_bytes
+            .saturating_add(section.len())
+            .saturating_add(line.len())
+            > max_bytes
+        {
+            break;
+        }
+        section.push_str(&line);
+        shown += 1;
+    }
+
+    let omitted = siblings.len().saturating_sub(shown);
+    if omitted > 0 {
+        section.push_str(&format!(
+            "\n  ... section-truncated ({omitted} more siblings not shown)"
+        ));
+    }
+
+    section
 }
 
 fn format_siblings(siblings: &[crate::live_index::SiblingSymbolView], overflow: usize) -> String {

@@ -22,7 +22,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Deserialize a `u32` from either a JSON number or a stringified number like `"5"`.
@@ -66,6 +66,65 @@ pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(
             ))),
         },
         BoolOrStr::Null => Ok(None),
+    }
+}
+
+fn lenient_bool_required<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    lenient_bool(deserializer).map(|value| value.unwrap_or(false))
+}
+
+const INCLUDE_TESTS_SECTION_MARKER: &str = "__symforge_include_tests";
+
+fn encode_include_tests_marker(
+    mut sections: Option<Vec<String>>,
+    include_tests: bool,
+) -> Option<Vec<String>> {
+    if include_tests {
+        sections
+            .get_or_insert_with(Vec::new)
+            .push(INCLUDE_TESTS_SECTION_MARKER.to_string());
+    }
+    sections
+}
+
+fn include_tests_from_sections(sections: Option<&Vec<String>>) -> bool {
+    sections
+        .map(|items| {
+            items
+                .iter()
+                .any(|section| section == INCLUDE_TESTS_SECTION_MARKER)
+        })
+        .unwrap_or(false)
+}
+
+fn visible_sections(sections: &Option<Vec<String>>) -> Option<Vec<String>> {
+    sections.as_ref().and_then(|items| {
+        let had_marker = items
+            .iter()
+            .any(|section| section.as_str() == INCLUDE_TESTS_SECTION_MARKER);
+        let visible = items
+            .iter()
+            .filter(|section| section.as_str() != INCLUDE_TESTS_SECTION_MARKER)
+            .cloned()
+            .collect::<Vec<_>>();
+        if visible.is_empty() && had_marker {
+            None
+        } else {
+            Some(visible)
+        }
+    })
+}
+
+fn add_include_tests_schema(schema: &mut Schema) {
+    if let Some(serde_json::Value::Object(properties)) = schema.get_mut("properties") {
+        properties.insert(
+            "include_tests".to_string(),
+            serde_json::json!({
+                "type": "boolean",
+                "default": false,
+                "description": "Include expanded test modules in context output."
+            }),
+        );
     }
 }
 
@@ -615,7 +674,8 @@ pub struct GetRepoMapInput {
 }
 
 /// Input for `get_file_context`.
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
+#[schemars(transform = add_include_tests_schema)]
 pub struct GetFileContextInput {
     /// Relative path to the file.
     pub path: String,
@@ -631,8 +691,34 @@ pub struct GetFileContextInput {
     pub estimate: Option<bool>,
 }
 
+impl<'de> Deserialize<'de> for GetFileContextInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            path: String,
+            #[serde(default, deserialize_with = "lenient_u64")]
+            max_tokens: Option<u64>,
+            #[serde(default, deserialize_with = "lenient_option_vec")]
+            sections: Option<Vec<String>>,
+            #[serde(default, deserialize_with = "lenient_bool_required")]
+            include_tests: bool,
+            #[serde(default, deserialize_with = "lenient_bool")]
+            estimate: Option<bool>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            path: raw.path,
+            max_tokens: raw.max_tokens,
+            sections: encode_include_tests_marker(raw.sections, raw.include_tests),
+            estimate: raw.estimate,
+        })
+    }
+}
+
 /// Input for `get_symbol_context`.
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
+#[schemars(transform = add_include_tests_schema)]
 pub struct GetSymbolContextInput {
     /// Symbol name to inspect.
     pub name: String,
@@ -667,6 +753,49 @@ pub struct GetSymbolContextInput {
     /// Shows estimated tokens for body, callers, bundle, and raw file.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for GetSymbolContextInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            name: String,
+            file: Option<String>,
+            path: Option<String>,
+            symbol_kind: Option<String>,
+            #[serde(default, deserialize_with = "lenient_u32")]
+            symbol_line: Option<u32>,
+            verbosity: Option<String>,
+            #[serde(default, deserialize_with = "lenient_bool")]
+            bundle: Option<bool>,
+            #[serde(default, deserialize_with = "lenient_option_vec")]
+            sections: Option<Vec<String>>,
+            #[serde(default, deserialize_with = "lenient_bool_required")]
+            include_tests: bool,
+            #[serde(default, deserialize_with = "lenient_u64")]
+            max_tokens: Option<u64>,
+            #[serde(default, deserialize_with = "lenient_bool")]
+            estimate: Option<bool>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let sections = match raw.sections {
+            Some(sections) => encode_include_tests_marker(Some(sections), raw.include_tests),
+            None => None,
+        };
+        Ok(Self {
+            name: raw.name,
+            file: raw.file,
+            path: raw.path,
+            symbol_kind: raw.symbol_kind,
+            symbol_line: raw.symbol_line,
+            verbosity: raw.verbosity,
+            bundle: raw.bundle,
+            sections,
+            max_tokens: raw.max_tokens,
+            estimate: raw.estimate,
+        })
+    }
 }
 
 /// Input for `analyze_file_impact`.
@@ -3144,13 +3273,17 @@ impl SymForgeServer {
         };
 
         let state = sidecar_state_for_server(self);
+        let include_tests = include_tests_from_sections(params.0.sections.as_ref());
+        let sections = visible_sections(&params.0.sections);
         let outline = OutlineParams {
             path: params.0.path.clone(),
             max_tokens: params.0.max_tokens,
-            sections: params.0.sections.clone(),
+            sections: sections.clone(),
         };
         match outline_tool_text(&state, &outline) {
             Ok(result) => {
+                let result =
+                    format::collapse_large_test_modules(result, include_tests, sections.as_deref());
                 let hint = format::compact_next_step_hint(&[
                     "get_symbol (body)",
                     "find_references (callers/imports)",
@@ -3161,7 +3294,8 @@ impl SymForgeServer {
                 let saved = raw_chars.saturating_sub(body.len());
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
                 self.record_read_savings((saved / 4) as u64);
-                let output = format!("{body}{footer}");
+                let output =
+                    format::enforce_token_budget(format!("{body}{footer}"), params.0.max_tokens);
                 self.session_context
                     .record_listed_file(&params.0.path, (output.len() / 4) as u32);
                 // Frecency bump — commitment tool. Reached only on the happy
@@ -3304,11 +3438,10 @@ impl SymForgeServer {
             };
 
             // Convert sections: Some(empty vec) = all sections (like trace_symbol's None)
-            let sections_param = params
-                .0
-                .sections
-                .as_ref()
-                .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
+            let include_tests = include_tests_from_sections(params.0.sections.as_ref());
+            let sections_param = visible_sections(&params.0.sections)
+                .and_then(|s| if s.is_empty() { None } else { Some(s) });
+            let sections_param = encode_include_tests_marker(sections_param, include_tests);
 
             let trace_input = TraceSymbolInput {
                 path: path.clone(),
@@ -3965,10 +4098,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("trace_symbol", &params.0).await {
             return result;
         }
+        let sections = visible_sections(&params.0.sections);
         if params.0.estimate == Some(true) {
-            let section_count = params
-                .0
-                .sections
+            let section_count = sections
                 .as_ref()
                 .map(|s| if s.is_empty() { 4 } else { s.len() })
                 .unwrap_or(4);
@@ -3987,15 +4119,14 @@ impl SymForgeServer {
                 &params.0.name,
                 params.0.kind.as_deref(),
                 params.0.symbol_line,
-                params.0.sections.as_deref(),
+                sections.as_deref(),
+                include_tests_from_sections(params.0.sections.as_ref()),
             )
         };
 
         // Fill in git activity if it was requested (or if all sections requested)
         if let crate::live_index::TraceSymbolView::Found(ref mut found) = trace_view {
-            let wants_git = params
-                .0
-                .sections
+            let wants_git = sections
                 .as_ref()
                 .map(|s| s.iter().any(|v| v.eq_ignore_ascii_case("git")))
                 .unwrap_or(true);
@@ -7859,6 +7990,100 @@ mod tests {
         }
     }
 
+    fn make_symbol_with_depth(
+        name: &str,
+        kind: SymbolKind,
+        depth: u32,
+        line_start: u32,
+        line_end: u32,
+        byte_range: (u32, u32),
+    ) -> SymbolRecord {
+        SymbolRecord {
+            name: name.to_string(),
+            kind,
+            depth,
+            sort_order: 0,
+            byte_range,
+            item_byte_range: Some(byte_range),
+            line_range: (line_start, line_end),
+            doc_byte_range: None,
+        }
+    }
+
+    fn large_outline_fixture(
+        path: &str,
+        function_count: u32,
+        line_count: u32,
+    ) -> (String, IndexedFile) {
+        let mut content = String::new();
+        let mut symbols = Vec::new();
+
+        let module_start = content.len() as u32;
+        content.push_str("mod large {\n");
+        for i in 0..function_count {
+            let start = content.len() as u32;
+            content.push_str(&format!("    fn function_{i:03}() {{}}\n"));
+            let end = content.len() as u32;
+            symbols.push(make_symbol_with_depth(
+                &format!("function_{i:03}"),
+                SymbolKind::Function,
+                1,
+                i + 1,
+                i + 1,
+                (start, end),
+            ));
+        }
+        content.push_str("}\n");
+
+        while content.lines().count() < line_count as usize {
+            content.push_str("// padding\n");
+        }
+
+        let module_end = content.len() as u32;
+        symbols.insert(
+            0,
+            make_symbol_with_depth(
+                "large",
+                SymbolKind::Module,
+                0,
+                0,
+                line_count.saturating_sub(1),
+                (module_start, module_end),
+            ),
+        );
+
+        make_file(path, content.as_bytes(), symbols)
+    }
+
+    fn nested_test_module_fixture(path: &str, test_count: u32) -> (String, IndexedFile) {
+        let mut content = String::from("#[cfg(test)]\nmod tests {\n");
+        let mut symbols = vec![make_symbol_with_depth(
+            "tests",
+            SymbolKind::Module,
+            0,
+            1,
+            test_count + 2,
+            (0, 0),
+        )];
+
+        for i in 0..test_count {
+            let start = content.len() as u32;
+            content.push_str(&format!("    fn test_{i:03}() {{}}\n"));
+            let end = content.len() as u32;
+            symbols.push(make_symbol_with_depth(
+                &format!("test_{i:03}"),
+                SymbolKind::Function,
+                1,
+                i + 2,
+                i + 2,
+                (start, end),
+            ));
+        }
+        content.push_str("}\n");
+
+        make_file(path, content.as_bytes(), symbols)
+    }
+
     fn make_live_index_ready(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         use crate::live_index::trigram::TrigramIndex;
         let files_map = files
@@ -8525,6 +8750,124 @@ mod tests {
             !result.contains("scripts/helper.py"),
             "generic-name local calls should not be attributed as key references: {result}"
         );
+    }
+
+    mod get_file_context {
+        use super::*;
+
+        #[test]
+        fn include_tests_is_advertised_for_context_tools() {
+            for tool_name in ["get_file_context", "get_symbol_context"] {
+                let tools = SymForgeServer::tool_definitions();
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool.name.as_ref() == tool_name)
+                    .unwrap_or_else(|| panic!("{tool_name} should be registered"));
+                let properties = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap_or_else(|| panic!("{tool_name} should expose schema properties"));
+                assert!(
+                    properties.contains_key("include_tests"),
+                    "{tool_name} should advertise include_tests in its input schema"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn nested_test_module_collapsed_by_default() {
+            let file = nested_test_module_fixture("src/lib.rs", 125);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let result = server
+                .get_file_context(Parameters(super::super::GetFileContextInput {
+                    path: "src/lib.rs".to_string(),
+                    max_tokens: Some(2000),
+                    sections: None,
+                    estimate: None,
+                }))
+                .await;
+
+            assert!(
+                result.contains("test module `tests` collapsed: 125 functions not shown"),
+                "large test module should collapse by default; got:\n{result}"
+            );
+            assert!(
+                !result.contains("test_124"),
+                "default outline should not enumerate every nested test function; got:\n{result}"
+            );
+        }
+
+        #[tokio::test]
+        async fn include_tests_true_restores_full_outline() {
+            let file = nested_test_module_fixture("src/lib.rs", 125);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let input: super::super::GetFileContextInput =
+                serde_json::from_value(serde_json::json!({
+                    "path": "src/lib.rs",
+                    "max_tokens": 4000,
+                    "include_tests": true
+                }))
+                .expect("include_tests input should deserialize");
+            let result = server.get_file_context(Parameters(input)).await;
+
+            assert!(
+                result.contains("test_124"),
+                "include_tests=true should show nested test functions; got:\n{result}"
+            );
+            assert!(
+                !result.contains("test module `tests` collapsed"),
+                "include_tests=true should not render collapse summary; got:\n{result}"
+            );
+        }
+    }
+
+    mod get_symbol_context {
+        use super::*;
+
+        #[tokio::test]
+        async fn large_file_respects_budget() {
+            let max_tokens = 600;
+            let file = large_outline_fixture("src/large.rs", 300, 16_000);
+            let server = make_server(make_live_index_ready(vec![file]));
+
+            let started = Instant::now();
+            let result = server
+                .get_symbol_context(Parameters(super::super::GetSymbolContextInput {
+                    name: "function_000".to_string(),
+                    file: None,
+                    path: Some("src/large.rs".to_string()),
+                    symbol_kind: Some("fn".to_string()),
+                    symbol_line: Some(2),
+                    verbosity: None,
+                    bundle: None,
+                    sections: Some(vec![]),
+                    max_tokens: Some(max_tokens),
+                    estimate: None,
+                }))
+                .await;
+            let elapsed = started.elapsed();
+
+            eprintln!(
+                "large_file_respects_budget wall_ms={} bytes={} max_tokens={}",
+                elapsed.as_millis(),
+                result.len(),
+                max_tokens
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "large-file context should complete under 5s; elapsed={elapsed:?}"
+            );
+            assert!(
+                result.len() <= (max_tokens as usize * 4 * 12) / 10,
+                "response should stay within +20% of token budget; bytes={}, max_tokens={}, output:\n{}",
+                result.len(),
+                max_tokens,
+                result
+            );
+        }
     }
 
     #[tokio::test]
