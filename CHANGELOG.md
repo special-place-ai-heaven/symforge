@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.10.0](https://github.com/special-place-administrator/symforge/compare/v7.9.2...v7.10.0) (2026-05-16)
+
+
+### Features
+
+* **edit:** add pre-write tee snapshots ([22a5edb](https://github.com/special-place-administrator/symforge/commit/22a5edb6f59eabd39efaaeba5bdfa4fd6ae1af88))
+
 ## [7.9.2](https://github.com/special-place-administrator/symforge/compare/v7.9.1...v7.9.2) (2026-05-16)
 
 
