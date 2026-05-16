@@ -1,4 +1,4 @@
-# /goal Call-Time Capability Resolution Task 06: Health Visibility And Integration
+# /goal Call-Time Capability Resolution Task 07: Health Visibility And Integration
 
 /goal close the call-time capability-resolution slice until health or equivalent status output reports capability states and installed/runtime tests prove env-vars-unset requested behavior or explicit evidence for frecency, co-change, worktree routing, and ranking diagnostics.
 
@@ -29,7 +29,8 @@
   - `call_time_capability_resolution_task02_capability_evidence_foundation.md`
   - `call_time_capability_resolution_task03_frecency_call_time_resolution.md`
   - `call_time_capability_resolution_task04_cochange_lazy_prepare.md`
-  - `call_time_capability_resolution_task05_worktree_and_debug_explain.md`
+  - `call_time_capability_resolution_task05_worktree_routing.md`
+  - `call_time_capability_resolution_task06_ranking_explain.md`
 - Expected files to modify:
   - `src/protocol/tools.rs`
   - `src/protocol/mod.rs`
@@ -41,12 +42,12 @@
   - `tests/capability_status_integration.rs`
   - `tests/schema_roundtrip.rs`
 - Files off limits:
-  - feature-specific internals from Tasks 03-05 unless integration tests reveal a defect that must be fixed to close the gate
+- feature-specific internals from Tasks 03-06 unless integration tests reveal a defect that must be fixed to close the gate
 
 ## Machine Metadata
 
 - phase: `3g-call-time-capability-resolution`
-- plan: `06`
+- plan: `07`
 - wave: `4`
 - type: `integration-closeout`
 - autonomous: `true`
@@ -72,7 +73,7 @@
 
 - Do not build a multi-process router or multi-tenant SymForge swarm in this task.
 - Do not add a broad generic `scope` parameter.
-- Do not expand feature behavior beyond closing integration gaps from Tasks 03-05.
+- Do not expand feature behavior beyond closing integration gaps from Tasks 03-06.
 - Preserve local-first, in-process read-path performance.
 - Keep capability status compact enough not to make health noisy.
 - Keep file writes inside the listed ownership scope unless code inspection proves a small extra file is required.
@@ -94,7 +95,7 @@
 ## Implementation Checklist
 
 - [ ] Re-read this task and list the plan.
-- [ ] Inspect health output paths, schema roundtrip tests, and feature-specific tests from Tasks 03-05.
+- [ ] Inspect health output paths, schema roundtrip tests, and feature-specific tests from Tasks 03-06.
 - [ ] Add or update capability status integration tests.
 - [ ] Add health/status output for capability states.
 - [ ] Update README and roadmap to match final behavior.

@@ -57,25 +57,30 @@ Wave 2
   Task 04: co-change lazy prepare
 
 Wave 3
-  Task 05: worktree routing and ranking explain
+  Task 05: worktree routing
+  Task 06: ranking explain
 
 Wave 4
-  Task 06: health visibility and integration
+  Task 07: health visibility and integration
 ```
 
-Task 01 and Task 02 are disjoint enough to run in parallel if reviewers are comfortable. Task 03 and Task 04 both touch `src/protocol/tools.rs`; if two agents run them, merge Task 02 first and coordinate the `search_files` handler changes carefully. Task 05 should run after Task 03 and Task 04 because it extends the same public `search_files` response surface. Task 06 should run last.
+Task 01 and Task 02 are disjoint enough to run in parallel if reviewers are comfortable. Task 03 and Task 04 both touch `src/protocol/tools.rs`; if two agents run them, merge Task 02 first and coordinate the `search_files` handler changes carefully. Task 05 is edit/write-path work and can run after Task 02. Task 06 should run after Tasks 03 and 04 because it extends the same public `search_files` response surface. Task 07 should run last.
 
 ## Dependency Graph
 
 ```mermaid
 graph TD
-  T01[Task 01: Contract and docs] --> T06[Task 06: Health visibility and integration]
+  T01[Task 01: Contract and docs] --> T07[Task 07: Health visibility and integration]
   T02[Task 02: Capability evidence foundation] --> T03[Task 03: Frecency call-time resolution]
   T02 --> T04[Task 04: Co-change lazy prepare]
-  T02 --> T05[Task 05: Worktree routing and ranking explain]
+  T02 --> T05[Task 05: Worktree routing]
+  T02 --> T06[Task 06: Ranking explain]
   T03 --> T06
   T04 --> T06
-  T05 --> T06
+  T03 --> T07
+  T04 --> T07
+  T05 --> T07
+  T06 --> T07
 ```
 
 ## Task Files
@@ -84,8 +89,9 @@ graph TD
 2. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task02_capability_evidence_foundation.md`
 3. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task03_frecency_call_time_resolution.md`
 4. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task04_cochange_lazy_prepare.md`
-5. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task05_worktree_and_debug_explain.md`
-6. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task06_health_visibility_and_integration.md`
+5. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task05_worktree_routing.md`
+6. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task06_ranking_explain.md`
+7. `/goal docs/plans/2026-05-16-call-time-capability-resolution/call_time_capability_resolution_task07_health_visibility_and_integration.md`
 
 ## Ownership Summary
 
@@ -95,8 +101,9 @@ graph TD
 | 02 | `src/capability/mod.rs`, `src/capability/state.rs`, `src/capability/policy.rs`, `src/lib.rs`, `src/protocol/format.rs` | `tests/capability_evidence.rs` |
 | 03 | `src/live_index/frecency.rs`, `src/live_index/persist.rs`, `src/protocol/tools.rs`, `src/protocol/format.rs` | `tests/frecency_ranking.rs`, `tests/call_time_frecency.rs`, `tests/edit_hook_behavior.rs` |
 | 04 | `src/live_index/coupling/lifecycle.rs`, `src/live_index/store.rs`, `src/protocol/tools.rs`, `src/protocol/format.rs` | `tests/cochange_fusion.rs`, `tests/call_time_cochange.rs`, `tests/coupling_refresh_generation_fence.rs` |
-| 05 | `src/worktree.rs`, `src/protocol/edit_hooks.rs`, `src/protocol/tools.rs`, `src/protocol/format.rs`, `src/live_index/search.rs` | `tests/worktree_awareness.rs`, `tests/edit_hook_behavior.rs`, `tests/search_files_ranking_debug.rs` |
-| 06 | `src/protocol/tools.rs`, `src/protocol/mod.rs`, `src/daemon.rs`, `src/protocol/format.rs`, `README.md` | `tests/capability_status_integration.rs`, `tests/schema_roundtrip.rs` |
+| 05 | `src/worktree.rs`, `src/protocol/edit_hooks.rs`, `src/protocol/edit_format.rs`, `src/protocol/tools.rs`, `src/protocol/mod.rs` | `tests/worktree_awareness.rs`, `tests/edit_hook_behavior.rs`, `tests/edit_safety_tee.rs` |
+| 06 | `src/protocol/tools.rs`, `src/protocol/format.rs`, `src/live_index/search.rs` | `tests/search_files_ranking_debug.rs`, `tests/schema_roundtrip.rs`, `tests/rank_signal_behavior.rs` |
+| 07 | `src/protocol/tools.rs`, `src/protocol/mod.rs`, `src/daemon.rs`, `src/protocol/format.rs`, `README.md` | `tests/capability_status_integration.rs`, `tests/schema_roundtrip.rs` |
 
 If implementation discovers an extra required file, the agent must record it in the progress log and explain why it was necessary.
 

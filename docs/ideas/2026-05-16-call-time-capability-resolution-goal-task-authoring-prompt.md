@@ -44,8 +44,9 @@ Create:
 - `call_time_capability_resolution_task02_capability_evidence_foundation.md`
 - `call_time_capability_resolution_task03_frecency_call_time_resolution.md`
 - `call_time_capability_resolution_task04_cochange_lazy_prepare.md`
-- `call_time_capability_resolution_task05_worktree_and_debug_explain.md`
-- `call_time_capability_resolution_task06_health_visibility_and_integration.md`
+- `call_time_capability_resolution_task05_worktree_routing.md`
+- `call_time_capability_resolution_task06_ranking_explain.md`
+- `call_time_capability_resolution_task07_health_visibility_and_integration.md`
 
 You may split or merge if repo inspection proves a better boundary, but keep each file small enough for one agent to finish in one focused session.
 
@@ -224,15 +225,16 @@ Use dependencies deliberately:
 - Task 02 should create shared capability evidence/policy types before feature-specific conversions.
 - Task 03 should depend on Task 02 if it consumes shared evidence types.
 - Task 04 should depend on Task 02 if it consumes shared evidence types.
-- Task 05 may depend on Task 02 if shared evidence/policy applies to worktree/debug output.
-- Task 06 should depend on all implementation tasks and focus on health/status/docs/integration verification.
+- Task 05 may depend on Task 02 if shared evidence/policy applies to worktree routing.
+- Task 06 should depend on Task 02, and preferably Tasks 03-04 if ranking explanation needs final frecency/co-change evidence wording.
+- Task 07 should depend on all implementation tasks and focus on health/status/docs/integration verification.
 
 Suggested waves:
 
 - Wave 1: Task 01 and, if disjoint enough, Task 02.
 - Wave 2: Task 03 and Task 04 in parallel if their write sets do not overlap.
-- Wave 3: Task 05.
-- Wave 4: Task 06.
+- Wave 3: Task 05 and Task 06, sequential if they both touch shared protocol response code.
+- Wave 4: Task 07.
 
 If repo inspection shows the files overlap, make them sequential.
 
@@ -268,10 +270,16 @@ Task 04 should ask the implementing agent to:
 Task 05 should ask the implementing agent to:
 
 - Let edit tools honor validated `working_directory` at call time without requiring `SYMFORGE_WORKTREE_AWARE=1`, unless policy disables it.
-- Add call-time ranking explain/debug output without requiring `SYMFORGE_DEBUG_RANKING=1`.
+- Keep routed write response evidence explicit and fail before write for invalid worktrees.
 - Keep the response shape backward compatible unless the task explicitly documents a versioned change.
 
 Task 06 should ask the implementing agent to:
+
+- Add call-time ranking explain/debug output without requiring `SYMFORGE_DEBUG_RANKING=1`.
+- Keep ranking explanation absent by default and concise when requested.
+- Cover the new request shape in schema/roundtrip tests.
+
+Task 07 should ask the implementing agent to:
 
 - Surface capability policy/status in health or equivalent status output.
 - Add integration tests that prove env vars unset still allow call-time requested behavior or explicit unavailable/disabled evidence.
