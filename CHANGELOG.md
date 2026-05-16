@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.9.1](https://github.com/special-place-administrator/symforge/compare/v7.9.0...v7.9.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* stabilize search and context trust gates ([c0bc663](https://github.com/special-place-administrator/symforge/commit/c0bc6637d3547244571a893e790b9b83c1de297e))
+
 ## [7.9.0](https://github.com/special-place-administrator/symforge/compare/v7.8.2...v7.9.0) (2026-05-16)
 
 
