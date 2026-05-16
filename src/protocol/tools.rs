@@ -484,6 +484,10 @@ pub struct SearchFilesInput {
     /// Optional maximum token budget for the response.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
+    /// When true, append a compact ranking explanation for this call without requiring `SYMFORGE_DEBUG_RANKING=1`.
+    /// Missing values default off; `SYMFORGE_DEBUG_RANKING=1` may still default diagnostics on operationally.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub debug_ranking: Option<bool>,
     /// Optional ranking mode. `"frecency"` requests call-time frecency
     /// resolution: available session or persistent history is fused with
     /// path ranking, otherwise the response includes explicit fallback,
@@ -2440,6 +2444,137 @@ fn frecency_ranking_evidence(
         .with_freshness(CapabilityFreshness::Current)
         .with_safety(CapabilitySafety::ReadOnly)
         .with_detail(detail)
+}
+
+fn search_files_debug_ranking_requested(input: &SearchFilesInput) -> bool {
+    input.debug_ranking.unwrap_or(false)
+        || std::env::var("SYMFORGE_DEBUG_RANKING").as_deref() == Ok("1")
+}
+
+fn search_files_rank_mode_label(rank_by: Option<&str>) -> &'static str {
+    match rank_by {
+        Some("frecency") => "frecency",
+        Some("path+cochange") => "path+cochange",
+        _ => "default path",
+    }
+}
+
+fn search_files_tier_summary(view: &SearchFilesView) -> String {
+    let SearchFilesView::Found { hits, .. } = view else {
+        return "no returned files".to_string();
+    };
+    let mut cochange = 0usize;
+    let mut strong = 0usize;
+    let mut basename = 0usize;
+    let mut loose = 0usize;
+    for hit in hits {
+        match hit.tier {
+            SearchFilesTier::CoChange => cochange += 1,
+            SearchFilesTier::StrongPath => strong += 1,
+            SearchFilesTier::Basename => basename += 1,
+            SearchFilesTier::LoosePath => loose += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if cochange > 0 {
+        parts.push(format!("co-change={cochange}"));
+    }
+    if strong > 0 {
+        parts.push(format!("strong path={strong}"));
+    }
+    if basename > 0 {
+        parts.push(format!("basename={basename}"));
+    }
+    if loose > 0 {
+        parts.push(format!("loose path={loose}"));
+    }
+    if parts.is_empty() {
+        "no returned files".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn search_files_signal_explanation(
+    signal: &str,
+    evidence: Option<&CapabilityEvidence>,
+    not_requested: bool,
+) -> String {
+    if not_requested {
+        return format!("{signal} signal: not requested");
+    }
+    match evidence {
+        Some(evidence) => {
+            let mut line = format!("{signal} signal: {}", evidence.status);
+            if let Some(detail) = evidence.detail.as_deref().map(str::trim)
+                && !detail.is_empty()
+            {
+                line.push_str(" - ");
+                line.push_str(detail.trim_end_matches('.'));
+            }
+            line
+        }
+        None => format!("{signal} signal: unavailable - no capability evidence was recorded"),
+    }
+}
+
+fn search_files_final_ordering_note(
+    rank_by: Option<&str>,
+    cochange_evidence: Option<&CapabilityEvidence>,
+    frecency_evidence: Option<&CapabilityEvidence>,
+) -> String {
+    match rank_by {
+        Some("frecency") => match frecency_evidence.map(|evidence| evidence.status) {
+            Some(CapabilityStatus::Applied) => {
+                "frecency fusion applied after path ranking; ties remain deterministic by path"
+                    .to_string()
+            }
+            Some(status) => format!(
+                "frecency requested but {status}; path-ranked ordering was returned"
+            ),
+            None => "frecency requested but no evidence was available; path-ranked ordering was returned"
+                .to_string(),
+        },
+        Some("path+cochange") => match cochange_evidence.map(|evidence| evidence.status) {
+            Some(CapabilityStatus::Applied) | Some(CapabilityStatus::Ready) => {
+                "co-change partners that passed gates were fused with path ranking; remaining files keep path tie-breakers"
+                    .to_string()
+            }
+            Some(status) => format!(
+                "path+cochange requested but {status}; path-ranked ordering was returned"
+            ),
+            None => "path+cochange requested but no evidence was available; path-ranked ordering was returned"
+                .to_string(),
+        },
+        _ => "tiered path relevance ordered the results with deterministic path tie-breakers"
+            .to_string(),
+    }
+}
+
+fn search_files_ranking_explanation(
+    view: &SearchFilesView,
+    rank_by: Option<&str>,
+    cochange_evidence: Option<&CapabilityEvidence>,
+    frecency_evidence: Option<&CapabilityEvidence>,
+) -> String {
+    let rank_mode = search_files_rank_mode_label(rank_by);
+    let frecency_not_requested = rank_by != Some("frecency");
+    let cochange_not_requested = rank_by != Some("path+cochange");
+    [
+        "Ranking explanation:".to_string(),
+        format!("requested rank mode: {rank_mode}"),
+        format!(
+            "path signal: applied - returned tier family: {}",
+            search_files_tier_summary(view)
+        ),
+        search_files_signal_explanation("frecency", frecency_evidence, frecency_not_requested),
+        search_files_signal_explanation("co-change", cochange_evidence, cochange_not_requested),
+        format!(
+            "final ordering: {}",
+            search_files_final_ordering_note(rank_by, cochange_evidence, frecency_evidence)
+        ),
+    ]
+    .join("\n")
 }
 
 const CHANGED_WITH_DEPRECATION_WARNING: &str = "Deprecation warning: `search_files changed_with=` is deprecated since v7.x and scheduled for removal in v8.x; prefer `rank_by=\"path+cochange\"` with `anchor_path=<path>`.";
@@ -5001,6 +5136,7 @@ impl SymForgeServer {
 
         let rank_by_path_cochange = params.0.rank_by.as_deref() == Some("path+cochange");
         let rank_by_frecency = params.0.rank_by.as_deref() == Some("frecency");
+        let debug_ranking = search_files_debug_ranking_requested(&params.0);
         let mut cochange_evidence: Option<CapabilityEvidence> = None;
         let mut frecency_evidence: Option<CapabilityEvidence> = None;
         let mut hidden_noise_count = 0usize;
@@ -5229,13 +5365,22 @@ impl SymForgeServer {
                 include_personal_tooling,
             );
         }
-        if let Some(evidence) = cochange_evidence {
+        if let Some(evidence) = cochange_evidence.as_ref() {
             result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(&evidence));
+            result.push_str(&format::capability_evidence_line(evidence));
         }
-        if let Some(evidence) = frecency_evidence {
+        if let Some(evidence) = frecency_evidence.as_ref() {
             result.push_str("\n\n");
-            result.push_str(&format::capability_evidence_line(&evidence));
+            result.push_str(&format::capability_evidence_line(evidence));
+        }
+        if debug_ranking {
+            result.push_str("\n\n");
+            result.push_str(&search_files_ranking_explanation(
+                &view,
+                params.0.rank_by.as_deref(),
+                cochange_evidence.as_ref(),
+                frecency_evidence.as_ref(),
+            ));
         }
         if let Some(note) = search_files_hidden_noise_note(
             hidden_noise_count,
@@ -7299,8 +7444,9 @@ impl SymForgeServer {
              searching for a file is not the same as working on it, and \
              self-bumping searches corrupt rankings via a positive feedback \
              loop. Batch tools dedup bumps per invocation. Set \
-             `SYMFORGE_DEBUG_RANKING=1` for per-signal score breakdowns in \
-             responses and the last-10 bumps list in `health`. See README \
+             `search_files(debug_ranking=true)` for compact call-time ranking \
+             diagnostics, or `SYMFORGE_DEBUG_RANKING=1` to default them on \
+             and show the last-10 bumps list in `health`. See README \
              §Frecency ranking and ADR 0011 for the full policy.",
         );
         self.session_context.record_summary_output(
@@ -7448,6 +7594,7 @@ impl SymForgeServer {
                     resolve: None,
                     estimate: None,
                     max_tokens: None,
+                    debug_ranking: None,
                     rank_by: None,
                     anchor_path: None,
                     include_vendor: None,
@@ -11571,6 +11718,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -11608,6 +11756,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -11638,6 +11787,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -11705,6 +11855,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -11756,6 +11907,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -11807,6 +11959,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -11846,6 +11999,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -11884,6 +12038,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -11919,6 +12074,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/missing/routes.rs".to_string()),
                 include_vendor: None,
@@ -11954,6 +12110,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -11992,6 +12149,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -12025,6 +12183,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12041,6 +12200,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: None,
                 include_vendor: None,
@@ -12079,6 +12239,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12095,6 +12256,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: Some("path+cochange".to_string()),
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
@@ -12130,6 +12292,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12167,6 +12330,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: Some(true),
@@ -12196,6 +12360,7 @@ mod tests {
                 resolve: Some(true),
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12233,6 +12398,7 @@ mod tests {
                 resolve: Some(true),
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: Some(true),
@@ -12266,6 +12432,7 @@ mod tests {
                 resolve: None,
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12300,6 +12467,7 @@ mod tests {
                 resolve: Some(true),
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,
@@ -12336,6 +12504,7 @@ mod tests {
                 resolve: Some(true),
                 estimate: None,
                 max_tokens: None,
+                debug_ranking: None,
                 rank_by: None,
                 anchor_path: None,
                 include_vendor: None,

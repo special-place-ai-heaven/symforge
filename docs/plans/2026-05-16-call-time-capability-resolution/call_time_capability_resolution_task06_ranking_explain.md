@@ -94,18 +94,18 @@
 
 ## Implementation Checklist
 
-- [ ] Re-read this task and list the plan.
-- [ ] Inspect `SearchFilesInput`, current `SYMFORGE_DEBUG_RANKING` call sites, rank-signal helpers, and search_files formatting.
-- [ ] Choose `explain=["ranking"]` or `debug_ranking=true`; prefer the smaller backward-compatible request shape if no explain-array precedent exists.
-- [ ] Add schema/roundtrip tests before changing handler behavior where practical.
-- [ ] Add focused behavior tests for default absence and call-time requested diagnostics with env vars unset.
-- [ ] Implement call-time ranking diagnostics.
-- [ ] Run focused ranking-debug tests.
-- [ ] Run `cargo check`.
-- [ ] Run `cargo test --all-targets -- --test-threads=1` because search response surfaces changed.
-- [ ] Run `cargo build --release` if public schema or docs changed.
-- [ ] Update docs if behavior, env vars, or response shapes changed.
-- [ ] Confirm every success criterion.
+- [x] Re-read this task and list the plan.
+- [x] Inspect `SearchFilesInput`, current `SYMFORGE_DEBUG_RANKING` call sites, rank-signal helpers, and search_files formatting.
+- [x] Choose `explain=["ranking"]` or `debug_ranking=true`; prefer the smaller backward-compatible request shape if no explain-array precedent exists.
+- [x] Add schema/roundtrip tests before changing handler behavior where practical.
+- [x] Add focused behavior tests for default absence and call-time requested diagnostics with env vars unset.
+- [x] Implement call-time ranking diagnostics.
+- [x] Run focused ranking-debug tests.
+- [x] Run `cargo check`.
+- [x] Run `cargo test --all-targets -- --test-threads=1` because search response surfaces changed.
+- [x] Run `cargo build --release` if public schema or docs changed.
+- [x] Update docs if behavior, env vars, or response shapes changed.
+- [x] Confirm every success criterion.
 
 ## Implementation Chunks
 

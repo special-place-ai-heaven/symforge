@@ -164,6 +164,28 @@ schema_roundtrip_test!(
 );
 schema_roundtrip_test!(roundtrip_search_text, "search_text", SearchTextInput);
 schema_roundtrip_test!(roundtrip_search_files, "search_files", SearchFilesInput);
+
+#[test]
+fn search_files_debug_ranking_schema_and_roundtrip() {
+    let schema = tool_schema("search_files");
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("search_files schema properties");
+    assert!(
+        properties.contains_key("debug_ranking"),
+        "search_files schema must advertise debug_ranking"
+    );
+
+    let input: SearchFilesInput =
+        serde_json::from_value(json!({"query": "routes", "debug_ranking": true}))
+            .expect("debug_ranking payload deserializes");
+    assert_eq!(input.debug_ranking, Some(true));
+
+    let roundtrip = serde_json::to_value(&input).expect("serialize SearchFilesInput");
+    assert_eq!(roundtrip.get("debug_ranking"), Some(&Value::Bool(true)));
+}
+
 schema_roundtrip_test!(roundtrip_index_folder, "index_folder", IndexFolderInput);
 schema_roundtrip_test!(roundtrip_what_changed, "what_changed", WhatChangedInput);
 schema_roundtrip_test!(

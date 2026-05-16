@@ -1764,8 +1764,9 @@ pub struct FrecencyFusionBreakdown {
 /// Re-rank a candidate set by the frecency fusion policy. The returned
 /// vector preserves one-to-one correspondence with the input `hits`: each
 /// hit keeps its position in the result vec, and the parallel
-/// `breakdowns` vec reports the per-hit scores. Callers can then sort or
-/// filter however they need; the `reorder_by_combined` helper is the
+/// `breakdowns` vec reports the per-hit scores for call-time or default-on
+/// ranking diagnostics. Callers can then sort or filter however they need;
+/// the `reorder_by_combined` helper is the
 /// common case.
 pub fn score_hits_by_frecency_fusion(
     hits: &[SearchFilesHit],
