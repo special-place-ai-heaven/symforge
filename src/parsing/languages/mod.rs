@@ -1,22 +1,4 @@
-mod c;
-mod cpp;
-mod csharp;
-mod css;
-mod dart;
-mod elixir;
-mod go;
-mod html;
-mod java;
-mod javascript;
-mod kotlin;
-mod perl;
-mod php;
-mod python;
-mod ruby;
-mod rust;
-mod scss;
-mod swift;
-mod typescript;
+automod::dir!("src/parsing/languages");
 
 use tree_sitter::Node;
 
@@ -275,7 +257,6 @@ pub(super) fn enter_ast_walk_frame() -> Option<AstWalkFrame> {
         }
     })
 }
-
 
 pub(super) fn walk_children(
     node: &Node,
