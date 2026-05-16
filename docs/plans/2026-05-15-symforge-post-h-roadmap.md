@@ -384,13 +384,13 @@ Foundation wave. Ships before any other roadmap work. Targets two fresh-from-dog
 
 ### Wave 1 — Index Hygiene Close-out (Phase 2.3 + 2.4)
 
-Small wave. One mechanical commit + one verification pass.
+Small wave. One mechanical commit + one verification pass. Completed on 2026-05-16 under existing `v7.8.2`; release workflow run `25959329481` verified `main` and skipped publish jobs because no version bump was required.
 
-#### - [ ] **Unit 1.1: `.gitignore` policy for `.claude/gsd-*` + remove from git index (Phase 2.3)**
+#### - [x] **Unit 1.1: `.gitignore` policy for `.claude/gsd-*` + remove from git index (Phase 2.3)**
 
 **Goal:** Add three gitignore rules + `git rm -r --cached` for `.claude/gsd-local-patches/` and `.claude/get-shit-done/`. Removes ~227 files / ~3400 symbols from the indexed tree. Runtime predicate `is_personal_tooling_path` already lives at `src/live_index/query.rs:786-789`; this is pure repo hygiene.
 
-**Status 2026-05-16:** Prepared and staged locally. `.gitignore` has the three GSD ignore rules, `git ls-files` returns zero for `.claude/gsd-local-patches/`, `.claude/get-shit-done/`, and `.claude/gsd-file-manifest.json`, and representative paths match the new ignore rules. Commit/push remains pending explicit commit permission.
+**Status 2026-05-16:** Complete and pushed as `af888ae` (`chore(gitignore): exclude personal gsd tooling from indexed tree`). `.gitignore` has the three GSD ignore rules, `git ls-files` returns zero for `.claude/gsd-local-patches/`, `.claude/get-shit-done/`, and `.claude/gsd-file-manifest.json`, and representative paths match the new ignore rules.
 
 **Requirements:** R2
 
@@ -411,11 +411,11 @@ Small wave. One mechanical commit + one verification pass.
 - `git status --short` shows expected D entries for the cached files
 - `mcp__symforge__health_compact` after re-index of E:/project/symforge shows file count dropped by ~227 (relative to pre-Wave-1 baseline)
 
-#### - [ ] **Unit 1.2: Wave 1 verification gate (Phase 2.4)**
+#### - [x] **Unit 1.2: Wave 1 verification gate (Phase 2.4)**
 
 **Goal:** Run the four cargo gates. Confirm clean.
 
-**Status 2026-05-16:** Local verification complete. After Unit 1.1 was staged, `cargo check`, `cargo test --all-targets -- --test-threads=1`, `cargo test --all-targets`, `cargo clippy -- -D warnings`, `cargo build --release`, and `cd npm && npm test` all passed. Push remains pending explicit commit permission.
+**Status 2026-05-16:** Complete. After Unit 1.1 was staged, `cargo check`, `cargo test --all-targets -- --test-threads=1`, `cargo test --all-targets`, `cargo clippy -- -D warnings`, `cargo build --release`, and `cd npm && npm test` all passed. `git push origin main` succeeded, and GitHub Release workflow run `25959329481` passed with release/publish jobs skipped.
 
 **Requirements:** R6
 
