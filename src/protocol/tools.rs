@@ -615,6 +615,9 @@ pub struct GetFileContentInput {
     /// Cannot be combined with the fields listed under `offset`.
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
+    /// Optional maximum token budget for the response.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// Input for `validate_file_syntax`.
@@ -6143,19 +6146,23 @@ impl SymForgeServer {
     /// For structured understanding use get_file_context. For a single function
     /// body use get_symbol.
     #[tool(
-        description = "Read exact raw file content. Modes: full file, line range, around_line/around_match/around_symbol, or chunked paging. Use this for exact docs/config reads, whitespace-sensitive inspection, or exact source excerpts after narrowing with get_file_context, search_text, or get_symbol. For structured code understanding use get_file_context first. For a single function body use get_symbol. Accepts offset/limit (Read-tool idiom) as aliases for start_line/end_line. Unknown fields are rejected with an error naming the invalid param. Responses are capped at ~60 KB; if truncated, a footer suggests chunk_index+max_lines, around_line, or around_symbol.",
+        description = "Read exact raw file content. Modes: full file, line range, around_line/around_match/around_symbol, or chunked paging. Use this for exact docs/config reads, whitespace-sensitive inspection, or exact source excerpts after narrowing with get_file_context, search_text, or get_symbol. For structured code understanding use get_file_context first. For a single function body use get_symbol. Accepts offset/limit (Read-tool idiom) as aliases for start_line/end_line. Use max_tokens to request a smaller response budget. Unknown fields are rejected with an error naming the invalid param. Responses are capped at ~60 KB; if truncated, a footer suggests chunk_index+max_lines, around_line, or around_symbol.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
         let mut input = params.0;
         input.path = normalize_exact_path(&input.path);
+        let max_tokens = input.max_tokens;
 
         if let Err(e) = normalize_file_content_aliases(&mut input) {
             return e;
         }
 
         if let Some(result) = self.proxy_tool_call("get_file_content", &input).await {
-            return format::cap_file_content_output(result);
+            return format::enforce_token_budget(
+                format::cap_file_content_output(result),
+                max_tokens,
+            );
         }
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
@@ -6208,7 +6215,10 @@ impl SymForgeServer {
                 // collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                format::cap_file_content_output(format!("{}{}", mode_annotation, output))
+                format::enforce_token_budget(
+                    format::cap_file_content_output(format!("{}{}", mode_annotation, output)),
+                    max_tokens,
+                )
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -6230,10 +6240,13 @@ impl SymForgeServer {
                                 // fallback branch (non-indexed source files);
                                 // collection policy is resolved inside bump_frecency.
                                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                                return format::cap_file_content_output(format!(
-                                    "{}{}",
-                                    mode_annotation, body
-                                ));
+                                return format::enforce_token_budget(
+                                    format::cap_file_content_output(format!(
+                                        "{}{}",
+                                        mode_annotation, body
+                                    )),
+                                    max_tokens,
+                                );
                             }
                             Err(e) => {
                                 return format!("{} [error: could not read file: {e}]", input.path);
@@ -13076,11 +13089,53 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
             result.contains("line 1"),
             "should return file content, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_honors_max_tokens_budget() {
+        let content = b"line one is long\nline two is also long\nline three is also long";
+        let (key, file) = make_file("src/lib.rs", content, vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .get_file_content(Parameters(super::GetFileContentInput {
+                path: "src/lib.rs".to_string(),
+                mode: None,
+                start_line: None,
+                end_line: None,
+                chunk_index: None,
+                max_lines: None,
+                around_line: None,
+                around_match: None,
+                match_occurrence: None,
+                around_symbol: None,
+                symbol_line: None,
+                context_lines: None,
+                show_line_numbers: None,
+                header: None,
+                estimate: None,
+                offset: None,
+                limit: None,
+                max_tokens: Some(8),
+            }))
+            .await;
+        assert!(
+            result.contains("[truncated"),
+            "budgeted read should include truncation notice, got: {result}"
+        );
+        assert!(
+            result.contains("budget is 8 tokens"),
+            "truncation notice should include requested budget, got: {result}"
+        );
+        assert!(
+            !result.contains("line three"),
+            "budgeted read should omit content past budget, got: {result}"
         );
     }
 
@@ -13106,6 +13161,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13138,6 +13194,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "line 2\nline 3");
@@ -13167,6 +13224,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: line 2\n3: line 3");
@@ -13196,6 +13254,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "src/lib.rs [lines 2-3]\n2: line 2\n3: line 3");
@@ -13225,6 +13284,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "2: line 2\n3: line 3\n4: line 4");
@@ -13254,6 +13314,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         // Should succeed (not reject) — header is now allowed with around_line.
@@ -13291,6 +13352,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13323,6 +13385,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: TODO first\n3: line 3");
@@ -13352,6 +13415,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13384,6 +13448,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "Chunk 3 out of range for src/lib.rs (2 chunks)");
@@ -13413,6 +13478,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "No matches for 'needle' in src/lib.rs");
@@ -13442,6 +13508,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "3: line 3\n4: TODO second\n5: line 5");
@@ -13471,6 +13538,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13512,6 +13580,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
 
@@ -13558,6 +13627,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
 
@@ -13599,6 +13669,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: fn connect() {}\n3: line 3");
@@ -13635,6 +13706,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13674,6 +13746,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "3: fn connect() {}");
@@ -13707,6 +13780,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13739,6 +13813,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13771,6 +13846,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13803,6 +13879,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13835,6 +13912,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13867,6 +13945,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -13905,6 +13984,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -13937,6 +14017,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "mode=symbol requires around_symbol");
@@ -13966,6 +14047,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14002,6 +14084,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14038,6 +14121,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14070,6 +14154,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "mode 'search' is not yet implemented");
@@ -14103,6 +14188,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14139,6 +14225,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14171,6 +14258,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -14203,6 +14291,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "mode=match requires around_match");
@@ -14232,6 +14321,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -14264,6 +14354,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -14296,6 +14387,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(result, "mode=chunk requires chunk_index");
@@ -14325,6 +14417,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14357,6 +14450,7 @@ mod tests {
                 estimate: None,
                 offset: None,
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -14382,12 +14476,20 @@ mod tests {
     }
 
     #[test]
+    fn test_get_file_content_input_deserializes_max_tokens() {
+        let json = r#"{"path":"x","max_tokens":1200}"#;
+        let input: super::GetFileContentInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.max_tokens, Some(1200));
+    }
+
+    #[test]
     fn test_get_file_content_input_defaults_all_none() {
         let json = r#"{"path":"x"}"#;
         let input: super::GetFileContentInput = serde_json::from_str(json).unwrap();
         assert!(input.offset.is_none());
         assert!(input.limit.is_none());
         assert!(input.start_line.is_none());
+        assert!(input.max_tokens.is_none());
     }
 
     #[test]
@@ -14432,6 +14534,7 @@ mod tests {
             estimate: None,
             offset,
             limit,
+            max_tokens: None,
         }
     }
 
@@ -14558,6 +14661,7 @@ mod tests {
                 estimate: None,
                 offset: Some(1),
                 limit: Some(2),
+                max_tokens: None,
             }))
             .await;
         // offset=1 → start_line=2, limit=2 → end_line=3
@@ -14588,6 +14692,7 @@ mod tests {
                 estimate: None,
                 offset: Some(1),
                 limit: None,
+                max_tokens: None,
             }))
             .await;
         assert!(

@@ -193,6 +193,17 @@ schema_roundtrip_test!(
     "get_file_content",
     GetFileContentInput
 );
+
+#[test]
+fn get_file_content_schema_includes_max_tokens() {
+    let schema = tool_schema("get_file_content");
+    let props = schema_property_names(&schema);
+    assert!(
+        props.iter().any(|name| name == "max_tokens"),
+        "get_file_content schema should advertise max_tokens"
+    );
+}
+
 schema_roundtrip_test!(
     roundtrip_find_references,
     "find_references",

@@ -208,6 +208,7 @@ impl SymForgeServer {
                     estimate: None,
                     offset: None,
                     limit: None,
+                    max_tokens: None,
                 }))
                 .await
             }
