@@ -1,5 +1,15 @@
 # Changelog
 
+## [7.11.1](https://github.com/special-place-administrator/symforge/compare/v7.11.0...v7.11.1) (2026-05-17)
+
+
+### Bug Fixes
+
+* accept max_tokens for get_file_content ([a826019](https://github.com/special-place-administrator/symforge/commit/a826019729d418f234900f7b5064279b8712fe4c))
+* pin tree-sitter parser versions exactly ([036f46c](https://github.com/special-place-administrator/symforge/commit/036f46c81ebfc4f42e511acf2c90eff3d68a7589))
+* tolerate borrowed raw identifiers in rust parser ([043b884](https://github.com/special-place-administrator/symforge/commit/043b884ad5a6b81cfeb85320bc34f20f6670c952))
+* update tree-sitter parser crates ([9f7ff32](https://github.com/special-place-administrator/symforge/commit/9f7ff32e3c385674f11a2282d37ddcfc41d034d1))
+
 ## [7.11.0](https://github.com/special-place-administrator/symforge/compare/v7.10.0...v7.11.0) (2026-05-17)
 
 
