@@ -255,6 +255,13 @@ fn assert_contains(result: &str, needle: &str) {
     );
 }
 
+fn assert_not_contains(result: &str, needle: &str) {
+    assert!(
+        !result.contains(needle),
+        "expected result to omit `{needle}`; result was:\n{result}"
+    );
+}
+
 fn assert_before(result: &str, first: &str, second: &str) {
     let first_pos = result
         .find(first)
@@ -314,6 +321,30 @@ async fn health_reports_disabled_policy_capability_states() {
         &health,
         "ranking diagnostics: call-time explain available/default-on",
     );
+
+    let compact = call(&fx.server, "health_compact", json!({})).await;
+    assert_contains(&compact, "ranking=call-time explain available/default-on");
+}
+
+#[tokio::test]
+async fn health_reports_ranking_diagnostics_disabled_by_policy_when_env_disabled() {
+    let _debug = EnvGuard::set("SYMFORGE_DEBUG_RANKING", "disabled");
+    let fx = Fixture::new_git(&[("src/lib.rs", HELLO_RS)]);
+
+    let health = call(&fx.server, "health", json!({})).await;
+
+    assert_contains(&health, "ranking diagnostics: disabled by policy");
+    assert_not_contains(
+        &health,
+        "ranking diagnostics: call-time explain available/default-off",
+    );
+    assert_not_contains(
+        &health,
+        "ranking diagnostics: call-time explain available/default-on",
+    );
+
+    let compact = call(&fx.server, "health_compact", json!({})).await;
+    assert_contains(&compact, "ranking=disabled by policy");
 }
 
 #[tokio::test]

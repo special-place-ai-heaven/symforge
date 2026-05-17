@@ -3989,9 +3989,9 @@ pub fn format_frecency_top(entries: &[(std::path::PathBuf, f64)]) -> String {
 
 /// Render the "Last 10 frecency bumps" debug section for the health report.
 ///
-/// Gated at the call-site on `SYMFORGE_DEBUG_RANKING=1`. `entries` comes from
-/// `FrecencyStore::last_10_bumps` (already ordered newest-first). Empty input
-/// produces a short "no data yet" line.
+/// Gated at the call-site by the ranking diagnostics default-on policy.
+/// `entries` comes from `FrecencyStore::last_10_bumps` (already ordered
+/// newest-first). Empty input produces a short "no data yet" line.
 pub fn format_frecency_last_bumps(entries: &[crate::live_index::frecency::BumpEntry]) -> String {
     let mut lines = vec!["── Last 10 frecency bumps ──".to_string()];
     if entries.is_empty() {

@@ -299,7 +299,7 @@ async fn debug_ranking_true_explains_path_cochange_ranking_with_envs_unset() {
 }
 
 #[tokio::test]
-async fn debug_env_defaults_ranking_explanation_on_without_request_field() {
+async fn debug_ranking_default_on_policy_explains_even_without_request_field() {
     let _debug = EnvGuard::set("SYMFORGE_DEBUG_RANKING", "1");
     let fx = Fixture::new(&[("src/auth/routes.rs", "pub fn auth_routes() {}\n")]);
 
@@ -307,4 +307,27 @@ async fn debug_env_defaults_ranking_explanation_on_without_request_field() {
 
     assert_contains(&result, "Ranking explanation");
     assert_contains(&result, "requested rank mode: default path");
+}
+
+#[tokio::test]
+async fn debug_ranking_disabled_by_policy_returns_evidence_and_omits_explanation() {
+    for value in ["disabled", "off", "0", "false", "no", "disable", "bogus"] {
+        let _debug = EnvGuard::set("SYMFORGE_DEBUG_RANKING", value);
+        let fx = Fixture::new(&[("src/auth/routes.rs", "pub fn auth_routes() {}\n")]);
+
+        let result = call(
+            &fx.server,
+            json!({"query": "routes.rs", "limit": 10, "debug_ranking": true}),
+        )
+        .await;
+
+        assert_contains(&result, "src/auth/routes.rs");
+        assert_contains(
+            &result,
+            "Capability: ranking diagnostics disabled by policy -",
+        );
+        assert_contains(&result, "ranking explanation omitted");
+        assert_not_contains(&result, "Ranking explanation");
+        assert_not_contains(&result, "requested rank mode:");
+    }
 }

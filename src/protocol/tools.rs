@@ -27,7 +27,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::capability::{
     CapabilityCost, CapabilityEvidence, CapabilityFreshness, CapabilityName, CapabilitySafety,
-    CapabilityStatus, CouplingPreparePolicy, FrecencyCollectionPolicy, WorktreeRoutingPolicy,
+    CapabilityStatus, CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
+    WorktreeRoutingPolicy,
 };
 
 /// Deserialize a `u32` from either a JSON number or a stringified number like `"5"`.
@@ -484,7 +485,7 @@ pub struct SearchFilesInput {
     /// Optional maximum token budget for the response.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// When true, append a compact ranking explanation for this call without requiring `SYMFORGE_DEBUG_RANKING=1`.
+    /// When true, append a compact ranking explanation unless ranking diagnostics are disabled by policy.
     /// Missing values default off; `SYMFORGE_DEBUG_RANKING=1` may still default diagnostics on operationally.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub debug_ranking: Option<bool>,
@@ -2446,9 +2447,64 @@ fn frecency_ranking_evidence(
         .with_detail(detail)
 }
 
-fn search_files_debug_ranking_requested(input: &SearchFilesInput) -> bool {
-    input.debug_ranking.unwrap_or(false)
-        || std::env::var("SYMFORGE_DEBUG_RANKING").as_deref() == Ok("1")
+const RANKING_DIAGNOSTICS_ENV: &str = "SYMFORGE_DEBUG_RANKING";
+
+fn ranking_diagnostics_policy_from_env() -> RankingDiagnosticsPolicy {
+    match std::env::var(RANKING_DIAGNOSTICS_ENV) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" => RankingDiagnosticsPolicy::CallTimeExplain,
+            "1" | "true" | "on" | "yes" | "default-on" => RankingDiagnosticsPolicy::DefaultOn,
+            "0" | "false" | "no" | "off" | "disabled" | "disable" => {
+                RankingDiagnosticsPolicy::Disabled
+            }
+            _ => RankingDiagnosticsPolicy::Disabled,
+        },
+        Err(std::env::VarError::NotPresent) => RankingDiagnosticsPolicy::CallTimeExplain,
+        Err(std::env::VarError::NotUnicode(_)) => RankingDiagnosticsPolicy::Disabled,
+    }
+}
+
+struct SearchFilesRankingDiagnosticsDecision {
+    explain: bool,
+    evidence: Option<CapabilityEvidence>,
+}
+
+fn ranking_diagnostics_evidence(
+    status: CapabilityStatus,
+    detail: impl Into<String>,
+) -> CapabilityEvidence {
+    CapabilityEvidence::new(CapabilityName::RankingDiagnostics, status)
+        .with_freshness(CapabilityFreshness::Current)
+        .with_safety(CapabilitySafety::ReadOnly)
+        .with_detail(detail)
+}
+
+fn search_files_debug_ranking_requested(
+    input: &SearchFilesInput,
+) -> SearchFilesRankingDiagnosticsDecision {
+    match ranking_diagnostics_policy_from_env() {
+        RankingDiagnosticsPolicy::CallTimeExplain => SearchFilesRankingDiagnosticsDecision {
+            explain: input.debug_ranking.unwrap_or(false),
+            evidence: None,
+        },
+        RankingDiagnosticsPolicy::DefaultOn => SearchFilesRankingDiagnosticsDecision {
+            explain: true,
+            evidence: None,
+        },
+        RankingDiagnosticsPolicy::Disabled if input.debug_ranking.unwrap_or(false) => {
+            SearchFilesRankingDiagnosticsDecision {
+                explain: false,
+                evidence: Some(ranking_diagnostics_evidence(
+                    CapabilityStatus::DisabledByPolicy,
+                    "operator policy disabled ranking diagnostics; ranking explanation omitted",
+                )),
+            }
+        }
+        RankingDiagnosticsPolicy::Disabled => SearchFilesRankingDiagnosticsDecision {
+            explain: false,
+            evidence: None,
+        },
+    }
 }
 
 fn search_files_rank_mode_label(rank_by: Option<&str>) -> &'static str {
@@ -2693,10 +2749,12 @@ fn worktree_routing_health_status() -> String {
 }
 
 fn ranking_diagnostics_health_status() -> String {
-    if std::env::var("SYMFORGE_DEBUG_RANKING").as_deref() == Ok("1") {
-        "call-time explain available/default-on".to_string()
-    } else {
-        "call-time explain available/default-off".to_string()
+    match ranking_diagnostics_policy_from_env() {
+        RankingDiagnosticsPolicy::CallTimeExplain => {
+            "call-time explain available/default-off".to_string()
+        }
+        RankingDiagnosticsPolicy::DefaultOn => "call-time explain available/default-on".to_string(),
+        RankingDiagnosticsPolicy::Disabled => "disabled by policy".to_string(),
     }
 }
 
@@ -5268,7 +5326,8 @@ impl SymForgeServer {
 
         let rank_by_path_cochange = params.0.rank_by.as_deref() == Some("path+cochange");
         let rank_by_frecency = params.0.rank_by.as_deref() == Some("frecency");
-        let debug_ranking = search_files_debug_ranking_requested(&params.0);
+        let ranking_diagnostics = search_files_debug_ranking_requested(&params.0);
+        let debug_ranking = ranking_diagnostics.explain;
         let mut cochange_evidence: Option<CapabilityEvidence> = None;
         let mut frecency_evidence: Option<CapabilityEvidence> = None;
         let mut hidden_noise_count = 0usize;
@@ -5505,6 +5564,10 @@ impl SymForgeServer {
             result.push_str("\n\n");
             result.push_str(&format::capability_evidence_line(evidence));
         }
+        if let Some(evidence) = ranking_diagnostics.evidence.as_ref() {
+            result.push_str("\n\n");
+            result.push_str(&format::capability_evidence_line(evidence));
+        }
         if debug_ranking {
             result.push_str("\n\n");
             result.push_str(&search_files_ranking_explanation(
@@ -5631,9 +5694,9 @@ impl SymForgeServer {
                 result.push_str(&format::format_frecency_top(&top));
             }
             // "Last 10 frecency bumps" is additionally gated on
-            // SYMFORGE_DEBUG_RANKING=1 per CONTEXT.md §Scope — debug-only
+            // the ranking diagnostics default-on policy; it is a debug-only
             // surface for ranker tuning, not the default health view.
-            if std::env::var("SYMFORGE_DEBUG_RANKING").as_deref() == Ok("1")
+            if ranking_diagnostics_policy_from_env() == RankingDiagnosticsPolicy::DefaultOn
                 && let Ok(last) = store.last_10_bumps()
             {
                 result.push('\n');

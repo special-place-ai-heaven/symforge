@@ -70,3 +70,9 @@ edit: rerouted: true
 - Health reports capability state at workspace/policy level. Per-query ranking reasons remain in `search_files(debug_ranking=true)`.
 - Frecency health can detect persistent history presence, but current-process session history is intentionally not enumerated in health.
 - Co-change health does not start lazy preparation; it only reports whether a request would use ready/current state, prepare/fallback, stale/fallback, unavailable, or disabled-by-policy state.
+
+## Follow-Up: Ranking Diagnostics Policy Enforcement (2026-05-17)
+
+Gap: `RankingDiagnosticsPolicy::Disabled` existed, but `search_files(debug_ranking=true)`, ranking diagnostics health, and the last-10 bumps health gate read `SYMFORGE_DEBUG_RANKING` directly and only recognized `1`.
+
+Close: ranking diagnostics now use one env-to-policy helper. `disabled`/`off`/`0`/`false`/`no`/`disable` and unknown values map to disabled policy; requested ranking diagnostics return disabled-by-policy evidence and omit the ranking explanation block. Health reports `ranking diagnostics: disabled by policy` under the same policy.
