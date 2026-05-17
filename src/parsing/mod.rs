@@ -3,6 +3,7 @@ pub mod config_extractors;
 pub mod languages;
 pub mod xref;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic;
 
@@ -185,6 +186,105 @@ fn collect_first_error_node(root: &Node, source: &str) -> Option<(String, u32, u
     None
 }
 
+fn rust_parser_source(source: &str) -> Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let mut patched: Option<Vec<u8>> = None;
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'&' {
+            continue;
+        }
+
+        let raw_start = skip_rust_trivia(bytes, idx + 1);
+        let Some(raw_end) = raw_start.checked_add(3) else {
+            continue;
+        };
+        if raw_end > bytes.len() || &bytes[raw_start..raw_end] != b"raw" {
+            continue;
+        }
+        if bytes
+            .get(raw_end)
+            .is_some_and(|next| is_rust_ident_continue(*next))
+        {
+            continue;
+        }
+
+        let next_token = skip_rust_trivia(bytes, raw_end);
+        if starts_keyword_token(bytes, next_token, b"const")
+            || starts_keyword_token(bytes, next_token, b"mut")
+        {
+            continue;
+        }
+
+        let out = patched.get_or_insert_with(|| bytes.to_vec());
+        out[raw_start..raw_end].copy_from_slice(b"r__");
+    }
+
+    match patched {
+        Some(bytes) => Cow::Owned(String::from_utf8(bytes).expect("source started as UTF-8")),
+        None => Cow::Borrowed(source),
+    }
+}
+
+fn skip_rust_trivia(bytes: &[u8], mut idx: usize) -> usize {
+    loop {
+        while bytes.get(idx).is_some_and(|b| b.is_ascii_whitespace()) {
+            idx += 1;
+        }
+
+        if bytes.get(idx..idx + 2) == Some(b"//") {
+            idx += 2;
+            while bytes.get(idx).is_some_and(|b| *b != b'\n') {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if bytes.get(idx..idx + 2) == Some(b"/*") {
+            idx = skip_rust_block_comment(bytes, idx + 2);
+            continue;
+        }
+
+        return idx;
+    }
+}
+
+fn skip_rust_block_comment(bytes: &[u8], mut idx: usize) -> usize {
+    let mut depth = 1usize;
+    while idx + 1 < bytes.len() {
+        match &bytes[idx..idx + 2] {
+            b"/*" => {
+                depth += 1;
+                idx += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                idx += 2;
+                if depth == 0 {
+                    return idx;
+                }
+            }
+            _ => idx += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn starts_keyword_token(bytes: &[u8], idx: usize, keyword: &[u8]) -> bool {
+    let Some(end) = idx.checked_add(keyword.len()) else {
+        return false;
+    };
+    end <= bytes.len()
+        && &bytes[idx..end] == keyword
+        && !bytes
+            .get(end)
+            .is_some_and(|next| is_rust_ident_continue(*next))
+}
+
+fn is_rust_ident_continue(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric() || byte >= 0x80
+}
+
 pub(crate) fn parse_source(
     source: &str,
     language: &LanguageId,
@@ -222,8 +322,13 @@ pub(crate) fn parse_source(
         .set_language(&ts_language)
         .map_err(|e| format!("failed to set language: {e}"))?;
 
+    let parser_source = if matches!(language, LanguageId::Rust) {
+        rust_parser_source(source)
+    } else {
+        Cow::Borrowed(source)
+    };
     let tree = parser
-        .parse(source, None)
+        .parse(parser_source.as_ref(), None)
         .ok_or_else(|| "tree-sitter parse returned None".to_string())?;
 
     let root = tree.root_node();
@@ -289,6 +394,20 @@ mod tests {
         assert!(!result.symbols.is_empty());
         assert_eq!(result.symbols[0].name, "hello");
         assert_eq!(result.symbols[0].kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_process_file_rust_accepts_borrowed_raw_identifier() {
+        let source = b"fn main() { let raw = 1; let _x = &raw; }";
+        let result = process_file("test.rs", source, LanguageId::Rust);
+        assert_eq!(result.outcome, FileOutcome::Processed);
+    }
+
+    #[test]
+    fn test_process_file_rust_preserves_raw_borrow_syntax() {
+        let source = b"fn main() { let value = 1; let _ptr = &raw const value; }";
+        let result = process_file("test.rs", source, LanguageId::Rust);
+        assert_eq!(result.outcome, FileOutcome::Processed);
     }
 
     #[test]
