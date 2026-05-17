@@ -1,5 +1,19 @@
 # Changelog
 
+## [7.11.0](https://github.com/special-place-administrator/symforge/compare/v7.10.0...v7.11.0) (2026-05-17)
+
+
+### Features
+
+* **edit:** enable call-time worktree routing ([cede566](https://github.com/special-place-administrator/symforge/commit/cede566ad00e5d206da3efb8ed419391fb6aa35b))
+* resolve cochange ranking lazily ([7d374ef](https://github.com/special-place-administrator/symforge/commit/7d374ef98a06a33c83629a254b01f29935719f55))
+
+
+### Bug Fixes
+
+* restore worktree misuse counter gate ([5ed437c](https://github.com/special-place-administrator/symforge/commit/5ed437cea488b92ceff53df06e4c28824d7541f2))
+* reuse cached frecency store for ranking ([69431df](https://github.com/special-place-administrator/symforge/commit/69431dfef589644b639e67a428f131bb824f7c13))
+
 ## [7.10.0](https://github.com/special-place-administrator/symforge/compare/v7.9.2...v7.10.0) (2026-05-16)
 
 
