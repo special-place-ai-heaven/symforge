@@ -4,10 +4,8 @@
 //! index. When an agent runs from inside a parallel `git worktree` that
 //! shares the same `.git` objects, an edit that resolves against the
 //! indexed absolute path silently writes to the *indexed* repo copy
-//! instead of the agent's own working tree. See
-//! `docs/decisions/0010-worktree-working-directory.md` for the full
-//! story and `wiki/concepts/SymForge Worktree Awareness.md` §2.2 for the
-//! resolution algorithm implemented here.
+//! instead of the agent's own working tree. The resolver below implements
+//! explicit call-time routing through the `working_directory` edit parameter.
 //!
 //! The edit handlers call [`resolve_target_path`] before writing. When
 //! `working_directory` is `None`, behavior is byte-identical to pre-routing

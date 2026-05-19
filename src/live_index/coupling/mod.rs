@@ -2,9 +2,8 @@
 //!
 //! Populated by a bounded git-history walker; queried at rerank time to
 //! promote files and symbols that historically ride with the query's
-//! anchor. Step 1.1 provides storage primitives only — cold-build,
-//! symbol-identity resolution, HEAD-delta updates, and ranker fusion
-//! land in subsequent steps per `docs/plans/cochange-coupling-execution.md`.
+//! anchor. This module owns storage, cold-build, HEAD-delta updates, lazy
+//! preparation, and ranker-facing evidence for co-change signals.
 
 pub mod lifecycle;
 pub mod schema;

@@ -145,7 +145,7 @@ After setup, confirm in your client that the SymForge MCP server is connected or
 
 ### Worktree awareness
 
-All seven edit tools accept an optional `working_directory` parameter pointing at a sibling `git worktree` of the indexed repo. Supplying that parameter is explicit call-time routing consent: SymForge validates the worktree before writing, re-roots the symbol's indexed path onto that worktree, and reports `working_directory`, `wrote_to`, `indexed_path`, and `rerouted` so callers can verify the target. Reads still come from the indexed path; only writes reroute. `SYMFORGE_WORKTREE_AWARE` is an operational policy/default knob: unset allows explicit call-time routing, while false/off/disabled values block requested routing before write. See [ADR 0010](docs/decisions/0010-worktree-working-directory.md) and [ADR 0016](docs/decisions/0016-call-time-capability-resolution.md).
+All seven edit tools accept an optional `working_directory` parameter pointing at a sibling `git worktree` of the indexed repo. Supplying that parameter is explicit call-time routing consent: SymForge validates the worktree before writing, re-roots the symbol's indexed path onto that worktree, and reports `working_directory`, `wrote_to`, `indexed_path`, and `rerouted` so callers can verify the target. Reads still come from the indexed path; only writes reroute. `SYMFORGE_WORKTREE_AWARE` is an operational policy/default knob: unset allows explicit call-time routing, while false/off/disabled values block requested routing before write.
 
 ```json
 {
@@ -159,7 +159,7 @@ All seven edit tools accept an optional `working_directory` parameter pointing a
 
 ### Ranking signals
 
-`search_files` ranks path matches by default and can opt into additional signals when the caller requests them. SymForge is migrating optional ranking capabilities to a call-time contract: a requested capability should be applied, prepared with evidence, reported unavailable, or reported disabled by policy. Frecency and co-change ranking follow that contract now; other optional capabilities may still carry transitional gates until their migration tasks land. The variables below are policy/default controls, not the only path for an LLM to request advertised behavior. See [ADR 0016](docs/decisions/0016-call-time-capability-resolution.md).
+`search_files` ranks path matches by default and can opt into additional signals when the caller requests them. SymForge uses a call-time contract for optional ranking capabilities: a requested capability should be applied, prepared with evidence, reported unavailable, or reported disabled by policy. Frecency and co-change ranking follow that contract now; other optional capabilities may still carry transitional gates until their migration tasks land. The variables below are policy/default controls, not the only path for an LLM to request advertised behavior.
 
 `health` and `health_compact` include a compact capability summary so operators can see the current call-time state without turning ranking responses into logs:
 
@@ -173,7 +173,7 @@ Capabilities:
 
 The status labels distinguish ready/current, preparing, unavailable, disabled-by-policy, stale, and fallback-used states where they apply. Detailed per-query ranking reasons stay in `search_files(debug_ranking=true)`.
 
-Use `rank_by="frecency"` to request fusion of a per-workspace frecency signal with path matching. Frecency decays on a 7-day half-life, so a file you touched five minutes ago outranks one you hit ten times six months ago. The request uses available current-session or existing persistent frecency history; if there is no useful history, the store is unavailable, or policy disables frecency, the response returns path ranking with explicit capability evidence. Omit `rank_by` for the default path-based order. See [ADR 0011](docs/decisions/0011-frecency-bump-policy.md).
+Use `rank_by="frecency"` to request fusion of a per-workspace frecency signal with path matching. Frecency decays on a 7-day half-life, so a file you touched five minutes ago outranks one you hit ten times six months ago. The request uses available current-session or existing persistent frecency history; if there is no useful history, the store is unavailable, or policy disables frecency, the response returns path ranking with explicit capability evidence. Omit `rank_by` for the default path-based order.
 
 ```json
 {
@@ -260,7 +260,7 @@ Each of the seven edit tools accepts an optional `working_directory` parameter p
 
 **`RankSignal`** wraps `search_files` scoring contributions. Each signal carries a name, a weight, and a `score()` function, and the ranker combines registered signals into a weighted sum. Path matching, co-change evidence, and frecency use this extension point, so ranking behavior can evolve without rewriting the search handler.
 
-See [ADR 0012](docs/decisions/0012-edit-and-ranker-hook-architecture.md) for the rationale and the feature plug-in pattern.
+This keeps worktree routing and ranking features isolated from the core tool handlers while still making their call-time behavior explicit in each response.
 
 ## Operational notes
 

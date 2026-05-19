@@ -5937,8 +5937,8 @@ impl SymForgeServer {
         // Append frecency diagnostics when SYMFORGE_FRECENCY=1. The feature-flag
         // guard mirrors the one in `frecency::bump`; when the flag is unset,
         // the health output is byte-identical to pre-frecency releases.
-        // See `docs/decisions/0011-frecency-bump-policy.md` for the visibility
-        // rationale (Implementation Notes §Visibility: last-10 bumps in `health`).
+        // Keep the diagnostic bounded to the last 10 bumps so health remains
+        // useful without turning into an analytics dump.
         if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
             && let Some(repo_root) = self.capture_repo_root()
             && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(

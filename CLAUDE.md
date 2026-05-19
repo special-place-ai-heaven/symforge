@@ -27,7 +27,3 @@ When merging tools A into B:
 5. Remove A from `SYMFORGE_TOOL_NAMES` in `src/cli/init.rs`
 6. Update cross-reference descriptions in other tools
 7. Update tests: add new field initializers, add mode-specific tests
-
-## Codex Integration
-
-See [docs/codex-integration-ceiling.md](docs/codex-integration-ceiling.md).
