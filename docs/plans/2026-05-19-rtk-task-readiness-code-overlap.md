@@ -3,6 +3,8 @@
 Date: 2026-05-19
 Scope: compare the copied RTK goal chain in `.agent/goals/rtk-symforge-integration/`, the latest planning report at `docs/plans/2026-05-19-rtk-integration-state-for-planning.md`, the vault concept note `wiki/concepts/RTK Techniques for SymForge.md`, and current SymForge code.
 
+Status update: superseded for active execution by the surgical package in `.agent/goals/symforge-rtk-surgical/` and `docs/plans/2026-05-19-symforge-rtk-surgical-code-analysis.md`. This file remains as historical overlap evidence; use the SRTK goal chain for execution.
+
 ## Executive Summary
 
 The generated RTK goal chain is directionally useful, but it should be treated as a planning backlog, not as an implementation order to execute blindly.
