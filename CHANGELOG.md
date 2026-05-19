@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.12.0](https://github.com/special-place-administrator/symforge/compare/v7.11.1...v7.12.0) (2026-05-19)
+
+
+### Features
+
+* ship RTK surgical hardening ([aa66ee7](https://github.com/special-place-administrator/symforge/commit/aa66ee70455fb79d9ce6fba08987e7ca24f68be2))
+
 ## [7.11.1](https://github.com/special-place-administrator/symforge/compare/v7.11.0...v7.11.1) (2026-05-17)
 
 
