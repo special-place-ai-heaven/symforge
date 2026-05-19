@@ -2,13 +2,13 @@
 goal_id: SRTK08
 title: Tier metadata lookup helpers
 phase: Wave C - graceful degradation foundation
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T20:12:58.7939599+02:00"
+completed_at: "2026-05-19T20:26:14.5908782+02:00"
+completion_commit: "1389bf3986bd894beaae2e449765cd501d624734"
 ---
 
 # SRTK08 - Tier metadata lookup helpers

@@ -2,13 +2,13 @@
 goal_id: SRTK11
 title: structural search compile hotspot investigation
 phase: Wave C - evidence-gated perf
-status: "Pending"
+status: "Completed"
 depends_on: ["SRTK03"]
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T21:31:48.6864707+02:00"
+completed_at: "2026-05-19T21:44:36.2106231+02:00"
+completion_commit: "a8c45e7963016a2513ad314c35f7351a2afe9950"
 ---
 
 # SRTK11 - structural search compile hotspot investigation

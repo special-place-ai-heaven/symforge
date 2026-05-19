@@ -63,6 +63,7 @@ async fn wait_for_shutdown(port: u16) {
 /// matching the alias branch, or `get_symbol_context` changes how
 /// `sections = Some(empty)` behaves — the two responses diverge and this
 /// test fails loudly.
+#[allow(unsafe_code)] // test-only daemon home override is scoped to this async test.
 #[tokio::test]
 async fn trace_symbol_alias_routes_to_get_symbol_context() {
     let daemon_home = TempDir::new().expect("daemon home temp dir");

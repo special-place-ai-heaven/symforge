@@ -59,6 +59,7 @@ struct WorktreePolicyEnvGuard {
     previous: Option<String>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes worktree policy mutation.
 impl WorktreePolicyEnvGuard {
     fn remove() -> Self {
         let previous = std::env::var("SYMFORGE_WORKTREE_AWARE").ok();
@@ -75,6 +76,7 @@ impl WorktreePolicyEnvGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized worktree policy mutation.
 impl Drop for WorktreePolicyEnvGuard {
     fn drop(&mut self) {
         // SAFETY: tests are `--test-threads=1` per project policy.

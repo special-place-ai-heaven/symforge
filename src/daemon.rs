@@ -1826,6 +1826,7 @@ fn cleanup_daemon_runtime_files() {
     }
 }
 
+#[allow(unsafe_code)] // Unix process signaling requires libc::kill; Windows uses taskkill.
 fn terminate_process(pid: u32) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -1941,6 +1942,7 @@ mod tests {
         previous: Option<OsString>,
     }
 
+    #[allow(unsafe_code)] // test-only env guard serializes process env mutation.
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let previous = std::env::var_os(key);
@@ -1952,6 +1954,7 @@ mod tests {
         }
     }
 
+    #[allow(unsafe_code)] // test-only env guard restores serialized process env mutation.
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match &self.previous {

@@ -2,13 +2,13 @@
 goal_id: SRTK07
 title: trust control surface and warning envelope
 phase: Wave B - trust integration
-status: "Pending"
+status: "Completed"
 depends_on: ["SRTK05", "SRTK06"]
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T19:43:44.8572530+02:00"
+completed_at: "2026-05-19T20:07:43.2788500+02:00"
+completion_commit: "8ccef85bd3c1112daeb2f7effd115d24fead3ff1"
 ---
 
 # SRTK07 - trust control surface and warning envelope

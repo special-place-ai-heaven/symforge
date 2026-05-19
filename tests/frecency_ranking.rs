@@ -80,6 +80,7 @@ struct FlagGuard {
     _g: std::sync::MutexGuard<'static, ()>,
 }
 
+#[allow(unsafe_code)] // test-only flag guard serializes frecency env mutation.
 impl FlagGuard {
     fn on() -> Self {
         let g = FRECENCY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -90,6 +91,7 @@ impl FlagGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only flag guard restores serialized frecency env mutation.
 impl Drop for FlagGuard {
     fn drop(&mut self) {
         // SAFETY: see FlagGuard::on.

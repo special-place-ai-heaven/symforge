@@ -2,13 +2,13 @@
 goal_id: SRTK12
 title: frecency read-path no-footprint audit
 phase: Wave C - evidence-gated perf
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T21:48:58.2017740+02:00"
+completed_at: "2026-05-19T21:59:01.6382863+02:00"
+completion_commit: "3b5b994d2f5a02302a534ef6ac3d7b61115e7f19"
 ---
 
 # SRTK12 - frecency read-path no-footprint audit

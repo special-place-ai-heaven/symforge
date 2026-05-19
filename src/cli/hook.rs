@@ -1955,6 +1955,7 @@ mod tests {
 
     // ---- HOOK-02: is_hook_verbose ----
 
+    #[allow(unsafe_code)] // test-only env mutation is serialized by HOOK_VERBOSE_ENV_LOCK.
     #[test]
     fn hook_verbose_returns_false_when_unset() {
         let _guard = HOOK_VERBOSE_ENV_LOCK.lock().unwrap();
@@ -1963,6 +1964,7 @@ mod tests {
         assert!(!is_hook_verbose());
     }
 
+    #[allow(unsafe_code)] // test-only env mutation is serialized by HOOK_VERBOSE_ENV_LOCK.
     #[test]
     fn hook_verbose_returns_true_when_set_to_1() {
         let _guard = HOOK_VERBOSE_ENV_LOCK.lock().unwrap();
@@ -1973,6 +1975,7 @@ mod tests {
         assert!(result);
     }
 
+    #[allow(unsafe_code)] // test-only env mutation is serialized by HOOK_VERBOSE_ENV_LOCK.
     #[test]
     fn hook_verbose_returns_false_for_other_values() {
         let _guard = HOOK_VERBOSE_ENV_LOCK.lock().unwrap();

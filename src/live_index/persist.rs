@@ -1664,6 +1664,7 @@ mod tests {
     // sibling test that forgets to clear) cannot interleave env transitions.
     static FRECENCY_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    #[allow(unsafe_code)] // test-only flag helper runs under FRECENCY_ENV_LOCK.
     fn clear_frecency_flag() {
         // SAFETY: callers hold FRECENCY_ENV_LOCK and tests run with
         // --test-threads=1 per the project test policy.
@@ -1830,6 +1831,7 @@ mod tests {
         );
     }
 
+    #[allow(unsafe_code)] // test-only flag mutation runs under FRECENCY_ENV_LOCK.
     #[test]
     fn init_frecency_store_with_flag_on_wires_boot_policy() {
         let _g = FRECENCY_ENV_LOCK.lock().unwrap();

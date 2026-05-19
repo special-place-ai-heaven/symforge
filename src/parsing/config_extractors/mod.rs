@@ -1,8 +1,4 @@
-pub mod env;
-pub mod json;
-pub mod markdown;
-pub mod toml_ext;
-pub mod yaml;
+automod::dir!("src/parsing/config_extractors");
 
 use crate::domain::{LanguageId, SymbolRecord};
 

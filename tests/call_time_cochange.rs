@@ -10,6 +10,7 @@ struct EnvGuard {
     previous: Option<std::ffi::OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes process env mutation.
 impl EnvGuard {
     fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
@@ -21,6 +22,7 @@ impl EnvGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized process env mutation.
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {

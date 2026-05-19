@@ -274,11 +274,13 @@ mod tests {
     // FRECENCY_ENV_LOCK. Project test policy already enforces --test-threads=1.
     static COUPLING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    #[allow(unsafe_code)] // test-only flag helper runs under COUPLING_ENV_LOCK.
     fn set_flag_on() {
         // SAFETY: callers hold COUPLING_ENV_LOCK; tests run single-threaded.
         unsafe { std::env::set_var(COUPLING_FLAG_ENV, "1") };
     }
 
+    #[allow(unsafe_code)] // test-only flag helper runs under COUPLING_ENV_LOCK.
     fn clear_flag() {
         // SAFETY: callers hold COUPLING_ENV_LOCK; tests run single-threaded.
         unsafe { std::env::remove_var(COUPLING_FLAG_ENV) };

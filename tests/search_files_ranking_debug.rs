@@ -20,6 +20,7 @@ struct EnvGuard {
     previous: Option<std::ffi::OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes ranking policy mutation.
 impl EnvGuard {
     fn remove(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
@@ -40,6 +41,7 @@ impl EnvGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized ranking policy mutation.
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {

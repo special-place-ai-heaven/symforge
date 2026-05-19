@@ -76,7 +76,19 @@ fn find_name(node: &Node, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::LanguageId;
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        python_inline_test_extracts_function,
+        LanguageId::Python,
+        r#"
+def inline_python_probe():
+    pass
+"#,
+        [(SymbolKind::Function, "inline_python_probe")]
+    );
 
     fn parse_python(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::domain::index::{AdmissionTier, SkipReason};
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
 use crate::watcher::{WatcherInfo, WatcherState};
 
@@ -903,6 +904,17 @@ pub struct HealthStats {
     pub local_empty_reason: Option<String>,
 }
 
+/// Owned per-path admission-tier lookup result for protocol handlers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionTierLookupView {
+    pub tier: AdmissionTier,
+    pub path: String,
+    pub size: Option<u64>,
+    pub extension: Option<String>,
+    pub language: Option<LanguageId>,
+    pub reason: Option<SkipReason>,
+}
+
 /// Owned entry used to render the repo outline after releasing the index lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoOutlineFileView {
@@ -1318,6 +1330,36 @@ impl LiveIndex {
     /// Iterate all (path, file) pairs in the index.
     pub fn all_files(&self) -> impl Iterator<Item = (&String, &IndexedFile)> {
         self.files.iter().map(|(path, file)| (path, file.as_ref()))
+    }
+
+    /// Capture per-path admission-tier metadata without changing tool response behavior.
+    pub fn capture_admission_tier_lookup_view(
+        &self,
+        relative_path: &str,
+    ) -> Option<AdmissionTierLookupView> {
+        let path = normalize_path_query(relative_path);
+        if let Some(file) = self.files.get(&path) {
+            return Some(AdmissionTierLookupView {
+                tier: AdmissionTier::Normal,
+                path: file.relative_path.clone(),
+                size: Some(file.byte_len),
+                extension: None,
+                language: Some(file.language.clone()),
+                reason: None,
+            });
+        }
+
+        self.skipped_files
+            .iter()
+            .find(|skipped| normalize_path_query(&skipped.path) == path)
+            .map(|skipped| AdmissionTierLookupView {
+                tier: skipped.tier(),
+                path: skipped.path.clone(),
+                size: Some(skipped.size),
+                extension: skipped.extension.clone(),
+                language: None,
+                reason: skipped.reason(),
+            })
     }
 
     /// Capture a shared immutable file entry under the read lock.
@@ -3389,8 +3431,10 @@ impl LiveIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextBundleView, SearchFilesHit, SearchFilesResolveView, SearchFilesTier, SearchFilesView,
+        AdmissionTierLookupView, ContextBundleView, SearchFilesHit, SearchFilesResolveView,
+        SearchFilesTier, SearchFilesView,
     };
+    use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
     use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
     use crate::live_index::store::{
         CircuitBreakerState, IndexState, IndexedFile, LiveIndex, ParseStatus,
@@ -3616,6 +3660,77 @@ mod tests {
         let index = make_index(vec![("a.rs", f1), ("b.rs", f2)], false);
         let pairs: Vec<_> = index.all_files().collect();
         assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_capture_admission_tier_lookup_view_returns_tier1_indexed_metadata() {
+        let file = make_indexed_file(
+            "src/main.rs",
+            vec![make_symbol("main")],
+            ParseStatus::Parsed,
+        );
+        let index = make_index(vec![("src/main.rs", file)], false);
+
+        assert_eq!(
+            index.capture_admission_tier_lookup_view("./src\\main.rs"),
+            Some(AdmissionTierLookupView {
+                tier: AdmissionTier::Normal,
+                path: "src/main.rs".to_string(),
+                size: Some(12),
+                extension: None,
+                language: Some(LanguageId::Rust),
+                reason: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_capture_admission_tier_lookup_view_returns_tier2_skipped_metadata() {
+        let mut index = make_index(vec![], false);
+        index.add_skipped_file(SkippedFile {
+            path: "models/v1.safetensors".to_string(),
+            size: 4096,
+            extension: Some("safetensors".to_string()),
+            decision: AdmissionDecision::skip(
+                AdmissionTier::MetadataOnly,
+                SkipReason::DenylistedExtension,
+            ),
+        });
+
+        assert_eq!(
+            index.capture_admission_tier_lookup_view("models\\v1.safetensors"),
+            Some(AdmissionTierLookupView {
+                tier: AdmissionTier::MetadataOnly,
+                path: "models/v1.safetensors".to_string(),
+                size: Some(4096),
+                extension: Some("safetensors".to_string()),
+                language: None,
+                reason: Some(SkipReason::DenylistedExtension),
+            })
+        );
+    }
+
+    #[test]
+    fn test_capture_admission_tier_lookup_view_returns_tier3_reason() {
+        let mut index = make_index(vec![], false);
+        index.add_skipped_file(SkippedFile {
+            path: "artifacts/huge.bin".to_string(),
+            size: 150 * 1024 * 1024,
+            extension: Some("bin".to_string()),
+            decision: AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
+        });
+
+        assert_eq!(
+            index.capture_admission_tier_lookup_view("./artifacts\\huge.bin"),
+            Some(AdmissionTierLookupView {
+                tier: AdmissionTier::HardSkip,
+                path: "artifacts/huge.bin".to_string(),
+                size: Some(150 * 1024 * 1024),
+                extension: Some("bin".to_string()),
+                language: None,
+                reason: Some(SkipReason::SizeCeiling),
+            })
+        );
     }
 
     #[test]

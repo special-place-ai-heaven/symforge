@@ -24,6 +24,7 @@ struct EnvVarGuard {
     previous: Option<OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes watcher env mutation.
 impl EnvVarGuard {
     fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let previous = std::env::var_os(key);
@@ -35,6 +36,7 @@ impl EnvVarGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized watcher env mutation.
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match &self.previous {

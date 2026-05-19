@@ -78,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         Some(cli::Commands::Init { client }) => cli::init::run_init(client),
         Some(cli::Commands::Daemon) => run_daemon(),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
+        Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
         None => run_mcp_server(),
     }
 }

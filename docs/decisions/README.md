@@ -80,3 +80,8 @@ What becomes easier and what becomes harder. Call out:
 | 0010 | Worktree-aware edit routing via `working_directory`                   | Accepted | 2026-04-18 |
 | 0011 | Frecency bump policy: commitment tools only, never discovery          | Accepted | 2026-04-18 |
 | 0012 | Edit-tool and Rank-signal Extension Points                            | Accepted | 2026-04-18 |
+| 0013 | Coupling Signal Contract                                              | Accepted | 2026-04-18 |
+| 0014 | Watcher-Subsystem Spawn-Blocking Discipline                           | Accepted | 2026-05-15 |
+| 0015 | Project-config trust gating for `.symforge`                           | Accepted | 2026-05-19 |
+| 0016 | Call-Time Capability Resolution                                       | Accepted | 2026-05-16 |
+| 0017 | Local Tool-Call Analytics                                             | Accepted | 2026-05-19 |

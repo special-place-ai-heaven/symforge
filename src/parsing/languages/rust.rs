@@ -91,3 +91,18 @@ fn extract_impl_name(node: &Node, source: &str) -> Option<String> {
 
     trait_name.map(|n| format!("impl {n}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::domain::{LanguageId, SymbolKind};
+    use crate::parsing::inline_tests::inline_test;
+
+    inline_test!(
+        rust_inline_test_extracts_function,
+        LanguageId::Rust,
+        r#"
+pub fn inline_rust_probe() {}
+"#,
+        [(SymbolKind::Function, "inline_rust_probe")]
+    );
+}

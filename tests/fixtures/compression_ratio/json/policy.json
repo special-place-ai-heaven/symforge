@@ -1,0 +1,59 @@
+{
+  "name": "compression-ratio-fixture-policy",
+  "description": "Stable JSON fixture used to prove get_file_context stays materially smaller than raw bytes without relying on drifting repository files. This policy deliberately carries realistic explanatory prose in values, not extra synthetic keys, because configuration files often contain long comments, descriptions, help text, and operational rationale while the outline only needs to name the structural keys.",
+  "version": 3,
+  "owners": [
+    "search-platform",
+    "developer-experience",
+    "runtime-quality"
+  ],
+  "defaults": {
+    "retry_limit": 3,
+    "timeout_ms": 2500,
+    "emit_diagnostics": true,
+    "quarantine_on_corruption": true
+  },
+  "rules": [
+    {
+      "id": "parse-rust",
+      "language": "rust",
+      "extensions": [".rs"],
+      "admission": "normal",
+      "notes": "Rust files should produce a compact outline with functions, structs, enums, and impl blocks. The raw source usually contains implementations, match arms, documentation, and string literals that are useful when requested directly but should not be echoed by a first-pass context summary."
+    },
+    {
+      "id": "parse-python",
+      "language": "python",
+      "extensions": [".py"],
+      "admission": "normal",
+      "notes": "Python files should produce a compact outline with classes, functions, and imports. The full module can contain dataclass fields, validation branches, annotations, and report formatting details that stay available through get_file_content or get_symbol after the user chooses a target."
+    },
+    {
+      "id": "parse-typescript",
+      "language": "typescript",
+      "extensions": [".ts", ".tsx"],
+      "admission": "normal",
+      "notes": "TypeScript files should produce a compact outline with interfaces, classes, functions, and exports. The rendered context should preserve the names and line anchors while omitting implementation statements, display strings, and ordinary data literals from the first response."
+    },
+    {
+      "id": "parse-config",
+      "language": "json",
+      "extensions": [".json"],
+      "admission": "normal",
+      "notes": "Config files are included because users ask for context on project configuration as often as source modules. Key-heavy files are a known pressure case, so this fixture keeps the structural shape stable and adds realistic value text to represent the bytes a normal policy document carries."
+    }
+  ],
+  "audit": {
+    "created_for": "SRTK02",
+    "threshold": "context bytes must be less than or equal to half of raw bytes, measured with the same byte-counting method for raw fixture contents and rendered get_file_context output",
+    "small_file_policy": "files below one hundred bytes require a named exclusion reason because fixed response envelopes, source authority lines, parse-state labels, and next-step hints can be larger than the source itself"
+  },
+  "operational_rationale": [
+    "The context view is a navigation aid, not a replacement for exact file reads. Operators often need to know which policy keys exist, where they are located, and which language or admission topic they describe before asking for raw content. This fixture keeps those needs visible while still making the raw bytes large enough to resemble a real policy document.",
+    "A stable fixture is preferable to measuring whichever package manifest or generated configuration happens to exist in the repository at the time of a test run. Repository files drift as dependencies change, and a compression-ratio test should fail only when the rendering behavior changes or when the curated corpus is intentionally revised.",
+    "JSON is intentionally included even though key extraction can be verbose. Configuration files are common code-intelligence targets, and a regression suite that omits them would overfit to programming languages with compact symbol lists. The fixture therefore represents a policy file with descriptive values, repeated rule notes, and audit rationale.",
+    "If a future renderer starts echoing long values, nested arrays, or entire objects into get_file_context, this fixture should fail loudly. The failure output reports raw bytes, context bytes, and a decimal ratio for every fixture so the owner can see whether the regression is isolated to JSON or affects the full corpus.",
+    "The policy also documents the intended user journey: first ask for context, inspect the compact structure, then request exact content only for the specific section or symbol that matters. That journey is central to SymForge because it keeps broad exploration fast while preserving precise byte-for-byte retrieval when exact wording or source slices matter.",
+    "The byte budget here is not a performance benchmark and should not be reported as latency or throughput evidence. It is only a regression gate for rendered context size, using fixed input bytes and deterministic output bytes so CI can catch accidental verbosity increases before they reach coding-agent workflows and before users pay for broad context they did not ask to inspect during first-pass exploration."
+  ]
+}

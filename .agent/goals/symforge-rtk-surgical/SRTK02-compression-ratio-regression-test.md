@@ -2,13 +2,13 @@
 goal_id: SRTK02
 title: compression ratio regression test
 phase: Wave A - test-only quality gate
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T17:48:02.1072124+02:00"
+completed_at: "2026-05-19T18:09:58.9176859+02:00"
+completion_commit: "92486abfd064f3115f793a161ab5ac06ab4417b6"
 ---
 
 # SRTK02 - compression ratio regression test

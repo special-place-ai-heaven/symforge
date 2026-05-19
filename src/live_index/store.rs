@@ -1730,6 +1730,7 @@ mod tests {
         previous: Option<String>,
     }
 
+    #[allow(unsafe_code)] // test-only env guard serializes coupling flag mutation.
     impl CouplingEnvGuard {
         fn set(value: Option<&str>) -> Self {
             let previous =
@@ -1750,6 +1751,7 @@ mod tests {
         }
     }
 
+    #[allow(unsafe_code)] // test-only env guard restores serialized coupling flag mutation.
     impl Drop for CouplingEnvGuard {
         fn drop(&mut self) {
             // SAFETY: callers hold COUPLING_ENV_LOCK; relevant tests run single-threaded.

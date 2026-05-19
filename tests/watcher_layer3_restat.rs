@@ -14,6 +14,7 @@ struct EnvVarGuard {
     previous: Option<std::ffi::OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes daemon home mutation.
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
@@ -25,6 +26,7 @@ impl EnvVarGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized daemon home mutation.
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match &self.previous {

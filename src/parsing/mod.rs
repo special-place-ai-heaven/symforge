@@ -1,5 +1,7 @@
 pub mod ast_grep;
 pub mod config_extractors;
+#[cfg(test)]
+mod inline_tests;
 pub mod languages;
 pub mod xref;
 

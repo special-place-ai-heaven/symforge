@@ -1184,11 +1184,35 @@ pub fn search_structural(
     pattern: &str,
     options: &TextSearchOptions,
 ) -> Result<TextSearchResult, TextSearchError> {
+    search_structural_with_compiler(
+        index,
+        pattern,
+        options,
+        crate::parsing::ast_grep::compile_structural_pattern,
+    )
+}
+
+fn search_structural_with_compiler(
+    index: &LiveIndex,
+    pattern: &str,
+    options: &TextSearchOptions,
+    mut compile_pattern: impl FnMut(
+        &str,
+        &LanguageId,
+    ) -> Result<
+        crate::parsing::ast_grep::CompiledStructuralPattern,
+        String,
+    >,
+) -> Result<TextSearchResult, TextSearchError> {
     let compiled_globs = compile_text_glob_filters(options)?;
 
     let mut files: Vec<TextFileMatches> = Vec::new();
     let mut total_matches = 0usize;
     let mut suppressed_by_noise = 0usize;
+    let mut compiled_patterns: HashMap<
+        (LanguageId, String),
+        Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
+    > = HashMap::new();
     // Track whether at least one candidate successfully compiled the
     // pattern. If every candidate errored, we must distinguish:
     //   * at least one candidate rejected the pattern as syntactically
@@ -1220,27 +1244,33 @@ pub fn search_structural(
 
         let content_str = String::from_utf8_lossy(&file.content);
 
-        let structural_matches =
-            match crate::parsing::ast_grep::structural_search(&content_str, pattern, lang) {
-                Ok(m) => {
-                    any_parse_succeeded = true;
-                    m
-                }
-                Err(e) => {
-                    // structural_search returns two distinguishable error
-                    // shapes: "structural search not supported for …" for
-                    // config languages, and "invalid structural pattern: …"
-                    // for ast-grep Pattern::try_new failures.
-                    if e.starts_with("invalid structural pattern") {
-                        if first_syntax_error.is_none() {
-                            first_syntax_error = Some(e);
-                        }
-                    } else if first_unsupported_error.is_none() {
-                        first_unsupported_error = Some(e);
+        let compiled = compiled_patterns
+            .entry((lang.clone(), pattern.to_string()))
+            .or_insert_with(|| compile_pattern(pattern, lang));
+        let structural_matches = match compiled {
+            Ok(compiled_pattern) => {
+                any_parse_succeeded = true;
+                crate::parsing::ast_grep::structural_search_with_compiled(
+                    &content_str,
+                    compiled_pattern,
+                )
+            }
+            Err(e) => {
+                // compile_structural_pattern returns two distinguishable error
+                // shapes: "structural search not supported for …" for
+                // config languages, and "invalid structural pattern: …"
+                // for ast-grep Pattern::try_new failures.
+                let e = e.clone();
+                if e.starts_with("invalid structural pattern") {
+                    if first_syntax_error.is_none() {
+                        first_syntax_error = Some(e);
                     }
-                    continue;
+                } else if first_unsupported_error.is_none() {
+                    first_unsupported_error = Some(e);
                 }
-            };
+                continue;
+            }
+        };
 
         if structural_matches.is_empty() {
             continue;
@@ -3192,5 +3222,42 @@ mod tests {
             "label must start with `structural ` so the renderer can detect structural searches; got: {}",
             result.label
         );
+    }
+
+    #[test]
+    fn search_structural_reuses_compiled_pattern_per_language_per_request() {
+        let pattern = "fn $NAME($$$) { $$$ }";
+        let index = make_index(vec![
+            make_file(
+                "src/a.rs",
+                "fn alpha() {}\n",
+                vec![make_symbol("alpha", SymbolKind::Function, 1)],
+            ),
+            make_file(
+                "src/b.rs",
+                "fn beta() {}\n",
+                vec![make_symbol("beta", SymbolKind::Function, 1)],
+            ),
+            make_file(
+                "src/c.rs",
+                "fn gamma() {}\n",
+                vec![make_symbol("gamma", SymbolKind::Function, 1)],
+            ),
+        ]);
+
+        let mut compile_calls_by_language: HashMap<LanguageId, usize> = HashMap::new();
+        let result = search_structural_with_compiler(
+            &index,
+            pattern,
+            &TextSearchOptions::default(),
+            |pattern, lang| {
+                *compile_calls_by_language.entry(lang.clone()).or_default() += 1;
+                crate::parsing::ast_grep::compile_structural_pattern(pattern, lang)
+            },
+        )
+        .expect("valid structural pattern should search all candidate files");
+
+        assert_eq!(result.total_matches, 3);
+        assert_eq!(compile_calls_by_language.get(&LanguageId::Rust), Some(&1));
     }
 }

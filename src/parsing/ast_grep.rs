@@ -136,25 +136,40 @@ pub struct StructuralMatch {
     pub captures: Vec<(String, String)>,
 }
 
-/// Search `source` for occurrences of an ast-grep `pattern` in the given language.
+/// A structural pattern compiled for one SymForge language.
+pub struct CompiledStructuralPattern {
+    lang: SgLang,
+    pattern: Pattern,
+}
+
+/// Compile an ast-grep pattern for the given language.
 ///
-/// Returns an error string if the pattern cannot be compiled (e.g., syntax error).
-pub fn structural_search(
-    source: &str,
+/// Returns an error string if the language is unsupported or the pattern cannot be compiled.
+pub fn compile_structural_pattern(
     pattern_str: &str,
     lang: &LanguageId,
-) -> Result<Vec<StructuralMatch>, String> {
+) -> Result<CompiledStructuralPattern, String> {
     let sg_lang = SgLang::from_language_id(lang)
         .ok_or_else(|| format!("structural search not supported for {:?}", lang))?;
 
     let pattern = Pattern::try_new(pattern_str, sg_lang.clone())
         .map_err(|e| format!("invalid structural pattern: {e}"))?;
 
-    let root = sg_lang.ast_grep(source);
+    Ok(CompiledStructuralPattern {
+        lang: sg_lang,
+        pattern,
+    })
+}
 
-    let matches: Vec<StructuralMatch> = root
-        .root()
-        .find_all(&pattern)
+/// Search `source` using an already compiled ast-grep pattern.
+pub fn structural_search_with_compiled(
+    source: &str,
+    compiled: &CompiledStructuralPattern,
+) -> Vec<StructuralMatch> {
+    let root = compiled.lang.ast_grep(source);
+
+    root.root()
+        .find_all(&compiled.pattern)
         .map(|node_match| {
             let start = node_match.start_pos();
             let text = node_match.text().to_string();
@@ -193,9 +208,19 @@ pub fn structural_search(
                 captures,
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(matches)
+/// Search `source` for occurrences of an ast-grep `pattern` in the given language.
+///
+/// Returns an error string if the pattern cannot be compiled (e.g., syntax error).
+pub fn structural_search(
+    source: &str,
+    pattern_str: &str,
+    lang: &LanguageId,
+) -> Result<Vec<StructuralMatch>, String> {
+    let compiled = compile_structural_pattern(pattern_str, lang)?;
+    Ok(structural_search_with_compiled(source, &compiled))
 }
 
 #[cfg(test)]

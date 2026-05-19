@@ -14,6 +14,7 @@ struct EnvGuard {
     previous: Option<std::ffi::OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes coupling flag mutation.
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
@@ -26,6 +27,7 @@ impl EnvGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized coupling flag mutation.
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {

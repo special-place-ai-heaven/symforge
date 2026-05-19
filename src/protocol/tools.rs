@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 /// - Never use MCP error codes for not-found — return helpful text via format functions
 /// - Never hold RwLockReadGuard across await points — extract into owned values first
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,6 +31,9 @@ use crate::capability::{
     CapabilityStatus, CouplingPreparePolicy, FrecencyCollectionPolicy, RankingDiagnosticsPolicy,
     WorktreeRoutingPolicy,
 };
+use crate::edit_safety::trust::{ProjectConfigTrust, TrustEvaluation, TrustStatus};
+
+const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
 
 /// Deserialize a `u32` from either a JSON number or a stringified number like `"5"`.
 pub(crate) fn lenient_u32<'de, D: Deserializer<'de>>(
@@ -77,6 +81,88 @@ pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(
 
 fn lenient_bool_required<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
     lenient_bool(deserializer).map(|value| value.unwrap_or(false))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectConfigTrustMode {
+    LogOnly,
+    Enforce,
+}
+
+impl ProjectConfigTrustMode {
+    fn current() -> Self {
+        match std::env::var(PROJECT_CONFIG_TRUST_MODE_ENV) {
+            Ok(value) if value.eq_ignore_ascii_case("enforce") => Self::Enforce,
+            _ => Self::LogOnly,
+        }
+    }
+}
+
+fn project_config_trust_inputs_exist(repo_root: &Path) -> bool {
+    let symforge_dir = repo_root.join(".symforge");
+    symforge_dir.join("config.toml").exists() || symforge_dir.join("config").exists()
+}
+
+fn project_config_trust_response_suffix(repo_root: &Path) -> Result<Option<String>, String> {
+    if !project_config_trust_inputs_exist(repo_root) {
+        return Ok(None);
+    }
+    let Some(trust) = ProjectConfigTrust::default_store() else {
+        return Ok(Some(
+            "ProjectConfigTrustWarning: status=Unavailable warning=\"could not determine user-local data directory\"; mode=LOG_ONLY; operation_allowed=true"
+                .to_string(),
+        ));
+    };
+    let evaluation = trust.evaluate(repo_root);
+    match evaluation.status {
+        TrustStatus::Trusted | TrustStatus::EnvOverride => Ok(None),
+        TrustStatus::Untrusted | TrustStatus::ContentChanged { .. } => {
+            let evidence = project_config_trust_evidence(&evaluation);
+            match ProjectConfigTrustMode::current() {
+                ProjectConfigTrustMode::LogOnly => Ok(Some(format!(
+                    "ProjectConfigTrustWarning: {evidence}; mode=LOG_ONLY; operation_allowed=true"
+                ))),
+                ProjectConfigTrustMode::Enforce => Err(format!(
+                    "ProjectConfigTrustEnforced: {evidence}; mode=ENFORCE; operation_allowed=false; run `symforge trust project-config accept --project {}` with reviewed actual_hash before retrying",
+                    repo_root.display()
+                )),
+            }
+        }
+    }
+}
+
+fn project_config_trust_evidence(evaluation: &TrustEvaluation) -> String {
+    let mut parts = match &evaluation.status {
+        TrustStatus::Trusted => vec!["status=Trusted".to_string()],
+        TrustStatus::Untrusted => vec!["status=Untrusted".to_string()],
+        TrustStatus::ContentChanged { expected, actual } => vec![
+            "status=ContentChanged".to_string(),
+            format!("expected_hash={expected}"),
+            format!("actual_hash={actual}"),
+        ],
+        TrustStatus::EnvOverride => vec!["status=EnvOverride".to_string()],
+    };
+    if !matches!(evaluation.status, TrustStatus::ContentChanged { .. }) {
+        parts.push(format!("actual_hash={}", evaluation.actual_hash));
+    }
+    if let Some(project_key) = &evaluation.project_key {
+        parts.push(format!("project_key={project_key}"));
+    }
+    if let Some(warning) = evaluation.warnings.first() {
+        parts.push(format!("warning=\"{}\"", one_line(warning)));
+    }
+    parts.join(" ")
+}
+
+fn append_project_config_trust_suffix(output: &mut String, suffix: Option<&str>) {
+    if let Some(suffix) = suffix {
+        output.push('\n');
+        output.push_str(suffix);
+    }
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const INCLUDE_TESTS_SECTION_MARKER: &str = "__symforge_include_tests";
@@ -274,6 +360,7 @@ where
     }
 }
 
+use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
 use crate::domain::{LanguageId, ReferenceKind};
 use crate::live_index::qualified_usages::{self, QualifiedUsage};
 use crate::live_index::{
@@ -2943,6 +3030,159 @@ where
     anchored_search_evidence(anchors, "paths")
 }
 
+struct AdmissionDegradationView {
+    tier: AdmissionTier,
+    path: String,
+    size: Option<u64>,
+    extension: Option<String>,
+    language: Option<LanguageId>,
+    reason: Option<SkipReason>,
+}
+
+fn normalize_admission_degradation_path(raw: &str) -> String {
+    let mut normalized = raw.trim().replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    normalized.trim_matches('/').to_string()
+}
+
+fn admission_degradation_view_from_lookup(
+    view: crate::live_index::query::AdmissionTierLookupView,
+) -> AdmissionDegradationView {
+    AdmissionDegradationView {
+        tier: view.tier,
+        path: view.path,
+        size: view.size,
+        extension: view.extension,
+        language: view.language,
+        reason: view.reason,
+    }
+}
+
+fn admission_degradation_view_from_disk(
+    repo_root: &Path,
+    path: &str,
+) -> Option<AdmissionDegradationView> {
+    let canonical_root = std::fs::canonicalize(repo_root).ok()?;
+    let raw_path = Path::new(path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        canonical_root.join(raw_path)
+    };
+    let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return None;
+    }
+
+    let metadata = std::fs::metadata(&canonical_candidate).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let size = metadata.len();
+    let initial_decision = crate::discovery::classify_admission(&canonical_candidate, size, None);
+    let decision = if initial_decision.tier == AdmissionTier::Normal {
+        let mut sample = Vec::new();
+        let mut file = std::fs::File::open(&canonical_candidate).ok()?;
+        file.by_ref()
+            .take(BINARY_SNIFF_BYTES as u64)
+            .read_to_end(&mut sample)
+            .ok()?;
+        crate::discovery::classify_admission(&canonical_candidate, size, Some(&sample))
+    } else {
+        initial_decision
+    };
+
+    if decision.tier == AdmissionTier::Normal {
+        return None;
+    }
+
+    let relative_path = canonical_candidate
+        .strip_prefix(&canonical_root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty())
+        .unwrap_or_else(|| normalize_admission_degradation_path(path));
+    let extension = canonical_candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_string);
+    let language = extension.as_deref().and_then(LanguageId::from_extension);
+
+    Some(AdmissionDegradationView {
+        tier: decision.tier,
+        path: relative_path,
+        size: Some(size),
+        extension,
+        language,
+        reason: decision.reason,
+    })
+}
+
+fn admission_tier_degradation_for_path(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    tool_name: &str,
+    path: &str,
+    symbol_name: &str,
+) -> Option<String> {
+    let view = index
+        .capture_admission_tier_lookup_view(path)
+        .map(admission_degradation_view_from_lookup)
+        .or_else(|| repo_root.and_then(|root| admission_degradation_view_from_disk(root, path)))?;
+    match view.tier {
+        AdmissionTier::Normal => None,
+        AdmissionTier::MetadataOnly => Some(format!(
+            "degraded result (Tier 2 metadata-only): `{tool_name}` cannot return symbol or \
+             reference data for `{}` because SymForge admits this path as metadata-only instead \
+             of parsing it.\n\n\
+             Warning: metadata-only files are not parsed, so no symbol or reference data exists \
+             for this file.\n\
+             Path: {}\n\
+             Size: {}\n\
+             Extension: {}\n\
+             Language: {}\n\
+             Reason: {}\n\
+             Requested symbol: `{symbol_name}`\n\n\
+             No symbol or reference data is available for this file.",
+            view.path,
+            view.path,
+            view.size
+                .map(|size| format!("{size} bytes"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            view.extension.as_deref().unwrap_or("unavailable"),
+            view.language
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_else(|| "unavailable".to_string()),
+            view.reason
+                .map(|reason| reason.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        )),
+        AdmissionTier::HardSkip => Some(format!(
+            "Not available (Tier 3 hard-skipped): `{tool_name}` cannot inspect `{}` because \
+             the file was hard-skipped during admission.\n\n\
+             Path: {}\n\
+             Size: {}\n\
+             Extension: {}\n\
+             Reason: {}\n\
+             Requested symbol: `{symbol_name}`\n\n\
+             No symbol or reference data is available for this file.",
+            view.path,
+            view.path,
+            view.size
+                .map(|size| format!("{size} bytes"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            view.extension.as_deref().unwrap_or("unavailable"),
+            view.reason
+                .map(|reason| reason.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        )),
+    }
+}
+
 fn find_references_match_type_label(input: &FindReferencesInput, mode: &str) -> &'static str {
     if mode == "implementations" {
         return "constrained (implementations mode)";
@@ -4165,6 +4405,23 @@ impl SymForgeServer {
     ) -> String {
         if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
             return result;
+        }
+        if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
+            let repo_root = self.capture_repo_root();
+            let degraded = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                admission_tier_degradation_for_path(
+                    &guard,
+                    repo_root.as_deref(),
+                    "get_symbol_context",
+                    path,
+                    &params.0.name,
+                )
+            };
+            if let Some(result) = degraded {
+                return result;
+            }
         }
         if params.0.estimate == Some(true) {
             let path = params.0.path.as_deref().unwrap_or("");
@@ -6357,6 +6614,23 @@ impl SymForgeServer {
             return result;
         }
         let input = &params.0;
+        if let Some(path) = input.path.as_deref() {
+            let repo_root = self.capture_repo_root();
+            let degraded = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                admission_tier_degradation_for_path(
+                    &guard,
+                    repo_root.as_deref(),
+                    "find_references",
+                    path,
+                    &input.name,
+                )
+            };
+            if let Some(result) = degraded {
+                return result;
+            }
+        }
         let mode = input.mode.as_deref().unwrap_or("references");
 
         if mode == "implementations" {
@@ -8176,6 +8450,10 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
+        };
         let working_directory = params
             .0
             .working_directory
@@ -8227,7 +8505,7 @@ impl SymForgeServer {
                 old_bytes,
                 params.0.new_body.len()
             );
-            return format!(
+            let mut result = format!(
                 "{}\n{}",
                 edit_format::format_edit_envelope(
                     edit_format::EditSafetyMode::StructuralEditSafe,
@@ -8237,6 +8515,8 @@ impl SymForgeServer {
                 ),
                 summary
             );
+            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+            return result;
         }
         let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
         // Decide where the splice starts based on whether the caller
@@ -8323,6 +8603,7 @@ impl SymForgeServer {
             working_directory,
             &resolved_target,
         ));
+        append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
         result
     }
 
@@ -8364,6 +8645,10 @@ impl SymForgeServer {
         let repo_root = match self.capture_repo_root() {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
+        };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
         };
         let working_directory = params
             .0
@@ -8415,7 +8700,7 @@ impl SymForgeServer {
                 params.0.path,
                 params.0.content.len()
             );
-            return format!(
+            let mut result = format!(
                 "{}\n{}",
                 edit_format::format_edit_envelope(
                     edit_format::EditSafetyMode::StructuralEditSafe,
@@ -8425,6 +8710,8 @@ impl SymForgeServer {
                 ),
                 summary
             );
+            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+            return result;
         }
         let line_ending = edit::detect_line_ending(&file.content);
         let new_content = if position == "before" {
@@ -8464,6 +8751,7 @@ impl SymForgeServer {
             &resolved_target,
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
+        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         out
     }
 
@@ -8500,6 +8788,10 @@ impl SymForgeServer {
         let repo_root = match self.capture_repo_root() {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
+        };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
         };
         let working_directory = params
             .0
@@ -8549,7 +8841,7 @@ impl SymForgeServer {
                 "[DRY RUN] Would delete `{}` in {} ({} bytes)",
                 params.0.name, params.0.path, deleted_bytes
             );
-            return format!(
+            let mut result = format!(
                 "{}\n{}",
                 edit_format::format_edit_envelope(
                     edit_format::EditSafetyMode::StructuralEditSafe,
@@ -8559,6 +8851,8 @@ impl SymForgeServer {
                 ),
                 summary
             );
+            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+            return result;
         }
         let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
         let line_ending = edit::detect_line_ending(&file.content);
@@ -8595,6 +8889,7 @@ impl SymForgeServer {
             &resolved_target,
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
+        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         out
     }
 
@@ -8633,6 +8928,10 @@ impl SymForgeServer {
         let repo_root = match self.capture_repo_root() {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
+        };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
         };
         let working_directory = params
             .0
@@ -8769,7 +9068,7 @@ impl SymForgeServer {
                     truncated
                 );
             }
-            return format!(
+            let mut result = format!(
                 "{}\n[DRY RUN] Would edit within `{}` in {} ({} replacement(s))",
                 edit_format::format_edit_envelope(
                     edit_format::EditSafetyMode::TextEditSafe,
@@ -8781,6 +9080,8 @@ impl SymForgeServer {
                 params.0.path,
                 count
             );
+            append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+            return result;
         }
         if count == 0 {
             let preview_len = 800.min(body_str.len());
@@ -8836,6 +9137,7 @@ impl SymForgeServer {
             &resolved_target,
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
+        append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
         out
     }
 
@@ -8866,6 +9168,10 @@ impl SymForgeServer {
             Ok(prepared) => prepared,
             Err(e) => return e,
         };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
+        };
         match edit::execute_batch_edit(
             &self.index,
             &repo_root,
@@ -8895,7 +9201,7 @@ impl SymForgeServer {
                     params.0.edits.len(),
                     file_count
                 );
-                format!(
+                let mut result = format!(
                     "{}\n{}",
                     edit_format::format_batch_envelope(
                         edit_format::EditSafetyMode::StructuralEditSafe,
@@ -8905,7 +9211,12 @@ impl SymForgeServer {
                         &evidence,
                     ),
                     edit_format::format_batch_summary(&summaries, file_count),
-                )
+                );
+                append_project_config_trust_suffix(
+                    &mut result,
+                    project_config_trust_suffix.as_deref(),
+                );
+                result
             }
             Err(e) => e,
         }
@@ -8931,6 +9242,10 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
+        };
         {
             let guard = self.index.read();
             loading_guard!(guard);
@@ -8947,7 +9262,7 @@ impl SymForgeServer {
                     "definition `{}` + project-wide constrained references",
                     params.0.path
                 );
-                format!(
+                let mut result = format!(
                     "{}\n{}",
                     edit_format::format_batch_envelope(
                         edit_format::EditSafetyMode::StructuralEditSafe,
@@ -8957,7 +9272,12 @@ impl SymForgeServer {
                         &evidence,
                     ),
                     summary,
-                )
+                );
+                append_project_config_trust_suffix(
+                    &mut result,
+                    project_config_trust_suffix.as_deref(),
+                );
+                result
             }
             Err(e) => e,
         }
@@ -8987,6 +9307,10 @@ impl SymForgeServer {
             Ok(prepared) => prepared,
             Err(e) => return e,
         };
+        let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
+            Ok(suffix) => suffix,
+            Err(message) => return message,
+        };
         match edit::execute_batch_insert(&self.index, &repo_root, &params.0) {
             Ok(summaries) => {
                 let file_count = params
@@ -9006,7 +9330,7 @@ impl SymForgeServer {
                     params.0.targets.len(),
                     file_count
                 );
-                format!(
+                let mut result = format!(
                     "{}\n{}",
                     edit_format::format_batch_envelope(
                         edit_format::EditSafetyMode::StructuralEditSafe,
@@ -9016,7 +9340,12 @@ impl SymForgeServer {
                         &evidence,
                     ),
                     edit_format::format_batch_summary(&summaries, file_count),
-                )
+                );
+                append_project_config_trust_suffix(
+                    &mut result,
+                    project_config_trust_suffix.as_deref(),
+                );
+                result
             }
             Err(e) => e,
         }
@@ -9361,6 +9690,7 @@ mod tests {
         previous: Option<OsString>,
     }
 
+    #[allow(unsafe_code)] // test-only env guard serializes process env mutation.
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
@@ -9390,6 +9720,7 @@ mod tests {
         }
     }
 
+    #[allow(unsafe_code)] // test-only env guard restores serialized process env mutation.
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match &self.previous {

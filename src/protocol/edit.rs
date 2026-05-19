@@ -250,6 +250,144 @@ pub(crate) fn reindex_after_write(
 // Symbol resolution wrapper
 // ---------------------------------------------------------------------------
 
+const MAX_SYMBOL_SUGGESTIONS: usize = 3;
+const MAX_SYMBOL_SUGGESTION_DISTANCE: usize = 3;
+const MIN_SYMBOL_SUGGESTION_CONFIDENCE: f64 = 0.6;
+
+fn did_you_mean_suffix(file: &IndexedFile, requested: &str) -> String {
+    let suggestions = same_file_symbol_suggestions(file, requested);
+    if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(" did_you_mean: [{}]", suggestions.join(", "))
+    }
+}
+
+fn same_file_symbol_suggestions(file: &IndexedFile, requested: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut scored = Vec::new();
+
+    for sym in &file.symbols {
+        let candidate = sym.name.trim();
+        if candidate.is_empty() || candidate == requested || !seen.insert(candidate.to_string()) {
+            continue;
+        }
+
+        if let Some((score, distance)) = symbol_suggestion_score(requested, candidate) {
+            scored.push((score, distance, sym.line_range.0, candidate.to_string()));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    scored
+        .into_iter()
+        .take(MAX_SYMBOL_SUGGESTIONS)
+        .map(|(_, _, _, name)| name)
+        .collect()
+}
+
+fn symbol_suggestion_score(requested: &str, candidate: &str) -> Option<(u16, usize)> {
+    let requested_norm = normalize_symbol_name(requested);
+    let candidate_norm = normalize_symbol_name(candidate);
+    if requested_norm.is_empty() || candidate_norm.is_empty() {
+        return None;
+    }
+
+    let mut best = bounded_levenshtein(
+        &requested_norm,
+        &candidate_norm,
+        MAX_SYMBOL_SUGGESTION_DISTANCE,
+    )
+    .and_then(|distance| {
+        let max_len = requested_norm
+            .chars()
+            .count()
+            .max(candidate_norm.chars().count());
+        let confidence = 1.0 - (distance as f64 / max_len as f64);
+        if confidence >= MIN_SYMBOL_SUGGESTION_CONFIDENCE {
+            Some(((confidence * 1000.0) as u16, distance))
+        } else {
+            None
+        }
+    });
+
+    if has_separator_prefix(requested, candidate) {
+        let prefix_score = 900;
+        let prefix_distance = bounded_levenshtein(
+            &requested_norm,
+            &candidate_norm,
+            MAX_SYMBOL_SUGGESTION_DISTANCE,
+        )
+        .unwrap_or(MAX_SYMBOL_SUGGESTION_DISTANCE + 1);
+        match best {
+            Some((score, _)) if score >= prefix_score => {}
+            _ => best = Some((prefix_score, prefix_distance)),
+        }
+    }
+
+    best
+}
+
+fn normalize_symbol_name(name: &str) -> String {
+    let mut normalized = String::new();
+    for ch in name.chars() {
+        for folded in ch.to_lowercase() {
+            if folded.is_alphanumeric() {
+                normalized.push(folded);
+            }
+        }
+    }
+    normalized
+}
+
+fn has_separator_prefix(requested: &str, candidate: &str) -> bool {
+    if normalize_symbol_name(requested).chars().count() < 3 {
+        return false;
+    }
+
+    let requested = requested.to_lowercase();
+    let candidate = candidate.to_lowercase();
+    let mut candidate_chars = candidate.chars();
+    for requested_char in requested.chars() {
+        if candidate_chars.next() != Some(requested_char) {
+            return false;
+        }
+    }
+
+    matches!(candidate_chars.next(), Some(ch) if !ch.is_alphanumeric())
+}
+
+fn bounded_levenshtein(left: &str, right: &str, max_distance: usize) -> Option<usize> {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_chars.len().abs_diff(right_chars.len()) > max_distance {
+        return None;
+    }
+
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left_chars.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let deletion = previous[right_index + 1] + 1;
+            let insertion = current[right_index] + 1;
+            let substitution = previous[right_index] + usize::from(left_char != right_char);
+            current[right_index + 1] = deletion.min(insertion).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    let distance = previous[right_chars.len()];
+    (distance <= max_distance).then_some(distance)
+}
+
 /// Resolve a symbol by name/kind/line, returning (index, cloned record) or user-friendly error.
 pub(crate) fn resolve_or_error(
     file: &IndexedFile,
@@ -275,7 +413,10 @@ pub(crate) fn resolve_or_error(
                 }
                 _ => String::new(),
             };
-            Err(format!("Symbol not found: {label}{status_hint}"))
+            let suggestion_hint = did_you_mean_suffix(file, name);
+            Err(format!(
+                "Symbol not found: {label}{status_hint}{suggestion_hint}"
+            ))
         }
         SymbolSelectorMatch::Ambiguous(candidate_lines) => {
             let candidates = candidate_lines
@@ -2733,6 +2874,93 @@ mod tests {
         assert!(result.unwrap_err().contains("not found"));
     }
 
+    fn did_you_mean_names(err: &str) -> Vec<&str> {
+        err.split("did_you_mean: [")
+            .nth(1)
+            .and_then(|tail| tail.split(']').next())
+            .map(|items| {
+                items
+                    .split(", ")
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_resolve_or_error_not_found_suggests_close_same_file_symbol() {
+        let file = make_test_indexed_file(vec![make_test_symbol(
+            "foo_bar",
+            SymbolKind::Function,
+            (0, 20),
+            1,
+        )]);
+        let result = resolve_or_error(&file, "foo", None, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            did_you_mean_names(&err).contains(&"foo_bar"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_or_error_not_found_omits_noisy_suggestions() {
+        let file = make_test_indexed_file(vec![make_test_symbol(
+            "foo_bar",
+            SymbolKind::Function,
+            (0, 20),
+            1,
+        )]);
+        let result = resolve_or_error(&file, "quux", None, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("did_you_mean"),
+            "unexpected suggestion in: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_or_error_not_found_caps_suggestions_at_three() {
+        let file = make_test_indexed_file(vec![
+            make_test_symbol("foo_alpha", SymbolKind::Function, (0, 20), 1),
+            make_test_symbol("foo_beta", SymbolKind::Function, (22, 40), 5),
+            make_test_symbol("foo_gamma", SymbolKind::Function, (42, 60), 9),
+            make_test_symbol("foo_delta", SymbolKind::Function, (62, 80), 13),
+        ]);
+        let result = resolve_or_error(&file, "foo", None, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let suggestions = did_you_mean_names(&err);
+        assert_eq!(suggestions.len(), 3, "error was: {err}");
+    }
+
+    #[test]
+    fn test_resolve_or_error_not_found_preserves_partial_parse_hint_with_suggestion() {
+        let mut file = make_test_indexed_file(vec![make_test_symbol(
+            "foo_bar",
+            SymbolKind::Function,
+            (0, 20),
+            1,
+        )]);
+        file.parse_status = crate::live_index::store::ParseStatus::PartialParse {
+            warning: "syntax error near line 9".to_string(),
+        };
+        let result = resolve_or_error(&file, "foo", None, None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("did_you_mean: [foo_bar]"), "error was: {err}");
+        assert!(
+            err.contains("file partially parsed with errors: syntax error near line 9"),
+            "error was: {err}"
+        );
+    }
+
     #[test]
     fn test_resolve_or_error_ambiguous_shows_candidates() {
         let file = make_test_indexed_file(vec![
@@ -3302,6 +3530,43 @@ mod tests {
         assert!(
             file_content.contains("fn foo() {}"),
             "file should be unmodified: {file_content}"
+        );
+    }
+
+    #[test]
+    fn test_execute_batch_edit_nonexistent_symbol_includes_same_file_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), b"fn foo_bar() {}\n").unwrap();
+        std::fs::write(src.join("b.rs"), b"fn foo() {}\n").unwrap();
+
+        let handle = crate::live_index::LiveIndex::empty();
+        for (path, content) in [
+            ("src/a.rs", b"fn foo_bar() {}\n" as &[u8]),
+            ("src/b.rs", b"fn foo() {}\n"),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
+            handle.update_file(path.to_string(), indexed);
+        }
+
+        let edits = vec![SingleEdit {
+            path: "src/a.rs".to_string(),
+            name: "foo".to_string(),
+            kind: None,
+            symbol_line: None,
+            operation: EditOperation::Delete,
+            working_directory: None,
+        }];
+
+        let result = execute_batch_edit(&handle, dir.path(), &edits, false, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("did_you_mean: [foo_bar]"), "error was: {err}");
+        assert!(
+            !err.contains("did_you_mean: [foo]"),
+            "must not suggest symbol from src/b.rs: {err}"
         );
     }
 

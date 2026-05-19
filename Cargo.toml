@@ -6,6 +6,10 @@ description = "SymForge — in-memory code intelligence MCP server for Claude Co
 license-file = "LICENSE"
 repository = "https://github.com/special-place-administrator/symforge"
 
+[lints.rust]
+unsafe_code = "deny"
+warnings = "deny"
+
 [lib]
 name = "symforge"
 path = "src/lib.rs"
@@ -34,6 +38,7 @@ tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "
 postcard = { version = "1.1", features = ["use-std"] }
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

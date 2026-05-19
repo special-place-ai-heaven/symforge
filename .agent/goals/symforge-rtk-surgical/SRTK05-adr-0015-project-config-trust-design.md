@@ -2,13 +2,13 @@
 goal_id: SRTK05
 title: ADR 0015 project config trust design
 phase: Wave B - trust decision before code
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T18:51:18.1091024+02:00"
+completed_at: "2026-05-19T19:04:25.5128013+02:00"
+completion_commit: "d8cd7d523e728032e43372731bd01124ee304ba0"
 ---
 
 # SRTK05 - ADR 0015 project config trust design

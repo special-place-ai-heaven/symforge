@@ -2,13 +2,13 @@
 goal_id: SRTK14
 title: integrity sidecar scope decision
 phase: Hold - trust-adjacent decision
-status: "Pending"
+status: "Completed"
 depends_on: ["SRTK05"]
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T22:17:52.1526298+02:00"
+completed_at: "2026-05-19T22:37:42.1832318+02:00"
+completion_commit: "3d799ccaede8a644f79783eb0e59b185dd495e5a"
 ---
 
 # SRTK14 - integrity sidecar scope decision

@@ -2,13 +2,13 @@
 goal_id: SRTK10
 title: stateless same-file symbol suggestions
 phase: Wave C - independent UX improvement
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T21:10:44.5193451+02:00"
+completed_at: "2026-05-19T21:25:00.4955149+02:00"
+completion_commit: "4c300cb5c473f9a543b7946b890dd1cf1fcf972d"
 ---
 
 # SRTK10 - stateless same-file symbol suggestions

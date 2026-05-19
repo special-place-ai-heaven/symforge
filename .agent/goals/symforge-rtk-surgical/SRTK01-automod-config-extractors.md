@@ -2,13 +2,13 @@
 goal_id: SRTK01
 title: automod config extractors
 phase: Wave A - low-risk hygiene
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T17:34:06.0248279+02:00"
+completed_at: "2026-05-19T17:44:26.0352997+02:00"
+completion_commit: "70206000c976d9a9d5723b825ed7da7927942c62"
 ---
 
 # SRTK01 - automod config extractors

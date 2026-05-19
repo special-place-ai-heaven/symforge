@@ -68,6 +68,7 @@ struct EnvGuard {
     previous: Option<OsString>,
 }
 
+#[allow(unsafe_code)] // test-only env guard serializes frecency flag mutation.
 impl EnvGuard {
     fn unset() -> Self {
         let guard = FRECENCY_ENV_LOCK
@@ -97,6 +98,7 @@ impl EnvGuard {
     }
 }
 
+#[allow(unsafe_code)] // test-only env guard restores serialized frecency flag mutation.
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {

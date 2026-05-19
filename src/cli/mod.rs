@@ -4,11 +4,13 @@
 //!   `symforge init`               — configure Claude, Codex, or both
 //!   `symforge hook <subcommand>`  — hook scripts called by Claude Code
 //!   `symforge daemon`             — shared project/session backend
+//!   `symforge trust project-config` — audit, accept, or revoke project-config trust
 //!
 //! Plan 03 wires these into main.rs and handles the top-level dispatch.
 
 pub mod hook;
 pub mod init;
+pub mod trust;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -39,6 +41,11 @@ pub enum Commands {
     Hook {
         #[command(subcommand)]
         subcommand: Option<HookSubcommand>,
+    },
+    /// Trust-control commands for project-local SymForge configuration
+    Trust {
+        #[command(subcommand)]
+        subcommand: trust::TrustSubcommand,
     },
 }
 
@@ -162,6 +169,60 @@ mod tests {
                 subcommand: Some(HookSubcommand::PreTool),
             }) => {}
             _ => panic!("expected pre-tool hook command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_project_config_status_command_parses() {
+        let cli = Cli::parse_from([
+            "symforge",
+            "trust",
+            "project-config",
+            "status",
+            "--project",
+            ".",
+        ]);
+
+        match cli.command {
+            Some(Commands::Trust {
+                subcommand:
+                    trust::TrustSubcommand::ProjectConfig {
+                        command: trust::ProjectConfigCommand::Status { project },
+                    },
+            }) => assert_eq!(project, std::path::PathBuf::from(".")),
+            _ => panic!("expected trust project-config status command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_project_config_accept_command_parses() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cli = Cli::parse_from([
+            "symforge",
+            "trust",
+            "project-config",
+            "accept",
+            "--project",
+            ".",
+            "--hash",
+            hash,
+        ]);
+
+        match cli.command {
+            Some(Commands::Trust {
+                subcommand:
+                    trust::TrustSubcommand::ProjectConfig {
+                        command:
+                            trust::ProjectConfigCommand::Accept {
+                                project,
+                                hash: parsed_hash,
+                            },
+                    },
+            }) => {
+                assert_eq!(project, std::path::PathBuf::from("."));
+                assert_eq!(parsed_hash, hash);
+            }
+            _ => panic!("expected trust project-config accept command"),
         }
     }
 }

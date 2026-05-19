@@ -2,13 +2,13 @@
 goal_id: SRTK04
 title: inline language test macro for Rust and Python
 phase: Wave B - parser test foundation
-status: "Pending"
+status: "Completed"
 depends_on: ["SRTK01"]
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T18:34:14.5161890+02:00"
+completed_at: "2026-05-19T18:45:04.6540706+02:00"
+completion_commit: "598637209978616a0b6d76b7c0e150c334bd6675"
 ---
 
 # SRTK04 - inline language test macro for Rust and Python

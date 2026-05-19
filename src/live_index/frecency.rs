@@ -928,12 +928,14 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[allow(unsafe_code)] // test-only flag helper runs under ENV_LOCK and --test-threads=1.
     fn set_flag_on() {
         // SAFETY: tests hold ENV_LOCK and run with --test-threads=1; no
         // concurrent env readers can observe the transition.
         unsafe { std::env::set_var(FRECENCY_FLAG_ENV, "1") };
     }
 
+    #[allow(unsafe_code)] // test-only flag helper runs under ENV_LOCK and --test-threads=1.
     fn clear_flag() {
         // SAFETY: see set_flag_on.
         unsafe { std::env::remove_var(FRECENCY_FLAG_ENV) };
@@ -941,6 +943,32 @@ mod tests {
 
     fn db_path_for(root: &Path) -> PathBuf {
         root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH)
+    }
+
+    #[test]
+    fn ranking_scores_without_history_repeatedly_stays_footprint_free() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = db_path_for(tmp.path());
+        let db_parent = db_path.parent().expect("frecency db has parent");
+        let path = PathBuf::from("src/lib.rs");
+        let path_refs = [path.as_path()];
+
+        for _ in 0..3 {
+            let snapshot = super::ranking_scores_for_paths(tmp.path(), &path_refs, 0)
+                .expect("read-only ranking score lookup should not fail");
+            assert!(
+                snapshot.is_none(),
+                "missing persistent and session history should return no ranking snapshot"
+            );
+            assert!(
+                !db_parent.exists(),
+                "read-only ranking score lookup must not create the .symforge directory"
+            );
+            assert!(
+                !db_path.exists(),
+                "read-only ranking score lookup must not create frecency.db"
+            );
+        }
     }
 
     #[test]
@@ -965,6 +993,7 @@ mod tests {
         );
     }
 
+    #[allow(unsafe_code)] // test-only flag mutation runs under ENV_LOCK and --test-threads=1.
     #[test]
     fn module_bump_is_noop_when_flag_not_one() {
         let _g = ENV_LOCK.lock().unwrap();

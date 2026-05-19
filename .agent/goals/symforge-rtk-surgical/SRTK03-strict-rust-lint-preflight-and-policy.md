@@ -2,13 +2,13 @@
 goal_id: SRTK03
 title: strict Rust lint preflight and policy
 phase: Wave A - policy hygiene
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "symforge-rtk-surgical"
 prohibited_branches: ["main"]
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-19T18:14:20.2484146+02:00"
+completed_at: "2026-05-19T18:29:20.5417673+02:00"
+completion_commit: "599d7a1cf0aadecc4c4993950e6ab921b69d00f8"
 ---
 
 # SRTK03 - strict Rust lint preflight and policy
