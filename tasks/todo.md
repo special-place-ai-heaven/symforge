@@ -1,3 +1,75 @@
+# SFB10 - Apply result-status semantics to read, search, and reference tools
+
+## Plan
+
+- [x] Run Branch Guard from the original checkout.
+- [x] Switch to `.worktrees/backlog-implementation` and confirm branch/status there.
+- [x] Index the target worktree with SymForge and check agentmemory for prior context.
+- [x] Copy the SFB10 goal file into the worktree and mark it `In progress`.
+- [x] Validate SFB09 dependency artifacts in current code because the SFB09 goal file is absent from this worktree.
+- [x] Inspect current read/search/reference response construction and status contract helpers.
+- [x] Add or update contract tests for found, not_found, ambiguous selector, invalid request, and empty/no-match states across read/search/reference surfaces.
+- [x] Apply result-status metadata to `get_symbol`, `get_file_content`, `search_*`, and `find_references` while preserving existing human-readable text.
+- [x] Capture before/after sample output for one found and one not-found response.
+- [x] Run exact goal verification:
+  - `cargo fmt --check`
+  - `cargo check`
+  - `cargo test --all-targets -- --test-threads=1`
+  - `rg "result_status|ResultStatus|outcome_class" src/protocol src/live_index tests`
+- [x] Run default full verification if task-specific verification passes and time permits.
+- [ ] Commit verified implementation work.
+- [ ] Update SFB10 frontmatter to `Completed` with the verified work commit hash.
+- [ ] Commit the SFB10 goal-status update separately.
+
+## Evidence Log
+
+- Branch Guard from the original checkout returned `main` with a clean status, so edits moved to `.worktrees/backlog-implementation`.
+- Branch Guard in the worktree returned `backlog-implementation` with a clean status before goal edits.
+- The SFB10 goal file was absent from the worktree and was copied from the original checkout per Branch Guard.
+- SymForge indexed the worktree: 191 files, 9292 symbols.
+- agentmemory recall for SFB10/result-status/read-search-reference context returned no matching prior observations.
+- `tasks/lessons.md` is absent in this worktree; no prior lesson file was available to review.
+- SFB09 dependency file is absent, but dependency artifacts are present in code: `src/protocol/result_status.rs`, `src/protocol/mod.rs`, `tests/conformance.rs`, and the existing read-tool fixture in `src/protocol/tools.rs`.
+- Goal status changed to `In progress` at `2026-05-20T14:40:39.2214133+02:00`.
+- Implementation finding: the public RMCP router can return `CallToolResult`, while the existing tool bodies return human-readable `String` used by daemon/proxy/internal tests. The lowest-impact path is statused wrapper methods registered under the same tool names, keeping existing text renderers unchanged.
+- Added status classifiers and registered wrappers for `get_symbol`, `get_file_content`, `search_symbols`, `search_text`, `search_files`, and `find_references` in `src/protocol/tools.rs`.
+- Added contract tests covering:
+  - read: `found`, `not_found`, `invalid_request`, `ambiguous`;
+  - search: `found`, `empty_result`, `invalid_request`, `not_found`, `ambiguous`;
+  - references: `found`, `empty_result`, `not_found`, `ambiguous`.
+- Initial focused red check: `cargo test result_status_contract -- --nocapture` failed before wrappers because tool responses had no `_meta["symforge/result_status"]`.
+- Focused verification passed:
+  - `cargo test result_status_contract -- --nocapture`: 3 passed, 0 failed.
+  - `cargo test test_get_file_content -- --test-threads=1`: passed.
+  - `cargo test test_search -- --test-threads=1`: passed.
+  - `cargo test test_find_references -- --test-threads=1`: passed.
+  - `cargo test test_get_symbol -- --test-threads=1`: passed.
+- Found sample:
+  - before SFB10 wrapper: `content[0].text = "fn present() {}\nfn duplicate() {}\nfn duplicate() {}\n"`;
+  - after SFB10 wrapper: same `content[0].text`, plus `_meta["symforge/result_status"] = {"contract_version":1,"outcome_class":"found"}`.
+- Not-found sample:
+  - before SFB10 wrapper: `content[0].text` begins `File not found: src/missing.rs`;
+  - after SFB10 wrapper: same human text, plus `_meta["symforge/result_status"] = {"contract_version":1,"outcome_class":"not_found"}`.
+- Exact goal verification passed:
+  - `cargo fmt --check`: exit 0 after applying rustfmt.
+  - `cargo check`: exit 0.
+  - `cargo test --all-targets -- --test-threads=1`: exit 0; observed key totals include `src/lib.rs` 1761 passed, `src/main.rs` 6 passed, and all integration targets passed.
+  - `rg "result_status|ResultStatus|outcome_class" src/protocol src/live_index tests`: exit 0 and showed the status module, conformance pins, wrappers, and SFB10 contract tests.
+- Default verification passed:
+  - `git branch --show-current`: `backlog-implementation`.
+  - `git diff --check`: exit 0; Git reported CRLF replacement warnings for touched files, not whitespace errors.
+  - `cargo fmt --check`: exit 0.
+  - `cargo check`: exit 0.
+  - `cargo test --all-targets -- --test-threads=1`: exit 0; full all-targets suite passed again.
+  - `cargo build --release`: exit 0; finished release profile successfully.
+
+## Review
+
+- SFB10 acceptance criteria passed before commit: public read/search/reference tool registrations now attach additive result-status metadata, existing human-readable text remains unchanged, and tests cover found, not_found, empty_result, ambiguous, and invalid_request states across the requested surfaces.
+- Changes stayed within the allowed tracked areas: `src/protocol/tools.rs` and `tasks/todo.md`. No daemon, sidecar, npm, docs, plans, `.planning`, openspec, or edit-tool implementation files were modified.
+
+---
+
 # SFB09 - Define machine-readable MCP result-status contract
 
 ## Plan

@@ -32,6 +32,7 @@ use crate::capability::{
     WorktreeRoutingPolicy,
 };
 use crate::edit_safety::trust::{ProjectConfigTrust, TrustEvaluation, TrustStatus};
+use crate::protocol::result_status::{OutcomeClass, ResultStatus};
 
 const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
 
@@ -163,6 +164,109 @@ fn append_project_config_trust_suffix(output: &mut String, suffix: Option<&str>)
 
 fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn statused_tool_result(
+    text: String,
+    outcome_class: OutcomeClass,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
+}
+
+fn classify_get_symbol_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Error:") {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("Ambiguous:") {
+        OutcomeClass::Ambiguous
+    } else if text.starts_with("File not found:") || text.starts_with("No symbol ") {
+        OutcomeClass::NotFound
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+fn classify_get_file_content_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Invalid get_file_content request:")
+        || text.starts_with("mode=")
+        || text.contains("[error:")
+    {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("Ambiguous symbol selector") {
+        OutcomeClass::Ambiguous
+    } else if text.starts_with("File not found:")
+        || text.starts_with("No symbol ")
+        || text.starts_with("Symbol not found in ")
+        || text.starts_with("Match '")
+        || text.starts_with("Match occurrence ")
+    {
+        OutcomeClass::NotFound
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+fn classify_search_symbols_output(text: &str) -> OutcomeClass {
+    if text.starts_with("search_symbols requires") {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("No symbols matching") {
+        OutcomeClass::EmptyResult
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+fn classify_search_text_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Error:")
+        || text.starts_with("Regex search requires")
+        || text.starts_with("Search requires")
+        || text.starts_with("Invalid regex")
+        || text.starts_with("Invalid glob")
+        || text.starts_with("whole_word is not supported")
+    {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("No matches") || text.starts_with("No AST matches") {
+        OutcomeClass::EmptyResult
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+fn classify_search_files_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Path search requires")
+        || text.starts_with("Path hint must not be empty")
+        || text.starts_with("search_files")
+    {
+        OutcomeClass::InvalidRequest
+    } else if text.contains("Ambiguous path hint") {
+        OutcomeClass::Ambiguous
+    } else if text.starts_with("No indexed source files matching")
+        || text.starts_with("No indexed source path matched")
+        || text.starts_with("No git history found")
+        || text.starts_with("'") && text.contains("not found in git history")
+    {
+        OutcomeClass::NotFound
+    } else if text.starts_with("No high-confidence co-change data") {
+        OutcomeClass::EmptyResult
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+fn classify_find_references_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Ambiguous symbol selector") {
+        OutcomeClass::Ambiguous
+    } else if text.starts_with("File not found:")
+        || text.starts_with("Symbol not found")
+        || text.contains("this symbol is not defined in the indexed project")
+    {
+        OutcomeClass::NotFound
+    } else if text.starts_with("No references found")
+        || text.starts_with("No implementations found")
+    {
+        OutcomeClass::EmptyResult
+    } else {
+        OutcomeClass::Found
+    }
 }
 
 const INCLUDE_TESTS_SECTION_MARKER: &str = "__symforge_include_tests";
@@ -4250,9 +4354,19 @@ impl SymForgeServer {
     /// NOT for understanding who calls it (use find_references or get_symbol_context).
     /// NOT for edit preparation (use get_symbol_context with bundle=true).
     #[tool(
+        name = "get_symbol",
         description = "Prefer this over reading an entire file when you already know the symbol or have narrowed to one file. Retrieves the complete source code of a specific symbol with doc comments. Single mode: provide path + name. Batch mode: provide targets[] array for 2+ symbols or code slices in one call (each target is file path + symbol name or byte range). When multiple symbols share the same name, pass symbol_line (1-based) to disambiguate; auto-selects by kind tier when possible. Use search_symbols first if you only know part of the name. NOT for understanding callers (use find_references or get_symbol_context). NOT for edit preparation (use get_symbol_context with bundle=true).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn get_symbol_tool(
+        &self,
+        params: Parameters<GetSymbolInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.get_symbol(params).await;
+        let outcome_class = classify_get_symbol_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn get_symbol(&self, params: Parameters<GetSymbolInput>) -> String {
         if let Some(result) = self.proxy_tool_call("get_symbol", &params.0).await {
             return result;
@@ -5133,9 +5247,19 @@ impl SymForgeServer {
     /// one of query, kind, or path_prefix is required).
     /// NOT for text content search (use search_text). NOT for file path search (use search_files).
     #[tool(
+        name = "search_symbols",
         description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. NOT for text content search (use search_text). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn search_symbols_tool(
+        &self,
+        params: Parameters<SearchSymbolsInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.search_symbols(params).await;
+        let outcome_class = classify_search_symbols_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn search_symbols(&self, params: Parameters<SearchSymbolsInput>) -> String {
         let query_str = params.0.query.as_deref().unwrap_or("").trim();
         let is_browse = query_str.is_empty();
@@ -5269,9 +5393,19 @@ impl SymForgeServer {
     /// ast-grep syntax ($VAR for metavariables, $$$ for multi-node wildcards).
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
+        name = "search_text",
         description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn search_text_tool(
+        &self,
+        params: Parameters<SearchTextInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.search_text(params).await;
+        let outcome_class = classify_search_text_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
@@ -5640,9 +5774,19 @@ impl SymForgeServer {
     /// anchor_path to fuse path matches with the coupling store. Set resolve=true for exact path resolution.
     /// NOT for file content search (use search_text). NOT for symbol names (use search_symbols).
     #[tool(
+        name = "search_files",
         description = "Find files by path, filename, or folder — ranked by relevance. Modes: (1) default: fuzzy search ranked by relevance, (2) changed_with=path: co-changing files via git temporal coupling, (3) rank_by=\"path+cochange\" with anchor_path: fuse path matches with coupling-store evidence, (4) resolve=true: resolve an ambiguous filename or partial path to one exact project path. NOT for file content search (use search_text). NOT for symbol names (use search_symbols).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn search_files_tool(
+        &self,
+        params: Parameters<SearchFilesInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.search_files(params).await;
+        let outcome_class = classify_search_files_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn search_files(&self, params: Parameters<SearchFilesInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_files", &params.0).await {
             return result;
@@ -6734,9 +6878,19 @@ impl SymForgeServer {
     /// For structured understanding use get_file_context. For a single function
     /// body use get_symbol.
     #[tool(
+        name = "get_file_content",
         description = "Read exact raw file content. Modes: full file, line range, around_line/around_match/around_symbol, or chunked paging. Use this for exact docs/config reads, whitespace-sensitive inspection, or exact source excerpts after narrowing with get_file_context, search_text, or get_symbol. For structured code understanding use get_file_context first. For a single function body use get_symbol. Accepts offset/limit (Read-tool idiom) as aliases for start_line/end_line. Use max_tokens to request a smaller response budget. Unknown fields are rejected with an error naming the invalid param. Responses are capped at ~60 KB; if truncated, a footer suggests chunk_index+max_lines, around_line, or around_symbol.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn get_file_content_tool(
+        &self,
+        params: Parameters<GetFileContentInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.get_file_content(params).await;
+        let outcome_class = classify_get_file_content_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
         let mut input = params.0;
         input.path = normalize_exact_path(&input.path);
@@ -6937,9 +7091,19 @@ impl SymForgeServer {
     /// NOT for file-level dependencies (use find_dependents).
     /// NOT for full refactoring context (use get_symbol_context with sections=[...]).
     #[tool(
+        name = "find_references",
         description = "Find all references or implementations for a symbol. Modes: (1) default/references: call sites, imports, type usages grouped by file - set compact=true for ~60-75% smaller output. (2) mode='implementations': find trait/interface implementors bidirectionally - set direction='trait'/'type'/'auto'. Use when you need 'who calls this?' or 'who implements this?' NOT for file-level dependencies (use find_dependents). NOT for full refactoring context (use get_symbol_context with sections=[...]).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn find_references_tool(
+        &self,
+        params: Parameters<FindReferencesInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let output = self.find_references(params).await;
+        let outcome_class = classify_find_references_output(&output);
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn find_references(&self, params: Parameters<FindReferencesInput>) -> String {
         if let Some(result) = self.proxy_tool_call("find_references", &params.0).await {
             return result;
@@ -9706,6 +9870,8 @@ mod tests {
     use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
     use crate::live_index::store::{CircuitBreakerState, IndexedFile, LiveIndex, ParseStatus};
     use crate::protocol::SymForgeServer;
+    use crate::protocol::result_status::{OutcomeClass, RESULT_STATUS_META_KEY};
+    use rmcp::handler::server::tool::IntoCallToolResult;
     use rmcp::handler::server::wrapper::Parameters;
     use tempfile::TempDir;
 
@@ -10020,6 +10186,114 @@ mod tests {
 
     fn make_server(index: LiveIndex) -> SymForgeServer {
         make_server_with_root(index, None)
+    }
+
+    fn serialized_tool_result<R: IntoCallToolResult>(result: R) -> serde_json::Value {
+        let result = result.into_call_tool_result().unwrap();
+        serde_json::to_value(&result).unwrap()
+    }
+
+    fn assert_tool_result_status(serialized: &serde_json::Value, expected: OutcomeClass) {
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["contract_version"],
+            serde_json::json!(1),
+            "missing or wrong result-status contract version: {serialized}"
+        );
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(expected.as_str()),
+            "wrong result-status outcome: {serialized}"
+        );
+    }
+
+    fn tool_result_text(serialized: &serde_json::Value) -> &str {
+        serialized["content"][0]["text"]
+            .as_str()
+            .expect("tool result should contain one text content item")
+    }
+
+    fn get_file_content_input(path: &str) -> super::GetFileContentInput {
+        super::GetFileContentInput {
+            path: path.to_string(),
+            mode: None,
+            start_line: None,
+            end_line: None,
+            chunk_index: None,
+            max_lines: None,
+            around_line: None,
+            around_match: None,
+            match_occurrence: None,
+            around_symbol: None,
+            symbol_line: None,
+            context_lines: None,
+            show_line_numbers: None,
+            header: None,
+            estimate: None,
+            offset: None,
+            limit: None,
+            max_tokens: None,
+        }
+    }
+
+    fn get_symbol_input(path: &str, name: &str) -> super::GetSymbolInput {
+        super::GetSymbolInput {
+            path: path.to_string(),
+            name: name.to_string(),
+            kind: None,
+            symbol_line: None,
+            targets: None,
+            estimate: None,
+        }
+    }
+
+    fn search_symbols_input(query: Option<&str>) -> super::SearchSymbolsInput {
+        super::SearchSymbolsInput {
+            query: query.map(str::to_string),
+            kind: None,
+            path_prefix: None,
+            language: None,
+            limit: None,
+            include_generated: None,
+            include_tests: None,
+            include_vendor: None,
+            include_personal_tooling: None,
+            estimate: None,
+            max_tokens: None,
+        }
+    }
+
+    fn search_files_input(query: &str) -> super::SearchFilesInput {
+        super::SearchFilesInput {
+            query: query.to_string(),
+            limit: None,
+            current_file: None,
+            changed_with: None,
+            resolve: None,
+            estimate: None,
+            max_tokens: None,
+            debug_ranking: None,
+            rank_by: None,
+            anchor_path: None,
+            include_vendor: None,
+            include_personal_tooling: None,
+        }
+    }
+
+    fn find_references_input(name: &str) -> super::FindReferencesInput {
+        super::FindReferencesInput {
+            name: name.to_string(),
+            kind: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+            limit: None,
+            max_per_file: None,
+            compact: None,
+            mode: None,
+            direction: None,
+            estimate: None,
+            max_tokens: None,
+        }
     }
 
     fn write_sidecar_state(repo_root: &Path, port: Option<u16>, pid: Option<&str>) {
@@ -14180,6 +14454,272 @@ mod tests {
             serialized["_meta"][crate::protocol::result_status::RESULT_STATUS_META_KEY]["outcome_class"],
             serde_json::json!("found")
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_tools_emit_result_status_contract() {
+        let source = "fn present() {}\nfn duplicate() {}\nfn duplicate() {}\n";
+        let present_start = source.find("fn present").unwrap() as u32;
+        let first_duplicate_start = source.find("fn duplicate").unwrap() as u32;
+        let second_duplicate_start = source.rfind("fn duplicate").unwrap() as u32;
+        let present_end = present_start + "fn present() {}".len() as u32;
+        let duplicate_len = "fn duplicate() {}".len() as u32;
+        let (key, file) = make_file(
+            "src/lib.rs",
+            source.as_bytes(),
+            vec![
+                make_symbol_with_bytes(
+                    "present",
+                    SymbolKind::Function,
+                    0,
+                    0,
+                    (present_start, present_end),
+                ),
+                make_symbol_with_bytes(
+                    "duplicate",
+                    SymbolKind::Function,
+                    1,
+                    1,
+                    (first_duplicate_start, first_duplicate_start + duplicate_len),
+                ),
+                make_symbol_with_bytes(
+                    "duplicate",
+                    SymbolKind::Function,
+                    2,
+                    2,
+                    (
+                        second_duplicate_start,
+                        second_duplicate_start + duplicate_len,
+                    ),
+                ),
+            ],
+        );
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let found_file = serialized_tool_result(
+            server
+                .get_file_content_tool(Parameters(get_file_content_input("src/lib.rs")))
+                .await,
+        );
+        assert_tool_result_status(&found_file, OutcomeClass::Found);
+        assert_eq!(tool_result_text(&found_file), source);
+
+        let missing_file = serialized_tool_result(
+            server
+                .get_file_content_tool(Parameters(get_file_content_input("src/missing.rs")))
+                .await,
+        );
+        assert_tool_result_status(&missing_file, OutcomeClass::NotFound);
+        assert!(tool_result_text(&missing_file).contains("File not found"));
+
+        let mut invalid_read = get_file_content_input("src/lib.rs");
+        invalid_read.start_line = Some(1);
+        invalid_read.around_line = Some(1);
+        let invalid_read =
+            serialized_tool_result(server.get_file_content_tool(Parameters(invalid_read)).await);
+        assert_tool_result_status(&invalid_read, OutcomeClass::InvalidRequest);
+
+        let mut ambiguous_read = get_file_content_input("src/lib.rs");
+        ambiguous_read.around_symbol = Some("duplicate".to_string());
+        let ambiguous_read = serialized_tool_result(
+            server
+                .get_file_content_tool(Parameters(ambiguous_read))
+                .await,
+        );
+        assert_tool_result_status(&ambiguous_read, OutcomeClass::Ambiguous);
+        assert!(tool_result_text(&ambiguous_read).contains("Ambiguous symbol selector"));
+
+        let found_symbol = serialized_tool_result(
+            server
+                .get_symbol_tool(Parameters(get_symbol_input("src/lib.rs", "present")))
+                .await,
+        );
+        assert_tool_result_status(&found_symbol, OutcomeClass::Found);
+        assert!(tool_result_text(&found_symbol).contains("fn present() {}"));
+
+        let missing_symbol = serialized_tool_result(
+            server
+                .get_symbol_tool(Parameters(get_symbol_input("src/lib.rs", "missing_symbol")))
+                .await,
+        );
+        assert_tool_result_status(&missing_symbol, OutcomeClass::NotFound);
+        assert!(tool_result_text(&missing_symbol).contains("No symbol missing_symbol"));
+
+        let ambiguous_symbol = serialized_tool_result(
+            server
+                .get_symbol_tool(Parameters(get_symbol_input("src/lib.rs", "duplicate")))
+                .await,
+        );
+        assert_tool_result_status(&ambiguous_symbol, OutcomeClass::Ambiguous);
+        assert!(tool_result_text(&ambiguous_symbol).contains("Ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_emit_result_status_contract() {
+        let server = make_server(make_live_index_ready(vec![
+            make_file(
+                "src/lib.rs",
+                b"fn present() {}\nconst NEEDLE: &str = \"needle\";\n",
+                vec![make_symbol("present", SymbolKind::Function, 0, 0)],
+            ),
+            make_file("tests/lib.rs", b"fn test_lib() {}", vec![]),
+        ]));
+
+        let found_symbols = serialized_tool_result(
+            server
+                .search_symbols_tool(Parameters(search_symbols_input(Some("present"))))
+                .await,
+        );
+        assert_tool_result_status(&found_symbols, OutcomeClass::Found);
+        assert!(tool_result_text(&found_symbols).contains("present"));
+
+        let empty_symbols = serialized_tool_result(
+            server
+                .search_symbols_tool(Parameters(search_symbols_input(Some("absent_symbol"))))
+                .await,
+        );
+        assert_tool_result_status(&empty_symbols, OutcomeClass::EmptyResult);
+        assert!(tool_result_text(&empty_symbols).contains("No symbols matching"));
+
+        let invalid_symbols = serialized_tool_result(
+            server
+                .search_symbols_tool(Parameters(search_symbols_input(None)))
+                .await,
+        );
+        assert_tool_result_status(&invalid_symbols, OutcomeClass::InvalidRequest);
+
+        let found_text = serialized_tool_result(
+            server
+                .search_text_tool(Parameters(super::SearchTextInput {
+                    query: Some("needle".to_string()),
+                    ..Default::default()
+                }))
+                .await,
+        );
+        assert_tool_result_status(&found_text, OutcomeClass::Found);
+        assert!(tool_result_text(&found_text).contains("needle"));
+
+        let empty_text = serialized_tool_result(
+            server
+                .search_text_tool(Parameters(super::SearchTextInput {
+                    query: Some("absent_text".to_string()),
+                    ..Default::default()
+                }))
+                .await,
+        );
+        assert_tool_result_status(&empty_text, OutcomeClass::EmptyResult);
+        assert!(tool_result_text(&empty_text).contains("No matches"));
+
+        let invalid_text = serialized_tool_result(
+            server
+                .search_text_tool(Parameters(super::SearchTextInput {
+                    query: Some("[".to_string()),
+                    regex: Some(true),
+                    ..Default::default()
+                }))
+                .await,
+        );
+        assert_tool_result_status(&invalid_text, OutcomeClass::InvalidRequest);
+
+        let found_file = serialized_tool_result(
+            server
+                .search_files_tool(Parameters(search_files_input("src/lib.rs")))
+                .await,
+        );
+        assert_tool_result_status(&found_file, OutcomeClass::Found);
+        assert!(tool_result_text(&found_file).contains("src/lib.rs"));
+
+        let missing_file = serialized_tool_result(
+            server
+                .search_files_tool(Parameters(search_files_input("missing.rs")))
+                .await,
+        );
+        assert_tool_result_status(&missing_file, OutcomeClass::NotFound);
+
+        let mut ambiguous_file_input = search_files_input("lib.rs");
+        ambiguous_file_input.resolve = Some(true);
+        let ambiguous_file = serialized_tool_result(
+            server
+                .search_files_tool(Parameters(ambiguous_file_input))
+                .await,
+        );
+        assert_tool_result_status(&ambiguous_file, OutcomeClass::Ambiguous);
+        assert!(tool_result_text(&ambiguous_file).contains("Ambiguous path hint"));
+    }
+
+    #[tokio::test]
+    async fn test_find_references_emits_result_status_contract() {
+        let target = make_file(
+            "src/db.rs",
+            b"pub fn connect() {}\n",
+            vec![make_symbol("connect", SymbolKind::Function, 0, 0)],
+        );
+        let dependent = make_file_with_refs(
+            "src/service.rs",
+            b"use crate::db::connect;\nfn run() { connect(); }\n",
+            vec![make_symbol("run", SymbolKind::Function, 1, 1)],
+            vec![
+                make_ref("db", Some("crate::db"), ReferenceKind::Import, 0, None),
+                make_ref(
+                    "connect",
+                    Some("crate::db::connect"),
+                    ReferenceKind::Call,
+                    1,
+                    Some(0),
+                ),
+            ],
+        );
+        let lonely = make_file(
+            "src/lonely.rs",
+            b"fn lonely() {}\n",
+            vec![make_symbol("lonely", SymbolKind::Function, 0, 0)],
+        );
+        let duplicate = make_file(
+            "src/duplicate.rs",
+            b"fn duplicate() {}\nfn duplicate() {}\n",
+            vec![
+                make_symbol("duplicate", SymbolKind::Function, 0, 0),
+                make_symbol("duplicate", SymbolKind::Function, 1, 1),
+            ],
+        );
+        let server = make_server(make_live_index_ready(vec![
+            target, dependent, lonely, duplicate,
+        ]));
+
+        let mut found_input = find_references_input("connect");
+        found_input.kind = Some("call".to_string());
+        found_input.path = Some("src/db.rs".to_string());
+        found_input.symbol_kind = Some("fn".to_string());
+        found_input.symbol_line = Some(1);
+        let found =
+            serialized_tool_result(server.find_references_tool(Parameters(found_input)).await);
+        assert_tool_result_status(&found, OutcomeClass::Found);
+        assert!(tool_result_text(&found).contains("src/service.rs"));
+
+        let mut empty_input = find_references_input("lonely");
+        empty_input.path = Some("src/lonely.rs".to_string());
+        empty_input.symbol_kind = Some("fn".to_string());
+        empty_input.symbol_line = Some(1);
+        let empty =
+            serialized_tool_result(server.find_references_tool(Parameters(empty_input)).await);
+        assert_tool_result_status(&empty, OutcomeClass::EmptyResult);
+        assert!(tool_result_text(&empty).contains("No references found"));
+
+        let mut missing_path = find_references_input("missing");
+        missing_path.path = Some("src/missing.rs".to_string());
+        let missing_path =
+            serialized_tool_result(server.find_references_tool(Parameters(missing_path)).await);
+        assert_tool_result_status(&missing_path, OutcomeClass::NotFound);
+        assert!(tool_result_text(&missing_path).contains("File not found"));
+
+        let mut ambiguous = find_references_input("duplicate");
+        ambiguous.kind = Some("call".to_string());
+        ambiguous.path = Some("src/duplicate.rs".to_string());
+        ambiguous.symbol_kind = Some("fn".to_string());
+        let ambiguous =
+            serialized_tool_result(server.find_references_tool(Parameters(ambiguous)).await);
+        assert_tool_result_status(&ambiguous, OutcomeClass::Ambiguous);
+        assert!(tool_result_text(&ambiguous).contains("Ambiguous symbol selector"));
     }
 
     #[tokio::test]
