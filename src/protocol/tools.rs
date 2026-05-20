@@ -8855,8 +8855,10 @@ impl SymForgeServer {
         //   * new_body starts with a doc marker → extend past the old
         //     attached/orphaned docs so the new ones replace them
         //     (prevents duplicate JSDoc/XML doc blocks).
-        //   * new_body has no doc marker → start at the signature line
-        //     so existing attached docs and attributes stay put.
+        //   * new_body has no doc marker → preserve existing attached docs
+        //     and attributes. If an inline doc marker shares the symbol line,
+        //     start just after that marker so the old modifier/signature is
+        //     still replaced by the caller's body.
         // Preserving docs by default was the behavior users expected;
         // swallowing them silently was the bug surfaced in the v7.5 review.
         let new_body_supplies_docs = edit::body_starts_with_doc_comment(&params.0.new_body);
@@ -8873,7 +8875,11 @@ impl SymForgeServer {
         let line_start = if new_body_supplies_docs {
             edit::extend_past_orphaned_docs(&file.content, raw_line_start, &sym) as u32
         } else {
-            raw_line_start as u32
+            edit::docless_replacement_splice_start(
+                &file.content,
+                raw_line_start,
+                sym.byte_range.0 as usize,
+            ) as u32
         };
         let indent = edit::detect_indentation(&file.content, sym.byte_range.0);
         let line_ending = edit::detect_line_ending(&file.content);
@@ -18457,6 +18463,81 @@ mod tests {
             on_disk.matches("/** Adds two numbers. */").count(),
             1,
             "JSDoc must not duplicate; disk was:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_symbol_body_preserves_same_line_jsdoc_without_new_doc() {
+        let original = b"/** @deprecated */ export function legacy(): number {\n    return 1;\n}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("legacy.ts");
+        std::fs::write(&file_path, original).unwrap();
+        let parse_result =
+            crate::parsing::process_file("src/legacy.ts", original, LanguageId::TypeScript);
+        let indexed = IndexedFile::from_parse_result(parse_result, original.to_vec());
+        let index = make_live_index_ready(vec![("src/legacy.ts".to_string(), indexed)]);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            path: "src/legacy.ts".to_string(),
+            name: "legacy".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "export function legacy(): number {\n    return 2;\n}".to_string(),
+            dry_run: None,
+            working_directory: None,
+        };
+        let result = server.replace_symbol_body(Parameters(input)).await;
+        assert!(result.contains("replaced"), "result was: {result}");
+
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            on_disk.starts_with("/** @deprecated */ export function legacy"),
+            "same-line JSDoc prefix must survive a body-only replace; disk was:\n{on_disk}"
+        );
+        assert_eq!(
+            on_disk.matches("/** @deprecated */").count(),
+            1,
+            "same-line JSDoc must not duplicate; disk was:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("return 2;"),
+            "new body must be written; disk was:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_symbol_body_preserves_same_line_rust_block_doc_without_new_doc() {
+        let original = b"/** @deprecated */ pub fn legacy() -> i32 {\n    1\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(original);
+
+        let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            path: "src/lib.rs".to_string(),
+            name: "legacy".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "pub fn legacy() -> i32 {\n    2\n}".to_string(),
+            dry_run: None,
+            working_directory: None,
+        };
+        let result = server.replace_symbol_body(Parameters(input)).await;
+        assert!(result.contains("replaced"), "result was: {result}");
+
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            on_disk.starts_with("/** @deprecated */ pub fn legacy"),
+            "same-line Rust block doc must survive a body-only replace; disk was:\n{on_disk}"
+        );
+        assert_eq!(
+            on_disk.matches("/** @deprecated */").count(),
+            1,
+            "same-line Rust block doc must not duplicate; disk was:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("    2"),
+            "new body must be written; disk was:\n{on_disk}"
         );
     }
 

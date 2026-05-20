@@ -651,6 +651,54 @@ pub(crate) fn body_starts_with_doc_comment(body: &str) -> bool {
         || trimmed.starts_with("#[doc")
 }
 
+/// Return the splice start for a docless replacement.
+///
+/// Normally this is the start of the symbol's source line. When a doc marker
+/// shares the line with the symbol, preserve the marker and its separator, then
+/// replace the old modifiers/signature with the caller's `new_body`.
+pub(crate) fn docless_replacement_splice_start(
+    file_content: &[u8],
+    raw_line_start: usize,
+    symbol_start: usize,
+) -> usize {
+    if raw_line_start >= symbol_start || symbol_start > file_content.len() {
+        return raw_line_start;
+    }
+
+    let prefix = &file_content[raw_line_start..symbol_start];
+    same_line_doc_prefix_end(prefix)
+        .map(|end| raw_line_start + end)
+        .unwrap_or(raw_line_start)
+}
+
+fn same_line_doc_prefix_end(prefix: &[u8]) -> Option<usize> {
+    let Ok(text) = std::str::from_utf8(prefix) else {
+        return None;
+    };
+    let leading = text.len() - text.trim_start().len();
+    let trimmed = &text[leading..];
+
+    if trimmed.starts_with("/**") || trimmed.starts_with("/*!") {
+        let marker_end = trimmed.find("*/")? + 2;
+        let after_padding = trimmed[marker_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|pos| marker_end + pos)
+            .unwrap_or(trimmed.len());
+        return Some(leading + after_padding);
+    }
+
+    if trimmed.starts_with("#[doc") {
+        let marker_end = trimmed.find(']')? + 1;
+        let after_padding = trimmed[marker_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|pos| marker_end + pos)
+            .unwrap_or(trimmed.len());
+        return Some(leading + after_padding);
+    }
+
+    None
+}
+
 pub(crate) fn build_delete(
     file_content: &[u8],
     sym: &SymbolRecord,
@@ -5257,6 +5305,45 @@ fn uses_it() { Widget::default(); }
         let raw = serde_json::Value::String("src/lib.rs::foo".to_string());
         let v: InsertTarget = serde_json::from_value(raw).unwrap();
         assert!(v.working_directory.is_none());
+    }
+
+    #[test]
+    fn docless_replacement_splice_start_preserves_same_line_block_doc() {
+        let source = b"/** @deprecated */ export function legacy() {}";
+        let symbol_start = source
+            .windows(b"function".len())
+            .position(|window| window == b"function")
+            .unwrap();
+
+        let start = docless_replacement_splice_start(source, 0, symbol_start);
+
+        assert_eq!(&source[..start], b"/** @deprecated */ ");
+    }
+
+    #[test]
+    fn docless_replacement_splice_start_preserves_same_line_doc_attribute() {
+        let source = br#"#[doc = "legacy"] pub fn legacy() {}"#;
+        let symbol_start = source
+            .windows(b"fn".len())
+            .position(|window| window == b"fn")
+            .unwrap();
+
+        let start = docless_replacement_splice_start(source, 0, symbol_start);
+
+        assert_eq!(&source[..start], br#"#[doc = "legacy"] "#);
+    }
+
+    #[test]
+    fn docless_replacement_splice_start_ignores_non_doc_prefix() {
+        let source = b"export function legacy() {}";
+        let symbol_start = source
+            .windows(b"function".len())
+            .position(|window| window == b"function")
+            .unwrap();
+
+        let start = docless_replacement_splice_start(source, 0, symbol_start);
+
+        assert_eq!(start, 0);
     }
 
     #[test]

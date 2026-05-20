@@ -1,3 +1,63 @@
+# SFB08 - Preserve same-line inline docs in replace_symbol_body
+
+## Plan
+
+- [x] Run Branch Guard and switch to the dedicated `backlog-implementation` worktree.
+- [x] Index the target worktree with SymForge and check memory/lessons context.
+- [x] Mark the SFB08 goal file `In progress` with a start timestamp.
+- [x] Inspect current `replace_symbol_body` formatting/span behavior and existing edit tests.
+- [x] Add a failing regression test for preserving same-line inline docs when `new_body` is docless.
+- [x] Implement the minimal span/formatting fix without changing unrelated edit behavior.
+- [x] Run task-specific verification:
+  - `cargo fmt --check`
+  - `cargo check`
+  - `cargo test --all-targets -- --test-threads=1`
+  - `rg "replace_symbol_body|inline doc|deprecated|raw_line_start" src tests`
+- [x] Run default full verification when task-specific verification passes and time permits.
+- [ ] Commit verified implementation work.
+- [ ] Update SFB08 frontmatter to `Completed` with the verified work commit hash.
+- [ ] Commit the goal-status update separately.
+
+## Evidence Log
+
+- Branch Guard from the original checkout returned `main` with a clean status, so edits moved to `.worktrees/backlog-implementation`.
+- Branch Guard in the worktree returned `backlog-implementation` with a clean status before goal edits.
+- SymForge indexed the worktree: 190 files, 9261 symbols.
+- Goal status changed to `In progress` at `2026-05-20T13:16:53.2047193+02:00`.
+- Root cause: docless `replace_symbol_body` used `raw_line_start` as the splice start. When `raw_line_start < sym.byte_range.0`, same-line doc text before the parsed symbol was removed with the old signature.
+- Red test evidence:
+  - `cargo test preserves_same_line -- --nocapture` failed with both new fixtures losing `/** @deprecated */`.
+  - The TypeScript fixture failed with disk output starting `export function legacy`.
+  - The Rust block-doc fixture failed with disk output starting `pub fn legacy`.
+- Implementation:
+  - Added `docless_replacement_splice_start` in `src/protocol/edit.rs`.
+  - The helper detects same-line `/** ... */`, `/*! ... */`, and `#[doc ...]` prefixes before the parsed symbol and returns the first non-whitespace byte after the doc marker.
+  - `replace_symbol_body` now uses that helper only when `new_body` does not supply docs.
+  - Added TypeScript/JSDoc and Rust block-doc same-line regression tests.
+- Focused verification:
+  - `cargo test docless_replacement_splice_start -- --nocapture`: 3 passed, 0 failed.
+  - `cargo test preserves_same_line -- --nocapture`: 4 passed, 0 failed after the helper tests were added.
+  - `cargo test replace_symbol_body -- --nocapture`: 18 unit tests passed plus matching integration tests including dry-run, attached-doc, orphan-doc, and same-line fixtures.
+- Task-specific verification passed:
+  - `cargo fmt --check`: exit 0.
+  - `cargo check`: exit 0.
+  - `cargo test --all-targets -- --test-threads=1`: exit 0; observed key totals include `src/lib.rs` 1757 passed and `src/main.rs` 6 passed, plus integration test targets.
+  - `rg "replace_symbol_body|inline doc|deprecated|raw_line_start" src tests`: exit 0 and showed the new same-line `@deprecated` fixtures plus `raw_line_start` call sites.
+- Default verification passed:
+  - `git branch --show-current`: `backlog-implementation`.
+  - `git diff --check`: exit 0; Git reported CRLF replacement warnings for touched files, not whitespace errors.
+  - `cargo fmt --check`: exit 0.
+  - `cargo check`: exit 0.
+  - `cargo test --all-targets -- --test-threads=1`: full all-targets suite passed again after the helper tests were added.
+  - `cargo build --release`: finished release profile successfully.
+
+## Review
+
+- SFB08 acceptance criteria passed: same-line TypeScript/JSDoc and Rust block-doc fixtures preserve `/** @deprecated */`, existing attached-doc and orphan-doc replacement tests pass, and required verification completed.
+- Changes stayed inside the allowed tracked files/areas: `src/protocol/edit.rs`, `src/protocol/tools.rs`, and `tests` coverage inside the inline `tools.rs` test module. No forbidden files were modified.
+
+---
+
 # SFB07 - Pin search_text usage grouping behavior for doc comments and markdown
 
 ## Plan
