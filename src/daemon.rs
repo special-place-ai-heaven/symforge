@@ -210,6 +210,8 @@ pub struct DaemonHealth {
 #[derive(Clone)]
 struct SessionRuntime {
     canonical_root: PathBuf,
+    project_id: String,
+    session_id: String,
     index: SharedIndex,
     token_stats: Arc<TokenStats>,
     symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
@@ -542,6 +544,8 @@ impl DaemonState {
         let project = projects.get(&session.project_id)?;
         Some(SessionRuntime {
             canonical_root: project.canonical_root.clone(),
+            project_id: session.project_id.clone(),
+            session_id: session.session_id.clone(),
             index: Arc::clone(&project.index),
             token_stats: Arc::clone(&project.token_stats),
             symbol_cache: Arc::clone(&project.symbol_cache),
@@ -1650,8 +1654,16 @@ async fn execute_tool_call(
         "search_files" => Ok(server
             .search_files(Parameters(decode_params::<SearchFilesInput>(params)?))
             .await),
-        "health" => Ok(server.health().await),
-        "health_compact" => Ok(server.health_compact().await),
+        "health" => Ok(server.health_for_daemon_session(
+            runtime.project_id.clone(),
+            runtime.session_id.clone(),
+            runtime.canonical_root.clone(),
+        )),
+        "health_compact" => Ok(server.health_compact_for_daemon_session(
+            runtime.project_id.clone(),
+            runtime.session_id.clone(),
+            runtime.canonical_root.clone(),
+        )),
         "index_folder" => Ok(server
             .index_folder(Parameters(decode_params::<IndexFolderInput>(params)?))
             .await),
@@ -2384,6 +2396,59 @@ mod tests {
         assert!(
             resolved_path_body.contains("src/main.rs"),
             "search_files resolve mode should return the indexed file, got: {resolved_path_body}"
+        );
+
+        let reused = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex-reused".to_string(),
+                pid: Some(9002),
+            })
+            .send()
+            .await
+            .expect("reused open request")
+            .error_for_status()
+            .expect("reused open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("reused open body");
+        assert_eq!(reused.project_id, opened.project_id);
+        assert_ne!(reused.session_id, opened.session_id);
+
+        let health = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health_compact",
+                reused.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("health request")
+            .error_for_status()
+            .expect("health status")
+            .text()
+            .await
+            .expect("health body");
+        assert!(
+            health.contains("Runtime: mode=daemon_reused_session"),
+            "daemon health should distinguish reused daemon sessions, got: {health}"
+        );
+        assert!(
+            health.contains(&format!("project_root={}", reused.canonical_root)),
+            "daemon health should surface canonical project root, got: {health}"
+        );
+        assert!(
+            health.contains(&format!("project_id={}", reused.project_id)),
+            "daemon health should surface daemon project id, got: {health}"
+        );
+        assert!(
+            health.contains(&format!("session_id={}", reused.session_id)),
+            "daemon health should surface daemon session id, got: {health}"
+        );
+        assert!(
+            health.contains("index_id=index-"),
+            "daemon health should surface index identity, got: {health}"
         );
 
         let _ = handle.shutdown_tx.send(());

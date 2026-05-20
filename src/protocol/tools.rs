@@ -6466,18 +6466,66 @@ impl SymForgeServer {
         result
     }
 
-    /// Diagnostic: index status, file/symbol counts, load time, watcher state, token savings,
-    /// hook adoption metrics, git temporal status. Always responds even during loading. Use to
-    /// verify SymForge is working.
-    #[tool(
-        description = "Diagnostic: index status, file/symbol counts, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
-        annotations(read_only_hint = true, open_world_hint = false)
-    )]
-    pub(crate) async fn health(&self) -> String {
-        if let Some(result) = self.proxy_tool_call_without_params("health").await {
-            return result;
+    fn project_id_for_root(root: &Path) -> String {
+        let normalized = root.display().to_string().replace('\\', "/");
+        let stable_path = if cfg!(windows) {
+            normalized.to_lowercase()
+        } else {
+            normalized
+        };
+        format!(
+            "project-{}",
+            crate::hash::digest_hex(stable_path.as_bytes())
+        )
+    }
+
+    fn runtime_status_for(
+        &self,
+        published: &crate::live_index::PublishedIndexState,
+        mode: format::RuntimeMode,
+        project_id: Option<String>,
+        session_id: Option<String>,
+        project_root: Option<PathBuf>,
+    ) -> format::RuntimeStatus {
+        let project_root = project_root.or_else(|| self.capture_repo_root());
+        let project_id = project_id.unwrap_or_else(|| {
+            project_root
+                .as_deref()
+                .map(Self::project_id_for_root)
+                .unwrap_or_else(|| "project-unknown".to_string())
+        });
+        let session_id =
+            session_id.unwrap_or_else(|| format!("local-process-{}", std::process::id()));
+
+        format::RuntimeStatus {
+            mode,
+            project_root: project_root.map(|root| root.to_string_lossy().replace('\\', "/")),
+            project_id,
+            session_id,
+            index_generation: published.generation,
+            project_generation: self.index.current_project_generation(),
+            load_source: published.load_source,
         }
+    }
+
+    fn local_runtime_mode(&self) -> format::RuntimeMode {
+        if self.daemon_client.is_some() && self.daemon_degraded.load(Ordering::Relaxed) {
+            format::RuntimeMode::DaemonDegradedLocalFallback
+        } else {
+            format::RuntimeMode::LocalProcess
+        }
+    }
+
+    fn health_for_runtime(
+        &self,
+        mode: format::RuntimeMode,
+        project_id: Option<String>,
+        session_id: Option<String>,
+        project_root: Option<PathBuf>,
+    ) -> String {
         let published = self.index.published_state();
+        let runtime_status =
+            self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
         let mut result = format::health_report_from_published_state(
@@ -6485,6 +6533,8 @@ impl SymForgeServer {
             &watcher_guard,
             rejected_stale_mutations,
         );
+        result.push('\n');
+        result.push_str(&format::format_runtime_status(&runtime_status));
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status(&sidecar_status));
@@ -6546,9 +6596,7 @@ impl SymForgeServer {
 
         // Append frecency diagnostics when SYMFORGE_FRECENCY=1. The feature-flag
         // guard mirrors the one in `frecency::bump`; when the flag is unset,
-        // the health output is byte-identical to pre-frecency releases.
-        // Keep the diagnostic bounded to the last 10 bumps so health remains
-        // useful without turning into an analytics dump.
+        // the health output remains compact unless the feature is explicitly enabled.
         if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
             && let Some(repo_root) = self.capture_repo_root()
             && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(
@@ -6574,22 +6622,19 @@ impl SymForgeServer {
             }
         }
 
-        self.session_context
-            .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
         result
     }
 
-    /// Compact diagnostic: essential health fields only. Use when token budget matters.
-    #[tool(
-        description = "Compact diagnostic: essential index, watcher, admission, and token-savings health fields only. Prefer this when token budget matters; use health for full diagnostic lists.",
-        annotations(read_only_hint = true, open_world_hint = false)
-    )]
-    pub(crate) async fn health_compact(&self) -> String {
-        if let Some(result) = self.proxy_tool_call_without_params("health_compact").await {
-            return result;
-        }
-
+    fn health_compact_for_runtime(
+        &self,
+        mode: format::RuntimeMode,
+        project_id: Option<String>,
+        session_id: Option<String>,
+        project_root: Option<PathBuf>,
+    ) -> String {
         let published = self.index.published_state();
+        let runtime_status =
+            self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
         let mut result = format::health_report_compact_from_published_state(
@@ -6597,6 +6642,8 @@ impl SymForgeServer {
             &watcher_guard,
             rejected_stale_mutations,
         );
+        result.push('\n');
+        result.push_str(&format::format_runtime_status_compact(&runtime_status));
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status_compact(&sidecar_status));
@@ -6644,6 +6691,65 @@ impl SymForgeServer {
         result.push('\n');
         result.push_str(&capabilities.compact_text());
 
+        result
+    }
+
+    pub(crate) fn health_for_daemon_session(
+        &self,
+        project_id: String,
+        session_id: String,
+        project_root: PathBuf,
+    ) -> String {
+        self.health_for_runtime(
+            format::RuntimeMode::DaemonReusedSession,
+            Some(project_id),
+            Some(session_id),
+            Some(project_root),
+        )
+    }
+
+    pub(crate) fn health_compact_for_daemon_session(
+        &self,
+        project_id: String,
+        session_id: String,
+        project_root: PathBuf,
+    ) -> String {
+        self.health_compact_for_runtime(
+            format::RuntimeMode::DaemonReusedSession,
+            Some(project_id),
+            Some(session_id),
+            Some(project_root),
+        )
+    }
+
+    /// Diagnostic: index status, file/symbol counts, load time, watcher state, token savings,
+    /// project/session identity, hook adoption metrics, git temporal status. Always responds
+    /// even during loading. Use to verify SymForge is working.
+    #[tool(
+        description = "Diagnostic: index status, file/symbol counts, project/session identity, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn health(&self) -> String {
+        if let Some(result) = self.proxy_tool_call_without_params("health").await {
+            return result;
+        }
+        let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None);
+        self.session_context
+            .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
+        result
+    }
+
+    /// Compact diagnostic: essential health fields only. Use when token budget matters.
+    #[tool(
+        description = "Compact diagnostic: essential index, project/session identity, watcher, admission, and token-savings health fields only. Prefer this when token budget matters; use health for full diagnostic lists.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn health_compact(&self) -> String {
+        if let Some(result) = self.proxy_tool_call_without_params("health_compact").await {
+            return result;
+        }
+
+        let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context.record_summary_output(
             "health_compact",
             (result.len() / 4).min(u32::MAX as usize) as u32,
@@ -11824,6 +11930,26 @@ mod tests {
             outline.contains("second"),
             "second local index_folder should refresh the same-root index, got: {outline}"
         );
+
+        let health = server.health_compact().await;
+        let root_text = repo
+            .path()
+            .canonicalize()
+            .expect("temp repo should canonicalize")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            health.contains(&format!("project_root={root_text}")),
+            "health should surface the reset project root after index_folder, got: {health}"
+        );
+        assert!(
+            health.contains("index_state=index_folder_reset"),
+            "health should distinguish index_folder reset state, got: {health}"
+        );
+        assert!(
+            health.contains("index_id=index-"),
+            "health should keep index identity assertable after reset, got: {health}"
+        );
     }
 
     #[tokio::test]
@@ -14128,6 +14254,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_health_surfaces_runtime_identity_for_fresh_local_process() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+
+        let result = server.health().await;
+        assert!(
+            result.contains("Runtime: mode=local_process"),
+            "health should identify local runtime mode: {result}"
+        );
+        let root_text = temp.path().to_string_lossy().replace('\\', "/");
+        assert!(
+            result.contains(&format!("project_root={root_text}")),
+            "health should identify active project root: {result}"
+        );
+        assert!(
+            result.contains("project_id=project-"),
+            "health should identify a stable project id: {result}"
+        );
+        assert!(
+            result.contains("session_id=local-process-"),
+            "health should identify the local session/process: {result}"
+        );
+        assert!(
+            result.contains("index_id=index-"),
+            "health should identify the active index: {result}"
+        );
+        assert!(
+            result.contains("load_source=fresh_load"),
+            "health should expose the load source: {result}"
+        );
+        assert!(
+            result.contains("index_state=fresh_process"),
+            "fresh local health should distinguish a fresh process: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_health_surfaces_alive_sidecar_pid_and_state() {
         let temp = TempDir::new().expect("tempdir should be created");
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -14175,6 +14342,14 @@ mod tests {
         assert!(result.contains("Status:"), "should have Status field");
         assert!(result.contains("Files:"), "should have Files field");
         assert!(result.contains("Symbols:"), "should have Symbols field");
+        assert!(
+            result.contains("Runtime: mode=local_process"),
+            "compact health should retain runtime identity: {result}"
+        );
+        assert!(
+            result.contains("index_id=index-"),
+            "compact health should retain index identity: {result}"
+        );
         assert!(
             !result.contains("Partial parse files"),
             "compact health should omit expanded path lists"

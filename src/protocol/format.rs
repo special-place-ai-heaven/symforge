@@ -38,11 +38,102 @@ use crate::live_index::query::EXPECTED_VENDOR_PARTIAL_PARSE_REASON;
 use crate::live_index::{
     ContextBundleFoundView, ContextBundleSectionView, ContextBundleView, FileContentView,
     FileOutlineView, FindDependentsView, FindReferencesView, HealthStats, ImplBlockSuggestionView,
-    ImplementationsView, IndexedFile, InspectMatchView, LiveIndex, PublishedIndexState,
-    RepoOutlineFileView, RepoOutlineView, SearchFilesResolveView, SearchFilesTier, SearchFilesView,
-    SymbolDetailView, TypeDependencyView, WhatChangedTimestampView, search,
+    ImplementationsView, IndexLoadSource, IndexedFile, InspectMatchView, LiveIndex,
+    PublishedIndexState, RepoOutlineFileView, RepoOutlineView, SearchFilesResolveView,
+    SearchFilesTier, SearchFilesView, SymbolDetailView, TypeDependencyView,
+    WhatChangedTimestampView, search,
 };
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMode {
+    LocalProcess,
+    DaemonReusedSession,
+    DaemonDegradedLocalFallback,
+}
+
+impl RuntimeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalProcess => "local_process",
+            Self::DaemonReusedSession => "daemon_reused_session",
+            Self::DaemonDegradedLocalFallback => "daemon_degraded_local_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub mode: RuntimeMode,
+    pub project_root: Option<String>,
+    pub project_id: String,
+    pub session_id: String,
+    pub index_generation: u64,
+    pub project_generation: u64,
+    pub load_source: IndexLoadSource,
+}
+
+fn index_load_source_label(load_source: IndexLoadSource) -> &'static str {
+    match load_source {
+        IndexLoadSource::EmptyBootstrap => "empty_bootstrap",
+        IndexLoadSource::FreshLoad => "fresh_load",
+        IndexLoadSource::SnapshotRestore => "snapshot_restore",
+    }
+}
+
+fn index_state_label(status: &RuntimeStatus) -> &'static str {
+    if status.project_generation > 0 {
+        return "index_folder_reset";
+    }
+
+    match status.load_source {
+        IndexLoadSource::EmptyBootstrap => "empty_bootstrap",
+        IndexLoadSource::FreshLoad => "fresh_process",
+        IndexLoadSource::SnapshotRestore => "snapshot_loaded_reused",
+    }
+}
+
+fn index_identity(status: &RuntimeStatus) -> String {
+    let suffix: String = status
+        .project_id
+        .strip_prefix("project-")
+        .unwrap_or(&status.project_id)
+        .chars()
+        .take(12)
+        .collect();
+    format!(
+        "index-{suffix}-p{}-g{}",
+        status.project_generation, status.index_generation
+    )
+}
+
+pub fn format_runtime_status(status: &RuntimeStatus) -> String {
+    format!(
+        "Runtime: mode={} | runtime_state={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | index_state={}",
+        status.mode.label(),
+        status.mode.label(),
+        status.project_root.as_deref().unwrap_or("<unknown>"),
+        status.project_id,
+        status.session_id,
+        index_identity(status),
+        status.index_generation,
+        status.project_generation,
+        index_load_source_label(status.load_source),
+        index_state_label(status),
+    )
+}
+
+pub fn format_runtime_status_compact(status: &RuntimeStatus) -> String {
+    format!(
+        "Runtime: mode={} | project_root={} | project_id={} | session_id={} | index_id={} | index_state={}",
+        status.mode.label(),
+        status.project_root.as_deref().unwrap_or("<unknown>"),
+        status.project_id,
+        status.session_id,
+        index_identity(status),
+        index_state_label(status),
+    )
+}
 
 pub fn capability_evidence_line(evidence: &crate::capability::CapabilityEvidence) -> String {
     let mut line = format!("Capability: {} {}", evidence.capability, evidence.status);
