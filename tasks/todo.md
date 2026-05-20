@@ -1,31 +1,34 @@
-# SFB01 - Mitigate Windows libgit2 lockfile flakes in git-heavy tests
+# SFB03 - Surface sidecar PID and alive state in health output
 
 ## Plan
 
 - [x] Run branch guard and move work to `backlog-implementation`.
-- [x] Mark SFB01 in progress.
-- [x] Identify git-heavy tests/helpers that create many commits.
-- [x] Confirm whether the flaky path is isolated to test setup.
-- [x] Add a bounded helper-level mitigation preserving the final git error.
-- [x] Add regression or stress coverage documenting the Windows lockfile race mitigation.
-- [x] Verify no `#[ignore]` workaround was introduced.
-- [x] Run required verification commands.
+- [x] Copy the SFB03 goal file into the worktree.
+- [x] Mark SFB03 in progress.
+- [x] Locate current health and health_compact formatting.
+- [x] Locate existing sidecar port/session state parsing and cleanup tests.
+- [x] Write failing tests for full, compact, and stale/dead sidecar output.
+- [x] Implement sidecar PID/liveness formatting without changing startup behavior.
+- [x] Verify existing port-file roundtrip and cleanup tests still pass.
+- [x] Run the goal-specific verification command.
+- [x] Run default verification if task-specific verification passes and time permits.
 - [x] Commit verified implementation work.
-- [x] Mark SFB01 completed and commit goal status.
+- [x] Mark SFB03 completed and commit goal status.
 
 ## Review
 
-- Before: duplicated frecency, persist, co-change, and ranking test fixtures called
-  `repo.commit(Some("HEAD"), ...)` directly while creating many commits.
-- After: `src/git/test_helpers.rs::commit_head_with_retry` wraps only the test
-  `HEAD` ref update in bounded retry/backoff and preserves the final git error.
-- Regression coverage: `tests/git_commit_retry.rs` exercises retry success and
-  final-error preservation for a Windows-style `.git/refs/heads/*.lock` failure.
-- Scope check: production git/query semantics were not changed; rewrites are
-  test fixture paths and inline unit-test helpers only.
-- Ignore check: SymForge search found only pre-existing ignored tests in
-  `tests/live_index_integration.rs` and `tests/coupling_calibration.rs`.
-- Verification passed: `cargo fmt --check`, `cargo check`,
-  `cargo test --all-targets -- --test-threads=1`, `cargo test --all-targets`,
-  `rg "#\\[ignore\\]" tests src`, `git branch --show-current`,
-  `git diff --check`, and `cargo build --release`.
+- Branch guard passed on `backlog-implementation`.
+- Verified work commit: `03bf46fa2515821a040e985dbba16583e923e5c1`.
+- Added non-mutating `.symforge/sidecar.*` status reporting with `alive`, `dead`,
+  `unknown`, and `none` states.
+- Full health sample lines covered by tests:
+  `Sidecar: pid=4242 port=<port> state=alive`,
+  `Sidecar: pid=4242 port=unknown state=unknown`, and `Sidecar: none`.
+- Compact health sample line covered by tests:
+  `Sidecar: dead pid=4242 port=0`.
+- Existing port-file roundtrip and cleanup tests passed via `cargo test port_file -- --test-threads=1`.
+- Goal verification passed: `cargo fmt --check`, `cargo check`,
+  `cargo test --all-targets -- --test-threads=1`, and `rg "Sidecar:" src tests`.
+- Default verification passed: `git branch --show-current`, `git diff --check`,
+  `cargo fmt --check`, `cargo check`, `cargo test --all-targets -- --test-threads=1`,
+  and `cargo build --release`.
