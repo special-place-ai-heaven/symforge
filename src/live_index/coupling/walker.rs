@@ -541,6 +541,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    mod git_test_helpers {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/git/test_helpers.rs"
+        ));
+    }
+
     struct TestRepo {
         tmp: tempfile::TempDir,
         repo: git2::Repository,
@@ -583,9 +590,14 @@ mod tests {
                 .into_iter()
                 .collect();
             let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-            self.repo
-                .commit(Some("HEAD"), &sig, &sig, msg, &tree, &parent_refs)
-                .unwrap()
+            git_test_helpers::commit_head_with_retry(
+                &self.repo,
+                &sig,
+                &sig,
+                msg,
+                &tree,
+                &parent_refs,
+            )
         }
     }
 

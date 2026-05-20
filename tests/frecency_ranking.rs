@@ -22,6 +22,13 @@ use tempfile::TempDir;
 
 // ─── Fixture ─────────────────────────────────────────────────────────────────
 
+mod git_test_helpers {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/git/test_helpers.rs"
+    ));
+}
+
 struct Fixture {
     _dir: TempDir,
     root: PathBuf,
@@ -556,9 +563,7 @@ fn init_repo_with_root_commit(root: &Path) -> String {
         idx.write_tree().expect("write tree")
     };
     let tree = repo.find_tree(tree_id).expect("find tree");
-    let oid = repo
-        .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-        .expect("commit");
+    let oid = git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
     oid.to_string()
 }
 
@@ -573,15 +578,14 @@ fn advance_head(root: &Path, count: usize) {
     for i in 0..count {
         let parent_oid = repo.head().expect("head").target().expect("head target");
         let parent = repo.find_commit(parent_oid).expect("find parent");
-        repo.commit(
-            Some("HEAD"),
+        git_test_helpers::commit_head_with_retry(
+            &repo,
             &sig,
             &sig,
             &format!("c{i}"),
             &tree,
             &[&parent],
-        )
-        .expect("commit");
+        );
     }
 }
 

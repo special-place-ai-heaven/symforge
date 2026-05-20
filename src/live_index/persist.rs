@@ -620,6 +620,13 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
     use tempfile::TempDir;
 
+    mod git_test_helpers {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/git/test_helpers.rs"
+        ));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn make_symbol(name: &str) -> SymbolRecord {
@@ -1687,16 +1694,14 @@ mod tests {
             .peel_to_commit()
             .expect("peel head");
         for i in 0..count {
-            let oid = repo
-                .commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &format!("{base_msg} {i}"),
-                    &tree,
-                    &[&head],
-                )
-                .expect("commit");
+            let oid = git_test_helpers::commit_head_with_retry(
+                &repo,
+                &sig,
+                &sig,
+                &format!("{base_msg} {i}"),
+                &tree,
+                &[&head],
+            );
             head = repo.find_commit(oid).expect("find commit");
         }
         head.id().to_string()
@@ -1711,9 +1716,7 @@ mod tests {
             idx.write_tree().expect("write tree")
         };
         let tree = repo.find_tree(tree_id).expect("find tree");
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-            .expect("root commit");
+        let oid = git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
         oid.to_string()
     }
 

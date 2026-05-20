@@ -15,6 +15,13 @@ use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
 
+mod git_test_helpers {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/git/test_helpers.rs"
+    ));
+}
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -129,9 +136,7 @@ fn init_git_repo(root: &Path) -> String {
         index.write_tree().expect("git write tree")
     };
     let tree = repo.find_tree(tree_id).expect("git tree");
-    let commit = repo
-        .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-        .expect("git commit");
+    let commit = git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
     let head = commit.to_string();
     drop(tree);
     drop(repo);

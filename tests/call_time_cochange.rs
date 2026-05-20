@@ -5,6 +5,13 @@ use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::{AnchorKey, CouplingRow, CouplingStore};
 use tempfile::TempDir;
 
+mod git_test_helpers {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/git/test_helpers.rs"
+    ));
+}
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -67,8 +74,7 @@ fn init_git_repo_with_workspace() -> TempDir {
         index.write_tree().unwrap()
     };
     let tree = repo.find_tree(tree_id).unwrap();
-    repo.commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-        .unwrap();
+    git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
     drop(tree);
     drop(repo);
     tmp

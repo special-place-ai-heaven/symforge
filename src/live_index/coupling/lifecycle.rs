@@ -270,6 +270,13 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
+    mod git_test_helpers {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/git/test_helpers.rs"
+        ));
+    }
+
     // Serialises COUPLING_FLAG_ENV mutation across tests. Mirrors frecency's
     // FRECENCY_ENV_LOCK. Project test policy already enforces --test-threads=1.
     static COUPLING_ENV_LOCK: StdMutex<()> = StdMutex::new(());
@@ -294,9 +301,7 @@ mod tests {
             idx.write_tree().expect("write tree")
         };
         let tree = repo.find_tree(tree_id).expect("find tree");
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-            .expect("root commit");
+        let oid = git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
         oid.to_string()
     }
 
@@ -315,9 +320,8 @@ mod tests {
         let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parents_vec: Vec<&git2::Commit> = parent_commit.iter().collect();
         let sig = git2::Signature::now("t", "t@x").expect("sig");
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents_vec)
-            .expect("commit");
+        let oid =
+            git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, msg, &tree, &parents_vec);
         oid.to_string()
     }
 

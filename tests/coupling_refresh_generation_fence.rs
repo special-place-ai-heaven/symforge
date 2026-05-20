@@ -7,6 +7,13 @@ use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::refresh_on_reconcile_tick;
 use tempfile::tempdir;
 
+mod git_test_helpers {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/git/test_helpers.rs"
+    ));
+}
+
 static COUPLING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
@@ -55,8 +62,7 @@ fn init_repo_with_root_commit(root: &Path) {
         idx.write_tree().expect("write tree")
     };
     let tree = repo.find_tree(tree_id).expect("tree");
-    repo.commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
-        .expect("root commit");
+    git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "root", &tree, &[]);
 }
 
 #[test]
