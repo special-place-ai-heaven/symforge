@@ -19,9 +19,9 @@
   - `cargo test --all-targets -- --test-threads=1`
   - `rg "ResultStatus|result_status|outcome_class|not_found|ambiguous" src tests`
 - [x] Run default full verification if task-specific verification passes and time permits.
-- [ ] Commit verified implementation work.
-- [ ] Update SFB09 frontmatter to `Completed` with the verified work commit hash.
-- [ ] Commit the SFB09 goal-status update separately.
+- [x] Commit verified implementation work.
+- [x] Update SFB09 frontmatter to `Completed` with the verified work commit hash.
+- [x] Commit the SFB09 goal-status update separately.
 
 ## Evidence Log
 
@@ -61,6 +61,7 @@
   - `cargo check`: exit 0.
   - `cargo test --all-targets -- --test-threads=1`: full all-targets suite passed again.
   - `cargo build --release`: finished release profile successfully.
+- Verified implementation commit: `8bcb3ab8aabf73cfac52d07b221ec08a4e73a449`.
 
 ## Review
 
