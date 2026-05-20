@@ -14,9 +14,9 @@
   - `cargo test --all-targets -- --test-threads=1`
   - `rg "replace_symbol_body|inline doc|deprecated|raw_line_start" src tests`
 - [x] Run default full verification when task-specific verification passes and time permits.
-- [ ] Commit verified implementation work.
-- [ ] Update SFB08 frontmatter to `Completed` with the verified work commit hash.
-- [ ] Commit the goal-status update separately.
+- [x] Commit verified implementation work.
+- [x] Update SFB08 frontmatter to `Completed` with the verified work commit hash.
+- [x] Commit the goal-status update separately.
 
 ## Evidence Log
 
@@ -50,6 +50,7 @@
   - `cargo check`: exit 0.
   - `cargo test --all-targets -- --test-threads=1`: full all-targets suite passed again after the helper tests were added.
   - `cargo build --release`: finished release profile successfully.
+- Verified implementation commit: `691e0a713035309d910b78b3cdf2d540112a4d37`.
 
 ## Review
 
