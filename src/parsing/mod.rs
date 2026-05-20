@@ -144,35 +144,23 @@ pub fn process_file_with_classification(
     }
 }
 
-/// Walk the tree-sitter tree and collect info about the first ERROR or MISSING node.
+/// Walk the tree-sitter tree and collect info about the deepest useful ERROR or MISSING node.
 /// Returns (message, line, column, byte_span) for building a `ParseDiagnostic`.
-fn collect_first_error_node(root: &Node, source: &str) -> Option<(String, u32, u32, (u32, u32))> {
+fn collect_deepest_error_node(root: &Node, source: &str) -> Option<(String, u32, u32, (u32, u32))> {
     let mut cursor = root.walk();
-    let mut stack = vec![*root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(*root, 0usize)];
+    let mut best: Option<(Node, usize)> = None;
+
+    while let Some((node, depth)) = stack.pop() {
         if node.is_error() || node.is_missing() {
-            let start = node.start_position();
-            let snippet_start = node.start_byte();
-            // Clamp the 40-byte snippet window down to the nearest UTF-8 char
-            // boundary — tree-sitter reports byte offsets, and `snippet_start +
-            // 40` can land mid-multibyte-char, which would panic str slicing.
-            let mut snippet_end = node.end_byte().min(snippet_start + 40).min(source.len());
-            while snippet_end > snippet_start && !source.is_char_boundary(snippet_end) {
-                snippet_end -= 1;
-            }
-            let snippet = &source[snippet_start..snippet_end];
-            let kind = if node.is_missing() {
-                "missing"
-            } else {
-                "error"
+            best = match best {
+                Some((current, current_depth))
+                    if !error_candidate_is_better(node, depth, current, current_depth) =>
+                {
+                    Some((current, current_depth))
+                }
+                _ => Some((node, depth)),
             };
-            let message = format!("syntax {kind} near `{}`", snippet.replace('\n', "\\n"));
-            return Some((
-                message,
-                start.row as u32 + 1,    // 1-based line
-                start.column as u32 + 1, // 1-based column
-                (node.start_byte() as u32, node.end_byte() as u32),
-            ));
         }
         // Push children in reverse so we visit left-to-right via the stack.
         cursor.reset(node);
@@ -181,10 +169,63 @@ fn collect_first_error_node(root: &Node, source: &str) -> Option<(String, u32, u
             while cursor.goto_next_sibling() {
                 children.push(cursor.node());
             }
-            stack.extend(children.into_iter().rev());
+            stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
         }
     }
-    None
+
+    best.map(|(node, _depth)| {
+        let start = node.start_position();
+        let snippet_start = node.start_byte().min(source.len());
+        // Clamp the 40-byte snippet window down to the nearest UTF-8 char
+        // boundary — tree-sitter reports byte offsets, and `snippet_start +
+        // 40` can land mid-multibyte-char, which would panic str slicing.
+        let snippet_limit = snippet_start + 40;
+        let span_end = node.end_byte().min(source.len());
+        let mut snippet_end = if span_end > snippet_start {
+            span_end.min(snippet_limit)
+        } else {
+            snippet_limit.min(source.len())
+        };
+        while snippet_end > snippet_start && !source.is_char_boundary(snippet_end) {
+            snippet_end -= 1;
+        }
+        let snippet = &source[snippet_start..snippet_end];
+        let kind = if node.is_missing() {
+            format!("missing {}", node.kind())
+        } else {
+            "error".to_string()
+        };
+        let message = format!("syntax {kind} near `{}`", snippet.replace('\n', "\\n"));
+        (
+            message,
+            start.row as u32 + 1,    // 1-based line
+            start.column as u32 + 1, // 1-based column
+            (node.start_byte() as u32, node.end_byte() as u32),
+        )
+    })
+}
+
+fn error_candidate_is_better(
+    candidate: Node,
+    candidate_depth: usize,
+    current: Node,
+    current_depth: usize,
+) -> bool {
+    if candidate_depth != current_depth {
+        return candidate_depth > current_depth;
+    }
+
+    let candidate_len = candidate.end_byte().saturating_sub(candidate.start_byte());
+    let current_len = current.end_byte().saturating_sub(current.start_byte());
+    if candidate_len != current_len {
+        return candidate_len < current_len;
+    }
+
+    if candidate.start_byte() != current.start_byte() {
+        return candidate.start_byte() < current.start_byte();
+    }
+
+    candidate.is_missing() && !current.is_missing()
 }
 
 pub(crate) fn parse_source(
@@ -234,7 +275,7 @@ pub(crate) fn parse_source(
     let (references, alias_map) = xref::extract_references(&root, source, language);
 
     let diagnostic = if has_error {
-        collect_first_error_node(&root, source).map(|(message, line, column, span)| {
+        collect_deepest_error_node(&root, source).map(|(message, line, column, span)| {
             ParseDiagnostic {
                 parser: "tree-sitter".to_string(),
                 message,
@@ -476,6 +517,58 @@ mod tests {
         assert!(
             summary.contains(&format!("line {line}")),
             "summary should include location for downstream display; got {summary}"
+        );
+    }
+
+    #[test]
+    fn test_parse_source_reports_deepest_actionable_nested_error_node() {
+        let source =
+            "def compute():\n    value = outer(inner(1 + 2, tail)\n    other = {'a': {'b': 1}}\n";
+        let (_symbols, has_error, diagnostic, _references, _aliases) =
+            parse_source(source, &LanguageId::Python).expect("python parse should complete");
+
+        assert!(has_error, "fixture must contain a tree-sitter parse error");
+        let diag = diagnostic.expect("partial parse must attach a diagnostic");
+
+        assert_eq!(diag.parser, "tree-sitter");
+        assert_eq!(diag.line, Some(2), "unexpected diagnostic: {diag:?}");
+        assert_eq!(diag.column, Some(19), "unexpected diagnostic: {diag:?}");
+        assert_eq!(
+            diag.byte_span,
+            Some((33, 51)),
+            "diagnostic must pin the nested call error, not the outer assignment; got {diag:?}"
+        );
+        assert!(
+            diag.message
+                .contains("syntax error near `inner(1 + 2, tail)`"),
+            "diagnostic should include the nested call context; got {diag:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_source_reports_actionable_missing_node_context() {
+        let source = "fn compute() {\n    let value = outer(inner(1 + ), tail);\n}\n";
+        let (_symbols, has_error, diagnostic, _references, _aliases) =
+            parse_source(source, &LanguageId::Rust).expect("rust parse should complete");
+
+        assert!(has_error, "fixture must contain a tree-sitter parse error");
+        let diag = diagnostic.expect("partial parse must attach a diagnostic");
+
+        assert_eq!(diag.parser, "tree-sitter");
+        assert_eq!(diag.line, Some(2), "unexpected diagnostic: {diag:?}");
+        assert_eq!(diag.column, Some(32), "unexpected diagnostic: {diag:?}");
+        assert_eq!(
+            diag.byte_span,
+            Some((46, 46)),
+            "diagnostic must pin the zero-width missing node; got {diag:?}"
+        );
+        assert!(
+            diag.message.contains("syntax missing identifier"),
+            "diagnostic should name the missing node kind; got {diag:?}"
+        );
+        assert!(
+            diag.message.contains("), tail"),
+            "diagnostic should include source context after the missing node; got {diag:?}"
         );
     }
 

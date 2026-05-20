@@ -11166,6 +11166,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_file_syntax_reports_deepest_nested_source_diagnostic() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::write(
+            repo.path().join("broken.py"),
+            "def compute():\n    value = outer(inner(1 + 2, tail)\n    other = {'a': {'b': 1}}\n",
+        )
+        .expect("write malformed python");
+        let server =
+            make_server_with_root(make_live_index_empty(), Some(repo.path().to_path_buf()));
+
+        let result = server
+            .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                path: "broken.py".to_string(),
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("Status: partial"),
+            "validator should report malformed source as a partial parse; got: {result}"
+        );
+        assert!(
+            result.contains(
+                "Diagnostic: tree-sitter: syntax error near `inner(1 + 2, tail)` (line 2, column 19)"
+            ),
+            "validator should report the nested actionable syntax location; got: {result}"
+        );
+        assert!(
+            result.contains("Byte span: 33..51"),
+            "validator should report the nested diagnostic byte span; got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_context_shows_imports_and_used_by_sections() {
         let callee = make_symbol("target", SymbolKind::Function, 1, 3);
         let caller = make_symbol("caller", SymbolKind::Function, 1, 3);

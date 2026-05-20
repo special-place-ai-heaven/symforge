@@ -342,6 +342,7 @@ fn cli_project_config_status_accept_and_revoke_round_trip() {
     assert!(command_stdout(&untrusted).contains("status: Untrusted"));
 }
 
+#[allow(clippy::await_holding_lock)] // ENV_LOCK intentionally serializes process env across the async edit.
 #[tokio::test]
 async fn log_only_edit_response_warns_and_allows_untrusted_project_config() {
     let (_guard, mut env_guards) = clean_trust_env();
@@ -371,6 +372,7 @@ async fn log_only_edit_response_warns_and_allows_untrusted_project_config() {
     );
 }
 
+#[allow(clippy::await_holding_lock)] // ENV_LOCK intentionally serializes process env across the async edit.
 #[tokio::test]
 async fn enforce_mode_blocks_untrusted_project_config_before_editing() {
     let (_guard, mut env_guards) = clean_trust_env();
@@ -400,6 +402,7 @@ async fn enforce_mode_blocks_untrusted_project_config_before_editing() {
     );
 }
 
+#[allow(clippy::await_holding_lock)] // ENV_LOCK intentionally serializes process env across both async edits.
 #[tokio::test]
 async fn trust_mode_changes_are_observed_at_call_time() {
     let (_guard, mut env_guards) = clean_trust_env();
@@ -439,6 +442,7 @@ async fn trust_mode_changes_are_observed_at_call_time() {
     );
 }
 
+#[allow(clippy::await_holding_lock)] // ENV_LOCK intentionally serializes process env across the async edit.
 #[tokio::test]
 async fn edit_response_without_project_config_preserves_no_trust_warning() {
     let (_guard, mut env_guards) = clean_trust_env();

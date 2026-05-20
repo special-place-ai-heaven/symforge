@@ -673,10 +673,10 @@ pub fn search_text_result_view(
         let mut names = Vec::new();
         for file in &result.files {
             for line_match in &file.matches {
-                if let Some(enc) = &line_match.enclosing_symbol {
-                    if !names.iter().any(|seen| seen == &enc.name) {
-                        names.push(enc.name.clone());
-                    }
+                if let Some(enc) = &line_match.enclosing_symbol
+                    && !names.iter().any(|seen| seen == &enc.name)
+                {
+                    names.push(enc.name.clone());
                 }
             }
         }
