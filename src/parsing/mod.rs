@@ -304,13 +304,17 @@ mod tests {
         assert_eq!(result.outcome, FileOutcome::Processed);
     }
 
-    // Regression guard: tree-sitter-rust must still recognize the raw-borrow
-    // syntax `&raw const value` after the upgrade.
+    // Regression guard: tree-sitter-rust must still recognize Rust 2024
+    // raw-reference syntax after the upgrade.
     #[test]
     fn test_process_file_rust_preserves_raw_borrow_syntax() {
-        let source = b"fn main() { let value = 1; let _ptr = &raw const value; }";
-        let result = process_file("test.rs", source, LanguageId::Rust);
-        assert_eq!(result.outcome, FileOutcome::Processed);
+        for source in [
+            b"fn main() { let value = 1; let _ptr = &raw const value; }" as &[u8],
+            b"fn main() { let mut value = 1; let _ptr = &raw mut value; }",
+        ] {
+            let result = process_file("test.rs", source, LanguageId::Rust);
+            assert_eq!(result.outcome, FileOutcome::Processed);
+        }
     }
 
     #[test]
