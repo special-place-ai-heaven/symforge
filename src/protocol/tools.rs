@@ -17774,6 +17774,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_text_group_by_usage_keeps_doc_comments_visible() {
+        let content = b"// usage_token in ordinary comment\n/// usage_token in doc comment\nfn handler() {\n    let _value = usage_token();\n}\n";
+        let sym = make_symbol("handler", SymbolKind::Function, 1, 4);
+        let (key, file) = make_file("src/api.rs", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("usage_token".to_string()),
+                terms: None,
+                regex: None,
+                path_prefix: None,
+                language: None,
+                limit: None,
+                max_per_file: None,
+                include_generated: None,
+                include_tests: None,
+                glob: None,
+                exclude_glob: None,
+                context: None,
+                case_sensitive: None,
+                whole_word: None,
+                group_by: Some("usage".to_string()),
+                follow_refs: None,
+                follow_refs_limit: None,
+                ranked: None,
+                estimate: None,
+                max_tokens: None,
+                structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+            }))
+            .await;
+
+        // SFB07 decision: KEEP_DOC_MARKDOWN_USAGE_VISIBLE. Usage grouping filters
+        // ordinary line-noise comments, but doc comments remain searchable context.
+        assert!(
+            !result.contains("// usage_token in ordinary comment"),
+            "ordinary comments should stay filtered by usage grouping: {result}"
+        );
+        assert!(
+            result.contains("/// usage_token in doc comment"),
+            "doc comments should remain visible usage context: {result}"
+        );
+        assert!(
+            result.contains("let _value = usage_token();"),
+            "code usage should remain visible: {result}"
+        );
+        assert!(
+            result.contains("1 import/comment match(es) excluded by usage filter"),
+            "filtered ordinary comment count should be explicit: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_group_by_usage_keeps_markdown_body_visible() {
+        let content = b"# usage_token heading\n\nusage_token appears in Markdown body\n";
+        let (key, mut file) = make_file("README.md", content, vec![]);
+        file.language = LanguageId::Markdown;
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .search_text(Parameters(super::SearchTextInput {
+                query: Some("usage_token".to_string()),
+                terms: None,
+                regex: None,
+                path_prefix: None,
+                language: None,
+                limit: None,
+                max_per_file: None,
+                include_generated: None,
+                include_tests: None,
+                glob: None,
+                exclude_glob: None,
+                context: None,
+                case_sensitive: None,
+                whole_word: None,
+                group_by: Some("usage".to_string()),
+                follow_refs: None,
+                follow_refs_limit: None,
+                ranked: None,
+                estimate: None,
+                max_tokens: None,
+                structural: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+            }))
+            .await;
+
+        // SFB07 decision: KEEP_DOC_MARKDOWN_USAGE_VISIBLE. Markdown body text remains
+        // visible; heading lines keep the existing hash-comment noise filtering.
+        assert!(
+            result.contains("README.md"),
+            "markdown file should be searched: {result}"
+        );
+        assert!(
+            result.contains("usage_token appears in Markdown body"),
+            "markdown body text should remain usage-visible: {result}"
+        );
+        assert!(
+            !result.contains("# usage_token heading"),
+            "hash-heading lines keep existing comment-like usage filtering: {result}"
+        );
+        assert!(
+            result.contains("1 import/comment match(es) excluded by usage filter"),
+            "filtered markdown heading count should be explicit: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_inspect_match_line_zero_is_out_of_bounds() {
         let sym = make_symbol("foo", SymbolKind::Function, 0, 0);
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![sym]);
