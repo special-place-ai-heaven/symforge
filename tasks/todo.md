@@ -10,10 +10,10 @@
 - [x] Add at least three deterministic regression tests, or add concrete backlog entries with file targets and verification for untestable top gaps.
 - [x] Confirm no historical planning directories or forbidden files were restored.
 - [x] Run focused verification for changed tests/code.
-- [ ] Run the exact goal verification command.
-- [ ] Run default verification if task-specific verification passes and time permits.
-- [ ] Commit verified implementation work.
-- [ ] Mark SFB05 completed and commit goal status.
+- [x] Run the exact goal verification command.
+- [x] Run default verification if task-specific verification passes and time permits.
+- [x] Commit verified implementation work.
+- [x] Mark SFB05 completed and commit goal status.
 
 ## Evidence Log
 
@@ -45,7 +45,20 @@
   - `cargo test test_what_changed_include_symbol_diff_appends_compact_symbol_summary -- --test-threads=1` after formatting.
 - No `plans/**`, `.planning/**`, `openspec/**`, historical ADRs, old reports, or `npm/**` files were restored or edited.
 - Elegance check: the only production change is localized to the existing search result formatter branch, avoiding a new abstraction or search-core churn.
+- Exact goal verification passed after implementation commit `5ac3e3959db88ef837ac9b6bde3178c42303eaaf`:
+  - `cargo fmt --check`.
+  - `cargo check`.
+  - `cargo test --all-targets -- --test-threads=1`.
+  - `git diff --name-only HEAD~1..HEAD` showed `src/protocol/format.rs`, `src/protocol/tools.rs`, `tasks/todo.md`, and `tests/edit_hook_behavior.rs`.
+- Default verification passed:
+  - `git branch --show-current` returned `backlog-implementation`.
+  - `git diff --check`.
+  - `cargo fmt --check`.
+  - `cargo check`.
+  - `cargo test --all-targets -- --test-threads=1`.
+  - `cargo build --release`.
+- Verified implementation commit: `5ac3e3959db88ef837ac9b6bde3178c42303eaaf`.
 
 ## Review
 
-- Pending.
+- SFB05 acceptance criteria passed: three deterministic regression tests landed and passed, selected gaps are mapped to search, git/ranking, and edit categories, and forbidden historical/planning/npm paths were not restored.
