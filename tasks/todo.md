@@ -10,8 +10,8 @@
 - [x] Add regression or stress coverage documenting the Windows lockfile race mitigation.
 - [x] Verify no `#[ignore]` workaround was introduced.
 - [x] Run required verification commands.
-- [ ] Commit verified implementation work.
-- [ ] Mark SFB01 completed and commit goal status.
+- [x] Commit verified implementation work.
+- [x] Mark SFB01 completed and commit goal status.
 
 ## Review
 
