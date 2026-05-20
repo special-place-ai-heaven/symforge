@@ -882,6 +882,10 @@ pub struct HealthStats {
     pub symbol_count: usize,
     pub parsed_count: usize,
     pub partial_parse_count: usize,
+    /// Partial parses that are not explicitly classified as expected vendor noise.
+    pub unexpected_partial_parse_count: usize,
+    /// Expected partial parses from the vendored tree-sitter-scss C/header parser source.
+    pub expected_vendor_partial_parse_count: usize,
     pub failed_count: usize,
     pub load_duration: Duration,
     /// Current state of the file watcher.
@@ -902,6 +906,10 @@ pub struct HealthStats {
     pub last_reconcile_at: Option<SystemTime>,
     /// Sorted, deduplicated list of files with partial-parse status.
     pub partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of unexpected partial-parse files.
+    pub unexpected_partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of expected vendored partial-parse files.
+    pub expected_vendor_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of files with failed parse status and their error messages.
     pub failed_files: Vec<(String, String)>,
     /// Admission tier counts: (Tier1 indexed, Tier2 metadata-only, Tier3 hard-skipped).
@@ -909,6 +917,27 @@ pub struct HealthStats {
     /// Reason the index is empty at startup (e.g. no safe root, auto-index off).
     /// Surfaced as a banner in `health` output so MCP clients see why no symbols loaded.
     pub local_empty_reason: Option<String>,
+}
+
+pub const EXPECTED_VENDOR_PARTIAL_PARSE_REASON: &str =
+    "expected vendor: tree-sitter-scss C/header parser limitation";
+
+fn is_expected_vendor_partial_parse_noise(
+    path: &str,
+    file: &IndexedFile,
+    gitignore: Option<&ignore::gitignore::Gitignore>,
+) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let is_tree_sitter_scss_c_or_header = normalized.starts_with("vendor/tree-sitter-scss/src/")
+        && (normalized.ends_with(".c") || normalized.ends_with(".h"));
+
+    is_tree_sitter_scss_c_or_header
+        && file.classification.is_vendor
+        && matches!(file.language, LanguageId::C | LanguageId::Cpp)
+        && matches!(
+            NoisePolicy::classify_path(path, gitignore),
+            NoiseClass::Vendor
+        )
 }
 
 /// Owned per-path admission-tier lookup result for protocol handlers.
@@ -2714,14 +2743,25 @@ impl LiveIndex {
             }
         }
 
-        let mut partial_parse_files: Vec<String> = self
-            .files
-            .iter()
-            .filter(|(_, f)| matches!(f.parse_status, ParseStatus::PartialParse { .. }))
-            .map(|(path, _)| path.clone())
-            .collect();
+        let mut partial_parse_files = Vec::new();
+        let mut unexpected_partial_parse_files = Vec::new();
+        let mut expected_vendor_partial_parse_files = Vec::new();
+        for (path, file) in &self.files {
+            if matches!(file.parse_status, ParseStatus::PartialParse { .. }) {
+                partial_parse_files.push(path.clone());
+                if is_expected_vendor_partial_parse_noise(path, file, self.gitignore.as_ref()) {
+                    expected_vendor_partial_parse_files.push(path.clone());
+                } else {
+                    unexpected_partial_parse_files.push(path.clone());
+                }
+            }
+        }
         partial_parse_files.sort();
         partial_parse_files.dedup();
+        unexpected_partial_parse_files.sort();
+        unexpected_partial_parse_files.dedup();
+        expected_vendor_partial_parse_files.sort();
+        expected_vendor_partial_parse_files.dedup();
 
         let mut failed_files: Vec<(String, String)> = self
             .files
@@ -2741,6 +2781,8 @@ impl LiveIndex {
             symbol_count,
             parsed_count,
             partial_parse_count,
+            unexpected_partial_parse_count: unexpected_partial_parse_files.len(),
+            expected_vendor_partial_parse_count: expected_vendor_partial_parse_files.len(),
             failed_count,
             load_duration: self.load_duration,
             watcher_state: WatcherState::Off,
@@ -2752,6 +2794,8 @@ impl LiveIndex {
             stale_files_found: 0,
             last_reconcile_at: None,
             partial_parse_files,
+            unexpected_partial_parse_files,
+            expected_vendor_partial_parse_files,
             failed_files,
             tier_counts: self.tier_counts(),
             local_empty_reason: self.local_empty_reason(),
@@ -3486,6 +3530,17 @@ mod tests {
             alias_map: std::collections::HashMap::new(),
             mtime_secs: 0,
         }
+    }
+
+    fn make_indexed_file_with_language(
+        path: &str,
+        language: LanguageId,
+        symbols: Vec<SymbolRecord>,
+        status: ParseStatus,
+    ) -> IndexedFile {
+        let mut file = make_indexed_file(path, symbols, status);
+        file.language = language;
+        file
     }
 
     fn make_index(files: Vec<(&str, IndexedFile)>, tripped: bool) -> LiveIndex {
@@ -4771,6 +4826,82 @@ impl Actor for MyActor {
         assert_eq!(stats.partial_parse_count, 1);
         assert_eq!(stats.failed_count, 1);
         assert_eq!(stats.partial_parse_files, vec!["b.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_health_stats_categorizes_expected_vendor_scss_parser_partials() {
+        let vendor_c = make_indexed_file_with_language(
+            "vendor/tree-sitter-scss/src/parser.c",
+            LanguageId::C,
+            vec![],
+            ParseStatus::PartialParse {
+                warning: "tree-sitter reported syntax errors".to_string(),
+            },
+        );
+        let vendor_h = make_indexed_file_with_language(
+            "vendor/tree-sitter-scss/src/tree_sitter/parser.h",
+            LanguageId::C,
+            vec![],
+            ParseStatus::PartialParse {
+                warning: "tree-sitter reported syntax errors".to_string(),
+            },
+        );
+        let repo_rust = make_indexed_file(
+            "src/broken.rs",
+            vec![],
+            ParseStatus::PartialParse {
+                warning: "tree-sitter reported syntax errors".to_string(),
+            },
+        );
+        let index = make_index(
+            vec![
+                ("vendor/tree-sitter-scss/src/parser.c", vendor_c),
+                ("vendor/tree-sitter-scss/src/tree_sitter/parser.h", vendor_h),
+                ("src/broken.rs", repo_rust),
+            ],
+            false,
+        );
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.partial_parse_count, 3);
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(stats.expected_vendor_partial_parse_count, 2);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/broken.rs".to_string()]
+        );
+        assert_eq!(
+            stats.expected_vendor_partial_parse_files,
+            vec![
+                "vendor/tree-sitter-scss/src/parser.c".to_string(),
+                "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_health_stats_does_not_mark_all_vendor_partials_expected() {
+        let vendor_c = make_indexed_file_with_language(
+            "vendor/other-parser/src/parser.c",
+            LanguageId::C,
+            vec![],
+            ParseStatus::PartialParse {
+                warning: "tree-sitter reported syntax errors".to_string(),
+            },
+        );
+        let index = make_index(vec![("vendor/other-parser/src/parser.c", vendor_c)], false);
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.partial_parse_count, 1);
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(stats.expected_vendor_partial_parse_count, 0);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["vendor/other-parser/src/parser.c".to_string()]
+        );
+        assert!(stats.expected_vendor_partial_parse_files.is_empty());
     }
 
     #[test]

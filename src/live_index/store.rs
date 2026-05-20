@@ -356,8 +356,12 @@ pub struct PublishedIndexState {
     pub file_count: usize,
     pub parsed_count: usize,
     pub partial_parse_count: usize,
+    pub unexpected_partial_parse_count: usize,
+    pub expected_vendor_partial_parse_count: usize,
     pub failed_count: usize,
     pub partial_parse_files: Vec<String>,
+    pub unexpected_partial_parse_files: Vec<String>,
+    pub expected_vendor_partial_parse_files: Vec<String>,
     pub failed_files: Vec<(String, String)>,
     pub symbol_count: usize,
     pub loaded_at_system: SystemTime,
@@ -916,8 +920,20 @@ impl PublishedIndexState {
             file_count: stats.file_count,
             parsed_count: stats.parsed_count,
             partial_parse_count: stats.partial_parse_count,
+            unexpected_partial_parse_count: stats.unexpected_partial_parse_count,
+            expected_vendor_partial_parse_count: stats.expected_vendor_partial_parse_count,
             failed_count: stats.failed_count,
             partial_parse_files: stats.partial_parse_files.into_iter().take(10).collect(),
+            unexpected_partial_parse_files: stats
+                .unexpected_partial_parse_files
+                .into_iter()
+                .take(10)
+                .collect(),
+            expected_vendor_partial_parse_files: stats
+                .expected_vendor_partial_parse_files
+                .into_iter()
+                .take(10)
+                .collect(),
             failed_files: stats.failed_files.into_iter().take(10).collect(),
             symbol_count: stats.symbol_count,
             loaded_at_system: index.loaded_at_system,

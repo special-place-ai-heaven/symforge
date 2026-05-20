@@ -34,6 +34,7 @@ impl Default for OutputLimits {
 }
 
 use crate::domain::index::{AdmissionTier, SkippedFile};
+use crate::live_index::query::EXPECTED_VENDOR_PARTIAL_PARSE_REASON;
 use crate::live_index::{
     ContextBundleFoundView, ContextBundleSectionView, ContextBundleView, FileContentView,
     FileOutlineView, FindDependentsView, FindReferencesView, HealthStats, ImplBlockSuggestionView,
@@ -1186,6 +1187,8 @@ pub fn health_report_from_published_state(
         symbol_count: published.symbol_count,
         parsed_count: published.parsed_count,
         partial_parse_count: published.partial_parse_count,
+        unexpected_partial_parse_count: published.unexpected_partial_parse_count,
+        expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
         failed_count: published.failed_count,
         load_duration: published.load_duration,
         watcher_state: watcher.state.clone(),
@@ -1197,6 +1200,8 @@ pub fn health_report_from_published_state(
         stale_files_found: watcher.stale_files_found,
         last_reconcile_at: watcher.last_reconcile_at,
         partial_parse_files: published.partial_parse_files.clone(),
+        unexpected_partial_parse_files: published.unexpected_partial_parse_files.clone(),
+        expected_vendor_partial_parse_files: published.expected_vendor_partial_parse_files.clone(),
         failed_files: published.failed_files.clone(),
         tier_counts: published.tier_counts,
         local_empty_reason: published.local_empty_reason.clone(),
@@ -1258,8 +1263,10 @@ pub fn health_report_compact_from_published_state(
 
     if published.partial_parse_count > 0 || published.failed_count > 0 {
         output.push_str(&format!(
-            "\nParse issues: {} partial, {} failed; use full health for path lists",
-            published.partial_parse_count, published.failed_count
+            "\nParse issues: {} unexpected partial, {} expected vendor partial, {} failed; use full health for path lists",
+            published.unexpected_partial_parse_count,
+            published.expected_vendor_partial_parse_count,
+            published.failed_count
         ));
     }
 
@@ -1404,28 +1411,78 @@ pub fn health_report_from_stats(
         output.push_str(&banner);
     }
 
-    if stats.partial_parse_count > 0 && stats.failed_count == 0 {
-        output.push_str(
-            "\nParse resilience: partial files kept best-effort symbols; inspect the partial list below only if answers from those files look incomplete.",
-        );
-    } else if stats.failed_count > 0 {
+    if stats.partial_parse_count > 0 {
+        output.push_str(&format!(
+            "\nPartial parse summary: {} unexpected, {} expected vendor",
+            stats.unexpected_partial_parse_count, stats.expected_vendor_partial_parse_count
+        ));
+    }
+
+    if stats.failed_count > 0 {
         output.push_str(
             "\nParse resilience: failed files are excluded from symbol-level answers until they re-index cleanly. Inspect the failed-file list below, use raw reads or validate_file_syntax for those paths, then re-run index_folder after fixing the source file.",
         );
+    } else if stats.unexpected_partial_parse_count > 0 {
+        output.push_str(
+            "\nParse resilience: partial files kept best-effort symbols; unexpected repo-owned partials remain visible below and may indicate missing symbols.",
+        );
+    } else if stats.expected_vendor_partial_parse_count > 0 {
+        output.push_str(
+            "\nParse resilience: expected vendor partial files kept best-effort symbols; they are labeled as vendor parser noise below.",
+        );
     }
 
-    if !stats.partial_parse_files.is_empty() {
+    if stats.unexpected_partial_parse_count > 0 {
         output.push_str(&format!(
-            "\nPartial parse files ({}):\n",
-            stats.partial_parse_files.len()
+            "\nUnexpected repo-owned partial parse files ({}):\n",
+            stats.unexpected_partial_parse_count
         ));
-        for (i, path) in stats.partial_parse_files.iter().take(10).enumerate() {
+        for (i, path) in stats
+            .unexpected_partial_parse_files
+            .iter()
+            .take(10)
+            .enumerate()
+        {
             output.push_str(&format!("  {}. {}\n", i + 1, path));
         }
-        if stats.partial_parse_files.len() > 10 {
+        let rendered = stats.unexpected_partial_parse_files.len().min(10);
+        let omitted = stats
+            .unexpected_partial_parse_count
+            .saturating_sub(rendered);
+        if omitted > 0 {
             output.push_str(&format!(
-                "  ... and {} more partial files\n",
-                stats.partial_parse_files.len() - 10
+                "  ... and {} more unexpected partial files\n",
+                omitted
+            ));
+        }
+    }
+
+    if stats.expected_vendor_partial_parse_count > 0 {
+        output.push_str(&format!(
+            "\nExpected vendor partial parse noise ({}):\n",
+            stats.expected_vendor_partial_parse_count
+        ));
+        for (i, path) in stats
+            .expected_vendor_partial_parse_files
+            .iter()
+            .take(10)
+            .enumerate()
+        {
+            output.push_str(&format!(
+                "  {}. {} [{}]\n",
+                i + 1,
+                path,
+                EXPECTED_VENDOR_PARTIAL_PARSE_REASON
+            ));
+        }
+        let rendered = stats.expected_vendor_partial_parse_files.len().min(10);
+        let omitted = stats
+            .expected_vendor_partial_parse_count
+            .saturating_sub(rendered);
+        if omitted > 0 {
+            output.push_str(&format!(
+                "  ... and {} more expected vendor partial files\n",
+                omitted
             ));
         }
     }

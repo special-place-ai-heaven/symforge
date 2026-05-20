@@ -799,6 +799,8 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         file_count: 4,
         parsed_count: 2,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 2,
         symbol_count: 12,
         loaded_at_system: SystemTime::now(),
@@ -807,6 +809,8 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         snapshot_verify_state: SnapshotVerifyState::NotNeeded,
         is_empty: false,
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![
             ("src/bad.rs".to_string(), "syntax error".to_string()),
             ("src/worse.rs".to_string(), "lexer panic".to_string()),
@@ -849,6 +853,8 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         file_count: 3,
         parsed_count: 1,
         partial_parse_count: 2,
+        unexpected_partial_parse_count: 2,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
@@ -860,6 +866,11 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
             "src/partial_a.rs".to_string(),
             "src/partial_b.rs".to_string(),
         ],
+        unexpected_partial_parse_files: vec![
+            "src/partial_a.rs".to_string(),
+            "src/partial_b.rs".to_string(),
+        ],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
@@ -871,7 +882,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
 
     let report = health_report_from_published_state(&published, &watcher, 0);
     assert!(
-        report.contains("Partial parse files (2):"),
+        report.contains("Unexpected repo-owned partial parse files (2):"),
         "published-state health should preserve partial file detail: {report}"
     );
     assert!(
@@ -894,6 +905,8 @@ fn test_health_report_lists_partial_parse_files() {
         symbol_count: 0,
         parsed_count: 0,
         partial_parse_count: 3,
+        unexpected_partial_parse_count: 3,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -909,13 +922,19 @@ fn test_health_report_lists_partial_parse_files() {
             "src/b.rs".to_string(),
             "src/c.rs".to_string(),
         ],
+        unexpected_partial_parse_files: vec![
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+            "src/c.rs".to_string(),
+        ],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
-        report.contains("Partial parse files (3):"),
+        report.contains("Unexpected repo-owned partial parse files (3):"),
         "should contain header"
     );
     assert!(report.contains("  1. src/a.rs"), "should list first file");
@@ -932,6 +951,117 @@ fn test_health_report_lists_partial_parse_files() {
 }
 
 #[test]
+fn test_health_report_labels_expected_vendor_partial_parse_noise() {
+    use crate::watcher::WatcherState;
+    use std::time::Duration;
+
+    let stats = HealthStats {
+        file_count: 2,
+        symbol_count: 0,
+        parsed_count: 0,
+        partial_parse_count: 2,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 2,
+        failed_count: 0,
+        load_duration: Duration::from_millis(0),
+        watcher_state: WatcherState::Off,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        last_overflow_at: None,
+        stale_files_found: 0,
+        last_reconcile_at: None,
+        partial_parse_files: vec![
+            "vendor/tree-sitter-scss/src/parser.c".to_string(),
+            "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
+        ],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![
+            "vendor/tree-sitter-scss/src/parser.c".to_string(),
+            "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
+        ],
+        failed_files: vec![],
+        tier_counts: (2, 0, 0),
+        local_empty_reason: None,
+    };
+    let report = health_report_from_stats("Ready", &stats, 0);
+
+    assert!(
+        report.contains("Partial parse summary: 0 unexpected, 2 expected vendor"),
+        "health should separate expected vendor noise from unexpected partials: {report}"
+    );
+    assert!(
+        report.contains("Expected vendor partial parse noise (2):"),
+        "health should label expected vendor partials: {report}"
+    );
+    assert!(
+        report.contains(
+            "vendor/tree-sitter-scss/src/parser.c [expected vendor: tree-sitter-scss C/header parser limitation]"
+        ),
+        "vendor parser.c should carry the expected/vendor reason: {report}"
+    );
+    assert!(
+        !report.contains("Unexpected repo-owned partial parse files"),
+        "zero unexpected partials should not render an unexpected section: {report}"
+    );
+}
+
+#[test]
+fn test_health_report_keeps_project_owned_partials_unexpected() {
+    use crate::watcher::WatcherState;
+    use std::time::Duration;
+
+    let stats = HealthStats {
+        file_count: 2,
+        symbol_count: 0,
+        parsed_count: 0,
+        partial_parse_count: 2,
+        unexpected_partial_parse_count: 1,
+        expected_vendor_partial_parse_count: 1,
+        failed_count: 0,
+        load_duration: Duration::from_millis(0),
+        watcher_state: WatcherState::Off,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        last_overflow_at: None,
+        stale_files_found: 0,
+        last_reconcile_at: None,
+        partial_parse_files: vec![
+            "src/broken.rs".to_string(),
+            "vendor/tree-sitter-scss/src/tree_sitter/array.h".to_string(),
+        ],
+        unexpected_partial_parse_files: vec!["src/broken.rs".to_string()],
+        expected_vendor_partial_parse_files: vec![
+            "vendor/tree-sitter-scss/src/tree_sitter/array.h".to_string(),
+        ],
+        failed_files: vec![],
+        tier_counts: (2, 0, 0),
+        local_empty_reason: None,
+    };
+    let report = health_report_from_stats("Ready", &stats, 0);
+
+    assert!(
+        report.contains("Partial parse summary: 1 unexpected, 1 expected vendor"),
+        "health should summarize mixed partial categories: {report}"
+    );
+    assert!(
+        report.contains("Unexpected repo-owned partial parse files (1):"),
+        "project-owned partials should remain a visible failure signal: {report}"
+    );
+    assert!(
+        report.contains("  1. src/broken.rs"),
+        "project-owned partial path should be listed as unexpected: {report}"
+    );
+    assert!(
+        report.contains("Expected vendor partial parse noise (1):"),
+        "expected vendor partial should be listed separately: {report}"
+    );
+}
+
+#[test]
 fn test_health_report_caps_partial_list_at_10() {
     use crate::watcher::WatcherState;
     use std::time::Duration;
@@ -943,6 +1073,8 @@ fn test_health_report_caps_partial_list_at_10() {
         symbol_count: 0,
         parsed_count: 0,
         partial_parse_count: 50,
+        unexpected_partial_parse_count: 50,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -953,20 +1085,22 @@ fn test_health_report_caps_partial_list_at_10() {
         last_overflow_at: None,
         stale_files_found: 0,
         last_reconcile_at: None,
-        partial_parse_files,
+        partial_parse_files: partial_parse_files.clone(),
+        unexpected_partial_parse_files: partial_parse_files,
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (50, 0, 0),
         local_empty_reason: None,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
-        report.contains("Partial parse files (50):"),
+        report.contains("Unexpected repo-owned partial parse files (50):"),
         "should show count of 50"
     );
     assert!(report.contains("  10."), "should list up to entry 10");
     assert!(!report.contains("  11."), "should not list entry 11");
     assert!(
-        report.contains("... and 40 more partial files"),
+        report.contains("... and 40 more unexpected partial files"),
         "should show overflow hint for 40 remaining"
     );
 }
@@ -981,6 +1115,8 @@ fn test_health_report_shows_tier_breakdown() {
         symbol_count: 10000,
         parsed_count: 8180,
         partial_parse_count: 15,
+        unexpected_partial_parse_count: 15,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 5,
         load_duration: Duration::from_millis(120),
         watcher_state: WatcherState::Off,
@@ -992,6 +1128,8 @@ fn test_health_report_shows_tier_breakdown() {
         stale_files_found: 0,
         last_reconcile_at: None,
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (8200, 1280, 20),
         local_empty_reason: None,
@@ -1025,6 +1163,8 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         symbol_count: 0,
         parsed_count: 1,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(10),
         watcher_state: WatcherState::Active,
@@ -1036,6 +1176,8 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         stale_files_found: 5,
         last_reconcile_at: Some(SystemTime::now()),
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (1, 0, 0),
         local_empty_reason: None,
@@ -1055,6 +1197,8 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         symbol_count: 0,
         parsed_count: 0,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::ZERO,
         watcher_state: crate::watcher::WatcherState::Off,
@@ -1066,6 +1210,8 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         last_overflow_at: None,
         last_reconcile_at: None,
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (0, 0, 0),
         local_empty_reason: Some(
@@ -1107,6 +1253,8 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         symbol_count: 1000,
         parsed_count: 100,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::from_millis(500),
         watcher_state: crate::watcher::WatcherState::Active,
@@ -1118,6 +1266,8 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         last_overflow_at: None,
         last_reconcile_at: Some(std::time::SystemTime::now()),
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
@@ -1152,6 +1302,8 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         file_count: 100,
         parsed_count: 100,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 1000,
         loaded_at_system: SystemTime::now(),
@@ -1160,6 +1312,8 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         snapshot_verify_state: SnapshotVerifyState::NotNeeded,
         is_empty: false,
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
@@ -1198,8 +1352,12 @@ mod health_report_consistency {
             file_count: 100,
             parsed_count: 100,
             partial_parse_count: 0,
+            unexpected_partial_parse_count: 0,
+            expected_vendor_partial_parse_count: 0,
             failed_count: 0,
             partial_parse_files: vec![],
+            unexpected_partial_parse_files: vec![],
+            expected_vendor_partial_parse_files: vec![],
             failed_files: vec![],
             symbol_count: 1000,
             loaded_at_system: SystemTime::now(),
@@ -1218,6 +1376,8 @@ mod health_report_consistency {
             symbol_count: published.symbol_count,
             parsed_count: published.parsed_count,
             partial_parse_count: published.partial_parse_count,
+            unexpected_partial_parse_count: published.unexpected_partial_parse_count,
+            expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
             failed_count: published.failed_count,
             load_duration: published.load_duration,
             watcher_state: watcher.state.clone(),
@@ -1229,6 +1389,10 @@ mod health_report_consistency {
             stale_files_found: watcher.stale_files_found,
             last_reconcile_at: watcher.last_reconcile_at,
             partial_parse_files: published.partial_parse_files.clone(),
+            unexpected_partial_parse_files: published.unexpected_partial_parse_files.clone(),
+            expected_vendor_partial_parse_files: published
+                .expected_vendor_partial_parse_files
+                .clone(),
             failed_files: published.failed_files.clone(),
             tier_counts: published.tier_counts,
             local_empty_reason: published.local_empty_reason.clone(),
@@ -1395,8 +1559,12 @@ fn health_renders_rejected_stale_mutations_counter() {
         file_count: 3,
         parsed_count: 3,
         partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
         failed_count: 0,
         partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
         failed_files: vec![],
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
