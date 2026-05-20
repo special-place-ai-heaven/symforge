@@ -13,8 +13,8 @@
 - [x] Run focused `search_text` regression verification.
 - [x] Run the exact goal verification command.
 - [x] Run default verification if task-specific verification passes and time permits.
-- [ ] Commit verified implementation work.
-- [ ] Mark SFB07 completed and commit goal status.
+- [x] Commit verified implementation work.
+- [x] Mark SFB07 completed and commit goal status.
 
 ## Evidence Log
 
@@ -52,7 +52,9 @@
   - `cargo check`.
   - `cargo test --all-targets -- --test-threads=1`: full all-targets suite passed again; observed key totals include `src/lib.rs` 1752 passed and `src/main.rs` 6 passed, plus integration test targets.
   - `cargo build --release`: finished release profile successfully.
+- Verified implementation commit: `96b4954e4458dc79f10012e28222c8588916cc9f`.
 
 ## Review
 
-- Pending. Review will be completed after implementation and verification.
+- SFB07 acceptance criteria passed: the KEEP_DOC_MARKDOWN_USAGE_VISIBLE decision is recorded in test comments, regression tests cover ordinary comments, doc comments, and markdown, and existing `search_text` tests plus full verification passed.
+- Changes stayed inside the allowed tracked files/areas plus the copied ignored goal-status file. No `docs/**`, `plans/**`, `.planning/**`, `openspec/**`, `npm/**`, daemon, edit protocol, or parsing files were modified.
