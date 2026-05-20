@@ -4,7 +4,7 @@
 /// Atomic write (tmp → rename) to prevent corruption on crash.
 /// Background verification corrects stale entries after loading a snapshot.
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,8 @@ use crate::domain::ParseDiagnostic;
 
 const CURRENT_VERSION: u32 = 4;
 const INDEX_FILENAME: &str = "index.bin";
+const INDEX_TMP_FILENAME: &str = "index.bin.tmp";
+pub const SNAPSHOT_RESET_SCOPE_LABEL: &str = ".symforge/index.bin,.symforge/index.bin.tmp";
 
 // ── Snapshot types ────────────────────────────────────────────────────────────
 
@@ -67,6 +69,22 @@ pub struct StatCheckResult {
     pub new_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotResetReport {
+    removed: Vec<PathBuf>,
+    missing: Vec<PathBuf>,
+}
+
+impl SnapshotResetReport {
+    pub fn removed_count(&self) -> usize {
+        self.removed.len()
+    }
+
+    pub fn missing_count(&self) -> usize {
+        self.missing.len()
+    }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /// Serialize `index` to `index.bin` inside the project's data directory.
@@ -105,6 +123,29 @@ pub fn serialize_shared_index(
     serialize_captured_snapshot(snapshot_input, project_root)
 }
 
+pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotResetReport> {
+    let dir = paths::resolve_symforge_dir(project_root);
+    let targets = [dir.join(INDEX_FILENAME), dir.join(INDEX_TMP_FILENAME)];
+    let mut removed = Vec::new();
+    let mut missing = Vec::new();
+
+    for target in targets {
+        match std::fs::remove_file(&target) {
+            Ok(()) => removed.push(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(target),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "removing snapshot reset target {}: {}",
+                    target.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    Ok(SnapshotResetReport { removed, missing })
+}
+
 fn write_snapshot(snapshot: IndexSnapshot, project_root: &Path) -> anyhow::Result<()> {
     // Serialize with postcard
     let bytes = postcard::to_stdvec(&snapshot)?;
@@ -113,7 +154,7 @@ fn write_snapshot(snapshot: IndexSnapshot, project_root: &Path) -> anyhow::Resul
 
     // Atomic write: tmp file then rename
     let final_path = dir.join(INDEX_FILENAME);
-    let tmp_path = dir.join(format!("{INDEX_FILENAME}.tmp"));
+    let tmp_path = dir.join(INDEX_TMP_FILENAME);
 
     std::fs::write(&tmp_path, &bytes).map_err(|e| {
         anyhow::anyhow!(
@@ -1658,6 +1699,33 @@ mod tests {
         assert!(
             tmp.path().join(".symforge").join("index.bin").exists(),
             ".symforge/index.bin should be created"
+        );
+    }
+
+    #[test]
+    fn test_reset_snapshot_state_deletes_only_snapshot_scope() {
+        let tmp = TempDir::new().unwrap();
+        let symforge_dir = tmp.path().join(".symforge");
+        let source_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&symforge_dir).expect("create .symforge");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::write(source_dir.join("lib.rs"), "fn source_file() {}\n").expect("write source");
+        std::fs::write(symforge_dir.join("index.bin"), b"stale snapshot").expect("write snapshot");
+        std::fs::write(symforge_dir.join("index.bin.tmp"), b"stale tmp").expect("write tmp");
+        std::fs::write(symforge_dir.join("frecency.db"), b"unrelated").expect("write sentinel");
+
+        let report = reset_snapshot_state(tmp.path()).expect("reset snapshot state");
+
+        assert_eq!(report.removed_count(), 2);
+        assert!(!symforge_dir.join("index.bin").exists());
+        assert!(!symforge_dir.join("index.bin.tmp").exists());
+        assert!(
+            symforge_dir.join("frecency.db").exists(),
+            "reset must preserve unrelated .symforge state"
+        );
+        assert!(
+            source_dir.join("lib.rs").exists(),
+            "reset must never delete source files"
         );
     }
 

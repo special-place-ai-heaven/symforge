@@ -37,6 +37,11 @@ use crate::protocol::result_status::{
 };
 
 const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
+const INDEX_FOLDER_RESET_ENV: &str = "SYMFORGE_INDEX_FOLDER_RESET";
+
+fn index_folder_reset_requested() -> bool {
+    std::env::var(INDEX_FOLDER_RESET_ENV).as_deref() == Ok("1")
+}
 
 /// Deserialize a `u32` from either a JSON number or a stringified number like `"5"`.
 pub(crate) fn lenient_u32<'de, D: Deserializer<'de>>(
@@ -6798,6 +6803,14 @@ impl SymForgeServer {
                 root.display()
             );
         }
+        let reset_report = if index_folder_reset_requested() {
+            match crate::live_index::persist::reset_snapshot_state(&root) {
+                Ok(report) => Some(report),
+                Err(error) => return format!("Reset failed: {error}"),
+            }
+        } else {
+            None
+        };
         let previous_watcher = self.watcher_handle.lock().take();
         if let Some(previous_watcher) = previous_watcher {
             previous_watcher.stop_token.store(true, Ordering::Release);
@@ -6836,11 +6849,28 @@ impl SymForgeServer {
                 let expected_gen = self.index.current_project_generation();
                 crate::live_index::git_temporal::spawn_git_temporal_computation(
                     Arc::clone(&self.index),
-                    root,
+                    root.clone(),
                     expected_gen,
                 );
 
-                let output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
+                let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
+                if let Some(reset_report) = reset_report {
+                    output.push_str(&format!(
+                        "\nReset: scope={} | removed={} | missing={}",
+                        crate::live_index::persist::SNAPSHOT_RESET_SCOPE_LABEL,
+                        reset_report.removed_count(),
+                        reset_report.missing_count()
+                    ));
+                    let runtime_status = self.runtime_status_for(
+                        &published,
+                        self.local_runtime_mode(),
+                        None,
+                        None,
+                        Some(root.clone()),
+                    );
+                    output.push('\n');
+                    output.push_str(&format::format_runtime_status(&runtime_status));
+                }
                 self.session_context.record_summary_output(
                     "index_folder",
                     (output.len() / 4).min(u32::MAX as usize) as u32,
@@ -11949,6 +11979,62 @@ mod tests {
         assert!(
             health.contains("index_id=index-"),
             "health should keep index identity assertable after reset, got: {health}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_folder_reset_deletes_snapshot_scope_and_reports_fresh_status() {
+        let _reset_env = EnvVarGuard::set(super::INDEX_FOLDER_RESET_ENV, "1");
+        let repo = TempDir::new().expect("temp repo");
+        let src_dir = repo.path().join("src");
+        let symforge_dir = repo.path().join(".symforge");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&symforge_dir).expect("create .symforge dir");
+        fs::write(src_dir.join("lib.rs"), "pub fn reset_fresh() {}\n").expect("write source");
+        fs::write(symforge_dir.join("index.bin"), b"stale snapshot").expect("write snapshot");
+        fs::write(symforge_dir.join("index.bin.tmp"), b"stale tmp").expect("write tmp");
+        fs::write(symforge_dir.join("frecency.db"), b"unrelated").expect("write sentinel");
+
+        let server = make_server(make_live_index_empty());
+        let output = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: repo.path().display().to_string(),
+            }))
+            .await;
+
+        assert!(
+            output.starts_with("Indexed 1 files"),
+            "reset index_folder should still report indexing success first, got: {output}"
+        );
+        assert!(
+            output.contains("Reset: scope=.symforge/index.bin,.symforge/index.bin.tmp | removed=2"),
+            "reset output should prove bounded snapshot deletion, got: {output}"
+        );
+        assert!(
+            output.contains("Runtime:") && output.contains("load_source=fresh_load"),
+            "reset output should include fresh runtime status, got: {output}"
+        );
+        assert!(
+            output.contains("index_state=index_folder_reset") && output.contains("index_id=index-"),
+            "reset output should include assertable fresh identity, got: {output}"
+        );
+        assert!(!symforge_dir.join("index.bin").exists());
+        assert!(!symforge_dir.join("index.bin.tmp").exists());
+        assert!(
+            symforge_dir.join("frecency.db").exists(),
+            "reset must preserve unrelated .symforge state"
+        );
+        assert!(
+            src_dir.join("lib.rs").exists(),
+            "reset must never delete source files"
+        );
+
+        let health = server.health().await;
+        assert!(
+            health.contains("load_source=fresh_load")
+                && health.contains("index_state=index_folder_reset")
+                && health.contains("index_id=index-"),
+            "health after reset should prove fresh identity/source, got: {health}"
         );
     }
 
