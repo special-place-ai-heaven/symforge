@@ -817,12 +817,19 @@ pub(crate) fn is_vendor_path(path: &str) -> bool {
 }
 
 /// Returns true when `path` is personal-tooling sidecar content under
-/// `.claude/gsd-*` or `.claude/get-shit-done/`. Excludes shared agent
-/// infrastructure like `.claude/CLAUDE.md`, `.claude/commands/`,
-/// `.claude/skills/`, `.claude/hooks/`, `.claude/agents/`.
+/// `.claude/gsd-*`, `.claude/get-shit-done/`, or an Obsidian `.obsidian/`
+/// directory. Excludes shared agent infrastructure like `.claude/CLAUDE.md`,
+/// `.claude/commands/`, `.claude/skills/`, `.claude/hooks/`, `.claude/agents/`.
 pub(crate) fn is_personal_tooling_path(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
-    lower.starts_with(".claude/gsd-") || lower.starts_with(".claude/get-shit-done/")
+    let has_obsidian_dir = lower
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| segment == ".obsidian");
+
+    has_obsidian_dir
+        || lower.starts_with(".claude/gsd-")
+        || lower.starts_with(".claude/get-shit-done/")
 }
 
 fn normalize_path_query(raw: &str) -> String {
@@ -1781,8 +1788,9 @@ impl LiveIndex {
         let max_coupling_weight = coupling_context
             .map(|(_, neighbors)| {
                 neighbors
-                    .values()
-                    .map(|evidence| evidence.weighted_score)
+                    .iter()
+                    .filter(|(path, _)| path_allowed(path.as_str()))
+                    .map(|(_, evidence)| evidence.weighted_score)
                     .filter(|score| score.is_finite() && *score > 0.0)
                     .fold(0.0_f32, f32::max)
             })
@@ -3431,8 +3439,9 @@ impl LiveIndex {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmissionTierLookupView, ContextBundleView, SearchFilesHit, SearchFilesResolveView,
-        SearchFilesTier, SearchFilesView,
+        AdmissionTierLookupView, ContextBundleView, SearchFilesCouplingEvidence,
+        SearchFilesCouplingNeighbors, SearchFilesHit, SearchFilesResolveView, SearchFilesTier,
+        SearchFilesView,
     };
     use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
     use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
@@ -4157,6 +4166,70 @@ mod tests {
         } else {
             panic!("expected found view");
         }
+    }
+
+    #[test]
+    fn test_capture_search_files_with_coupling_filters_obsidian_internals() {
+        let index = make_index(
+            vec![
+                (
+                    "wiki/notes.md",
+                    make_indexed_file("wiki/notes.md", vec![], ParseStatus::Parsed),
+                ),
+                (
+                    "wiki/.obsidian/notes.md",
+                    make_indexed_file("wiki/.obsidian/notes.md", vec![], ParseStatus::Parsed),
+                ),
+                (
+                    ".obsidian/plugins/dataview/styles.css",
+                    make_indexed_file(
+                        ".obsidian/plugins/dataview/styles.css",
+                        vec![],
+                        ParseStatus::Parsed,
+                    ),
+                ),
+            ],
+            false,
+        );
+        let mut neighbors = SearchFilesCouplingNeighbors::new();
+        neighbors.insert(
+            "wiki/notes.md".to_string(),
+            SearchFilesCouplingEvidence {
+                shared_commits: 3,
+                weighted_score: 3.0,
+            },
+        );
+        neighbors.insert(
+            "wiki/.obsidian/notes.md".to_string(),
+            SearchFilesCouplingEvidence {
+                shared_commits: 9,
+                weighted_score: 9.0,
+            },
+        );
+
+        let view = index.capture_search_files_view_with_noise(
+            "notes.md",
+            10,
+            None,
+            Some(("wiki/notes.md", &neighbors)),
+            true,
+            false,
+        );
+
+        assert_eq!(
+            view,
+            SearchFilesView::Found {
+                query: "notes.md".to_string(),
+                total_matches: 1,
+                overflow_count: 0,
+                hits: vec![SearchFilesHit {
+                    tier: SearchFilesTier::CoChange,
+                    path: "wiki/notes.md".to_string(),
+                    coupling_score: Some(1.0),
+                    shared_commits: Some(3),
+                }],
+            }
+        );
     }
 
     #[test]
@@ -6202,6 +6275,26 @@ public class PacketsController {
         assert!(is_personal_tooling_path(".claude/get-shit-done/bar.sh"));
         assert!(!is_personal_tooling_path(".claude/CLAUDE.md")); // root-level claude config
         assert!(!is_personal_tooling_path("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_is_personal_tooling_path_matches_obsidian_internals() {
+        use super::is_personal_tooling_path;
+        assert!(is_personal_tooling_path(".obsidian/app.json"));
+        assert!(is_personal_tooling_path("wiki/.obsidian/workspace.json"));
+        assert!(is_personal_tooling_path(
+            ".obsidian/plugins/dataview/styles.css"
+        ));
+        assert!(is_personal_tooling_path(
+            "wiki\\.obsidian\\plugins\\dataview\\styles.css"
+        ));
+    }
+
+    #[test]
+    fn test_is_personal_tooling_path_allows_normal_wiki_markdown() {
+        use super::is_personal_tooling_path;
+        assert!(!is_personal_tooling_path("wiki/notes.md"));
+        assert!(!is_personal_tooling_path("wiki/.obsidian.md"));
     }
 
     #[test]

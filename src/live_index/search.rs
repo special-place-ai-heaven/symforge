@@ -2324,6 +2324,37 @@ mod tests {
     }
 
     #[test]
+    fn test_search_module_text_search_filters_obsidian_but_keeps_wiki_markdown() {
+        let index = make_index(vec![
+            make_file("wiki/notes.md", "needle visible\n", Vec::new()),
+            make_file(
+                "wiki/.obsidian/workspace.json",
+                "needle hidden workspace\n",
+                Vec::new(),
+            ),
+            make_file(
+                ".obsidian/plugins/dataview/styles.css",
+                "needle hidden style\n",
+                Vec::new(),
+            ),
+        ]);
+        let options = TextSearchOptions {
+            include_personal_tooling: false,
+            total_limit: 10,
+            max_per_file: 5,
+            ..TextSearchOptions::default()
+        };
+
+        let result = search_text_with_options(&index, Some("needle"), None, false, &options)
+            .expect("search should work");
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "wiki/notes.md");
+        assert_eq!(result.suppressed_by_noise, 2);
+    }
+
+    #[test]
     fn test_search_module_text_search_with_options_respects_glob_filters() {
         let index = make_index(vec![
             make_file("src/app.ts", "needle app\n", Vec::new()),
