@@ -32,7 +32,9 @@ use crate::capability::{
     WorktreeRoutingPolicy,
 };
 use crate::edit_safety::trust::{ProjectConfigTrust, TrustEvaluation, TrustStatus};
-use crate::protocol::result_status::{OutcomeClass, ResultStatus};
+use crate::protocol::result_status::{
+    OutcomeClass, RESULT_STATUS_CONTRACT_VERSION, RESULT_STATUS_META_KEY, ResultStatus,
+};
 
 const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
 
@@ -171,6 +173,142 @@ fn statused_tool_result(
     outcome_class: OutcomeClass,
 ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditResultStatus {
+    Success,
+    DryRunSuccess,
+    NotFound,
+    Ambiguous,
+    InvalidRequest,
+    InternalFailure,
+}
+
+impl EditResultStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::DryRunSuccess => "dry_run_success",
+            Self::NotFound => "not_found",
+            Self::Ambiguous => "ambiguous",
+            Self::InvalidRequest => "invalid_request",
+            Self::InternalFailure => "internal_failure",
+        }
+    }
+
+    const fn outcome_class(self) -> OutcomeClass {
+        match self {
+            Self::Success | Self::DryRunSuccess => OutcomeClass::Found,
+            Self::NotFound => OutcomeClass::NotFound,
+            Self::Ambiguous => OutcomeClass::Ambiguous,
+            Self::InvalidRequest => OutcomeClass::InvalidRequest,
+            Self::InternalFailure => OutcomeClass::InternalFailure,
+        }
+    }
+}
+
+fn statused_edit_tool_result(
+    text: String,
+    status: EditResultStatus,
+    operation_statuses: Vec<(usize, EditResultStatus)>,
+) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    let mut status_payload = serde_json::json!({
+        "contract_version": RESULT_STATUS_CONTRACT_VERSION,
+        "outcome_class": status.outcome_class().as_str(),
+        "status": status.as_str(),
+    });
+    if !operation_statuses.is_empty() {
+        status_payload["operations"] = serde_json::Value::Array(
+            operation_statuses
+                .into_iter()
+                .map(|(operation_index, operation_status)| {
+                    serde_json::json!({
+                        "operation_index": operation_index,
+                        "status": operation_status.as_str(),
+                        "outcome_class": operation_status.outcome_class().as_str(),
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    let mut meta = rmcp::model::JsonObject::new();
+    meta.insert(RESULT_STATUS_META_KEY.to_string(), status_payload);
+
+    let content = vec![rmcp::model::Content::text(text)];
+    let result = if status.outcome_class().is_error() {
+        rmcp::model::CallToolResult::error(content)
+    } else {
+        rmcp::model::CallToolResult::success(content)
+    };
+    Ok(result.with_meta(Some(rmcp::model::Meta(meta))))
+}
+
+fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
+    if text.contains("Ambiguous:") || text.starts_with("Ambiguous:") {
+        EditResultStatus::Ambiguous
+    } else if text.starts_with("File not found:")
+        || text.starts_with("Symbol not found:")
+        || text.contains("Symbol not found:")
+        || text.contains("File not indexed:")
+    {
+        EditResultStatus::NotFound
+    } else if text.contains("no repository root configured")
+        || text.starts_with("Index not loaded.")
+        || text.contains("still loading")
+        || text.contains("unavailable")
+        || text.starts_with("Error writing ")
+        || text.contains("Write failed")
+        || text.contains("ROLLBACK INCOMPLETE")
+        || text.contains("File disappeared:")
+        || text.contains("byte range")
+        || text.contains("Session stale")
+    {
+        EditResultStatus::InternalFailure
+    } else if text.starts_with("Error:")
+        || text.starts_with("ProjectConfigTrustEnforced:")
+        || text.starts_with("Overlapping edits")
+        || text.contains("path escapes repo root")
+        || text.contains("Path containment error")
+        || text.contains("Path resolution error")
+    {
+        EditResultStatus::InvalidRequest
+    } else if dry_run
+        || text.contains("[DRY RUN]")
+        || text.contains("Write semantics: dry run (no writes)")
+    {
+        EditResultStatus::DryRunSuccess
+    } else {
+        EditResultStatus::Success
+    }
+}
+
+fn success_operation_statuses(
+    count: usize,
+    status: EditResultStatus,
+) -> Vec<(usize, EditResultStatus)> {
+    (1..=count).map(|index| (index, status)).collect()
+}
+
+fn failed_batch_operation_statuses(
+    text: &str,
+    status: EditResultStatus,
+) -> Vec<(usize, EditResultStatus)> {
+    let Some(rest) = text.strip_prefix("Edit ") else {
+        return Vec::new();
+    };
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let Some(':') = rest.chars().nth(digits.len()) else {
+        return Vec::new();
+    };
+    match digits.parse::<usize>() {
+        Ok(index) => vec![(index, status)],
+        Err(_) => Vec::new(),
+    }
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
@@ -8914,6 +9052,7 @@ impl SymForgeServer {
     /// NOT for small edits within a symbol (use edit_within_symbol).
     /// NOT for removing a symbol entirely (use delete_symbol).
     #[tool(
+        name = "replace_symbol_body",
         description = "Replace a symbol's entire definition with new source code. The index resolves the symbol's byte range server-side — no need to read the file first. Content is auto-indented to match the original symbol's indentation level. Use symbol_line to disambiguate overloaded names. NOT for small edits within a symbol (use edit_within_symbol). NOT for removing a symbol entirely (use delete_symbol).",
         annotations(
             read_only_hint = false,
@@ -8922,6 +9061,16 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn replace_symbol_body_tool(
+        &self,
+        params: Parameters<edit::ReplaceSymbolBodyInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let output = self.replace_symbol_body(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        statused_edit_tool_result(output, status, Vec::new())
+    }
+
     pub(crate) async fn replace_symbol_body(
         &self,
         params: Parameters<edit::ReplaceSymbolBodyInput>,
@@ -9647,6 +9796,7 @@ impl SymForgeServer {
     /// Apply multiple symbol-addressed edits atomically.
     /// Set dry_run=true for a read-only preview that makes no file changes.
     #[tool(
+        name = "batch_edit",
         description = "Apply multiple symbol-addressed edits atomically across files. Each edit specifies a file, symbol, and operation (replace/insert_before/insert_after/delete/edit_within). Accepts either structured edits or shorthand strings like `src/lib.rs::helper => edit_within old >>> new`. All symbols are validated before any writes — if any resolution fails, no files are modified. Set dry_run=true for a READ-ONLY preview that shows what would change without writing (safe, no confirmation needed). Edits within the same file must target non-overlapping symbols. NOT for single-symbol edits (use replace_symbol_body, insert_symbol, etc.).",
         annotations(
             read_only_hint = false,
@@ -9655,6 +9805,23 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn batch_edit_tool(
+        &self,
+        params: Parameters<edit::BatchEditInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let operation_count = params.0.edits.len();
+        let output = self.batch_edit(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        let operation_statuses = match status {
+            EditResultStatus::Success | EditResultStatus::DryRunSuccess => {
+                success_operation_statuses(operation_count, status)
+            }
+            _ => failed_batch_operation_statuses(&output, status),
+        };
+        statused_edit_tool_result(output, status, operation_statuses)
+    }
+
     pub(crate) async fn batch_edit(&self, params: Parameters<edit::BatchEditInput>) -> String {
         if let Some(result) = self.proxy_tool_call("batch_edit", &params.0).await {
             return result;
@@ -9786,6 +9953,7 @@ impl SymForgeServer {
 
     /// Insert the same code at multiple symbol locations across files.
     #[tool(
+        name = "batch_insert",
         description = "Insert the same code before or after multiple symbols across the project. Useful for adding logging, instrumentation, or boilerplate to many locations at once. Accepts either structured targets or shorthand strings like `src/lib.rs::helper`. Code is auto-indented to match each target symbol. All targets are validated before any writes, and live execution applies transactionally across files with rollback on failure. Set dry_run=true for a READ-ONLY preview. NOT for inserting at a single location (use insert_symbol).",
         annotations(
             read_only_hint = false,
@@ -9794,6 +9962,23 @@ impl SymForgeServer {
             open_world_hint = false
         )
     )]
+    pub(crate) async fn batch_insert_tool(
+        &self,
+        params: Parameters<edit::BatchInsertInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let operation_count = params.0.targets.len();
+        let output = self.batch_insert(params).await;
+        let status = classify_edit_output(&output, dry_run);
+        let operation_statuses = match status {
+            EditResultStatus::Success | EditResultStatus::DryRunSuccess => {
+                success_operation_statuses(operation_count, status)
+            }
+            _ => failed_batch_operation_statuses(&output, status),
+        };
+        statused_edit_tool_result(output, status, operation_statuses)
+    }
+
     pub(crate) async fn batch_insert(&self, params: Parameters<edit::BatchInsertInput>) -> String {
         if let Some(result) = self.proxy_tool_call("batch_insert", &params.0).await {
             return result;
@@ -10203,6 +10388,19 @@ mod tests {
             serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
             serde_json::json!(expected.as_str()),
             "wrong result-status outcome: {serialized}"
+        );
+    }
+
+    fn assert_tool_result_edit_status(
+        serialized: &serde_json::Value,
+        expected_status: &str,
+        expected_outcome: OutcomeClass,
+    ) {
+        assert_tool_result_status(serialized, expected_outcome);
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["status"],
+            serde_json::json!(expected_status),
+            "wrong edit result status: {serialized}"
         );
     }
 
@@ -14720,6 +14918,294 @@ mod tests {
             serialized_tool_result(server.find_references_tool(Parameters(ambiguous)).await);
         assert_tool_result_status(&ambiguous, OutcomeClass::Ambiguous);
         assert!(tool_result_text(&ambiguous).contains("Ambiguous symbol selector"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_tools_emit_result_status_contract() {
+        use crate::protocol::edit::ReplaceSymbolBodyInput;
+
+        let success_source = b"fn present() {\n    println!(\"old\");\n}\nfn other() {}\n";
+        let (_dir, server, file_path) = setup_edit_test(success_source);
+        let success = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    path: "src/lib.rs".to_string(),
+                    name: "present".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    new_body: "fn present() {\n    println!(\"new\");\n}".to_string(),
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&success, "success", OutcomeClass::Found);
+        assert!(tool_result_text(&success).contains("replaced"));
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("\"new\"")
+        );
+
+        let dry_run_source = b"fn present() {\n    println!(\"old\");\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(dry_run_source);
+        let dry_run = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    path: "src/lib.rs".to_string(),
+                    name: "present".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    new_body: "fn present() {\n    println!(\"planned\");\n}".to_string(),
+                    dry_run: Some(true),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&dry_run, "dry_run_success", OutcomeClass::Found);
+        assert!(tool_result_text(&dry_run).contains("[DRY RUN]"));
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("\"old\"")
+        );
+
+        let not_found = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    path: "src/lib.rs".to_string(),
+                    name: "missing_symbol".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    new_body: "fn missing_symbol() {}".to_string(),
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&not_found, "not_found", OutcomeClass::NotFound);
+        assert!(tool_result_text(&not_found).contains("Symbol not found"));
+
+        let ambiguous_source = b"fn duplicate() {}\nfn duplicate() {}\n";
+        let (_dir, server, _file_path) = setup_edit_test(ambiguous_source);
+        let ambiguous = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    path: "src/lib.rs".to_string(),
+                    name: "duplicate".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    new_body: "fn duplicate() { changed(); }".to_string(),
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&ambiguous, "ambiguous", OutcomeClass::Ambiguous);
+        assert!(tool_result_text(&ambiguous).contains("Ambiguous"));
+
+        let invalid_request = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(crate::protocol::edit::BatchEditInput {
+                    edits: vec![crate::protocol::edit::SingleEdit {
+                        path: "../outside.rs".to_string(),
+                        name: "duplicate".to_string(),
+                        kind: None,
+                        symbol_line: None,
+                        operation: crate::protocol::edit::EditOperation::Delete,
+                        working_directory: None,
+                    }],
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(
+            &invalid_request,
+            "invalid_request",
+            OutcomeClass::InvalidRequest,
+        );
+        assert!(tool_result_text(&invalid_request).contains("Error:"));
+
+        let source = b"fn present() {}\n";
+        let parse_result = crate::parsing::process_file("src/lib.rs", source, LanguageId::Rust);
+        let indexed = IndexedFile::from_parse_result(parse_result, source.to_vec());
+        let server = make_server(make_live_index_ready(vec![(
+            "src/lib.rs".to_string(),
+            indexed,
+        )]));
+        let internal_failure = serialized_tool_result(
+            server
+                .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    path: "src/lib.rs".to_string(),
+                    name: "present".to_string(),
+                    kind: None,
+                    symbol_line: None,
+                    new_body: "fn present() { changed(); }".to_string(),
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(
+            &internal_failure,
+            "internal_failure",
+            OutcomeClass::InternalFailure,
+        );
+        assert_eq!(internal_failure["isError"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_batch_edit_and_insert_statuses_include_per_operation_status() {
+        use crate::protocol::edit::{
+            BatchEditInput, BatchInsertInput, EditOperation, InsertPosition, InsertTarget,
+            SingleEdit,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let a_content = b"fn alpha() { old(); }\n";
+        let b_content = b"fn beta() { old(); }\n";
+        std::fs::write(src_dir.join("a.rs"), a_content).unwrap();
+        std::fs::write(src_dir.join("b.rs"), b_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/a.rs", a_content as &[u8]),
+            ("src/b.rs", b_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed = IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let server =
+            make_server_with_root(make_live_index_ready(files), Some(dir.path().to_path_buf()));
+
+        let dry_run_batch_edit = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(BatchEditInput {
+                    edits: vec![
+                        SingleEdit {
+                            path: "src/a.rs".to_string(),
+                            name: "alpha".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            operation: EditOperation::Replace {
+                                new_body: "fn alpha() { new(); }".to_string(),
+                            },
+                            working_directory: None,
+                        },
+                        SingleEdit {
+                            path: "src/b.rs".to_string(),
+                            name: "beta".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            operation: EditOperation::Delete,
+                            working_directory: None,
+                        },
+                    ],
+                    dry_run: Some(true),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&dry_run_batch_edit, "dry_run_success", OutcomeClass::Found);
+        let operation_statuses = dry_run_batch_edit["_meta"][RESULT_STATUS_META_KEY]["operations"]
+            .as_array()
+            .expect("batch edit status should include per-operation statuses");
+        assert_eq!(operation_statuses.len(), 2);
+        assert!(
+            operation_statuses
+                .iter()
+                .all(|entry| entry["status"] == serde_json::json!("dry_run_success"))
+        );
+        assert!(tool_result_text(&dry_run_batch_edit).contains("[DRY RUN]"));
+        assert!(
+            std::fs::read_to_string(src_dir.join("a.rs"))
+                .unwrap()
+                .contains("old")
+        );
+
+        let successful_batch_insert = serialized_tool_result(
+            server
+                .batch_insert_tool(Parameters(BatchInsertInput {
+                    content: "fn logging() {}".to_string(),
+                    position: InsertPosition::After,
+                    targets: vec![
+                        InsertTarget {
+                            path: "src/a.rs".to_string(),
+                            name: "alpha".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            working_directory: None,
+                        },
+                        InsertTarget {
+                            path: "src/b.rs".to_string(),
+                            name: "beta".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            working_directory: None,
+                        },
+                    ],
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&successful_batch_insert, "success", OutcomeClass::Found);
+        let operation_statuses =
+            successful_batch_insert["_meta"][RESULT_STATUS_META_KEY]["operations"]
+                .as_array()
+                .expect("batch insert status should include per-operation statuses");
+        assert_eq!(operation_statuses.len(), 2);
+        assert!(
+            operation_statuses
+                .iter()
+                .all(|entry| entry["status"] == serde_json::json!("success"))
+        );
+
+        let failed_batch_edit = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(BatchEditInput {
+                    edits: vec![
+                        SingleEdit {
+                            path: "src/a.rs".to_string(),
+                            name: "alpha".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            operation: EditOperation::Delete,
+                            working_directory: None,
+                        },
+                        SingleEdit {
+                            path: "src/b.rs".to_string(),
+                            name: "missing".to_string(),
+                            kind: None,
+                            symbol_line: None,
+                            operation: EditOperation::Delete,
+                            working_directory: None,
+                        },
+                    ],
+                    dry_run: Some(false),
+                    working_directory: None,
+                }))
+                .await,
+        );
+        assert_tool_result_edit_status(&failed_batch_edit, "not_found", OutcomeClass::NotFound);
+        assert!(tool_result_text(&failed_batch_edit).contains("ROLLED BACK"));
+        let operation_statuses = failed_batch_edit["_meta"][RESULT_STATUS_META_KEY]["operations"]
+            .as_array()
+            .expect("failed batch edit status should identify the failing operation");
+        assert_eq!(operation_statuses.len(), 1);
+        assert_eq!(
+            operation_statuses[0]["operation_index"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            operation_statuses[0]["status"],
+            serde_json::json!("not_found")
+        );
     }
 
     #[tokio::test]
