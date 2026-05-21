@@ -2091,7 +2091,7 @@ fn test_around_symbol_with_max_lines_truncates() {
     let result_lines: Vec<&str> = result.lines().collect();
     assert_eq!(result_lines.len(), 4); // 3 content lines + truncation hint
     assert!(result_lines[0].contains("fn connect()"));
-    assert!(result_lines[3].contains("truncated"));
+    assert!(result_lines[3].contains("[truncated] Truncated at ~3 lines."));
     assert!(result_lines[3].contains("showing first 3"));
 }
 
@@ -3822,6 +3822,17 @@ fn test_auto_summarize_uses_capitalized_heuristic_phrase() {
 // ── cap_file_content_output tests ──────────────────────────────────────────
 
 #[test]
+fn test_enforce_token_budget_uses_canonical_truncation_marker() {
+    let output = "alpha\n".repeat(100);
+    let result = super::enforce_token_budget(output, Some(4));
+
+    assert!(
+        result.contains("[truncated] Truncated at ~4 tokens."),
+        "budget truncation should use the canonical marker: {result}"
+    );
+}
+
+#[test]
 fn test_cap_under_limit_unchanged() {
     let s = "hello\nworld\n".to_string();
     let result = super::cap_file_content_output(s.clone());
@@ -3850,8 +3861,8 @@ fn test_cap_over_limit_truncates_and_adds_footer() {
         result.len()
     );
     assert!(
-        result.contains("truncated"),
-        "should contain truncation footer"
+        result.contains("[truncated] Truncated at ~"),
+        "should contain canonical truncation footer"
     );
     assert!(
         result.contains("chunk_index"),
@@ -3864,9 +3875,14 @@ fn test_cap_truncates_at_line_boundary() {
     // Build output that crosses the cap mid-line
     let before_cap = "line\n".repeat(super::GET_FILE_CONTENT_MAX_BYTES / 5 + 1);
     let result = super::cap_file_content_output(before_cap);
-    assert!(result.contains("truncated"), "should be truncated");
+    assert!(
+        result.contains("[truncated] Truncated at ~"),
+        "should be truncated"
+    );
     // The truncated portion (before footer) should end with a newline
-    let footer_start = result.find("\n[Output truncated").unwrap_or(result.len());
+    let footer_start = result
+        .find("\n[truncated] Truncated at ~")
+        .unwrap_or(result.len());
     let body = &result[..footer_start];
     assert!(
         body.ends_with('\n'),

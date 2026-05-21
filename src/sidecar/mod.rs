@@ -225,7 +225,7 @@ pub struct SidecarState {
 /// If `max_bytes` is 0, all items are returned without truncation.
 ///
 /// Returns `(text, remaining_count)` where `remaining_count` is 0 when no
-/// truncation occurred. A `"... (truncated, N more)"` suffix is appended when
+/// truncation occurred. A canonical truncation suffix is appended when
 /// items were dropped.
 pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
     if max_bytes == 0 || items.is_empty() {
@@ -242,7 +242,7 @@ pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
             // Would exceed budget — stop here.
             let remaining = items.len() - included.len();
             let mut text = included.join("\n");
-            text.push_str(&format!("\n... (truncated, {remaining} more)"));
+            text.push_str(&budget_truncation_suffix(max_bytes, remaining));
             return (text, remaining);
         }
         used_bytes += item_cost;
@@ -256,11 +256,25 @@ pub fn build_with_budget(items: &[String], max_bytes: u64) -> (String, usize) {
     if included.len() < items.len() {
         let remaining = items.len() - included.len();
         let mut text = included.join("\n");
-        text.push_str(&format!("\n... (truncated, {remaining} more)"));
+        text.push_str(&budget_truncation_suffix(max_bytes, remaining));
         return (text, remaining);
     }
 
     (included.join("\n"), 0)
+}
+
+const CANONICAL_TRUNCATION_MARKER: &str = "[truncated]";
+const APPROX_BYTES_PER_TOKEN: u64 = 4;
+
+fn approx_tokens_from_bytes(bytes: u64) -> u64 {
+    bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN
+}
+
+fn budget_truncation_suffix(max_bytes: u64, remaining: usize) -> String {
+    let max_tokens = approx_tokens_from_bytes(max_bytes);
+    format!(
+        "\n{CANONICAL_TRUNCATION_MARKER} Truncated at ~{max_tokens} tokens. {remaining} additional output line(s) not shown."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -421,8 +435,10 @@ mod tests {
         ];
         let (text, remaining) = build_with_budget(&items, 12);
         assert!(
-            text.ends_with("... (truncated, 2 more)") || text.contains("truncated, 2 more"),
-            "suffix should mention 2 more items, got: {text}"
+            text.ends_with(
+                "[truncated] Truncated at ~3 tokens. 2 additional output line(s) not shown."
+            ),
+            "suffix should use canonical truncation marker and mention 2 remaining items, got: {text}"
         );
         assert_eq!(remaining, 2);
     }

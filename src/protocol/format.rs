@@ -2099,10 +2099,14 @@ fn render_numbered_symbol_range_excerpt(
             let mut result: Vec<String> = (start..=truncated_end)
                 .map(|n| format!("{n}: {}", lines[n - 1]))
                 .collect();
-            result.push(format!(
-                "... truncated (symbol is {} lines, showing first {})",
-                sym_end.saturating_sub(sym_start) + 1,
-                ml
+            let detail = format!(
+                "Symbol is {} lines, showing first {ml}.",
+                sym_end.saturating_sub(sym_start) + 1
+            );
+            result.push(canonical_truncation_notice(
+                ml as u64,
+                "lines",
+                Some(detail.as_str()),
             ));
             return result.join("\n");
         }
@@ -2258,8 +2262,16 @@ pub fn cap_file_content_output(output: String) -> String {
     if output.len() <= GET_FILE_CONTENT_MAX_BYTES {
         return output;
     }
-    // Reserve ~300 bytes for footer; align budget to a UTF-8 char boundary.
-    let mut budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(300);
+    let original_bytes = output.len();
+    let original_tokens_est = approx_tokens_from_bytes(original_bytes);
+    let cap_tokens_est = approx_tokens_from_bytes(GET_FILE_CONTENT_MAX_BYTES);
+    let detail = format!(
+        "Original output is ~{original_tokens_est} tokens ({original_bytes} bytes), exceeding {GET_FILE_CONTENT_MAX_BYTES}-byte cap. Use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window."
+    );
+    let footer = token_truncation_footer(cap_tokens_est, Some(detail.as_str()));
+
+    // Reserve exactly enough bytes for the footer; align budget to a UTF-8 char boundary.
+    let mut budget = GET_FILE_CONTENT_MAX_BYTES.saturating_sub(footer.len());
     while budget > 0 && !output.is_char_boundary(budget) {
         budget -= 1;
     }
@@ -2268,11 +2280,7 @@ pub fn cap_file_content_output(output: String) -> String {
         None => budget,       // no newline — truncate at char boundary
     };
     let truncated = &output[..truncate_at];
-    let original_bytes = output.len();
-    format!(
-        "{truncated}\n[Output truncated: {original_bytes} bytes exceeds {GET_FILE_CONTENT_MAX_BYTES}-byte cap. \
-Use chunk_index + max_lines, around_line, around_match, or around_symbol to read a smaller window.]"
-    )
+    format!("{truncated}{footer}")
 }
 
 /// "File not found: {path}"
@@ -3042,13 +3050,6 @@ pub fn trace_symbol_result_view(
     }
 }
 
-fn max_budget_bytes(max_tokens: Option<u64>) -> Option<usize> {
-    match max_tokens {
-        Some(tokens) if tokens > 0 => Some((tokens as usize).saturating_mul(4)),
-        _ => None,
-    }
-}
-
 fn append_budgeted_trace_section(
     output: &mut String,
     section: &str,
@@ -3056,18 +3057,21 @@ fn append_budgeted_trace_section(
     label: &str,
     omitted_count: usize,
 ) {
-    let Some(max_bytes) = max_budget_bytes(max_tokens) else {
+    let Some(max_tokens) = max_tokens.filter(|tokens| *tokens > 0) else {
         output.push_str(section);
         return;
     };
+    let max_bytes = (max_tokens as usize).saturating_mul(4);
 
     if output.len().saturating_add(section.len()) <= max_bytes {
         output.push_str(section);
         return;
     }
 
+    let detail = format!("{label} section omitted {omitted_count} item(s).");
     output.push_str(&format!(
-        "\n\n{label}: section-truncated ({omitted_count} not shown)"
+        "\n\n{}",
+        token_truncation_notice(max_tokens, Some(detail.as_str()))
     ));
 }
 
@@ -3076,9 +3080,10 @@ fn format_siblings_with_budget(
     current_bytes: usize,
     max_tokens: Option<u64>,
 ) -> String {
-    let Some(max_bytes) = max_budget_bytes(max_tokens) else {
+    let Some(max_tokens) = max_tokens.filter(|tokens| *tokens > 0) else {
         return format_siblings(siblings, 0);
     };
+    let max_bytes = (max_tokens as usize).saturating_mul(4);
 
     let mut section = "\nNearby siblings:".to_string();
     let mut shown = 0usize;
@@ -3100,8 +3105,10 @@ fn format_siblings_with_budget(
 
     let omitted = siblings.len().saturating_sub(shown);
     if omitted > 0 {
+        let detail = format!("{omitted} additional sibling(s) not shown.");
         section.push_str(&format!(
-            "\n  ... section-truncated ({omitted} more siblings not shown)"
+            "\n  {}",
+            token_truncation_notice(max_tokens, Some(detail.as_str()))
         ));
     }
 
@@ -3813,13 +3820,34 @@ fn format_impl_block_suggestion(suggestion: &ImplBlockSuggestionView) -> String 
     )
 }
 
-fn format_bundle_truncation_notice(max_tokens: u64, omitted_dependencies: Option<usize>) -> String {
-    match omitted_dependencies {
-        Some(count) => format!(
-            "\nTruncated at ~{max_tokens} tokens. {count} additional type dependencies not shown.\n"
-        ),
-        None => format!("\nTruncated at ~{max_tokens} tokens.\n"),
+const CANONICAL_TRUNCATION_MARKER: &str = "[truncated]";
+const APPROX_BYTES_PER_TOKEN: u64 = 4;
+
+fn approx_tokens_from_bytes(bytes: usize) -> u64 {
+    ((bytes as u64).saturating_add(APPROX_BYTES_PER_TOKEN - 1)) / APPROX_BYTES_PER_TOKEN
+}
+
+fn canonical_truncation_notice(amount: u64, unit: &str, detail: Option<&str>) -> String {
+    match detail.filter(|value| !value.is_empty()) {
+        Some(detail) => {
+            format!("{CANONICAL_TRUNCATION_MARKER} Truncated at ~{amount} {unit}. {detail}")
+        }
+        None => format!("{CANONICAL_TRUNCATION_MARKER} Truncated at ~{amount} {unit}."),
     }
+}
+
+fn token_truncation_notice(max_tokens: u64, detail: Option<&str>) -> String {
+    canonical_truncation_notice(max_tokens, "tokens", detail)
+}
+
+fn token_truncation_footer(max_tokens: u64, detail: Option<&str>) -> String {
+    format!("\n{}\n", token_truncation_notice(max_tokens, detail))
+}
+
+fn format_bundle_truncation_notice(max_tokens: u64, omitted_dependencies: Option<usize>) -> String {
+    let detail = omitted_dependencies
+        .map(|count| format!("{count} additional type dependencies not shown."));
+    token_truncation_footer(max_tokens, detail.as_deref())
 }
 
 /// Enforce a max-token budget on an already-assembled output string.
@@ -3836,12 +3864,11 @@ pub fn enforce_token_budget(output: String, max_tokens: Option<u64>) -> String {
     if output.len() <= max_bytes {
         return output;
     }
-    let actual_tokens_est = output.len() / 4;
+    let actual_tokens_est = approx_tokens_from_bytes(output.len());
     let mut truncated = truncate_text_at_line_boundary(&output, max_bytes);
-    truncated.push_str(&format!(
-        "\n\n[truncated — output is ~{} tokens, budget is {} tokens]\n",
-        actual_tokens_est, max_tokens
-    ));
+    let detail =
+        format!("Original output is ~{actual_tokens_est} tokens; budget is {max_tokens} tokens.");
+    truncated.push_str(&token_truncation_footer(max_tokens, Some(detail.as_str())));
     truncated
 }
 
