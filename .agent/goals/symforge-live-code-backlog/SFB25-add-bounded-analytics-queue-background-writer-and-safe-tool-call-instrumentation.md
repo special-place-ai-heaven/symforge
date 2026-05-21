@@ -3,15 +3,15 @@ goal_id: SFB25
 title: Add bounded analytics queue, background writer, and safe tool-call instrumentation
 chain_id: symforge-live-code-backlog
 phase: Phase 4 - local analytics
-status: "Pending"
+status: "Completed"
 depends_on: ["SFB24"]
 target_branch: "backlog-implementation"
 prohibited_branches: ["main", "master"]
 worktree_hint: ".worktrees/backlog-implementation"
 created_at: "2026-05-19"
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-21T22:50:40.8440804+02:00"
+completed_at: "2026-05-21T23:31:55.0133732+02:00"
+completion_commit: "6bdde6a95b69528bfc1648c694ed7c8cebd1a99c"
 blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "high"
@@ -195,4 +195,3 @@ Known gaps / blockers:
 - <none or explicit blocker with reason>
 Next goal:
 - SFB26 - Add analytics CLI status, summary, export, reset, retention, and redaction coverage
-
