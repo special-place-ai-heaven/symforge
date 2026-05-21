@@ -1,4 +1,3 @@
-// TODO: Add inline_test! cases for the remaining language extractors tracked in docs/live-code-backlog.md.
 macro_rules! inline_test {
     (
         $name:ident,
@@ -92,5 +91,68 @@ public class InlineCSharpProbe {}
 class InlineSwiftProbe {}
 "#,
         [(SymbolKind::Class, "InlineSwiftProbe")]
+    );
+}
+
+#[cfg(test)]
+mod scripting_and_remaining_tests {
+    use crate::domain::{LanguageId, SymbolKind};
+
+    inline_test!(
+        ruby_inline_test_extracts_method,
+        LanguageId::Ruby,
+        r#"
+def inline_ruby_probe
+end
+"#,
+        [(SymbolKind::Method, "inline_ruby_probe")]
+    );
+
+    inline_test!(
+        php_inline_test_extracts_function,
+        LanguageId::Php,
+        r#"
+<?php
+function inline_php_probe() {}
+"#,
+        [(SymbolKind::Function, "inline_php_probe")]
+    );
+
+    inline_test!(
+        perl_inline_test_extracts_function,
+        LanguageId::Perl,
+        r#"
+sub inline_perl_probe { return 1; }
+"#,
+        [(SymbolKind::Function, "inline_perl_probe")]
+    );
+
+    inline_test!(
+        kotlin_inline_test_extracts_function,
+        LanguageId::Kotlin,
+        r#"
+fun inlineKotlinProbe() = Unit
+"#,
+        [(SymbolKind::Function, "inlineKotlinProbe")]
+    );
+
+    inline_test!(
+        dart_inline_test_extracts_function,
+        LanguageId::Dart,
+        r#"
+void inlineDartProbe() {}
+"#,
+        [(SymbolKind::Function, "inlineDartProbe")]
+    );
+
+    inline_test!(
+        elixir_inline_test_extracts_function,
+        LanguageId::Elixir,
+        r#"
+def inline_elixir_probe do
+  :ok
+end
+"#,
+        [(SymbolKind::Function, "inline_elixir_probe")]
     );
 }
