@@ -3,15 +3,15 @@ goal_id: SFB26
 title: Add analytics CLI status, summary, export, reset, retention, and redaction coverage
 chain_id: symforge-live-code-backlog
 phase: Phase 4 - local analytics
-status: "Pending"
+status: "Completed"
 depends_on: ["SFB24", "SFB25"]
 target_branch: "backlog-implementation"
 prohibited_branches: ["main", "master"]
 worktree_hint: ".worktrees/backlog-implementation"
 created_at: "2026-05-19"
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-21T23:36:27.1648174+02:00"
+completed_at: "2026-05-21T23:55:23.5996296+02:00"
+completion_commit: "f968214e91abb6c1e8a6b0b4c8822a588a90b75f"
 blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "medium"
@@ -198,4 +198,3 @@ Known gaps / blockers:
 - <none or explicit blocker with reason>
 Next goal:
 - SFB27 - Choose first non-code repository intelligence family and define corpus
-
