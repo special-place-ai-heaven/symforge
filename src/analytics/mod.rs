@@ -9,6 +9,7 @@ pub use queue::{
 };
 pub use store::{
     AnalyticsConfig, AnalyticsMode, AnalyticsObservation, AnalyticsScope, AnalyticsStatus,
-    AnalyticsStore, AnalyticsSurface, AnalyticsWriteOutcome, MAX_TOOL_NAME_BYTES,
-    SqliteAnalyticsStore, StoredAnalyticsRecord,
+    AnalyticsStore, AnalyticsSummary, AnalyticsSummaryCount, AnalyticsSurface,
+    AnalyticsWriteOutcome, DEFAULT_ANALYTICS_EXPORT_LIMIT, DEFAULT_ANALYTICS_RETENTION_RECORDS,
+    MAX_ANALYTICS_EXPORT_LIMIT, MAX_TOOL_NAME_BYTES, SqliteAnalyticsStore, StoredAnalyticsRecord,
 };

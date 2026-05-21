@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::capability::CapabilityEvidence;
@@ -17,6 +18,9 @@ pub const MAX_CONFIGURED_SCOPE_BYTES: usize = 128;
 pub const MAX_CAPABILITY_DETAIL_BYTES: usize = 256;
 pub const MAX_CAPABILITY_STATE_JSON_BYTES: usize = 4096;
 pub const MAX_CAPABILITY_ITEMS: usize = 16;
+pub const DEFAULT_ANALYTICS_EXPORT_LIMIT: usize = 100;
+pub const MAX_ANALYTICS_EXPORT_LIMIT: usize = 1_000;
+pub const DEFAULT_ANALYTICS_RETENTION_RECORDS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalyticsMode {
@@ -184,7 +188,7 @@ impl AnalyticsObservation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredAnalyticsRecord {
     pub id: i64,
     pub tool_name: String,
@@ -196,6 +200,22 @@ pub struct StoredAnalyticsRecord {
     pub success: bool,
     pub outcome_class: String,
     pub capability_state_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnalyticsSummary {
+    pub total_records: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub latest_id: Option<i64>,
+    pub tool_counts: Vec<AnalyticsSummaryCount>,
+    pub outcome_counts: Vec<AnalyticsSummaryCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnalyticsSummaryCount {
+    pub value: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -333,7 +353,9 @@ impl SqliteAnalyticsStore {
                 sanitized.capability_state_json,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        enforce_record_retention(&conn, DEFAULT_ANALYTICS_RETENTION_RECORDS)?;
+        Ok(id)
     }
 
     pub fn recent_records(&self, limit: usize) -> Result<Vec<StoredAnalyticsRecord>> {
@@ -376,6 +398,86 @@ impl SqliteAnalyticsStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    pub fn export_records(&self, limit: usize) -> Result<Vec<StoredAnalyticsRecord>> {
+        self.recent_records(normalize_export_limit(limit))
+    }
+
+    pub fn summary(&self, group_limit: usize) -> Result<AnalyticsSummary> {
+        let conn = self.conn.lock().expect("analytics mutex poisoned");
+        let total_records = query_count(&conn, "SELECT COUNT(*) FROM analytics_tool_calls")?;
+        let success_count = query_count(
+            &conn,
+            "SELECT COUNT(*) FROM analytics_tool_calls WHERE success = 1",
+        )?;
+        let failure_count = query_count(
+            &conn,
+            "SELECT COUNT(*) FROM analytics_tool_calls WHERE success = 0",
+        )?;
+        let latest_id = conn.query_row("SELECT MAX(id) FROM analytics_tool_calls", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+
+        Ok(AnalyticsSummary {
+            total_records,
+            success_count,
+            failure_count,
+            latest_id,
+            tool_counts: grouped_counts(&conn, "tool_name", group_limit)?,
+            outcome_counts: grouped_counts(&conn, "outcome_class", group_limit)?,
+        })
+    }
+
+    pub fn enforce_retention(&self, max_records: usize) -> Result<usize> {
+        let conn = self.conn.lock().expect("analytics mutex poisoned");
+        enforce_record_retention(&conn, max_records)
+    }
+}
+
+fn normalize_export_limit(limit: usize) -> usize {
+    limit.min(MAX_ANALYTICS_EXPORT_LIMIT)
+}
+
+fn query_count(conn: &Connection, sql: &str) -> Result<u64> {
+    let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+    Ok(i64_to_u64(count))
+}
+
+fn grouped_counts(
+    conn: &Connection,
+    column: &'static str,
+    limit: usize,
+) -> Result<Vec<AnalyticsSummaryCount>> {
+    let sql = format!(
+        "SELECT {column}, COUNT(*) FROM analytics_tool_calls \
+         GROUP BY {column} \
+         ORDER BY COUNT(*) DESC, {column} ASC \
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![usize_to_i64(limit)], |row| {
+        let count: i64 = row.get(1)?;
+        Ok(AnalyticsSummaryCount {
+            value: row.get(0)?,
+            count: i64_to_u64(count),
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn enforce_record_retention(conn: &Connection, max_records: usize) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM analytics_tool_calls
+         WHERE id NOT IN (
+             SELECT id FROM analytics_tool_calls
+             ORDER BY id DESC
+             LIMIT ?1
+         )",
+        params![usize_to_i64(max_records)],
+    )
+    .map_err(Into::into)
 }
 
 struct SanitizedObservation {
@@ -627,6 +729,24 @@ mod tests {
                 .capability_state_json
                 .contains("frecency ranking")
         );
+    }
+
+    #[test]
+    fn retention_deletes_older_records_and_keeps_recent_records() {
+        let store = SqliteAnalyticsStore::open_in_memory().expect("analytics store");
+        for index in 0..5 {
+            let mut observation = sample_observation();
+            observation.tool_name = format!("tool_{index}");
+            store.record(&observation).expect("record");
+        }
+
+        let deleted = store.enforce_retention(2).expect("retention");
+        let records = store.recent_records(10).expect("records");
+
+        assert_eq!(deleted, 3);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tool_name, "tool_4");
+        assert_eq!(records[1].tool_name, "tool_3");
     }
 
     #[test]

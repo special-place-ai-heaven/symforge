@@ -2,12 +2,14 @@
 //!
 //! Subcommands:
 //!   `symforge init`               — configure Claude, Codex, or both
+//!   `symforge analytics <cmd>`     — inspect or reset local analytics storage
 //!   `symforge hook <subcommand>`  — hook scripts called by Claude Code
 //!   `symforge daemon`             — shared project/session backend
 //!   `symforge trust project-config` — audit, accept, or revoke project-config trust
 //!
 //! Plan 03 wires these into main.rs and handles the top-level dispatch.
 
+pub mod analytics;
 pub mod hook;
 pub mod init;
 pub mod trust;
@@ -29,6 +31,11 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Inspect, export, or reset local analytics storage
+    Analytics {
+        #[command(subcommand)]
+        command: analytics::AnalyticsCommand,
+    },
     /// Install SymForge integration for Claude, Codex, Gemini, Kilo Code, or all
     Init {
         /// Client to configure
@@ -145,6 +152,27 @@ mod tests {
         match cli.command {
             Some(Commands::Daemon) => {}
             _ => panic!("expected daemon command"),
+        }
+    }
+
+    #[test]
+    fn test_analytics_status_command_parses() {
+        let cli = Cli::parse_from([
+            "symforge",
+            "analytics",
+            "status",
+            "--db-path",
+            ".symforge/analytics.db",
+        ]);
+
+        match cli.command {
+            Some(Commands::Analytics {
+                command:
+                    analytics::AnalyticsCommand::Status {
+                        db_path: Some(db_path),
+                    },
+            }) => assert_eq!(db_path, std::path::PathBuf::from(".symforge/analytics.db")),
+            _ => panic!("expected analytics status command"),
         }
     }
 
