@@ -3,15 +3,15 @@ goal_id: SFB21
 title: Add inline extractor tests for web and typed-script languages
 chain_id: symforge-live-code-backlog
 phase: Phase 3 - parser correctness
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "backlog-implementation"
 prohibited_branches: ["main", "master"]
 worktree_hint: ".worktrees/backlog-implementation"
 created_at: "2026-05-19"
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-21T21:26:57.5935605+02:00"
+completed_at: "2026-05-21T21:36:51.4837083+02:00"
+completion_commit: "82e3d98b38b3a751b28d75cde8cc91d106573ef3"
 blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "low"
@@ -193,4 +193,3 @@ Known gaps / blockers:
 - <none or explicit blocker with reason>
 Next goal:
 - SFB22 - Add inline extractor tests for systems and backend languages
-
