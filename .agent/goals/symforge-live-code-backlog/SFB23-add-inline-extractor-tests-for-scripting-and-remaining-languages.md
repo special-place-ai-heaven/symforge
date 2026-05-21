@@ -3,15 +3,15 @@ goal_id: SFB23
 title: Add inline extractor tests for scripting and remaining languages
 chain_id: symforge-live-code-backlog
 phase: Phase 3 - parser correctness
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "backlog-implementation"
 prohibited_branches: ["main", "master"]
 worktree_hint: ".worktrees/backlog-implementation"
 created_at: "2026-05-19"
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-21T21:52:52.2757622+02:00"
+completed_at: "2026-05-21T21:59:18.5270267+02:00"
+completion_commit: "8eaf08905937aed8ca69da2d741cbbef69605ceb"
 blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "low"
@@ -192,4 +192,3 @@ Known gaps / blockers:
 - <none or explicit blocker with reason>
 Next goal:
 - SFB24 - Implement local SQLite analytics store foundation with disabled no-footprint behavior
-
