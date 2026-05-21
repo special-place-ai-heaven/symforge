@@ -233,8 +233,18 @@ fn scan_angular_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::SymbolKind;
+    use crate::domain::{LanguageId, SymbolKind};
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        html_inline_test_extracts_custom_element,
+        LanguageId::Html,
+        r#"
+<app-inline-probe></app-inline-probe>
+"#,
+        [(SymbolKind::Other, "app-inline-probe")]
+    );
 
     fn parse_html(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();

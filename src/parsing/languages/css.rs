@@ -124,8 +124,18 @@ fn walk_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::SymbolKind;
+    use crate::domain::{LanguageId, SymbolKind};
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        css_inline_test_extracts_selector,
+        LanguageId::Css,
+        r#"
+.inline-css-probe { color: red; }
+"#,
+        [(SymbolKind::Other, ".inline-css-probe")]
+    );
 
     fn parse_css(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();

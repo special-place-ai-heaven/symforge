@@ -135,8 +135,18 @@ fn walk_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::SymbolKind;
+    use crate::domain::{LanguageId, SymbolKind};
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        scss_inline_test_extracts_variable,
+        LanguageId::Scss,
+        r#"
+$inline-scss-probe: #333;
+"#,
+        [(SymbolKind::Variable, "$inline-scss-probe")]
+    );
 
     fn parse_scss(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();

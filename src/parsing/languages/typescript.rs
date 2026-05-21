@@ -151,7 +151,20 @@ fn find_name(node: &Node, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::LanguageId;
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        typescript_inline_test_extracts_interface,
+        LanguageId::TypeScript,
+        r#"
+interface InlineTypeScriptProbe {
+  id: string;
+}
+"#,
+        [(SymbolKind::Interface, "InlineTypeScriptProbe")]
+    );
 
     fn parse_ts(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();

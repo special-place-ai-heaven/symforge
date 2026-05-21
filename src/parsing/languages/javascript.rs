@@ -144,7 +144,18 @@ fn find_name(node: &Node, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::LanguageId;
+    use crate::parsing::inline_tests::inline_test;
     use tree_sitter::Parser;
+
+    inline_test!(
+        javascript_inline_test_extracts_function,
+        LanguageId::JavaScript,
+        r#"
+function inlineJavaScriptProbe() {}
+"#,
+        [(SymbolKind::Function, "inlineJavaScriptProbe")]
+    );
 
     fn parse_js(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();
