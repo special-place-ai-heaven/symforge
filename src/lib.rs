@@ -1,3 +1,4 @@
+pub mod analytics;
 pub mod capability;
 pub mod cli;
 pub mod daemon;
