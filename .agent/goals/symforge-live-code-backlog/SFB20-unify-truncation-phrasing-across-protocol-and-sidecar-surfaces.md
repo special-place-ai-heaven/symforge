@@ -3,15 +3,15 @@ goal_id: SFB20
 title: Unify truncation phrasing across protocol and sidecar surfaces
 chain_id: symforge-live-code-backlog
 phase: Phase 2 - public contract hardening
-status: "Pending"
+status: "Completed"
 depends_on: []
 target_branch: "backlog-implementation"
 prohibited_branches: ["main", "master"]
 worktree_hint: ".worktrees/backlog-implementation"
 created_at: "2026-05-19"
-started_at: ""
-completed_at: ""
-completion_commit: ""
+started_at: "2026-05-21T21:02:36.6007271+02:00"
+completed_at: "2026-05-21T21:20:32.1512191+02:00"
+completion_commit: "a6c1841eccf6b981f35e64567c0fb92cbca16541"
 blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "low"
@@ -196,4 +196,3 @@ Known gaps / blockers:
 - <none or explicit blocker with reason>
 Next goal:
 - SFB21 - Add inline extractor tests for web and typed-script languages
-
