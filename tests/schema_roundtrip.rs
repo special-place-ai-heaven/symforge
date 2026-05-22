@@ -187,6 +187,38 @@ fn search_files_debug_ranking_schema_and_roundtrip() {
 }
 
 schema_roundtrip_test!(roundtrip_index_folder, "index_folder", IndexFolderInput);
+
+#[test]
+fn index_folder_idempotency_key_is_optional_and_roundtrips() {
+    let schema = tool_schema("index_folder");
+    let props = schema_property_names(&schema);
+    assert!(
+        props.iter().any(|name| name == "idempotency_key"),
+        "index_folder schema should advertise optional idempotency_key"
+    );
+    assert!(
+        !schema_required_fields(&schema)
+            .iter()
+            .any(|name| name == "idempotency_key"),
+        "index_folder idempotency_key must be optional for backward compatibility"
+    );
+
+    let old_payload: IndexFolderInput =
+        serde_json::from_value(json!({ "path": "src" })).expect("old payload deserializes");
+    assert_eq!(old_payload.idempotency_key, None);
+
+    let new_payload: IndexFolderInput =
+        serde_json::from_value(json!({ "path": "src", "idempotency_key": "schema-key" }))
+            .expect("new payload deserializes");
+    assert_eq!(new_payload.idempotency_key.as_deref(), Some("schema-key"));
+
+    let roundtrip = serde_json::to_value(&new_payload).expect("serialize IndexFolderInput");
+    assert_eq!(
+        roundtrip.get("idempotency_key"),
+        Some(&Value::String("schema-key".to_string()))
+    );
+}
+
 schema_roundtrip_test!(roundtrip_what_changed, "what_changed", WhatChangedInput);
 schema_roundtrip_test!(
     roundtrip_get_file_content,

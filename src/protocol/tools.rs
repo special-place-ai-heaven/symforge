@@ -39,7 +39,7 @@ use crate::protocol::result_status::{
 const PROJECT_CONFIG_TRUST_MODE_ENV: &str = "SYMFORGE_PROJECT_CONFIG_TRUST_MODE";
 const INDEX_FOLDER_RESET_ENV: &str = "SYMFORGE_INDEX_FOLDER_RESET";
 
-fn index_folder_reset_requested() -> bool {
+pub(crate) fn index_folder_reset_requested() -> bool {
     std::env::var(INDEX_FOLDER_RESET_ENV).as_deref() == Ok("1")
 }
 
@@ -867,6 +867,9 @@ pub struct SearchFilesInput {
 pub struct IndexFolderInput {
     /// Absolute or relative path to the directory to index.
     pub path: String,
+    /// Optional key used to replay an identical `index_folder` request safely.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Input for `what_changed`.
@@ -6820,12 +6823,13 @@ impl SymForgeServer {
             }
             return result;
         }
-        let root = PathBuf::from(&params.0.path);
+        let input = params.0;
+        let root = PathBuf::from(&input.path);
         if !root.exists() {
-            return format!("Path does not exist: {}", params.0.path);
+            return format!("Path does not exist: {}", input.path);
         }
         if !root.is_dir() {
-            return format!("Path is not a directory: {}", params.0.path);
+            return format!("Path is not a directory: {}", input.path);
         }
         // Trust boundary: canonicalize and reject sensitive system paths.
         let root = match root.canonicalize() {
@@ -6838,10 +6842,32 @@ impl SymForgeServer {
                 root.display()
             );
         }
-        let reset_report = if index_folder_reset_requested() {
+        let reset_requested = index_folder_reset_requested();
+        let current_root = self.capture_repo_root();
+        let idempotency = match input.idempotency_key.as_deref() {
+            Some(raw_key) => match crate::idempotency::begin_index_folder_replay(
+                &root,
+                current_root.as_deref(),
+                &root,
+                raw_key,
+                reset_requested,
+            ) {
+                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
+                Ok(crate::idempotency::ReplayStart::Replay(response)) => return response,
+                Err(error) => return crate::idempotency::format_tool_error(&error),
+            },
+            None => None,
+        };
+        let reset_report = if reset_requested {
             match crate::live_index::persist::reset_snapshot_state(&root) {
                 Ok(report) => Some(report),
-                Err(error) => return format!("Reset failed: {error}"),
+                Err(error) => {
+                    let output = format!("Reset failed: {error}");
+                    if let Some(idempotency) = &idempotency {
+                        let _ = idempotency.fail(output.clone());
+                    }
+                    return output;
+                }
             }
         } else {
             None
@@ -6906,14 +6932,33 @@ impl SymForgeServer {
                     output.push('\n');
                     output.push_str(&format::format_runtime_status(&runtime_status));
                 }
+                if let Some(idempotency) = &idempotency
+                    && let Err(error) = idempotency.complete(output.clone())
+                {
+                    output.push_str(&format!(
+                        "\nIdempotency warning: failed to store replay result: {error}"
+                    ));
+                }
                 self.session_context.record_summary_output(
                     "index_folder",
                     (output.len() / 4).min(u32::MAX as usize) as u32,
                 );
                 output
             }
-            Ok(Err(e)) => format!("Index failed: {e}"),
-            Err(join_err) => format!("Index failed: reload task panicked: {join_err}"),
+            Ok(Err(e)) => {
+                let output = format!("Index failed: {e}");
+                if let Some(idempotency) = &idempotency {
+                    let _ = idempotency.fail(output.clone());
+                }
+                output
+            }
+            Err(join_err) => {
+                let output = format!("Index failed: reload task panicked: {join_err}");
+                if let Some(idempotency) = &idempotency {
+                    let _ = idempotency.fail(output.clone());
+                }
+                output
+            }
         }
     }
 
@@ -12083,6 +12128,7 @@ mod tests {
         let index_result = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
+                idempotency_key: None,
             }))
             .await;
 
@@ -12137,6 +12183,7 @@ mod tests {
         let index_result = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
+                idempotency_key: None,
             }))
             .await;
         assert!(
@@ -12183,6 +12230,7 @@ mod tests {
         let first = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
+                idempotency_key: None,
             }))
             .await;
         assert!(
@@ -12194,6 +12242,7 @@ mod tests {
         let second = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
+                idempotency_key: None,
             }))
             .await;
         assert!(
@@ -12252,6 +12301,7 @@ mod tests {
         let output = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
+                idempotency_key: None,
             }))
             .await;
 
@@ -12288,6 +12338,83 @@ mod tests {
                 && health.contains("index_state=index_folder_reset")
                 && health.contains("index_id=index-"),
             "health after reset should prove fresh identity/source, got: {health}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_folder_idempotency_replays_same_key_same_request_locally() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "pub fn first() {}\n")
+            .expect("write initial file");
+
+        let server = make_server(make_live_index_empty());
+        let first = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: repo.path().display().to_string(),
+                idempotency_key: Some("local-replay-key".to_string()),
+            }))
+            .await;
+        assert!(
+            first.starts_with("Indexed 1 files"),
+            "first idempotent index_folder should index once, got: {first}"
+        );
+
+        fs::write(repo.path().join("src/second.rs"), "pub fn second() {}\n")
+            .expect("write second file");
+        let replay = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: repo.path().display().to_string(),
+                idempotency_key: Some("local-replay-key".to_string()),
+            }))
+            .await;
+
+        assert_eq!(
+            replay, first,
+            "same idempotency key and same canonical request must replay stored output"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_folder_idempotency_rejects_same_key_different_request_locally() {
+        let first_repo = TempDir::new().expect("first repo");
+        let second_repo = TempDir::new().expect("second repo");
+        fs::create_dir_all(first_repo.path().join("src")).expect("create first src dir");
+        fs::create_dir_all(second_repo.path().join("src")).expect("create second src dir");
+        fs::write(first_repo.path().join("src/lib.rs"), "pub fn first() {}\n")
+            .expect("write first source");
+        fs::write(
+            second_repo.path().join("src/lib.rs"),
+            "pub fn second() {}\n",
+        )
+        .expect("write second source");
+
+        let server = make_server(make_live_index_empty());
+        let first = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: first_repo.path().display().to_string(),
+                idempotency_key: Some("local-conflict-key".to_string()),
+            }))
+            .await;
+        assert!(
+            first.starts_with("Indexed 1 files"),
+            "first idempotent index_folder should index once, got: {first}"
+        );
+
+        let conflict = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: second_repo.path().display().to_string(),
+                idempotency_key: Some("local-conflict-key".to_string()),
+            }))
+            .await;
+
+        assert!(
+            conflict.contains("Idempotency conflict"),
+            "same key with a different canonical request must fail deterministically, got: {conflict}"
+        );
+        assert!(
+            !conflict.starts_with("Indexed "),
+            "conflict must not report synthetic indexing success: {conflict}"
         );
     }
 

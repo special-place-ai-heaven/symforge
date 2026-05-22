@@ -594,11 +594,36 @@ impl DaemonState {
     ) -> anyhow::Result<String> {
         let target_root = canonical_project_root(Path::new(&input.path))?;
         let target_project_id = project_key(&target_root);
+        let current_session_root = {
+            let projects = self.projects.read();
+            let sessions = self.sessions.read();
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
+            projects
+                .get(&session.project_id)
+                .map(|project| project.canonical_root.clone())
+        };
+        let reset_requested = crate::protocol::tools::index_folder_reset_requested();
+        let idempotency = match input.idempotency_key.as_deref() {
+            Some(raw_key) => match crate::idempotency::begin_index_folder_replay(
+                &target_root,
+                current_session_root.as_deref(),
+                &target_root,
+                raw_key,
+                reset_requested,
+            ) {
+                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
+                Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
+                Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
+            },
+            None => None,
+        };
 
         // All project-map mutations happen inside this block so the write guard
         // is fully released before we touch sessions.write() below — preventing
         // the lock-order inversion with close_session (sessions → projects).
-        let (file_count, symbol_count, needs_reassign) = {
+        let reload_result = (|| -> anyhow::Result<(usize, usize, bool)> {
             let mut projects = self.projects.write();
 
             // Re-read current_project_id under projects write lock to handle
@@ -646,8 +671,18 @@ impl DaemonState {
                 .get_mut(&target_project_id)
                 .ok_or_else(|| anyhow::anyhow!("missing target project after reload"))?;
             let counts = target_project.reload(&target_root)?;
-            (counts.0, counts.1, needs_reassign)
-        }; // projects write lock released here
+            Ok((counts.0, counts.1, needs_reassign))
+        })(); // projects write lock released here
+
+        let (file_count, symbol_count, needs_reassign) = match reload_result {
+            Ok(counts) => counts,
+            Err(error) => {
+                if let Some(idempotency) = &idempotency {
+                    let _ = idempotency.fail(format!("Index failed: {error}"));
+                }
+                return Err(error);
+            }
+        };
 
         // Update the session's project association *after* the projects lock is
         // released to maintain lock order (projects before sessions everywhere).
@@ -658,10 +693,15 @@ impl DaemonState {
                 .store(now_epoch_millis(), Ordering::Relaxed);
         }
 
-        Ok(format!(
-            "Indexed {} files, {} symbols.",
-            file_count, symbol_count
-        ))
+        let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
+        if let Some(idempotency) = &idempotency
+            && let Err(error) = idempotency.complete(output.clone())
+        {
+            output.push_str(&format!(
+                "\nIdempotency warning: failed to store replay result: {error}"
+            ));
+        }
+        Ok(output)
     }
 
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
@@ -3400,6 +3440,7 @@ mod tests {
             ))
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
+                idempotency_key: None,
             })
             .send()
             .await
@@ -3453,6 +3494,119 @@ mod tests {
         assert!(
             !outline.contains("old.rs"),
             "rebound session should no longer point at old root: {outline}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+    }
+
+    #[tokio::test]
+    async fn test_index_folder_idempotency_replays_same_key_same_request_in_daemon_route() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-daemon-idempotency-a");
+        let project_b = project_dir("symforge-daemon-idempotency-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = reqwest::Client::new();
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(56),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let tool_url = format!(
+            "{base_url}/v1/sessions/{}/tools/index_folder",
+            opened.session_id
+        );
+        let first = client
+            .post(&tool_url)
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: Some("daemon-replay-key".to_string()),
+            })
+            .send()
+            .await
+            .expect("first index request")
+            .error_for_status()
+            .expect("first index status")
+            .text()
+            .await
+            .expect("first index body");
+        assert!(
+            first.starts_with("Indexed 1 files"),
+            "first daemon idempotent index_folder should index once, got: {first}"
+        );
+
+        std::fs::write(
+            project_b.path().join("src").join("second.rs"),
+            "fn second_fn() {}\n",
+        )
+        .expect("write second source b");
+
+        let replay = client
+            .post(&tool_url)
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: Some("daemon-replay-key".to_string()),
+            })
+            .send()
+            .await
+            .expect("replay index request")
+            .error_for_status()
+            .expect("replay index status")
+            .text()
+            .await
+            .expect("replay index body");
+        assert_eq!(
+            replay, first,
+            "daemon special route must replay stored output for same key and canonical request"
+        );
+
+        let conflict = client
+            .post(&tool_url)
+            .json(&IndexFolderInput {
+                path: project_a.path().display().to_string(),
+                idempotency_key: Some("daemon-replay-key".to_string()),
+            })
+            .send()
+            .await
+            .expect("conflict index request")
+            .error_for_status()
+            .expect("conflict index status")
+            .text()
+            .await
+            .expect("conflict index body");
+        assert!(
+            conflict.contains("Idempotency conflict"),
+            "daemon special route must reject same key with different request, got: {conflict}"
+        );
+        assert!(
+            !conflict.starts_with("Indexed "),
+            "daemon conflict must not report synthetic indexing success: {conflict}"
         );
 
         let _ = handle.shutdown_tx.send(());
