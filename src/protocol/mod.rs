@@ -3,6 +3,7 @@ pub(crate) mod edit;
 pub(crate) mod edit_format;
 pub mod edit_hooks;
 pub mod edit_plan;
+pub(crate) mod edit_tools;
 pub mod explore;
 pub mod format;
 pub mod investigation;
@@ -100,6 +101,10 @@ fn estimate_tokens(response_bytes: u64) -> u64 {
 }
 
 impl SymForgeServer {
+    pub(crate) fn tool_router() -> ToolRouter<Self> {
+        Self::core_tool_router() + Self::edit_tool_router()
+    }
+
     /// Create a new server with the given shared index, project name, and watcher state.
     ///
     /// `token_stats` is optional — when `Some`, the health tool will include a token savings
