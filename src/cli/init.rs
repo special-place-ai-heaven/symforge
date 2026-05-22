@@ -44,28 +44,28 @@ struct InitPaths {
 }
 
 impl InitPaths {
-    fn from_home_and_working_dir(home: &std::path::Path, working_dir: &std::path::Path) -> Self {
-        // Claude Desktop config path varies by platform:
-        // - Windows: %APPDATA%\Claude\claude_desktop_config.json
-        // - macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
-        // - Linux:   ~/.config/Claude/claude_desktop_config.json
-        let claude_desktop_config = if cfg!(windows) {
-            std::env::var("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home.join("AppData").join("Roaming"))
-                .join("Claude")
-                .join("claude_desktop_config.json")
-        } else if cfg!(target_os = "macos") {
-            home.join("Library")
-                .join("Application Support")
-                .join("Claude")
-                .join("claude_desktop_config.json")
-        } else {
-            home.join(".config")
-                .join("Claude")
-                .join("claude_desktop_config.json")
-        };
+    fn from_current_environment(home: &std::path::Path, working_dir: &std::path::Path) -> Self {
+        let windows_appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        Self::from_home_working_dir_and_desktop_config(
+            home,
+            working_dir,
+            claude_desktop_config_path(home, windows_appdata),
+        )
+    }
 
+    fn from_home_and_working_dir(home: &std::path::Path, working_dir: &std::path::Path) -> Self {
+        Self::from_home_working_dir_and_desktop_config(
+            home,
+            working_dir,
+            claude_desktop_config_path(home, None),
+        )
+    }
+
+    fn from_home_working_dir_and_desktop_config(
+        home: &std::path::Path,
+        working_dir: &std::path::Path,
+        claude_desktop_config: PathBuf,
+    ) -> Self {
         Self {
             claude_settings: home.join(".claude").join("settings.json"),
             claude_config: home.join(".claude.json"),
@@ -85,6 +85,28 @@ impl InitPaths {
     }
 }
 
+fn claude_desktop_config_path(home: &std::path::Path, windows_appdata: Option<PathBuf>) -> PathBuf {
+    // Claude Desktop config path varies by platform:
+    // - Windows: %APPDATA%\Claude\claude_desktop_config.json
+    // - macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
+    // - Linux:   ~/.config/Claude/claude_desktop_config.json
+    if cfg!(windows) {
+        windows_appdata
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    } else {
+        home.join(".config")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }
+}
+
 const CODEX_STARTUP_TIMEOUT_SEC: i64 = 30;
 const CODEX_TOOL_TIMEOUT_SEC: i64 = 120;
 const SYMFORGE_GUIDANCE_START: &str = "<!-- SYMFORGE START -->";
@@ -99,8 +121,9 @@ pub fn run_init(client: InitClient) -> anyhow::Result<()> {
     let working_dir =
         std::env::current_dir().context("cannot determine current working directory")?;
     let binary_path = discover_binary_path();
+    let paths = InitPaths::from_current_environment(&home, &working_dir);
 
-    run_init_with_context(client, &home, &working_dir, &binary_path)
+    run_init_with_paths(client, paths, &home, &working_dir, &binary_path)
 }
 
 /// Testable core for `symforge init` with injected paths.
@@ -111,6 +134,17 @@ pub fn run_init_with_context(
     binary_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let paths = InitPaths::from_home_and_working_dir(home_dir, working_dir);
+
+    run_init_with_paths(client, paths, home_dir, working_dir, binary_path)
+}
+
+fn run_init_with_paths(
+    client: InitClient,
+    paths: InitPaths,
+    home_dir: &std::path::Path,
+    working_dir: &std::path::Path,
+    binary_path: &std::path::Path,
+) -> anyhow::Result<()> {
     let registration_binary_path = binary_path_for_registration(binary_path, home_dir)?;
     let binary_path_str = registration_binary_path.display().to_string();
 
@@ -139,7 +173,11 @@ pub fn run_init_with_context(
     }
 
     if matches!(client, InitClient::ClaudeDesktop | InitClient::All) {
-        register_claude_desktop_mcp_server(&paths.claude_desktop_config, &binary_path_str)?;
+        register_claude_desktop_mcp_server_with_home(
+            &paths.claude_desktop_config,
+            &binary_path_str,
+            home_dir,
+        )?;
         eprintln!(
             "Claude Desktop MCP server registered in {}",
             paths.claude_desktop_config.display()

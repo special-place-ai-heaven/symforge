@@ -536,6 +536,24 @@ fn test_run_init_all_updates_both_clients() {
     std::fs::create_dir_all(home_binary.parent().unwrap()).unwrap();
     std::fs::write(&home_binary, b"").unwrap();
     std::fs::write(&binary_path, b"").unwrap();
+    let claude_desktop_config = if cfg!(windows) {
+        home.path()
+            .join("AppData")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    } else if cfg!(target_os = "macos") {
+        home.path()
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    } else {
+        home.path()
+            .join(".config")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    };
 
     run_init_with_context(InitClient::All, home.path(), cwd.path(), &binary_path)
         .expect("all-client init must succeed");
@@ -579,6 +597,25 @@ fn test_run_init_all_updates_both_clients() {
             .join("symforge.md")
             .exists(),
         "Kilo guidance rules must be created"
+    );
+    assert!(
+        claude_desktop_config.exists(),
+        "Claude Desktop config must be created under the injected home"
+    );
+    let claude_desktop_config_json = read_text(&claude_desktop_config);
+    let claude_desktop_config_value: serde_json::Value =
+        serde_json::from_str(&claude_desktop_config_json).unwrap();
+    let claude_desktop_command = claude_desktop_config_value["mcpServers"]["symforge"]["command"]
+        .as_str()
+        .unwrap();
+    let durable_bin_dir = home_binary.parent().unwrap().display().to_string();
+    assert!(
+        claude_desktop_command.contains(&durable_bin_dir),
+        "Claude Desktop config must use the injected durable binary directory: {claude_desktop_command}"
+    );
+    assert!(
+        !claude_desktop_command.contains(&binary_path.display().to_string()),
+        "Claude Desktop config must not persist temporary binary path: {claude_desktop_command}"
     );
 
     let codex_config = read_text(&home.path().join(".codex").join("config.toml"));

@@ -1,3 +1,34 @@
+# Init All-Client Durable Binary Failure
+
+## Plan
+
+- [x] Reproduce/trace the CI failure from the supplied panic.
+- [x] Identify where the temporary binary guard loses the injected test home.
+- [x] Patch `run_init_with_context` so all client branches use the same injected home context.
+- [x] Run the focused failing init integration test.
+- [x] Run format/check verification.
+
+## Evidence Log
+
+- Failure: `test_run_init_all_updates_both_clients` panics because the Claude Desktop branch refuses `/tmp/.../.symforge/bin/symforge` and asks for `/home/runner/.symforge/bin/symforge`.
+- Root cause: `run_init_with_context` resolves the registration binary with the injected `home_dir`, then calls `register_claude_desktop_mcp_server`, whose public wrapper re-reads `dirs::home_dir()` and re-applies the temporary-binary guard against the real CI home.
+- Added regression assertions that all-client init writes Claude Desktop config under the injected home, points it at the injected durable binary directory, and does not persist the temporary extraction binary. Before the fix, the focused test failed on Windows because the config was written to `%APPDATA%\Claude\claude_desktop_config.json`.
+- Fix: split production path construction (`InitPaths::from_current_environment`) from injected path construction (`InitPaths::from_home_and_working_dir`), and route `run_init_with_context` through `register_claude_desktop_mcp_server_with_home`.
+- Focused verification passed after the fix: `cargo test --test init_integration test_run_init_all_updates_both_clients -- --nocapture`.
+- Inspected the real Claude Desktop config after the earlier test pollution. Current `symforge` points at the durable `C:\Users\rakovnik\.symforge\bin\symforge-desktop.cmd`; the available May 19 backup already had a temporary SymForge wrapper entry, so deleting or reverting the entry would be destructive and less correct.
+- `cargo fmt --check` initially failed on one rustfmt wrapping change; `cargo fmt` applied it and the latest rerun passed.
+- `git diff --check` passed with CRLF conversion warnings only.
+- `cargo check` passed.
+- `cargo test --test init_integration test_run_init_all_updates_both_clients -- --nocapture` passed with the JSON-parsed Claude Desktop command assertions.
+- `cargo test --test init_integration -- --nocapture` passed: 24 passed, 0 failed.
+- `cargo test --all-targets init -- --test-threads=1` first hit local disk exhaustion while writing `target/debug` artifacts. After removing the generated repo-local `target/debug/incremental` cache, the latest rerun passed: 95 selected tests passed across all targets, 0 failed.
+
+## Review
+
+- The CI failure was a real implementation bug, not a flaky test: all-client init lost the injected home only when it reached Claude Desktop registration. The fix preserves production `%APPDATA%` behavior while making the injected test path deterministic and isolated.
+
+---
+
 # SFB10 - Apply result-status semantics to read, search, and reference tools
 
 ## Plan
