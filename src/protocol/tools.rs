@@ -250,8 +250,16 @@ fn statused_edit_tool_result(
     Ok(result.with_meta(Some(rmcp::model::Meta(meta))))
 }
 
+fn is_index_unavailable_output(text: &str) -> bool {
+    text.starts_with("Index not loaded.")
+        || text.starts_with("Index is loading")
+        || text.starts_with("Index degraded:")
+}
+
 fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
-    if text.contains("Ambiguous:") || text.starts_with("Ambiguous:") {
+    if is_index_unavailable_output(text) {
+        EditResultStatus::InternalFailure
+    } else if text.contains("Ambiguous:") || text.starts_with("Ambiguous:") {
         EditResultStatus::Ambiguous
     } else if text.starts_with("File not found:")
         || text.starts_with("Symbol not found:")
@@ -260,7 +268,6 @@ fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
     {
         EditResultStatus::NotFound
     } else if text.contains("no repository root configured")
-        || text.starts_with("Index not loaded.")
         || text.contains("still loading")
         || text.contains("unavailable")
         || text.starts_with("Error writing ")
@@ -317,7 +324,9 @@ fn failed_batch_operation_statuses(
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Error:") {
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Error:") {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous:") {
         OutcomeClass::Ambiguous
@@ -329,7 +338,9 @@ fn classify_get_symbol_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Error:") {
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Error:") {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
         OutcomeClass::Ambiguous
@@ -341,7 +352,9 @@ fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_get_file_content_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Invalid get_file_content request:")
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
         || text.contains("[error:")
     {
@@ -361,7 +374,9 @@ fn classify_get_file_content_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_search_symbols_output(text: &str) -> OutcomeClass {
-    if text.starts_with("search_symbols requires") {
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("search_symbols requires") {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("No symbols matching") {
         OutcomeClass::EmptyResult
@@ -371,7 +386,9 @@ fn classify_search_symbols_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_search_text_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Error:")
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Error:")
         || text.starts_with("Regex search requires")
         || text.starts_with("Search requires")
         || text.starts_with("Invalid regex")
@@ -387,7 +404,9 @@ fn classify_search_text_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_search_files_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Path search requires")
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Path search requires")
         || text.starts_with("Path hint must not be empty")
         || text.starts_with("search_files")
     {
@@ -408,7 +427,9 @@ fn classify_search_files_output(text: &str) -> OutcomeClass {
 }
 
 fn classify_find_references_output(text: &str) -> OutcomeClass {
-    if text.starts_with("Ambiguous symbol selector") {
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Ambiguous symbol selector") {
         OutcomeClass::Ambiguous
     } else if text.starts_with("File not found:")
         || text.starts_with("Symbol not found")

@@ -61,9 +61,16 @@ const EXPECTED_TOOLS: &[&str] = &[
 
 const PUBLIC_CONFORMANCE_CORPUS_VERSION: u8 = 1;
 
+#[derive(Clone, Copy)]
+enum ConformanceFixtureKind {
+    Ready,
+    EmptyIndex,
+}
+
 struct PublicContractCase {
     name: &'static str,
     tool_name: &'static str,
+    fixture_kind: ConformanceFixtureKind,
     request_json: fn(&ConformanceFixture) -> Value,
     expected_outcome: OutcomeClass,
     expected_edit_status: Option<&'static str>,
@@ -74,8 +81,20 @@ struct PublicContractCase {
 
 const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
     PublicContractCase {
+        name: "read_get_symbol_found_v1",
+        tool_name: "get_symbol",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_get_symbol_found,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: None,
+        expected_text_contains: &["pub fn alpha"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
         name: "read_get_file_content_found_v1",
         tool_name: "get_file_content",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_get_file_content_found,
         expected_outcome: OutcomeClass::Found,
         expected_edit_status: None,
@@ -84,8 +103,20 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: None,
     },
     PublicContractCase {
+        name: "search_symbols_found_v1",
+        tool_name: "search_symbols",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_search_symbols_found,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: None,
+        expected_text_contains: &["Match type:", "src/lib.rs", "alpha"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
         name: "search_text_found_v1",
         tool_name: "search_text",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_search_text_found,
         expected_outcome: OutcomeClass::Found,
         expected_edit_status: None,
@@ -94,8 +125,53 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: None,
     },
     PublicContractCase {
+        name: "search_files_found_v1",
+        tool_name: "search_files",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_search_files_found,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: None,
+        expected_text_contains: &["src/lib.rs"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
+        name: "read_find_references_found_v1",
+        tool_name: "find_references",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_find_references_found,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: None,
+        expected_text_contains: &["src/lib.rs", "beta"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
+        name: "read_get_file_content_not_found_v1",
+        tool_name: "get_file_content",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_get_file_content_not_found,
+        expected_outcome: OutcomeClass::NotFound,
+        expected_edit_status: None,
+        expected_text_contains: &["File not found:", "src/missing.rs"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
+        name: "search_text_empty_result_v1",
+        tool_name: "search_text",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_search_text_empty_result,
+        expected_outcome: OutcomeClass::EmptyResult,
+        expected_edit_status: None,
+        expected_text_contains: &["No matches"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
         name: "read_get_symbol_context_ambiguous_v1",
         tool_name: "get_symbol_context",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_get_symbol_context_ambiguous,
         expected_outcome: OutcomeClass::Ambiguous,
         expected_edit_status: None,
@@ -106,6 +182,7 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
     PublicContractCase {
         name: "edit_replace_symbol_body_dry_run_v1",
         tool_name: "replace_symbol_body",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_replace_symbol_body_dry_run,
         expected_outcome: OutcomeClass::Found,
         expected_edit_status: Some("dry_run_success"),
@@ -117,8 +194,31 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: Some("src/lib.rs"),
     },
     PublicContractCase {
+        name: "edit_batch_edit_dry_run_v1",
+        tool_name: "batch_edit",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_batch_edit_dry_run,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: Some("dry_run_success"),
+        expected_text_contains: &["Write semantics: dry run (no writes)", "[DRY RUN]"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: Some("src/lib.rs"),
+    },
+    PublicContractCase {
+        name: "edit_batch_insert_dry_run_v1",
+        tool_name: "batch_insert",
+        fixture_kind: ConformanceFixtureKind::Ready,
+        request_json: request_batch_insert_dry_run,
+        expected_outcome: OutcomeClass::Found,
+        expected_edit_status: Some("dry_run_success"),
+        expected_text_contains: &["Write semantics: dry run (no writes)", "[DRY RUN]"],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: Some("src/lib.rs"),
+    },
+    PublicContractCase {
         name: "invalid_get_file_content_mode_hint_v1",
         tool_name: "get_file_content",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_get_file_content_invalid_mode,
         expected_outcome: OutcomeClass::InvalidRequest,
         expected_edit_status: None,
@@ -127,8 +227,20 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: None,
     },
     PublicContractCase {
+        name: "search_text_empty_index_internal_failure_v1",
+        tool_name: "search_text",
+        fixture_kind: ConformanceFixtureKind::EmptyIndex,
+        request_json: request_search_text_found,
+        expected_outcome: OutcomeClass::InternalFailure,
+        expected_edit_status: None,
+        expected_text_contains: &["Index not loaded."],
+        expected_recovery_hint: None,
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
         name: "unsupported_tool_name_hint_v1",
         tool_name: "definitely_not_a_symforge_tool",
+        fixture_kind: ConformanceFixtureKind::Ready,
         request_json: request_empty_object,
         expected_outcome: OutcomeClass::InvalidRequest,
         expected_edit_status: None,
@@ -592,11 +704,54 @@ fn public_contract_conformance_corpus_is_versioned_and_named() {
     }
 }
 
+#[test]
+fn public_contract_conformance_corpus_covers_all_result_outcomes() {
+    let observed: BTreeSet<&'static str> = PUBLIC_CONTRACT_CONFORMANCE_CORPUS
+        .iter()
+        .map(|case| case.expected_outcome.as_str())
+        .collect();
+    let expected: BTreeSet<&'static str> = OutcomeClass::ALL
+        .iter()
+        .map(|outcome| outcome.as_str())
+        .collect();
+
+    assert_eq!(
+        observed, expected,
+        "public conformance corpus must replay every stable result_status outcome"
+    );
+}
+
+#[test]
+fn public_contract_conformance_corpus_covers_prioritized_status_tools() {
+    let observed: BTreeSet<&'static str> = PUBLIC_CONTRACT_CONFORMANCE_CORPUS
+        .iter()
+        .map(|case| case.tool_name)
+        .collect();
+    let prioritized = [
+        "get_symbol",
+        "get_file_content",
+        "get_symbol_context",
+        "search_symbols",
+        "search_text",
+        "search_files",
+        "find_references",
+        "replace_symbol_body",
+        "batch_edit",
+        "batch_insert",
+    ];
+
+    for tool_name in prioritized {
+        assert!(
+            observed.contains(tool_name),
+            "public conformance corpus must include statused `{tool_name}` coverage"
+        );
+    }
+}
+
 #[tokio::test]
 async fn public_contract_conformance_corpus_replays() {
-    let fixture = ConformanceFixture::new();
-
     for case in PUBLIC_CONTRACT_CONFORMANCE_CORPUS {
+        let fixture = ConformanceFixture::for_kind(case.fixture_kind);
         let request = (case.request_json)(&fixture);
         assert!(
             request.is_object(),
@@ -692,6 +847,13 @@ struct ConformanceFixture {
 }
 
 impl ConformanceFixture {
+    fn for_kind(kind: ConformanceFixtureKind) -> Self {
+        match kind {
+            ConformanceFixtureKind::Ready => Self::new(),
+            ConformanceFixtureKind::EmptyIndex => Self::empty_index(),
+        }
+    }
+
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -717,6 +879,25 @@ impl ConformanceFixture {
         }
     }
 
+    fn empty_index() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let shared = LiveIndex::empty();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        let server = SymForgeServer::new(
+            shared,
+            "public_contract_empty_index_conformance_test".to_string(),
+            watcher_info,
+            Some(root.clone()),
+            None,
+        );
+        Self {
+            _dir: dir,
+            root,
+            server,
+        }
+    }
+
     fn read(&self, relative_path: &str) -> String {
         fs::read_to_string(self.root.join(relative_path)).expect("read fixture file")
     }
@@ -730,6 +911,13 @@ fn write_fixture_file(root: &std::path::Path, relative_path: &str, content: &str
     fs::write(path, content).expect("write fixture file");
 }
 
+fn request_get_symbol_found(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "path": "src/lib.rs",
+        "name": "alpha"
+    })
+}
+
 fn request_get_file_content_found(_fixture: &ConformanceFixture) -> Value {
     json!({
         "path": "src/lib.rs",
@@ -740,11 +928,48 @@ fn request_get_file_content_found(_fixture: &ConformanceFixture) -> Value {
     })
 }
 
+fn request_search_symbols_found(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "query": "alpha",
+        "path_prefix": "src/",
+        "include_tests": true
+    })
+}
+
 fn request_search_text_found(_fixture: &ConformanceFixture) -> Value {
     json!({
         "query": "alpha",
         "path_prefix": "src/",
         "include_tests": true
+    })
+}
+
+fn request_search_files_found(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "query": "lib",
+        "limit": 5
+    })
+}
+
+fn request_find_references_found(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "name": "alpha",
+        "path": "src/lib.rs",
+        "symbol_kind": "fn",
+        "compact": true
+    })
+}
+
+fn request_get_file_content_not_found(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "path": "src/missing.rs"
+    })
+}
+
+fn request_search_text_empty_result(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "query": "definitely_missing_result_status_needle",
+        "path_prefix": "src/"
     })
 }
 
@@ -760,6 +985,36 @@ fn request_replace_symbol_body_dry_run(_fixture: &ConformanceFixture) -> Value {
         "path": "src/lib.rs",
         "name": "alpha",
         "new_body": "pub fn alpha() -> i32 {\n    42\n}",
+        "dry_run": true
+    })
+}
+
+fn request_batch_edit_dry_run(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "dry_run": true,
+        "edits": [
+            {
+                "path": "src/lib.rs",
+                "name": "beta",
+                "operation": {
+                    "type": "replace",
+                    "new_body": "pub fn beta() -> i32 {\n    99\n}"
+                }
+            }
+        ]
+    })
+}
+
+fn request_batch_insert_dry_run(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "content": "pub fn gamma() -> i32 {\n    3\n}\n",
+        "position": "after",
+        "targets": [
+            {
+                "path": "src/lib.rs",
+                "name": "beta"
+            }
+        ],
         "dry_run": true
     })
 }
