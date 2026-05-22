@@ -93,6 +93,16 @@ const PUBLIC_CONTRACT_CONFORMANCE_CORPUS: &[PublicContractCase] = &[
         dry_run_preserves_file: None,
     },
     PublicContractCase {
+        name: "read_get_symbol_context_ambiguous_v1",
+        tool_name: "get_symbol_context",
+        request_json: request_get_symbol_context_ambiguous,
+        expected_outcome: OutcomeClass::Ambiguous,
+        expected_edit_status: None,
+        expected_text_contains: &["Ambiguous symbol selector", "src/lib.rs", "src/other.rs"],
+        expected_recovery_hint: Some("Pass `path` or `file`"),
+        dry_run_preserves_file: None,
+    },
+    PublicContractCase {
         name: "edit_replace_symbol_body_dry_run_v1",
         tool_name: "replace_symbol_body",
         request_json: request_replace_symbol_body_dry_run,
@@ -553,6 +563,40 @@ async fn public_contract_conformance_corpus_replays() {
     }
 }
 
+#[tokio::test]
+async fn get_symbol_context_ambiguous_result_status_conformance() {
+    let fixture = ConformanceFixture::new();
+    let case = PUBLIC_CONTRACT_CONFORMANCE_CORPUS
+        .iter()
+        .find(|case| case.name == "read_get_symbol_context_ambiguous_v1")
+        .expect("ambiguous get_symbol_context conformance case");
+    let request = (case.request_json)(&fixture);
+    let result = fixture
+        .server
+        .dispatch_tool_result_for_tests(case.tool_name, request)
+        .await
+        .unwrap_or_else(|error| panic!("case `{}` returned transport error: {error:?}", case.name));
+    let serialized = serde_json::to_value(&result)
+        .unwrap_or_else(|error| panic!("case `{}` result must serialize: {error}", case.name));
+    let text = result_text(&serialized);
+
+    assert_result_status(case, &serialized);
+    for needle in case.expected_text_contains {
+        assert!(
+            text.contains(needle),
+            "case `{}` expected response text to contain `{needle}`; text was:\n{text}",
+            case.name
+        );
+    }
+    if let Some(hint) = case.expected_recovery_hint {
+        assert!(
+            text.contains(hint),
+            "case `{}` expected recovery hint `{hint}`; text was:\n{text}",
+            case.name
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -572,6 +616,7 @@ impl ConformanceFixture {
             "src/lib.rs",
             "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    alpha() + 1\n}\n",
         );
+        write_fixture_file(&root, "src/other.rs", "pub fn alpha() -> i32 {\n    2\n}\n");
         let shared = LiveIndex::load(&root).expect("LiveIndex::load conformance fixture");
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let server = SymForgeServer::new(
@@ -616,6 +661,13 @@ fn request_search_text_found(_fixture: &ConformanceFixture) -> Value {
         "query": "alpha",
         "path_prefix": "src/",
         "include_tests": true
+    })
+}
+
+fn request_get_symbol_context_ambiguous(_fixture: &ConformanceFixture) -> Value {
+    json!({
+        "name": "alpha",
+        "symbol_kind": "fn"
     })
 }
 

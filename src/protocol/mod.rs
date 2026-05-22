@@ -558,6 +558,9 @@ impl SymForgeServer {
                 call_statused!(get_file_content_tool, tools::GetFileContentInput)
             }
             "get_symbol" => call_statused!(get_symbol_tool, tools::GetSymbolInput),
+            "get_symbol_context" => {
+                call_statused!(get_symbol_context_tool, tools::GetSymbolContextInput)
+            }
             "find_references" => call_statused!(find_references_tool, tools::FindReferencesInput),
             other => {
                 let text = format!(

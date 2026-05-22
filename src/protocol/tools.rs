@@ -328,6 +328,18 @@ fn classify_get_symbol_output(text: &str) -> OutcomeClass {
     }
 }
 
+fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Error:") {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
+        OutcomeClass::Ambiguous
+    } else if text.starts_with("Symbol \"") || text.starts_with("Symbol '") {
+        OutcomeClass::NotFound
+    } else {
+        OutcomeClass::Found
+    }
+}
+
 fn classify_get_file_content_output(text: &str) -> OutcomeClass {
     if text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
@@ -4361,6 +4373,18 @@ fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &st
     candidates
 }
 
+fn format_ambiguous_symbol_context(name: &str, candidates: &[String]) -> String {
+    let mut output = format!(
+        "Ambiguous symbol selector: {} symbols named \"{}\" found.\nPass `path` or `file` to disambiguate.\nCandidate paths:",
+        candidates.len(),
+        name
+    );
+    for path in candidates {
+        output.push_str(&format!("\n- {path}"));
+    }
+    output
+}
+
 fn render_symbol_context_header(
     file: &IndexedFile,
     name: &str,
@@ -4959,9 +4983,26 @@ impl SymForgeServer {
     /// 'implementations', 'git' (empty array = all). Set verbosity='signature' for ~80% smaller output.
     /// NOT for just the symbol body (use get_symbol).
     #[tool(
+        name = "get_symbol_context",
         description = "Symbol usage analysis with three modes. (1) Default: definition + callers grouped by file + callees + type usages. (2) bundle=true: symbol body + full definitions of all referenced custom types, resolved recursively — best for edit preparation (requires path). (3) sections=[...]: comprehensive trace analysis — definition, callers, callees, implementations, type dependencies, git activity. Valid sections: 'dependents', 'siblings', 'implementations', 'git' (empty array = all). Set verbosity='signature' for ~80% smaller output. NOT for just the symbol body (use get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
+    pub(crate) async fn get_symbol_context_tool(
+        &self,
+        params: Parameters<GetSymbolContextInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let output = self.get_symbol_context(params).await;
+        let outcome_class = classify_get_symbol_context_output(&output);
+        self.record_tool_completion(
+            "get_symbol_context",
+            &output,
+            started.elapsed(),
+            outcome_class,
+        );
+        statused_tool_result(output, outcome_class)
+    }
+
     pub(crate) async fn get_symbol_context(
         &self,
         params: Parameters<GetSymbolContextInput>,
@@ -5128,22 +5169,18 @@ impl SymForgeServer {
         let file_path_hint = params.0.path.as_deref().or(params.0.file.as_deref());
         // Auto-resolve path from index when not provided
         let resolved_path: Option<String>;
-        let auto_resolved_candidate_count: usize;
         let file_path_hint = if file_path_hint.is_some() {
             resolved_path = None;
-            auto_resolved_candidate_count = 0;
             file_path_hint
         } else {
             let guard = self.index.read();
             let candidates = symbol_candidate_paths(&guard, &params.0.name);
             drop(guard);
-            auto_resolved_candidate_count = candidates.len();
             if candidates.len() == 1 {
                 resolved_path = Some(candidates.into_iter().next().unwrap());
                 resolved_path.as_deref()
             } else if candidates.len() > 1 {
-                resolved_path = Some(candidates[0].clone());
-                resolved_path.as_deref()
+                return format_ambiguous_symbol_context(&params.0.name, &candidates);
             } else {
                 resolved_path = None;
                 None
@@ -5217,17 +5254,6 @@ impl SymForgeServer {
                     "find_references (usages)",
                     "edit_within_symbol / replace_symbol_body (edits)",
                 ]));
-                // Add disambiguation note when path was auto-resolved from multiple candidates
-                if params.0.path.is_none()
-                    && params.0.file.is_none()
-                    && auto_resolved_candidate_count > 1
-                    && let Some(ref resolved) = resolved_path
-                {
-                    output.push_str(&format!(
-                        "\n\nNote: {} symbols named \"{}\" found — showing from {}. Specify path for precision.",
-                        auto_resolved_candidate_count, params.0.name, resolved
-                    ));
-                }
                 let saved = raw_chars.saturating_sub(output.len());
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
                 self.record_read_savings((saved / 4) as u64);
@@ -11672,6 +11698,160 @@ mod tests {
         );
         assert!(result.contains("1"), "got: {result}");
         assert!(result.contains("2"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_context_without_path_returns_ambiguous_candidate_list() {
+        let alpha = make_file(
+            "src/alpha.rs",
+            b"fn connect() { alpha(); }\n",
+            vec![make_symbol_with_bytes(
+                "connect",
+                SymbolKind::Function,
+                1,
+                1,
+                (0, 25),
+            )],
+        );
+        let beta = make_file(
+            "src/beta.rs",
+            b"fn connect() { beta(); }\n",
+            vec![make_symbol_with_bytes(
+                "connect",
+                SymbolKind::Function,
+                1,
+                1,
+                (0, 24),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![alpha, beta]));
+
+        let result = server
+            .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                name: "connect".to_string(),
+                file: None,
+                path: None,
+                symbol_kind: Some("fn".to_string()),
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.starts_with("Ambiguous symbol selector"),
+            "ambiguous selector must fail explicitly; got: {result}"
+        );
+        assert!(result.contains("src/alpha.rs"), "got: {result}");
+        assert!(result.contains("src/beta.rs"), "got: {result}");
+        assert!(
+            result.contains("Pass `path` or `file`"),
+            "ambiguous response should include recovery guidance; got: {result}"
+        );
+        assert!(
+            !result.contains("alpha()") && !result.contains("beta()"),
+            "ambiguous selector must not show an arbitrary first definition: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_context_with_path_succeeds_when_symbol_name_is_duplicated() {
+        let alpha = make_file(
+            "src/alpha.rs",
+            b"fn connect() { alpha(); }\n",
+            vec![make_symbol_with_bytes(
+                "connect",
+                SymbolKind::Function,
+                1,
+                1,
+                (0, 25),
+            )],
+        );
+        let beta = make_file(
+            "src/beta.rs",
+            b"fn connect() { beta(); }\n",
+            vec![make_symbol_with_bytes(
+                "connect",
+                SymbolKind::Function,
+                1,
+                1,
+                (0, 24),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![alpha, beta]));
+
+        let result = server
+            .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                name: "connect".to_string(),
+                file: None,
+                path: Some("src/beta.rs".to_string()),
+                symbol_kind: Some("fn".to_string()),
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            !result.starts_with("Ambiguous symbol selector"),
+            "explicit path should disambiguate duplicate symbol names: {result}"
+        );
+        assert!(result.contains("src/beta.rs"), "got: {result}");
+        assert!(result.contains("beta()"), "got: {result}");
+        assert!(!result.contains("alpha()"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_context_without_path_ambiguity_does_not_bump_frecency() {
+        let repo = TempDir::new().expect("temp repo");
+        let _frecency = EnvVarGuard::set(crate::live_index::frecency::FRECENCY_FLAG_ENV, "1");
+        let alpha = make_file(
+            "src/alpha.rs",
+            b"fn connect() { alpha(); }\n",
+            vec![make_symbol("connect", SymbolKind::Function, 1, 1)],
+        );
+        let beta = make_file(
+            "src/beta.rs",
+            b"fn connect() { beta(); }\n",
+            vec![make_symbol("connect", SymbolKind::Function, 1, 1)],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![alpha, beta]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let result = server
+            .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                name: "connect".to_string(),
+                file: None,
+                path: None,
+                symbol_kind: Some("fn".to_string()),
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.starts_with("Ambiguous symbol selector"),
+            "got: {result}"
+        );
+        assert!(
+            !repo
+                .path()
+                .join(crate::paths::SYMFORGE_FRECENCY_DB_PATH)
+                .exists(),
+            "ambiguous selector must not bump frecency for an arbitrary first candidate"
+        );
     }
 
     #[test]
