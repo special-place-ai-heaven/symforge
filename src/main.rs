@@ -72,6 +72,52 @@ fn startup_plan(
     }
 }
 
+fn checkpoint_interval_from_value(value: Option<&str>) -> Option<std::time::Duration> {
+    persist::checkpoint_interval_from_value(value)
+}
+
+fn checkpoint_interval_from_env() -> Option<std::time::Duration> {
+    checkpoint_interval_from_value(
+        std::env::var(persist::CHECKPOINT_INTERVAL_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn spawn_periodic_checkpoint(
+    index: live_index::SharedIndex,
+    root: std::path::PathBuf,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let checkpoint_index = Arc::clone(&index);
+            let checkpoint_root = root.clone();
+            match tokio::task::spawn_blocking(move || {
+                persist::checkpoint_shared_index(&checkpoint_index, &checkpoint_root)
+            })
+            .await
+            {
+                Ok(Ok(report)) => tracing::info!(
+                    bytes = report.bytes,
+                    files = report.files,
+                    path = %report.path.display(),
+                    "periodic checkpoint wrote .symforge/index.bin"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    interval_secs = interval.as_secs(),
+                    "periodic checkpoint failed: {error}"
+                ),
+                Err(join_error) => tracing::warn!(
+                    interval_secs = interval.as_secs(),
+                    "periodic checkpoint task panicked: {join_error}"
+                ),
+            }
+        }
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
@@ -295,6 +341,17 @@ async fn run_local_mcp_server_async(
         );
     }
 
+    let periodic_checkpoint = watcher_root.as_ref().and_then(|root| {
+        checkpoint_interval_from_env().map(|interval| {
+            tracing::info!(
+                interval_secs = interval.as_secs(),
+                env = persist::CHECKPOINT_INTERVAL_ENV,
+                "periodic checkpointing enabled"
+            );
+            spawn_periodic_checkpoint(Arc::clone(&index), root.clone(), interval)
+        })
+    });
+
     // Spawn HTTP sidecar after watcher, before MCP serve.
     // The sidecar shares the same Arc<LiveIndex> so mutations are immediately visible.
     let bind_host =
@@ -329,6 +386,10 @@ async fn run_local_mcp_server_async(
 
     tracing::info!("MCP server shut down cleanly");
 
+    if let Some(handle) = periodic_checkpoint {
+        handle.abort();
+    }
+
     // Serialize index to disk on clean shutdown.
     // Only serialize when auto-index is enabled (i.e., we have a real project root).
     if let Some(ref root) = watcher_root {
@@ -348,7 +409,8 @@ async fn run_local_mcp_server_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupIndexLogView, StartupPlan, local_empty_reason, startup_index_log_view, startup_plan,
+        StartupIndexLogView, StartupPlan, checkpoint_interval_from_value, local_empty_reason,
+        startup_index_log_view, startup_plan,
     };
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
@@ -447,6 +509,25 @@ mod tests {
             StartupPlan::LocalEmpty {
                 reason: local_empty_reason(true).to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_interval_is_opt_in_and_bounded() {
+        assert_eq!(checkpoint_interval_from_value(None), None);
+        assert_eq!(checkpoint_interval_from_value(Some("0")), None);
+        assert_eq!(checkpoint_interval_from_value(Some("false")), None);
+        assert_eq!(
+            checkpoint_interval_from_value(Some("15")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            checkpoint_interval_from_value(Some("120")),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            checkpoint_interval_from_value(Some("999999")),
+            Some(Duration::from_secs(3600))
         );
     }
 }

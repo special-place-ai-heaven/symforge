@@ -872,6 +872,14 @@ pub struct IndexFolderInput {
     pub idempotency_key: Option<String>,
 }
 
+/// Input for `checkpoint_now`.
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
+pub struct CheckpointNowInput {
+    /// When true, deserialize the snapshot after writing and fail the command if it cannot be read back.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub verify_after_write: Option<bool>,
+}
+
 /// Input for `what_changed`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct WhatChangedInput {
@@ -6852,6 +6860,53 @@ impl SymForgeServer {
             (result.len() / 4).min(u32::MAX as usize) as u32,
         );
         result
+    }
+
+    /// Serialize the current in-memory index to `.symforge/index.bin` immediately.
+    #[tool(
+        name = "checkpoint_now",
+        description = "Serialize the current in-memory index to `.symforge/index.bin` immediately. Uses the same atomic snapshot path as shutdown persistence and reports failures explicitly.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn checkpoint_now(&self, params: Parameters<CheckpointNowInput>) -> String {
+        if self.daemon_client.is_some() {
+            return "Checkpoint failed: checkpoint_now is unavailable in daemon-proxy mode; restart with SYMFORGE_NO_DAEMON=1 for local in-process checkpointing.".to_string();
+        }
+        let repo_root = match self.capture_repo_root() {
+            Some(root) => root,
+            None => return "Checkpoint failed: no repository root configured.".to_string(),
+        };
+        let index = Arc::clone(&self.index);
+        let checkpoint_root = repo_root.clone();
+        let verify_after_write = params.0.verify_after_write.unwrap_or(false);
+        match tokio::task::spawn_blocking(move || {
+            let report =
+                crate::live_index::persist::checkpoint_shared_index(&index, &checkpoint_root)?;
+            if verify_after_write
+                && crate::live_index::persist::load_snapshot(&checkpoint_root).is_none()
+            {
+                anyhow::bail!(
+                    "checkpoint verification failed: snapshot did not deserialize after write"
+                );
+            }
+            anyhow::Ok(report)
+        })
+        .await
+        {
+            Ok(Ok(report)) => format!(
+                "Checkpoint complete: wrote {} bytes for {} file(s) to {}",
+                report.bytes,
+                report.files,
+                report.path.display()
+            ),
+            Ok(Err(error)) => format!("Checkpoint failed: {error}"),
+            Err(join_error) => format!("Checkpoint failed: checkpoint task panicked: {join_error}"),
+        }
     }
 
     /// Reindex a directory from scratch — replaces the current index, restarts watcher, triggers
@@ -14948,6 +15003,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_checkpoint_now_writes_snapshot_and_reports_success() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
+        fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+
+        let result = server
+            .checkpoint_now(Parameters(super::CheckpointNowInput {
+                verify_after_write: Some(true),
+            }))
+            .await;
+
+        assert!(
+            result.contains("Checkpoint complete"),
+            "checkpoint should report success: {result}"
+        );
+        assert!(
+            temp.path().join(".symforge").join("index.bin").exists(),
+            "checkpoint_now should create .symforge/index.bin"
+        );
+        assert!(
+            crate::live_index::persist::load_snapshot(temp.path()).is_some(),
+            "checkpoint_now should write a readable snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_now_reports_failure_without_success_text() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
+        fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+        fs::write(temp.path().join(".symforge"), b"not a directory")
+            .expect("block .symforge directory creation");
+
+        let result = server
+            .checkpoint_now(Parameters(super::CheckpointNowInput::default()))
+            .await;
+
+        assert!(
+            result.contains("Checkpoint failed"),
+            "checkpoint write failure should be explicit: {result}"
+        );
+        assert!(
+            !result.contains("Checkpoint complete"),
+            "failure output must not contain success text: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_health_surfaces_alive_sidecar_pid_and_state() {
         let temp = TempDir::new().expect("tempdir should be created");
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -18973,7 +19086,7 @@ mod tests {
     // ── INFR-05: No v1 tools in server ──────────────────────────────────────
 
     #[test]
-    fn test_no_v1_tools_in_server() {
+    fn test_retired_v1_tools_stay_out_of_server() {
         // Build the tool list by inspecting what tool_router() generates
         let server = make_server(make_live_index_ready(vec![]));
         let router = server.tool_router.clone();
@@ -18983,16 +19096,20 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        let v1_tools = [
+        assert!(
+            tool_names.iter().any(|name| name == "checkpoint_now"),
+            "checkpoint_now is a current v7 checkpoint tool and must remain registered; found: {tool_names:?}"
+        );
+
+        let retired_v1_tools = [
             "cancel_index_run",
-            "checkpoint_now",
             "resume_index_run",
             "get_provenance",
             "get_trust",
             "verify_chunk",
         ];
 
-        for v1_tool in &v1_tools {
+        for v1_tool in &retired_v1_tools {
             assert!(
                 !tool_names.iter().any(|n| n == v1_tool),
                 "v1 tool '{v1_tool}' must not appear in server tool list (INFR-05); found: {tool_names:?}"

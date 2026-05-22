@@ -237,6 +237,7 @@ by how an agent should use them.
 | Tool | Use |
 |---|---|
 | `index_folder` | Reindex a repository from scratch |
+| `checkpoint_now` | Atomically write the current in-memory index to `.symforge/index.bin` |
 
 The deprecated daemon compatibility name `trace_symbol` is not granted by
 generated client allow-lists. Use `get_symbol_context` or `find_references`.
@@ -355,6 +356,7 @@ Common configuration variables:
 | `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` | Explicit truthy opt-in required before the daemon binds a non-loopback host |
 | `SYMFORGE_DAEMON_AUTH_TOKEN` | Optional local bearer token for daemon project, session, tool, and sidecar routes |
 | `SYMFORGE_RECONCILE_INTERVAL` | Watcher reconciliation interval in seconds; `0` disables periodic sweeps |
+| `SYMFORGE_CHECKPOINT_INTERVAL_SECS` | Optional periodic snapshot interval for local in-process mode; unset/`0`/false disables it, nonzero values are bounded to 30-3600 seconds |
 | `SYMFORGE_CB_THRESHOLD` | Parse-failure circuit-breaker threshold |
 | `SYMFORGE_FRECENCY` | Frecency policy: session-only by default, persistent when truthy, disabled when false/off/disabled |
 | `SYMFORGE_COUPLING` | Co-change policy: lazy by default, warm on startup when truthy, disabled when false/off/disabled |

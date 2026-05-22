@@ -25,6 +25,10 @@ const CURRENT_VERSION: u32 = 4;
 const INDEX_FILENAME: &str = "index.bin";
 const INDEX_TMP_FILENAME: &str = "index.bin.tmp";
 pub const SNAPSHOT_RESET_SCOPE_LABEL: &str = ".symforge/index.bin,.symforge/index.bin.tmp";
+pub const CHECKPOINT_INTERVAL_ENV: &str = "SYMFORGE_CHECKPOINT_INTERVAL_SECS";
+pub const MIN_CHECKPOINT_INTERVAL_SECS: u64 = 30;
+pub const MAX_CHECKPOINT_INTERVAL_SECS: u64 = 3600;
+static SNAPSHOT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ── Snapshot types ────────────────────────────────────────────────────────────
 
@@ -75,6 +79,13 @@ pub struct SnapshotResetReport {
     missing: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotWriteReport {
+    pub path: PathBuf,
+    pub bytes: usize,
+    pub files: usize,
+}
+
 impl SnapshotResetReport {
     pub fn removed_count(&self) -> usize {
         self.removed.len()
@@ -95,7 +106,7 @@ impl SnapshotResetReport {
 /// Returns `Ok(())` on success. Non-fatal — caller logs and continues.
 pub fn serialize_index(index: &LiveIndex, project_root: &Path) -> anyhow::Result<()> {
     let snapshot_input = capture_snapshot_build_input(index);
-    serialize_captured_snapshot(snapshot_input, project_root)
+    serialize_captured_snapshot(snapshot_input, project_root).map(|_| ())
 }
 
 fn capture_snapshot_build_input(index: &LiveIndex) -> SnapshotBuildInput {
@@ -107,7 +118,7 @@ fn capture_snapshot_build_input(index: &LiveIndex) -> SnapshotBuildInput {
 fn serialize_captured_snapshot(
     snapshot_input: SnapshotBuildInput,
     project_root: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SnapshotWriteReport> {
     let snapshot = build_snapshot(snapshot_input, project_root);
     write_snapshot(snapshot, project_root)
 }
@@ -116,11 +127,44 @@ pub fn serialize_shared_index(
     shared: &crate::live_index::store::SharedIndex,
     project_root: &Path,
 ) -> anyhow::Result<()> {
+    checkpoint_shared_index(shared, project_root).map(|_| ())
+}
+
+pub fn checkpoint_shared_index(
+    shared: &crate::live_index::store::SharedIndex,
+    project_root: &Path,
+) -> anyhow::Result<SnapshotWriteReport> {
     let snapshot_input = {
         let guard = shared.read();
         capture_snapshot_build_input(&guard)
     };
     serialize_captured_snapshot(snapshot_input, project_root)
+}
+
+pub fn checkpoint_interval_from_value(value: Option<&str>) -> Option<Duration> {
+    let raw = value?.trim();
+    if raw.is_empty()
+        || raw == "0"
+        || raw.eq_ignore_ascii_case("false")
+        || raw.eq_ignore_ascii_case("off")
+        || raw.eq_ignore_ascii_case("disabled")
+    {
+        return None;
+    }
+
+    let seconds = raw.parse::<u64>().ok()?;
+    if seconds == 0 {
+        return None;
+    }
+
+    Some(Duration::from_secs(seconds.clamp(
+        MIN_CHECKPOINT_INTERVAL_SECS,
+        MAX_CHECKPOINT_INTERVAL_SECS,
+    )))
+}
+
+pub fn checkpoint_interval_from_env() -> Option<Duration> {
+    checkpoint_interval_from_value(std::env::var(CHECKPOINT_INTERVAL_ENV).ok().as_deref())
 }
 
 pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotResetReport> {
@@ -146,10 +190,17 @@ pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotReset
     Ok(SnapshotResetReport { removed, missing })
 }
 
-fn write_snapshot(snapshot: IndexSnapshot, project_root: &Path) -> anyhow::Result<()> {
+fn write_snapshot(
+    snapshot: IndexSnapshot,
+    project_root: &Path,
+) -> anyhow::Result<SnapshotWriteReport> {
     // Serialize with postcard
     let bytes = postcard::to_stdvec(&snapshot)?;
+    let file_count = snapshot.files.len();
 
+    let _write_guard = SNAPSHOT_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot write lock poisoned"))?;
     let dir = paths::ensure_symforge_dir(project_root)?;
 
     // Atomic write: tmp file then rename
@@ -174,12 +225,16 @@ fn write_snapshot(snapshot: IndexSnapshot, project_root: &Path) -> anyhow::Resul
 
     info!(
         bytes = bytes.len(),
-        files = snapshot.files.len(),
+        files = file_count,
         path = %final_path.display(),
         "index serialized to project data dir"
     );
 
-    Ok(())
+    Ok(SnapshotWriteReport {
+        path: final_path,
+        bytes: bytes.len(),
+        files: file_count,
+    })
 }
 
 /// Load an `IndexSnapshot` from the project's data directory.

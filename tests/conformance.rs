@@ -26,6 +26,7 @@ use tempfile::TempDir;
 
 const EXPECTED_TOOLS: &[&str] = &[
     "health",
+    "checkpoint_now",
     "index_folder",
     "validate_file_syntax",
     "get_file_content",
@@ -405,7 +406,7 @@ fn all_tools_have_annotations() {
 
     const ADDITIVE_WRITE: &[&str] = &["insert_symbol", "edit_within_symbol", "batch_insert"];
 
-    const IDEMPOTENT_STATE: &[&str] = &["index_folder", "analyze_file_impact"];
+    const IDEMPOTENT_STATE: &[&str] = &["checkpoint_now", "index_folder", "analyze_file_impact"];
 
     let tools = SymForgeServer::tool_definitions();
 

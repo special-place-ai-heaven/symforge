@@ -654,18 +654,17 @@ fn test_empty_index_when_no_auto_index() {
 }
 
 // --------------------------------------------------------------------------
-// Test INFR-05: No v1 tool function definitions in protocol source
+// Test INFR-05: Retired v1 run lifecycle tools stay absent
 //
-// Compile-time verification — the old v1 tool names must not appear as
-// function definitions in protocol/tools.rs. Checks for `fn {name}` patterns
-// to avoid false positives from test assertion strings.
+// `checkpoint_now` is intentionally revived as a current v7 snapshot tool by
+// SFR09. The rest of the v1 run lifecycle names must not appear as function
+// definitions in protocol/tools.rs.
 // --------------------------------------------------------------------------
 
 #[test]
-fn test_no_v1_tools_in_codebase() {
-    let v1_tools = [
+fn test_retired_v1_run_lifecycle_tools_stay_absent() {
+    let retired_v1_tools = [
         "cancel_index_run",
-        "checkpoint_now",
         "resume_index_run",
         "get_index_run",
         "list_index_runs",
@@ -676,7 +675,11 @@ fn test_no_v1_tools_in_codebase() {
         "reindex_repository",
     ];
     let tools_source = include_str!("../src/protocol/tools.rs");
-    for tool in &v1_tools {
+    assert!(
+        tools_source.contains("fn checkpoint_now"),
+        "checkpoint_now is a current v7 checkpoint tool and must remain explicit"
+    );
+    for tool in &retired_v1_tools {
         // Check for `fn {name}` patterns — actual function definitions, not test strings
         let fn_pattern = format!("fn {tool}");
         assert!(
