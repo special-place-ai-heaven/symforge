@@ -1,6 +1,9 @@
+mod context_bundle;
 pub mod coupling;
+mod disambiguation;
 pub mod frecency;
 pub mod git_temporal;
+mod health_view;
 pub mod persist;
 pub(crate) mod qualified_usages;
 pub mod query;
