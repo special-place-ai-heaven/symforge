@@ -77,9 +77,10 @@ Required behavior:
 
 Likely idempotent current or near-term tools:
 - `index_folder`
+- `checkpoint_now`
 - structural edit and batch mutation tools
-- `checkpoint_now` or `repair_index` only after those deferred recovery tools
-  exist in the shipped MCP surface
+- `repair_index` only if a future WorkSpec ships a real repair tool with
+  durable state and machine-readable status
 - future write or annotation tools when they become real shipped tools
 
 ## Recovery Rules
@@ -88,26 +89,43 @@ Self-healing means deterministic repair paths.
 
 The system should support:
 - startup sweeps for stale leases and temp files
-- checkpoint replay for interrupted runs
+- checkpoint replay for interrupted snapshot state
 - quarantine of bad parses or bad spans
 - scheduled repair jobs
 - integrity verification
-- explicit health and repair tools
+- explicit health tools, plus repair tools only when their workflow is real
 
 Failure should degrade safely:
-- process crashes should be resumable
+- process crashes should recover from the latest valid snapshot or an explicit
+  source rebuild path
 - parser failures should isolate a file, not poison a run
 - bad symbol spans should never be served silently
+
+Current v7.13.x recovery contract:
+
+- `checkpoint_now(verify_after_write=true)` is the explicit checkpoint path for
+  forcing `.symforge/index.bin` persistence before risky operations.
+- Use `health` or `health_compact` to inspect snapshot load source, background
+  snapshot verification state, and mismatch summaries.
+- Bad or version-incompatible snapshots are preserved under
+  `.symforge/quarantine/index-snapshots/` with metadata instead of being served
+  silently.
+- Use `index_folder` reset when the active index must be rebuilt from source
+  after health, verification, or quarantine evidence shows a snapshot is not a
+  valid recovery source.
+- `repair_index` is intentionally retired until a real repair workflow exists.
+  `get_index_run` and `cancel_index_run` remain retired. No durable run IDs are
+  exposed until resumable run storage exists.
 
 ## MCP Surface
 
 The shipped v7.13.x MCP surface includes tools, resources, and prompts. Do not
 design for tools only.
 
-Current canonical `tools/list` exposes 31 tools, including `health_compact`:
+Current canonical `tools/list` exposes 32 tools, including `health_compact`:
 
 - Runtime and index: `health`, `health_compact`, `index_folder`,
-  `analyze_file_impact`, `what_changed`, `diff_symbols`,
+  `checkpoint_now`, `analyze_file_impact`, `what_changed`, `diff_symbols`,
   `validate_file_syntax`
 - Read and search: `get_repo_map`, `get_file_context`, `get_file_content`,
   `get_symbol`, `get_symbol_context`, `inspect_match`, `search_symbols`,
@@ -140,8 +158,9 @@ Name migration and deferred-surface table:
 | `get_symbols` | Use `get_symbol` batch mode. |
 | `trace_symbol` | Retired from client guidance; daemon compatibility may route to `get_symbol_context` with a deprecation warning. |
 | `index_repository` | Deferred; use `index_folder` for current local repository indexing. |
-| `get_index_run`, `cancel_index_run` | Deferred run-lifecycle surface; do not describe as shipped. |
-| `checkpoint_now`, `repair_index` | Deferred recovery surface; SFR09/SFR10 decide the current-contract shape. |
+| `get_index_run`, `cancel_index_run` | `get_index_run` and `cancel_index_run` remain retired; no durable run IDs are exposed. |
+| `checkpoint_now` | Current recovery surface; use `checkpoint_now(verify_after_write=true)` for explicit snapshot persistence. |
+| `repair_index` | `repair_index` is intentionally retired; use `health` or `health_compact`, inspect `.symforge/quarantine/index-snapshots/`, then use `index_folder` reset when a rebuild is required. |
 | `invalidate_cache` | Deferred; use `analyze_file_impact` for one changed file or `index_folder` for a full reset. |
 
 ## Memory Strategy

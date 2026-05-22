@@ -181,6 +181,48 @@ fn no_unexpected_tools_registered() {
 }
 
 #[test]
+fn repair_lifecycle_retirement_contract_documents_checkpoint_snapshot_workflow() {
+    let tools = SymForgeServer::tool_definitions();
+    let registered: BTreeSet<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    for tool_name in ["checkpoint_now", "health", "health_compact", "index_folder"] {
+        assert!(
+            registered.contains(tool_name),
+            "{tool_name} must remain part of the explicit recovery replacement workflow"
+        );
+    }
+
+    for retired_tool_name in ["repair_index", "get_index_run", "cancel_index_run"] {
+        assert!(
+            !registered.contains(retired_tool_name),
+            "{retired_tool_name} must not be reintroduced as a placeholder run-lifecycle tool"
+        );
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let docs = [
+        fs::read_to_string(root.join("AGENTS.md")).expect("read AGENTS.md"),
+        fs::read_to_string(root.join("README.md")).expect("read README.md"),
+    ]
+    .join("\n");
+
+    for required_phrase in [
+        "`repair_index` is intentionally retired",
+        "`get_index_run` and `cancel_index_run` remain retired",
+        "`checkpoint_now(verify_after_write=true)`",
+        "`health` or `health_compact`",
+        "`index_folder` reset",
+        "`.symforge/quarantine/index-snapshots/`",
+        "No durable run IDs are exposed",
+    ] {
+        assert!(
+            docs.contains(required_phrase),
+            "repair/run-lifecycle retirement docs must contain {required_phrase:?}"
+        );
+    }
+}
+
+#[test]
 fn all_tools_have_valid_schemas() {
     for tool in SymForgeServer::tool_definitions() {
         let schema = tool.input_schema.as_ref();

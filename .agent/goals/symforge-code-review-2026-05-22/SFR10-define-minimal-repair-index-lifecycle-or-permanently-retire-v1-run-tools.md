@@ -3,17 +3,17 @@ goal_id: SFR10
 title: Define minimal repair_index lifecycle or permanently retire v1 run tools
 chain_id: symforge-code-review-2026-05-22
 phase: Wave 2 - idempotency and recovery
-status: "Blocked"
+status: "Completed"
 depends_on: ["SFR09", "SFR11", "SFR12"]
 target_branch: "goal/sfr10-define-minimal-repair-index-lifecycle-or-permanently-retire-v1-run-tools"
 landing_branch: "main"
 prohibited_branches: ["main", "master", "backlog-implementation"]
 worktree_hint: ".worktrees/sfr10-define-minimal-repair-index-lifecycle-or-permanently-retire-v1-run-tools"
 created_at: "2026-05-22"
-started_at: "2026-05-22T22:06:57+02:00"
-completed_at: ""
-completion_commit: ""
-blocked_reason: "Dependency guard failed: SFR11 and SFR12 are still Pending, and current code lacks their required snapshot quarantine and background verification mismatch/progress acceptance artifacts. SFR10 should resume after SFR11 and SFR12 complete."
+started_at: "2026-05-22T22:55:48+02:00"
+completed_at: "2026-05-22T23:12:20.3503903+02:00"
+completion_commit: "5b76927"
+blocked_reason: ""
 gate: "implementation-ready"
 risk_level: "high"
 source_refs:

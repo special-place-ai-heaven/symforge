@@ -6,7 +6,7 @@ of reading whole files, running broad grep commands, or editing code with blind
 text replacement.
 
 It is written in Rust, indexes code with tree-sitter, keeps the active workspace
-in memory, and exposes 31 canonical MCP tools plus resources and prompts for
+in memory, and exposes 32 canonical MCP tools plus resources and prompts for
 repo orientation, code reading, search, reference tracing, impact analysis, and
 structural edits.
 
@@ -60,7 +60,7 @@ flowchart LR
     Local --> Snapshot[".symforge/index.bin"]
     Snapshot --> Local
 
-    Local --> Tools["31 MCP tools<br/>resources + prompts"]
+    Local --> Tools["32 MCP tools<br/>resources + prompts"]
     Tools --> Client
 
     Tools --> Edits["structural edit engine"]
@@ -174,7 +174,7 @@ Analytics subcommands:
 
 ## MCP Tools
 
-SymForge exposes 31 canonical tools through MCP `tools/list`. They are grouped
+SymForge exposes 32 canonical tools through MCP `tools/list`. They are grouped
 by how an agent should use them.
 
 ### Orient
@@ -238,6 +238,24 @@ by how an agent should use them.
 |---|---|
 | `index_folder` | Reindex a repository from scratch |
 | `checkpoint_now` | Atomically write the current in-memory index to `.symforge/index.bin` |
+
+### Recovery
+
+SymForge does not expose placeholder v1 run-lifecycle tools. `repair_index` is
+intentionally retired until a real repair workflow has durable state and
+machine-readable status. `get_index_run` and `cancel_index_run` remain retired.
+No durable run IDs are exposed.
+
+Current replacement workflow:
+
+1. Run `checkpoint_now(verify_after_write=true)` to force a byte-exact snapshot
+   write and verification attempt.
+2. Use `health` or `health_compact` to inspect snapshot load source, background
+   verification state, mismatch counts, and mismatch paths.
+3. Inspect `.symforge/quarantine/index-snapshots/` when a corrupt or
+   version-incompatible snapshot is detected.
+4. Use `index_folder` reset to rebuild from source when health, verification,
+   or quarantine evidence shows the snapshot should not be reused.
 
 The deprecated daemon compatibility name `trace_symbol` is not granted by
 generated client allow-lists. Use `get_symbol_context` or `find_references`.
