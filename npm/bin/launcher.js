@@ -31,9 +31,36 @@ function createLauncher(overrides = {}) {
   const ext = processMod.platform === "win32" ? ".exe" : "";
   const installDir = resolveInstallDir();
   const binPath = pathMod.join(installDir, "symforge" + ext);
+  const cmdShimPath = pathMod.join(installDir, "symforge.cmd");
   const pendingPath = pathMod.join(installDir, "symforge.pending" + ext);
   const versionPath = pathMod.join(installDir, "symforge.version");
   const pendingVersionPath = pathMod.join(installDir, "symforge.pending.version");
+
+  function getLaunchPath() {
+    if (
+      processMod.platform === "win32"
+      && !fsMod.existsSync(binPath)
+      && fsMod.existsSync(cmdShimPath)
+    ) {
+      return cmdShimPath;
+    }
+    return binPath;
+  }
+
+  function isWindowsCmdShim(targetPath) {
+    return (
+      processMod.platform === "win32"
+      && pathMod.extname(targetPath).toLowerCase() === ".cmd"
+    );
+  }
+
+  function childOptionsFor(targetPath, baseOptions) {
+    const options = { ...baseOptions, env: processMod.env };
+    if (isWindowsCmdShim(targetPath)) {
+      options.shell = true;
+    }
+    return options;
+  }
 
   function relayInstallerOutput(output) {
     if (!output) {
@@ -81,11 +108,15 @@ function createLauncher(overrides = {}) {
     }
 
     try {
-      const output = execFileSyncFn(binPath, ["--version"], {
-        encoding: "utf8",
-        timeout: 5000,
-        env: processMod.env,
-      }).trim();
+      const launchPath = getLaunchPath();
+      const output = execFileSyncFn(
+        launchPath,
+        ["--version"],
+        childOptionsFor(launchPath, {
+          encoding: "utf8",
+          timeout: 5000,
+        }),
+      ).trim();
       const parsedVersion = parseVersion(output);
       writeRecordedVersion(versionPath, parsedVersion);
       return parsedVersion;
@@ -149,11 +180,15 @@ function createLauncher(overrides = {}) {
     }
     consoleMod.error(`symforge: auto-configuring for ${client}...`);
     try {
-      const output = execFileSyncFn(binPath, ["init", "--client", client], {
-        encoding: "utf8",
-        timeout: 15000,
-        env: processMod.env,
-      });
+      const launchPath = getLaunchPath();
+      const output = execFileSyncFn(
+        launchPath,
+        ["init", "--client", client],
+        childOptionsFor(launchPath, {
+          encoding: "utf8",
+          timeout: 15000,
+        }),
+      );
       relayInstallerOutput(output);
     } catch (error) {
       consoleMod.error(
@@ -166,7 +201,7 @@ function createLauncher(overrides = {}) {
     const pendingApplied = applyPendingUpdate();
 
     const expectedVersion = packageJson.version;
-    const hasBinary = fsMod.existsSync(binPath);
+    const hasBinary = fsMod.existsSync(getLaunchPath());
     const installedVersion = hasBinary ? getInstalledVersion() : null;
 
     if (installedVersion === expectedVersion) {
@@ -188,17 +223,21 @@ function createLauncher(overrides = {}) {
     runInstaller();
     applyPendingUpdate();
 
-    if (!fsMod.existsSync(binPath)) {
+    if (!fsMod.existsSync(getLaunchPath())) {
       throw new Error("symforge binary is still missing after install.");
     }
   }
 
   function main(args) {
     ensureInstalledBinary();
-    const result = spawnSyncFn(binPath, args, {
-      stdio: "inherit",
-      env: processMod.env,
-    });
+    const launchPath = getLaunchPath();
+    const result = spawnSyncFn(
+      launchPath,
+      args,
+      childOptionsFor(launchPath, {
+        stdio: "inherit",
+      }),
+    );
     return result.status ?? 1;
   }
 
@@ -207,7 +246,7 @@ function createLauncher(overrides = {}) {
     detectClients,
     ensureInstalledBinary,
     getInstalledVersion,
-    getBinaryPath: () => binPath,
+    getBinaryPath: () => getLaunchPath(),
     getPendingPath: () => pendingPath,
     main,
     runAutoInit,
