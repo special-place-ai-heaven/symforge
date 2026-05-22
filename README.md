@@ -6,8 +6,9 @@ of reading whole files, running broad grep commands, or editing code with blind
 text replacement.
 
 It is written in Rust, indexes code with tree-sitter, keeps the active workspace
-in memory, and exposes 31 MCP tools for repo orientation, code reading, search,
-reference tracing, impact analysis, and structural edits.
+in memory, and exposes 31 canonical MCP tools plus resources and prompts for
+repo orientation, code reading, search, reference tracing, impact analysis, and
+structural edits.
 
 > [!IMPORTANT]
 > SymForge is for code intelligence and code editing.
@@ -59,7 +60,7 @@ flowchart LR
     Local --> Snapshot[".symforge/index.bin"]
     Snapshot --> Local
 
-    Local --> Tools["31 MCP tools"]
+    Local --> Tools["31 MCP tools<br/>resources + prompts"]
     Tools --> Client
 
     Tools --> Edits["structural edit engine"]
@@ -173,7 +174,8 @@ Analytics subcommands:
 
 ## MCP Tools
 
-SymForge exposes 31 tools. They are grouped by how an agent should use them.
+SymForge exposes 31 canonical tools through MCP `tools/list`. They are grouped
+by how an agent should use them.
 
 ### Orient
 
@@ -238,6 +240,40 @@ SymForge exposes 31 tools. They are grouped by how an agent should use them.
 
 The deprecated daemon compatibility name `trace_symbol` is not granted by
 generated client allow-lists. Use `get_symbol_context` or `find_references`.
+
+## MCP Resources And Prompts
+
+SymForge also exposes protocol resources and prompts. These are current shipped
+surfaces, not future-only design notes.
+
+Static resources:
+
+| Resource | Use |
+|---|---|
+| `symforge://repo/health` | Current runtime and index health |
+| `symforge://repo/outline` | Compact file-level repository outline |
+| `symforge://repo/map` | Directory and symbol map |
+| `symforge://repo/changes/uncommitted` | Current uncommitted-change view |
+
+Resource templates:
+
+| Template | Use |
+|---|---|
+| `symforge://file/context` | File outline, references, imports, consumers, and git activity |
+| `symforge://file/content` | Exact file content and contextual excerpts |
+| `symforge://symbol/detail` | Symbol definition body |
+| `symforge://symbol/context` | Symbol context with grouped references |
+
+Prompts:
+
+| Prompt | Use |
+|---|---|
+| `symforge-review` | Code review planning with SymForge context |
+| `symforge-architecture` | Architecture mapping |
+| `symforge-triage` | Failure triage |
+| `symforge-onboard` | Codebase onboarding |
+| `symforge-refactor` | Refactor planning |
+| `symforge-debug` | Debugging plan |
 
 ## Ranking And Search Signals
 

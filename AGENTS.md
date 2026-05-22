@@ -75,12 +75,12 @@ Required behavior:
 - replay with same key and same hash returns the stored result
 - replay with same key and different hash fails deterministically
 
-Likely idempotent tools:
+Likely idempotent current or near-term tools:
 - `index_folder`
-- `index_repository`
-- `repair_index`
-- `checkpoint_now`
-- future write or annotation tools
+- structural edit and batch mutation tools
+- `checkpoint_now` or `repair_index` only after those deferred recovery tools
+  exist in the shipped MCP surface
+- future write or annotation tools when they become real shipped tools
 
 ## Recovery Rules
 
@@ -101,40 +101,48 @@ Failure should degrade safely:
 
 ## MCP Surface
 
-This project should eventually support:
-- tools
-- resources
-- prompts
+The shipped v7.13.x MCP surface includes tools, resources, and prompts. Do not
+design for tools only.
 
-Do not design for tools only.
+Current canonical `tools/list` exposes 31 tools, including `health_compact`:
 
-Likely foundation tools:
-- `health`
-- `index_folder`
-- `index_repository`
-- `get_index_run`
-- `cancel_index_run`
-- `checkpoint_now`
-- `repair_index`
-- `search_symbols`
-- `search_text`
-- `get_file_outline`
-- `get_symbol`
-- `get_symbols`
-- `get_repo_outline`
-- `invalidate_cache`
+- Runtime and index: `health`, `health_compact`, `index_folder`,
+  `analyze_file_impact`, `what_changed`, `diff_symbols`,
+  `validate_file_syntax`
+- Read and search: `get_repo_map`, `get_file_context`, `get_file_content`,
+  `get_symbol`, `get_symbol_context`, `inspect_match`, `search_symbols`,
+  `search_text`, `search_files`, `find_references`, `find_dependents`
+- Guidance: `explore`, `ask`, `conventions`, `edit_plan`,
+  `context_inventory`, `investigation_suggest`
+- Structural edits: `replace_symbol_body`, `edit_within_symbol`,
+  `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`,
+  `batch_rename`
 
-Likely useful resources:
-- repository outline
-- repository health
-- run status
-- symbol metadata views
+Current resources:
 
-Likely useful prompts:
-- codebase audit
-- architecture map
-- failure triage
-- index repair diagnosis
+- Static repository resources: `symforge://repo/health`,
+  `symforge://repo/outline`, `symforge://repo/map`,
+  `symforge://repo/changes/uncommitted`
+- Templates: `symforge://file/context`, `symforge://file/content`,
+  `symforge://symbol/detail`, `symforge://symbol/context`
+
+Current prompts:
+
+- `symforge-review`, `symforge-architecture`, `symforge-triage`,
+  `symforge-onboard`, `symforge-refactor`, `symforge-debug`
+
+Name migration and deferred-surface table:
+
+| Old, removed, or future name | Current v7.13.x status |
+|---|---|
+| `get_repo_outline` | Use `get_repo_map`; repository outline also exists as a resource. |
+| `get_file_outline` | Use `get_file_context`. |
+| `get_symbols` | Use `get_symbol` batch mode. |
+| `trace_symbol` | Retired from client guidance; daemon compatibility may route to `get_symbol_context` with a deprecation warning. |
+| `index_repository` | Deferred; use `index_folder` for current local repository indexing. |
+| `get_index_run`, `cancel_index_run` | Deferred run-lifecycle surface; do not describe as shipped. |
+| `checkpoint_now`, `repair_index` | Deferred recovery surface; SFR09/SFR10 decide the current-contract shape. |
+| `invalidate_cache` | Deferred; use `analyze_file_impact` for one changed file or `index_folder` for a full reset. |
 
 ## Memory Strategy
 
@@ -168,14 +176,22 @@ As of 2026-03-06:
 
 ## Implementation Guidance
 
-- Prefer clean module boundaries:
+- Prefer clean module boundaries. The shipped layout currently uses:
   - `protocol`
-  - `application`
-  - `domain`
-  - `storage`
-  - `indexing`
+  - `live_index`
   - `parsing`
-  - `observability`
+  - `daemon`
+  - `cli`
+  - `watcher`
+  - `discovery`
+  - `git`
+  - `analytics`
+  - `worktree`
+  - `sidecar`
+  - `edit_safety`
+  - `domain`
+- Treat `application`, `storage`, `indexing`, and `observability` as possible
+  future boundary names, not current shipped directories.
 - Keep domain logic testable without MCP or database runtime dependencies.
 - Prefer bounded concurrency and structured shutdown.
 - Long-running operations should return durable run ids when appropriate.
@@ -205,10 +221,9 @@ Use SymForge first for:
 Preferred tools:
 - `search_text`
 - `search_symbols`
-- `get_file_outline`
-- `get_repo_outline`
+- `get_file_context`
+- `get_repo_map`
 - `get_symbol`
-- `get_symbols`
 
 Default rule:
 - use SymForge to narrow and target code inspection first

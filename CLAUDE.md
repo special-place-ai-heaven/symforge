@@ -1,13 +1,13 @@
 # CLAUDE.md — SymForge
 
 ## Verification (symforge)
-- Backend: `cargo check`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
+- Backend: `cargo fmt --check`, `cargo check`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
 ## Architecture
 
-Rust MCP server providing symbol-aware code navigation and editing tools. Currently 31 tools exposed via MCP `tools/list`, with backward-compat aliases for removed tools in `src/daemon.rs`.
+Rust MCP server providing symbol-aware code navigation and editing tools. Current MCP `tools/list` exposes 31 canonical tools, including `health_compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests
@@ -16,6 +16,8 @@ Key source files:
 - `src/cli/init.rs` — Tool name list for client init
 - `src/live_index/query.rs` — Index query functions
 - `src/protocol/resources.rs` — MCP resource handlers
+- `src/protocol/prompts.rs` — MCP prompt handlers
+- `src/protocol/result_status.rs` — Machine-readable outcome metadata
 
 ## Tool Consolidation Pattern
 
