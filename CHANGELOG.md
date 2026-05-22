@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.13.1](https://github.com/special-place-administrator/symforge/compare/v7.13.0...v7.13.1) (2026-05-22)
+
+
+### Bug Fixes
+
+* keep all-client init on injected home ([3c7daf5](https://github.com/special-place-administrator/symforge/commit/3c7daf5f70a7b4aac4775e67f72c90cbb3f3e5b7))
+* stabilize harness init paths ([9732a7d](https://github.com/special-place-administrator/symforge/commit/9732a7dbf735856d1a1d29303c3d7583694011c2))
+
 ## [7.13.0](https://github.com/special-place-administrator/symforge/compare/v7.12.0...v7.13.0) (2026-05-21)
 
 
