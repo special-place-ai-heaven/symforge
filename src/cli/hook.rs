@@ -18,6 +18,7 @@ use crate::cli::HookSubcommand;
 const PORT_FILE: &str = ".symforge/sidecar.port";
 const SESSION_FILE: &str = ".symforge/sidecar.session";
 const ADOPTION_LOG_FILE: &str = ".symforge/hook-adoption.log";
+const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 /// Hard HTTP timeout — leaves margin within HOOK-03's 100 ms total budget.
 const HTTP_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -865,8 +866,14 @@ fn sync_http_get_with_timeout(
         format!("{path}?{query}")
     };
 
+    let auth_header = std::env::var(DAEMON_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET {request_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth_header}Connection: close\r\n\r\n"
     );
 
     stream.write_all(request.as_bytes())?;

@@ -3,6 +3,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rmcp::handler::server::wrapper::Parameters;
@@ -37,6 +39,9 @@ use crate::watcher::{self, WatcherInfo};
 pub(crate) const DAEMON_PORT_FILE: &str = "daemon.port";
 const DAEMON_PID_FILE: &str = "daemon.pid";
 const DAEMON_START_LOCK_FILE: &str = "daemon.starting";
+const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
+const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
+const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
     "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
@@ -59,6 +64,7 @@ pub struct DaemonSessionClient {
     project_id: String,
     session_id: String,
     project_name: String,
+    auth_token: Option<String>,
     /// Stored so reconnection can re-open a session at the same project root.
     project_root: Option<PathBuf>,
 }
@@ -68,6 +74,7 @@ pub struct DaemonState {
     projects: RwLock<HashMap<String, ProjectInstance>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
+    auth_token: Option<String>,
     /// Concurrency governor — limits parallel tool calls and enforces timeouts.
     governor: crate::sidecar::governor::RequestGovernor,
 }
@@ -141,6 +148,106 @@ fn now_epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn daemon_auth_token_from_env() -> Option<String> {
+    std::env::var(DAEMON_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_var_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn resolve_daemon_bind_host(default_host: &str) -> anyhow::Result<String> {
+    let configured = std::env::var(DAEMON_BIND_ENV).unwrap_or_else(|_| default_host.to_string());
+    let host = configured.trim();
+    if host.is_empty() {
+        anyhow::bail!("{DAEMON_BIND_ENV} must not be empty");
+    }
+
+    if is_loopback_bind_host(host) {
+        return Ok(host.to_string());
+    }
+
+    if env_var_truthy(DAEMON_ALLOW_NON_LOOPBACK_ENV) {
+        tracing::warn!(
+            bind_host = %host,
+            allow_env = DAEMON_ALLOW_NON_LOOPBACK_ENV,
+            "daemon binding to a non-loopback interface after explicit operator opt-in"
+        );
+        Ok(host.to_string())
+    } else {
+        anyhow::bail!(
+            "refusing non-loopback daemon bind '{host}'; set {DAEMON_ALLOW_NON_LOOPBACK_ENV}=1 to allow it explicitly"
+        );
+    }
+}
+
+fn daemon_socket_bind_address(host: &str) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:0")
+    } else {
+        format!("{host}:0")
+    }
+}
+
+fn apply_daemon_auth_header(
+    request: reqwest::RequestBuilder,
+    auth_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(token) = auth_token {
+        request.bearer_auth(token)
+    } else {
+        request
+    }
+}
+
+fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(expected_token) = state.auth_token.as_deref() else {
+        return Ok(());
+    };
+
+    let Some(header_value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    let Some((scheme, provided_token)) = header_value.split_once(' ') else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    if scheme.eq_ignore_ascii_case("bearer") && provided_token == expected_token {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn daemon_auth_error(status: StatusCode) -> (StatusCode, String) {
+    (status, "daemon authentication required".to_string())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenProjectRequest {
     pub project_root: String,
@@ -209,6 +316,8 @@ pub struct DaemonHealth {
     pub daemon_version: String,
     pub executable_path: String,
     #[serde(default)]
+    pub auth_required: bool,
+    #[serde(default)]
     pub pid: Option<u32>,
 }
 
@@ -232,11 +341,16 @@ struct DaemonIdentity {
 
 impl DaemonState {
     pub fn new() -> Self {
+        Self::with_auth_token(daemon_auth_token_from_env())
+    }
+
+    fn with_auth_token(auth_token: Option<String>) -> Self {
         Self {
             next_session_id: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
+            auth_token,
             governor: crate::sidecar::governor::RequestGovernor::new(),
         }
     }
@@ -564,6 +678,7 @@ impl DaemonState {
             session_count: self.sessions.read().len(),
             daemon_version: self.identity.version.clone(),
             executable_path: self.identity.executable_path.clone(),
+            auth_required: self.auth_token.is_some(),
             pid: Some(std::process::id()),
         }
     }
@@ -576,7 +691,13 @@ impl Default for DaemonState {
 }
 
 impl DaemonSessionClient {
-    fn new(base_url: String, project_id: String, session_id: String, project_name: String) -> Self {
+    fn new_with_auth_token(
+        base_url: String,
+        project_id: String,
+        session_id: String,
+        project_name: String,
+        auth_token: Option<String>,
+    ) -> Self {
         // CRITICAL: reqwest::Client::new() has NO timeout by default.
         // Under concurrent load, if the daemon is slow, HTTP requests hang
         // indefinitely while holding read locks on daemon_lock in the proxy
@@ -597,6 +718,7 @@ impl DaemonSessionClient {
             project_id,
             session_id,
             project_name,
+            auth_token,
             project_root: None,
         }
     }
@@ -613,7 +735,7 @@ impl DaemonSessionClient {
         session_id: String,
         project_name: String,
     ) -> Self {
-        Self::new(base_url, project_id, session_id, project_name)
+        Self::new_with_auth_token(base_url, project_id, session_id, project_name, None)
     }
 
     pub fn project_name(&self) -> &str {
@@ -667,13 +789,14 @@ impl DaemonSessionClient {
         tool_name: &str,
         params: serde_json::Value,
     ) -> anyhow::Result<String> {
-        let response = self
+        let request = self
             .http_client
             .post(format!(
                 "{}/v1/sessions/{}/tools/{}",
                 self.base_url, self.session_id, tool_name
             ))
-            .json(&params)
+            .json(&params);
+        let response = apply_daemon_auth_header(request, self.auth_token.as_deref())
             .send()
             .await
             .with_context(|| format!("calling daemon tool '{tool_name}'"))?
@@ -687,11 +810,11 @@ impl DaemonSessionClient {
     }
 
     pub async fn heartbeat(&self) -> anyhow::Result<HeartbeatResponse> {
-        self.http_client
-            .post(format!(
-                "{}/v1/sessions/{}/heartbeat",
-                self.base_url, self.session_id
-            ))
+        let request = self.http_client.post(format!(
+            "{}/v1/sessions/{}/heartbeat",
+            self.base_url, self.session_id
+        ));
+        apply_daemon_auth_header(request, self.auth_token.as_deref())
             .send()
             .await
             .context("sending daemon heartbeat")?
@@ -703,8 +826,10 @@ impl DaemonSessionClient {
     }
 
     pub async fn close(&self) -> anyhow::Result<CloseSessionResponse> {
-        self.http_client
-            .delete(format!("{}/v1/sessions/{}", self.base_url, self.session_id))
+        let request = self
+            .http_client
+            .delete(format!("{}/v1/sessions/{}", self.base_url, self.session_id));
+        apply_daemon_auth_header(request, self.auth_token.as_deref())
             .send()
             .await
             .context("closing daemon session")?
@@ -738,13 +863,15 @@ pub async fn connect_or_spawn_session(
         .timeout(Duration::from_secs(60))
         .build()
         .context("building reqwest client for connect_or_spawn_session")?;
-    let opened = http_client
+    let auth_token = daemon_auth_token_from_env();
+    let open_request = http_client
         .post(format!("{base_url}/v1/sessions/open"))
         .json(&OpenProjectRequest {
             project_root: project_root.display().to_string(),
             client_name: client_name.to_string(),
             pid,
-        })
+        });
+    let opened = apply_daemon_auth_header(open_request, auth_token.as_deref())
         .send()
         .await
         .context("opening daemon session")?
@@ -754,11 +881,12 @@ pub async fn connect_or_spawn_session(
         .await
         .context("daemon session open body")?;
 
-    Ok(DaemonSessionClient::new(
+    Ok(DaemonSessionClient::new_with_auth_token(
         base_url,
         opened.project_id,
         opened.session_id,
         opened.project_name,
+        auth_token,
     )
     .with_project_root(project_root.to_path_buf()))
 }
@@ -1226,11 +1354,10 @@ pub fn build_router(state: SharedDaemonState) -> Router {
 }
 
 pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
-    let resolved_host =
-        std::env::var("SYMFORGE_DAEMON_BIND").unwrap_or_else(|_| bind_host.to_string());
+    let resolved_host = resolve_daemon_bind_host(bind_host)?;
     cleanup_daemon_runtime_files();
 
-    let listener = TcpListener::bind(format!("{resolved_host}:0")).await?;
+    let listener = TcpListener::bind(daemon_socket_bind_address(&resolved_host)).await?;
     let port = listener.local_addr()?.port();
     write_daemon_port_file(port)?;
     write_daemon_pid_file(std::process::id())?;
@@ -1305,34 +1432,42 @@ async fn daemon_health_handler(State(state): State<SharedDaemonState>) -> Json<D
 
 async fn list_projects_handler(
     State(state): State<SharedDaemonState>,
-) -> Json<Vec<ProjectSummary>> {
-    Json(state.list_projects())
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProjectSummary>>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
+    Ok(Json(state.list_projects()))
 }
 
 async fn project_health_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(project_id): AxumPath<String>,
-) -> Result<Json<ProjectHealth>, axum::http::StatusCode> {
+) -> Result<Json<ProjectHealth>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     state
         .project_health(&project_id)
         .map(Json)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn list_sessions_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(project_id): AxumPath<String>,
-) -> Result<Json<Vec<SessionSummary>>, axum::http::StatusCode> {
+) -> Result<Json<Vec<SessionSummary>>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     state
         .list_sessions(&project_id)
         .map(Json)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn open_project_session_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     Json(request): Json<OpenProjectRequest>,
-) -> Result<Json<OpenProjectResponse>, (axum::http::StatusCode, String)> {
+) -> Result<Json<OpenProjectResponse>, (StatusCode, String)> {
+    authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     let state_for_load = Arc::clone(&state);
     let response =
         tokio::task::spawn_blocking(move || state_for_load.open_project_session(request))
@@ -1344,9 +1479,11 @@ async fn open_project_session_handler(
 
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath((session_id, tool_name)): AxumPath<(String, String)>,
     Json(params): Json<serde_json::Value>,
-) -> Result<String, (axum::http::StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
+    authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     if tool_name == "index_folder" {
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
         let state_for_index = state.clone();
@@ -1367,7 +1504,7 @@ async fn call_tool_handler(
 
     let runtime = state.session_runtime(&session_id).ok_or_else(|| {
         (
-            axum::http::StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
             format!("unknown session '{session_id}'"),
         )
     })?;
@@ -1414,11 +1551,13 @@ async fn call_tool_handler(
 
 async fn sidecar_health_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
-) -> Result<Json<crate::sidecar::handlers::HealthResponse>, axum::http::StatusCode> {
+) -> Result<Json<crate::sidecar::handlers::HealthResponse>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1428,20 +1567,22 @@ async fn sidecar_health_handler(
                 handle.block_on(crate::sidecar::handlers::health_handler(State(sidecar)))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_outline_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::OutlineParams>,
-) -> Result<String, axum::http::StatusCode> {
+) -> Result<String, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1454,20 +1595,22 @@ async fn sidecar_outline_handler(
                 ))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_impact_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::ImpactParams>,
-) -> Result<String, axum::http::StatusCode> {
+) -> Result<String, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1480,20 +1623,22 @@ async fn sidecar_impact_handler(
                 ))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_symbol_context_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::SymbolContextParams>,
-) -> Result<String, axum::http::StatusCode> {
+) -> Result<String, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1506,19 +1651,21 @@ async fn sidecar_symbol_context_handler(
                 ))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_repo_map_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
-) -> Result<String, axum::http::StatusCode> {
+) -> Result<String, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1528,20 +1675,22 @@ async fn sidecar_repo_map_handler(
                 handle.block_on(crate::sidecar::handlers::repo_map_handler(State(sidecar)))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_prompt_context_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::PromptContextParams>,
-) -> Result<String, axum::http::StatusCode> {
+) -> Result<String, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1554,19 +1703,21 @@ async fn sidecar_prompt_context_handler(
                 ))
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn sidecar_stats_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
-) -> Result<Json<crate::sidecar::StatsSnapshot>, axum::http::StatusCode> {
+) -> Result<Json<crate::sidecar::StatsSnapshot>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sidecar = sidecar_state_for_runtime(&runtime);
     state
         .governor
@@ -1578,27 +1729,31 @@ async fn sidecar_stats_handler(
                 })
             })
             .await
-            .unwrap_or(Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
+            .unwrap_or(Err(StatusCode::INTERNAL_SERVER_ERROR))
         })
         .await
-        .map_err(|_| axum::http::StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 
 async fn heartbeat_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
-) -> Json<HeartbeatResponse> {
-    Json(state.heartbeat(&session_id))
+) -> Result<Json<HeartbeatResponse>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
+    Ok(Json(state.heartbeat(&session_id)))
 }
 
 async fn close_session_handler(
     State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
-) -> Result<Json<CloseSessionResponse>, axum::http::StatusCode> {
+) -> Result<Json<CloseSessionResponse>, StatusCode> {
+    authorize_daemon_request(&state, &headers)?;
     state
         .close_session(&session_id)
         .map(Json)
-        .ok_or(axum::http::StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn execute_tool_call(
@@ -1970,6 +2125,24 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: called only in single-threaded test context; no concurrent env readers.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: called only in single-threaded test context; no concurrent env readers.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     #[allow(unsafe_code)] // test-only env guard restores serialized process env mutation.
@@ -2007,6 +2180,36 @@ mod tests {
                     .expect("manifest dir must be a valid cwd fallback");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_daemon_bind_policy_rejects_non_loopback_without_opt_in() {
+        let _env_lock = env_lock().await;
+        let _bind_guard = EnvVarGuard::set_str(DAEMON_BIND_ENV, "0.0.0.0");
+        let _allow_guard = EnvVarGuard::unset(DAEMON_ALLOW_NON_LOOPBACK_ENV);
+
+        let error = resolve_daemon_bind_host("127.0.0.1")
+            .expect_err("non-loopback bind must require explicit opt-in");
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing non-loopback daemon bind"),
+            "unexpected bind rejection: {message}"
+        );
+        assert!(
+            message.contains(DAEMON_ALLOW_NON_LOOPBACK_ENV),
+            "rejection should name the explicit opt-in env var: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_bind_policy_allows_non_loopback_with_explicit_opt_in() {
+        let _env_lock = env_lock().await;
+        let _bind_guard = EnvVarGuard::set_str(DAEMON_BIND_ENV, "0.0.0.0");
+        let _allow_guard = EnvVarGuard::set_str(DAEMON_ALLOW_NON_LOOPBACK_ENV, "1");
+
+        let resolved = resolve_daemon_bind_host("127.0.0.1")
+            .expect("explicit opt-in should allow non-loopback bind");
+        assert_eq!(resolved, "0.0.0.0");
     }
 
     #[test]
@@ -2189,6 +2392,7 @@ mod tests {
         assert_eq!(daemon_health.project_count, 0);
         assert_eq!(daemon_health.session_count, 0);
         assert_eq!(daemon_health.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert!(!daemon_health.auth_required);
         assert!(!daemon_health.executable_path.is_empty());
 
         let opened = client
@@ -2296,6 +2500,176 @@ mod tests {
             !daemon_home.path().join(DAEMON_PID_FILE).exists(),
             "daemon pid file should be removed on shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_auth_token_protects_session_tool_and_sidecar_routes() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _bind_guard = EnvVarGuard::unset(DAEMON_BIND_ENV);
+        let _allow_guard = EnvVarGuard::unset(DAEMON_ALLOW_NON_LOOPBACK_ENV);
+        let token = "sfr03-test-token";
+        let _auth_guard = EnvVarGuard::set_str(DAEMON_AUTH_TOKEN_ENV, token);
+        let project = project_dir("symforge-daemon-auth");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = reqwest::Client::new();
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let health_body = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health request")
+            .error_for_status()
+            .expect("health status")
+            .text()
+            .await
+            .expect("health body");
+        assert!(
+            !health_body.contains(token),
+            "health body must not leak auth token"
+        );
+        let daemon_health: DaemonHealth = serde_json::from_str(&health_body).expect("health json");
+        assert!(daemon_health.auth_required);
+
+        let missing_projects = client
+            .get(format!("{base_url}/v1/projects"))
+            .send()
+            .await
+            .expect("projects request");
+        assert_eq!(missing_projects.status(), StatusCode::UNAUTHORIZED);
+        let missing_body = missing_projects.text().await.expect("missing auth body");
+        assert!(
+            !missing_body.contains(token),
+            "401 body must not leak auth token"
+        );
+
+        let wrong_open = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .bearer_auth("wrong-token")
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(5150),
+            })
+            .send()
+            .await
+            .expect("wrong auth open request");
+        assert_eq!(wrong_open.status(), StatusCode::UNAUTHORIZED);
+        let wrong_body = wrong_open.text().await.expect("wrong auth body");
+        assert!(
+            !wrong_body.contains(token),
+            "wrong-token body must not leak auth token"
+        );
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .bearer_auth(token)
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(5150),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        client
+            .get(format!("{base_url}/v1/projects"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("authorized projects request")
+            .error_for_status()
+            .expect("authorized projects status");
+
+        let missing_tool = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("missing tool auth request");
+        assert_eq!(missing_tool.status(), StatusCode::UNAUTHORIZED);
+
+        let tool_body = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health",
+                opened.session_id
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("authorized tool request")
+            .error_for_status()
+            .expect("authorized tool status")
+            .text()
+            .await
+            .expect("authorized tool body");
+        assert!(
+            tool_body.contains("Status:"),
+            "health tool response should succeed: {tool_body}"
+        );
+        assert!(
+            !tool_body.contains(token),
+            "tool response must not leak auth token"
+        );
+
+        let missing_sidecar = client
+            .get(format!(
+                "{base_url}/v1/sessions/{}/sidecar/health",
+                opened.session_id
+            ))
+            .send()
+            .await
+            .expect("missing sidecar auth request");
+        assert_eq!(missing_sidecar.status(), StatusCode::UNAUTHORIZED);
+
+        client
+            .get(format!(
+                "{base_url}/v1/sessions/{}/sidecar/health",
+                opened.session_id
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("authorized sidecar request")
+            .error_for_status()
+            .expect("authorized sidecar status");
+
+        client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/heartbeat",
+                opened.session_id
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("authorized heartbeat request")
+            .error_for_status()
+            .expect("authorized heartbeat status");
+
+        client
+            .delete(format!("{base_url}/v1/sessions/{}", opened.session_id))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("authorized close request")
+            .error_for_status()
+            .expect("authorized close status");
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -2493,6 +2867,7 @@ mod tests {
             session_count: 0,
             daemon_version: "0.0.0".to_string(),
             executable_path: current_daemon_identity().executable_path,
+            auth_required: false,
             pid: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
@@ -2516,6 +2891,7 @@ mod tests {
             session_count: 0,
             daemon_version: current_daemon_identity().version,
             executable_path: current_daemon_identity().executable_path,
+            auth_required: false,
             pid: Some(42),
         };
 
@@ -2537,6 +2913,7 @@ mod tests {
             session_count: 0,
             daemon_version: "0.0.0".to_string(),
             executable_path: current_daemon_identity().executable_path,
+            auth_required: false,
             pid: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;

@@ -351,7 +351,9 @@ Common configuration variables:
 | `SYMFORGE_AUTO_INDEX` | Enables startup project discovery and indexing |
 | `SYMFORGE_NO_DAEMON` | Forces local in-process mode instead of daemon routing |
 | `SYMFORGE_SIDECAR_BIND` | Bind host for local sidecar state |
-| `SYMFORGE_DAEMON_BIND` | Bind host for shared daemon state |
+| `SYMFORGE_DAEMON_BIND` | Bind host for shared daemon state; loopback hosts are accepted by default |
+| `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` | Explicit truthy opt-in required before the daemon binds a non-loopback host |
+| `SYMFORGE_DAEMON_AUTH_TOKEN` | Optional local bearer token for daemon project, session, tool, and sidecar routes |
 | `SYMFORGE_RECONCILE_INTERVAL` | Watcher reconciliation interval in seconds; `0` disables periodic sweeps |
 | `SYMFORGE_CB_THRESHOLD` | Parse-failure circuit-breaker threshold |
 | `SYMFORGE_FRECENCY` | Frecency policy: session-only by default, persistent when truthy, disabled when false/off/disabled |
@@ -362,6 +364,16 @@ Common configuration variables:
 | `SYMFORGE_FRECENCY_DB_PATH` | Override frecency database location |
 | `SYMFORGE_COUPLING_DB_PATH` | Override co-change database location |
 | `SYMFORGE_PROJECT_CONFIG_TRUST_MODE` | Trust behavior for project-local SymForge configuration |
+
+Daemon HTTP is a local coordination surface, not a remote production API.
+The default bind path is loopback-only. If `SYMFORGE_DAEMON_BIND` names a
+non-loopback host, SymForge rejects startup unless
+`SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` is truthy; that opt-in emits a warning.
+When `SYMFORGE_DAEMON_AUTH_TOKEN` is non-empty, project, session, tool, and
+sidecar routes require `Authorization: Bearer <token>`. `/health` remains
+unauthenticated so local readiness and compatibility checks can still discover
+the daemon, but health output reports only whether auth is required and never
+prints the token.
 
 ## Develop
 
