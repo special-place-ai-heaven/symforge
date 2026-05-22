@@ -7,6 +7,7 @@ pub mod domain;
 pub mod edit_safety;
 pub mod git;
 pub mod hash;
+pub mod idempotency;
 pub mod live_index;
 pub mod observability;
 pub mod parsing;

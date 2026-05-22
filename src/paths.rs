@@ -5,6 +5,9 @@ pub const SYMFORGE_DIR_NAME: &str = ".symforge";
 pub const SYMFORGE_FRECENCY_DB_PATH: &str = ".symforge/frecency.db";
 pub const SYMFORGE_COUPLING_DB_PATH: &str = ".symforge/coupling.db";
 pub const SYMFORGE_ANALYTICS_DB_PATH: &str = ".symforge/analytics.db";
+pub const SYMFORGE_IDEMPOTENCY_DIR_PATH: &str = ".symforge/idempotency";
+pub const SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH: &str = ".symforge/idempotency/records";
+pub const SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH: &str = ".symforge/idempotency/quarantine";
 
 /// Resolve the canonical symforge data directory under `base`.
 pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
@@ -18,6 +21,23 @@ pub fn ensure_symforge_dir(base: &Path) -> io::Result<PathBuf> {
         io::Error::new(
             e.kind(),
             format!("ensuring symforge data dir at {}: {}", dir.display(), e),
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Resolve the canonical idempotency replay directory under `base`.
+pub fn resolve_idempotency_dir(base: &Path) -> PathBuf {
+    base.join(SYMFORGE_IDEMPOTENCY_DIR_PATH)
+}
+
+/// Ensure the canonical idempotency replay directory exists under `base`.
+pub fn ensure_idempotency_dir(base: &Path) -> io::Result<PathBuf> {
+    let dir = resolve_idempotency_dir(base);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("ensuring idempotency dir at {}: {}", dir.display(), e),
         )
     })?;
     Ok(dir)
@@ -57,6 +77,24 @@ mod tests {
         assert_eq!(
             tmp.path().join(SYMFORGE_ANALYTICS_DB_PATH),
             tmp.path().join(SYMFORGE_DIR_NAME).join("analytics.db")
+        );
+    }
+
+    #[test]
+    fn test_idempotency_paths_stay_under_canonical_symforge_dir() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(
+            resolve_idempotency_dir(tmp.path()),
+            tmp.path().join(SYMFORGE_DIR_NAME).join("idempotency")
+        );
+        assert_eq!(
+            tmp.path().join(SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH),
+            resolve_idempotency_dir(tmp.path()).join("records")
+        );
+        assert_eq!(
+            tmp.path().join(SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH),
+            resolve_idempotency_dir(tmp.path()).join("quarantine")
         );
     }
 }
