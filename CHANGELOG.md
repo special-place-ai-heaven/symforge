@@ -3,6 +3,11 @@
 ## [7.13.1](https://github.com/special-place-administrator/symforge/compare/v7.13.0...v7.13.1) (2026-05-22)
 
 
+### Compatibility
+
+* document that retired daemon alias `trace_symbol` remains available with deprecation through v7.x, is planned for removal in v8.0, and stays excluded from generated client allow-lists.
+
+
 ### Bug Fixes
 
 * keep all-client init on injected home ([3c7daf5](https://github.com/special-place-administrator/symforge/commit/3c7daf5f70a7b4aac4775e67f72c90cbb3f3e5b7))

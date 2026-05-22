@@ -45,7 +45,7 @@ const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
     "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
-    "Compatibility policy: KEEP_WITH_DEPRECATION."
+    "Compatibility policy: keep daemon alias through v7.x; planned removal in v8.0."
 );
 
 pub type SharedDaemonState = Arc<DaemonState>;

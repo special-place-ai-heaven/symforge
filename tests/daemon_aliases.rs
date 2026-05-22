@@ -126,7 +126,7 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
     let deprecation_warning = concat!(
         "Deprecation warning: `trace_symbol` is retired; ",
         "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
-        "Compatibility policy: KEEP_WITH_DEPRECATION."
+        "Compatibility policy: keep daemon alias through v7.x; planned removal in v8.0."
     );
     assert!(
         alias_body.starts_with(deprecation_warning),

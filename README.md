@@ -257,8 +257,10 @@ Current replacement workflow:
 4. Use `index_folder` reset to rebuild from source when health, verification,
    or quarantine evidence shows the snapshot should not be reused.
 
-The deprecated daemon compatibility name `trace_symbol` is not granted by
-generated client allow-lists. Use `get_symbol_context` or `find_references`.
+The deprecated daemon compatibility name `trace_symbol` remains available
+through v7.x with an explicit deprecation warning and is planned for removal in
+v8.0. Generated client allow-lists do not grant it by default. Use
+`get_symbol_context` or `find_references`.
 
 ## MCP Resources And Prompts
 

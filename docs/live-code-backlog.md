@@ -28,7 +28,7 @@ not in these completed SFB items.
 | 11. Replayable public-contract conformance suite | Closed by SFB14 | `completion_commit: a247c61faa7c0ef73c0f0b25cdab52ae1419a5c9`; `tests/conformance.rs` |
 | 12. Guidance ranking and noise filtering | Closed by SFB15 | `completion_commit: 2c907ce54924d097987736e2ffc1c21f5513921a` |
 | 13. Co-change rerank calibration closure | Closed by SFB16 | `completion_commit: d2b5de693632d7a0bfbb47ff01fb20c53b7c1c32` |
-| 14. `trace_symbol` compatibility alias cleanup | Closed by SFB17, with daemon compatibility intentionally retained | `completion_commit: 2e8900f`; `src/cli/init.rs:1671`; `tests/daemon_aliases.rs` |
+| 14. `trace_symbol` compatibility alias cleanup | Closed by SFB17, with daemon compatibility intentionally retained through v7.x and planned for v8.0 removal | `completion_commit: 2e8900f`; `src/cli/init.rs:1671`; `tests/daemon_aliases.rs` |
 | 15. Rust raw-reference grammar upgrade | Closed by SFB18 | `completion_commit: 8cdf24e5e2b8c38e61c1c7b0196b9ad2d4f60efe` |
 | 16. `validate_file_syntax` deepest-error diagnostics | Closed by SFB19 | `completion_commit: dbb70fd935fdd94919abdb3083cbb3d71f98b2a9`; `src/parsing/mod.rs:147` |
 | 17. Unified truncation phrasing | Closed by SFB20 | `completion_commit: a6c1841eccf6b981f35e64567c0fb92cbca16541` |
@@ -306,6 +306,10 @@ Historical acceptance:
 - Source search for `trace_symbol` returns only deliberate historical references
   or none at all, depending on the chosen compatibility policy.
 - Client init tests still pass and do not grant the retired tool by default.
+
+Resolution: the daemon compatibility route is retained through v7.x with an
+explicit deprecation warning and planned for removal in v8.0. Generated client
+allow-lists continue to exclude the retired name.
 
 ## 15. Rust raw-reference grammar upgrade
 
