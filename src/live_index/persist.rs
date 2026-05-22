@@ -522,11 +522,7 @@ fn spot_verify_sample_from_view(
     let sample_size = ((total as f64 * sample_pct).ceil() as usize)
         .max(1)
         .min(total);
-    let step = if sample_size == 0 {
-        1
-    } else {
-        total / sample_size
-    };
+    let step = total.checked_div(sample_size).unwrap_or(1);
     let step = step.max(1);
 
     let mut mismatches = Vec::new();
@@ -709,7 +705,7 @@ pub async fn background_verify(
     let to_reparse: Vec<String> = stat_result
         .changed
         .into_iter()
-        .chain(stat_result.new_files.into_iter())
+        .chain(stat_result.new_files)
         .collect();
 
     for rel_path in &to_reparse {

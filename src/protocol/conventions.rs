@@ -161,16 +161,10 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
 
     // Naming summary
     let naming = {
-        let fn_pct = if total_fns > 0 {
-            snake_case_fns * 100 / total_fns
-        } else {
-            0
-        };
-        let type_pct = if total_types > 0 {
-            camel_case_types * 100 / total_types
-        } else {
-            0
-        };
+        let fn_pct = (snake_case_fns * 100).checked_div(total_fns).unwrap_or(0);
+        let type_pct = (camel_case_types * 100)
+            .checked_div(total_types)
+            .unwrap_or(0);
         format!(
             "Functions: {fn_pct}% snake_case ({snake_case_fns}/{total_fns}). Types: {type_pct}% CamelCase ({camel_case_types}/{total_types})."
         )
@@ -183,7 +177,7 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
 
     // Common imports (top 10)
     let mut import_vec: Vec<(String, u32)> = import_counts.into_iter().collect();
-    import_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    import_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     let common_imports: Vec<String> = import_vec
         .iter()
         .take(10)
@@ -191,11 +185,7 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
         .collect();
 
     // File organization
-    let avg_symbols = if code_file_count > 0 {
-        total_symbols / code_file_count
-    } else {
-        0
-    };
+    let avg_symbols = total_symbols.checked_div(code_file_count).unwrap_or(0);
     let avg_size = if code_file_count > 0 {
         total_file_bytes / code_file_count as u64
     } else {
@@ -293,7 +283,7 @@ pub fn extract_top_import_roots(index: &LiveIndex, limit: usize) -> Vec<String> 
     }
 
     let mut vec: Vec<(String, u32)> = counts.into_iter().collect();
-    vec.sort_by(|a, b| b.1.cmp(&a.1));
+    vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     vec.into_iter().take(limit).map(|(name, _)| name).collect()
 }
 

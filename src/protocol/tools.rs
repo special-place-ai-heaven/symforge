@@ -4978,11 +4978,10 @@ impl SymForgeServer {
                     params.0.path,
                     outline_tokens,
                     file_tokens,
-                    if file_tokens > 0 {
-                        100 - (outline_tokens * 100 / file_tokens)
-                    } else {
-                        0
-                    }
+                    (outline_tokens * 100)
+                        .checked_div(file_tokens)
+                        .map(|pct| 100usize.saturating_sub(pct))
+                        .unwrap_or(0)
                 );
             } else {
                 return format::not_found_file(&params.0.path);
@@ -8758,7 +8757,7 @@ impl SymForgeServer {
             *file_counts.entry(path.clone()).or_default() += 1;
         }
         let mut related_files: Vec<(String, usize)> = file_counts.into_iter().collect();
-        related_files.sort_by(|a, b| b.1.cmp(&a.1));
+        related_files.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         related_files.truncate(limit);
 
         // Depth 2+: enrich top symbol hits with signatures and dependents

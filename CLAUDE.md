@@ -1,13 +1,23 @@
 # CLAUDE.md — SymForge
 
 ## Verification (symforge)
-- Backend: `cargo fmt --check`, `cargo check`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
+- Backend: `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
+## CI Gates
+
+- PR and push CI run version sync, `cargo fmt --check`, `cargo check`,
+  `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
+  `cargo build --release`, and npm tests.
+- Scheduled and manual CI additionally run ignored performance smoke coverage:
+  `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
+- Full real-repo coupling calibration is operator-triggered with
+  `SYMFORGE_CALIBRATION_REPOS`; standard CI must not depend on local paths.
+
 ## Architecture
 
-Rust MCP server providing symbol-aware code navigation and editing tools. Current MCP `tools/list` exposes 31 canonical tools, including `health_compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
+Rust MCP server providing symbol-aware code navigation and editing tools. Current MCP `tools/list` exposes 32 canonical tools, including `health_compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests

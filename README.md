@@ -410,6 +410,7 @@ metadata instead of terminating when those checks fail.
 ```bash
 cargo fmt --check
 cargo check
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets -- --test-threads=1
 cargo build --release
 ```
@@ -419,6 +420,26 @@ The npm wrapper has its own tests:
 ```bash
 cd npm
 npm test
+```
+
+The Rust toolchain is pinned by `rust-toolchain.toml` to Rust 1.95.0 with
+`rustfmt` and `clippy`; the crate uses Rust edition 2024. PR and push CI run
+version sync, formatting, `cargo check`, clippy with warnings denied, the full
+Rust test suite, a release build, and npm tests.
+
+Scheduled and manual CI also run bounded ignored performance evidence:
+
+```bash
+cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1
+cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --test-threads=1 --nocapture
+```
+
+The full real-repo coupling calibration remains operator-triggered. Provide a
+portable corpus with `SYMFORGE_CALIBRATION_REPOS`, for example
+`symforge=/repos/symforge;tokio=/repos/tokio;magika=/repos/magika`, then run:
+
+```bash
+cargo test --release --test coupling_calibration calibrate_against_real_repos -- --ignored --test-threads=1 --nocapture
 ```
 
 The release workflow is driven by Release Please on `main`. When a release is

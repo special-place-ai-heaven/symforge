@@ -538,7 +538,7 @@ fn outline_text(
         }
 
         // Sort by caller count descending, take top 5.
-        symbol_callers.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        symbol_callers.sort_by_key(|(_, callers)| std::cmp::Reverse(callers.len()));
         symbol_callers.truncate(5);
 
         if !symbol_callers.is_empty() {

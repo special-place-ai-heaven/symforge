@@ -58,14 +58,12 @@ fn classify_swift_class(node: &Node) -> SymbolKind {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "enum_class_body" => has_enum_body = true,
-            "user_type" | "type_identifier" => {
-                if first_name_kind.is_none() {
-                    first_name_kind = Some(if child.kind() == "user_type" {
-                        "user_type"
-                    } else {
-                        "type_identifier"
-                    });
-                }
+            "user_type" | "type_identifier" if first_name_kind.is_none() => {
+                first_name_kind = Some(if child.kind() == "user_type" {
+                    "user_type"
+                } else {
+                    "type_identifier"
+                });
             }
             _ => {}
         }

@@ -6,9 +6,17 @@
 //! as product code — it exists purely to generate evidence for the
 //! ADR's default coefficients.
 //!
-//! Run:
+//! Portable CI/manual smoke:
+//!   cargo test --release --test coupling_calibration calibrate_current_repo_smoke -- --ignored --nocapture
+//!
+//! Full operator corpus:
+//!   SYMFORGE_CALIBRATION_REPOS="symforge=/path/to/symforge;tokio=/path/to/tokio;magika=/path/to/magika" \
+//!   cargo test --release --test coupling_calibration calibrate_against_real_repos -- --ignored --nocapture
+//!
+//! Legacy local run shape:
 //!   cargo test --release --test coupling_calibration -- --ignored --nocapture
 
+use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -18,14 +26,13 @@ use symforge::live_index::coupling::{CouplingStore, WalkerConfig, cold_build};
 #[test]
 #[ignore]
 fn calibrate_against_real_repos() {
-    // Corpus per Tentacle 2 brief: SymForge (self-host Rust), tokio
-    // (large Rust async runtime), magika (polyglot with Python + JS +
-    // Rust under one roof).
-    let targets: &[(&str, &str)] = &[
-        ("symforge", "C:/AI_STUFF/PROGRAMMING/symforge"),
-        ("tokio", "C:/AI_STUFF/temp/tokio"),
-        ("magika", "C:/AI_STUFF/temp/magika"),
-    ];
+    let targets = calibration_targets_from_env();
+    assert!(
+        targets.len() >= 3,
+        "full calibration requires SYMFORGE_CALIBRATION_REPOS with at least \
+         three name=path entries, for example \
+         symforge=/repos/symforge;tokio=/repos/tokio;magika=/repos/magika"
+    );
 
     println!("\n\n# Coupling calibration run\n");
     println!(
@@ -40,12 +47,12 @@ fn calibrate_against_real_repos() {
     // Pin corpus state: record each repo's HEAD SHA + bail if the corpus
     // is smaller than the Tentacle 2 brief requires (3 repos). Silently
     // under-sampling would weaken the ADR's auditability.
-    let mut present: Vec<(&str, &str, String)> = Vec::new();
+    let mut present: Vec<(&str, &Path, String)> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
-    for (name, repo_path) in targets {
-        match read_head_sha(Path::new(repo_path)) {
-            Some(sha) => present.push((*name, *repo_path, sha)),
-            None => missing.push(*name),
+    for (name, repo_path) in &targets {
+        match read_head_sha(repo_path) {
+            Some(sha) => present.push((name, repo_path.as_path(), sha)),
+            None => missing.push(name),
         }
     }
 
@@ -53,7 +60,7 @@ fn calibrate_against_real_repos() {
     println!("| repo | path | HEAD SHA |");
     println!("|---|---|---|");
     for (name, path, sha) in &present {
-        println!("| {name} | `{path}` | `{sha}` |");
+        println!("| {name} | `{}` | `{sha}` |", path.display());
     }
     for name in &missing {
         println!("| {name} | — | _missing_ |");
@@ -68,9 +75,41 @@ fn calibrate_against_real_repos() {
 
     for (name, repo_path, _sha) in &present {
         for include_symbols in [false, true] {
-            run_calibration(name, Path::new(repo_path), include_symbols);
+            run_calibration(name, repo_path, include_symbols);
         }
     }
+}
+
+#[test]
+#[ignore]
+fn calibrate_current_repo_smoke() {
+    let repo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut cfg = WalkerConfig::system_now();
+    cfg.max_commits = 50;
+    cfg.window_days = 365;
+    cfg.include_symbols = false;
+
+    run_calibration_with_config("symforge-ci-smoke", repo_path, cfg);
+}
+
+fn calibration_targets_from_env() -> Vec<(String, PathBuf)> {
+    let Ok(raw) = env::var("SYMFORGE_CALIBRATION_REPOS") else {
+        return Vec::new();
+    };
+    raw.split(';')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, path) = entry.split_once('=').unwrap_or_else(|| {
+                panic!(
+                    "invalid SYMFORGE_CALIBRATION_REPOS entry `{entry}`; expected name=/repo/path"
+                )
+            });
+            Some((name.trim().to_string(), PathBuf::from(path.trim())))
+        })
+        .collect()
 }
 
 fn read_head_sha(repo_path: &Path) -> Option<String> {
@@ -84,7 +123,13 @@ fn read_head_sha(repo_path: &Path) -> Option<String> {
 }
 
 fn run_calibration(name: &str, repo_path: &Path, include_symbols: bool) {
-    let mode = if include_symbols {
+    let mut cfg = WalkerConfig::system_now();
+    cfg.include_symbols = include_symbols;
+    run_calibration_with_config(name, repo_path, cfg);
+}
+
+fn run_calibration_with_config(name: &str, repo_path: &Path, cfg: WalkerConfig) {
+    let mode = if cfg.include_symbols {
         "file+symbol"
     } else {
         "file-only"
@@ -94,9 +139,6 @@ fn run_calibration(name: &str, repo_path: &Path, include_symbols: bool) {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("coupling.db");
-
-    let mut cfg = WalkerConfig::system_now();
-    cfg.include_symbols = include_symbols;
 
     let stats;
     let build_time_ms;
