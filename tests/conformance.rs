@@ -270,6 +270,47 @@ fn edit_tools_accept_dry_run_parameter() {
 }
 
 #[test]
+fn edit_tools_accept_optional_idempotency_key_parameter() {
+    let edit_tools = [
+        "replace_symbol_body",
+        "edit_within_symbol",
+        "insert_symbol",
+        "delete_symbol",
+        "batch_edit",
+        "batch_insert",
+        "batch_rename",
+    ];
+
+    for tool_name in edit_tools {
+        let tools = SymForgeServer::tool_definitions();
+        let tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == tool_name)
+            .unwrap_or_else(|| panic!("edit tool '{tool_name}' not found"));
+
+        let schema = tool.input_schema.as_ref();
+        let properties = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap_or_else(|| panic!("tool '{tool_name}' has no properties"));
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(
+            properties.contains_key("idempotency_key"),
+            "edit tool '{tool_name}' must accept idempotency_key parameter"
+        );
+        assert!(
+            !required.iter().any(|value| value == "idempotency_key"),
+            "edit tool '{tool_name}' idempotency_key parameter must be optional"
+        );
+    }
+}
+
+#[test]
 fn estimate_parameter_on_read_tools() {
     let estimate_tools = [
         "get_file_content",

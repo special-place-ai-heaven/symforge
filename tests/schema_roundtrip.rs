@@ -219,6 +219,32 @@ fn index_folder_idempotency_key_is_optional_and_roundtrips() {
     );
 }
 
+#[test]
+fn edit_mutation_idempotency_key_is_optional_in_tool_schemas() {
+    for tool_name in [
+        "replace_symbol_body",
+        "insert_symbol",
+        "delete_symbol",
+        "edit_within_symbol",
+        "batch_edit",
+        "batch_rename",
+        "batch_insert",
+    ] {
+        let schema = tool_schema(tool_name);
+        let props = schema_property_names(&schema);
+        assert!(
+            props.iter().any(|name| name == "idempotency_key"),
+            "{tool_name} schema should advertise optional idempotency_key"
+        );
+        assert!(
+            !schema_required_fields(&schema)
+                .iter()
+                .any(|name| name == "idempotency_key"),
+            "{tool_name} idempotency_key must be optional for backward compatibility"
+        );
+    }
+}
+
 schema_roundtrip_test!(roundtrip_what_changed, "what_changed", WhatChangedInput);
 schema_roundtrip_test!(
     roundtrip_get_file_content,

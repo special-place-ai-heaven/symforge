@@ -994,6 +994,9 @@ pub struct ReplaceSymbolBodyInput {
     /// When true, validate and preview but skip the actual write.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
     /// `worktree-awareness` feature hook to redirect the write into the
     /// matching git worktree. Omit to preserve today's behaviour (write to
@@ -1021,6 +1024,9 @@ pub struct InsertSymbolInput {
     /// When true, validate and preview but skip the actual write.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
     /// `worktree-awareness` feature hook to redirect the write into the
     /// matching git worktree.
@@ -1042,6 +1048,9 @@ pub struct DeleteSymbolInput {
     /// When true, validate and preview but skip the actual write.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
     /// `worktree-awareness` feature hook to redirect the write into the
     /// matching git worktree.
@@ -1070,6 +1079,9 @@ pub struct EditWithinSymbolInput {
     /// When true, validate and preview but skip the actual write.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
     /// `worktree-awareness` feature hook to redirect the write into the
     /// matching git worktree.
@@ -1091,6 +1103,9 @@ pub struct BatchEditInput {
     /// Returns per-edit preview lines prefixed with `[DRY RUN]`.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Applies to all edits in the
     /// batch unless a per-edit override is set. Consumed by the
     /// `worktree-awareness` feature hook to redirect writes into the matching
@@ -1699,6 +1714,9 @@ pub struct BatchRenameInput {
     /// When true, show what would change without writing any files.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// When true, exclude non-source files (docs, configs, images) from renaming.
     /// Only files with a recognized programming language extension are included.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
@@ -2099,6 +2117,9 @@ pub struct BatchInsertInput {
     /// Returns per-target preview lines prefixed with `[DRY RUN]`.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,
+    /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     /// Caller's working directory (absolute path). Applies to all targets in
     /// the batch unless a per-target override is set. Consumed by the
     /// `worktree-awareness` feature hook to redirect writes into the matching
@@ -3733,6 +3754,7 @@ mod tests {
                 },
             ],
             dry_run: Some(false),
+            idempotency_key: None,
             working_directory: None,
         };
 
@@ -3783,6 +3805,7 @@ mod tests {
                 },
             ],
             dry_run: Some(true),
+            idempotency_key: None,
             working_directory: None,
         };
 
@@ -3863,6 +3886,7 @@ mod tests {
                 },
             ],
             dry_run: Some(false),
+            idempotency_key: None,
             working_directory: None,
         };
 
@@ -4061,6 +4085,7 @@ mod tests {
             kind: None,
             symbol_line: None,
             dry_run: Some(false),
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };

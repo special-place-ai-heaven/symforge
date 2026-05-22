@@ -436,6 +436,26 @@ pub fn begin_index_folder_replay(
     }
 }
 
+pub fn begin_tool_replay(
+    store_root: &Path,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+) -> Result<ReplayStart, IdempotencyError> {
+    let key = IdempotencyKey::new(raw_key)?;
+    let request_hash = RequestHash::for_tool_request(tool_name, request)?;
+    let store = FileReplayStore::open(store_root)?;
+
+    match store.check_or_reserve(&key, &request_hash)? {
+        ReplayDecision::FirstExecution(_) => Ok(ReplayStart::FirstExecution(ActiveReplay {
+            store,
+            key,
+            request_hash,
+        })),
+        ReplayDecision::Replay(record) => Ok(ReplayStart::Replay(replay_response(&record))),
+    }
+}
+
 fn same_normalized_path(left: &Path, right: &Path) -> bool {
     normalized_path_string(left) == normalized_path_string(right)
 }

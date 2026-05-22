@@ -2323,6 +2323,60 @@ fn prepare_project_wide_rename(
     }
 }
 
+fn begin_mutation_replay<T: Serialize>(
+    repo_root: &Path,
+    tool_name: &str,
+    input: &T,
+    idempotency_key: Option<&str>,
+    dry_run: bool,
+) -> Result<Option<crate::idempotency::ActiveReplay>, String> {
+    if dry_run {
+        return Ok(None);
+    }
+    let Some(raw_key) = idempotency_key else {
+        return Ok(None);
+    };
+
+    let mut request = serde_json::to_value(input)
+        .map_err(|error| crate::idempotency::format_tool_error(&error.into()))?;
+    if let serde_json::Value::Object(map) = &mut request {
+        map.remove("idempotency_key");
+    }
+
+    match crate::idempotency::begin_tool_replay(repo_root, tool_name, raw_key, &request) {
+        Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Ok(Some(active)),
+        Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
+        Err(error) => Err(crate::idempotency::format_tool_error(&error)),
+    }
+}
+
+fn complete_mutation_replay(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    output: &mut String,
+) {
+    if let Some(idempotency) = idempotency
+        && let Err(error) = idempotency.complete(output.clone())
+    {
+        output.push_str(&format!(
+            "\nIdempotency warning: failed to store replay result: {error}"
+        ));
+    }
+}
+
+fn fail_mutation_replay(idempotency: &Option<crate::idempotency::ActiveReplay>, output: &str) {
+    if let Some(idempotency) = idempotency {
+        let _ = idempotency.fail(output.to_string());
+    }
+}
+
+fn fail_and_return_mutation_replay(
+    idempotency: &Option<crate::idempotency::ActiveReplay>,
+    output: String,
+) -> String {
+    fail_mutation_replay(idempotency, &output);
+    output
+}
+
 fn symbol_anchor(path: &str, symbol: &crate::domain::SymbolRecord) -> String {
     format!("{path}:{}", symbol.line_range.0.saturating_add(1))
 }
@@ -9330,6 +9384,16 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "replace_symbol_body",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            params.0.dry_run.unwrap_or(false),
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         let working_directory = params
             .0
             .working_directory
@@ -9343,7 +9407,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -9353,14 +9417,19 @@ impl SymForgeServer {
         };
         let file = match file {
             Some(f) => f,
-            None => return format::not_found_file(&params.0.path),
+            None => {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    format::not_found_file(&params.0.path),
+                );
+            }
         };
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "replace_symbol_body",
         ) {
-            return warning;
+            return fail_and_return_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -9369,7 +9438,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -9435,7 +9504,11 @@ impl SymForgeServer {
             edit::apply_splice(&file.content, (line_start, sym.byte_range.1), &indented);
         let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
             Ok(report) => report,
-            Err(e) => return format!("Error writing {}: {e}", params.0.path),
+            Err(e) => {
+                let output = format!("Error writing {}: {e}", params.0.path);
+                fail_mutation_replay(&idempotency, &output);
+                return output;
+            }
         };
         let old_sig = edit::extract_signature(&file.content, sym.byte_range);
         let new_sig = params.0.new_body.lines().next().unwrap_or("").to_string();
@@ -9486,6 +9559,7 @@ impl SymForgeServer {
             &resolved_target,
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+        complete_mutation_replay(&idempotency, &mut result);
         result
     }
 
@@ -9532,6 +9606,16 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "insert_symbol",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            params.0.dry_run.unwrap_or(false),
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         let working_directory = params
             .0
             .working_directory
@@ -9545,7 +9629,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -9555,14 +9639,19 @@ impl SymForgeServer {
         };
         let file = match file {
             Some(f) => f,
-            None => return format::not_found_file(&params.0.path),
+            None => {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    format::not_found_file(&params.0.path),
+                );
+            }
         };
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "insert_symbol",
         ) {
-            return warning;
+            return fail_and_return_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -9571,7 +9660,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -9603,7 +9692,11 @@ impl SymForgeServer {
         };
         let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
             Ok(report) => report,
-            Err(e) => return format!("Error writing {}: {e}", params.0.path),
+            Err(e) => {
+                let output = format!("Error writing {}: {e}", params.0.path);
+                fail_mutation_replay(&idempotency, &output);
+                return output;
+            }
         };
         edit::reindex_after_write(
             &self.index,
@@ -9634,6 +9727,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        complete_mutation_replay(&idempotency, &mut out);
         out
     }
 
@@ -9675,6 +9769,16 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "delete_symbol",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            params.0.dry_run.unwrap_or(false),
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         let working_directory = params
             .0
             .working_directory
@@ -9688,7 +9792,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -9698,14 +9802,19 @@ impl SymForgeServer {
         };
         let file = match file {
             Some(f) => f,
-            None => return format::not_found_file(&params.0.path),
+            None => {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    format::not_found_file(&params.0.path),
+                );
+            }
         };
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
             "delete_symbol",
         ) {
-            return warning;
+            return fail_and_return_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -9714,7 +9823,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
@@ -9741,7 +9850,11 @@ impl SymForgeServer {
         let new_content = edit::build_delete(&file.content, &sym, line_ending);
         let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
             Ok(report) => report,
-            Err(e) => return format!("Error writing {}: {e}", params.0.path),
+            Err(e) => {
+                let output = format!("Error writing {}: {e}", params.0.path);
+                fail_mutation_replay(&idempotency, &output);
+                return output;
+            }
         };
         edit::reindex_after_write(
             &self.index,
@@ -9772,6 +9885,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        complete_mutation_replay(&idempotency, &mut out);
         out
     }
 
@@ -9815,6 +9929,16 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "edit_within_symbol",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            params.0.dry_run.unwrap_or(false),
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         let working_directory = params
             .0
             .working_directory
@@ -9828,7 +9952,7 @@ impl SymForgeServer {
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
             Ok(r) => r,
-            Err(e) => return format!("Error: {e}"),
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, format!("Error: {e}")),
         };
         let resolved_path = resolved_target.target_path.clone();
         let file = {
@@ -9838,14 +9962,19 @@ impl SymForgeServer {
         };
         let file = match file {
             Some(f) => f,
-            None => return format::not_found_file(&params.0.path),
+            None => {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    format::not_found_file(&params.0.path),
+                );
+            }
         };
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::TextEditSafe,
             "edit_within_symbol",
         ) {
-            return warning;
+            return fail_and_return_mutation_replay(&idempotency, warning);
         }
         let (_, sym) = match edit::resolve_or_error(
             &file,
@@ -9854,7 +9983,7 @@ impl SymForgeServer {
             params.0.symbol_line,
         ) {
             Ok(s) => s,
-            Err(e) => return e,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
         };
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         let sym_start = sym.effective_start() as usize;
@@ -9862,7 +9991,12 @@ impl SymForgeServer {
         let body = &file.content[sym_start..sym_end];
         let body_str = match std::str::from_utf8(body) {
             Ok(s) => s,
-            Err(_) => return "Error: symbol body is not valid UTF-8.".to_string(),
+            Err(_) => {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    "Error: symbol body is not valid UTF-8.".to_string(),
+                );
+            }
         };
         // Normalize both old_text and new_text to match file line endings.
         let line_ending = edit::detect_line_ending(&file.content);
@@ -9917,7 +10051,7 @@ impl SymForgeServer {
                             } else {
                                 String::new()
                             };
-                            return format!(
+                            let output = format!(
                                 "Error: `{}` not found within symbol `{}`. \
                                  The symbol body is ({} bytes):\n```\n{}{}\n```",
                                 params.0.old_text,
@@ -9926,6 +10060,7 @@ impl SymForgeServer {
                                 preview,
                                 truncated
                             );
+                            return fail_and_return_mutation_replay(&idempotency, output);
                         }
                     }
                 }
@@ -9940,7 +10075,7 @@ impl SymForgeServer {
                 } else {
                     String::new()
                 };
-                return format!(
+                let output = format!(
                     "Error: `{}` not found within symbol `{}`. \
                      The symbol body is ({} bytes):\n```\n{}{}\n```",
                     params.0.old_text,
@@ -9949,6 +10084,7 @@ impl SymForgeServer {
                     preview,
                     truncated
                 );
+                return fail_and_return_mutation_replay(&idempotency, output);
             }
             let mut result = format!(
                 "{}\n[DRY RUN] Would edit within `{}` in {} ({} replacement(s))",
@@ -9973,7 +10109,7 @@ impl SymForgeServer {
             } else {
                 String::new()
             };
-            return format!(
+            let output = format!(
                 "Error: `{}` not found within symbol `{}`. \
                  The symbol body is ({} bytes):\n```\n{}{}\n```",
                 params.0.old_text,
@@ -9982,13 +10118,18 @@ impl SymForgeServer {
                 preview,
                 truncated
             );
+            return fail_and_return_mutation_replay(&idempotency, output);
         }
         let old_sym_bytes = sym_end - sym_start;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
         let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
         let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
             Ok(report) => report,
-            Err(e) => return format!("Error writing {}: {e}", params.0.path),
+            Err(e) => {
+                let output = format!("Error writing {}: {e}", params.0.path);
+                fail_mutation_replay(&idempotency, &output);
+                return output;
+            }
         };
         edit::reindex_after_write(
             &self.index,
@@ -10020,6 +10161,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        complete_mutation_replay(&idempotency, &mut out);
         out
     }
 
@@ -10079,11 +10221,22 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "batch_edit",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            dry_run,
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         match edit::execute_batch_edit(
             &self.index,
             &repo_root,
             &params.0.edits,
-            params.0.dry_run.unwrap_or(false),
+            dry_run,
             params
                 .0
                 .working_directory
@@ -10098,7 +10251,7 @@ impl SymForgeServer {
                     .map(|e| e.path.as_str())
                     .collect::<std::collections::HashSet<_>>()
                     .len();
-                let write_semantics = if params.0.dry_run.unwrap_or(false) {
+                let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
                 } else {
                     edit_format::EditWriteSemantics::TransactionalWriteRollbackAndReindex
@@ -10123,9 +10276,13 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                complete_mutation_replay(&idempotency, &mut result);
                 result
             }
-            Err(e) => e,
+            Err(e) => {
+                fail_mutation_replay(&idempotency, &e);
+                e
+            }
         }
     }
 
@@ -10158,9 +10315,20 @@ impl SymForgeServer {
             loading_guard!(guard);
         }
         let source_authority = prepare_project_wide_rename(self, &repo_root);
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "batch_rename",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            dry_run,
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         match edit::execute_batch_rename(&self.index, &repo_root, &params.0) {
             Ok(summary) => {
-                let write_semantics = if params.0.dry_run.unwrap_or(false) {
+                let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
                 } else {
                     edit_format::EditWriteSemantics::TransactionalWriteRollbackAndReindex
@@ -10184,9 +10352,13 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                complete_mutation_replay(&idempotency, &mut result);
                 result
             }
-            Err(e) => e,
+            Err(e) => {
+                fail_mutation_replay(&idempotency, &e);
+                e
+            }
         }
     }
 
@@ -10243,6 +10415,17 @@ impl SymForgeServer {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
+        let dry_run = params.0.dry_run.unwrap_or(false);
+        let idempotency = match begin_mutation_replay(
+            &repo_root,
+            "batch_insert",
+            &params.0,
+            params.0.idempotency_key.as_deref(),
+            dry_run,
+        ) {
+            Ok(idempotency) => idempotency,
+            Err(output) => return output,
+        };
         match edit::execute_batch_insert(&self.index, &repo_root, &params.0) {
             Ok(summaries) => {
                 let file_count = params
@@ -10252,7 +10435,7 @@ impl SymForgeServer {
                     .map(|t| t.path.as_str())
                     .collect::<std::collections::HashSet<_>>()
                     .len();
-                let write_semantics = if params.0.dry_run.unwrap_or(false) {
+                let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
                 } else {
                     edit_format::EditWriteSemantics::TransactionalWriteRollbackAndReindex
@@ -10277,9 +10460,13 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                complete_mutation_replay(&idempotency, &mut result);
                 result
             }
-            Err(e) => e,
+            Err(e) => {
+                fail_mutation_replay(&idempotency, &e);
+                e
+            }
         }
     }
 }
@@ -15576,6 +15763,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn present() {\n    println!(\"new\");\n}".to_string(),
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15599,6 +15787,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn present() {\n    println!(\"planned\");\n}".to_string(),
                     dry_run: Some(true),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15620,6 +15809,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn missing_symbol() {}".to_string(),
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15638,6 +15828,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn duplicate() { changed(); }".to_string(),
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15657,6 +15848,7 @@ mod tests {
                         working_directory: None,
                     }],
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15684,6 +15876,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn present() { changed(); }".to_string(),
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15739,6 +15932,7 @@ mod tests {
                     symbol_line: None,
                     new_body: "fn present() {\n    println!(\"new\");\n}".to_string(),
                     dry_run: Some(true),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15882,6 +16076,7 @@ mod tests {
                         },
                     ],
                     dry_run: Some(true),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15925,6 +16120,7 @@ mod tests {
                         },
                     ],
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15963,6 +16159,7 @@ mod tests {
                         },
                     ],
                     dry_run: Some(false),
+                    idempotency_key: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15981,6 +16178,236 @@ mod tests {
             operation_statuses[0]["status"],
             serde_json::json!("not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn test_edit_idempotency_replays_same_key_same_request_without_second_write() {
+        let source = b"fn present() {\n    old();\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "new_body": "fn present() {\n    new();\n}",
+            "dry_run": false,
+            "idempotency_key": "edit-replay-same-request",
+        });
+
+        let first = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                request.clone(),
+            )))
+            .await;
+        assert!(first.contains("replaced"));
+        let written_once = std::fs::read_to_string(&file_path).unwrap();
+        assert!(written_once.contains("new();"));
+
+        let second = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(request)))
+            .await;
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
+    }
+
+    #[tokio::test]
+    async fn test_edit_idempotency_rejects_same_key_different_request_before_file_changes() {
+        let source = b"fn present() {\n    old();\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let first_request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "new_body": "fn present() {\n    first();\n}",
+            "dry_run": false,
+            "idempotency_key": "edit-conflict-same-key",
+        });
+        let second_request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "new_body": "fn present() {\n    second();\n}",
+            "dry_run": false,
+            "idempotency_key": "edit-conflict-same-key",
+        });
+
+        let first = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                first_request,
+            )))
+            .await;
+        assert!(first.contains("replaced"));
+
+        let conflict = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                second_request,
+            )))
+            .await;
+        let content = std::fs::read_to_string(&file_path).unwrap();
+
+        assert!(conflict.contains("Idempotency conflict"));
+        assert!(content.contains("first();"));
+        assert!(!content.contains("second();"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_idempotency_dry_run_does_not_poison_committed_replay_state() {
+        let source = b"fn present() {\n    old();\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let dry_run_request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "new_body": "fn present() {\n    planned();\n}",
+            "dry_run": true,
+            "idempotency_key": "edit-dry-run-ignored",
+        });
+        let commit_request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "new_body": "fn present() {\n    committed();\n}",
+            "dry_run": false,
+            "idempotency_key": "edit-dry-run-ignored",
+        });
+
+        let dry_run = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                dry_run_request,
+            )))
+            .await;
+        assert!(dry_run.contains("[DRY RUN]"));
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("old();")
+        );
+
+        let committed = server
+            .replace_symbol_body(Parameters(replace_symbol_body_input_from_json(
+                commit_request,
+            )))
+            .await;
+        assert!(committed.contains("replaced"));
+        assert!(
+            std::fs::read_to_string(&file_path)
+                .unwrap()
+                .contains("committed();")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_symbol_idempotency_replays_after_symbol_is_removed() {
+        let source = b"fn target() {}\nfn keep() {}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "target",
+            "dry_run": false,
+            "idempotency_key": "delete-symbol-replay-after-removal",
+        });
+
+        let first = server
+            .delete_symbol(Parameters(delete_symbol_input_from_json(request.clone())))
+            .await;
+        assert!(first.contains("deleted"));
+        let written_once = std::fs::read_to_string(&file_path).unwrap();
+        assert!(!written_once.contains("fn target"));
+        assert!(written_once.contains("fn keep"));
+
+        let second = server
+            .delete_symbol(Parameters(delete_symbol_input_from_json(request)))
+            .await;
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_idempotency_replays_after_old_text_is_replaced() {
+        let source = b"fn present() {\n    old();\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let request = serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "present",
+            "old_text": "old();",
+            "new_text": "new();",
+            "replace_all": false,
+            "dry_run": false,
+            "idempotency_key": "edit-within-replay-after-replacement",
+        });
+
+        let first = server
+            .edit_within_symbol(Parameters(edit_within_symbol_input_from_json(
+                request.clone(),
+            )))
+            .await;
+        assert!(first.contains("edited"));
+        let written_once = std::fs::read_to_string(&file_path).unwrap();
+        assert!(written_once.contains("new();"));
+        assert!(!written_once.contains("old();"));
+
+        let second = server
+            .edit_within_symbol(Parameters(edit_within_symbol_input_from_json(request)))
+            .await;
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
+    }
+
+    #[tokio::test]
+    async fn test_batch_edit_idempotency_replay_preserves_operation_status_metadata() {
+        let source = b"fn alpha() {\n    old();\n}\nfn beta() {}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let request = batch_replace_request_json(
+            "batch-edit-replay-same-request",
+            "fn alpha() {\n    new();\n}",
+        );
+
+        let first = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(batch_edit_input_from_json(request.clone())))
+                .await,
+        );
+        assert_tool_result_edit_status(&first, "success", OutcomeClass::Found);
+        assert_eq!(
+            first["_meta"][RESULT_STATUS_META_KEY]["operations"][0]["status"],
+            serde_json::json!("success")
+        );
+        let written_once = std::fs::read_to_string(&file_path).unwrap();
+        assert!(written_once.contains("new();"));
+
+        let second = serialized_tool_result(
+            server
+                .batch_edit_tool(Parameters(batch_edit_input_from_json(request)))
+                .await,
+        );
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), written_once);
+    }
+
+    #[tokio::test]
+    async fn test_batch_edit_idempotency_rejects_same_key_different_request_before_file_changes() {
+        let source = b"fn alpha() {\n    old();\n}\nfn beta() {}\n";
+        let (_dir, server, file_path) = setup_edit_test(source);
+        let first_request = batch_replace_request_json(
+            "batch-edit-conflict-same-key",
+            "fn alpha() {\n    first();\n}",
+        );
+        let second_request = batch_replace_request_json(
+            "batch-edit-conflict-same-key",
+            "fn alpha() {\n    second();\n}",
+        );
+
+        let first = server
+            .batch_edit(Parameters(batch_edit_input_from_json(first_request)))
+            .await;
+        assert!(first.contains("replaced"));
+
+        let conflict = server
+            .batch_edit(Parameters(batch_edit_input_from_json(second_request)))
+            .await;
+        let content = std::fs::read_to_string(&file_path).unwrap();
+
+        assert!(conflict.contains("Idempotency conflict"));
+        assert!(content.contains("first();"));
+        assert!(!content.contains("second();"));
     }
 
     #[tokio::test]
@@ -19973,6 +20400,50 @@ mod tests {
         (dir, server, file_path)
     }
 
+    fn replace_symbol_body_input_from_json(
+        value: serde_json::Value,
+    ) -> crate::protocol::edit::ReplaceSymbolBodyInput {
+        serde_json::from_value(value).expect("valid replace_symbol_body input")
+    }
+
+    fn delete_symbol_input_from_json(
+        value: serde_json::Value,
+    ) -> crate::protocol::edit::DeleteSymbolInput {
+        serde_json::from_value(value).expect("valid delete_symbol input")
+    }
+
+    fn edit_within_symbol_input_from_json(
+        value: serde_json::Value,
+    ) -> crate::protocol::edit::EditWithinSymbolInput {
+        serde_json::from_value(value).expect("valid edit_within_symbol input")
+    }
+
+    fn batch_edit_input_from_json(
+        value: serde_json::Value,
+    ) -> crate::protocol::edit::BatchEditInput {
+        serde_json::from_value(value).expect("valid batch_edit input")
+    }
+
+    fn batch_replace_request_json(idempotency_key: &str, new_body: &str) -> serde_json::Value {
+        let edits = serde_json::to_value(vec![crate::protocol::edit::SingleEdit {
+            path: "src/lib.rs".to_string(),
+            name: "alpha".to_string(),
+            kind: None,
+            symbol_line: None,
+            operation: crate::protocol::edit::EditOperation::Replace {
+                new_body: new_body.to_string(),
+            },
+            working_directory: None,
+        }])
+        .expect("single edit should serialize");
+
+        serde_json::json!({
+            "edits": edits,
+            "dry_run": false,
+            "idempotency_key": idempotency_key,
+        })
+    }
+
     fn setup_loaded_edit_test(files: &[(&str, &str)]) -> (TempDir, SymForgeServer) {
         let dir = tempfile::tempdir().unwrap();
         for (relative_path, content) in files {
@@ -20085,6 +20556,7 @@ mod tests {
             symbol_line: None,
             new_body: "fn hello() {\n    println!(\"HELLO\");\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20135,6 +20607,7 @@ mod tests {
             symbol_line: None,
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20173,6 +20646,7 @@ mod tests {
                 "/// New doc.\npub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}"
                     .to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20210,6 +20684,7 @@ mod tests {
             symbol_line: None,
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20245,6 +20720,7 @@ mod tests {
             symbol_line: None,
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20294,6 +20770,7 @@ mod tests {
             new_body: "export function add(a: number, b: number): number {\n    return a + b;\n}"
                 .to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20332,6 +20809,7 @@ mod tests {
             symbol_line: None,
             new_body: "export function legacy(): number {\n    return 2;\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20365,6 +20843,7 @@ mod tests {
             symbol_line: None,
             new_body: "pub fn legacy() -> i32 {\n    2\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20400,6 +20879,7 @@ mod tests {
             symbol_line: None,
             new_body: "fn inner() {\n    new_body();\n}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20425,6 +20905,7 @@ mod tests {
             symbol_line: None,
             new_body: "fn foo() {}".to_string(),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20447,6 +20928,7 @@ mod tests {
             content: "fn world() {\n    println!(\"world\");\n}".to_string(),
             position: None, // defaults to "after"
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.insert_symbol(Parameters(input)).await;
@@ -20478,6 +20960,7 @@ mod tests {
             content: "fn hello() {\n    println!(\"hello\");\n}".to_string(),
             position: Some("before".to_string()),
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.insert_symbol(Parameters(input)).await;
@@ -20501,6 +20984,7 @@ mod tests {
             kind: None,
             symbol_line: None,
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.delete_symbol(Parameters(input)).await;
@@ -20574,6 +21058,7 @@ mod tests {
             new_text: "\"HELLO\"".to_string(),
             replace_all: false,
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.edit_within_symbol(Parameters(input)).await;
@@ -20613,6 +21098,7 @@ mod tests {
             symbol_line: None,
             new_body: "fn hello() {\n    println!(\"new body\");\n}".to_string(),
             dry_run: Some(true),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20640,6 +21126,7 @@ mod tests {
             new_text: "replacement".to_string(),
             replace_all: false,
             dry_run: None,
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.edit_within_symbol(Parameters(input)).await;
@@ -20659,6 +21146,7 @@ mod tests {
                 symbol_line: None,
                 new_body: "fn foo() { new }".to_string(),
                 dry_run: Some(true),
+                idempotency_key: None,
                 working_directory: None,
             }))
             .await;
@@ -20690,6 +21178,7 @@ mod tests {
                 content: "fn new_fn() {}".to_string(),
                 position: Some("after".to_string()),
                 dry_run: Some(true),
+                idempotency_key: None,
                 working_directory: None,
             }))
             .await;
@@ -20719,6 +21208,7 @@ mod tests {
                 kind: None,
                 symbol_line: None,
                 dry_run: Some(true),
+                idempotency_key: None,
                 working_directory: None,
             }))
             .await;
@@ -20751,6 +21241,7 @@ mod tests {
                 new_text: "new_text".to_string(),
                 replace_all: false,
                 dry_run: Some(true),
+                idempotency_key: None,
                 working_directory: None,
             }))
             .await;
@@ -20819,6 +21310,7 @@ mod tests {
                 },
             ],
             dry_run: Some(false),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.batch_edit(Parameters(input)).await;
@@ -20896,6 +21388,7 @@ mod tests {
                 working_directory: None,
             }],
             dry_run: Some(true),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.batch_edit(Parameters(input)).await;
@@ -20948,6 +21441,7 @@ mod tests {
             symbol_line: None,
             new_name: "new_name".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21003,6 +21497,7 @@ mod tests {
             symbol_line: None,
             new_name: "new_name".to_string(),
             dry_run: Some(true),
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21060,6 +21555,7 @@ mod tests {
             symbol_line: None,
             new_name: "Gadget".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21116,6 +21612,7 @@ mod tests {
             symbol_line: None,
             new_name: "Gadget".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21199,6 +21696,7 @@ mod tests {
             symbol_line: None,
             new_name: "NewType".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21253,6 +21751,7 @@ mod tests {
             symbol_line: None,
             new_name: "NewType".to_string(),
             dry_run: Some(true),
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21307,6 +21806,7 @@ mod tests {
             symbol_line: None,
             new_name: "NewType".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21362,6 +21862,7 @@ mod tests {
             symbol_line: None,
             new_name: "Renamed".to_string(),
             dry_run: None,
+            idempotency_key: None,
             code_only: None,
             working_directory: None,
         };
@@ -21429,6 +21930,7 @@ mod tests {
                 },
             ],
             dry_run: Some(false),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.batch_insert(Parameters(input)).await;
@@ -21481,6 +21983,7 @@ mod tests {
                 working_directory: None,
             }],
             dry_run: Some(true),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.batch_insert(Parameters(input)).await;
@@ -21546,6 +22049,7 @@ mod tests {
                 },
             ],
             dry_run: Some(true),
+            idempotency_key: None,
             working_directory: None,
         };
         let result = server.batch_insert(Parameters(input)).await;
