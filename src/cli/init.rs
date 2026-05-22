@@ -297,6 +297,7 @@ pub fn merge_hooks_into_settings(
 
 const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__health",
+    "mcp__symforge__health_compact",
     "mcp__symforge__index_folder",
     "mcp__symforge__validate_file_syntax",
     "mcp__symforge__get_file_content",
@@ -330,6 +331,7 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
 
 const KILO_ALWAYS_ALLOW: &[&str] = &[
     "health",
+    "health_compact",
     "index_folder",
     "validate_file_syntax",
     "get_repo_map",
@@ -363,6 +365,7 @@ const KILO_ALWAYS_ALLOW: &[&str] = &[
 
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "health",
+    "health_compact",
     "get_repo_map",
     "explore",
     "validate_file_syntax",
@@ -1655,6 +1658,12 @@ mod tests {
             "should include get_file_context"
         );
         assert!(
+            allowed
+                .iter()
+                .any(|v| v.as_str() == Some("mcp__symforge__health_compact")),
+            "should include health_compact"
+        );
+        assert!(
             !allowed
                 .iter()
                 .any(|v| v.as_str() == Some("mcp__symforge__trace_symbol")),
@@ -1680,6 +1689,22 @@ mod tests {
         assert!(
             !CLAUDE_ALWAYS_ALLOW.contains(&"trace_symbol"),
             "Claude allow list should not grant retired trace_symbol alias"
+        );
+    }
+
+    #[test]
+    fn test_default_client_allow_lists_include_health_compact() {
+        assert!(
+            SYMFORGE_TOOL_NAMES.contains(&"mcp__symforge__health_compact"),
+            "Codex/client allow list should grant health_compact when conformance exposes it"
+        );
+        assert!(
+            KILO_ALWAYS_ALLOW.contains(&"health_compact"),
+            "Kilo allow list should grant health_compact when conformance exposes it"
+        );
+        assert!(
+            CLAUDE_ALWAYS_ALLOW.contains(&"health_compact"),
+            "Claude allow list should grant health_compact when conformance exposes it"
         );
     }
 
