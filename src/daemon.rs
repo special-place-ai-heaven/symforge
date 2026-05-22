@@ -479,7 +479,20 @@ impl DaemonState {
 
             match owning_project_id {
                 Some(pid) => {
-                    let project = projects.get_mut(&pid).unwrap();
+                    let Some(project) = projects.get_mut(&pid) else {
+                        tracing::warn!(
+                            project_id = %pid,
+                            session_id,
+                            "daemon close observed stale owning project; returning orphan close response"
+                        );
+                        let session = self.sessions.write().remove(session_id)?;
+                        return Some(CloseSessionResponse {
+                            session_id: session.session_id,
+                            project_id: "orphan".to_string(),
+                            remaining_sessions: 0,
+                            project_removed: false,
+                        });
+                    };
                     project.session_ids.remove(session_id);
                     let remaining = project.session_ids.len();
                     if remaining == 0 {
@@ -491,7 +504,7 @@ impl DaemonState {
                     (pid, remaining)
                 }
                 None => {
-                    // Session not found in any project — it was never registered under
+                    // Session not found in any project -- it was never registered under
                     // a project or its project was already removed. Clean up the session
                     // record only. We return "orphan" as the project_id because
                     // session.project_id may be stale (set at open time and never
@@ -1000,7 +1013,7 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
     }
 
     if let Ok(pid) = read_daemon_pid_file() {
-        if daemon_health_matches_recorded_pid(&health, pid) {
+        if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
                 tracing::warn!(
                     pid,
@@ -1008,7 +1021,7 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
                 );
             }
             wait_for_daemon_unhealthy(port).await;
-        } else {
+        } else if !daemon_health_matches_recorded_pid(&health, pid) {
             match health.pid {
                 Some(health_pid) => {
                     tracing::warn!(
@@ -1024,6 +1037,14 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
                     );
                 }
             }
+        } else {
+            tracing::warn!(
+                recorded_pid = pid,
+                daemon_pid = ?health.pid,
+                recorded_executable = %health.executable_path,
+                expected_executable = %identity.executable_path,
+                "not terminating incompatible symforge daemon because pid ownership/executable safety checks failed"
+            );
         }
     }
 
@@ -1123,6 +1144,83 @@ fn daemon_health_matches(health: &DaemonHealth, identity: &DaemonIdentity) -> bo
 
 fn daemon_health_matches_recorded_pid(health: &DaemonHealth, recorded_pid: u32) -> bool {
     health.pid == Some(recorded_pid)
+}
+
+fn should_terminate_recorded_daemon(
+    health: &DaemonHealth,
+    identity: &DaemonIdentity,
+    recorded_pid: u32,
+) -> bool {
+    if !daemon_health_matches_recorded_pid(health, recorded_pid) {
+        return false;
+    }
+
+    if !daemon_executable_name_matches_current(health, identity) {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !recorded_pid_owner_matches_current_user(recorded_pid).unwrap_or(false) {
+            return false;
+        }
+
+        if !recorded_pid_executable_matches_health(recorded_pid, health).unwrap_or(false) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn daemon_executable_name_matches_current(
+    health: &DaemonHealth,
+    identity: &DaemonIdentity,
+) -> bool {
+    let Some(health_name) = daemon_executable_file_name(&health.executable_path) else {
+        return false;
+    };
+    let Some(identity_name) = daemon_executable_file_name(&identity.executable_path) else {
+        return false;
+    };
+    health_name == identity_name
+}
+
+fn daemon_executable_file_name(path: &str) -> Option<String> {
+    if path == "unknown" {
+        return None;
+    }
+
+    let normalized = path.replace('\\', "/");
+    let name = normalized.rsplit('/').find(|part| !part.is_empty())?;
+    if cfg!(windows) {
+        Some(name.to_lowercase())
+    } else {
+        Some(name.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // Reading /proc ownership needs the current effective uid from libc.
+fn recorded_pid_owner_matches_current_user(pid: u32) -> Option<bool> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid_line = status.lines().find(|line| line.starts_with("Uid:"))?;
+    let effective_uid = uid_line.split_whitespace().nth(2)?.parse::<u32>().ok()?;
+    let current_uid = unsafe { libc::geteuid() as u32 };
+    Some(effective_uid == current_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn recorded_pid_executable_matches_health(pid: u32, health: &DaemonHealth) -> Option<bool> {
+    if health.executable_path == "unknown" {
+        return None;
+    }
+
+    let actual = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(
+        stable_path_identity(&normalized_path_string(&actual))
+            == stable_path_identity(&health.executable_path),
+    )
 }
 
 fn stable_path_identity(path: &str) -> String {
@@ -2302,6 +2400,32 @@ mod tests {
     }
 
     #[test]
+    fn test_close_session_handles_orphan_session_record_without_panic() {
+        let state = DaemonState::new();
+        let session_id = "stale-session".to_string();
+        state.sessions.write().insert(
+            session_id.clone(),
+            SessionRecord {
+                session_id: session_id.clone(),
+                project_id: "missing-project".to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(777),
+                opened_at: SystemTime::now(),
+                last_seen_at: AtomicU64::new(now_epoch_millis()),
+            },
+        );
+
+        let closed = state
+            .close_session(&session_id)
+            .expect("orphan session should still close");
+        assert_eq!(closed.session_id, session_id);
+        assert_eq!(closed.project_id, "orphan");
+        assert_eq!(closed.remaining_sessions, 0);
+        assert!(!closed.project_removed);
+        assert!(state.close_session(&closed.session_id).is_none());
+    }
+
+    #[test]
     fn test_heartbeat_updates_known_session() {
         let project = project_dir("symforge-daemon-e");
         let state = DaemonState::new();
@@ -2900,6 +3024,62 @@ mod tests {
 
         health.pid = None;
         assert!(!daemon_health_matches_recorded_pid(&health, 42));
+    }
+
+    #[tokio::test]
+    async fn test_stop_incompatible_recorded_daemon_does_not_kill_unrelated_pid() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-running child");
+
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-running child");
+
+        let child_pid = child.id();
+        let health = DaemonHealth {
+            project_count: 0,
+            session_count: 0,
+            daemon_version: current_daemon_identity().version,
+            executable_path: "C:/unrelated/not-symforge-daemon.exe".to_string(),
+            auth_required: false,
+            pid: Some(child_pid),
+        };
+        let (port, shutdown_tx) = spawn_fake_health_server(health).await;
+        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), port.to_string())
+            .expect("write daemon port");
+        std::fs::write(
+            daemon_home.path().join(DAEMON_PID_FILE),
+            child_pid.to_string(),
+        )
+        .expect("write daemon pid");
+
+        stop_incompatible_recorded_daemon(&current_daemon_identity())
+            .await
+            .expect("stop incompatible daemon");
+
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "daemon pid safety checks must not terminate unrelated processes"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = shutdown_tx.send(());
     }
 
     #[tokio::test]

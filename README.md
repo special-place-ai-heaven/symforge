@@ -375,6 +375,15 @@ unauthenticated so local readiness and compatibility checks can still discover
 the daemon, but health output reports only whether auth is required and never
 prints the token.
 
+Automatic stale-daemon cleanup is conservative. SymForge only terminates an
+incompatible recorded daemon when the pid file matches `/health`, the reported
+executable name matches the current SymForge executable, and platform safety
+checks pass. On Linux, cleanup also verifies `/proc/<pid>/status` ownership and
+`/proc/<pid>/exe` against the daemon's health report before sending a signal. On
+Windows and other platforms, where SymForge does not have a portable owner check,
+it falls back to the pid plus executable-name guard and logs/cleans stale
+metadata instead of terminating when those checks fail.
+
 ## Develop
 
 ```bash
