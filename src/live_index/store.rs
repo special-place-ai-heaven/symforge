@@ -329,13 +329,56 @@ pub enum IndexLoadSource {
     SnapshotRestore,
 }
 
+const SNAPSHOT_VERIFY_MISMATCH_PATH_LIMIT: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotVerifyReport {
+    pub mismatch_count: usize,
+    pub mismatched_paths: Vec<String>,
+}
+
+impl SnapshotVerifyReport {
+    pub fn from_mismatched_paths(mut paths: Vec<String>) -> Self {
+        paths.sort();
+        paths.dedup();
+        let mismatch_count = paths.len();
+        paths.truncate(SNAPSHOT_VERIFY_MISMATCH_PATH_LIMIT);
+        Self {
+            mismatch_count,
+            mismatched_paths: paths,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            mismatch_count: 0,
+            mismatched_paths: Vec::new(),
+        }
+    }
+
+    pub fn omitted_path_count(&self) -> usize {
+        self.mismatch_count
+            .saturating_sub(self.mismatched_paths.len())
+    }
+}
+
 /// Reconciliation status after restoring from a persisted snapshot.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotVerifyState {
     NotNeeded,
     Pending,
     Running,
-    Completed,
+    Completed(SnapshotVerifyReport),
+}
+
+impl SnapshotVerifyState {
+    pub fn completed_without_mismatches() -> Self {
+        Self::Completed(SnapshotVerifyReport::empty())
+    }
+
+    pub fn completed_with_mismatches(paths: Vec<String>) -> Self {
+        Self::Completed(SnapshotVerifyReport::from_mismatched_paths(paths))
+    }
 }
 
 /// Compact published status label for handle-level state consumers.
@@ -803,10 +846,10 @@ impl SharedIndexHandle {
         self.swap_and_publish(live);
     }
 
-    pub fn mark_snapshot_verify_completed(&self) {
+    pub fn mark_snapshot_verify_completed(&self, mismatched_paths: Vec<String>) {
         let _wg = self.write_mutex.lock();
         let mut live = (*self.live.load_full()).clone();
-        live.mark_snapshot_verify_completed();
+        live.mark_snapshot_verify_completed(mismatched_paths);
         self.swap_and_publish(live);
     }
 
@@ -939,7 +982,7 @@ impl PublishedIndexState {
             loaded_at_system: index.loaded_at_system,
             load_duration: stats.load_duration,
             load_source: index.load_source,
-            snapshot_verify_state: index.snapshot_verify_state,
+            snapshot_verify_state: index.snapshot_verify_state.clone(),
             is_empty: index.is_empty,
             tier_counts: stats.tier_counts,
             local_empty_reason: stats.local_empty_reason,
@@ -1673,7 +1716,7 @@ impl LiveIndex {
 
     /// Returns the current snapshot reconciliation state.
     pub fn snapshot_verify_state(&self) -> SnapshotVerifyState {
-        self.snapshot_verify_state
+        self.snapshot_verify_state.clone()
     }
 
     pub(crate) fn mark_snapshot_verify_running(&mut self) {
@@ -1682,9 +1725,10 @@ impl LiveIndex {
         }
     }
 
-    pub(crate) fn mark_snapshot_verify_completed(&mut self) {
+    pub(crate) fn mark_snapshot_verify_completed(&mut self, mismatched_paths: Vec<String>) {
         if self.load_source == IndexLoadSource::SnapshotRestore {
-            self.snapshot_verify_state = SnapshotVerifyState::Completed;
+            self.snapshot_verify_state =
+                SnapshotVerifyState::completed_with_mismatches(mismatched_paths);
         }
     }
 }
@@ -2187,16 +2231,43 @@ mod tests {
         assert_eq!(running.partial_parse_count, initial.partial_parse_count);
         assert_eq!(running.failed_count, initial.failed_count);
 
-        shared.mark_snapshot_verify_completed();
+        shared.mark_snapshot_verify_completed(Vec::new());
         let completed = shared.published_state();
         assert_eq!(completed.generation, 2);
         assert_eq!(
             completed.snapshot_verify_state,
-            SnapshotVerifyState::Completed
+            SnapshotVerifyState::completed_without_mismatches()
         );
         assert_eq!(completed.file_count, initial.file_count);
         assert_eq!(completed.partial_parse_count, initial.partial_parse_count);
         assert_eq!(completed.failed_count, initial.failed_count);
+    }
+
+    #[test]
+    fn test_shared_index_handle_published_state_bounds_snapshot_verify_mismatch_paths() {
+        let mut live = make_empty_live_index();
+        live.is_empty = false;
+        live.load_source = IndexLoadSource::SnapshotRestore;
+        live.snapshot_verify_state = SnapshotVerifyState::Pending;
+        let shared = SharedIndexHandle::shared(live);
+
+        let mismatch_paths = (0..12)
+            .rev()
+            .map(|i| format!("src/mismatch_{i:02}.rs"))
+            .collect::<Vec<_>>();
+        shared.mark_snapshot_verify_completed(mismatch_paths);
+
+        let completed = shared.published_state();
+        match &completed.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                assert_eq!(report.mismatch_count, 12);
+                assert_eq!(report.mismatched_paths.len(), 10);
+                assert_eq!(report.mismatched_paths[0], "src/mismatch_00.rs");
+                assert_eq!(report.mismatched_paths[9], "src/mismatch_09.rs");
+                assert_eq!(report.omitted_path_count(), 2);
+            }
+            other => panic!("expected completed snapshot verify report, got {other:?}"),
+        }
     }
 
     #[test]

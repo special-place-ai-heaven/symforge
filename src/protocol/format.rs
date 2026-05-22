@@ -40,7 +40,7 @@ use crate::live_index::{
     FileOutlineView, FindDependentsView, FindReferencesView, HealthStats, ImplBlockSuggestionView,
     ImplementationsView, IndexLoadSource, IndexedFile, InspectMatchView, LiveIndex,
     PublishedIndexState, RepoOutlineFileView, RepoOutlineView, SearchFilesResolveView,
-    SearchFilesTier, SearchFilesView, SymbolDetailView, TypeDependencyView,
+    SearchFilesTier, SearchFilesView, SnapshotVerifyState, SymbolDetailView, TypeDependencyView,
     WhatChangedTimestampView, search,
 };
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
@@ -91,6 +91,79 @@ fn index_state_label(status: &RuntimeStatus) -> &'static str {
         IndexLoadSource::FreshLoad => "fresh_process",
         IndexLoadSource::SnapshotRestore => "snapshot_loaded_reused",
     }
+}
+
+fn snapshot_verify_state_label(state: &SnapshotVerifyState) -> &'static str {
+    match state {
+        SnapshotVerifyState::NotNeeded => "not_needed",
+        SnapshotVerifyState::Pending => "pending",
+        SnapshotVerifyState::Running => "running",
+        SnapshotVerifyState::Completed(_) => "completed",
+    }
+}
+
+fn append_snapshot_verify_mismatch_summary(
+    line: &mut String,
+    state: &SnapshotVerifyState,
+    path_limit: usize,
+) {
+    if let SnapshotVerifyState::Completed(report) = state {
+        line.push_str(&format!(" mismatches={}", report.mismatch_count));
+        if report.mismatch_count > 0 {
+            let shown = report.mismatched_paths.len().min(path_limit);
+            let omitted = report.mismatch_count.saturating_sub(shown);
+            line.push_str(&format!(" showing={shown} omitted={omitted}"));
+            if shown > 0 {
+                let paths = report
+                    .mismatched_paths
+                    .iter()
+                    .take(shown)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                line.push_str(" paths=");
+                line.push_str(&paths);
+            }
+        }
+    }
+}
+
+fn snapshot_verify_health_line(published: &PublishedIndexState) -> Option<String> {
+    if published.load_source != IndexLoadSource::SnapshotRestore
+        && matches!(
+            &published.snapshot_verify_state,
+            SnapshotVerifyState::NotNeeded
+        )
+    {
+        return None;
+    }
+
+    let mut line = format!(
+        "Snapshot verify: load_source={} state={}",
+        index_load_source_label(published.load_source),
+        snapshot_verify_state_label(&published.snapshot_verify_state)
+    );
+    append_snapshot_verify_mismatch_summary(&mut line, &published.snapshot_verify_state, 10);
+    Some(line)
+}
+
+fn snapshot_verify_compact_line(published: &PublishedIndexState) -> Option<String> {
+    if published.load_source != IndexLoadSource::SnapshotRestore
+        && matches!(
+            &published.snapshot_verify_state,
+            SnapshotVerifyState::NotNeeded
+        )
+    {
+        return None;
+    }
+
+    let mut line = format!(
+        "Snapshot: load_source={} verify={}",
+        index_load_source_label(published.load_source),
+        snapshot_verify_state_label(&published.snapshot_verify_state)
+    );
+    append_snapshot_verify_mismatch_summary(&mut line, &published.snapshot_verify_state, 3);
+    Some(line)
 }
 
 fn index_identity(status: &RuntimeStatus) -> String {
@@ -1302,7 +1375,13 @@ pub fn health_report_from_published_state(
         stats.events_processed = 0;
         stats.last_event_at = None;
     }
-    health_report_from_stats(published.status_label(), &stats, rejected_stale_mutations)
+    let mut report =
+        health_report_from_stats(published.status_label(), &stats, rejected_stale_mutations);
+    if let Some(line) = snapshot_verify_health_line(published) {
+        report.push('\n');
+        report.push_str(&line);
+    }
+    report
 }
 
 pub fn health_report_compact_from_published_state(
@@ -1359,6 +1438,11 @@ pub fn health_report_compact_from_published_state(
             published.expected_vendor_partial_parse_count,
             published.failed_count
         ));
+    }
+
+    if let Some(line) = snapshot_verify_compact_line(published) {
+        output.push('\n');
+        output.push_str(&line);
     }
 
     output

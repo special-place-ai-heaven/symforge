@@ -795,7 +795,7 @@ pub async fn background_verify(
         index.update_file(rel_path.clone(), indexed_file);
     }
 
-    index.mark_snapshot_verify_completed();
+    index.mark_snapshot_verify_completed(spot_mismatches);
 
     info!(
         "background verify complete: {} changed, {} deleted, {} new, {} spot-check mismatches",
@@ -997,14 +997,14 @@ mod tests {
         assert_eq!(guard.load_source(), IndexLoadSource::SnapshotRestore);
         assert_eq!(
             guard.snapshot_verify_state(),
-            SnapshotVerifyState::Completed
+            SnapshotVerifyState::completed_without_mismatches()
         );
         drop(guard);
 
         let published = shared.published_state();
         assert_eq!(
             published.snapshot_verify_state,
-            SnapshotVerifyState::Completed
+            SnapshotVerifyState::completed_without_mismatches()
         );
         assert!(
             published.generation >= 2,
@@ -1049,12 +1049,54 @@ mod tests {
         );
         assert_eq!(
             published.snapshot_verify_state,
-            SnapshotVerifyState::Completed
+            SnapshotVerifyState::completed_without_mismatches()
         );
         assert_eq!(published.file_count, 0);
         assert_eq!(published.parsed_count, 0);
         assert_eq!(published.partial_parse_count, 0);
         assert_eq!(published.failed_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_background_verify_records_spot_verify_mismatch_paths() {
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("src").join("main.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fn alt1() {}\n").unwrap();
+        let disk_mtime = std::fs::metadata(&file_path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
+        let mut index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        index.files.insert(
+            "src/main.rs".to_string(),
+            Arc::new(make_indexed_file("src/main.rs", b"fn main() {}\n").with_mtime(disk_mtime)),
+        );
+        serialize_index(&index, tmp.path()).expect("serialize should succeed");
+
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        let loaded = snapshot_to_live_index(snapshot);
+        let shared = crate::live_index::SharedIndexHandle::shared(loaded);
+
+        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+
+        let published = shared.published_state();
+        match &published.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                assert_eq!(report.mismatch_count, 1);
+                assert_eq!(report.mismatched_paths, vec!["src/main.rs".to_string()]);
+                assert_eq!(report.omitted_path_count(), 0);
+            }
+            other => panic!("expected completed snapshot verify report, got {other:?}"),
+        }
     }
 
     #[test]

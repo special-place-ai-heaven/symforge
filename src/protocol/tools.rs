@@ -15120,6 +15120,74 @@ mod tests {
             !result.contains("Partial parse files"),
             "compact health should omit expanded path lists"
         );
+        assert!(
+            !result.contains("Snapshot:"),
+            "fresh compact health should omit snapshot verification lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_surfaces_snapshot_verify_running_state() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Running;
+        let server = make_server(index);
+
+        let full = server.health().await;
+        assert!(
+            full.contains("Snapshot verify: load_source=snapshot_restore state=running"),
+            "full health should expose background snapshot verification progress: {full}"
+        );
+
+        let compact = server.health_compact().await;
+        assert!(
+            compact.contains("Snapshot: load_source=snapshot_restore verify=running"),
+            "compact health should retain snapshot verify progress: {compact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_surfaces_snapshot_verify_mismatch_summary() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        index.snapshot_verify_state =
+            crate::live_index::store::SnapshotVerifyState::completed_with_mismatches(
+                (0..12)
+                    .rev()
+                    .map(|i| format!("src/mismatch_{i:02}.rs"))
+                    .collect::<Vec<_>>(),
+            );
+        let server = make_server(index);
+
+        let full = server.health().await;
+        assert!(
+            full.contains(
+                "Snapshot verify: load_source=snapshot_restore state=completed mismatches=12 showing=10 omitted=2",
+            ),
+            "full health should expose mismatch count and truncation: {full}"
+        );
+        assert!(
+            full.contains("src/mismatch_00.rs") && full.contains("src/mismatch_09.rs"),
+            "full health should include bounded mismatch path examples: {full}"
+        );
+        assert!(
+            !full.contains("src/mismatch_10.rs"),
+            "full health should truncate mismatch path examples: {full}"
+        );
+
+        let compact = server.health_compact().await;
+        assert!(
+            compact.contains(
+                "Snapshot: load_source=snapshot_restore verify=completed mismatches=12 showing=3 omitted=9",
+            ),
+            "compact health should retain bounded mismatch summary: {compact}"
+        );
+        assert!(
+            compact.contains("src/mismatch_00.rs") && !compact.contains("src/mismatch_03.rs"),
+            "compact health should include only compact path examples: {compact}"
+        );
     }
 
     #[tokio::test]
