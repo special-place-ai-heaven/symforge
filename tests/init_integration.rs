@@ -520,10 +520,22 @@ fn test_run_init_claude_only_updates_claude_files() {
 fn test_run_init_all_updates_both_clients() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    // On Windows, InitClient::All triggers ClaudeDesktop which writes a .cmd
-    // wrapper next to the binary.  Use a temp dir so the write succeeds.
+    // Npm installs may execute from a temporary extraction path, but init must
+    // register the durable home binary for global harnesses.
     let bin_dir = TempDir::new().unwrap();
     let binary_path = bin_dir.path().join("symforge");
+    let home_binary = home
+        .path()
+        .join(".symforge")
+        .join("bin")
+        .join(if cfg!(windows) {
+            "symforge.exe"
+        } else {
+            "symforge"
+        });
+    std::fs::create_dir_all(home_binary.parent().unwrap()).unwrap();
+    std::fs::write(&home_binary, b"").unwrap();
+    std::fs::write(&binary_path, b"").unwrap();
 
     run_init_with_context(InitClient::All, home.path(), cwd.path(), &binary_path)
         .expect("all-client init must succeed");
@@ -567,6 +579,16 @@ fn test_run_init_all_updates_both_clients() {
             .join("symforge.md")
             .exists(),
         "Kilo guidance rules must be created"
+    );
+
+    let codex_config = read_text(&home.path().join(".codex").join("config.toml"));
+    assert!(
+        codex_config.contains(&home_binary.display().to_string()),
+        "Codex config must use durable home binary: {codex_config}"
+    );
+    assert!(
+        !codex_config.contains(&binary_path.display().to_string()),
+        "Codex config must not persist temporary binary path: {codex_config}"
     );
 }
 
