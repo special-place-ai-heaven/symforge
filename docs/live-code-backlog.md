@@ -20,7 +20,7 @@ not in these completed SFB items.
 | 3. Sidecar PID/alive state in health output | Closed by SFB03 | `completion_commit: 03bf46fa2515821a040e985dbba16583e923e5c1`; `src/protocol/format.rs:1387`; `test_health_compact_surfaces_dead_sidecar_pid_and_state` |
 | 4. NoisePolicy classification for Obsidian internals | Closed by SFB04 | `completion_commit: 2a4577a39a76c38e33889519d689dd458d3a837c` |
 | 5. External-evaluator regression coverage | Closed by SFB05 | `completion_commit: 5ac3e3959db88ef837ac9b6bde3178c42303eaaf` |
-| 6. Current partial-parse hygiene | Closed by SFB06 | `completion_commit: 37d7918`; `health` distinguishes expected vendor partials from unexpected repo partials |
+| 6. Current partial-parse hygiene | Closed by SFB06; SFR13 adds bounded quarantine health evidence | `completion_commit: 37d7918`; `health` distinguishes expected vendor partials from unexpected repo partials; `tests/health_parse_quarantine.rs` covers parse/span quarantine surfacing |
 | 7. `search_text(group_by="usage")` doc/comment filter | Closed by SFB07 | `completion_commit: 96b4954e4458dc79f10012e28222c8588916cc9f` |
 | 8. `replace_symbol_body` same-line inline doc preservation | Closed by SFB08 | `completion_commit: 691e0a713035309d910b78b3cdf2d540112a4d37`; `src/protocol/edit.rs:5312`; `src/protocol/tools.rs:20009` |
 | 9. Machine-readable result status semantics | Closed by SFB09-SFB11 | `src/protocol/result_status.rs`; `src/protocol/tools.rs:14992`, `:15090`, `:15183`, `:15258` |
@@ -139,6 +139,12 @@ Historical acceptance:
 
 - Health reports zero unexpected partials for the repo, or clearly marks vendor
   partials as expected/noise.
+
+SFR13 verification adds a bounded parse/span quarantine registry to full and
+compact health output. It is diagnostic evidence derived from `ParseStatus`,
+not a second parser state machine: unexpected repo partials, expected vendor
+partials, and failed parses remain visible with bounded `showing`/`omitted`
+counts.
 
 ## 7. `search_text(group_by="usage")` doc/comment filter
 

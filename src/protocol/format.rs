@@ -45,6 +45,170 @@ use crate::live_index::{
 };
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
+const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParseQuarantineKind {
+    UnexpectedPartial,
+    ExpectedVendorPartial,
+    Failed,
+}
+
+impl ParseQuarantineKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnexpectedPartial => "unexpected_partial",
+            Self::ExpectedVendorPartial => "expected_vendor_partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParseQuarantineEntry {
+    path: String,
+    kind: ParseQuarantineKind,
+    reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParseQuarantineSummary {
+    total_count: usize,
+    unexpected_partial_count: usize,
+    expected_vendor_partial_count: usize,
+    failed_count: usize,
+    entries: Vec<ParseQuarantineEntry>,
+}
+
+impl ParseQuarantineSummary {
+    fn from_stats(stats: &HealthStats) -> Self {
+        let mut summary = Self::new(
+            stats.unexpected_partial_parse_count,
+            stats.expected_vendor_partial_parse_count,
+            stats.failed_count,
+        );
+        for path in &stats.unexpected_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::UnexpectedPartial,
+                "repo-owned partial parse; best-effort symbols may be incomplete",
+            );
+        }
+        for path in &stats.expected_vendor_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedVendorPartial,
+                EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
+            );
+        }
+        for (path, error) in &stats.failed_files {
+            summary.push(path, ParseQuarantineKind::Failed, error);
+        }
+        summary
+    }
+
+    fn from_published(published: &PublishedIndexState) -> Self {
+        let mut summary = Self::new(
+            published.unexpected_partial_parse_count,
+            published.expected_vendor_partial_parse_count,
+            published.failed_count,
+        );
+        for path in &published.unexpected_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::UnexpectedPartial,
+                "repo-owned partial parse; best-effort symbols may be incomplete",
+            );
+        }
+        for path in &published.expected_vendor_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedVendorPartial,
+                EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
+            );
+        }
+        for (path, error) in &published.failed_files {
+            summary.push(path, ParseQuarantineKind::Failed, error);
+        }
+        summary
+    }
+
+    fn new(
+        unexpected_partial_count: usize,
+        expected_vendor_partial_count: usize,
+        failed_count: usize,
+    ) -> Self {
+        Self {
+            total_count: unexpected_partial_count + expected_vendor_partial_count + failed_count,
+            unexpected_partial_count,
+            expected_vendor_partial_count,
+            failed_count,
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, path: &str, kind: ParseQuarantineKind, reason: &str) {
+        if self.entries.len() >= PARSE_QUARANTINE_ENTRY_LIMIT {
+            return;
+        }
+        self.entries.push(ParseQuarantineEntry {
+            path: path.to_string(),
+            kind,
+            reason: reason.to_string(),
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total_count == 0
+    }
+
+    fn omitted_count(&self) -> usize {
+        self.total_count.saturating_sub(self.entries.len())
+    }
+
+    fn full_section(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let mut section = format!(
+            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} failed={} showing={} omitted={}",
+            self.total_count,
+            self.unexpected_partial_count,
+            self.expected_vendor_partial_count,
+            self.failed_count,
+            self.entries.len(),
+            self.omitted_count()
+        );
+        for (index, entry) in self.entries.iter().enumerate() {
+            section.push_str(&format!(
+                "\n  {}. {} [{}] - {}",
+                index + 1,
+                entry.path,
+                entry.kind.label(),
+                entry.reason
+            ));
+        }
+        Some(section)
+    }
+
+    fn compact_line(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} failed={} showing={} omitted={}",
+            self.total_count,
+            self.unexpected_partial_count,
+            self.expected_vendor_partial_count,
+            self.failed_count,
+            self.entries.len(),
+            self.omitted_count()
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeMode {
     LocalProcess,
@@ -1440,6 +1604,11 @@ pub fn health_report_compact_from_published_state(
         ));
     }
 
+    if let Some(line) = ParseQuarantineSummary::from_published(published).compact_line() {
+        output.push('\n');
+        output.push_str(&line);
+    }
+
     if let Some(line) = snapshot_verify_compact_line(published) {
         output.push('\n');
         output.push_str(&line);
@@ -1605,6 +1774,11 @@ pub fn health_report_from_stats(
         output.push_str(
             "\nParse resilience: expected vendor partial files kept best-effort symbols; they are labeled as vendor parser noise below.",
         );
+    }
+
+    if let Some(section) = ParseQuarantineSummary::from_stats(stats).full_section() {
+        output.push('\n');
+        output.push_str(&section);
     }
 
     if stats.unexpected_partial_parse_count > 0 {
