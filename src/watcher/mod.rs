@@ -1240,6 +1240,52 @@ mod tests {
     }
 
     #[test]
+    fn test_read_and_index_preserves_crlf_bytes_and_hash() {
+        use crate::domain::LanguageId;
+
+        let tmp = TempDir::new().unwrap();
+        let rs_path = tmp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(rs_path.parent().unwrap()).unwrap();
+        let content = b"fn entry() {\r\n    watched_call();\r\n}\r\n";
+        std::fs::write(&rs_path, content).unwrap();
+
+        let rel_path = "src/lib.rs";
+        let shared: crate::live_index::store::SharedIndex = {
+            let index = crate::live_index::store::LiveIndex {
+                files: std::collections::HashMap::new(),
+                loaded_at: std::time::Instant::now(),
+                loaded_at_system: std::time::SystemTime::now(),
+                load_duration: std::time::Duration::ZERO,
+                cb_state: crate::live_index::store::CircuitBreakerState::new(0.20),
+                is_empty: false,
+                load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
+                snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+                reverse_index: std::collections::HashMap::new(),
+                files_by_basename: std::collections::HashMap::new(),
+                files_by_dir_component: std::collections::HashMap::new(),
+                trigram_index: crate::live_index::trigram::TrigramIndex::new(),
+                gitignore: None,
+                skipped_files: Vec::new(),
+                coupling_store: None,
+                local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            };
+            crate::live_index::SharedIndexHandle::shared(index)
+        };
+
+        let expected_gen = shared.current_project_generation();
+        let result = read_and_index(rel_path, &rs_path, &shared, LanguageId::Rust, expected_gen);
+        assert_eq!(result, ReindexResult::Reindexed);
+
+        let idx = shared.read();
+        let file = idx
+            .get_file(rel_path)
+            .expect("watcher should index the CRLF file");
+        assert_eq!(file.content, content);
+        assert_eq!(file.byte_len, content.len() as u64);
+        assert_eq!(file.content_hash, crate::hash::digest_hex(content));
+    }
+
+    #[test]
     fn test_maybe_reindex_retries_transient_not_found() {
         let tmp = TempDir::new().unwrap();
         let src_dir = tmp.path().join("src");

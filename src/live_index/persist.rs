@@ -932,6 +932,27 @@ mod tests {
     }
 
     #[test]
+    fn test_round_trip_preserves_crlf_bytes_and_hash() {
+        let tmp = TempDir::new().unwrap();
+        let content = b"fn my_func() {\r\n    other_func();\r\n}\r\n";
+        let index =
+            make_live_index_with_files(vec![("tests/generated/main.generated.rs", content)]);
+
+        serialize_index(&index, tmp.path()).expect("serialize should succeed");
+
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let loaded = snapshot_to_live_index(snapshot);
+        let file = loaded
+            .files
+            .get("tests/generated/main.generated.rs")
+            .expect("file should be present");
+
+        assert_eq!(file.content, content);
+        assert_eq!(file.byte_len, content.len() as u64);
+        assert_eq!(file.content_hash, crate::hash::digest_hex(content));
+    }
+
+    #[test]
     fn test_round_trip_empty_index() {
         let tmp = TempDir::new().unwrap();
         let index = make_live_index_with_files(vec![]);
