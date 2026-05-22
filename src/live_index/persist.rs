@@ -237,6 +237,90 @@ fn write_snapshot(
     })
 }
 
+fn quarantine_bad_snapshot(
+    project_root: &Path,
+    snapshot_path: &Path,
+    bytes: &[u8],
+    reason: &str,
+    detail: String,
+) -> anyhow::Result<PathBuf> {
+    let dir = paths::ensure_index_snapshot_quarantine_dir(project_root)?;
+    let hash = crate::hash::digest_hex(bytes);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let name = format!(
+        "{}-{:09}-{}-{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        &hash[..16],
+        reason
+    );
+    let quarantine_path = dir.join(format!("{name}.bin"));
+    let metadata_path = dir.join(format!("{name}.json"));
+
+    std::fs::write(&quarantine_path, bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "writing quarantined index snapshot at {}: {}",
+            quarantine_path.display(),
+            e
+        )
+    })?;
+
+    let metadata = serde_json::json!({
+        "source_path": snapshot_path.to_string_lossy(),
+        "quarantine_path": quarantine_path.to_string_lossy(),
+        "reason": reason,
+        "detail": detail,
+        "sha256": hash,
+        "bytes": bytes.len(),
+        "quarantined_at_unix_seconds": now.as_secs(),
+        "quarantined_at_unix_nanos": now.subsec_nanos(),
+    });
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+    std::fs::write(&metadata_path, metadata_bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "writing index snapshot quarantine metadata at {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })?;
+
+    match std::fs::remove_file(snapshot_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %snapshot_path.display(),
+            quarantine_path = %quarantine_path.display(),
+            "failed to remove active bad index snapshot after quarantine: {error}"
+        ),
+    }
+
+    Ok(quarantine_path)
+}
+
+fn try_quarantine_bad_snapshot(
+    project_root: &Path,
+    snapshot_path: &Path,
+    bytes: &[u8],
+    reason: &str,
+    detail: String,
+) {
+    match quarantine_bad_snapshot(project_root, snapshot_path, bytes, reason, detail) {
+        Ok(quarantine_path) => warn!(
+            path = %snapshot_path.display(),
+            quarantine_path = %quarantine_path.display(),
+            reason = reason,
+            "bad index snapshot quarantined"
+        ),
+        Err(error) => warn!(
+            path = %snapshot_path.display(),
+            reason = reason,
+            "failed to quarantine bad index snapshot: {error}"
+        ),
+    }
+}
+
 /// Load an `IndexSnapshot` from the project's data directory.
 ///
 /// Returns `None` (not panic) on:
@@ -258,6 +342,13 @@ pub fn load_snapshot(project_root: &Path) -> Option<IndexSnapshot> {
         Ok(s) => s,
         Err(e) => {
             warn!("failed to deserialize index snapshot (corrupt?): {e}");
+            try_quarantine_bad_snapshot(
+                project_root,
+                &path,
+                &bytes,
+                "deserialize-error",
+                e.to_string(),
+            );
             return None;
         }
     };
@@ -266,6 +357,16 @@ pub fn load_snapshot(project_root: &Path) -> Option<IndexSnapshot> {
         warn!(
             "index snapshot version mismatch: got {}, expected {} — will re-index",
             snapshot.version, CURRENT_VERSION
+        );
+        try_quarantine_bad_snapshot(
+            project_root,
+            &path,
+            &bytes,
+            "version-mismatch",
+            format!(
+                "snapshot version {}, expected {}",
+                snapshot.version, CURRENT_VERSION
+            ),
         );
         return None;
     }
@@ -1422,8 +1523,21 @@ mod tests {
 
     // ── Version mismatch / corrupt data tests ─────────────────────────────────
 
+    fn quarantine_files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
+        let dir = paths::resolve_index_snapshot_quarantine_dir(root);
+        let mut files = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        files.sort();
+        files
+    }
+
     #[test]
-    fn test_version_mismatch_returns_none() {
+    fn test_version_mismatch_quarantines_snapshot_and_returns_none() {
         let tmp = TempDir::new().unwrap();
 
         // Build a snapshot with a wrong version and serialize it manually
@@ -1439,10 +1553,32 @@ mod tests {
         // load_snapshot must return None, not panic
         let result = load_snapshot(tmp.path());
         assert!(result.is_none(), "version mismatch must return None");
+
+        let quarantine_bins = quarantine_files_with_extension(tmp.path(), "bin");
+        assert_eq!(
+            quarantine_bins.len(),
+            1,
+            "version mismatch should preserve the snapshot in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&quarantine_bins[0]).unwrap(),
+            bytes,
+            "quarantine must preserve original version-mismatched bytes"
+        );
+        assert!(
+            !dir.join("index.bin").exists(),
+            "version-mismatched active snapshot should be removed after quarantine"
+        );
+        let quarantine_metadata = quarantine_files_with_extension(tmp.path(), "json");
+        assert_eq!(quarantine_metadata.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
+        assert_eq!(metadata["reason"], "version-mismatch");
+        assert_eq!(metadata["sha256"], crate::hash::digest_hex(&bytes));
     }
 
     #[test]
-    fn test_corrupt_bytes_returns_none_no_panic() {
+    fn test_corrupt_bytes_quarantined_and_returns_none_no_panic() {
         let tmp = TempDir::new().unwrap();
 
         // Write random garbage
@@ -1459,10 +1595,31 @@ mod tests {
             result.is_none(),
             "corrupt bytes must return None, not panic"
         );
+
+        let quarantine_bins = quarantine_files_with_extension(tmp.path(), "bin");
+        assert_eq!(
+            quarantine_bins.len(),
+            1,
+            "corrupt bytes should be preserved in quarantine"
+        );
+        assert_eq!(
+            std::fs::read(&quarantine_bins[0]).unwrap(),
+            b"not valid postcard data xyzzy 12345",
+            "quarantine must preserve original corrupt bytes"
+        );
+        assert!(
+            !dir.join("index.bin").exists(),
+            "corrupt active snapshot should be removed after quarantine"
+        );
+        let quarantine_metadata = quarantine_files_with_extension(tmp.path(), "json");
+        assert_eq!(quarantine_metadata.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&quarantine_metadata[0]).unwrap()).unwrap();
+        assert_eq!(metadata["reason"], "deserialize-error");
     }
 
     #[test]
-    fn test_truncated_bytes_returns_none_no_panic() {
+    fn test_truncated_bytes_quarantined_and_returns_none_no_panic() {
         let tmp = TempDir::new().unwrap();
 
         // Serialize a real snapshot, then truncate it to half
@@ -1479,6 +1636,14 @@ mod tests {
             result.is_none(),
             "truncated bytes must return None, not panic"
         );
+
+        let quarantine_bins = quarantine_files_with_extension(tmp.path(), "bin");
+        assert_eq!(
+            quarantine_bins.len(),
+            1,
+            "truncated bytes should be preserved in quarantine"
+        );
+        assert_eq!(std::fs::read(&quarantine_bins[0]).unwrap(), truncated);
     }
 
     #[test]
@@ -1487,6 +1652,10 @@ mod tests {
         // No .symforge/index.bin exists
         let result = load_snapshot(tmp.path());
         assert!(result.is_none(), "missing file must return None");
+        assert!(
+            quarantine_files_with_extension(tmp.path(), "bin").is_empty(),
+            "missing first-run snapshot should not create quarantine artifacts"
+        );
     }
 
     // ── stat_check_files tests ────────────────────────────────────────────────

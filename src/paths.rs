@@ -8,6 +8,8 @@ pub const SYMFORGE_ANALYTICS_DB_PATH: &str = ".symforge/analytics.db";
 pub const SYMFORGE_IDEMPOTENCY_DIR_PATH: &str = ".symforge/idempotency";
 pub const SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH: &str = ".symforge/idempotency/records";
 pub const SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH: &str = ".symforge/idempotency/quarantine";
+pub const SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH: &str =
+    ".symforge/quarantine/index-snapshots";
 
 /// Resolve the canonical symforge data directory under `base`.
 pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
@@ -38,6 +40,27 @@ pub fn ensure_idempotency_dir(base: &Path) -> io::Result<PathBuf> {
         io::Error::new(
             e.kind(),
             format!("ensuring idempotency dir at {}: {}", dir.display(), e),
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Resolve the canonical index-snapshot quarantine directory under `base`.
+pub fn resolve_index_snapshot_quarantine_dir(base: &Path) -> PathBuf {
+    base.join(SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH)
+}
+
+/// Ensure the canonical index-snapshot quarantine directory exists under `base`.
+pub fn ensure_index_snapshot_quarantine_dir(base: &Path) -> io::Result<PathBuf> {
+    let dir = resolve_index_snapshot_quarantine_dir(base);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "ensuring index snapshot quarantine dir at {}: {}",
+                dir.display(),
+                e
+            ),
         )
     })?;
     Ok(dir)
@@ -95,6 +118,19 @@ mod tests {
         assert_eq!(
             tmp.path().join(SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH),
             resolve_idempotency_dir(tmp.path()).join("quarantine")
+        );
+    }
+
+    #[test]
+    fn test_index_snapshot_quarantine_path_stays_under_canonical_symforge_dir() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(
+            resolve_index_snapshot_quarantine_dir(tmp.path()),
+            tmp.path()
+                .join(SYMFORGE_DIR_NAME)
+                .join("quarantine")
+                .join("index-snapshots")
         );
     }
 }

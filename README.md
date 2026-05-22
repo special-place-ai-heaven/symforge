@@ -334,6 +334,7 @@ Common files:
 | Path | Purpose |
 |---|---|
 | `.symforge/index.bin` | Warm-start snapshot for the live index |
+| `.symforge/quarantine/index-snapshots/` | Preserved corrupt or version-incompatible snapshots with metadata |
 | `.symforge/frecency.db` | Optional persistent frecency signal store |
 | `.symforge/coupling.db` | Optional co-change coupling store |
 | `.symforge/analytics.db` | Optional local analytics store |
