@@ -18,27 +18,42 @@ structural edits.
 > managers, Docker, and process/runtime work. Use exact file reads when literal
 > docs or config text is the thing being inspected.
 
-## What It Does
+## Features
 
-- Builds a live index of source files, symbols, references, file contents, and
-  git-derived ranking signals.
-- Answers MCP requests from agents through structured tools like
-  `get_file_context`, `search_symbols`, `find_references`, `edit_plan`, and
-  `replace_symbol_body`.
-- Watches the workspace and can reindex files after edits through
-  `analyze_file_impact`.
-- Keeps output bounded with token-aware summaries and explicit truncation
-  markers.
-- Reports machine-readable result status metadata for core tool responses:
-  found, not found, ambiguous, invalid request, empty result, and internal
-  failure.
-- Provides health output for index state, watcher state, parser resilience,
-  sidecar state, runtime identity, ranking capability state, and tool-routing
-  evidence.
-- Supports optional local analytics for tool-call metadata through a bounded
-  queue and SQLite store.
-- Ships through npm as a wrapper that downloads the right Rust binary for the
-  current platform.
+- **Live repository index:** Builds and maintains an in-memory index of source
+  files, symbols, references, file contents, and git-derived ranking signals so
+  agents can query the codebase without repeatedly scanning the filesystem.
+- **Symbol-aware reading:** Lets agents inspect file outlines, imports,
+  consumers, exact source excerpts, full symbol bodies, and symbol context before
+  deciding whether they need a raw file read.
+- **Search and exploration:** Searches symbols, text, file paths, natural
+  language concepts, and AST-shaped patterns with bounded output and ranking
+  reasons.
+- **Reference and impact tracing:** Finds call sites, imports, type usages,
+  implementations, file dependents, symbol diffs, and changed files so agents
+  can understand blast radius before editing.
+- **Structural editing:** Replaces, inserts, deletes, batch-edits, and renames
+  symbols by indexed structure instead of blind string replacement, then reports
+  edit status and affected paths.
+- **Safe retry semantics:** Supports optional idempotency keys for indexing and
+  structural edit mutations. Replaying the same key with the same canonical
+  request returns the stored result; reusing the key for a different request
+  fails deterministically.
+- **Snapshot and recovery safeguards:** Writes byte-exact index snapshots through
+  explicit checkpoints, verifies snapshots when requested, and quarantines
+  corrupt or version-incompatible snapshots instead of silently serving them.
+- **Malformed-file diagnostics:** Isolates parser failures to the affected file
+  and exposes `validate_file_syntax` for line-and-column diagnostics when source
+  or config files are malformed.
+- **Local daemon mode:** Can run a shared local daemon for multiple agent
+  sessions while keeping the query path local-first and workspace-aware.
+- **Resources and prompts:** Exposes MCP resources for repo health, outlines,
+  maps, changes, file context, file content, and symbol context, plus prompts for
+  review, architecture, triage, onboarding, refactoring, and debugging.
+- **Local analytics:** Optionally records bounded, local-only tool-call metadata
+  in SQLite so operators can inspect usage without exporting source code.
+- **npm binary distribution:** Installs as an npm package with a JavaScript
+  launcher that downloads the correct Rust binary for the current platform.
 
 ## How It Works
 
@@ -94,7 +109,8 @@ It also indexes common project formats:
   permissions, env keys, jobs, needs, runners, matrix strategy, and step fields
 
 Malformed files are isolated. A bad parse can degrade that file, but it should
-not poison the whole run.
+not poison the whole run. Use `validate_file_syntax` for parser diagnostics with
+line and column locations when a config or source file looks malformed.
 
 ## Install
 
@@ -245,8 +261,8 @@ vendor, generated, test, and personal-tooling noise by default.
 
 | Tool | Use |
 |---|---|
-| `index_folder` | Reindex a repository from scratch |
-| `checkpoint_now` | Atomically write the current in-memory index to `.symforge/index.bin` |
+| `index_folder` | Reindex a repository from scratch, with optional idempotency for safe retries |
+| `checkpoint_now` | Atomically write the current in-memory index to `.symforge/index.bin`, optionally verifying after write |
 
 ### Recovery
 
@@ -352,6 +368,11 @@ The edit tools operate by symbol and validate targets before writing. They also
 report edit status and affected paths so callers can tell whether the operation
 actually changed code.
 
+Edit mutations accept an optional `idempotency_key` where advertised. A retry
+with the same key and the same canonical request returns the stored result
+without writing again; the same key with a different request returns an
+idempotency conflict. Dry runs do not reserve replay state.
+
 All edit tools accept an optional `working_directory` pointing at a sibling git
 worktree. Supplying it is explicit routing consent: SymForge validates the
 worktree, maps the indexed path into that worktree, writes there, and reports
@@ -377,6 +398,7 @@ Common files:
 |---|---|
 | `.symforge/index.bin` | Warm-start snapshot for the live index |
 | `.symforge/quarantine/index-snapshots/` | Preserved corrupt or version-incompatible snapshots with metadata |
+| `.symforge/idempotency/` | Retry records and quarantined corrupt idempotency records for mutating tools |
 | `.symforge/frecency.db` | Optional persistent frecency signal store |
 | `.symforge/coupling.db` | Optional co-change coupling store |
 | `.symforge/analytics.db` | Optional local analytics store |
