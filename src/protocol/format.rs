@@ -234,6 +234,7 @@ pub struct RuntimeStatus {
     pub session_id: String,
     pub index_generation: u64,
     pub project_generation: u64,
+    pub reset_project_generation: Option<u64>,
     pub load_source: IndexLoadSource,
 }
 
@@ -246,7 +247,7 @@ fn index_load_source_label(load_source: IndexLoadSource) -> &'static str {
 }
 
 fn index_state_label(status: &RuntimeStatus) -> &'static str {
-    if status.project_generation > 0 {
+    if current_project_was_reset(status) {
         return "index_folder_reset";
     }
 
@@ -254,6 +255,21 @@ fn index_state_label(status: &RuntimeStatus) -> &'static str {
         IndexLoadSource::EmptyBootstrap => "empty_bootstrap",
         IndexLoadSource::FreshLoad => "fresh_process",
         IndexLoadSource::SnapshotRestore => "snapshot_loaded_reused",
+    }
+}
+
+fn current_project_was_reset(status: &RuntimeStatus) -> bool {
+    status.project_generation > 0
+        && status.reset_project_generation == Some(status.project_generation)
+}
+
+fn reset_state_label(status: &RuntimeStatus) -> String {
+    match status.reset_project_generation {
+        Some(generation) if generation == status.project_generation => {
+            format!("current_project:p{generation}")
+        }
+        Some(generation) => format!("previous_project:p{generation}"),
+        None => "none".to_string(),
     }
 }
 
@@ -346,7 +362,7 @@ fn index_identity(status: &RuntimeStatus) -> String {
 
 pub fn format_runtime_status(status: &RuntimeStatus) -> String {
     format!(
-        "Runtime: mode={} | runtime_state={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | index_state={}",
+        "Runtime: mode={} | runtime_state={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
         status.mode.label(),
         status.mode.label(),
         status.project_root.as_deref().unwrap_or("<unknown>"),
@@ -356,18 +372,23 @@ pub fn format_runtime_status(status: &RuntimeStatus) -> String {
         status.index_generation,
         status.project_generation,
         index_load_source_label(status.load_source),
+        reset_state_label(status),
         index_state_label(status),
     )
 }
 
 pub fn format_runtime_status_compact(status: &RuntimeStatus) -> String {
     format!(
-        "Runtime: mode={} | project_root={} | project_id={} | session_id={} | index_id={} | index_state={}",
+        "Runtime: mode={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
         status.mode.label(),
         status.project_root.as_deref().unwrap_or("<unknown>"),
         status.project_id,
         status.session_id,
         index_identity(status),
+        status.index_generation,
+        status.project_generation,
+        index_load_source_label(status.load_source),
+        reset_state_label(status),
         index_state_label(status),
     )
 }

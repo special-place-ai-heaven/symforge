@@ -4825,6 +4825,7 @@ impl SymForgeServer {
             session_id,
             index_generation: published.generation,
             project_generation: self.index.current_project_generation(),
+            reset_project_generation: self.index.current_reset_project_generation(),
             load_source: published.load_source,
         }
     }
@@ -5215,6 +5216,9 @@ impl SymForgeServer {
         let reload_root = root.clone();
         match tokio::task::spawn_blocking(move || index.reload(&reload_root)).await {
             Ok(Ok(())) => {
+                if reset_report.is_some() {
+                    self.index.mark_index_folder_reset();
+                }
                 let published = self.index.published_state();
                 let file_count = published.file_count;
                 let symbol_count = published.symbol_count;
@@ -9540,15 +9544,21 @@ mod tests {
             .replace('\\', "/");
         assert!(
             health.contains(&format!("project_root={root_text}")),
-            "health should surface the reset project root after index_folder, got: {health}"
+            "health should surface the project root after index_folder, got: {health}"
         );
         assert!(
-            health.contains("index_state=index_folder_reset"),
-            "health should distinguish index_folder reset state, got: {health}"
+            health.contains("load_source=fresh_load")
+                && health.contains("reset_state=none")
+                && health.contains("index_state=fresh_process"),
+            "plain index_folder should report a fresh index without reset identity, got: {health}"
+        );
+        assert!(
+            !health.contains("index_state=index_folder_reset"),
+            "plain index_folder must not claim reset state, got: {health}"
         );
         assert!(
             health.contains("index_id=index-"),
-            "health should keep index identity assertable after reset, got: {health}"
+            "health should keep index identity assertable after reindex, got: {health}"
         );
     }
 
@@ -9589,6 +9599,10 @@ mod tests {
             output.contains("index_state=index_folder_reset") && output.contains("index_id=index-"),
             "reset output should include assertable fresh identity, got: {output}"
         );
+        assert!(
+            output.contains("reset_state=current_project:p"),
+            "reset output should prove reset identity is tied to the current project generation, got: {output}"
+        );
         assert!(!symforge_dir.join("index.bin").exists());
         assert!(!symforge_dir.join("index.bin.tmp").exists());
         assert!(
@@ -9603,6 +9617,7 @@ mod tests {
         let health = server.health().await;
         assert!(
             health.contains("load_source=fresh_load")
+                && health.contains("reset_state=current_project:p")
                 && health.contains("index_state=index_folder_reset")
                 && health.contains("index_id=index-"),
             "health after reset should prove fresh identity/source, got: {health}"
@@ -12023,8 +12038,94 @@ mod tests {
             "health should expose the load source: {result}"
         );
         assert!(
+            result.contains("reset_state=none"),
+            "fresh local health should not claim reset identity: {result}"
+        );
+        assert!(
             result.contains("index_state=fresh_process"),
             "fresh local health should distinguish a fresh process: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_surfaces_runtime_identity_for_daemon_reused_session() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+        let project_id = "project-daemon-test".to_string();
+        let session_id = "session-daemon-test".to_string();
+        let root_text = temp.path().to_string_lossy().replace('\\', "/");
+
+        let full = server.health_for_daemon_session(
+            project_id.clone(),
+            session_id.clone(),
+            temp.path().to_path_buf(),
+        );
+        assert!(
+            full.contains("Runtime: mode=daemon_reused_session")
+                && full.contains("runtime_state=daemon_reused_session"),
+            "full health should identify reused daemon runtime: {full}"
+        );
+        assert!(
+            full.contains(&format!("project_root={root_text}"))
+                && full.contains(&format!("project_id={project_id}"))
+                && full.contains(&format!("session_id={session_id}"))
+                && full.contains("index_id=index-"),
+            "full health should expose daemon project/session/index identity: {full}"
+        );
+        assert!(
+            full.contains("load_source=fresh_load")
+                && full.contains("reset_state=none")
+                && full.contains("index_state=fresh_process"),
+            "full daemon health should distinguish fresh index state without reset: {full}"
+        );
+
+        let compact = server.health_compact_for_daemon_session(
+            project_id.clone(),
+            session_id.clone(),
+            temp.path().to_path_buf(),
+        );
+        assert!(
+            compact.contains("Runtime: mode=daemon_reused_session")
+                && compact.contains(&format!("project_root={root_text}"))
+                && compact.contains(&format!("project_id={project_id}"))
+                && compact.contains(&format!("session_id={session_id}"))
+                && compact.contains("index_id=index-"),
+            "compact health should retain daemon project/session/index identity: {compact}"
+        );
+        assert!(
+            compact.contains("load_source=fresh_load")
+                && compact.contains("reset_state=none")
+                && compact.contains("index_state=fresh_process"),
+            "compact daemon health should retain bounded source/reset state: {compact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_surfaces_runtime_identity_for_warm_snapshot_reuse() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
+        let server = make_server_with_root(index, Some(temp.path().to_path_buf()));
+
+        let full = server.health().await;
+        assert!(
+            full.contains("load_source=snapshot_restore")
+                && full.contains("reset_state=none")
+                && full.contains("index_state=snapshot_loaded_reused"),
+            "full health should distinguish warm snapshot reuse without reset: {full}"
+        );
+
+        let compact = server.health_compact().await;
+        assert!(
+            compact.contains("load_source=snapshot_restore")
+                && compact.contains("reset_state=none")
+                && compact.contains("index_state=snapshot_loaded_reused"),
+            "compact health should retain warm snapshot source/reset state: {compact}"
         );
     }
 
@@ -12141,6 +12242,12 @@ mod tests {
         assert!(
             result.contains("index_id=index-"),
             "compact health should retain index identity: {result}"
+        );
+        assert!(
+            result.contains("load_source=fresh_load")
+                && result.contains("reset_state=none")
+                && result.contains("index_state=fresh_process"),
+            "compact health should retain bounded source/reset state: {result}"
         );
         assert!(
             !result.contains("Partial parse files"),

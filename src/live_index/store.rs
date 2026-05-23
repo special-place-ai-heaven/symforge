@@ -490,6 +490,8 @@ pub struct SharedIndexHandle {
     next_generation: AtomicU64,
     /// Project-identity counter for fencing stale watcher mutations; bumped only on reload.
     project_generation: AtomicU64,
+    /// Project generation that was last produced by an explicit index_folder reset.
+    last_reset_project_generation: AtomicU64,
     /// Telemetry counter for fenced mutations rejected due to stale project generation.
     rejected_stale_mutations: AtomicU64,
     /// Git temporal intelligence — independently swapped side-table with
@@ -525,6 +527,7 @@ impl SharedIndexHandle {
             published_repo_outline: ArcSwap::new(published_repo_outline),
             next_generation: AtomicU64::new(1),
             project_generation: AtomicU64::new(0),
+            last_reset_project_generation: AtomicU64::new(0),
             rejected_stale_mutations: AtomicU64::new(0),
             git_temporal: ArcSwap::new(Arc::new(super::git_temporal::GitTemporalIndex::pending())),
             pre_update_symbols: Mutex::new(HashMap::new()),
@@ -572,6 +575,20 @@ impl SharedIndexHandle {
         self.project_generation.load(Ordering::Acquire)
     }
 
+    pub fn current_reset_project_generation(&self) -> Option<u64> {
+        match self.last_reset_project_generation.load(Ordering::Acquire) {
+            0 => None,
+            generation => Some(generation),
+        }
+    }
+
+    pub fn mark_index_folder_reset(&self) -> u64 {
+        let generation = self.current_project_generation();
+        self.last_reset_project_generation
+            .store(generation, Ordering::Release);
+        generation
+    }
+
     #[allow(dead_code)]
     pub fn current_rejected_stale_mutations(&self) -> u64 {
         self.rejected_stale_mutations.load(Ordering::Relaxed)
@@ -592,6 +609,8 @@ impl SharedIndexHandle {
         live.apply_reload_data(data);
         self.swap_and_publish(live);
         self.project_generation.fetch_add(1, Ordering::AcqRel);
+        self.last_reset_project_generation
+            .store(0, Ordering::Release);
         Ok(())
     }
 

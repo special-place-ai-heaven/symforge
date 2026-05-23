@@ -257,6 +257,14 @@ Current replacement workflow:
 4. Use `index_folder` reset to rebuild from source when health, verification,
    or quarantine evidence shows the snapshot should not be reused.
 
+`index_folder` reset is explicit: run the serving process with
+`SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder` for the project root.
+The reset deletes only `.symforge/index.bin` and `.symforge/index.bin.tmp`
+before reloading source files. The tool response and subsequent `health` or
+`health_compact` output include `reset_state=current_project:pN` and
+`index_state=index_folder_reset`; ordinary `index_folder` reloads report
+`reset_state=none`.
+
 The deprecated daemon compatibility name `trace_symbol` remains available
 through v7.x with an explicit deprecation warning and is planned for removal in
 v8.0. Generated client allow-lists do not grant it by default. Use
