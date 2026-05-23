@@ -24,7 +24,11 @@ fn walk_node(
     symbols: &mut Vec<SymbolRecord>,
 ) {
     let kind = match node.kind() {
-        "function_item" => Some(SymbolKind::Function),
+        "function_item" => Some(if is_impl_function_item(node) {
+            SymbolKind::Method
+        } else {
+            SymbolKind::Function
+        }),
         "struct_item" => Some(SymbolKind::Struct),
         "enum_item" => Some(SymbolKind::Enum),
         "trait_item" => Some(SymbolKind::Trait),
@@ -47,6 +51,21 @@ fn walk_node(
         );
     }
     walk_children(node, source, depth, sort_order, symbols, kind, walk_node);
+}
+
+fn is_impl_function_item(node: &Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if parent.kind() == "impl_item" {
+        return true;
+    }
+
+    parent.kind() == "declaration_list"
+        && parent
+            .parent()
+            .is_some_and(|grandparent| grandparent.kind() == "impl_item")
 }
 
 fn find_name(node: &Node, source: &str) -> Option<String> {
@@ -104,5 +123,22 @@ mod tests {
 pub fn inline_rust_probe() {}
 "#,
         [(SymbolKind::Function, "inline_rust_probe")]
+    );
+
+    inline_test!(
+        rust_inline_test_extracts_impl_method,
+        LanguageId::Rust,
+        r#"
+pub struct Greeter;
+
+impl Greeter {
+    pub fn greet(&self) {}
+}
+"#,
+        [
+            (SymbolKind::Struct, "Greeter"),
+            (SymbolKind::Impl, "impl Greeter"),
+            (SymbolKind::Method, "greet"),
+        ]
     );
 }

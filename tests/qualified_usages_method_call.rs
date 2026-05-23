@@ -88,3 +88,47 @@ fn utf8_receiver_does_not_match_or_panic() {
         "free function references must exclude method-call sites; view: {view:#?}"
     );
 }
+
+#[test]
+fn impl_method_references_include_receiver_method_call_sites() {
+    let source = r#"
+pub struct Greeter {
+    prefix: String,
+}
+
+impl Greeter {
+    pub fn new(prefix: &str) -> Self {
+        Self { prefix: prefix.to_string() }
+    }
+
+    pub fn greet(&self, name: &str) -> String {
+        format!("{}, {}", self.prefix, name)
+    }
+}
+
+pub fn welcome(name: &str) -> String {
+    let greeter = Greeter::new("Hello");
+    greeter.greet(name)
+}
+"#;
+
+    let (_dir, shared) = build_index(&[("src/lib.rs", source)]);
+    let index = shared.read();
+
+    let view = index
+        .capture_find_references_view_for_symbol(
+            "src/lib.rs",
+            "greet",
+            Some("fn"),
+            Some(11),
+            Some("call"),
+            50,
+        )
+        .expect("impl method greet should resolve");
+
+    let lines = reference_lines(&view);
+    assert!(
+        lines.contains(&"greeter.greet(name)"),
+        "impl method references should include receiver method calls; view: {view:#?}"
+    );
+}
