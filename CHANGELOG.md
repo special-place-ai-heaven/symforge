@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.14.1](https://github.com/special-place-administrator/symforge/compare/v7.14.0...v7.14.1) (2026-05-23)
+
+
+### Bug Fixes
+
+* include Rust impl method call references ([37765d2](https://github.com/special-place-administrator/symforge/commit/37765d2f453ea41d721bddcce4a6c5d48d07ff2e))
+
 ## [7.14.0](https://github.com/special-place-administrator/symforge/compare/v7.13.1...v7.14.0) (2026-05-23)
 
 
