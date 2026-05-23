@@ -136,6 +136,13 @@ Current canonical `tools/list` exposes 32 tools, including `health_compact`:
   `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`,
   `batch_rename`
 
+Ranking signal invariants:
+- `search_symbols`, `search_text`, `search_files`, `explore`, `ask`, and
+  `investigation_suggest` are discovery or guidance tools; they must not bump
+  frecency. Frecency is a commitment signal from loaded context and mutation
+  paths. Letting searches create it would turn searched-but-ignored files into
+  false ranking evidence.
+
 Current resources:
 
 - Static repository resources: `symforge://repo/health`,

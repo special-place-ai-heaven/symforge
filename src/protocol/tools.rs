@@ -19471,6 +19471,12 @@ mod tests {
             "result: {result}"
         );
         assert!(result.contains("Chosen tool: explore"), "result: {result}");
+        assert!(
+            result.contains(
+                "Rationale: no stronger route matched, so SymForge fell back to conceptual exploration"
+            ),
+            "fallback ask routes should explain why explore was chosen: {result}"
+        );
         assert!(result.contains("Suggested next step:"), "result: {result}");
     }
 

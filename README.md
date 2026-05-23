@@ -184,11 +184,20 @@ by how an agent should use them.
 | `health` | Check index health, watcher state, parse resilience, runtime identity, sidecar state, and capability state |
 | `health_compact` | Smaller health summary for prompt budgets |
 | `get_repo_map` | Get a bounded repository map |
-| `explore` | Explore a concept across symbols, files, and patterns |
-| `ask` | Ask a natural-language codebase question and route internally |
+| `explore` | Explore a broad concept across symbols, files, and patterns with noise filtering and ranking reasons |
+| `ask` | Ask a natural-language codebase question and see route confidence, rationale, and the selected invocation |
 | `conventions` | Detect local coding and test conventions |
 | `context_inventory` | See what context has already been loaded |
 | `investigation_suggest` | Find likely gaps in the current investigation |
+
+`ask` is a routing envelope for natural-language questions. It reports the
+chosen tool, route confidence, invocation, and rationale before the routed
+result so callers can see why the request did or did not become a narrow symbol
+or reference lookup.
+
+`explore` is the broad concept-discovery tool. It ranks by concept match,
+symbol-token alignment, path proximity, and caller density, and it hides
+vendor, generated, test, and personal-tooling noise by default.
 
 ### Read
 
@@ -325,6 +334,11 @@ when explicitly requested:
 ```
 
 Frecency favors files recently and repeatedly touched through commitment tools.
+Search and guidance tools such as `search_symbols`, `search_text`,
+`search_files`, `ask`, `explore`, and `investigation_suggest` do not bump
+frecency; even `search_files(rank_by="frecency")` reads that signal without
+creating it. This avoids a positive feedback loop where searched-but-ignored
+files drift upward as if they were actually used.
 Co-change ranking uses git history to surface files that tend to move together.
 If a requested capability is unavailable, stale, disabled, or still preparing,
 the response says that explicitly and falls back to path ranking.
