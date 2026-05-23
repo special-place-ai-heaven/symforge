@@ -95,3 +95,131 @@ SFR00 reconciliation artifact.
 - Deferred strategic or hygiene items: SF-008, SF-022, SF-023, SF-029, SF-038, SF-042, SF-049, SF-053, SF-055, SF-056, SF-057.
 - False positive / no action: SF-054.
 - Operational note: SF-060.
+
+## SFR27 Final Burndown
+
+SFR27 closure audit date: 2026-05-23.
+
+Branch evidence: `git branch --show-current` returned `goal/sfr27-final-review-burndown-audit-and-release-readiness-evidence`; starting `HEAD` was `2c98649 feat: land SFR26 validate_file_syntax diagnostics`.
+
+All SFR00-SFR26 goal files in `.agent/goals/symforge-code-review-2026-05-22/` were marked `Completed` before this closure section was written. This closure goal changed no source code, tests, npm files, Cargo metadata, or GitHub workflow files.
+
+| Finding | Final disposition | Evidence pointer |
+|---|---|---|
+| SF-001 | Fixed | SFR01 `2b844a5`; docs aligned to shipped v7 tool/resource/prompt surface. |
+| SF-002 | Fixed | SFR06 `0dfd598c36501519772e23e08a5f4ca9e4e50d3f`, SFR07 `cb8dac218b70f0ca4cce327b2a13b920c6251598`, SFR08 `c8254953a4d8acb817d4008228c2d4d8014fac37`; mutating-tool idempotency substrate and applications completed. |
+| SF-003 | Fixed | SFR09 `1c5f896`, SFR10 `5b76927`; checkpoint/repair/run-lifecycle surface resolved for current v7 behavior. |
+| SF-004 | Fixed | SFR03 `b21b24b`; daemon bind/auth hardening completed. |
+| SF-005 | Fixed | SFR05 `0d95de72b21aa8afb555f71480a4c2c94f2c00fa`; ambiguous `get_symbol_context` outcome and conformance coverage completed. |
+| SF-006 | Fixed | SFR09 `1c5f896`, SFR10 `5b76927`; checkpointing and lifecycle reconciliation completed. |
+| SF-007 | Fixed | SFR02 `7551932`; `health_compact` allowlist/conformance alignment completed. |
+| SF-008 | Superseded | SFR19 `70214e7b3ca0dfc663dfe25467747574d29430d4`; v7 compatibility alias policy retained deliberately and v8 removal path documented. |
+| SF-009 | Fixed | SFR01 `2b844a5`, SFR02 `7551932`; tool count and `health_compact` documentation/allowlists aligned. |
+| SF-010 | Fixed | SFR01 `2b844a5`; backlog item closed as SFB02 evidence-backed docs drift. |
+| SF-011 | Fixed | SFR01 `2b844a5`; backlog item closed as SFB03 evidence-backed docs drift. |
+| SF-012 | Fixed | SFR20 `3bfc45fe628a681ce514b060e4ec873756d1dde5`, SFR21 `7ca22cac0df939f155f5732ea875470ba718eafc`; protocol read/search/edit handler extraction completed. |
+| SF-013 | Fixed | SFR22 `ee6c3d2314089b91609bdb90ef07edeb3b131a9a`; live-index query split completed. |
+| SF-014 | Fixed | SFR01 `2b844a5`; architecture docs reconciled to current layout. |
+| SF-015 | Fixed | SFR11 `0c05e43`, SFR10 `5b76927`; corrupt snapshot quarantine and repair policy completed. |
+| SF-016 | Fixed | SFR13 `10985b3`; parse/span quarantine registry and health surfacing completed. |
+| SF-017 | Fixed | SFR04 `63badac545b5477667352141e84a4e3871189c65`; daemon close-session unwrap removed. |
+| SF-018 | Fixed | SFR04 `63badac545b5477667352141e84a4e3871189c65`; PID ownership and process-safety checks strengthened. |
+| SF-019 | False positive | Positive edit-trust behavior retained; no implementation defect was identified. |
+| SF-020 | Fixed | SFR17 `51ab5c7`, SFR11 `0c05e43`; byte-exact CRLF/watch-read coverage and snapshot quarantine completed. |
+| SF-021 | Fixed | SFR12 `c1bf125`, SFR10 `5b76927`; snapshot mismatch/progress surfacing and repair policy completed. |
+| SF-022 | Deferred | SFR15 `38f3a92` added CI/performance-smoke coverage; full 1000-file ignored perf test remains a deliberate manual/nightly-scale concern. |
+| SF-023 | Deferred | SFR15 `38f3a92` added CI/performance-smoke coverage; real-repo coupling calibration remains manual/nightly-scale. |
+| SF-024 | Fixed | SFR15 `38f3a92`; fmt, clippy, release-build, and quality-gate coverage completed. |
+| SF-025 | Fixed | SFR15 `38f3a92`, SFR25 `e0c652cce92eed59837d635b2d986c3fb6067169`; toolchain rationale/gates and Rust raw-reference parser coverage completed. Current project policy accepts Rust 1.95.0 as latest stable. |
+| SF-026 | Fixed | SFR18 `b3df776`; Windows launcher executable smoke path completed. |
+| SF-027 | Fixed | SFR01 `2b844a5`; resource URI documentation completed. |
+| SF-028 | Fixed | SFR01 `2b844a5`; prompt mapping documentation completed. |
+| SF-029 | Superseded | SFR19 `70214e7b3ca0dfc663dfe25467747574d29430d4`; compatibility/deprecation lifecycle is now explicit. |
+| SF-030 | Fixed | SFR14 `56b1287`, SFR05 `0d95de72b21aa8afb555f71480a4c2c94f2c00fa`, SFR02 `7551932`; result-status coverage completed across targeted read/search/edit outcomes. |
+| SF-031 | Fixed | SFR01 `2b844a5`; generation-fence behavior documented as release evidence. |
+| SF-032 | Fixed | SFR09 `1c5f896`, SFR12 `c1bf125`, SFR23 `915e4e9bb531804f3a630b42af47dfa3302b648b`; checkpoint/background verify/runtime identity evidence completed. |
+| SF-033 | Fixed | SFR17 `51ab5c7`; watcher byte-read regression coverage completed. |
+| SF-034 | Fixed | SFR12 `c1bf125`, SFR13 `10985b3`; parse status and compact-health/quarantine visibility completed. |
+| SF-035 | Fixed | SFR13 `10985b3`; vendor partial parse hygiene and quarantine surfacing completed without duplicating SFB06. |
+| SF-036 | Fixed | SFR01 `2b844a5`, SFR24 `882b33092aae66786d9189f500c6c6cbeb6c6d89`; frecency/search ranking behavior documented and preserved. |
+| SF-037 | Fixed | SFR16 `6f52074`; Windows libgit2 lockfile flake mitigation verified. |
+| SF-038 | Deferred | Sidecar governor tuning for large repos remains a future performance-calibration item; no release-blocking correctness defect was identified. |
+| SF-039 | Fixed | SFR01 `2b844a5`, SFR23 `915e4e9bb531804f3a630b42af47dfa3302b648b`; startup/runtime identity guidance completed. |
+| SF-040 | Fixed | SFR03 `b21b24b`, SFR04 `63badac545b5477667352141e84a4e3871189c65`; daemon localhost/auth/PID identity safety completed. |
+| SF-041 | Superseded | SFR19 `70214e7b3ca0dfc663dfe25467747574d29430d4`; retired `trace_symbol` allowlist exclusion and daemon alias lifecycle are pinned. |
+| SF-042 | Deferred | Historical `tasks/todo.md` repo-hygiene decision remains outside this release closure; no source behavior is affected. |
+| SF-043 | Fixed | SFR01 `2b844a5`; analytics privacy stance documented; SFB24-SFB26 remain implementation evidence. |
+| SF-044 | Fixed | SFR01 `2b844a5`, SFR24 `882b33092aae66786d9189f500c6c6cbeb6c6d89`; config-intelligence and guidance behavior documented/tuned. |
+| SF-045 | Fixed | SFR01 `2b844a5`; inline-doc preservation recognized as SFB08-backed closed evidence. |
+| SF-046 | Fixed | SFR06 `0dfd598c36501519772e23e08a5f4ca9e4e50d3f`, SFR08 `c8254953a4d8acb817d4008228c2d4d8014fac37`, SFR21 `7ca22cac0df939f155f5732ea875470ba718eafc`; dry-run semantics preserved while idempotency was added. |
+| SF-047 | Fixed | SFR01 `2b844a5`, SFR08 `c8254953a4d8acb817d4008228c2d4d8014fac37`, SFR21 `7ca22cac0df939f155f5732ea875470ba718eafc`; edit tee snapshot behavior documented and preserved. |
+| SF-048 | Fixed | SFR01 `2b844a5`; frecency policy documented. |
+| SF-049 | Deferred | Co-change store corruption monitoring beyond existing tests remains a future reliability-hardening item. |
+| SF-050 | Fixed | SFR01 `2b844a5`, SFR23 `915e4e9bb531804f3a630b42af47dfa3302b648b`; worktree routing and runtime identity evidence documented. |
+| SF-051 | False positive | Existing tracing/env-filter posture remains sufficient for local-first MCP; OpenTelemetry is optional future work. |
+| SF-052 | False positive | Existing `unsafe_code = deny` discipline with narrow exceptions remains release evidence, not a defect. |
+| SF-053 | Deferred | Allowed dead-code helper remains a low-priority hygiene item. |
+| SF-054 | False positive | Test-only helper dead-code allowances are isolated and require no action. |
+| SF-055 | Deferred | Deprecated `home_dir` cleanup remains future discovery hygiene. |
+| SF-056 | Deferred | Patched SCSS vendor crate upstream tracking remains future vendor hygiene. |
+| SF-057 | Deferred | `diff.txt` repo-hygiene decision remains future cleanup; no file deletion was authorized in this closure goal. |
+| SF-058 | Fixed | SFR05 `0d95de72b21aa8afb555f71480a4c2c94f2c00fa`, SFR14 `56b1287`; ambiguous symbol and public contract corpus coverage completed. |
+| SF-059 | Fixed | SFR24 `882b33092aae66786d9189f500c6c6cbeb6c6d89`; `ask` vs `explore` boundaries and guidance behavior documented/tuned. |
+| SF-060 | Fixed | SFR00 `4dd4a4a`; operational indexing discipline captured. SFR27 also re-indexed the worktree before closure with SymForge `health_compact` Ready. |
+
+## Release Readiness Summary
+
+Release-readiness status: **Ready for release-candidate packaging after normal operator review of the deferred non-blocking items below.**
+
+Verification evidence already run in the SFR26 worktree immediately before this closure goal:
+
+| Command | Result | Evidence |
+|---|---|---|
+| `git branch --show-current` | PASS | Returned `goal/sfr26-report-deepest-actionable-validate-file-syntax-diagnostics`. |
+| `git diff --check` | PASS | No whitespace errors; Git emitted only the Windows LF-to-CRLF working-copy warning. |
+| `cargo fmt --check` | PASS | Formatting clean. |
+| `cargo test validate_file_syntax syntax diagnostics -- --test-threads=1` | FAIL, documented pre-existing command-form issue | Cargo accepts only one positional test filter and rejected `syntax`; split equivalents were run. |
+| `cargo test validate_file_syntax -- --test-threads=1` | PASS | 3 validate-file-syntax tests passed, including nested ERROR and missing-node diagnostics. |
+| `cargo test syntax -- --test-threads=1` | PASS | 5 matching tests passed. |
+| `cargo test diagnostics -- --test-threads=1` | PASS | Matching diagnostics tests passed. |
+| `cargo check` | PASS | Dev check completed successfully. |
+| `cargo clippy --all-targets --all-features -- -D warnings` | PASS | No clippy warnings. |
+| `cargo test --all-targets -- --test-threads=1` | PASS | 1837 unit tests plus integration suites passed; expected ignored long-running tests remained ignored. |
+| `cargo build --release` | PASS | Release build completed successfully. |
+| `npm test --prefix npm` | PASS | 28 Node tests passed. |
+| post-land `cargo check` on `main` at `2c98649` | PASS | `main` check completed after SFR26 was squash-landed. |
+
+Additional SFR27 branch verification for this closure artifact:
+
+| Command | Result | Evidence |
+|---|---|---|
+| `git diff --check` | PASS | No whitespace errors; Git emitted only the Windows LF-to-CRLF working-copy warning for this Markdown file. |
+| `rg "SF-001|SF-060|Blocked|Deferred|Completed|Superseded|False positive" .agent/goals/symforge-code-review-2026-05-22 -n` | PASS | Broad goal-directory evidence returned matches for completed goal statuses, deferred/superseded/false-positive rows, and SF-001/SF-060 coverage. |
+| `git branch --show-current` | PASS | Returned `goal/sfr27-final-review-burndown-audit-and-release-readiness-evidence`. |
+| `cargo fmt --check` | PASS | Formatting clean. |
+| `cargo check` | PASS | Dev check completed successfully. |
+| `cargo clippy --all-targets --all-features -- -D warnings` | PASS | No clippy warnings. |
+| `cargo test --all-targets -- --test-threads=1` | PASS | 1837 unit tests plus integration suites passed; expected ignored long-running tests remained ignored. |
+| `cargo build --release` | PASS | Release build completed successfully. |
+| `npm test --prefix npm` | PASS | 28 Node tests passed. |
+
+SFR27 is a documentation/status closure only. Its own task-specific verification for this section is:
+
+```bash
+git diff --check
+rg "SF-001|SF-060|Blocked|Deferred|Completed|Superseded|False positive" .agent/goals/symforge-code-review-2026-05-22 -n
+```
+
+## Residual Risk Register
+
+| Risk | Disposition | Release impact |
+|---|---|---|
+| SF-022 full 1000-file load performance test remains ignored/manual-scale | Deferred | Not a release blocker after SFR15 CI/perf-smoke gate coverage; run manually/nightly before scale-sensitive releases. |
+| SF-023 real-repo coupling calibration remains ignored/manual-scale | Deferred | Not a release blocker after SFR15; run manually/nightly when changing co-change ranking. |
+| SF-038 sidecar governor tuning for very large repositories is not calibrated here | Deferred | Not a correctness/security blocker; revisit with benchmark data. |
+| SF-042 historical `tasks/todo.md` repo hygiene | Deferred | No runtime impact; cleanup requires explicit owner decision because the file is outside this closure goal's allowed area. |
+| SF-049 co-change store corruption monitoring beyond existing tests | Deferred | Existing generation-fence/store tests remain evidence; add targeted corruption tests if future failures appear. |
+| SF-053 allowed dead-code helper | Deferred | Low-priority hygiene; no known runtime path affected. |
+| SF-055 deprecated `home_dir` discovery cleanup | Deferred | Low-priority cleanup; no current failure evidence. |
+| SF-056 patched SCSS vendor crate upstream tracking | Deferred | Vendor maintenance item; current vendor partial parses remain classified as expected noise. |
+| SF-057 `diff.txt` repo-hygiene decision | Deferred | No source behavior impact; do not delete without explicit cleanup scope. |
