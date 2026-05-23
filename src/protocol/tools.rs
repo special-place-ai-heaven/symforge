@@ -8581,6 +8581,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_file_syntax_reports_deepest_missing_node_diagnostic() {
+        let repo = TempDir::new().expect("temp repo");
+        fs::write(
+            repo.path().join("broken.rs"),
+            "fn compute() {\n    let value = outer(inner(1 + ), tail);\n}\n",
+        )
+        .expect("write malformed rust");
+        let server =
+            make_server_with_root(make_live_index_empty(), Some(repo.path().to_path_buf()));
+
+        let result = server
+            .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                path: "broken.rs".to_string(),
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("Status: partial"),
+            "validator should report malformed source as a partial parse; got: {result}"
+        );
+        assert!(
+            result.contains("Diagnostic: tree-sitter: syntax missing identifier"),
+            "validator should report the missing node kind; got: {result}"
+        );
+        assert!(
+            result.contains("(line 2, column 32)"),
+            "validator should report the missing node location; got: {result}"
+        );
+        assert!(
+            result.contains("Byte span: 46..46"),
+            "validator should report the zero-width missing-node byte span; got: {result}"
+        );
+        assert!(
+            result.contains("), tail);"),
+            "validator should include source context after the missing node; got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_file_context_shows_imports_and_used_by_sections() {
         let callee = make_symbol("target", SymbolKind::Function, 1, 3);
         let caller = make_symbol("caller", SymbolKind::Function, 1, 3);
