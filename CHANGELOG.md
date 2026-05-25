@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.14.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.2...v7.14.3) (2026-05-25)
+
+
+### Bug Fixes
+
+* sync platform dependency versions ([4974ba1](https://github.com/special-place-ai-heaven/symforge/commit/4974ba1108594e59b10b2adad16619b9b8a0ca77))
+
 ## [7.14.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.1...v7.14.2) (2026-05-25)
 
 
