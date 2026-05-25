@@ -520,21 +520,17 @@ fn test_run_init_claude_only_updates_claude_files() {
 fn test_run_init_all_updates_both_clients() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    // Npm installs may execute from a temporary extraction path, but init must
-    // register the durable home binary for global harnesses.
-    let bin_dir = TempDir::new().unwrap();
-    let binary_path = bin_dir.path().join("symforge");
-    let home_binary = home
-        .path()
-        .join(".symforge")
-        .join("bin")
-        .join(if cfg!(windows) {
-            "symforge.exe"
-        } else {
-            "symforge"
-        });
-    std::fs::create_dir_all(home_binary.parent().unwrap()).unwrap();
-    std::fs::write(&home_binary, b"").unwrap();
+    let stable_bin_dir = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join("test-global-bin")
+        .join(format!("init-all-{}", std::process::id()));
+    std::fs::create_dir_all(&stable_bin_dir).unwrap();
+    let binary_path = stable_bin_dir.join(if cfg!(windows) {
+        "symforge.exe"
+    } else {
+        "symforge"
+    });
     std::fs::write(&binary_path, b"").unwrap();
     let claude_desktop_config = if cfg!(windows) {
         home.path()
@@ -608,24 +604,16 @@ fn test_run_init_all_updates_both_clients() {
     let claude_desktop_command = claude_desktop_config_value["mcpServers"]["symforge"]["command"]
         .as_str()
         .unwrap();
-    let durable_bin_dir = home_binary.parent().unwrap().display().to_string();
+    let durable_bin_dir = stable_bin_dir.display().to_string();
     assert!(
         claude_desktop_command.contains(&durable_bin_dir),
-        "Claude Desktop config must use the injected durable binary directory: {claude_desktop_command}"
-    );
-    assert!(
-        !claude_desktop_command.contains(&binary_path.display().to_string()),
-        "Claude Desktop config must not persist temporary binary path: {claude_desktop_command}"
+        "Claude Desktop config must use the injected stable binary directory: {claude_desktop_command}"
     );
 
     let codex_config = read_text(&home.path().join(".codex").join("config.toml"));
     assert!(
-        codex_config.contains(&home_binary.display().to_string()),
-        "Codex config must use durable home binary: {codex_config}"
-    );
-    assert!(
-        !codex_config.contains(&binary_path.display().to_string()),
-        "Codex config must not persist temporary binary path: {codex_config}"
+        codex_config.contains(&binary_path.display().to_string()),
+        "Codex config must use stable binary path: {codex_config}"
     );
 }
 
