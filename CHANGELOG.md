@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.14.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.1...v7.14.2) (2026-05-25)
+
+
+### Bug Fixes
+
+* make npm distribution av-safe ([6e96d99](https://github.com/special-place-ai-heaven/symforge/commit/6e96d99ead459810b7a4c8b420b429dd55a81430))
+
 ## [7.14.1](https://github.com/special-place-administrator/symforge/compare/v7.14.0...v7.14.1) (2026-05-23)
 
 
