@@ -6,6 +6,7 @@
 //!   `symforge hook <subcommand>`  — hook scripts called by Claude Code
 //!   `symforge daemon`             — shared project/session backend
 //!   `symforge trust project-config` — audit, accept, or revoke project-config trust
+//!   `symforge update`             — update the npm-managed SymForge install
 //!
 //! Plan 03 wires these into main.rs and handles the top-level dispatch.
 
@@ -13,6 +14,8 @@ pub mod analytics;
 pub mod hook;
 pub mod init;
 pub mod trust;
+pub mod update;
+pub mod version;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -54,6 +57,8 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: trust::TrustSubcommand,
     },
+    /// Update the npm-managed SymForge install
+    Update,
 }
 
 /// Supported `symforge init` targets.
@@ -251,6 +256,16 @@ mod tests {
                 assert_eq!(parsed_hash, hash);
             }
             _ => panic!("expected trust project-config accept command"),
+        }
+    }
+
+    #[test]
+    fn test_update_command_parses() {
+        let cli = Cli::parse_from(["symforge", "update"]);
+
+        match cli.command {
+            Some(Commands::Update) => {}
+            _ => panic!("expected update command"),
         }
     }
 }

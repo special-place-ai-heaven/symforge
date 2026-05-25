@@ -4,7 +4,7 @@ version = "7.14.1"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
-repository = "https://github.com/special-place-administrator/symforge"
+repository = "https://github.com/special-place-ai-heaven/symforge"
 
 [lints.rust]
 unsafe_code = "deny"

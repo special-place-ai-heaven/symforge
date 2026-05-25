@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rmcp::{serve_server, transport};
+use std::ffi::OsString;
 use symforge::live_index::persist;
 use symforge::{cli, daemon, discovery, live_index, observability, protocol, sidecar, watcher};
 
@@ -119,13 +120,19 @@ fn spawn_periodic_checkpoint(
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if cli::version::is_version_request(&args) {
+        return cli::version::run_version();
+    }
+
+    let cli = cli::Cli::parse_from(args);
     match cli.command {
         Some(cli::Commands::Analytics { command }) => cli::analytics::run_analytics(&command),
         Some(cli::Commands::Init { client }) => cli::init::run_init(client),
         Some(cli::Commands::Daemon) => run_daemon(),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
         Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
+        Some(cli::Commands::Update) => cli::update::run_update(),
         None => run_mcp_server(),
     }
 }

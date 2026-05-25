@@ -8,7 +8,11 @@
       "include-v-in-tag": true,
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        "npm/package.json"
+        "npm/package.json",
+        "npm/platforms/linux-x64/package.json",
+        "npm/platforms/macos-arm64/package.json",
+        "npm/platforms/macos-x64/package.json",
+        "npm/platforms/windows-x64/package.json"
       ]
     }
   }

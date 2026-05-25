@@ -5,18 +5,23 @@
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "https://github.com/special-place-administrator/symforge"
+    "url": "https://github.com/special-place-ai-heaven/symforge"
   },
   "bin": {
     "symforge": "bin/symforge.js"
   },
   "scripts": {
-    "test": "node --test tests/*.test.js",
-    "postinstall": "node scripts/install.js"
+    "test": "node --test tests/*.test.js"
+  },
+  "optionalDependencies": {
+    "symforge-linux-x64": "7.14.1",
+    "symforge-macos-arm64": "7.14.1",
+    "symforge-macos-x64": "7.14.1",
+    "symforge-windows-x64": "7.14.1"
   },
   "files": [
     "bin/",
-    "scripts/",
+    "lib/",
     "LICENSE"
   ],
   "keywords": [

@@ -1,0 +1,20 @@
+{
+  "name": "symforge-linux-x64",
+  "version": "7.14.1",
+  "description": "Linux x64 native binary for SymForge",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/special-place-ai-heaven/symforge"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/",
+    "LICENSE"
+  ]
+}

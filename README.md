@@ -53,7 +53,8 @@ structural edits.
 - **Local analytics:** Optionally records bounded, local-only tool-call metadata
   in SQLite so operators can inspect usage without exporting source code.
 - **npm binary distribution:** Installs as an npm package with a JavaScript
-  launcher that downloads the correct Rust binary for the current platform.
+  launcher plus a platform-specific optional package. It does not run a
+  postinstall downloader or bootstrap client configs during install.
 
 ## How It Works
 
@@ -120,9 +121,24 @@ Prerequisite: Node.js 18+.
 npm install -g symforge
 ```
 
-The npm package installs a JavaScript launcher and downloads the platform binary
-to `~/.symforge/bin/symforge` or `~/.symforge/bin/symforge.exe` on Windows.
-Set `SYMFORGE_HOME` to use a different home directory.
+The npm package installs a JavaScript launcher and a platform-specific optional
+dependency containing the native binary. It does not run a postinstall
+downloader, stop processes, or auto-configure MCP clients during install.
+
+Update the npm-managed install explicitly:
+
+```bash
+symforge update
+```
+
+This runs the same package manager path as:
+
+```bash
+npm install -g symforge@latest
+```
+
+`symforge --version` prints the installed version and, when npm can be reached
+quickly, reports when a newer npm release is available.
 
 Prebuilt binaries are produced for:
 
@@ -133,8 +149,8 @@ Prebuilt binaries are produced for:
 
 ## Configure A Client
 
-Global install tries to configure home-scoped clients when their config
-directories already exist:
+`npm install -g symforge` only installs the launcher and native platform
+package. Configure MCP clients explicitly after install or update:
 
 - Claude Code
 - Claude Desktop
@@ -152,6 +168,11 @@ symforge init --client gemini
 symforge init --client all
 ```
 
+Cursor and other desktop harnesses that do not have a SymForge-specific init
+target should use their global MCP configuration and point the command at the
+installed `symforge` binary. Do not rely on npm install hooks to mutate editor
+configuration.
+
 Kilo Code is workspace-local. Run this from the repository you want to use:
 
 ```bash
@@ -167,6 +188,7 @@ symforge --help
 symforge init --help
 symforge daemon --help
 symforge analytics --help
+symforge update
 ```
 
 Top-level commands:
@@ -178,6 +200,7 @@ Top-level commands:
 | `hook` | Hook subcommands used by Claude Code and compatible workflows |
 | `trust` | Trust-control commands for project-local SymForge configuration |
 | `analytics` | Inspect, summarize, export, or reset local analytics storage |
+| `update` | Explicitly update the npm-managed global install |
 
 Analytics subcommands:
 

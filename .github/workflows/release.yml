@@ -235,7 +235,9 @@ jobs:
           if-no-files-found: error
 
   build-npm-package:
-    needs: prepare-release
+    needs:
+      - prepare-release
+      - build
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -254,19 +256,88 @@ jobs:
         with:
           node-version: 20
 
-      - name: Test npm installer
+      - name: Synchronize npm package versions
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const version = process.env.VERSION;
+          const platformPackages = {
+            'linux-x64': 'symforge-linux-x64',
+            'macos-arm64': 'symforge-macos-arm64',
+            'macos-x64': 'symforge-macos-x64',
+            'windows-x64': 'symforge-windows-x64',
+          };
+
+          const rootPath = 'npm/package.json';
+          const root = JSON.parse(fs.readFileSync(rootPath, 'utf8'));
+          root.version = version;
+          root.optionalDependencies = Object.fromEntries(
+            Object.values(platformPackages).map((name) => [name, version]),
+          );
+          fs.writeFileSync(rootPath, JSON.stringify(root, null, 2) + '\n');
+
+          for (const [dir, name] of Object.entries(platformPackages)) {
+            const packagePath = `npm/platforms/${dir}/package.json`;
+            const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+            pkg.name = name;
+            pkg.version = version;
+            fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n');
+          }
+          NODE
+
+      - name: Test npm package
         working-directory: npm
         run: npm test
 
-      - name: Build npm tarball
-        working-directory: npm
-        run: npm pack
+      - name: Download built binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: symforge-*
+          path: dist-binaries
+          merge-multiple: true
+
+      - name: Prepare platform npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p npm/platforms/windows-x64/bin
+          mkdir -p npm/platforms/linux-x64/bin
+          mkdir -p npm/platforms/macos-x64/bin
+          mkdir -p npm/platforms/macos-arm64/bin
+
+          cp dist-binaries/symforge-windows-x64.exe npm/platforms/windows-x64/bin/symforge.exe
+          cp dist-binaries/symforge-linux-x64 npm/platforms/linux-x64/bin/symforge
+          cp dist-binaries/symforge-macos-x64 npm/platforms/macos-x64/bin/symforge
+          cp dist-binaries/symforge-macos-arm64 npm/platforms/macos-arm64/bin/symforge
+
+          chmod 755 npm/platforms/linux-x64/bin/symforge
+          chmod 755 npm/platforms/macos-x64/bin/symforge
+          chmod 755 npm/platforms/macos-arm64/bin/symforge
+
+          for dir in npm/platforms/*; do
+            cp LICENSE "$dir/LICENSE"
+          done
+
+      - name: Build npm tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist-npm
+          npm pack ./npm --pack-destination dist-npm
+          for dir in npm/platforms/*; do
+            npm pack "$dir" --pack-destination dist-npm
+          done
+          ls -l dist-npm
 
       - name: Upload npm package artifact
         uses: actions/upload-artifact@v4
         with:
           name: npm-package
-          path: npm/symforge-${{ needs.prepare-release.outputs.version }}.tgz
+          path: dist-npm/*.tgz
           if-no-files-found: error
 
   upload-release-assets:
@@ -331,12 +402,41 @@ jobs:
 
       - name: Verify npm package artifact
         shell: bash
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          TAR_PATH="./dist/symforge-${{ needs.prepare-release.outputs.version }}.tgz"
-          test -f "$TAR_PATH"
-          ls -l "$TAR_PATH"
+          set -euo pipefail
+          for package in \
+            symforge-windows-x64 \
+            symforge-linux-x64 \
+            symforge-macos-x64 \
+            symforge-macos-arm64 \
+            symforge
+          do
+            test -f "./dist/${package}-${VERSION}.tgz"
+          done
+          ls -l dist
 
-      - name: Publish to npm
+      - name: Publish platform packages to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for package in \
+            symforge-windows-x64 \
+            symforge-linux-x64 \
+            symforge-macos-x64 \
+            symforge-macos-arm64
+          do
+            python execution/release_ops.py publish-npm \
+              --tarball "./dist/${package}-${VERSION}.tgz" \
+              --package-name "$package" \
+              --version "$VERSION"
+          done
+
+      - name: Publish root package to npm
         run: >
           python execution/release_ops.py publish-npm
           --tarball "./dist/symforge-${{ needs.prepare-release.outputs.version }}.tgz"

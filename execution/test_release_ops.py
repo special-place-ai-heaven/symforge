@@ -90,6 +90,23 @@ class ReleaseOpsTests(unittest.TestCase):
             cwd=root,
         )
 
+    def test_release_workflow_publishes_platform_npm_packages_before_root(self) -> None:
+        root = release_ops.repo_root()
+        workflow = (root / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        for package_name in (
+            "symforge-windows-x64",
+            "symforge-linux-x64",
+            "symforge-macos-x64",
+            "symforge-macos-arm64",
+        ):
+            self.assertIn(package_name, workflow)
+        self.assertIn("Download built binary artifacts", workflow)
+        self.assertIn("Publish platform packages to npm", workflow)
+        self.assertIn("Publish root package to npm", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
