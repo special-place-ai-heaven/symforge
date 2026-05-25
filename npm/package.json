@@ -14,10 +14,10 @@
     "test": "node --test tests/*.test.js"
   },
   "optionalDependencies": {
-    "symforge-linux-x64": "7.14.1",
-    "symforge-macos-arm64": "7.14.1",
-    "symforge-macos-x64": "7.14.1",
-    "symforge-windows-x64": "7.14.1"
+    "symforge-linux-x64": "7.14.2",
+    "symforge-macos-arm64": "7.14.2",
+    "symforge-macos-x64": "7.14.2",
+    "symforge-windows-x64": "7.14.2"
   },
   "files": [
     "bin/",

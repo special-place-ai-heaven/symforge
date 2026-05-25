@@ -9,6 +9,26 @@
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "npm/package.json",
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['symforge-linux-x64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['symforge-macos-arm64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['symforge-macos-x64']"
+        },
+        {
+          "type": "json",
+          "path": "npm/package.json",
+          "jsonpath": "$.optionalDependencies['symforge-windows-x64']"
+        },
         "npm/platforms/linux-x64/package.json",
         "npm/platforms/macos-arm64/package.json",
         "npm/platforms/macos-x64/package.json",
