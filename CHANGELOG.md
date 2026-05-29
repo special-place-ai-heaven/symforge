@@ -1,5 +1,17 @@
 # Changelog
 
+## [7.14.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.3...v7.14.4) (2026-05-29)
+
+
+### Bug Fixes
+
+* **edit:** normalize line endings in batch edit_within matching ([556216f](https://github.com/special-place-ai-heaven/symforge/commit/556216fe83493bb75555272aebaef3d8c4aa01d5))
+* **edit:** remove leading attributes when deleting a symbol ([ffbf734](https://github.com/special-place-ai-heaven/symforge/commit/ffbf7344e7635d24f75eca0fcad8cc5f97f3a6d9))
+* prompt-context precision, watcher gitignore, and CRLF batch-edit correctness ([8f29ab3](https://github.com/special-place-ai-heaven/symforge/commit/8f29ab3af6a8a0c8450776d0908e9c66fa8cf14c))
+* **prompt-context:** match repo-map request terms as whole words ([035296e](https://github.com/special-place-ai-heaven/symforge/commit/035296ea535794d0086a0caaac3e74afac1d3551))
+* **prompt-context:** suppress prose-word false-positive symbol hints ([9deaee8](https://github.com/special-place-ai-heaven/symforge/commit/9deaee800909f334151c7b2ecd7ca2928db4e6b0))
+* **watcher:** skip gitignored paths on incremental indexing ([fc2d9e6](https://github.com/special-place-ai-heaven/symforge/commit/fc2d9e6125a5d946a9235a15bed1331bd7850275))
+
 ## [7.14.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.2...v7.14.3) (2026-05-25)
 
 
