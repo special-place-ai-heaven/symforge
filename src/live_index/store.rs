@@ -1623,6 +1623,30 @@ impl LiveIndex {
         self.loaded_at_system = SystemTime::now();
     }
 
+    /// Returns `true` when `relative_path` is excluded by the repository's
+    /// gitignore rules, using the same matcher loaded at discovery time.
+    ///
+    /// This mirrors the `ignore::WalkBuilder` behaviour of the initial scan so
+    /// the live watcher never indexes paths the initial walk would have pruned —
+    /// most importantly SymForge's own gitignored `.symforge/` state directory
+    /// (e.g. `tee/*.rs` edit snapshots), which would otherwise leak into
+    /// reference and search results and grow the index unbounded across a
+    /// session. Whitelisted paths (such as `.github/` via `!/.github/`) and
+    /// committed, non-ignored `vendor/` trees are reported as not ignored.
+    pub(crate) fn is_path_gitignored(&self, relative_path: &str) -> bool {
+        let Some(gitignore) = self.gitignore.as_ref() else {
+            return false;
+        };
+        // The `ignore` crate asserts that paths are relative; guard against
+        // absolute paths that could reach here from unsanitized watcher events.
+        if std::path::Path::new(relative_path).has_root() {
+            return false;
+        }
+        gitignore
+            .matched_path_or_any_parents(relative_path, false)
+            .is_ignore()
+    }
+
     /// Insert a new file into the index (alias for `update_file`).
     ///
     /// Semantically identical to `update_file` — if the file already exists

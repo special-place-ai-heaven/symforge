@@ -44,12 +44,12 @@ fn latest_npm_version_with_timeout(timeout: Duration) -> Option<String> {
 
 pub(crate) fn version_lines(current: &str, latest: Option<&str>) -> Vec<String> {
     let mut lines = vec![format!("symforge {current}")];
-    if let Some(latest) = latest {
-        if is_newer_version(latest, current) {
-            lines.push(format!(
-                "Update available: {latest} (run `symforge update`)"
-            ));
-        }
+    if let Some(latest) = latest
+        && is_newer_version(latest, current)
+    {
+        lines.push(format!(
+            "Update available: {latest} (run `symforge update`)"
+        ));
     }
 
     lines
@@ -59,8 +59,7 @@ pub(crate) fn parse_latest_version_output(output: &str) -> Option<String> {
     output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .last()
+        .rfind(|line| !line.is_empty())
         .filter(|version| {
             version
                 .chars()

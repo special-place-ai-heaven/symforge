@@ -628,6 +628,35 @@ pub(crate) fn extend_past_orphaned_docs(
     line_start
 }
 
+/// Walk upward from `line_start` (the first byte of the symbol's opening
+/// line) and include contiguous Rust outer-attribute lines (`#[...]`) that sit
+/// directly above the item with no blank line between. Attributes belong to
+/// the item; leaving them behind on a delete orphans them onto the following
+/// item — for example a stray `#[test]` that then fails to compile. Inner
+/// attributes (`#![...]`) are not consumed (they belong to the enclosing
+/// scope), and only the leading line of a multi-line attribute is recognized,
+/// which is never worse than the previous behaviour of consuming none.
+fn extend_past_leading_attributes(file_content: &[u8], line_start: usize) -> usize {
+    let mut start = line_start;
+    while start > 0 {
+        // `start` sits just past a '\n'; find the bounds of the line above it.
+        let prev_line_end = start - 1;
+        let prev_line_start = file_content[..prev_line_end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line = &file_content[prev_line_start..prev_line_end];
+        let trimmed = std::str::from_utf8(line).unwrap_or("").trim();
+        if trimmed.starts_with("#[") {
+            start = prev_line_start;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 /// Whether `body` begins (first non-blank line) with a doc-comment marker.
 ///
 /// Used by `replace_symbol_body` to decide whether the caller intends to
@@ -704,7 +733,8 @@ pub(crate) fn build_delete(
     sym: &SymbolRecord,
     line_ending: LineEnding,
 ) -> Vec<u8> {
-    // Extend to start of line (include leading whitespace and orphaned doc comments).
+    // Extend to start of line (include leading whitespace, attached attributes,
+    // and orphaned doc comments).
     let start = {
         let s = sym.effective_start() as usize;
         let line_start = file_content[..s]
@@ -712,7 +742,11 @@ pub(crate) fn build_delete(
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        extend_past_orphaned_docs(file_content, line_start, sym) as u32
+        // Consume contiguous outer-attribute lines (`#[...]`) directly above the
+        // item so they are removed with it instead of being orphaned onto the
+        // next item (e.g. a stray `#[test]`, which then fails to compile).
+        let after_attrs = extend_past_leading_attributes(file_content, line_start);
+        extend_past_orphaned_docs(file_content, after_attrs, sym) as u32
     };
     // Extend past trailing newlines (consume up to one blank line).
     // CRLF-aware: on CRLF files, a line ending is \r\n not just \n.
@@ -809,18 +843,34 @@ pub(crate) fn build_edit_within(
     let body_str =
         std::str::from_utf8(body).map_err(|_| "Symbol body is not valid UTF-8.".to_string())?;
 
+    // Callers (LLMs) almost always supply `\n`-separated text regardless of the
+    // file's on-disk convention. Normalize both the search needle and the
+    // replacement to the file's dominant line ending so matches succeed in
+    // CRLF files and the splice never introduces mixed line endings.
+    let line_ending = detect_line_ending(file_content);
+    let needle = String::from_utf8(normalize_line_endings(old_text.as_bytes(), line_ending))
+        .map_err(|_| "Normalized search text is not valid UTF-8.".to_string())?;
+    let replacement = String::from_utf8(normalize_line_endings(new_text.as_bytes(), line_ending))
+        .map_err(|_| "Normalized replacement text is not valid UTF-8.".to_string())?;
+
     let (new_body, count) = if replace_all {
-        let count = body_str.matches(old_text).count();
+        let count = body_str.matches(needle.as_str()).count();
         if count == 0 {
             return Err(format!(
                 "`{old_text}` not found within symbol `{}`",
                 sym.name
             ));
         }
-        (body_str.replace(old_text, new_text), count)
+        (
+            body_str.replace(needle.as_str(), replacement.as_str()),
+            count,
+        )
     } else {
-        match body_str.find(old_text) {
-            Some(_) => (body_str.replacen(old_text, new_text, 1), 1),
+        match body_str.find(needle.as_str()) {
+            Some(_) => (
+                body_str.replacen(needle.as_str(), replacement.as_str(), 1),
+                1,
+            ),
             None => {
                 return Err(format!(
                     "`{old_text}` not found within symbol `{}`",
@@ -3349,6 +3399,47 @@ mod tests {
     }
 
     #[test]
+    fn test_build_delete_removes_leading_attribute_without_orphan() {
+        // No doc comment, so effective_start is the `fn` line; the `#[test]`
+        // attribute on the line above must be removed with the item, not orphaned
+        // onto the next one (which would be a compile error).
+        let content = b"fn keep() {}\n\n#[test]\nfn remove() {}\n";
+        let sym = make_test_symbol("remove", SymbolKind::Function, (22, 36), 4);
+        let result = build_delete(content, &sym, LineEnding::Lf);
+        let text = std::str::from_utf8(&result).unwrap();
+        assert!(
+            !text.contains("#[test]"),
+            "attribute must be removed: {text:?}"
+        );
+        assert!(!text.contains("remove"), "item must be removed: {text:?}");
+        assert!(
+            text.contains("keep"),
+            "unrelated item must remain: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_delete_removes_multiple_leading_attributes() {
+        let content = b"fn keep() {}\n\n#[cfg(test)]\n#[tokio::test]\nasync fn remove() {}\n";
+        let sym = make_test_symbol("remove", SymbolKind::Function, (42, 62), 5);
+        let result = build_delete(content, &sym, LineEnding::Lf);
+        let text = std::str::from_utf8(&result).unwrap();
+        assert!(
+            !text.contains("#[cfg(test)]"),
+            "first attribute must be removed: {text:?}"
+        );
+        assert!(
+            !text.contains("#[tokio::test]"),
+            "second attribute must be removed: {text:?}"
+        );
+        assert!(!text.contains("remove"), "item must be removed: {text:?}");
+        assert!(
+            text.contains("keep"),
+            "unrelated item must remain: {text:?}"
+        );
+    }
+
+    #[test]
     fn test_build_delete_collapses_excessive_blank_lines() {
         // Simulate what happens after deleting 3 adjacent symbols: triple blank lines.
         let content = b"fn a() {}\n\n\n\nfn d() {}\n";
@@ -3392,6 +3483,40 @@ mod tests {
         let sym = make_test_symbol("foo", SymbolKind::Function, (0, 18), 1);
         let result = build_edit_within(content, &sym, "missing", "new", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_edit_within_matches_lf_needle_in_crlf_body() {
+        // Callers supply `\n`-separated text, but the file on disk uses CRLF.
+        // The search must still match, and the splice must preserve CRLF without
+        // introducing lone LF line endings.
+        let content = b"fn foo() {\r\n    let x = 1;\r\n    bar();\r\n}";
+        let sym = make_test_symbol("foo", SymbolKind::Function, (0, content.len() as u32), 1);
+        let (result, count) =
+            build_edit_within(content, &sym, "    let x = 1;\n", "    let x = 2;\n", false)
+                .unwrap();
+        let text = std::str::from_utf8(&result).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(text, "fn foo() {\r\n    let x = 2;\r\n    bar();\r\n}");
+        // Every LF is part of a CRLF pair — no mixed line endings were introduced.
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "result must not contain lone LF line endings: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_edit_within_replace_all_lf_needle_in_crlf_body() {
+        // replace_all must also normalize the needle so every CRLF occurrence is
+        // matched and replaced.
+        let content = b"fn foo() {\r\n    old();\r\n    old();\r\n}";
+        let sym = make_test_symbol("foo", SymbolKind::Function, (0, content.len() as u32), 1);
+        let (result, count) =
+            build_edit_within(content, &sym, "    old();\n", "    new();\n", true).unwrap();
+        let text = std::str::from_utf8(&result).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(text, "fn foo() {\r\n    new();\r\n    new();\r\n}");
     }
 
     // -- whitespace-flexible fallback --
