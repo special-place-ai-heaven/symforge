@@ -1848,13 +1848,60 @@ fn find_prompt_qualified_symbol_hint(
     }
 }
 
+/// Common English function words and ubiquitous programming terms that
+/// frequently appear in natural-language coding prompts. A bare lowercase
+/// token in this set is treated as prose rather than a deliberate symbol
+/// reference, which prevents noisy false-positive prompt-context signals such
+/// as the word "any" incidentally matching `fn any` in the index.
+const PROMPT_NOISE_WORDS: &[&str] = &[
+    "add", "all", "and", "any", "api", "app", "are", "arg", "args", "but", "call", "can", "case",
+    "check", "class", "code", "data", "def", "did", "does", "done", "else", "enum", "error",
+    "fail", "few", "field", "file", "find", "fix", "for", "from", "func", "get", "had", "has",
+    "have", "help", "her", "him", "his", "how", "impl", "index", "init", "into", "item", "its",
+    "json", "just", "key", "kind", "let", "like", "line", "list", "load", "main", "make", "many",
+    "map", "match", "may", "mod", "mode", "more", "most", "name", "need", "new", "node", "not",
+    "now", "null", "off", "one", "only", "open", "our", "out", "own", "parse", "path", "read",
+    "ref", "result", "run", "save", "see", "self", "set", "she", "show", "size", "some", "sort",
+    "state", "step", "stop", "str", "sync", "task", "test", "text", "than", "that", "the", "their",
+    "them", "then", "there", "they", "this", "those", "todo", "true", "type", "use", "used",
+    "uses", "using", "value", "void", "want", "was", "way", "were", "what", "when", "where",
+    "which", "who", "why", "will", "with", "write", "you", "your",
+];
+
+/// Returns true when `token` looks like a deliberate symbol reference rather
+/// than an incidental natural-language word. Code identifiers (snake_case,
+/// camelCase/PascalCase, all-caps acronyms, or names containing digits) never
+/// collide with prose and are always distinctive; a plain lowercase word must
+/// be at least four characters and absent from [`PROMPT_NOISE_WORDS`].
+fn is_distinctive_symbol_token(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+    if token.contains('_')
+        || token
+            .chars()
+            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    token.len() >= 4 && !PROMPT_NOISE_WORDS.contains(&token)
+}
 fn find_prompt_symbol_hint(
     state: &SidecarState,
     prompt: &str,
 ) -> Result<Option<String>, StatusCode> {
     let guard = state.index.read();
     for token in prompt_tokens(prompt) {
-        if token.len() < 3 || token.contains('/') || token.contains('.') {
+        // Path- and module-qualified mentions are served by the dedicated file
+        // and qualified-symbol hints; this bare-token branch only handles plain
+        // identifiers.
+        if token.contains('/') || token.contains('.') {
+            continue;
+        }
+        // Suppress prose: only fire for tokens that look like a deliberate code
+        // identifier or a distinctive content word, so natural-language prompts
+        // (e.g. "use any tool") do not match incidental symbols like `fn any`.
+        if !is_distinctive_symbol_token(&token) {
             continue;
         }
 
@@ -3193,6 +3240,57 @@ mod tests {
         assert!(
             result.contains("search_symbols(...)"),
             "unmatched prompts should suggest the next narrowing step: {result}"
+        );
+    }
+
+    #[test]
+    fn test_is_distinctive_symbol_token_filters_prose_keeps_identifiers() {
+        // Deliberate code identifiers stay distinctive.
+        assert!(is_distinctive_symbol_token("connect"));
+        assert!(is_distinctive_symbol_token("find_prompt_symbol_hint"));
+        assert!(is_distinctive_symbol_token("LiveIndex"));
+        assert!(is_distinctive_symbol_token("utf8"));
+        assert!(is_distinctive_symbol_token("HTTP"));
+        // Common prose / generic programming words are suppressed.
+        assert!(!is_distinctive_symbol_token("any"));
+        assert!(!is_distinctive_symbol_token("the"));
+        assert!(!is_distinctive_symbol_token("file"));
+        assert!(!is_distinctive_symbol_token("value"));
+        assert!(!is_distinctive_symbol_token("get"));
+        // Too short to be a confident bare-token hint.
+        assert!(!is_distinctive_symbol_token("io"));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_context_handler_ignores_common_word_symbol_collision() {
+        // `any` is both a real symbol name (e.g. `fn any`) and an extremely common
+        // English word. A natural-language prompt that merely contains "any" must
+        // not produce a heuristic symbol signal, otherwise every prose prompt
+        // pollutes the LLM's context with an irrelevant symbol expansion.
+        let target = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("any", SymbolKind::Function, 1, 1)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/db.rs", target)]);
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "can you use any helper that already exists".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.contains("Prompt-context signal: no high-confidence hint"),
+            "common-word collisions must not fire a heuristic symbol signal: {result}"
+        );
+        assert!(
+            !result.contains("symbol token `any`"),
+            "the prose word \"any\" must not surface as a symbol hint: {result}"
         );
     }
 
