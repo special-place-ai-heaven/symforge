@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.4...v7.15.0) (2026-05-29)
+
+
+### Features
+
+* **version:** warn when the daemon binary is stale vs an installed update ([5e1e50c](https://github.com/special-place-ai-heaven/symforge/commit/5e1e50cd8fb16255ca1990665a15e92ec824947c))
+
 ## [7.14.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.3...v7.14.4) (2026-05-29)
 
 
