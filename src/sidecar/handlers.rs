@@ -2149,8 +2149,7 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
 }
 
 fn prompt_requests_repo_map(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    [
+    const REPO_MAP_TERMS: &[&str] = &[
         "architecture",
         "codebase",
         "map",
@@ -2158,9 +2157,17 @@ fn prompt_requests_repo_map(prompt: &str) -> bool {
         "repo",
         "repository",
         "structure",
-    ]
-    .iter()
-    .any(|term| lower.contains(term))
+    ];
+    // Whole-word matching: a substring scan would fire on unrelated words such
+    // as "report" (repo), "mapping" (map), or "infrastructure" (structure),
+    // wrongly dumping a full repo map into the high-confidence context branch.
+    prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            REPO_MAP_TERMS
+                .iter()
+                .any(|term| word.eq_ignore_ascii_case(term))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -3292,6 +3299,22 @@ mod tests {
             !result.contains("symbol token `any`"),
             "the prose word \"any\" must not surface as a symbol hint: {result}"
         );
+    }
+
+    #[test]
+    fn test_prompt_requests_repo_map_matches_whole_words_only() {
+        // Genuine repo-map requests fire.
+        assert!(prompt_requests_repo_map("give me a codebase overview"));
+        assert!(prompt_requests_repo_map("show the repo structure"));
+        assert!(prompt_requests_repo_map("draw the architecture map"));
+        assert!(prompt_requests_repo_map("what's in this repo?"));
+        // Substrings of unrelated words must NOT fire (the prior `contains` bug).
+        assert!(!prompt_requests_repo_map("generate a quarterly report"));
+        assert!(!prompt_requests_repo_map("explain the mapping layer"));
+        assert!(!prompt_requests_repo_map(
+            "how does the infrastructure scale"
+        ));
+        assert!(!prompt_requests_repo_map("restructure this function"));
     }
 
     #[tokio::test]
