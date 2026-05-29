@@ -545,11 +545,6 @@ pub(crate) fn start_watcher(
     })
 }
 
-/// Process a batch of debounced events, updating the shared index.
-///
-/// Filters out non-relevant events (Access) and unsupported file extensions.
-/// For Remove events, removes directly from the index.
-/// For Create/Modify events, calls `maybe_reindex` for hash-gated re-parsing.
 pub(crate) fn process_events(
     events: Vec<DebouncedEvent>,
     repo_root: &Path,
@@ -582,6 +577,16 @@ pub(crate) fn process_events(
                 Some(l) => l,
                 None => continue,
             };
+
+            // Mirror discovery's gitignore-aware walk: never index paths the
+            // initial scan would have pruned. Without this the watcher picks
+            // up files created under gitignored directories during a session —
+            // most importantly SymForge's own `.symforge/` state dir (e.g.
+            // `tee/*.rs` edit snapshots) — polluting search and reference
+            // results and growing the index unbounded.
+            if shared.read().is_path_gitignored(&relative_path) {
+                continue;
+            }
 
             match event.kind {
                 EventKind::Remove(_) => {
@@ -1189,6 +1194,51 @@ mod tests {
             assert!(file.classification.is_test);
             assert!(file.classification.is_generated);
         }
+    }
+
+    #[test]
+    fn process_events_predicate_skips_gitignored_state_dir() {
+        use crate::live_index::store::LiveIndex;
+        use ignore::gitignore::GitignoreBuilder;
+
+        // Reproduce SymForge's own root ignore rules: ignore every root-level dot
+        // directory but explicitly re-include `.github` (as the repo's .gitignore
+        // does via `/.*/` + `!/.github/`).
+        let mut builder = GitignoreBuilder::new("/repo");
+        builder.add_line(None, "/.*/").unwrap();
+        builder.add_line(None, "!/.github/").unwrap();
+        let gitignore = builder.build().unwrap();
+
+        let index = LiveIndex {
+            files: std::collections::HashMap::new(),
+            loaded_at: std::time::Instant::now(),
+            loaded_at_system: std::time::SystemTime::now(),
+            load_duration: std::time::Duration::ZERO,
+            cb_state: crate::live_index::store::CircuitBreakerState::new(0.20),
+            is_empty: false,
+            load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
+            snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+            reverse_index: std::collections::HashMap::new(),
+            files_by_basename: std::collections::HashMap::new(),
+            files_by_dir_component: std::collections::HashMap::new(),
+            trigram_index: crate::live_index::trigram::TrigramIndex::new(),
+            gitignore: Some(gitignore),
+            skipped_files: Vec::new(),
+            coupling_store: None,
+            local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        };
+
+        // SymForge's own gitignored state dir must never be indexed, even though
+        // tee snapshots are `.rs` files with a supported language.
+        assert!(index.is_path_gitignored(".symforge/tee/1780038581944-000040-handlers.rs"));
+        assert!(index.is_path_gitignored(".claude/settings.local.json"));
+        // Real source, whitelisted `.github`, and committed `vendor/` stay indexable.
+        assert!(!index.is_path_gitignored("src/sidecar/handlers.rs"));
+        assert!(!index.is_path_gitignored(".github/workflows/ci.yml"));
+        assert!(!index.is_path_gitignored("vendor/tree-sitter-scss/src/parser.c"));
+        // Absolute paths are rejected defensively (the `ignore` crate requires
+        // relative paths).
+        assert!(!index.is_path_gitignored("/abs/path.rs"));
     }
 
     /// Confirms that maybe_reindex returns HashSkip when content has not changed.
