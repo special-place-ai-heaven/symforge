@@ -628,6 +628,35 @@ pub(crate) fn extend_past_orphaned_docs(
     line_start
 }
 
+/// Walk upward from `line_start` (the first byte of the symbol's opening
+/// line) and include contiguous Rust outer-attribute lines (`#[...]`) that sit
+/// directly above the item with no blank line between. Attributes belong to
+/// the item; leaving them behind on a delete orphans them onto the following
+/// item — for example a stray `#[test]` that then fails to compile. Inner
+/// attributes (`#![...]`) are not consumed (they belong to the enclosing
+/// scope), and only the leading line of a multi-line attribute is recognized,
+/// which is never worse than the previous behaviour of consuming none.
+fn extend_past_leading_attributes(file_content: &[u8], line_start: usize) -> usize {
+    let mut start = line_start;
+    while start > 0 {
+        // `start` sits just past a '\n'; find the bounds of the line above it.
+        let prev_line_end = start - 1;
+        let prev_line_start = file_content[..prev_line_end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line = &file_content[prev_line_start..prev_line_end];
+        let trimmed = std::str::from_utf8(line).unwrap_or("").trim();
+        if trimmed.starts_with("#[") {
+            start = prev_line_start;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 /// Whether `body` begins (first non-blank line) with a doc-comment marker.
 ///
 /// Used by `replace_symbol_body` to decide whether the caller intends to
@@ -704,7 +733,8 @@ pub(crate) fn build_delete(
     sym: &SymbolRecord,
     line_ending: LineEnding,
 ) -> Vec<u8> {
-    // Extend to start of line (include leading whitespace and orphaned doc comments).
+    // Extend to start of line (include leading whitespace, attached attributes,
+    // and orphaned doc comments).
     let start = {
         let s = sym.effective_start() as usize;
         let line_start = file_content[..s]
@@ -712,7 +742,11 @@ pub(crate) fn build_delete(
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        extend_past_orphaned_docs(file_content, line_start, sym) as u32
+        // Consume contiguous outer-attribute lines (`#[...]`) directly above the
+        // item so they are removed with it instead of being orphaned onto the
+        // next item (e.g. a stray `#[test]`, which then fails to compile).
+        let after_attrs = extend_past_leading_attributes(file_content, line_start);
+        extend_past_orphaned_docs(file_content, after_attrs, sym) as u32
     };
     // Extend past trailing newlines (consume up to one blank line).
     // CRLF-aware: on CRLF files, a line ending is \r\n not just \n.
@@ -3362,6 +3396,47 @@ mod tests {
         assert!(!text.contains("remove"), "got: {text}");
         assert!(text.contains("keep"), "got: {text}");
         assert!(text.contains("also_keep"), "got: {text}");
+    }
+
+    #[test]
+    fn test_build_delete_removes_leading_attribute_without_orphan() {
+        // No doc comment, so effective_start is the `fn` line; the `#[test]`
+        // attribute on the line above must be removed with the item, not orphaned
+        // onto the next one (which would be a compile error).
+        let content = b"fn keep() {}\n\n#[test]\nfn remove() {}\n";
+        let sym = make_test_symbol("remove", SymbolKind::Function, (22, 36), 4);
+        let result = build_delete(content, &sym, LineEnding::Lf);
+        let text = std::str::from_utf8(&result).unwrap();
+        assert!(
+            !text.contains("#[test]"),
+            "attribute must be removed: {text:?}"
+        );
+        assert!(!text.contains("remove"), "item must be removed: {text:?}");
+        assert!(
+            text.contains("keep"),
+            "unrelated item must remain: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_delete_removes_multiple_leading_attributes() {
+        let content = b"fn keep() {}\n\n#[cfg(test)]\n#[tokio::test]\nasync fn remove() {}\n";
+        let sym = make_test_symbol("remove", SymbolKind::Function, (42, 62), 5);
+        let result = build_delete(content, &sym, LineEnding::Lf);
+        let text = std::str::from_utf8(&result).unwrap();
+        assert!(
+            !text.contains("#[cfg(test)]"),
+            "first attribute must be removed: {text:?}"
+        );
+        assert!(
+            !text.contains("#[tokio::test]"),
+            "second attribute must be removed: {text:?}"
+        );
+        assert!(!text.contains("remove"), "item must be removed: {text:?}");
+        assert!(
+            text.contains("keep"),
+            "unrelated item must remain: {text:?}"
+        );
     }
 
     #[test]
