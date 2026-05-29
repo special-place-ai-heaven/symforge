@@ -5,7 +5,9 @@ use clap::Parser;
 use rmcp::{serve_server, transport};
 use std::ffi::OsString;
 use symforge::live_index::persist;
-use symforge::{cli, daemon, discovery, live_index, observability, protocol, sidecar, watcher};
+use symforge::{
+    cli, daemon, discovery, live_index, observability, protocol, sidecar, version_registry, watcher,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupPlan {
@@ -121,6 +123,13 @@ fn spawn_periodic_checkpoint(
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
+
+    // Record this binary's path+version so a stale durable binary can be
+    // detected later (see `version_registry`). Best-effort and read-mostly;
+    // runs before the `--version` fast path so the npm-installed binary
+    // registers itself when the user verifies an update with `symforge --version`.
+    version_registry::record_self_default();
+
     if cli::version::is_version_request(&args) {
         return cli::version::run_version();
     }

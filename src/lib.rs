@@ -14,5 +14,7 @@ pub mod parsing;
 pub mod paths;
 pub mod protocol;
 pub mod sidecar;
+
+pub mod version_registry;
 pub mod watcher;
 pub mod worktree;

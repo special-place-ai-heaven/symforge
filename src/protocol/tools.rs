@@ -4944,6 +4944,14 @@ impl SymForgeServer {
             }
         }
 
+        // Surface a version-drift warning when this daemon's binary is older
+        // than another installed copy (e.g. an npm-updated package). Read-only;
+        // never copies or replaces the binary (see version_registry).
+        if let Some(drift) = crate::version_registry::drift_banner_default() {
+            result.push('\n');
+            result.push_str(&drift);
+        }
+
         result
     }
 
@@ -5012,6 +5020,11 @@ impl SymForgeServer {
         };
         result.push('\n');
         result.push_str(&capabilities.compact_text());
+
+        if let Some(drift) = crate::version_registry::drift_banner_default() {
+            result.push('\n');
+            result.push_str(&drift);
+        }
 
         result
     }
