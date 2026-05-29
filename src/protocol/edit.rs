@@ -809,18 +809,34 @@ pub(crate) fn build_edit_within(
     let body_str =
         std::str::from_utf8(body).map_err(|_| "Symbol body is not valid UTF-8.".to_string())?;
 
+    // Callers (LLMs) almost always supply `\n`-separated text regardless of the
+    // file's on-disk convention. Normalize both the search needle and the
+    // replacement to the file's dominant line ending so matches succeed in
+    // CRLF files and the splice never introduces mixed line endings.
+    let line_ending = detect_line_ending(file_content);
+    let needle = String::from_utf8(normalize_line_endings(old_text.as_bytes(), line_ending))
+        .map_err(|_| "Normalized search text is not valid UTF-8.".to_string())?;
+    let replacement = String::from_utf8(normalize_line_endings(new_text.as_bytes(), line_ending))
+        .map_err(|_| "Normalized replacement text is not valid UTF-8.".to_string())?;
+
     let (new_body, count) = if replace_all {
-        let count = body_str.matches(old_text).count();
+        let count = body_str.matches(needle.as_str()).count();
         if count == 0 {
             return Err(format!(
                 "`{old_text}` not found within symbol `{}`",
                 sym.name
             ));
         }
-        (body_str.replace(old_text, new_text), count)
+        (
+            body_str.replace(needle.as_str(), replacement.as_str()),
+            count,
+        )
     } else {
-        match body_str.find(old_text) {
-            Some(_) => (body_str.replacen(old_text, new_text, 1), 1),
+        match body_str.find(needle.as_str()) {
+            Some(_) => (
+                body_str.replacen(needle.as_str(), replacement.as_str(), 1),
+                1,
+            ),
             None => {
                 return Err(format!(
                     "`{old_text}` not found within symbol `{}`",
@@ -3392,6 +3408,40 @@ mod tests {
         let sym = make_test_symbol("foo", SymbolKind::Function, (0, 18), 1);
         let result = build_edit_within(content, &sym, "missing", "new", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_edit_within_matches_lf_needle_in_crlf_body() {
+        // Callers supply `\n`-separated text, but the file on disk uses CRLF.
+        // The search must still match, and the splice must preserve CRLF without
+        // introducing lone LF line endings.
+        let content = b"fn foo() {\r\n    let x = 1;\r\n    bar();\r\n}";
+        let sym = make_test_symbol("foo", SymbolKind::Function, (0, content.len() as u32), 1);
+        let (result, count) =
+            build_edit_within(content, &sym, "    let x = 1;\n", "    let x = 2;\n", false)
+                .unwrap();
+        let text = std::str::from_utf8(&result).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(text, "fn foo() {\r\n    let x = 2;\r\n    bar();\r\n}");
+        // Every LF is part of a CRLF pair — no mixed line endings were introduced.
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "result must not contain lone LF line endings: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_edit_within_replace_all_lf_needle_in_crlf_body() {
+        // replace_all must also normalize the needle so every CRLF occurrence is
+        // matched and replaced.
+        let content = b"fn foo() {\r\n    old();\r\n    old();\r\n}";
+        let sym = make_test_symbol("foo", SymbolKind::Function, (0, content.len() as u32), 1);
+        let (result, count) =
+            build_edit_within(content, &sym, "    old();\n", "    new();\n", true).unwrap();
+        let text = std::str::from_utf8(&result).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(text, "fn foo() {\r\n    new();\r\n    new();\r\n}");
     }
 
     // -- whitespace-flexible fallback --
