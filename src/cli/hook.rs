@@ -1,5 +1,5 @@
-//! Hook binary logic — reads `.symforge/sidecar.port`, calls sidecar over sync HTTP,
-//! and outputs a single JSON line to stdout.
+//! Hook binary logic — reads the OS-tagged `.symforge/sidecar.<os>.port`, calls the
+//! sidecar over sync HTTP, and outputs a single JSON line to stdout.
 //!
 //! Design constraints (HOOK-10):
 //! - The ONLY thing written to stdout is the final JSON line.
@@ -15,9 +15,38 @@ use std::time::Duration;
 
 use crate::cli::HookSubcommand;
 
-const PORT_FILE: &str = ".symforge/sidecar.port";
-const SESSION_FILE: &str = ".symforge/sidecar.session";
+// hook-adoption.log is written AND read only inside this hook binary (single OS per
+// process), so it stays un-tagged. The sidecar port/session files are cross-process
+// (written by the sidecar/proxy, read here) and MUST be OS-tagged in lockstep with the
+// writer — both sides derive the tag from `crate::paths::os_tagged_runtime_file_name`,
+// so a given OS's hook and sidecar always agree. See `sidecar_port_file_rel` below.
 const ADOPTION_LOG_FILE: &str = ".symforge/hook-adoption.log";
+
+/// Legacy (pre-OS-tag) cross-process paths, read-only fallback for one release.
+const LEGACY_PORT_FILE: &str = ".symforge/sidecar.port";
+const LEGACY_SESSION_FILE: &str = ".symforge/sidecar.session";
+
+/// CWD-relative path to the OS-tagged sidecar port file, e.g. `.symforge/sidecar.windows.port`.
+fn sidecar_port_file_rel() -> PathBuf {
+    Path::new(crate::paths::SYMFORGE_DIR_NAME)
+        .join(crate::paths::os_tagged_runtime_file_name("sidecar", "port"))
+}
+
+/// CWD-relative path to the OS-tagged sidecar session file.
+fn sidecar_session_file_rel() -> PathBuf {
+    Path::new(crate::paths::SYMFORGE_DIR_NAME).join(crate::paths::os_tagged_runtime_file_name(
+        "sidecar", "session",
+    ))
+}
+
+/// Read a CWD-relative runtime file, preferring the OS-tagged path then the legacy path.
+fn read_runtime_rel(tagged: &Path, legacy: &str) -> std::io::Result<String> {
+    match std::fs::read_to_string(tagged) {
+        Ok(contents) => Ok(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::read_to_string(legacy),
+        Err(e) => Err(e),
+    }
+}
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 /// Hard HTTP timeout — leaves margin within HOOK-03's 100 ms total budget.
 const HTTP_TIMEOUT: Duration = Duration::from_millis(50);
@@ -270,7 +299,7 @@ pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
         }
         Err(e) => {
             let repo_root = std::env::current_dir().unwrap_or_default();
-            let port_file_path = repo_root.join(PORT_FILE);
+            let port_file_path = repo_root.join(sidecar_port_file_rel());
             if verbose {
                 eprintln!(
                     "[symforge-hook] port file not readable: {e} (searched {})",
@@ -338,7 +367,7 @@ pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
         Err(_) => {
             // Port file existed but HTTP call failed — sidecar is stale.
             let repo_root = std::env::current_dir().unwrap_or_default();
-            let port_file_path = repo_root.join(PORT_FILE);
+            let port_file_path = repo_root.join(sidecar_port_file_rel());
             if verbose {
                 eprintln!(
                     "[symforge-hook] HTTP request failed — classifying as sidecar_port_stale"
@@ -700,9 +729,9 @@ fn extract_file_path(input: &HookInput, cwd: &str) -> String {
     }
 }
 
-/// Read `.symforge/sidecar.port` from the current working directory.
+/// Read the OS-tagged `.symforge/sidecar.<os>.port` (legacy fallback) from the CWD.
 fn read_port_file() -> std::io::Result<u16> {
-    let contents = std::fs::read_to_string(PORT_FILE)?;
+    let contents = read_runtime_rel(&sidecar_port_file_rel(), LEGACY_PORT_FILE)?;
     contents
         .trim()
         .parse::<u16>()
@@ -710,7 +739,7 @@ fn read_port_file() -> std::io::Result<u16> {
 }
 
 fn read_session_file() -> std::io::Result<String> {
-    let contents = std::fs::read_to_string(SESSION_FILE)?;
+    let contents = read_runtime_rel(&sidecar_session_file_rel(), LEGACY_SESSION_FILE)?;
     Ok(contents.trim().to_string())
 }
 
@@ -1027,7 +1056,7 @@ fn emit_no_sidecar_diagnostic(repo_root: &Path, port_file_path: &Path) {
 
     eprintln!(
         "[symforge-hook] sidecar not running. No {} found in {}.",
-        PORT_FILE,
+        sidecar_port_file_rel().display(),
         repo_root.display()
     );
     eprintln!("[symforge-hook]   Searched: {}", port_file_path.display());
@@ -1119,14 +1148,18 @@ fn adoption_log_path(repo_root: Option<&Path>) -> PathBuf {
 fn session_file_path(repo_root: Option<&Path>) -> PathBuf {
     repo_root
         .unwrap_or_else(|| Path::new("."))
-        .join(SESSION_FILE)
+        .join(sidecar_session_file_rel())
 }
 
 fn read_session_id_for_repo(repo_root: Option<&Path>) -> Option<String> {
-    std::fs::read_to_string(session_file_path(repo_root))
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let base = repo_root.unwrap_or_else(|| Path::new("."));
+    read_runtime_rel(
+        &session_file_path(repo_root),
+        &base.join(LEGACY_SESSION_FILE).to_string_lossy(),
+    )
+    .ok()
+    .map(|text| text.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
 fn load_hook_adoption_snapshot_from_path(

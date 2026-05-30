@@ -36,9 +36,48 @@ use crate::protocol::tools::{
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
 
-pub(crate) const DAEMON_PORT_FILE: &str = "daemon.port";
-const DAEMON_PID_FILE: &str = "daemon.pid";
-const DAEMON_START_LOCK_FILE: &str = "daemon.starting";
+// Daemon runtime files are OS-tagged (daemon.<os>.port) so a Windows daemon and a
+// WSL/Linux daemon never collide — even when SYMFORGE_HOME is deliberately pointed at
+// a shared mount. Without the tag, isolation would rely only on dirs::home_dir()
+// landing on different filesystems per OS, which a shared SYMFORGE_HOME defeats.
+// The tag is the same compile-time std::env::consts::OS the sidecar uses, so all
+// in-crate readers/writers agree by construction. Legacy un-tagged files are read as
+// a fallback for one release so an upgrade does not strand a running daemon.
+const LEGACY_DAEMON_PORT_FILE: &str = "daemon.port";
+const LEGACY_DAEMON_PID_FILE: &str = "daemon.pid";
+// Lock files are transient and never read across the upgrade boundary, so the legacy
+// name is only needed by the test-only cleanup helper.
+#[cfg(test)]
+const LEGACY_DAEMON_START_LOCK_FILE: &str = "daemon.starting";
+
+// Back-compat aliases for in-crate tests that write/assert the legacy un-tagged names.
+// Production read paths fall back to these, so such tests keep passing; production WRITE
+// paths use the OS-tagged names via the *_file_name() helpers above.
+#[cfg(test)]
+const DAEMON_PORT_FILE: &str = LEGACY_DAEMON_PORT_FILE;
+#[cfg(test)]
+const DAEMON_PID_FILE: &str = LEGACY_DAEMON_PID_FILE;
+#[cfg(test)]
+const DAEMON_START_LOCK_FILE: &str = LEGACY_DAEMON_START_LOCK_FILE;
+
+fn daemon_port_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("daemon", "port")
+}
+fn daemon_pid_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("daemon", "pid")
+}
+fn daemon_start_lock_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("daemon", "starting")
+}
+
+/// Read a daemon runtime file under `dir`, OS-tagged name first then legacy.
+fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io::Result<String> {
+    match std::fs::read_to_string(dir.join(tagged)) {
+        Ok(c) => Ok(c),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::read_to_string(dir.join(legacy)),
+        Err(e) => Err(e),
+    }
+}
 const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
 const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
@@ -1103,7 +1142,7 @@ async fn wait_for_daemon_unhealthy(port: u16) {
 }
 
 fn try_acquire_start_lock() -> anyhow::Result<Option<DaemonStartLock>> {
-    let path = daemon_dir()?.join(DAEMON_START_LOCK_FILE);
+    let path = daemon_dir()?.join(daemon_start_lock_file_name());
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2087,7 +2126,7 @@ pub(crate) fn daemon_dir() -> io::Result<PathBuf> {
 }
 
 fn write_daemon_port_file(port: u16) -> io::Result<()> {
-    let path = daemon_dir()?.join(DAEMON_PORT_FILE);
+    let path = daemon_dir()?.join(daemon_port_file_name());
     std::fs::write(&path, port.to_string()).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -2097,7 +2136,7 @@ fn write_daemon_port_file(port: u16) -> io::Result<()> {
 }
 
 fn write_daemon_pid_file(pid: u32) -> io::Result<()> {
-    let path = daemon_dir()?.join(DAEMON_PID_FILE);
+    let path = daemon_dir()?.join(daemon_pid_file_name());
     std::fs::write(&path, pid.to_string()).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -2107,7 +2146,11 @@ fn write_daemon_pid_file(pid: u32) -> io::Result<()> {
 }
 
 fn read_daemon_pid_file() -> io::Result<u32> {
-    let contents = std::fs::read_to_string(daemon_dir()?.join(DAEMON_PID_FILE))?;
+    let contents = read_daemon_runtime(
+        &daemon_dir()?,
+        &daemon_pid_file_name(),
+        LEGACY_DAEMON_PID_FILE,
+    )?;
     contents
         .trim()
         .parse::<u32>()
@@ -2115,7 +2158,11 @@ fn read_daemon_pid_file() -> io::Result<u32> {
 }
 
 pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
-    let contents = std::fs::read_to_string(daemon_dir()?.join(DAEMON_PORT_FILE))?;
+    let contents = read_daemon_runtime(
+        &daemon_dir()?,
+        &daemon_port_file_name(),
+        LEGACY_DAEMON_PORT_FILE,
+    )?;
     contents
         .trim()
         .parse::<u16>()
@@ -2126,14 +2173,17 @@ pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
 fn cleanup_daemon_files() {
     cleanup_daemon_runtime_files();
     if let Ok(dir) = daemon_dir() {
-        let _ = std::fs::remove_file(dir.join(DAEMON_START_LOCK_FILE));
+        let _ = std::fs::remove_file(dir.join(daemon_start_lock_file_name()));
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_START_LOCK_FILE));
     }
 }
 
 fn cleanup_daemon_runtime_files() {
     if let Ok(dir) = daemon_dir() {
-        let _ = std::fs::remove_file(dir.join(DAEMON_PORT_FILE));
-        let _ = std::fs::remove_file(dir.join(DAEMON_PID_FILE));
+        let _ = std::fs::remove_file(dir.join(daemon_port_file_name()));
+        let _ = std::fs::remove_file(dir.join(daemon_pid_file_name()));
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PORT_FILE));
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PID_FILE));
     }
 }
 
@@ -3905,7 +3955,7 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let lock_path = daemon_home.path().join(DAEMON_START_LOCK_FILE);
+        let lock_path = daemon_home.path().join(daemon_start_lock_file_name());
 
         // Create a lock file and backdate it to 60 seconds ago.
         let file = std::fs::File::create(&lock_path).expect("create lock");
@@ -3931,7 +3981,7 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let lock_path = daemon_home.path().join(DAEMON_START_LOCK_FILE);
+        let lock_path = daemon_home.path().join(daemon_start_lock_file_name());
 
         // Create a fresh lock file (just now — well within 30s threshold).
         std::fs::write(&lock_path, "").expect("create lock");

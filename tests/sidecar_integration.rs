@@ -138,8 +138,11 @@ async fn test_sidecar_binds_ephemeral_port() {
 
     assert!(handle.port > 0, "port must be a valid non-zero value");
 
-    let port_file = tmp.path().join(".symforge/sidecar.port");
-    assert!(port_file.exists(), "sidecar.port file must exist");
+    // The sidecar writes OS-tagged runtime files (sidecar.<os>.port); this test runs on
+    // the same OS as the spawned sidecar, so std::env::consts::OS matches the tag.
+    let sf = tmp.path().join(".symforge");
+    let port_file = sf.join(format!("sidecar.{}.port", std::env::consts::OS));
+    assert!(port_file.exists(), "OS-tagged sidecar port file must exist");
     let content = std::fs::read_to_string(&port_file).unwrap();
     let file_port: u16 = content
         .trim()
@@ -147,8 +150,8 @@ async fn test_sidecar_binds_ephemeral_port() {
         .expect("port file must contain a valid u16");
     assert_eq!(file_port, handle.port, "port file must match handle port");
 
-    let pid_file = tmp.path().join(".symforge/sidecar.pid");
-    assert!(pid_file.exists(), "sidecar.pid file must exist");
+    let pid_file = sf.join(format!("sidecar.{}.pid", std::env::consts::OS));
+    assert!(pid_file.exists(), "OS-tagged sidecar pid file must exist");
 
     // Send shutdown and await server-task completion (listener fully dropped).
     handle.shutdown_and_join().await;

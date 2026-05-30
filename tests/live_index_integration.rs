@@ -63,14 +63,21 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .filter(|contents| !contents.is_empty())
 }
 
+// The spawned sidecar writes OS-tagged runtime files (sidecar.<os>.port); these test
+// helpers run on the SAME OS as the spawned binary, so std::env::consts::OS matches.
+// Fall back to the legacy un-tagged name for resilience.
+fn read_runtime(dir: &Path, stem: &str, ext: &str) -> Option<String> {
+    let sf = dir.join(".symforge");
+    let tagged = format!("{stem}.{}.{ext}", std::env::consts::OS);
+    read_trimmed(&sf.join(&tagged)).or_else(|| read_trimmed(&sf.join(format!("{stem}.{ext}"))))
+}
+
 fn read_sidecar_port(dir: &Path) -> Option<u16> {
-    read_trimmed(&dir.join(".symforge").join("sidecar.port"))?
-        .parse()
-        .ok()
+    read_runtime(dir, "sidecar", "port")?.parse().ok()
 }
 
 fn read_session_id(dir: &Path) -> Option<String> {
-    read_trimmed(&dir.join(".symforge").join("sidecar.session"))
+    read_runtime(dir, "sidecar", "session")
 }
 
 /// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}`.
