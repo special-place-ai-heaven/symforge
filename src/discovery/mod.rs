@@ -309,6 +309,34 @@ fn is_forbidden_root(path: &Path) -> bool {
         }
     }
 
+    // 4c. WSL DrvFs Windows-profile / drive-root guard (Linux only).
+    //     Under WSL, Windows drives mount at /mnt/<drive> (default automount root)
+    //     and the Windows user profile surfaces at /mnt/<drive>/Users/<name>. None
+    //     of the rules above catch this: $HOME is the Linux home (/home/<user>), so
+    //     the home-based guards never match, and the leaf-name guards never inspect
+    //     the intermediate `Users` component. Auto-indexing any of these roots walks
+    //     a huge tree over the slow DrvFs/9p mount and hangs the daemon.
+    //
+    //     We forbid the broad container roots only — NOT deep project dirs — so a
+    //     non-git project kept at /mnt/c/Users/<name>/dev/proj stays auto-indexable:
+    //       /mnt/<drive>                 (bare Windows drive root)
+    //       /mnt/<drive>/Users           (the profile container)
+    //       /mnt/<drive>/Users/<name>    (a bare profile root)
+    //     A genuine git repo anywhere under these is still indexable because the
+    //     `.git` fast-path in `find_project_root` returns before this gate runs.
+    //
+    //     Gated on an actual WSL probe so a real Linux host that merely mounts a
+    //     volume at /mnt/<letter>/Users is not falsely forbidden. The `Users`
+    //     segment is matched case-insensitively because DrvFs is case-insensitive
+    //     but path canonicalization is case-preserving — `cd /mnt/c/users/...`
+    //     reaches the identical Windows tree and must be caught too.
+    #[cfg(not(target_os = "windows"))]
+    {
+        if is_running_under_wsl() && is_wsl_windows_container_path(&path) {
+            return true;
+        }
+    }
+
     // 5. Parent-of-home: e.g. C:\Users or /home
     if let Some(home) = home_dir() {
         let home = home.canonicalize().unwrap_or(home);
@@ -336,6 +364,86 @@ fn home_dir() -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         std::env::var("HOME").ok().map(PathBuf::from)
+    }
+}
+
+/// Returns `true` when running inside the Windows Subsystem for Linux.
+///
+/// Detected by sniffing `/proc/version` for the `microsoft` / `WSL` marker the
+/// WSL kernel writes there. The result is computed once and cached, so the file
+/// is read at most one time per process. Always `false` on non-Linux targets.
+#[cfg(not(target_os = "windows"))]
+fn is_running_under_wsl() -> bool {
+    use std::sync::OnceLock;
+    static IS_WSL: OnceLock<bool> = OnceLock::new();
+    *IS_WSL.get_or_init(|| {
+        std::fs::read_to_string("/proc/version")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("microsoft") || v.contains("wsl")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Pure path-shape test for the broad WSL DrvFs container roots that must never
+/// be auto-indexed: the bare Windows drive mount and the Windows user-profile
+/// container/root surfaced under WSL's default `/mnt/` automount.
+///
+/// Returns `true` for exactly:
+///
+/// - `/mnt/<drive>` (bare drive root)
+/// - `/mnt/<drive>/Users` (profile container)
+/// - `/mnt/<drive>/Users/<name>` (bare profile root)
+///
+/// where `<drive>` is a single ASCII letter and `Users` matches case-insensitively
+/// (DrvFs is case-insensitive but canonicalization is case-preserving). Anything
+/// deeper (`/mnt/<drive>/Users/<name>/...`) and any non-`Users` mount path
+/// (`/mnt/<drive>/code/proj`) returns `false` and stays indexable.
+///
+/// Path-shape only — the caller is responsible for confirming the host is WSL.
+/// Kept separate from the WSL probe so it is host-independent and unit-testable.
+#[cfg(not(target_os = "windows"))]
+fn is_wsl_windows_container_path(path: &Path) -> bool {
+    // Lexically normalize: drop `.`, pop on `..`. A path that escapes above the
+    // root via `..` is treated as non-matching rather than silently collapsing,
+    // so the gate never misfires on `..`-bearing input a future caller passes.
+    let mut comps: Vec<&str> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(os) => {
+                if let Some(s) = os.to_str() {
+                    comps.push(s);
+                }
+            }
+            // `..` that pops past the root means the path escapes above `/mnt`;
+            // treat as non-matching rather than silently collapsing.
+            std::path::Component::ParentDir if comps.pop().is_none() => return false,
+            std::path::Component::ParentDir => {}
+            // RootDir / CurDir / Prefix carry no addressable segment.
+            _ => {}
+        }
+    }
+
+    if comps.first() != Some(&"mnt") {
+        return false;
+    }
+
+    let is_drive_letter =
+        |s: &str| s.len() == 1 && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+
+    let is_users = |s: &str| s.eq_ignore_ascii_case("Users");
+
+    match comps.as_slice() {
+        // /mnt/<drive> — bare Windows drive root.
+        [_mnt, drive] => is_drive_letter(drive),
+        // /mnt/<drive>/Users — the profile container.
+        [_mnt, drive, users] => is_drive_letter(drive) && is_users(users),
+        // /mnt/<drive>/Users/<name> — a bare profile root (exactly 4 segments).
+        [_mnt, drive, users, _name] => is_drive_letter(drive) && is_users(users),
+        // Bare /mnt, or deeper than a bare profile root
+        // (/mnt/<drive>/Users/<name>/...), stays indexable.
+        _ => false,
     }
 }
 
@@ -856,5 +964,132 @@ mod tests {
             Some(SkipReason::BinaryContent),
             "custom.dat skip reason must be BinaryContent"
         );
+    }
+
+    // WSL DrvFs Windows-profile / drive-root guard (rule 4c).
+    //
+    // These exercise the pure path-shape helper `is_wsl_windows_container_path`,
+    // which is independent of the WSL probe and therefore deterministic on any
+    // non-Windows host (CI, macOS, native Linux). The helper only exists on
+    // non-Windows targets, so the whole group is gated to match.
+    #[cfg(not(target_os = "windows"))]
+    mod wsl_drvfs {
+        use super::*;
+
+        // --- forbidden: the broad container roots that caused the hang ---
+
+        #[test]
+        fn blocks_bare_drive_root() {
+            assert!(is_wsl_windows_container_path(Path::new("/mnt/c")));
+            assert!(is_wsl_windows_container_path(Path::new("/mnt/d")));
+        }
+
+        #[test]
+        fn blocks_users_container() {
+            assert!(is_wsl_windows_container_path(Path::new("/mnt/c/Users")));
+        }
+
+        #[test]
+        fn blocks_bare_profile_root() {
+            // The exact reported hang path.
+            assert!(is_wsl_windows_container_path(Path::new(
+                "/mnt/c/Users/poslj"
+            )));
+        }
+
+        #[test]
+        fn blocks_other_drive_profile() {
+            assert!(is_wsl_windows_container_path(Path::new(
+                "/mnt/d/Users/alice"
+            )));
+        }
+
+        #[test]
+        fn blocks_case_insensitive_users_segment() {
+            // DrvFs is case-insensitive but canonicalize is case-preserving, so
+            // `cd /mnt/c/users/...` reaches the identical Windows tree. All
+            // casings of the profile container/root must be caught.
+            assert!(is_wsl_windows_container_path(Path::new("/mnt/c/users")));
+            assert!(is_wsl_windows_container_path(Path::new(
+                "/mnt/c/USERS/poslj"
+            )));
+            assert!(is_wsl_windows_container_path(Path::new(
+                "/mnt/c/UsErS/poslj"
+            )));
+        }
+
+        // --- allowed: deep projects and lookalikes must stay indexable ---
+
+        #[test]
+        fn allows_deep_project_under_profile() {
+            // A non-git project kept under the profile must NOT be forbidden;
+            // the .git fast-path handles real repos, and deep dirs are scoped.
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/Users/poslj/dev/my-lib"
+            )));
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/Users/poslj/Documents/project"
+            )));
+        }
+
+        #[test]
+        fn allows_non_users_mount_project() {
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/code/proj"
+            )));
+        }
+
+        #[test]
+        fn allows_users_named_deeper() {
+            // A dir literally named Users but NOT at the /mnt/<drive>/Users
+            // position must stay allowed (guards against over-broad matching).
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/code/Users"
+            )));
+        }
+
+        #[test]
+        fn allows_non_mnt_paths() {
+            // Genuine Linux paths with a Users dir are not under /mnt.
+            assert!(!is_wsl_windows_container_path(Path::new("/srv/Users/bob")));
+            assert!(!is_wsl_windows_container_path(Path::new("/home/robert")));
+        }
+
+        #[test]
+        fn allows_multichar_second_segment() {
+            // comps[1] must be a single ASCII letter; multi-char (a real mount
+            // name, not a drive) is allowed.
+            assert!(!is_wsl_windows_container_path(Path::new("/mnt/cc/Users/x")));
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/wsl/Users/x"
+            )));
+        }
+
+        #[test]
+        fn allows_lookalike_prefixes() {
+            // Substring/prefix lookalikes must not collide with `Users`.
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/Users-data/proj"
+            )));
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/UserStuff/proj"
+            )));
+        }
+
+        #[test]
+        fn allows_bare_mnt() {
+            assert!(!is_wsl_windows_container_path(Path::new("/mnt")));
+        }
+
+        #[test]
+        fn parent_dir_escape_does_not_misfire() {
+            // `..` is popped lexically rather than dropped, so a path whose real
+            // target is a non-Users dir is not falsely forbidden.
+            assert!(!is_wsl_windows_container_path(Path::new(
+                "/mnt/c/Users/../code/proj"
+            )));
+            // `..` popping past the root yields no match (not a panic / false true).
+            assert!(!is_wsl_windows_container_path(Path::new("/mnt/c/../..")));
+        }
     }
 }
