@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.15.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.0...v7.15.1) (2026-05-30)
+
+
+### Bug Fixes
+
+* **discovery:** forbid WSL Windows-profile/drive mounts as auto-index root ([b1170a2](https://github.com/special-place-ai-heaven/symforge/commit/b1170a2d17f1222472aa82e282ddaf8e8fa5946a))
+
 ## [7.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.14.4...v7.15.0) (2026-05-29)
 
 
