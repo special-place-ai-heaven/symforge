@@ -11,6 +11,36 @@ pub const SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH: &str = ".symforge/idempotenc
 pub const SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH: &str =
     ".symforge/quarantine/index-snapshots";
 
+/// OS isolation tag for per-process runtime files (sidecar/daemon port/pid/session).
+///
+/// This is a pure compile-time constant baked into the binary from its build
+/// target (`std::env::consts::OS`): `"windows"`, `"linux"`, `"macos"`, etc. It is
+/// NOT a runtime probe, so any two binaries built for the same OS — notably the
+/// sidecar/daemon writer and the `symforge hook` reader, which are the SAME crate
+/// — always compute the IDENTICAL tag and therefore always agree on filenames.
+///
+/// Rationale: a Windows symforge and a WSL/Linux symforge can share one physical
+/// project-local `.symforge/` directory (a project on a Windows drive opened from
+/// both `C:\proj` and `/mnt/c/proj`). Each writes a port that is only valid in its
+/// own loopback namespace. Tagging the runtime filenames by OS guarantees neither
+/// side ever reads the other's port file. WSL2 reports `"linux"`, which is correct:
+/// two Linux processes sharing a dir share the same namespace semantics, so no
+/// WSL-vs-native discriminator is needed (adding a `/proc` sniff would make the tag
+/// a runtime probe that the Windows side could not reproduce — defeating agreement).
+#[must_use]
+pub fn os_runtime_tag() -> &'static str {
+    std::env::consts::OS
+}
+
+/// Build an OS-tagged runtime filename: `sidecar_runtime_file_name("sidecar", "port")`
+/// yields e.g. `"sidecar.linux.port"`. The extension is preserved so docs/tools that
+/// key on `.port`/`.pid`/`.session` continue to match, and the file stays a sibling
+/// in the same `.symforge/` directory.
+#[must_use]
+pub fn os_tagged_runtime_file_name(stem: &str, ext: &str) -> String {
+    format!("{stem}.{tag}.{ext}", tag = os_runtime_tag())
+}
+
 /// Resolve the canonical symforge data directory under `base`.
 pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
     base.join(SYMFORGE_DIR_NAME)

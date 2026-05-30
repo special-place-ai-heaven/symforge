@@ -1,7 +1,15 @@
 //! Port and PID file management for the HTTP sidecar.
 //!
 //! All files live under `.symforge/` in the current working directory.
-//! The hook binary reads `sidecar.port` to locate the running sidecar.
+//! The hook binary reads the sidecar port file to locate the running sidecar.
+//!
+//! Runtime filenames are OS-tagged (`sidecar.<os>.port`, see
+//! [`crate::paths::os_tagged_runtime_file_name`]) so a Windows symforge and a
+//! WSL/Linux symforge sharing one physical project `.symforge/` dir can never read
+//! each other's loopback port. The writer (here) and the `symforge hook` reader both
+//! derive the tag from the same compile-time `std::env::consts::OS`, so for a given
+//! OS they always agree. Legacy un-tagged files are still READ as a fallback for one
+//! release so an upgrade does not orphan a sidecar started by the previous binary.
 
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -9,9 +17,34 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DIR_NAME: &str = crate::paths::SYMFORGE_DIR_NAME;
-const PORT_FILE: &str = "sidecar.port";
-const PID_FILE: &str = "sidecar.pid";
-const SESSION_FILE: &str = "sidecar.session";
+
+// Legacy (pre-OS-tag) names. Read-only fallback + cleanup for one release window.
+const LEGACY_PORT_FILE: &str = "sidecar.port";
+const LEGACY_PID_FILE: &str = "sidecar.pid";
+const LEGACY_SESSION_FILE: &str = "sidecar.session";
+
+/// OS-tagged sidecar port filename, e.g. `sidecar.windows.port`.
+fn port_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("sidecar", "port")
+}
+/// OS-tagged sidecar pid filename, e.g. `sidecar.linux.pid`.
+fn pid_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("sidecar", "pid")
+}
+/// OS-tagged sidecar session filename, e.g. `sidecar.macos.session`.
+fn session_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("sidecar", "session")
+}
+
+/// Read a runtime file under `dir`, preferring the OS-tagged name and falling back
+/// to the legacy un-tagged name. Returns the first that exists/parses.
+fn read_runtime_file(dir: &Path, tagged: &str, legacy: &str) -> io::Result<String> {
+    match std::fs::read_to_string(dir.join(tagged)) {
+        Ok(contents) => Ok(contents),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::read_to_string(dir.join(legacy)),
+        Err(e) => Err(e),
+    }
+}
 
 /// Ensure the current working directory has a usable `.symforge/` runtime directory.
 pub fn ensure_symforge_dir() -> io::Result<PathBuf> {
@@ -25,27 +58,27 @@ pub fn ensure_symforge_dir() -> io::Result<PathBuf> {
 /// This is the convention the hook binary relies on.
 pub fn write_port_file(port: u16) -> io::Result<()> {
     let dir = ensure_symforge_dir()?;
-    let path = dir.join(PORT_FILE);
+    let path = dir.join(port_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{port}")?;
     Ok(())
 }
 
-/// Write the sidecar PID to `.symforge/sidecar.pid`.
+/// Write the sidecar PID to `.symforge/sidecar.<os>.pid`.
 ///
 /// The file contains ONLY the PID as ASCII digits, no trailing newline.
 pub fn write_pid_file(pid: u32) -> io::Result<()> {
     let dir = ensure_symforge_dir()?;
-    let path = dir.join(PID_FILE);
+    let path = dir.join(pid_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{pid}")?;
     Ok(())
 }
 
-/// Write the daemon/session proxy identifier to `.symforge/sidecar.session`.
+/// Write the daemon/session proxy identifier to `.symforge/sidecar.<os>.session`.
 pub fn write_session_file(session_id: &str) -> io::Result<()> {
     let dir = ensure_symforge_dir()?;
-    let path = dir.join(SESSION_FILE);
+    let path = dir.join(session_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{session_id}")?;
     Ok(())
@@ -54,10 +87,11 @@ pub fn write_session_file(session_id: &str) -> io::Result<()> {
 /// Remove only the daemon/session proxy file, preserving any live local sidecar port/pid files.
 pub fn cleanup_session_file() {
     let dir = PathBuf::from(DIR_NAME);
-    let _ = std::fs::remove_file(dir.join(SESSION_FILE));
+    let _ = std::fs::remove_file(dir.join(session_file_name()));
+    let _ = std::fs::remove_file(dir.join(LEGACY_SESSION_FILE));
 }
 
-/// Read and parse the port from `.symforge/sidecar.port`.
+/// Read and parse the port from `.symforge/sidecar.<os>.port` (legacy fallback).
 ///
 /// Returns an error if the file doesn't exist or contains invalid data.
 pub fn read_port() -> io::Result<u16> {
@@ -65,8 +99,7 @@ pub fn read_port() -> io::Result<u16> {
 }
 
 fn read_port_at(dir: &Path) -> io::Result<u16> {
-    let path = dir.join(PORT_FILE);
-    let contents = std::fs::read_to_string(&path)?;
+    let contents = read_runtime_file(dir, &port_file_name(), LEGACY_PORT_FILE)?;
     contents
         .trim()
         .parse::<u16>()
@@ -74,8 +107,7 @@ fn read_port_at(dir: &Path) -> io::Result<u16> {
 }
 
 fn read_pid_at(dir: &Path) -> io::Result<u32> {
-    let path = dir.join(PID_FILE);
-    let contents = std::fs::read_to_string(&path)?;
+    let contents = read_runtime_file(dir, &pid_file_name(), LEGACY_PID_FILE)?;
     contents
         .trim()
         .parse::<u32>()
@@ -121,7 +153,12 @@ impl SidecarStatus {
 }
 
 fn sidecar_files_exist(dir: &Path) -> bool {
-    dir.join(PORT_FILE).exists() || dir.join(PID_FILE).exists() || dir.join(SESSION_FILE).exists()
+    dir.join(port_file_name()).exists()
+        || dir.join(pid_file_name()).exists()
+        || dir.join(session_file_name()).exists()
+        || dir.join(LEGACY_PORT_FILE).exists()
+        || dir.join(LEGACY_PID_FILE).exists()
+        || dir.join(LEGACY_SESSION_FILE).exists()
 }
 
 fn sidecar_socket_addr(bind_host: &str, port: u16) -> io::Result<std::net::SocketAddr> {
@@ -196,18 +233,19 @@ pub fn read_sidecar_status(bind_host: &str) -> SidecarStatus {
 ///
 /// Called during sidecar shutdown — it is safe to call even if files don't exist.
 pub fn cleanup_files() {
-    let dir = PathBuf::from(DIR_NAME);
-    let _ = std::fs::remove_file(dir.join(PORT_FILE));
-    let _ = std::fs::remove_file(dir.join(PID_FILE));
-    let _ = std::fs::remove_file(dir.join(SESSION_FILE));
+    cleanup_files_at(&PathBuf::from(DIR_NAME));
 }
 
-/// Remove port/PID/session files from a specific directory.
+/// Remove port/PID/session files from a specific directory (both the OS-tagged names
+/// and the legacy un-tagged names, so a dead old-binary file cannot shadow a fresh one).
 /// Used by the panic hook which cannot rely on CWD.
 pub fn cleanup_files_at(dir: &std::path::Path) {
-    let _ = std::fs::remove_file(dir.join(PORT_FILE));
-    let _ = std::fs::remove_file(dir.join(PID_FILE));
-    let _ = std::fs::remove_file(dir.join(SESSION_FILE));
+    let _ = std::fs::remove_file(dir.join(port_file_name()));
+    let _ = std::fs::remove_file(dir.join(pid_file_name()));
+    let _ = std::fs::remove_file(dir.join(session_file_name()));
+    let _ = std::fs::remove_file(dir.join(LEGACY_PORT_FILE));
+    let _ = std::fs::remove_file(dir.join(LEGACY_PID_FILE));
+    let _ = std::fs::remove_file(dir.join(LEGACY_SESSION_FILE));
 }
 
 /// Check whether the port/PID files are stale (i.e., the old sidecar is no longer running).
@@ -290,7 +328,7 @@ mod tests {
         with_temp_dir(|| {
             write_port_file(8080).expect("write_port_file should succeed");
             // Read while still inside the temp cwd so the relative path resolves correctly.
-            let port_path = PathBuf::from(DIR_NAME).join(PORT_FILE);
+            let port_path = PathBuf::from(DIR_NAME).join(port_file_name());
             let bytes = std::fs::read(&port_path).unwrap();
             assert_eq!(
                 bytes, b"8080",
@@ -300,31 +338,83 @@ mod tests {
     }
 
     #[test]
+    fn test_write_is_os_tagged_only() {
+        with_temp_dir(|| {
+            write_port_file(8080).expect("write_port_file should succeed");
+            let dir = PathBuf::from(DIR_NAME);
+            // Writer is tag-pure: the OS-tagged file exists, the legacy name does NOT.
+            assert!(
+                dir.join(port_file_name()).exists(),
+                "OS-tagged port file must exist after write"
+            );
+            assert!(
+                !dir.join(LEGACY_PORT_FILE).exists(),
+                "writer must NOT create a legacy un-tagged port file (would re-open cross-OS collision)"
+            );
+            assert!(
+                port_file_name().contains(std::env::consts::OS),
+                "tagged name must carry this OS"
+            );
+        });
+    }
+
+    #[test]
+    fn test_read_falls_back_to_legacy_untagged() {
+        with_temp_dir(|| {
+            // Simulate a sidecar started by an OLD (pre-tag) binary.
+            let dir = ensure_symforge_dir().expect("dir");
+            std::fs::write(dir.join(LEGACY_PORT_FILE), b"7777").unwrap();
+            let port = read_port().expect("read_port must fall back to legacy file");
+            assert_eq!(port, 7777, "legacy fallback must read the un-tagged port");
+        });
+    }
+
+    #[test]
+    fn test_tagged_wins_over_legacy() {
+        with_temp_dir(|| {
+            let dir = ensure_symforge_dir().expect("dir");
+            std::fs::write(dir.join(LEGACY_PORT_FILE), b"1111").unwrap();
+            std::fs::write(dir.join(port_file_name()), b"2222").unwrap();
+            let port = read_port().expect("read_port should succeed");
+            assert_eq!(
+                port, 2222,
+                "OS-tagged file must take precedence over legacy"
+            );
+        });
+    }
+
+    #[test]
     fn test_cleanup_removes_files() {
         with_temp_dir(|| {
             write_port_file(9000).expect("write should succeed");
             write_pid_file(12345).expect("write should succeed");
-
+            // Also drop legacy files to prove cleanup removes BOTH.
             let dir = PathBuf::from(DIR_NAME);
+            std::fs::write(dir.join(LEGACY_PORT_FILE), b"9000").unwrap();
+            std::fs::write(dir.join(LEGACY_PID_FILE), b"12345").unwrap();
+
             assert!(
-                dir.join(PORT_FILE).exists(),
-                "port file should exist before cleanup"
+                dir.join(port_file_name()).exists(),
+                "tagged port file should exist before cleanup"
             );
             assert!(
-                dir.join(PID_FILE).exists(),
-                "pid file should exist before cleanup"
+                dir.join(pid_file_name()).exists(),
+                "tagged pid file should exist before cleanup"
             );
 
             cleanup_files();
 
-            assert!(
-                !dir.join(PORT_FILE).exists(),
-                "port file should be gone after cleanup"
-            );
-            assert!(
-                !dir.join(PID_FILE).exists(),
-                "pid file should be gone after cleanup"
-            );
+            for name in [
+                port_file_name(),
+                pid_file_name(),
+                LEGACY_PORT_FILE.to_string(),
+                LEGACY_PID_FILE.to_string(),
+            ] {
+                assert!(
+                    !dir.join(&name).exists(),
+                    "{name} should be gone after cleanup (tagged + legacy)"
+                );
+            }
         });
     }
 
@@ -390,7 +480,7 @@ mod tests {
             // Cleanup should have been called.
             let dir = PathBuf::from(DIR_NAME);
             assert!(
-                !dir.join(PORT_FILE).exists(),
+                !dir.join(port_file_name()).exists(),
                 "port file cleaned up after stale detection"
             );
         });
