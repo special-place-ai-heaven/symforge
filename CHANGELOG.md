@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.15.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.1...v7.15.2) (2026-05-30)
+
+
+### Bug Fixes
+
+* **runtime:** OS-tag sidecar/daemon runtime files for per-OS isolation ([f5075aa](https://github.com/special-place-ai-heaven/symforge/commit/f5075aa6cb89e8d2c855b1dc0fcf26972774fdbb))
+* **runtime:** OS-tag sidecar/daemon runtime files for per-OS isolation ([35c1adb](https://github.com/special-place-ai-heaven/symforge/commit/35c1adb288d0d13eb796a9a6ae4b9b79e086e38e))
+
 ## [7.15.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.0...v7.15.1) (2026-05-30)
 
 
