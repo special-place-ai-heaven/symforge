@@ -1,17 +1,27 @@
 //! EDR-safe version-drift detection for the SymForge binary.
 //!
-//! SymForge is launched two ways that can drift apart: a global npm package
-//! (refreshed by `npm install -g`) and a *durable* per-user binary under
-//! `~/.symforge/bin` that MCP clients launch directly. `npm install` updates
-//! the former but not the latter, so a stale durable binary can silently serve
-//! old code to every harness.
+//! SymForge may be launched from more than one location that can drift apart in
+//! version: the per-OS npm global install (refreshed by `npm install -g`), a
+//! local dev `target/` build, or any other on-disk copy an MCP client points
+//! at. If a client is wired to an older path while a newer install exists
+//! elsewhere, that client silently serves stale code.
 //!
-//! This module detects that drift **without ever copying, executing, or
-//! downloading anything** — the one and only side effect is reading and
-//! (rarely) atomically rewriting a small plain-text JSON file. That keeps it
-//! clear of antivirus / EDR heuristics that flag a running process which drops
-//! or overwrites executables. The actual refresh is left to a user-run command
-//! surfaced in the warning; the daemon never replaces its own binary.
+//! NOTE: there is no longer any *durable* SymForge binary under `~/.symforge/bin`.
+//! That promotion mechanism was retired — `symforge init` registers MCP clients
+//! against the running native binary's own path AS-IS (the npm global install
+//! for that OS; see `cli::init::binary_path_for_registration`), and nothing in
+//! current code copies, promotes, or writes a binary into `~/.symforge/bin`.
+//! Drift detection therefore compares only the paths that binaries have actually
+//! recorded in `versions.json`; a leftover `~/.symforge/bin` entry from an old
+//! install is harmless because [`detect_stale`] skips any registered path that
+//! no longer exists on disk.
+//!
+//! This module detects drift **without ever copying, executing, or downloading
+//! anything** — the one and only side effect is reading and (rarely) atomically
+//! rewriting a small plain-text JSON file. That keeps it clear of antivirus /
+//! EDR heuristics that flag a running process which drops or overwrites
+//! executables. Any refresh is left to a user-run command surfaced in the
+//! warning; the daemon never replaces its own binary.
 //!
 //! Mechanism: every binary, on launch, records its own canonical path and
 //! version into `<home>/versions.json`. The daemon reads that registry and, if
@@ -147,8 +157,8 @@ pub fn detect_stale(home: &Path) -> Option<StaleBinary> {
 }
 
 /// Human-readable, EDR-safe drift warning. Surfaces a command the **user**
-/// runs in their own shell to refresh the durable binary — the daemon itself
-/// never copies or replaces the executable.
+/// runs in their own shell to overwrite the stale running binary with the newer
+/// install — the daemon itself never copies or replaces the executable.
 pub fn stale_warning(stale: &StaleBinary) -> String {
     let refresh = if cfg!(windows) {
         format!(
@@ -167,8 +177,8 @@ pub fn stale_warning(stale: &StaleBinary) -> String {
         "── \u{26a0} Version drift ──\n\
          This daemon is serving symforge {running_ver} from:\n  {running_path}\n\
          but a newer install ({newer_ver}) exists at:\n  {newer_path}\n\
-         The MCP daemon is serving stale code. In your own shell, refresh the\n\
-         durable binary, then reconnect your MCP client (e.g. /mcp):\n{refresh}",
+         The MCP daemon is serving stale code. In your own shell, overwrite the\n\
+         stale binary with the newer install, then reconnect your MCP client (e.g. /mcp):\n{refresh}",
         running_ver = stale.running_version,
         running_path = stale.running_path,
         newer_ver = stale.newer_version,
