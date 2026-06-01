@@ -116,10 +116,22 @@ function resolveBinary(opts) {
   };
 }
 
+// Detect the WSL trap: a non-Windows process executing a symforge install whose
+// own files live under a Windows drive mount (`/mnt/<letter>/...`). That means
+// the launcher came from a Windows npm prefix that bled onto the WSL PATH, so it
+// only ships the Windows platform package — `npm install -g` from here just
+// rewrites the Windows prefix again. The fix is to install into the Linux prefix.
+function isWindowsPrefixUnderUnix(platform, selfPath) {
+  if (platform === "win32") return false;
+  if (typeof selfPath !== "string") return false;
+  return /^\/mnt\/[a-z]\//i.test(selfPath);
+}
+
 function formatResolveError(result, opts) {
   const options = opts || {};
   const platform = options.platform || process.platform;
   const arch = options.arch || process.arch;
+  const selfPath = options.selfPath || __dirname;
   const targets = result.supportedTargets.map((t) => `${t.platform}-${t.arch}`).join(", ");
 
   if (result.reason === "ok") return null;
@@ -127,6 +139,21 @@ function formatResolveError(result, opts) {
     return `symforge: unsupported platform ${platform}-${arch}; supported: ${targets}`;
   }
   if (result.reason === "platform_package_missing") {
+    if (isWindowsPrefixUnderUnix(platform, selfPath)) {
+      return (
+        `symforge: platform package ${result.platformPackage} is missing because this is a Windows ` +
+        `npm install running under ${platform}.\n` +
+        `  This launcher lives at ${selfPath} — a Windows drive mount, not your ${platform} npm prefix.\n` +
+        `  Cause: a shared Windows ~/.npmrc 'prefix=' (e.g. C:\\Users\\<you>\\.npm-global) is bleeding ` +
+        `into ${platform}, so 'npm install -g' lands in the Windows prefix and only ships the Windows binary.\n` +
+        `  Give ${platform} its own npm prefix, then reinstall:\n` +
+        `    npm config set prefix "$HOME/.npm-global"\n` +
+        `    export PATH="$HOME/.npm-global/bin:$PATH"   # ahead of any /mnt/* entries; add to ~/.profile to persist\n` +
+        `    hash -r && npm install -g symforge@latest\n` +
+        `  Verify with: which symforge   # expect $HOME/.npm-global/bin/symforge, not /mnt/...\n` +
+        `  Then run: symforge init --client all`
+      );
+    }
     return (
       `symforge: platform package ${result.platformPackage} not installed or missing its binary. ` +
       "Reinstall with optional dependencies enabled: npm install -g symforge@latest"

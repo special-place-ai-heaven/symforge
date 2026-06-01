@@ -74,6 +74,69 @@ test("resolveBinary reports missing optional platform package", () => {
   assert.equal(result.platformPackage, "symforge-linux-x64");
 });
 
+test("formatResolveError diagnoses the WSL Windows-prefix trap for a /mnt launcher", () => {
+  const result = resolveBinary({
+    binary: "symforge",
+    platform: "linux",
+    arch: "x64",
+    requireResolve() {
+      throw new Error("not installed");
+    },
+  });
+
+  const message = formatResolveError(result, {
+    platform: "linux",
+    arch: "x64",
+    selfPath: "/mnt/c/Users/rakovnik/.npm-global/node_modules/symforge/lib",
+  });
+
+  assert.match(message, /Windows npm install running under linux/);
+  assert.match(message, /\/mnt\/c\/Users\/rakovnik/);
+  assert.match(message, /shared Windows ~\/\.npmrc 'prefix='/);
+  assert.match(message, /npm config set prefix "\$HOME\/\.npm-global"/);
+  assert.match(message, /symforge init --client all/);
+});
+
+test("formatResolveError keeps the generic missing-package message off Windows mounts", () => {
+  const result = resolveBinary({
+    binary: "symforge",
+    platform: "linux",
+    arch: "x64",
+    requireResolve() {
+      throw new Error("not installed");
+    },
+  });
+
+  const message = formatResolveError(result, {
+    platform: "linux",
+    arch: "x64",
+    selfPath: "/home/rakovnik/.npm-global/lib/node_modules/symforge/lib",
+  });
+
+  assert.match(message, /not installed or missing its binary/);
+  assert.doesNotMatch(message, /Windows drive mount/);
+});
+
+test("formatResolveError never shows the WSL hint to a real Windows host", () => {
+  const result = resolveBinary({
+    binary: "symforge",
+    platform: "win32",
+    arch: "x64",
+    requireResolve() {
+      throw new Error("not installed");
+    },
+  });
+
+  const message = formatResolveError(result, {
+    platform: "win32",
+    arch: "x64",
+    selfPath: "/mnt/c/whatever",
+  });
+
+  assert.match(message, /not installed or missing its binary/);
+  assert.doesNotMatch(message, /Windows drive mount/);
+});
+
 test("resolveBinary rejects invalid binary names", () => {
   const result = resolveBinary({ binary: "other", platform: "linux", arch: "x64" });
 
