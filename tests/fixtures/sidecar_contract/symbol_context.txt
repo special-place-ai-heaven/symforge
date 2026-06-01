@@ -1,7 +1,4 @@
-Match type: heuristic
-Source authority: current index
-Parse state: parsed
-Completeness: full
+Trust: heuristic | current index | parsed | full
 Scope: repo-wide symbol token `do_thing`
 Evidence: symbol token `do_thing` anchored at src/call.rs:1
 

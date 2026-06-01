@@ -9801,12 +9801,8 @@ mod tests {
             "should find matching symbol, got: {result}"
         );
         assert!(
-            result.contains("Match type: constrained (prefix tier)"),
-            "search_symbols should expose trust envelope, got: {result}"
-        );
-        assert!(
-            result.contains("Source authority: current index"),
-            "search_symbols should expose source authority, got: {result}"
+            result.contains("Trust: constrained (prefix tier) | current index | parsed"),
+            "search_symbols should expose the compact trust line, got: {result}"
         );
         assert!(
             result.contains("Tip:"),
@@ -10423,7 +10419,7 @@ mod tests {
             "should find matching text, got: {result}"
         );
         assert!(
-            result.contains("Match type: constrained (literal)"),
+            result.contains("Trust: constrained (literal)"),
             "search_text should expose trust envelope, got: {result}"
         );
         assert!(
@@ -10593,7 +10589,7 @@ mod tests {
             "should find matching function, got: {result}"
         );
         assert!(
-            result.contains("Match type: structural (ast-grep)"),
+            result.contains("Trust: structural (ast-grep)"),
             "structural search should expose ast-grep match type, got: {result}"
         );
     }
@@ -11177,7 +11173,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("Match type: constrained (tiered path relevance)"),
+            result.contains("Trust: constrained (tiered path relevance)"),
             "search_files should expose trust envelope, got: {result}"
         );
         assert!(
@@ -11951,7 +11947,7 @@ mod tests {
             "include_vendor=true should resolve vendor path: {result}"
         );
         assert!(
-            result.contains("Match type: exact (resolve)"),
+            result.contains("Trust: exact (resolve)"),
             "include_vendor=true should keep normal resolve envelope: {result}"
         );
         assert!(
@@ -12015,11 +12011,7 @@ mod tests {
             }))
             .await;
         assert!(
-            result.contains("Match type: exact (resolve)"),
-            "got: {result}"
-        );
-        assert!(
-            result.contains("Source authority: current index"),
+            result.contains("Trust: exact (resolve) | current index | parsed"),
             "got: {result}"
         );
         assert!(
@@ -12056,7 +12048,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("Match type: constrained (resolve candidates)"),
+            result.contains("Trust: constrained (resolve candidates)"),
             "got: {result}"
         );
         assert!(result.contains("src/lib.rs"), "got: {result}");
@@ -12530,12 +12522,8 @@ mod tests {
             "what_changed since epoch should list all files, got: {result}"
         );
         assert!(
-            result.contains("Match type: exact (timestamp compare)"),
-            "timestamp mode should report authority envelope: {result}"
-        );
-        assert!(
-            result.contains("Source authority: current index"),
-            "timestamp mode should report index authority: {result}"
+            result.contains("Trust: exact (timestamp compare) | current index | parsed"),
+            "timestamp mode should report the compact trust line: {result}"
         );
     }
 
@@ -16851,12 +16839,8 @@ mod tests {
             "expected dependent hit: {result}"
         );
         assert!(
-            result.contains("Match type: exact"),
-            "bundle mode should surface match type; got: {result}"
-        );
-        assert!(
-            result.contains("Source authority: current index"),
-            "bundle mode should surface source authority; got: {result}"
+            result.contains("Trust: exact | current index | parsed"),
+            "bundle mode should surface the compact trust line; got: {result}"
         );
         assert!(
             result.contains("Scope: path `src/db.rs`; bundle mode"),
@@ -16985,7 +16969,7 @@ mod tests {
             !result.contains("src/other.rs"),
             "unrelated same-name file should be excluded: {result}"
         );
-        assert!(result.contains("Match type: exact"), "got: {result}");
+        assert!(result.contains("Trust: exact"), "got: {result}");
         assert!(
             result.contains("Scope: path `src/db.rs`; exact selector line 2; symbol kind `fn`; reference kind `call`"),
             "exact selector scope should be explicit: {result}"

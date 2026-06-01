@@ -1,10 +1,7 @@
 Prompt-context signal: high-confidence
 Evidence: exact path `src/lib.rs` matched in the prompt
 
-Match type: exact
-Source authority: current index
-Parse state: parsed
-Completeness: full
+Trust: exact | current index | parsed | full
 Scope: path `src/lib.rs`; all sections
 Evidence: file anchor `src/lib.rs`
 

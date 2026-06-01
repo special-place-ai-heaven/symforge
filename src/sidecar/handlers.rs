@@ -169,12 +169,21 @@ fn format_context_envelope(
     scope: impl Into<String>,
     evidence: impl Into<String>,
 ) -> String {
-    format!(
-        "Match type: {match_type}\nSource authority: {}\nParse state: {parse_state}\nCompleteness: {completeness}\nScope: {}\nEvidence: {}",
-        context_source_authority_label(source_authority),
-        scope.into(),
-        evidence.into()
-    )
+    let authority = context_source_authority_label(source_authority);
+    let scope = scope.into();
+    let evidence = evidence.into();
+    // "Silence is the happy path" (see format_search_envelope): collapse the four
+    // baseline status lines on a fully-trusted result; keep the full six-line
+    // envelope when anything deviates so degraded/stale results stay loud.
+    if authority == "current index" && parse_state == "parsed" && completeness.starts_with("full") {
+        format!(
+            "Trust: {match_type} | {authority} | {parse_state} | {completeness}\nScope: {scope}\nEvidence: {evidence}"
+        )
+    } else {
+        format!(
+            "Match type: {match_type}\nSource authority: {authority}\nParse state: {parse_state}\nCompleteness: {completeness}\nScope: {scope}\nEvidence: {evidence}"
+        )
+    }
 }
 
 fn freshen_sidecar_path_if_stale(
@@ -2402,13 +2411,10 @@ mod tests {
             result.contains("tokens saved"),
             "outline should have token savings footer"
         );
-        assert!(result.contains("Match type: exact"), "got: {result}");
         assert!(
-            result.contains("Source authority: current index"),
-            "got: {result}"
+            result.contains("Trust: exact | current index | parsed | full"),
+            "outline should expose the compact trust line; got: {result}"
         );
-        assert!(result.contains("Parse state: parsed"), "got: {result}");
-        assert!(result.contains("Completeness: full"), "got: {result}");
         assert!(
             result.contains("Scope: path `src/foo.rs`; all sections"),
             "got: {result}"
@@ -2852,13 +2858,10 @@ mod tests {
         assert!(result.contains("src/main.rs"), "should contain the file");
         assert!(result.contains("line 5"), "should show line number");
         assert!(result.contains("tokens saved"), "should have footer");
-        assert!(result.contains("Match type: heuristic"), "got: {result}");
         assert!(
-            result.contains("Source authority: current index"),
-            "got: {result}"
+            result.contains("Trust: heuristic | current index | parsed | full"),
+            "symbol_context should expose the compact trust line; got: {result}"
         );
-        assert!(result.contains("Parse state: parsed"), "got: {result}");
-        assert!(result.contains("Completeness: full"), "got: {result}");
         assert!(
             result.contains("Scope: repo-wide symbol token `process`"),
             "got: {result}"
