@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.15.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.2...v7.15.3) (2026-06-01)
+
+
+### Bug Fixes
+
+* **npm:** diagnose WSL Windows-prefix trap in launcher resolve error ([08816f4](https://github.com/special-place-ai-heaven/symforge/commit/08816f4f3db2ec13a3f885c4e9064e3705b7590f))
+* **npm:** diagnose WSL Windows-prefix trap in launcher resolve error ([2c5df02](https://github.com/special-place-ai-heaven/symforge/commit/2c5df02f85285428d723fe88a15f312969101842))
+
 ## [7.15.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.1...v7.15.2) (2026-05-30)
 
 
