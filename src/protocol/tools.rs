@@ -3241,7 +3241,7 @@ impl SymForgeServer {
                     format::collapse_large_test_modules(result, include_tests, sections.as_deref());
                 if large_default_summary {
                     let note = format!(
-                        "Large file summary: default call included outline/imports only for {} symbols and {} references. Omitted consumers, references, and git activity; request sections=[\"consumers\"], sections=[\"references\"], sections=[\"git\"], or a larger max_tokens for more detail.",
+                        "Large file summary: outline+imports only ({} symbols, {} references); omitted consumers/references/git; request sections=[\"consumers\"], sections=[\"references\"], sections=[\"git\"] or higher max_tokens.",
                         symbol_count, reference_count
                     );
                     result = if let Some((envelope, rest)) = result.split_once("\n\n") {
