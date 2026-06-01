@@ -1,5 +1,18 @@
 # Changelog
 
+## [7.15.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.3...v7.15.4) (2026-06-01)
+
+
+### Bug Fixes
+
+* **protocol:** close trust + correctness gaps from self-audit ([089af96](https://github.com/special-place-ai-heaven/symforge/commit/089af962a3396de9bfa789f7ad866c1847db67c4))
+
+
+### Performance Improvements
+
+* **get_file_context:** compress the large-file summary note ([8a7600f](https://github.com/special-place-ai-heaven/symforge/commit/8a7600fdd89f8f73391e51842958adcd03e1f52f))
+* **protocol:** collapse trust envelope to one line on clean results ([dc9d4f7](https://github.com/special-place-ai-heaven/symforge/commit/dc9d4f78b990e01ad98c9b6e0e67d9d16e59065b))
+
 ## [7.15.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.2...v7.15.3) (2026-06-01)
 
 
