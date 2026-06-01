@@ -674,6 +674,11 @@ pub fn code_slice_from_indexed_file(
         .unwrap_or(file.content.len())
         .min(file.content.len());
     let start = start_byte.min(end);
+    // Safety: `file.content` is `Vec<u8>`, so this is a BYTE-slice index (no
+    // char-boundary panic), and the clamps above guarantee 0 <= start <= end <=
+    // len (no out-of-range panic) even for untrusted caller-supplied byte offsets.
+    // `code_slice_view` decodes via `String::from_utf8_lossy`. Keep `content` as
+    // `Vec<u8>` (not `String`) to preserve this no-panic invariant.
     code_slice_view(&file.relative_path, &file.content[start..end])
 }
 
@@ -2379,7 +2384,7 @@ fn render_numbered_symbol_range_excerpt(
                 .map(|n| format!("{n}: {}", lines[n - 1]))
                 .collect();
             let detail = format!(
-                "Symbol is {} lines, showing first {ml}.",
+                "Range is {full_range_len} lines (symbol {} + {context_lines} ctx/side), showing first {ml}.",
                 sym_end.saturating_sub(sym_start) + 1
             );
             result.push(canonical_truncation_notice(
@@ -2694,7 +2699,9 @@ pub fn find_references_result_view(
     limits: &OutputLimits,
 ) -> String {
     if view.total_refs == 0 {
-        return format!("No references found for \"{name}\"");
+        return format!(
+            "No references found for \"{name}\". Either the name is misspelled (try search_symbols(query={name})), it has no callers (public API, entry point, or dead code), or you wanted implementors (try find_references with mode=implementations)."
+        );
     }
 
     let total = view.total_refs;
@@ -2771,7 +2778,9 @@ pub fn find_references_compact_view(
     limits: &OutputLimits,
 ) -> String {
     if view.total_refs == 0 {
-        return format!("No references found for \"{name}\"");
+        return format!(
+            "No references found for \"{name}\". Either the name is misspelled (try search_symbols(query={name})), it has no callers (public API, entry point, or dead code), or you wanted implementors (try find_references with mode=implementations)."
+        );
     }
 
     let total_files = view.total_files;
@@ -4813,7 +4822,7 @@ pub fn explore_result_view(input: ExploreResultViewInput<'_>) -> String {
     }
 
     if visible_symbol_count == 0 && visible_text_hits.is_empty() {
-        lines.push("No matches found.".to_string());
+        lines.push("No matches found for this concept. Try rephrasing with different terms, use search_text(query=...) for a literal or regex match, broaden with include_noise=true to include vendor/generated files, or run health to confirm the index is populated.".to_string());
     }
 
     lines.join("\n")

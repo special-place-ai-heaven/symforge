@@ -512,11 +512,12 @@ fn push_import_reference(
         // JS/TS path imports like '../utils/helpers' — take the last path segment
         full_text.split('/').next_back().unwrap_or(full_text)
     } else {
-        full_text
-            .split("::")
-            .last()
-            .or_else(|| full_text.split('.').next_back())
-            .unwrap_or(full_text)
+        // Reduce a qualified import to its final segment so name-based
+        // find_references matches it: strip `::` then `.` (namespace.Class ->
+        // Class, module path 'pkg.sub' -> sub), mirroring the `/` path-segment
+        // handling above. `qualified_name` below retains the full dotted path.
+        let after_colons = full_text.rsplit("::").next().unwrap_or(full_text);
+        after_colons.rsplit('.').next().unwrap_or(after_colons)
     };
     let name = name.trim_matches('"').trim_matches('\'').to_string();
 
@@ -1648,6 +1649,25 @@ mod tests {
             .iter()
             .find(|r| r.kind == ReferenceKind::Import)
             .expect("should capture C# using directive");
+        assert_eq!(
+            import_ref.qualified_name.as_deref(),
+            Some("CeRegistry.Core.Services")
+        );
+    }
+
+    #[test]
+    fn test_import_ref_reduces_dotted_name_to_final_segment() {
+        // A dotted import reduces its simple `name` to the final segment so
+        // name-based find_references matches it, while `qualified_name` retains the
+        // full dotted path. Previously a dead `.or_else(split('.'))` branch left the
+        // full dotted string as the simple name.
+        let source = "using CeRegistry.Core.Services;\npublic class App {}";
+        let (refs, _) = parse_and_extract(source, LanguageId::CSharp);
+        let import_ref = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Import)
+            .expect("should capture C# using directive");
+        assert_eq!(import_ref.name, "Services");
         assert_eq!(
             import_ref.qualified_name.as_deref(),
             Some("CeRegistry.Core.Services")

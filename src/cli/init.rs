@@ -298,6 +298,7 @@ pub fn merge_hooks_into_settings(
 const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__health",
     "mcp__symforge__health_compact",
+    "mcp__symforge__checkpoint_now",
     "mcp__symforge__index_folder",
     "mcp__symforge__validate_file_syntax",
     "mcp__symforge__get_file_content",
@@ -332,6 +333,7 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
 const KILO_ALWAYS_ALLOW: &[&str] = &[
     "health",
     "health_compact",
+    "checkpoint_now",
     "index_folder",
     "validate_file_syntax",
     "get_repo_map",
@@ -366,6 +368,7 @@ const KILO_ALWAYS_ALLOW: &[&str] = &[
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "health",
     "health_compact",
+    "checkpoint_now",
     "get_repo_map",
     "explore",
     "validate_file_syntax",
@@ -1690,6 +1693,42 @@ mod tests {
         assert!(
             CLAUDE_ALWAYS_ALLOW.contains(&"health_compact"),
             "Claude allow list should grant health_compact when conformance exposes it"
+        );
+    }
+
+    #[test]
+    fn test_client_allow_lists_match_registered_tool_surface() {
+        use std::collections::BTreeSet;
+
+        // The registered MCP tool surface is the single source of truth.
+        let registered: BTreeSet<String> = crate::protocol::SymForgeServer::tool_definitions()
+            .iter()
+            .map(|t| t.name.as_ref().to_string())
+            .collect();
+
+        // SYMFORGE_TOOL_NAMES carries the `mcp__symforge__` prefix; strip it to compare.
+        let codex: BTreeSet<String> = SYMFORGE_TOOL_NAMES
+            .iter()
+            .map(|n| n.trim_start_matches("mcp__symforge__").to_string())
+            .collect();
+        assert_eq!(
+            codex, registered,
+            "SYMFORGE_TOOL_NAMES (Codex/Claude client allow list) must match the registered MCP tool \
+             surface exactly — a registered tool missing here means clients prompt for permission on \
+             every call; a stale entry grants a retired tool. Update the allow list when the tool \
+             surface changes."
+        );
+
+        let kilo: BTreeSet<String> = KILO_ALWAYS_ALLOW.iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            kilo, registered,
+            "KILO_ALWAYS_ALLOW must match the registered MCP tool surface exactly"
+        );
+
+        let claude: BTreeSet<String> = CLAUDE_ALWAYS_ALLOW.iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            claude, registered,
+            "CLAUDE_ALWAYS_ALLOW must match the registered MCP tool surface exactly"
         );
     }
 

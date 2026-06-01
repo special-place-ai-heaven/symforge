@@ -2314,7 +2314,14 @@ fn test_find_references_result_groups_by_file_and_shows_context() {
 fn test_find_references_result_zero_results() {
     let index = make_index_with_reverse(vec![]);
     let result = find_references_result(&index, "nobody", None);
-    assert_eq!(result, "No references found for \"nobody\"");
+    assert!(
+        result.starts_with("No references found for \"nobody\""),
+        "must preserve the classifier-anchored prefix: {result}"
+    );
+    assert!(
+        result.contains("search_symbols(query=nobody)"),
+        "empty find_references result must teach a recovery step: {result}"
+    );
 }
 
 #[test]

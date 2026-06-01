@@ -160,7 +160,11 @@ fn is_pub_use_import(file: &IndexedFile, reference: &ReferenceRecord) -> bool {
         return false;
     }
     let prefix = &file.content[lookback_start..start];
-    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    // Lossy decode: a fixed 30-byte lookback can split a multibyte UTF-8 char.
+    // `from_utf8(..).unwrap_or("")` would blank the whole prefix and silently
+    // report a genuine `pub use` re-export as non-public; lossy decode keeps the
+    // `pub`-prefix detection intact (a split codepoint becomes U+FFFD).
+    let prefix_str = String::from_utf8_lossy(prefix);
     // Check if the line containing this import starts with `pub`
     let line_start = prefix_str.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line_prefix = prefix_str[line_start..].trim_start();
@@ -2086,13 +2090,10 @@ impl LiveIndex {
                 for keyword in &[
                     "fn", "struct", "enum", "trait", "type", "const", "static", "mod",
                 ] {
-                    let pattern = format!("pub {keyword} {name}");
-                    if is_word_match(&content, &pattern) {
-                        return true;
-                    }
-                    let crate_pattern = format!("pub(crate) {keyword} {name}");
-                    if is_word_match(&content, &crate_pattern) {
-                        return true;
+                    for vis in &["pub ", "pub(crate) ", "pub(super) ", "pub(self) "] {
+                        if is_word_match(&content, &format!("{vis}{keyword} {name}")) {
+                            return true;
+                        }
                     }
                 }
                 false
@@ -2125,7 +2126,7 @@ impl LiveIndex {
                 for keyword in [
                     "fn", "struct", "enum", "trait", "type", "const", "static", "mod",
                 ] {
-                    for prefix in ["pub ", "pub(crate) "] {
+                    for prefix in ["pub ", "pub(crate) ", "pub(super) ", "pub(self) "] {
                         let pattern = format!("{prefix}{keyword} ");
                         let mut start = 0usize;
                         while let Some(pos) = content[start..].find(&pattern) {
@@ -2636,6 +2637,26 @@ mod tests {
         );
         let index = make_index(vec![("src/main.rs", f)], false);
         assert!(index.get_file("src/main.rs").is_some());
+    }
+
+    #[test]
+    fn test_has_pub_symbol_recognizes_restricted_pub_visibilities() {
+        let mut file = make_indexed_file("src/lib.rs", vec![], ParseStatus::Parsed);
+        file.content =
+            b"pub(super) fn restricted_fn() {}\npub(self) struct Inner {}\nfn private_fn() {}"
+                .to_vec();
+        assert!(
+            super::LiveIndex::has_pub_symbol(&file, "restricted_fn"),
+            "pub(super) fn must count as an exported symbol"
+        );
+        assert!(
+            super::LiveIndex::has_pub_symbol(&file, "Inner"),
+            "pub(self) struct must count as an exported symbol"
+        );
+        assert!(
+            !super::LiveIndex::has_pub_symbol(&file, "private_fn"),
+            "a non-pub fn must not count as exported"
+        );
     }
 
     #[test]

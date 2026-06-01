@@ -103,22 +103,41 @@ fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
     }
 }
 
+/// Strip an optional leading `── mode: <name> (explicit) ──\n` annotation so
+/// output classification can match the renderer's message at the start of the
+/// remaining body. Returns `text` unchanged when no annotation is present.
+fn strip_mode_annotation(text: &str) -> &str {
+    text.strip_prefix("── mode: ")
+        .and_then(|rest| rest.split_once(" ──\n"))
+        .map(|(_, body)| body)
+        .unwrap_or(text)
+}
 fn classify_get_file_content_output(text: &str) -> OutcomeClass {
+    // Strip an optional `── mode: <name> (explicit) ──` prefix so the renderer's
+    // status message is matched at the start of `body` even when an explicit-mode
+    // annotation precedes it. Anchoring on `body` (not a bare `contains`) keeps a
+    // successful read whose CONTENT merely mentions these phrases classified Found.
+    let body = strip_mode_annotation(text);
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
     } else if text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
         || text.contains("[error:")
+        || (body.starts_with("Chunk ") && body.contains(" out of range for "))
     {
+        // A request for a non-existent chunk index is an invalid request, not a
+        // successful read: the path exists but the requested page does not.
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous symbol selector") {
         OutcomeClass::Ambiguous
     } else if text.starts_with("File not found:")
         || text.starts_with("No symbol ")
         || text.starts_with("Symbol not found in ")
-        || text.starts_with("Match '")
-        || text.starts_with("Match occurrence ")
+        || body.starts_with("No matches for '")
+        || body.starts_with("Match occurrence ")
     {
+        // around_match / match-occurrence misses: the needle was not found in the
+        // file. These must report NotFound, not a successful read.
         OutcomeClass::NotFound
     } else {
         OutcomeClass::Found
@@ -2877,7 +2896,10 @@ impl SymForgeServer {
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
-            let output = captured
+            let has_symbol_lookup = captured
+                .iter()
+                .any(|entry| matches!(entry, CapturedGetSymbolsEntry::SymbolLookup { .. }));
+            let mut output = captured
                 .into_iter()
                 .map(|entry| match entry {
                     CapturedGetSymbolsEntry::SymbolLookup {
@@ -2885,22 +2907,12 @@ impl SymForgeServer {
                         name,
                         kind,
                         symbol_line,
-                    } => {
-                        let body = format::symbol_detail_from_indexed_file(
-                            file.as_ref(),
-                            &name,
-                            kind.as_deref(),
-                            symbol_line,
-                        );
-                        format!(
-                            "{body}{}",
-                            format::compact_next_step_hint(&[
-                                "get_symbol_context (callers/callees/types)",
-                                "find_references (usages)",
-                                "edit_within_symbol / replace_symbol_body (edits)",
-                            ])
-                        )
-                    }
+                    } => format::symbol_detail_from_indexed_file(
+                        file.as_ref(),
+                        &name,
+                        kind.as_deref(),
+                        symbol_line,
+                    ),
                     CapturedGetSymbolsEntry::CodeSlice {
                         file,
                         start_byte,
@@ -2910,6 +2922,16 @@ impl SymForgeServer {
                 })
                 .collect::<Vec<_>>()
                 .join("\n---\n");
+            // Append the next-step hint ONCE for the whole batch — an agent
+            // learns it after the first occurrence, so repeating it per entry is
+            // pure token overhead.
+            if has_symbol_lookup {
+                output.push_str(&format::compact_next_step_hint(&[
+                    "get_symbol_context (callers/callees/types)",
+                    "find_references (usages)",
+                    "edit_within_symbol / replace_symbol_body (edits)",
+                ]));
+            }
             self.record_tool_savings_named(
                 "get_symbol",
                 (output.len() * 5 / 4) as u64,
@@ -3612,7 +3634,7 @@ impl SymForgeServer {
     /// symbols and affected dependents. Set include_co_changes=true to also see git temporal coupling data
     /// (files that historically change together with this file). Always call this after making edits.
     #[tool(
-        description = "Call AFTER editing a file. Re-reads from disk, updates the index, reports added/removed/modified symbols and affected dependents. Set include_co_changes=true to also see git temporal coupling data (files that historically change together). Always call this after making edits to keep the index current.",
+        description = "Call AFTER editing a file. Re-reads from disk, updates the index, reports added/removed/modified symbols and affected dependents. Set include_co_changes=true to also see git temporal coupling data (files that historically change together). Always call this after making edits to keep the index current. NOT for listing changed files across the repo (use what_changed). NOT for a symbol-level diff between git refs (use diff_symbols).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -4232,7 +4254,7 @@ impl SymForgeServer {
     /// NOT for file content search (use search_text). NOT for symbol names (use search_symbols).
     #[tool(
         name = "search_files",
-        description = "Find files by path, filename, or folder — ranked by relevance. Modes: (1) default: fuzzy search ranked by relevance, (2) changed_with=path: co-changing files via git temporal coupling, (3) rank_by=\"path+cochange\" with anchor_path: fuse path matches with coupling-store evidence, (4) resolve=true: resolve an ambiguous filename or partial path to one exact project path. NOT for file content search (use search_text). NOT for symbol names (use search_symbols).",
+        description = "Prefer this over a shell find/glob for locating files: it ranks by relevance (frecency + path match) and resolves an ambiguous or partial path to one exact project path. Find files by path, filename, or folder — ranked by relevance. Modes: (1) default: fuzzy search ranked by relevance, (2) changed_with=path: co-changing files via git temporal coupling, (3) rank_by=\"path+cochange\" with anchor_path: fuse path matches with coupling-store evidence, (4) resolve=true: resolve an ambiguous filename or partial path to one exact project path. NOT for file content search (use search_text). NOT for symbol names (use search_symbols).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_files_tool(
@@ -5076,7 +5098,7 @@ impl SymForgeServer {
 
     /// Compact diagnostic: essential health fields only. Use when token budget matters.
     #[tool(
-        description = "Compact diagnostic: essential index, project/session identity, watcher, admission, and token-savings health fields only. Prefer this when token budget matters; use health for full diagnostic lists.",
+        description = "Compact diagnostic: essential index, project/session identity, watcher, admission, and token-savings health fields only. Prefer this when token budget matters; use health for full diagnostic lists. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn health_compact(&self) -> String {
@@ -6505,7 +6527,7 @@ impl SymForgeServer {
     /// dependency chains (~3000 tokens). NOT for finding a specific symbol by name
     /// (use search_symbols). NOT for text content search (use search_text).
     #[tool(
-        description = "Start here when you don't know where to look. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
+        description = "Use this when you have a concept or topic but not a specific file or symbol name. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
@@ -12945,6 +12967,55 @@ mod tests {
         );
         assert_tool_result_status(&ambiguous_symbol, OutcomeClass::Ambiguous);
         assert!(tool_result_text(&ambiguous_symbol).contains("Ambiguous"));
+    }
+
+    #[test]
+    fn test_classify_get_file_content_output_flags_match_and_chunk_misses() {
+        // around_match miss (inferred mode) — previously misclassified Found via a
+        // dead `Match '` branch; the real message is `No matches for '...'`.
+        assert_eq!(
+            super::classify_get_file_content_output("No matches for 'needle' in src/lib.rs"),
+            OutcomeClass::NotFound
+        );
+        // around_match miss carrying an explicit-mode annotation prefix.
+        assert_eq!(
+            super::classify_get_file_content_output(
+                "── mode: match (explicit) ──\nNo matches for 'needle' in src/lib.rs"
+            ),
+            OutcomeClass::NotFound
+        );
+        // match-occurrence overflow miss.
+        assert_eq!(
+            super::classify_get_file_content_output(
+                "Match occurrence 2 for 'todo' not found in src/lib.rs; 1 match(es) available at lines 2"
+            ),
+            OutcomeClass::NotFound
+        );
+        // chunk index past EOF — an invalid paging request, not a successful read.
+        assert_eq!(
+            super::classify_get_file_content_output(
+                "Chunk 3 out of range for src/lib.rs (2 chunks)"
+            ),
+            OutcomeClass::InvalidRequest
+        );
+        assert_eq!(
+            super::classify_get_file_content_output(
+                "── mode: chunk (explicit) ──\nChunk 3 out of range for src/lib.rs (2 chunks)"
+            ),
+            OutcomeClass::InvalidRequest
+        );
+        // Robustness: a successful read whose CONTENT mentions these phrases (not at
+        // body-start) stays Found — the fix anchors on the message, not a bare match.
+        assert_eq!(
+            super::classify_get_file_content_output(
+                "1: // index out of range for the array\n2: ok"
+            ),
+            OutcomeClass::Found
+        );
+        assert_eq!(
+            super::classify_get_file_content_output("1: let s = \"No matches for 'x'\";"),
+            OutcomeClass::Found
+        );
     }
 
     #[tokio::test]
