@@ -115,15 +115,71 @@ line and column locations when a config or source file looks malformed.
 
 ## Install
 
-Prerequisite: Node.js 18+.
+Prerequisite: Node.js 18+ and npm.
 
 ```bash
 npm install -g symforge
 ```
 
-The npm package installs a JavaScript launcher and a platform-specific optional
-dependency containing the native binary. It does not run a postinstall
-downloader, stop processes, or auto-configure MCP clients during install.
+The npm package installs a JavaScript launcher plus a platform-specific optional
+dependency that carries the native binary. The binary also runs as the daemon,
+so there is no separate daemon to install. npm automatically selects the correct
+platform package for your OS and CPU. There is no postinstall step: install does
+not download anything, stop processes, or auto-configure MCP clients.
+
+The command above works on every platform, with one requirement: `symforge` must
+install into the npm global prefix that belongs to the OS you are running, and
+that prefix's `bin` directory must be on your `PATH`. Confirm the install with:
+
+```bash
+symforge --version    # prints the installed version
+```
+
+### Windows
+
+```powershell
+npm install -g symforge
+```
+
+Run it from PowerShell or Windows Terminal. npm's default global prefix
+(`%APPDATA%\npm`) is already on `PATH`, so no extra setup is needed.
+
+### macOS and Linux
+
+```bash
+npm install -g symforge
+```
+
+If `npm install -g` fails with a permissions error, do not use `sudo`. Point npm
+at a user-writable prefix once, then reinstall:
+
+```bash
+npm config set prefix "$HOME/.npm-global"
+export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.profile or ~/.zshrc to persist
+npm install -g symforge
+```
+
+### WSL (Windows Subsystem for Linux)
+
+WSL is Linux and needs the Linux build, but a WSL shell often inherits the
+Windows `PATH` and a shared Windows npm prefix (for example a
+`C:\Users\<you>\.npmrc` containing `prefix=C:\Users\<you>\.npm-global`). When
+that happens, `npm install -g symforge` lands in the Windows prefix and pulls the
+Windows binary, which cannot run under Linux — the launcher then reports a
+missing `symforge-linux-x64` package.
+
+Give WSL its own Linux npm prefix, then install:
+
+```bash
+npm config set prefix "$HOME/.npm-global"
+export PATH="$HOME/.npm-global/bin:$PATH"    # ahead of any /mnt/* entries; add to ~/.profile to persist
+hash -r
+npm install -g symforge
+which symforge        # expect /home/<you>/.npm-global/bin/symforge, not /mnt/c/...
+symforge --version
+```
+
+### Update
 
 Update the npm-managed install explicitly:
 
@@ -131,7 +187,7 @@ Update the npm-managed install explicitly:
 symforge update
 ```
 
-This runs the same package manager path as:
+This runs the same package-manager path as:
 
 ```bash
 npm install -g symforge@latest
@@ -140,12 +196,12 @@ npm install -g symforge@latest
 `symforge --version` prints the installed version and, when npm can be reached
 quickly, reports when a newer npm release is available.
 
-Prebuilt binaries are produced for:
+Prebuilt native binaries are produced for:
 
 - Windows x64
 - Linux x64
-- macOS arm64
-- macOS x64
+- macOS arm64 (Apple Silicon)
+- macOS x64 (Intel)
 
 ## Configure A Client
 
