@@ -1,6 +1,6 @@
 {
   "name": "symforge-macos-arm64",
-  "version": "7.17.1",
+  "version": "7.17.2",
   "description": "macOS arm64 native binary for SymForge",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
