@@ -156,6 +156,31 @@ pub fn detect_stale(home: &Path) -> Option<StaleBinary> {
     })
 }
 
+/// Remove registry entries whose recorded binary path no longer exists on disk.
+/// Best-effort and advisory: returns the number of entries removed (`0` on any
+/// I/O error or when nothing changed). `symforge update` calls this after a
+/// version swap so the registry does not accumulate dead entries (e.g. the
+/// retired `~/.symforge/bin` durable binary once it is removed).
+pub fn prune_missing_entries(home: &Path) -> usize {
+    let map = load(home);
+    let before = map.len();
+    let pruned: BTreeMap<String, String> = map
+        .into_iter()
+        .filter(|(path, _)| {
+            let candidate = Path::new(path);
+            // Keep an entry whose PARENT is unreachable (e.g. an offline network
+            // or removable mount) so a transiently-missing path is not permanently
+            // purged; only drop a leaf whose parent exists but the file is gone.
+            candidate.exists() || candidate.parent().is_some_and(|parent| !parent.exists())
+        })
+        .collect();
+    let removed = before - pruned.len();
+    if removed > 0 {
+        let _ = atomic_write(home, &pruned);
+    }
+    removed
+}
+
 /// Human-readable, EDR-safe drift warning. Surfaces a command the **user**
 /// runs in their own shell to overwrite the stale running binary with the newer
 /// install — the daemon itself never copies or replaces the executable.
@@ -224,6 +249,35 @@ mod tests {
         record_self(home);
         let after_second = std::fs::read_to_string(registry_path(home)).unwrap();
         assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn prune_missing_entries_drops_dead_paths_and_keeps_live_ones() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        // One entry points at a real file, one at a path that no longer exists.
+        let live = tmp.path().join("live-symforge");
+        std::fs::write(&live, b"binary").unwrap();
+        let live_key = live.to_string_lossy().into_owned();
+        let dead_key = tmp
+            .path()
+            .join("gone-symforge")
+            .to_string_lossy()
+            .into_owned();
+        write_registry(
+            home,
+            &[(live_key.as_str(), "7.15.4"), (dead_key.as_str(), "7.14.4")],
+        );
+
+        let removed = prune_missing_entries(home);
+
+        assert_eq!(removed, 1, "exactly the dead entry should be pruned");
+        let map = load(home);
+        assert!(map.contains_key(&live_key), "live entry kept");
+        assert!(!map.contains_key(&dead_key), "dead entry removed");
+
+        // Idempotent: a second prune removes nothing.
+        assert_eq!(prune_missing_entries(home), 0);
     }
 
     #[test]

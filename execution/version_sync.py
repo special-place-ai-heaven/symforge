@@ -58,6 +58,13 @@ def read_npm_version(root: Path) -> str:
         raise VersionSyncError("Missing version in npm/package.json.")
     return version
 
+def read_npm_optional_dependencies(root: Path) -> dict[str, str]:
+    manifest = json.loads(npm_path(root).read_text(encoding="utf-8"))
+    deps = manifest.get("optionalDependencies", {})
+    if not isinstance(deps, dict):
+        raise VersionSyncError("npm/package.json optionalDependencies must be an object.")
+    return {str(name): str(pin) for name, pin in deps.items()}
+
 
 def collect_versions(root: Path) -> dict[str, str]:
     return {
@@ -101,6 +108,13 @@ def check_versions(root: Path, tag: str | None = None) -> list[str]:
         if tag_version is not None and tag_version != canonical:
             problems.append(
                 f"tag version '{tag_version}' does not match release manifest '{canonical}'."
+            )
+
+    for name, pin in sorted(read_npm_optional_dependencies(root).items()):
+        if pin != canonical:
+            problems.append(
+                f"npm optionalDependencies '{name}' pin '{pin}' does not match "
+                f"release manifest '{canonical}'."
             )
 
     return problems

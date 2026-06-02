@@ -1131,6 +1131,126 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
     Ok(())
 }
 
+/// Outcome of stopping the global daemon during `symforge update`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DaemonStopOutcome {
+    /// No live, recorded daemon was found.
+    NotRunning,
+    /// The daemon was terminated and confirmed gone.
+    Stopped { pid: u32 },
+    /// The daemon was signaled (incl. SIGKILL escalation) but had not exited
+    /// within the wait window; its runtime files are LEFT IN PLACE so it stays
+    /// discoverable and the next launch reuses it instead of spawning a duplicate.
+    StopTimedOut { pid: u32 },
+    /// A daemon was recorded but the ownership/executable safety gate refused to
+    /// terminate it (e.g. the recorded pid was recycled by an unrelated process).
+    SkippedSafety,
+}
+
+/// Stop the currently-recorded global daemon regardless of its version, for the
+/// update flow: the binary is about to be replaced, so even a same-version
+/// daemon must exit and let the next launch respawn the new one. Unlike
+/// [`stop_incompatible_recorded_daemon`], this does not skip a same-identity
+/// daemon — but it preserves the exact ownership/executable safety gate
+/// (`should_terminate_recorded_daemon`) so an unrelated or pid-recycled process
+/// is never terminated.
+pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonStopOutcome> {
+    let port = match read_daemon_port_file() {
+        Ok(port) => port,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DaemonStopOutcome::NotRunning);
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            tracing::warn!("removing corrupt symforge daemon port file during update: {error}");
+            cleanup_daemon_runtime_files();
+            return Ok(DaemonStopOutcome::NotRunning);
+        }
+        Err(error) => return Err(error).context("reading daemon port file"),
+    };
+
+    let Some(health) = daemon_health(port).await else {
+        // Recorded but unreachable — clear the stale files and report not-running.
+        cleanup_daemon_runtime_files();
+        return Ok(DaemonStopOutcome::NotRunning);
+    };
+
+    let identity = current_daemon_identity();
+    match read_daemon_pid_file() {
+        Ok(pid) if should_terminate_recorded_daemon(&health, &identity, pid) => {
+            if let Err(error) = terminate_process(pid) {
+                tracing::warn!(
+                    pid,
+                    "failed to terminate symforge daemon during update: {error}"
+                );
+            }
+            wait_for_daemon_unhealthy(port).await;
+
+            // Confirm the process is actually gone before declaring success and
+            // removing its discovery files. The daemon's graceful-shutdown drain
+            // (up to ~5s on Unix) can outlive terminate_process's wait window, so
+            // escalate to SIGKILL and re-poll rather than orphaning a live daemon.
+            if process_is_alive(pid) {
+                #[cfg(unix)]
+                // SAFETY: sending a signal to a pid is always memory-safe; an
+                // already-dead/invalid pid simply returns an error we ignore, and
+                // liveness is re-confirmed by the loop below.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                for _ in 0..20 {
+                    if !process_is_alive(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+
+            if process_is_alive(pid) {
+                // Still alive: LEAVE its runtime files so it stays discoverable and
+                // the next launch reuses it instead of spawning a duplicate.
+                tracing::warn!(
+                    pid,
+                    "symforge daemon still alive after terminate during update"
+                );
+                Ok(DaemonStopOutcome::StopTimedOut { pid })
+            } else {
+                cleanup_daemon_runtime_files();
+                Ok(DaemonStopOutcome::Stopped { pid })
+            }
+        }
+        // Safety gate refused: the daemon is alive and we will not touch it, so
+        // LEAVE its runtime files in place — removing them would orphan a live,
+        // discoverable daemon and cause a duplicate spawn on the next launch.
+        Ok(_) => Ok(DaemonStopOutcome::SkippedSafety),
+        // No readable pid file: nothing to stop; clear any stale leftovers.
+        Err(_) => {
+            cleanup_daemon_runtime_files();
+            Ok(DaemonStopOutcome::NotRunning)
+        }
+    }
+}
+
+/// Best-effort liveness check: does a process with this pid still exist?
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // `tasklist` lists the pid only when it exists; "No tasks" otherwise.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        // kill(pid, 0): Ok(0) => the process exists (or is a zombie),
+        // ESRCH => it is gone.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
 async fn wait_for_daemon_unhealthy(port: u16) {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
@@ -2188,7 +2308,7 @@ fn cleanup_daemon_runtime_files() {
 }
 
 #[allow(unsafe_code)] // Unix process signaling requires libc::kill; Windows uses taskkill.
-fn terminate_process(pid: u32) -> io::Result<()> {
+pub(crate) fn terminate_process(pid: u32) -> io::Result<()> {
     #[cfg(windows)]
     {
         let status = std::process::Command::new("taskkill")

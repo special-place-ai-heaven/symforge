@@ -53,6 +53,37 @@ class VersionSyncTests(unittest.TestCase):
             problems,
         )
 
+    def test_check_versions_reports_optional_dependency_pin_drift(self) -> None:
+        root = self.make_repo()
+        (root / "npm" / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "symforge",
+                    "version": "0.3.12",
+                    "optionalDependencies": {
+                        "symforge-linux-x64": "0.3.12",
+                        "symforge-windows-x64": "0.3.11",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        problems = version_sync.check_versions(root)
+
+        self.assertIn(
+            "npm optionalDependencies 'symforge-windows-x64' pin '0.3.11' does not match "
+            "release manifest '0.3.12'.",
+            problems,
+        )
+        # The aligned pin must not be reported.
+        self.assertFalse(
+            any("symforge-linux-x64" in problem for problem in problems),
+            problems,
+        )
+
     def test_check_versions_rejects_noncanonical_tag_shape(self) -> None:
         root = self.make_repo()
 

@@ -42,6 +42,13 @@ fn latest_npm_version_with_timeout(timeout: Duration) -> Option<String> {
     })
 }
 
+/// Resolve the latest published symforge version from the npm registry using a
+/// short default timeout. Returns `None` when offline or on any registry error,
+/// so callers can degrade gracefully rather than fail.
+pub(crate) fn latest_npm_version() -> Option<String> {
+    latest_npm_version_with_timeout(std::time::Duration::from_secs(3))
+}
+
 pub(crate) fn version_lines(current: &str, latest: Option<&str>) -> Vec<String> {
     let mut lines = vec![format!("symforge {current}")];
     if let Some(latest) = latest
