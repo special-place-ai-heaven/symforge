@@ -376,6 +376,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish to crates.io
         run: cargo publish
