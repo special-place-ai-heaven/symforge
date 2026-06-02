@@ -194,8 +194,13 @@ fn find_reexporters<'a>(
             continue;
         }
         for reference in &file.references {
-            if matches_target_import(target_language, reference, target_stem, target_module_path)
-                && is_pub_use_import(file, reference)
+            if matches_target_import(
+                &file.language,
+                target_language,
+                reference,
+                target_stem,
+                target_module_path,
+            ) && is_pub_use_import(file, reference)
             {
                 reexporters.push(file_path.as_str());
                 break;
@@ -314,13 +319,49 @@ fn matches_target_module(language: &LanguageId, text: &str, module_path: Option<
     false
 }
 
+/// Returns `true` when an import written in `importer_language` could plausibly
+/// resolve to a file written in `target_language`.
+///
+/// Import resolution is language-scoped: a Python `import gguf` resolves within
+/// the Python module namespace, never to a Rust `gguf.rs`; a Rust `use gguf`
+/// resolves within the crate, never to a Python `gguf.py`. Bare module names are
+/// frequently shared across unrelated languages in mixed monorepos (e.g. a Rust
+/// `launcher/src/gguf.rs` alongside a Python `gguf` package), so matching imports
+/// to a target file without checking language conflates them.
+///
+/// The only genuine cross-language interop for bare-module imports is the
+/// JavaScript/TypeScript family, where a `.js` file may import a `.ts` module and
+/// vice versa; those are treated as mutually compatible.
+fn import_languages_compatible(
+    importer_language: &LanguageId,
+    target_language: &LanguageId,
+) -> bool {
+    if importer_language == target_language {
+        return true;
+    }
+
+    matches!(
+        (importer_language, target_language),
+        (LanguageId::JavaScript, LanguageId::TypeScript)
+            | (LanguageId::TypeScript, LanguageId::JavaScript)
+    )
+}
+
 fn matches_target_import(
-    language: &LanguageId,
+    importer_language: &LanguageId,
+    target_language: &LanguageId,
     reference: &ReferenceRecord,
     stem: &str,
     module_path: Option<&str>,
 ) -> bool {
     if reference.kind != ReferenceKind::Import {
+        return false;
+    }
+
+    // Import resolution is language-scoped. A bare module name shared across
+    // unrelated languages (e.g. Python `import gguf` vs. Rust `gguf.rs`) must not
+    // be treated as a dependency edge.
+    if !import_languages_compatible(importer_language, target_language) {
         return false;
     }
 
@@ -330,10 +371,10 @@ fn matches_target_import(
             .as_deref()
             .map(|text| {
                 matches_target_stem(text, stem)
-                    || matches_target_module(language, text, module_path)
+                    || matches_target_module(target_language, text, module_path)
             })
             .unwrap_or(false)
-        || matches_target_module(language, &reference.name, module_path)
+        || matches_target_module(target_language, &reference.name, module_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -2209,7 +2250,13 @@ impl LiveIndex {
                 .references
                 .iter()
                 .filter(|reference| {
-                    matches_target_import(&target_language, reference, stem, module_path.as_deref())
+                    matches_target_import(
+                        &file.language,
+                        &target_language,
+                        reference,
+                        stem,
+                        module_path.as_deref(),
+                    )
                 })
                 .collect();
 
@@ -2268,6 +2315,12 @@ impl LiveIndex {
 
             for (file_path, file) in &self.files {
                 if file_path.as_str() == target_path || already_found.contains(file_path.as_str()) {
+                    continue;
+                }
+
+                // Qualified calls resolve within the importer's own language; a
+                // cross-language file cannot depend on this target via a call.
+                if !import_languages_compatible(&file.language, &target_language) {
                     continue;
                 }
 
@@ -2354,6 +2407,7 @@ impl LiveIndex {
                         .iter()
                         .filter(|reference| {
                             matches_target_import(
+                                &file.language,
                                 &target_language,
                                 reference,
                                 re_stem,
@@ -4559,6 +4613,120 @@ impl Actor for MyActor {
             deps.len(),
             1,
             "'utils.helpers' starts with module path 'utils'"
+        );
+    }
+
+    #[test]
+    fn test_find_dependents_rust_target_excludes_python_bare_module_import() {
+        // Regression: a Python `import gguf` (referring to the Python `gguf`
+        // package) must NOT be reported as a dependent of the unrelated Rust file
+        // `launcher/src/gguf.rs`. Import resolution is language-scoped; matching the
+        // two purely by the shared bare module name "gguf" is the bug under test.
+        //
+        // Meanwhile a genuine same-language Rust importer of `gguf` MUST still be
+        // returned, so the language guard does not drop legitimate dependents.
+        let py_import = make_ref("gguf", None, ReferenceKind::Import, None, 0);
+        let mut f_py = make_file_with_refs(
+            "llama-cpp/convert_hf_to_gguf.py",
+            vec![py_import],
+            HashMap::new(),
+        );
+        f_py.language = LanguageId::Python;
+
+        let rust_import = make_ref("gguf", None, ReferenceKind::Import, None, 0);
+        let f_rust = make_file_with_refs("launcher/src/main.rs", vec![rust_import], HashMap::new());
+
+        let f_target = make_file_with_refs("launcher/src/gguf.rs", vec![], HashMap::new());
+
+        let index = make_index(
+            vec![
+                ("llama-cpp/convert_hf_to_gguf.py", f_py),
+                ("launcher/src/main.rs", f_rust),
+                ("launcher/src/gguf.rs", f_target),
+            ],
+            false,
+        );
+
+        let deps = index.find_dependents_for_file("launcher/src/gguf.rs");
+        let dep_paths: Vec<&str> = deps.iter().map(|(p, _)| *p).collect();
+
+        assert!(
+            !dep_paths.contains(&"llama-cpp/convert_hf_to_gguf.py"),
+            "a Python `import gguf` must not be a dependent of Rust gguf.rs, got: {dep_paths:?}"
+        );
+        assert!(
+            dep_paths.contains(&"launcher/src/main.rs"),
+            "a same-language Rust importer of `gguf` must still be a dependent, got: {dep_paths:?}"
+        );
+        assert_eq!(
+            dep_paths.len(),
+            1,
+            "only the same-language Rust importer should match, got: {dep_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_dependents_python_target_excludes_rust_bare_module_import() {
+        // Reverse direction: a Rust `use gguf` must NOT be reported as a dependent
+        // of an unrelated Python `gguf.py`, while a same-language Python importer is.
+        let rust_import = make_ref("gguf", None, ReferenceKind::Import, None, 0);
+        let f_rust = make_file_with_refs("launcher/src/main.rs", vec![rust_import], HashMap::new());
+
+        let py_import = make_ref("gguf", None, ReferenceKind::Import, None, 0);
+        let mut f_py = make_file_with_refs("app.py", vec![py_import], HashMap::new());
+        f_py.language = LanguageId::Python;
+
+        let mut f_target = make_file_with_refs("gguf-py/gguf/gguf.py", vec![], HashMap::new());
+        f_target.language = LanguageId::Python;
+
+        let index = make_index(
+            vec![
+                ("launcher/src/main.rs", f_rust),
+                ("app.py", f_py),
+                ("gguf-py/gguf/gguf.py", f_target),
+            ],
+            false,
+        );
+
+        let deps = index.find_dependents_for_file("gguf-py/gguf/gguf.py");
+        let dep_paths: Vec<&str> = deps.iter().map(|(p, _)| *p).collect();
+
+        assert!(
+            !dep_paths.contains(&"launcher/src/main.rs"),
+            "a Rust `use gguf` must not be a dependent of Python gguf.py, got: {dep_paths:?}"
+        );
+        assert!(
+            dep_paths.contains(&"app.py"),
+            "a same-language Python importer of `gguf` must still be a dependent, got: {dep_paths:?}"
+        );
+        assert_eq!(
+            dep_paths.len(),
+            1,
+            "only the same-language Python importer should match, got: {dep_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_dependents_js_ts_interop_still_matches() {
+        // Guard: the JavaScript/TypeScript family genuinely imports across the
+        // boundary, so a `.ts` importer of a `.js` module must still be a dependent.
+        let ts_import = make_ref("widget", None, ReferenceKind::Import, None, 0);
+        let mut f_ts = make_file_with_refs("src/app.ts", vec![ts_import], HashMap::new());
+        f_ts.language = LanguageId::TypeScript;
+
+        let mut f_widget = make_file_with_refs("src/widget.js", vec![], HashMap::new());
+        f_widget.language = LanguageId::JavaScript;
+
+        let index = make_index(
+            vec![("src/app.ts", f_ts), ("src/widget.js", f_widget)],
+            false,
+        );
+
+        let deps = index.find_dependents_for_file("src/widget.js");
+        let dep_paths: Vec<&str> = deps.iter().map(|(p, _)| *p).collect();
+        assert!(
+            dep_paths.contains(&"src/app.ts"),
+            "a .ts importer of a .js module must remain a dependent (JS/TS interop), got: {dep_paths:?}"
         );
     }
 
