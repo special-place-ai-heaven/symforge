@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.17.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.1...v7.17.2) (2026-06-02)
+
+
+### Bug Fixes
+
+* **ci:** pin cargo-publish checkout to the release ref ([c850fed](https://github.com/special-place-ai-heaven/symforge/commit/c850fedd8cdb6d3a74f92d78da20da8f36f358a8))
+* **xref:** emit references for bare-value const/static uses ([cf38312](https://github.com/special-place-ai-heaven/symforge/commit/cf38312c8832e42c7a5511c70180513ff19b4994)), closes [#257](https://github.com/special-place-ai-heaven/symforge/issues/257)
+
 ## [7.17.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.0...v7.17.1) (2026-06-02)
 
 
