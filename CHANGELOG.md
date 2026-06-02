@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.17.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.16.0...v7.17.0) (2026-06-02)
+
+
+### Features
+
+* **cargo:** add engine-only `embed` feature so library consumers skip the server surface ([1fa7366](https://github.com/special-place-ai-heaven/symforge/commit/1fa736600db940c38a645deecf65f3bbed84609d))
+
 ## [7.16.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.4...v7.16.0) (2026-06-02)
 
 
