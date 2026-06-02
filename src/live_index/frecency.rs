@@ -547,8 +547,10 @@ fn cached_session_store_for(repo_root: &Path) -> Option<Arc<FrecencyStore>> {
 /// successful edit commit. Delegates to [`bump`], so the
 /// collection policy check happens there — registering the hook is itself
 /// unconditional.
+#[cfg(feature = "server")]
 pub struct FrecencyBumpHook;
 
+#[cfg(feature = "server")]
 impl crate::protocol::edit_hooks::EditHook for FrecencyBumpHook {
     fn after_edit_committed(
         &self,
@@ -565,11 +567,17 @@ impl crate::protocol::edit_hooks::EditHook for FrecencyBumpHook {
 /// registering unconditionally is cheap and keeps env changes observable after
 /// startup.
 pub fn ensure_bump_hook_registered() {
-    use std::sync::OnceLock;
-    static REGISTERED: OnceLock<()> = OnceLock::new();
-    REGISTERED.get_or_init(|| {
-        crate::protocol::edit_hooks::register(Box::new(FrecencyBumpHook));
-    });
+    // Server builds register a frecency-bump hook on the protocol edit registry.
+    // `embed` builds have no protocol edit registry (embedders drive the engine
+    // directly), so this is a no-op there.
+    #[cfg(feature = "server")]
+    {
+        use std::sync::OnceLock;
+        static REGISTERED: OnceLock<()> = OnceLock::new();
+        REGISTERED.get_or_init(|| {
+            crate::protocol::edit_hooks::register(Box::new(FrecencyBumpHook));
+        });
+    }
 }
 
 /// Drain and return every path recorded by [`bump`] since the last drain/clear.

@@ -2437,7 +2437,7 @@ mod tests {
     use crate::live_index::store::{
         CircuitBreakerState, IndexState, IndexedFile, LiveIndex, ParseStatus,
     };
-    use crate::watcher::{WatcherInfo, WatcherState};
+    use crate::watcher_state::{WatcherInfo, WatcherState};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};

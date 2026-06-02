@@ -78,6 +78,30 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+  embed-build:
+    needs: release-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      # Engine-only build for library embedders (e.g. AAP): no daemon / sidecar /
+      # protocol-server / CLI surface. Makes "an embedder can build symforge" a
+      # green gate, so a server-only break (e.g. a `#[cfg(unix)]` unsafe block that
+      # a Windows-only check cfg's out) can never silently reach embedders.
+      - name: Build engine-only embed feature
+        run: cargo build --no-default-features --features embed
+
+      - name: Clippy engine-only embed feature
+        run: cargo clippy --no-default-features --features embed --lib -- -D warnings
+
+      - name: Run embed-feature lib tests
+        run: cargo test --no-default-features --features embed --lib -- --test-threads=1
+
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'

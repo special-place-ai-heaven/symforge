@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::domain::LanguageId;
 use crate::domain::index::{AdmissionTier, SkipReason};
-use crate::watcher::{WatcherInfo, WatcherState};
+use crate::watcher_state::{WatcherInfo, WatcherState};
 
 use super::query::normalize_path_query;
 use super::search::{NoiseClass, NoisePolicy};

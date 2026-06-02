@@ -17,6 +17,28 @@ path = "src/lib.rs"
 [[bin]]
 name = "symforge"
 path = "src/main.rs"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+# Full MCP server + CLI surface: daemon, sidecar, protocol server, watcher,
+# analytics, version registry, and the heavy server-only deps (axum, rmcp, clap,
+# reqwest, socket2, notify, tracing-subscriber).
+server = [
+    "dep:rmcp",
+    "dep:axum",
+    "dep:clap",
+    "dep:reqwest",
+    "dep:socket2",
+    "dep:notify",
+    "dep:notify-debouncer-full",
+    "dep:tracing-subscriber",
+]
+# Engine-only build for library embedders (e.g. AAP): parsing + live_index +
+# query + git, exposed via the `symforge::embed` facade. Compiles NONE of the
+# daemon/sidecar/protocol-server/CLI surface, so server-side breakage (unsafe
+# syscalls, axum, rmcp, process signaling) structurally cannot reach an embedder.
+embed = []
 
 [dependencies]
 aho-corasick = "1.1"
@@ -28,7 +50,7 @@ sha2 = "0.10"
 parking_lot = "0.12"
 rayon = "1.10"
 schemars = "1"
-rmcp = { version = "1.1.0", features = ["transport-io"] }
+rmcp = { version = "1.1.0", features = ["transport-io"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yml = "0.0.12"
@@ -36,12 +58,12 @@ toml_edit = "0.23"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal"] }
 postcard = { version = "1.1", features = ["use-std"] }
-axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 chrono = "0.4"
 dirs = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tree-sitter = "=0.26.8"
 streaming-iterator = "0.1"
 tree-sitter-rust = "=0.24.2"
@@ -64,17 +86,17 @@ tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 tree-sitter-scss = "1.0.0"
 ignore = "0.4"
-notify = "8"
-notify-debouncer-full = "0.7"
+notify = { version = "8", optional = true }
+notify-debouncer-full = { version = "0.7", optional = true }
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 globset = "0.4"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 libc = "0.2.183"
 dunce = "1"
-socket2 = "0.6"
+socket2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
