@@ -1154,6 +1154,7 @@ pub(crate) enum DaemonStopOutcome {
 /// daemon — but it preserves the exact ownership/executable safety gate
 /// (`should_terminate_recorded_daemon`) so an unrelated or pid-recycled process
 /// is never terminated.
+#[allow(unsafe_code)] // SAFETY: SIGKILL targets a pid that already passed the ownership safety gate; a dead/invalid pid only errors, no memory is touched.
 pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonStopOutcome> {
     let port = match read_daemon_port_file() {
         Ok(port) => port,
@@ -1231,6 +1232,7 @@ pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonSto
 }
 
 /// Best-effort liveness check: does a process with this pid still exist?
+#[allow(unsafe_code)] // SAFETY: kill(pid, 0) only probes for existence; it sends no signal and touches no memory.
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
