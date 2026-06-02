@@ -614,6 +614,27 @@ impl SharedIndexHandle {
         Ok(())
     }
 
+    /// Drop all indexed state and publish a fresh empty index.
+    ///
+    /// Used to invalidate a stale in-process index after the project has been
+    /// switched out-of-band (e.g. a daemon-proxy `index_folder` rebinds the
+    /// shared session to a new workspace). Bumps `project_generation` so any
+    /// in-flight watcher mutations carrying the old generation are fenced, and
+    /// clears any captured pre-update symbol snapshots so they cannot leak into
+    /// a later impact diff for the wrong project.
+    ///
+    /// After this returns, `published_state().file_count == 0`, so the next
+    /// local-fallback path (`ensure_local_index`) reloads from the current
+    /// repo root instead of serving the previous project.
+    pub fn reset_to_empty(&self) {
+        let _wg = self.write_mutex.lock();
+        self.swap_and_publish(LiveIndex::empty_live_index());
+        self.project_generation.fetch_add(1, Ordering::AcqRel);
+        self.last_reset_project_generation
+            .store(0, Ordering::Release);
+        self.pre_update_symbols.lock().clear();
+    }
+
     pub fn update_file(&self, path: String, file: IndexedFile) {
         let _wg = self.write_mutex.lock();
         let current = self.live.load_full();
@@ -1372,12 +1393,13 @@ impl LiveIndex {
         Ok(SharedIndexHandle::shared(index))
     }
 
-    /// Create an empty `SharedIndex` with no files loaded.
+    /// Build a bare, empty `LiveIndex` value (no files loaded).
     ///
-    /// Used when `SYMFORGE_AUTO_INDEX=false`. The caller must call `reload()` to populate it.
-    /// Returns `IndexState::Empty` and `is_ready() == false` until reloaded.
-    pub fn empty() -> SharedIndex {
-        let index = LiveIndex {
+    /// Shared by [`LiveIndex::empty`] (initial bootstrap) and
+    /// [`SharedIndexHandle::reset_to_empty`] (project-switch invalidation) so
+    /// both produce identical empty state.
+    pub(crate) fn empty_live_index() -> LiveIndex {
+        LiveIndex {
             files: HashMap::new(),
             loaded_at: Instant::now(),
             loaded_at_system: SystemTime::now(),
@@ -1394,8 +1416,15 @@ impl LiveIndex {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
-        };
-        SharedIndexHandle::shared(index)
+        }
+    }
+
+    /// Create an empty `SharedIndex` with no files loaded.
+    ///
+    /// Used when `SYMFORGE_AUTO_INDEX=false`. The caller must call `reload()` to populate it.
+    /// Returns `IndexState::Empty` and `is_ready() == false` until reloaded.
+    pub fn empty() -> SharedIndex {
+        SharedIndexHandle::shared(Self::empty_live_index())
     }
 
     /// Set the reason this index is empty (for `health` banner). Call at startup
@@ -2194,6 +2223,50 @@ mod tests {
         assert_eq!(after_remove.degraded_summary, None);
         assert_eq!(after_remove.file_count, 0);
         assert_eq!(after_remove.symbol_count, 0);
+    }
+
+    #[test]
+    fn test_reset_to_empty_invalidates_populated_index_and_bumps_generation() {
+        // Populate a handle with a file (simulating a stale OLD-project local index).
+        let shared = LiveIndex::empty();
+        shared.add_file(
+            "src/old_project.rs".to_string(),
+            make_indexed_file_for_mutation("src/old_project.rs"),
+        );
+        let before = shared.published_state();
+        assert_eq!(before.file_count, 1, "precondition: index has stale file");
+        let project_gen_before = shared.current_project_generation();
+
+        // Reset (the operation index_folder's daemon branch now performs on switch).
+        shared.reset_to_empty();
+
+        let after = shared.published_state();
+        assert_eq!(
+            after.file_count, 0,
+            "reset_to_empty must drop all indexed files so ensure_local_index reloads the new root"
+        );
+        assert_eq!(
+            after.symbol_count, 0,
+            "reset_to_empty must drop all symbols"
+        );
+        assert_eq!(
+            after.status,
+            PublishedIndexStatus::Empty,
+            "reset_to_empty must publish Empty status"
+        );
+        assert_eq!(
+            after.load_source,
+            IndexLoadSource::EmptyBootstrap,
+            "reset_to_empty must mark the index as a fresh empty bootstrap"
+        );
+        assert!(
+            shared.read().get_file("src/old_project.rs").is_none(),
+            "stale file must be unreachable after reset"
+        );
+        assert!(
+            shared.current_project_generation() > project_gen_before,
+            "reset_to_empty must bump project generation to fence stale watcher mutations"
+        );
     }
 
     #[test]

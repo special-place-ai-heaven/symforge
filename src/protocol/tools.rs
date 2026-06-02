@@ -5181,6 +5181,17 @@ impl SymForgeServer {
             if result.starts_with("Indexed ") {
                 let new_root = PathBuf::from(&params.0.path);
                 self.set_repo_root(Some(new_root));
+                // Trust-critical: invalidate any stale in-process index left
+                // over from a previous local-fallback load. Without this, a
+                // server that already populated `self.index` for the OLD
+                // project (via `ensure_local_index`) would keep serving the old
+                // project from every tool that falls back to local execution
+                // (search_symbols, search_text, get_file_context, conventions,
+                // explore, ...), because `ensure_local_index` only reloads when
+                // the index is empty. Resetting to empty forces the next local
+                // fallback to reload from the NEW root, so no tool can silently
+                // mix projects after a daemon-proxied `index_folder` switch.
+                self.index.reset_to_empty();
             }
             return result;
         }

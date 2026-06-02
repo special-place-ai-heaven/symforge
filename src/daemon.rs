@@ -3672,6 +3672,126 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
     }
 
+    /// Regression: a daemon-proxy `index_folder` switch must invalidate any
+    /// stale in-process index that a prior local fallback populated for the OLD
+    /// project. Without the fix, the server keeps serving the old project from
+    /// every tool that falls back to local execution (search_symbols,
+    /// search_text, get_file_context, conventions, explore), silently mixing
+    /// two projects in one session while health/get_repo_map/index_folder
+    /// follow the switch.
+    #[tokio::test]
+    async fn test_index_folder_proxy_switch_invalidates_stale_local_index() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-proxy-stale-a");
+        let project_b = project_dir("symforge-proxy-stale-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = reqwest::Client::new();
+
+        // Open a daemon session bound to project A.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "regression".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        // Build a daemon-proxy SymForgeServer for that session — the exact shape
+        // `run_remote_mcp_server_async` constructs for a real MCP client.
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Simulate a prior local-fallback load: the in-process index already
+        // holds OLD-project (project A) state.
+        server.index.add_file(
+            "src/old.rs".to_string(),
+            crate::live_index::store::IndexedFile {
+                relative_path: "src/old.rs".to_string(),
+                language: crate::domain::index::LanguageId::Rust,
+                classification: crate::domain::FileClassification::for_code_path("src/old.rs"),
+                content: b"fn old_fn() {}".to_vec(),
+                symbols: vec![],
+                parse_status: crate::live_index::store::ParseStatus::Parsed,
+                parse_diagnostic: None,
+                byte_len: 14,
+                content_hash: "old-hash".to_string(),
+                references: vec![],
+                alias_map: std::collections::HashMap::new(),
+                mtime_secs: 0,
+            },
+        );
+        assert_eq!(
+            server.index.published_state().file_count,
+            1,
+            "precondition: stale local index holds the OLD project"
+        );
+
+        // Switch projects via the proxy path. The daemon answers "Indexed ..."
+        // and rebinds the session to project B.
+        let result = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+        assert!(
+            result.starts_with("Indexed "),
+            "daemon proxy index_folder should report success, got: {result}"
+        );
+
+        // The fix: the stale local index must be invalidated so no local
+        // fallback can serve the OLD project after the switch.
+        assert_eq!(
+            server.index.published_state().file_count,
+            0,
+            "stale local index must be reset to empty after a proxy project switch, got: {result}"
+        );
+        assert!(
+            server.index.read().get_file("src/old.rs").is_none(),
+            "OLD-project file must be unreachable from the local index after switch"
+        );
+
+        // And repo_root must follow the switch so the next local fallback
+        // reloads project B (not project A).
+        let switched_root = server.capture_repo_root().expect("repo root after switch");
+        assert_eq!(
+            switched_root,
+            project_b.path().to_path_buf(),
+            "repo_root must point at the new project after a proxy switch"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+    }
+
     #[tokio::test]
     async fn test_index_folder_idempotency_replays_same_key_same_request_in_daemon_route() {
         let _env_lock = env_lock().await;
