@@ -1,5 +1,17 @@
 # Changelog
 
+## [7.16.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.4...v7.16.0) (2026-06-02)
+
+
+### Features
+
+* **update:** orchestrate daemon-stop, OS-native install, verify, and client reconcile ([8e8f894](https://github.com/special-place-ai-heaven/symforge/commit/8e8f89473bb5d867904fb5405b916ab0c92318fb))
+
+
+### Bug Fixes
+
+* **daemon:** allow unsafe_code on the update daemon-stop libc::kill paths ([47a0e66](https://github.com/special-place-ai-heaven/symforge/commit/47a0e662a791afa71b78487dfb5b2c5a6f5f76c0))
+
 ## [7.15.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.15.3...v7.15.4) (2026-06-01)
 
 
