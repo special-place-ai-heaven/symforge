@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use streaming_iterator::StreamingIterator;
@@ -39,6 +39,24 @@ const RUST_XREF_QUERY: &str = r#"
 (impl_item trait: (type_identifier) @ref.implements type: (type_identifier) @ref.implements_target)
 (impl_item trait: (scoped_type_identifier) @ref.implements type: (type_identifier) @ref.implements_target)
 (impl_item trait: (generic_type) @ref.implements type: (type_identifier) @ref.implements_target)
+"#;
+
+// Focused query that collects the *definition* names of top-level / nested
+// `const` and `static` items in a Rust file, e.g. `const FOO: u8 = 1;` →
+// captures `FOO`.  Used to build the same-file const/static name set that
+// gates value-position reference resolution (see `extract_rust_value_refs`).
+const RUST_CONST_DEF_QUERY: &str = r#"
+(const_item name: (identifier) @const.def)
+(static_item name: (identifier) @const.def)
+"#;
+
+// Focused query that captures every bare value-position `(identifier)`.  On its
+// own this is extremely noisy (it matches call targets, pattern bindings,
+// parameters, etc.), so callers MUST gate each hit against the same-file
+// const/static definition-name set and dedupe against ranges already captured
+// by the main query (see `extract_rust_value_refs`).
+const RUST_VALUE_IDENT_QUERY: &str = r#"
+(identifier) @ref.value
 "#;
 
 const PYTHON_XREF_QUERY: &str = r#"
@@ -357,6 +375,8 @@ const PERL_XREF_QUERY: &str = r#"
 // ---------------------------------------------------------------------------
 
 static RUST_QUERY: OnceLock<Query> = OnceLock::new();
+static RUST_CONST_DEF_QUERY_C: OnceLock<Query> = OnceLock::new();
+static RUST_VALUE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
 static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
 static JS_QUERY: OnceLock<Query> = OnceLock::new();
 static TS_QUERY: OnceLock<Query> = OnceLock::new();
@@ -375,6 +395,17 @@ static PERL_QUERY: OnceLock<Query> = OnceLock::new();
 
 fn rust_query(lang: &Language) -> &'static Query {
     RUST_QUERY.get_or_init(|| Query::new(lang, RUST_XREF_QUERY).expect("valid rust xref query"))
+}
+
+fn rust_const_def_query(lang: &Language) -> &'static Query {
+    RUST_CONST_DEF_QUERY_C
+        .get_or_init(|| Query::new(lang, RUST_CONST_DEF_QUERY).expect("valid rust const-def query"))
+}
+
+fn rust_value_ident_query(lang: &Language) -> &'static Query {
+    RUST_VALUE_IDENT_QUERY_C.get_or_init(|| {
+        Query::new(lang, RUST_VALUE_IDENT_QUERY).expect("valid rust value-ident query")
+    })
 }
 
 fn python_query(lang: &Language) -> &'static Query {
@@ -545,6 +576,134 @@ fn push_import_reference(
     });
 }
 
+/// Resolve bare value-position references to same-file `const`/`static` items.
+///
+/// The main Rust query only captures identifiers in *call*, *type*, *import*,
+/// *macro*, or *qualified-path* positions. A `const`/`static` used as a plain
+/// value — iterated in `for x in CONST`, passed as `CONST.contains(..)`, or
+/// handed to a function as a bare argument — is just an `(identifier)` node and
+/// is therefore invisible to the main query. This pass closes that gap with
+/// strict, precision-first calibration:
+///
+/// 1. It builds the set of `const`/`static` definition names declared *in this
+///    same file*. A bare identifier is emitted ONLY when its exact text is in
+///    that set, so ordinary locals, parameters, struct fields, and function
+///    names are never reported (a `let foo` is not a reference to `const FOO`,
+///    and case is significant). If the file declares no consts/statics the pass
+///    does nothing.
+/// 2. It skips the definition sites themselves (the identifier in
+///    `const FOO: .. = ..;` is not a self-reference).
+/// 3. It dedupes against every range already captured by the main query, so a
+///    name already recorded as a call/type/import/macro/qualified-path hit is
+///    not double-counted, and it dedupes within this pass.
+///
+/// Precision over recall: a cross-file bare use whose target const is not
+/// defined in the current file is intentionally *not* resolved here (we have no
+/// whole-repo symbol table at extraction time). Missing such a use is
+/// acceptable — `find_references` prints a `search_text` fallback hint on an
+/// empty result — whereas a false positive would poison a high-traffic tool.
+fn extract_rust_value_refs(
+    root: &Node,
+    source: &str,
+    ts_language: &Language,
+    existing: &[ReferenceRecord],
+) -> Vec<ReferenceRecord> {
+    let source_bytes = source.as_bytes();
+
+    // Step 1: collect same-file const/static definition names and their
+    // definition-site byte ranges (so we can skip the definition itself).
+    let def_query = rust_const_def_query(ts_language);
+    let def_capture_names = def_query.capture_names();
+    let mut def_names: HashSet<String> = HashSet::new();
+    let mut def_ranges: HashSet<(u32, u32)> = HashSet::new();
+    {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(def_query, *root, source_bytes);
+        while let Some(m) = {
+            matches.advance();
+            matches.get()
+        } {
+            for capture in m.captures {
+                if def_capture_names[capture.index as usize] != "const.def" {
+                    continue;
+                }
+                let node = capture.node;
+                if let Ok(text) = node.utf8_text(source_bytes) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        def_names.insert(trimmed.to_string());
+                        def_ranges.insert((node.start_byte() as u32, node.end_byte() as u32));
+                    }
+                }
+            }
+        }
+    }
+
+    // No consts/statics defined here → nothing this pass can resolve.
+    if def_names.is_empty() {
+        return Vec::new();
+    }
+
+    // Ranges already captured by the main query (any kind), used for dedup so a
+    // name already recorded as a call/type/import/macro/qualified hit is not
+    // emitted again as a value use.
+    let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
+
+    // Step 2: scan every bare value-position identifier and emit a reference
+    // only for those resolving to a known same-file const/static.
+    let value_query = rust_value_ident_query(ts_language);
+    let value_capture_names = value_query.capture_names();
+    let mut out: Vec<ReferenceRecord> = Vec::new();
+    let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(value_query, *root, source_bytes);
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        for capture in m.captures {
+            if value_capture_names[capture.index as usize] != "ref.value" {
+                continue;
+            }
+            let node = capture.node;
+            let range = (node.start_byte() as u32, node.end_byte() as u32);
+
+            // Skip the definition site itself.
+            if def_ranges.contains(&range) {
+                continue;
+            }
+            // Skip anything already captured by the main query or this pass.
+            if existing_ranges.contains(&range) || emitted_ranges.contains(&range) {
+                continue;
+            }
+
+            let Ok(text) = node.utf8_text(source_bytes) else {
+                continue;
+            };
+            let name = text.trim();
+            // Exact, case-sensitive match against same-file const/static names.
+            if name.is_empty() || !def_names.contains(name) {
+                continue;
+            }
+
+            let start = node.start_position();
+            let end = node.end_position();
+            out.push(ReferenceRecord {
+                name: name.to_string(),
+                qualified_name: None,
+                kind: ReferenceKind::ValueUse,
+                byte_range: range,
+                line_range: (start.row as u32, end.row as u32),
+                enclosing_symbol_index: None,
+            });
+            emitted_ranges.insert(range);
+        }
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Main extraction function
 // ---------------------------------------------------------------------------
@@ -640,7 +799,8 @@ pub fn extract_references(
 
     // Safety: the query and parse tree use the same grammar version because both are produced by
     // the same linked tree-sitter crate. The OnceLock ensures the query is compiled once and reused.
-    let _ = ts_language;
+    // `ts_language` is reused below for the Rust const/static value-reference pass.
+    let _ = &ts_language;
 
     let capture_names = query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -951,6 +1111,17 @@ pub fn extract_references(
         }
     }
 
+    // --- Rust const/static value-position references ---
+    //
+    // The main query never captures a `const`/`static` used as a bare value
+    // (iterated in a `for` loop, passed to `.contains(..)`, handed as a plain
+    // argument), so resolve those here against same-file const/static defs.
+    // Strict precision gating lives in `extract_rust_value_refs`.
+    if *language == LanguageId::Rust {
+        let value_refs = extract_rust_value_refs(root, source, &ts_language, &references);
+        references.extend(value_refs);
+    }
+
     (references, alias_map)
 }
 
@@ -1203,6 +1374,188 @@ mod tests {
             impl_refs[0].name
         );
         assert_eq!(impl_refs[0].qualified_name.as_deref(), Some("Foo"));
+    }
+
+    // --- Rust const/static value-position references (issue #257) ---
+
+    #[test]
+    fn test_rust_const_used_in_for_loop_and_contains() {
+        // SYMFORGE_TOOL_NAMES-style: a const iterated in `for ... in CONST` and
+        // queried via `CONST.contains(..)` must both surface as ValueUse refs.
+        let source = r#"
+const TOOL_NAMES: &[&str] = &["a", "b"];
+
+fn iterate() {
+    for name in TOOL_NAMES {
+        let _ = name;
+    }
+}
+
+fn membership(candidate: &str) -> bool {
+    TOOL_NAMES.contains(&candidate)
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        let value_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.name == "TOOL_NAMES" && r.kind == ReferenceKind::ValueUse)
+            .collect();
+        assert_eq!(
+            value_refs.len(),
+            2,
+            "for-loop use and .contains() use should both surface as ValueUse, refs: {:?}",
+            refs
+        );
+        // The definition site itself must NOT be reported as a reference.
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.name == "TOOL_NAMES" && r.line_range.0 == 1),
+            "the const definition site must not be a reference, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_rust_static_used_as_bare_value_arg() {
+        // A `static` handed to a function as a bare value argument must surface.
+        let source = r#"
+static MAX_RETRIES: u32 = 5;
+
+fn configure(limit: u32) {
+    let _ = limit;
+}
+
+fn run() {
+    configure(MAX_RETRIES);
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        assert!(
+            has_ref(&refs, "MAX_RETRIES", ReferenceKind::ValueUse),
+            "bare value-arg use of a static should surface as ValueUse, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_rust_value_ref_does_not_report_local_var_named_like_const() {
+        // False-positive guard: a lowercase local `let foo`/parameter `foo`
+        // must NOT be reported as a reference to an unrelated `const FOO`.
+        // Case discipline + exact same-file def-name matching makes this safe.
+        let source = r#"
+const FOO: u32 = 1;
+
+fn unrelated(foo: u32) -> u32 {
+    let bar = foo + 1;
+    bar
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        // The lowercase `foo` (param + uses) must produce zero ValueUse refs.
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.name == "foo" && r.kind == ReferenceKind::ValueUse),
+            "lowercase local `foo` must not be a reference to const FOO, refs: {:?}",
+            refs
+        );
+        // And FOO is never used, so it should produce no ValueUse refs at all.
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.name == "FOO" && r.kind == ReferenceKind::ValueUse),
+            "unused const FOO should have no value references, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_rust_value_ref_requires_same_file_definition() {
+        // Precision guard: a SCREAMING_SNAKE_CASE identifier that is NOT defined
+        // as a const/static in this file must not be reported (no whole-repo
+        // symbol table at extraction time — we resolve same-file only).
+        let source = r#"
+fn run() {
+    let _ = EXTERNAL_CONST;
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        assert!(
+            !refs.iter().any(|r| r.kind == ReferenceKind::ValueUse),
+            "an identifier with no same-file const/static def must not surface as ValueUse, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_rust_value_ref_not_duplicated_with_call_capture() {
+        // Dedup guard: if a const-named identifier is *also* captured by the
+        // main query (here a function call shares the byte range of nothing,
+        // but a same-named call must not collide), we must not double-count.
+        // Use a const whose name is also referenced once as a bare value — it
+        // should appear exactly once as ValueUse, never as Call.
+        let source = r#"
+const LIMIT: u32 = 10;
+
+fn check(v: u32) -> bool {
+    v < LIMIT
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        let limit_refs: Vec<_> = refs.iter().filter(|r| r.name == "LIMIT").collect();
+        assert_eq!(
+            limit_refs.len(),
+            1,
+            "LIMIT should be referenced exactly once, refs: {:?}",
+            refs
+        );
+        assert_eq!(
+            limit_refs[0].kind,
+            ReferenceKind::ValueUse,
+            "the LIMIT value use should be kind ValueUse, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_rust_existing_call_and_type_refs_unchanged_with_value_pass() {
+        // Regression: the value pass must not perturb call/type/import capture.
+        let source = r#"
+use std::collections::HashMap;
+
+const SIZE: usize = 4;
+
+fn build(map: HashMap<String, usize>) {
+    let _ = map;
+    helper(SIZE);
+}
+
+fn helper(n: usize) {
+    let _ = n;
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        assert!(
+            has_ref(&refs, "helper", ReferenceKind::Call),
+            "call ref to helper must remain, refs: {:?}",
+            refs
+        );
+        assert!(
+            has_ref(&refs, "HashMap", ReferenceKind::TypeUsage),
+            "type ref to HashMap must remain, refs: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::Import),
+            "import ref must remain, refs: {:?}",
+            refs
+        );
+        assert!(
+            has_ref(&refs, "SIZE", ReferenceKind::ValueUse),
+            "const SIZE used as a bare arg should surface as ValueUse, refs: {:?}",
+            refs
+        );
     }
 
     #[test]

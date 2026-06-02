@@ -7,6 +7,7 @@ pub(super) fn parse_reference_kind_filter(kind_filter: Option<&str>) -> Option<R
         Some("import") => Some(ReferenceKind::Import),
         Some("type_usage") => Some(ReferenceKind::TypeUsage),
         Some("macro_use") => Some(ReferenceKind::MacroUse),
+        Some("value_use") => Some(ReferenceKind::ValueUse),
         Some("all") | None => None,
         _ => None,
     }

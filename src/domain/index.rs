@@ -427,6 +427,10 @@ pub enum ReferenceKind {
     /// A trait/interface implementation relationship.
     /// `name` holds the trait/interface name, `qualified_name` holds the implementing type.
     Implements,
+    /// A read of a named `const`/`static` value at a value-expression site
+    /// (e.g. iterated in a `for` loop, used as a receiver, or passed as a bare
+    /// argument). Distinct from `Call` so callee/type analysis stays clean.
+    ValueUse,
 }
 
 impl fmt::Display for ReferenceKind {
@@ -437,6 +441,7 @@ impl fmt::Display for ReferenceKind {
             Self::TypeUsage => "type_usage",
             Self::MacroUse => "macro_use",
             Self::Implements => "implements",
+            Self::ValueUse => "value_use",
         };
         write!(f, "{s}")
     }
