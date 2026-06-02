@@ -57,6 +57,16 @@ jobs:
       - name: Build release binary on main pushes
         run: cargo build --release
 
+      # Engine-only build for library embedders (e.g. AAP). ci.yml runs the same
+      # gate on PRs; this mirrors it on main pushes so a server-only break (e.g. a
+      # `#[cfg(unix)]` path cfg'd out on the contributor's OS) can never reach an
+      # embedder via main.
+      - name: Build engine-only embed feature
+        run: cargo build --no-default-features --features embed
+
+      - name: Run embed-feature lib tests
+        run: cargo test --no-default-features --features embed --lib -- --test-threads=1
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
