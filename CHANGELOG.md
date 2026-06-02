@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.17.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.0...v7.17.1) (2026-06-02)
+
+
+### Bug Fixes
+
+* **protocol:** invalidate stale local index on daemon-proxied project switch ([6303a3c](https://github.com/special-place-ai-heaven/symforge/commit/6303a3c0da35745489ed9cad474d1a341e8a6155))
+* **query:** scope find_dependents import matching to compatible languages ([6949df8](https://github.com/special-place-ai-heaven/symforge/commit/6949df80f5db2d365ac4d7ba710283769674b5a8))
+
 ## [7.17.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.16.0...v7.17.0) (2026-06-02)
 
 
