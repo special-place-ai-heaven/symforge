@@ -4,6 +4,9 @@
 /.*/
 !/.github/
 
+# Nested SymForge local cache (e.g. npm/.symforge/) — local state, never tracked.
+**/.symforge/
+
 npm/*.tgz
 .env
 spacetime/*/target/
