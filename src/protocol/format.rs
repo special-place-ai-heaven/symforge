@@ -360,11 +360,21 @@ fn index_identity(status: &RuntimeStatus) -> String {
     )
 }
 
+/// Version of the binary actually serving this runtime status line.
+///
+/// Included in EVERY mode so a `local_process` front-end (which carries no
+/// `daemon_version`) still reports which binary is running, removing the
+/// version-provenance ambiguity that existed when only daemon mode surfaced a
+/// version. Consistent with the daemon's `daemon_version`, which is sourced
+/// from the same `CARGO_PKG_VERSION`.
+const RUNTIME_BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn format_runtime_status(status: &RuntimeStatus) -> String {
     format!(
-        "Runtime: mode={} | runtime_state={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
+        "Runtime: mode={} | runtime_state={} | version={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
         status.mode.label(),
         status.mode.label(),
+        RUNTIME_BINARY_VERSION,
         status.project_root.as_deref().unwrap_or("<unknown>"),
         status.project_id,
         status.session_id,
@@ -379,8 +389,9 @@ pub fn format_runtime_status(status: &RuntimeStatus) -> String {
 
 pub fn format_runtime_status_compact(status: &RuntimeStatus) -> String {
     format!(
-        "Runtime: mode={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
+        "Runtime: mode={} | version={} | project_root={} | project_id={} | session_id={} | index_id={} | index_generation={} | project_generation={} | load_source={} | reset_state={} | index_state={}",
         status.mode.label(),
+        RUNTIME_BINARY_VERSION,
         status.project_root.as_deref().unwrap_or("<unknown>"),
         status.project_id,
         status.session_id,

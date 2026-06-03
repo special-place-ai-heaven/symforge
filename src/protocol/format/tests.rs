@@ -3917,3 +3917,43 @@ fn test_cap_idempotent() {
     let twice = super::cap_file_content_output(once.clone());
     assert_eq!(once, twice, "cap helper should be idempotent");
 }
+
+fn sample_runtime_status(mode: RuntimeMode) -> RuntimeStatus {
+    RuntimeStatus {
+        mode,
+        project_root: Some("/home/user/project".to_string()),
+        project_id: "project-abcdef0123456789".to_string(),
+        session_id: "session-1".to_string(),
+        index_generation: 7,
+        project_generation: 1,
+        reset_project_generation: None,
+        load_source: IndexLoadSource::FreshLoad,
+    }
+}
+
+#[test]
+fn test_runtime_status_includes_binary_version_in_every_mode() {
+    // Regression: `local_process` mode carries no `daemon_version`, so the
+    // running binary version was invisible there. The version must now appear
+    // in the runtime status line for EVERY mode.
+    let expected = format!("version={}", env!("CARGO_PKG_VERSION"));
+    for mode in [
+        RuntimeMode::LocalProcess,
+        RuntimeMode::DaemonReusedSession,
+        RuntimeMode::DaemonDegradedLocalFallback,
+    ] {
+        let status = sample_runtime_status(mode);
+
+        let full = format_runtime_status(&status);
+        assert!(
+            full.contains(&expected),
+            "full runtime status for {mode:?} must include `{expected}`, got: {full}"
+        );
+
+        let compact = format_runtime_status_compact(&status);
+        assert!(
+            compact.contains(&expected),
+            "compact runtime status for {mode:?} must include `{expected}`, got: {compact}"
+        );
+    }
+}
