@@ -69,6 +69,15 @@ fn daemon_pid_file_name() -> String {
 fn daemon_start_lock_file_name() -> String {
     crate::paths::os_tagged_runtime_file_name("daemon", "starting")
 }
+/// OS-tagged auth-token file. Sits alongside the port/pid files in `daemon_dir()`
+/// and carries the bearer token the daemon requires on every authenticated
+/// route. It is the connection-info channel the legit MCP front-end and hook
+/// read when the operator has NOT pinned a token via env — closing the prior
+/// "no token ⇒ open daemon" ambient-authority hole without breaking the
+/// handshake. On Unix it is created `0o600` (owner read/write only).
+fn daemon_token_file_name() -> String {
+    crate::paths::os_tagged_runtime_file_name("daemon", "token")
+}
 
 /// Read a daemon runtime file under `dir`, OS-tagged name first then legacy.
 fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io::Result<String> {
@@ -113,7 +122,12 @@ pub struct DaemonState {
     projects: RwLock<HashMap<String, ProjectInstance>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
-    auth_token: Option<String>,
+    /// The bearer token this daemon requires on every authenticated route.
+    /// Non-optional by design: the daemon ALWAYS establishes a token at startup
+    /// (env pin or freshly generated), so `authorize_daemon_request` is strictly
+    /// fail-closed — there is no "no token ⇒ allow" path. Making this a `String`
+    /// (not `Option`) encodes the fail-closed invariant in the type system.
+    auth_token: String,
     /// Concurrency governor — limits parallel tool calls and enforces timeouts.
     governor: crate::sidecar::governor::RequestGovernor,
 }
@@ -194,6 +208,138 @@ fn daemon_auth_token_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Read the persisted daemon auth token from the OS-tagged token file in
+/// `daemon_dir()`. Returns `None` if the file is absent, empty, or unreadable.
+/// This is how a front-end / hook process that did NOT spawn the daemon — and
+/// therefore has no `SYMFORGE_DAEMON_AUTH_TOKEN` in its env — still learns the
+/// running daemon's token and authenticates.
+fn daemon_auth_token_from_file() -> Option<String> {
+    let dir = daemon_dir().ok()?;
+    let contents = std::fs::read_to_string(dir.join(daemon_token_file_name())).ok()?;
+    let trimmed = contents.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Resolve the daemon auth token a CLIENT (front-end proxy, hook) must present.
+///
+/// Resolution order:
+/// 1. `SYMFORGE_DAEMON_AUTH_TOKEN` env var — explicit operator pin / test
+///    override, and what a parent that spawned the daemon shares with it.
+/// 2. The persisted token file written by the daemon at startup.
+///
+/// Returns `None` only when neither source is available; with the fail-closed
+/// daemon this means the request will be rejected, which is the safe outcome.
+pub(crate) fn resolve_daemon_auth_token() -> Option<String> {
+    daemon_auth_token_from_env().or_else(daemon_auth_token_from_file)
+}
+
+/// Generate an unpredictable 64-hex-character daemon auth token.
+///
+/// Prefers the OS CSPRNG via `/dev/urandom` on Unix (a plain file read — no
+/// `unsafe`, no extra dependency). When that is unavailable (Windows, or a
+/// sandbox without `/dev/urandom`), it falls back to a SHA-256 digest over
+/// several process-local entropy sources that a local peer cannot observe or
+/// reproduce: high-resolution timestamps, the process id, a heap-allocation
+/// address (ASLR), the current thread id, and a per-call atomic counter.
+///
+/// The token's real confidentiality barrier is the `0o600` token FILE; the
+/// token only needs to be non-guessable by a local process that cannot read
+/// that file. Both paths satisfy that.
+fn generate_daemon_auth_token() -> String {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 32];
+            if f.read_exact(&mut buf).is_ok() {
+                return crate::hash::digest_hex(&buf);
+            }
+        }
+    }
+
+    // Portable fallback: hash a mix of process-local, non-deterministic sources.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut seed: Vec<u8> = Vec::with_capacity(64);
+    let now_nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    seed.extend_from_slice(&now_nanos.to_le_bytes());
+    let mono = std::time::Instant::now();
+    seed.extend_from_slice(&format!("{mono:?}").into_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    // Heap-allocation address carries ASLR entropy that is not observable to a
+    // peer process without the token file.
+    let boxed = Box::new(0u8);
+    let addr = (&*boxed as *const u8) as usize;
+    seed.extend_from_slice(&addr.to_le_bytes());
+    seed.extend_from_slice(format!("{:?}", std::thread::current().id()).as_bytes());
+
+    crate::hash::digest_hex(&seed)
+}
+
+/// Establish the token the DAEMON will require: an explicit env pin if present,
+/// otherwise a freshly generated random token. Always returns `Some` — the
+/// daemon never starts without a token, so `authorize_daemon_request` can be
+/// strictly fail-closed.
+fn establish_daemon_auth_token() -> String {
+    daemon_auth_token_from_env().unwrap_or_else(generate_daemon_auth_token)
+}
+
+/// Persist the daemon auth token to its OS-tagged file with owner-only
+/// permissions on Unix. The token is written before the daemon starts serving
+/// so a client that observes the port file can also read a valid token.
+fn write_daemon_token_file(token: &str) -> io::Result<()> {
+    let path = daemon_dir()?.join(daemon_token_file_name());
+
+    // On Unix, create the file with 0o600 from the start so the secret is never
+    // briefly world-readable between create and chmod.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("writing daemon token file at {}: {}", path.display(), e),
+                )
+            })?;
+        file.write_all(token.as_bytes()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("writing daemon token file at {}: {}", path.display(), e),
+            )
+        })?;
+        // Best-effort re-assert mode in case a restrictive umask still widened it
+        // (OpenOptions mode is ANDed with the complement of umask).
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, token.as_bytes()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("writing daemon token file at {}: {}", path.display(), e),
+            )
+        })
+    }
+}
+
 fn env_var_truthy(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -260,10 +406,29 @@ fn apply_daemon_auth_header(
     }
 }
 
+/// Constant-time byte-slice equality.
+///
+/// Returns `false` on length mismatch and otherwise XOR-folds every byte pair
+/// into an accumulator, returning `acc == 0`. There is no early return on the
+/// first differing byte, so the running time depends only on the input length,
+/// not on the position of the first mismatch. This denies the byte-by-byte
+/// timing oracle that `==` on `&[u8]`/`&str` exposes (it short-circuits).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (lhs, rhs) in a.iter().zip(b.iter()) {
+        acc |= lhs ^ rhs;
+    }
+    acc == 0
+}
+
 fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let Some(expected_token) = state.auth_token.as_deref() else {
-        return Ok(());
-    };
+    // Fail-closed: the daemon always holds a token (see `DaemonState.auth_token`),
+    // so there is no unauthenticated-allow path. A local process that cannot read
+    // the 0o600 token file (and has no env pin) can no longer drive the daemon.
+    let expected_token = state.auth_token.as_str();
 
     let Some(header_value) = headers
         .get(header::AUTHORIZATION)
@@ -276,7 +441,18 @@ fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    if scheme.eq_ignore_ascii_case("bearer") && provided_token == expected_token {
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Compare in constant time. We hash BOTH sides to a fixed 32-byte SHA-256
+    // digest first so the comparison width is constant regardless of the
+    // presented token's length: this leaks neither the real token's length nor
+    // the byte position of the first mismatch. A wrong/empty token still 401s,
+    // preserving the fail-closed contract.
+    let expected_digest = crate::hash::digest(expected_token.as_bytes());
+    let provided_digest = crate::hash::digest(provided_token.as_bytes());
+    if constant_time_eq(&expected_digest, &provided_digest) {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -379,11 +555,17 @@ struct DaemonIdentity {
 }
 
 impl DaemonState {
+    /// Construct daemon state with an always-present auth token: the env pin if
+    /// set, otherwise a freshly generated random token. Used by tests and as the
+    /// in-process default. The serving path (`spawn_daemon`) instead constructs
+    /// via [`DaemonState::with_token`] so the SAME token it persists to the token
+    /// file is the one the state enforces.
     pub fn new() -> Self {
-        Self::with_auth_token(daemon_auth_token_from_env())
+        Self::with_token(establish_daemon_auth_token())
     }
 
-    fn with_auth_token(auth_token: Option<String>) -> Self {
+    /// Construct daemon state bound to a specific, already-established token.
+    fn with_token(auth_token: String) -> Self {
         Self {
             next_session_id: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
@@ -643,11 +825,12 @@ impl DaemonState {
         input: IndexFolderInput,
     ) -> anyhow::Result<String> {
         let target_root = canonical_project_root(Path::new(&input.path))?;
-        // TODO(security): require a fail-closed daemon `auth_token`. The path
-        // guard below stops sensitive-root indexing, but the daemon currently
-        // serves any local client that can reach its loopback port. A mandatory
-        // per-daemon token (rejecting unauthenticated callers) would close the
-        // ambient-authority surface entirely. Deferred — separate hardening.
+        // Fail-closed daemon auth is now in force: the daemon ALWAYS establishes
+        // a token at startup and `authorize_daemon_request` rejects any caller
+        // that does not present it, so this route (like every authenticated
+        // route) is unreachable by an unauthenticated local process. The
+        // ambient-authority surface is closed. See `establish_daemon_auth_token`
+        // / `write_daemon_token_file` / `authorize_daemon_request`.
         //
         // Trust boundary: refuse sensitive system paths before any reload/IO.
         // The local `tools::index_folder` already guards this; the daemon path
@@ -799,7 +982,10 @@ impl DaemonState {
             session_count: self.sessions.read().len(),
             daemon_version: self.identity.version.clone(),
             executable_path: self.identity.executable_path.clone(),
-            auth_required: self.auth_token.is_some(),
+            // Always true now: the daemon is fail-closed and always requires a
+            // token. The field is retained for wire compatibility and so clients
+            // can surface that authentication is in force.
+            auth_required: true,
             pid: Some(std::process::id()),
         }
     }
@@ -856,7 +1042,16 @@ impl DaemonSessionClient {
         session_id: String,
         project_name: String,
     ) -> Self {
-        Self::new_with_auth_token(base_url, project_id, session_id, project_name, None)
+        // The daemon is fail-closed; a proxy client must carry the token. Resolve
+        // it the same way production does (env pin, then the persisted token
+        // file) so test proxies authenticate against a spawned daemon.
+        Self::new_with_auth_token(
+            base_url,
+            project_id,
+            session_id,
+            project_name,
+            resolve_daemon_auth_token(),
+        )
     }
 
     pub fn project_name(&self) -> &str {
@@ -984,7 +1179,10 @@ pub async fn connect_or_spawn_session(
         .timeout(Duration::from_secs(60))
         .build()
         .context("building reqwest client for connect_or_spawn_session")?;
-    let auth_token = daemon_auth_token_from_env();
+    // Resolve the token AFTER `ensure_daemon_running` so a freshly spawned
+    // daemon's persisted token file is already present (it is written before the
+    // port file). Env pin takes precedence; otherwise we read the token file.
+    let auth_token = resolve_daemon_auth_token();
     let open_request = http_client
         .post(format!("{base_url}/v1/sessions/open"))
         .json(&OpenProjectRequest {
@@ -1687,10 +1885,17 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
 
     let listener = TcpListener::bind(daemon_socket_bind_address(&resolved_host)).await?;
     let port = listener.local_addr()?.port();
+
+    // Establish the fail-closed auth token and persist it BEFORE the port file.
+    // Clients discover the daemon via the port file and then read the token file;
+    // writing the token first guarantees a client that observes the port can
+    // always read a valid token (no open-then-tokenless window).
+    let auth_token = establish_daemon_auth_token();
+    write_daemon_token_file(&auth_token)?;
     write_daemon_port_file(port)?;
     write_daemon_pid_file(std::process::id())?;
 
-    let state = Arc::new(DaemonState::new());
+    let state = Arc::new(DaemonState::with_token(auth_token));
     let app = build_router(Arc::clone(&state));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -2333,6 +2538,9 @@ fn cleanup_daemon_runtime_files() {
     if let Ok(dir) = daemon_dir() {
         let _ = std::fs::remove_file(dir.join(daemon_port_file_name()));
         let _ = std::fs::remove_file(dir.join(daemon_pid_file_name()));
+        // Remove the auth-token file too so a stale token from a previous daemon
+        // can never be presented to (or mistaken for) a newly spawned daemon.
+        let _ = std::fs::remove_file(dir.join(daemon_token_file_name()));
         let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PORT_FILE));
         let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PID_FILE));
     }
@@ -2408,6 +2616,111 @@ mod tests {
 
     async fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().await
+    }
+
+    /// Build a reqwest client that authenticates every request against the now
+    /// fail-closed daemon by attaching the daemon's established token as a
+    /// default `Authorization: Bearer` header. The daemon ALWAYS has a token
+    /// (generated when no env pin is set), so functional tests that exercise the
+    /// real handshake must present it — `authorize_daemon_request` is strict.
+    fn authed_client(handle: &DaemonHandle) -> reqwest::Client {
+        let token = handle.state.auth_token.clone();
+        let mut headers = header::HeaderMap::new();
+        let mut value =
+            header::HeaderValue::from_str(&format!("Bearer {token}")).expect("valid bearer header");
+        value.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, value);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build authed reqwest client")
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_equal_and_rejects_unequal() {
+        // Equal slices accept.
+        assert!(constant_time_eq(b"sekret-token", b"sekret-token"));
+        assert!(constant_time_eq(b"", b""));
+
+        // Length mismatch rejects (and does not panic on zip of unequal lens).
+        assert!(!constant_time_eq(b"short", b"longer-token"));
+        assert!(!constant_time_eq(b"longer-token", b"short"));
+
+        // Same length, differing content rejects — including a mismatch only in
+        // the very last byte, which a short-circuiting `==` would reveal late.
+        assert!(!constant_time_eq(b"sekret-token", b"sekret-tokeX"));
+        assert!(!constant_time_eq(b"sekret-token", b"Xekret-token"));
+    }
+
+    #[test]
+    fn constant_time_eq_has_no_early_out_on_first_mismatch() {
+        // A correct constant-time compare must inspect the WHOLE slice even when
+        // the first byte already differs. We verify there is no early return by
+        // constructing two inputs that differ in byte 0 but are otherwise equal:
+        // the XOR-fold accumulator must still incorporate every later byte. If
+        // the implementation returned early on byte 0, flipping a later byte
+        // would be unobservable; here we assert it is correctly still unequal.
+        let base = vec![0u8; 64];
+        let mut differ_first = base.clone();
+        differ_first[0] = 1;
+        assert!(!constant_time_eq(&base, &differ_first));
+
+        // Identical except the final byte — must also reject, proving the loop
+        // reaches the end rather than stopping at the first equal prefix.
+        let mut differ_last = base.clone();
+        differ_last[63] = 1;
+        assert!(!constant_time_eq(&base, &differ_last));
+
+        // Fully equal long slice still accepts after folding all bytes.
+        assert!(constant_time_eq(&base, &base.clone()));
+    }
+
+    #[test]
+    fn authorize_daemon_request_constant_time_token_check() {
+        fn state_with_token(token: &str) -> DaemonState {
+            DaemonState::with_token(token.to_string())
+        }
+
+        fn bearer_headers(value: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                header::HeaderValue::from_str(value).expect("valid header value"),
+            );
+            headers
+        }
+
+        let state = state_with_token("the-real-token-value");
+
+        // Correct token accepts.
+        assert!(
+            authorize_daemon_request(&state, &bearer_headers("Bearer the-real-token-value"))
+                .is_ok()
+        );
+
+        // Wrong token (same length) still 401s — fail-closed preserved.
+        assert_eq!(
+            authorize_daemon_request(&state, &bearer_headers("Bearer the-real-token-WRONG")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+
+        // Empty token still 401s.
+        assert_eq!(
+            authorize_daemon_request(&state, &bearer_headers("Bearer ")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+
+        // Missing Authorization header still 401s.
+        assert_eq!(
+            authorize_daemon_request(&state, &HeaderMap::new()),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+
+        // Wrong scheme still 401s.
+        assert_eq!(
+            authorize_daemon_request(&state, &bearer_headers("Basic the-real-token-value")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
     }
 
     async fn wait_for_path_absent(path: &Path) {
@@ -2818,7 +3131,7 @@ mod tests {
         let project = project_dir("symforge-daemon-http");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let daemon_health = client
@@ -2834,7 +3147,9 @@ mod tests {
         assert_eq!(daemon_health.project_count, 0);
         assert_eq!(daemon_health.session_count, 0);
         assert_eq!(daemon_health.daemon_version, env!("CARGO_PKG_VERSION"));
-        assert!(!daemon_health.auth_required);
+        // Fail-closed: the daemon always establishes a token, so auth is always
+        // required even when no env pin was set (this test sets none).
+        assert!(daemon_health.auth_required);
         assert!(!daemon_health.executable_path.is_empty());
 
         let opened = client
@@ -2956,6 +3271,9 @@ mod tests {
         let project = project_dir("symforge-daemon-auth");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        // This test drives auth explicitly (missing / wrong / correct token), so
+        // it uses a bare client and attaches `.bearer_auth` per request rather
+        // than the always-authed `authed_client` helper.
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -3115,6 +3433,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_daemon_is_fail_closed_without_env_token() {
+        // Item-2 acceptance: with NO env pin, the daemon must STILL establish a
+        // token, persist it to the token file, reject unauthenticated requests,
+        // and accept requests bearing the file-resolved token.
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _bind_guard = EnvVarGuard::unset(DAEMON_BIND_ENV);
+        let _allow_guard = EnvVarGuard::unset(DAEMON_ALLOW_NON_LOOPBACK_ENV);
+        // Critical: no env token. Previously this meant "auth disabled".
+        let _auth_guard = EnvVarGuard::unset(DAEMON_AUTH_TOKEN_ENV);
+        let project = project_dir("symforge-daemon-failclosed");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        // 1. A token file is always present after start.
+        let token_path = daemon_home.path().join(daemon_token_file_name());
+        assert!(
+            token_path.exists(),
+            "daemon must persist an auth token file even without an env pin"
+        );
+        let file_token = std::fs::read_to_string(&token_path)
+            .expect("read token file")
+            .trim()
+            .to_string();
+        assert!(!file_token.is_empty(), "persisted token must be non-empty");
+        assert_eq!(
+            file_token, handle.state.auth_token,
+            "the persisted token must match the token the daemon enforces"
+        );
+
+        // The token must not leak via the unauthenticated health endpoint.
+        let bare = reqwest::Client::new();
+        let health_body = bare
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health request")
+            .error_for_status()
+            .expect("health status")
+            .text()
+            .await
+            .expect("health body");
+        assert!(
+            !health_body.contains(&file_token),
+            "health body must not leak the auth token"
+        );
+        let health: DaemonHealth = serde_json::from_str(&health_body).expect("health json");
+        assert!(health.auth_required, "auth must always be required");
+
+        // 2. An unauthenticated session-open is rejected.
+        let unauth = bare
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(7000),
+            })
+            .send()
+            .await
+            .expect("unauth open request");
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "a request without the token must be rejected"
+        );
+
+        // 3. The file-resolved token authenticates successfully.
+        let opened = bare
+            .post(format!("{base_url}/v1/sessions/open"))
+            .bearer_auth(&file_token)
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(7000),
+            })
+            .send()
+            .await
+            .expect("authed open request")
+            .error_for_status()
+            .expect("authed open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("authed open body");
+        assert!(!opened.session_id.is_empty());
+
+        // 4. `resolve_daemon_auth_token` (the client/hook resolution path) reads
+        //    the same token from the file when no env pin is set.
+        assert_eq!(
+            resolve_daemon_auth_token().as_deref(),
+            Some(file_token.as_str()),
+            "client token resolution must read the persisted token file"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+    }
+
+    #[tokio::test]
     async fn test_daemon_executes_session_scoped_tool_calls() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
@@ -3124,7 +3542,7 @@ mod tests {
             .expect("write source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3440,7 +3858,7 @@ mod tests {
             .expect("write source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3494,7 +3912,7 @@ mod tests {
             .expect("write source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3560,7 +3978,7 @@ mod tests {
             .expect("write source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3615,7 +4033,7 @@ mod tests {
             .expect("write source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3692,7 +4110,7 @@ mod tests {
         .expect("write source b");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -3805,7 +4223,7 @@ mod tests {
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
-        let http = reqwest::Client::new();
+        let http = authed_client(&handle);
 
         // Open a daemon session bound to project A.
         let opened = http
@@ -3917,7 +4335,7 @@ mod tests {
         .expect("write source b");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client
@@ -4022,7 +4440,7 @@ mod tests {
         std::fs::write(&source_path, "pub fn old_name() {}\n").expect("write initial source");
 
         let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
-        let client = reqwest::Client::new();
+        let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         let opened = client

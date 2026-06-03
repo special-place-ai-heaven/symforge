@@ -5211,11 +5211,14 @@ impl SymForgeServer {
                 root.display()
             );
         }
-        // TODO(security): bound discovery. The sensitive-path guard above blocks
-        // known system/credential roots, but a huge NON-sensitive tree (e.g. a
-        // deep monorepo or a user-pointed scratch dir) can still OOM or panic the
-        // reload. Add a file-count / byte ceiling to `discover_*` and refuse or
-        // degrade gracefully past it. Deferred — separate hardening.
+        // Bounded discovery: a huge NON-sensitive tree (a deep monorepo, a
+        // generated-file bomb, a user-pointed scratch dir) can no longer OOM or
+        // panic the reload. `discovery::discover_all_files`/`discover_files`
+        // enforce a file-count and cumulative-byte ceiling
+        // (`SYMFORGE_MAX_INDEX_FILES` / `SYMFORGE_MAX_INDEX_BYTES`, generous
+        // defaults) DURING the walk and return a graceful "tree too large to
+        // index" error before the in-memory index build commits. The reload
+        // below propagates that error to the caller instead of crashing.
         let reset_requested = index_folder_reset_requested();
         let current_root = self.capture_repo_root();
         let idempotency = match input.idempotency_key.as_deref() {
@@ -8312,6 +8315,10 @@ mod tests {
     async fn test_get_repo_map_full_proxies_to_daemon_session() {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set_path("SYMFORGE_HOME", daemon_home.path());
+        // The daemon is fail-closed; pin a token so the direct open call and the
+        // proxy client (which resolves the token via env) can authenticate.
+        let auth_token = "repo-map-proxy-test-token";
+        let _auth_guard = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
         let project = TempDir::new().expect("project dir");
         fs::create_dir_all(project.path().join("src")).expect("src dir");
         fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
@@ -8323,6 +8330,7 @@ mod tests {
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let opened = reqwest::Client::new()
             .post(format!("{base_url}/v1/sessions/open"))
+            .bearer_auth(auth_token)
             .json(&crate::daemon::OpenProjectRequest {
                 project_root: project.path().display().to_string(),
                 client_name: "codex".to_string(),

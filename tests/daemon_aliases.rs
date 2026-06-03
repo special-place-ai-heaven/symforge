@@ -70,9 +70,16 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
     // env var does not race with sibling tests in the same binary. Integration
     // test binaries run in their own process, so they do not share env state
     // with other test binaries either.
+    //
+    // The daemon is now fail-closed: it ALWAYS requires an auth token. Pin a
+    // known token via the env var so this test (which exercises the real MCP
+    // dispatch path) can present it with `.bearer_auth`, mirroring how the real
+    // MCP front-end authenticates against the daemon.
+    let auth_token = "daemon-aliases-test-token";
     // SAFETY: single-threaded test binary; no concurrent env access.
     unsafe {
         std::env::set_var("SYMFORGE_HOME", daemon_home.path());
+        std::env::set_var("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
     }
 
     let project = TempDir::new().expect("project temp dir");
@@ -84,6 +91,7 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
 
     let opened: OpenProjectResponse = client
         .post(format!("{base_url}/v1/sessions/open"))
+        .bearer_auth(auth_token)
         .json(&OpenProjectRequest {
             project_root: project.path().display().to_string(),
             client_name: "daemon-aliases-test".to_string(),
@@ -104,6 +112,7 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
             "{base_url}/v1/sessions/{}/tools/trace_symbol",
             opened.session_id
         ))
+        .bearer_auth(auth_token)
         .json(&serde_json::json!({
             "path": "src/main.rs",
             "name": "main",
@@ -156,6 +165,7 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
             "{base_url}/v1/sessions/{}/tools/get_symbol_context",
             opened.session_id
         ))
+        .bearer_auth(auth_token)
         .json(&serde_json::json!({
             "name": "main",
             "path": "src/main.rs",

@@ -47,7 +47,6 @@ fn read_runtime_rel(tagged: &Path, legacy: &str) -> std::io::Result<String> {
         Err(e) => Err(e),
     }
 }
-const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 /// Hard HTTP timeout — leaves margin within HOOK-03's 100 ms total budget.
 const HTTP_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -895,10 +894,10 @@ fn sync_http_get_with_timeout(
         format!("{path}?{query}")
     };
 
-    let auth_header = std::env::var(DAEMON_AUTH_TOKEN_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    // Resolve the daemon auth token the same way the MCP proxy does — env pin
+    // first, then the daemon's persisted token file — so the hook authenticates
+    // against the now fail-closed daemon even when it has no env pin of its own.
+    let auth_header = crate::daemon::resolve_daemon_auth_token()
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
     let request = format!(

@@ -35,11 +35,93 @@ pub struct DiscoveredEntry {
     pub classification: FileClassification,
 }
 
+/// Environment variable overriding the maximum number of files a single
+/// discovery pass will accept before refusing to index the tree.
+const MAX_INDEX_FILES_ENV: &str = "SYMFORGE_MAX_INDEX_FILES";
+/// Environment variable overriding the maximum cumulative byte size a single
+/// discovery pass will accept before refusing to index the tree.
+const MAX_INDEX_BYTES_ENV: &str = "SYMFORGE_MAX_INDEX_BYTES";
+
+/// Default file-count ceiling. Generous enough for very large real monorepos
+/// (this repo is ~230 files; 50k+ file monorepos are common), while still well
+/// below the point where building the in-memory index maps/strings would
+/// exhaust memory or trip `String join would overflow memory bounds`.
+const DEFAULT_MAX_INDEX_FILES: u64 = 200_000;
+/// Default cumulative-bytes ceiling: 16 GiB of accepted file content. A tree
+/// whose discoverable files exceed this is almost certainly a generated-file
+/// bomb, a mounted volume, or an accidental scratch root, not a project.
+const DEFAULT_MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Resource ceilings applied DURING the filesystem walk, before any in-memory
+/// index build commits to the discovered set. Bounding the streaming walk (not
+/// the post-collection `Vec`) is what keeps a huge but non-sensitive tree from
+/// OOM-ing or panicking the reload: we stop and return a graceful error the
+/// moment either ceiling is crossed, instead of collecting megabytes of paths
+/// and then letting `LiveIndex::load` blow the memory bound.
+#[derive(Debug, Clone, Copy)]
+pub struct DiscoveryLimits {
+    /// Maximum number of files accepted before refusing the tree.
+    pub max_files: u64,
+    /// Maximum cumulative bytes of accepted files before refusing the tree.
+    pub max_bytes: u64,
+}
+
+impl DiscoveryLimits {
+    /// Resolve limits from the environment, falling back to the generous
+    /// defaults. A non-parseable or empty override is ignored (the default is
+    /// used) so a typo can never silently *lower* the ceiling to zero and brick
+    /// indexing — only an explicit, well-formed value takes effect.
+    pub fn from_env() -> Self {
+        let max_files = parse_positive_env(MAX_INDEX_FILES_ENV).unwrap_or(DEFAULT_MAX_INDEX_FILES);
+        let max_bytes = parse_positive_env(MAX_INDEX_BYTES_ENV).unwrap_or(DEFAULT_MAX_INDEX_BYTES);
+        Self {
+            max_files,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_MAX_INDEX_FILES,
+            max_bytes: DEFAULT_MAX_INDEX_BYTES,
+        }
+    }
+}
+
+/// Parse a strictly-positive `u64` from the named env var, or `None` if the var
+/// is unset, empty, non-numeric, or zero. Zero is rejected so an override can
+/// never disable indexing entirely; callers fall back to the default instead.
+fn parse_positive_env(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&value| value > 0)
+}
+
+/// Build the graceful, explicit over-cap error. Surfaced to the caller (and
+/// thus the MCP client) instead of an OOM/panic, and it names the override knob
+/// so an operator with a genuinely huge repo can raise the ceiling.
+fn tree_too_large_error(files: u64, bytes: u64, limits: &DiscoveryLimits) -> anyhow::Error {
+    anyhow::anyhow!(
+        "tree too large to index ({files} files / {bytes} bytes exceeds limit of \
+         {max_files} files / {max_bytes} bytes); set {MAX_INDEX_FILES_ENV} or \
+         {MAX_INDEX_BYTES_ENV} to override",
+        max_files = limits.max_files,
+        max_bytes = limits.max_bytes,
+    )
+}
+
 /// Discover all source files under `root` that have a recognized language extension.
 ///
 /// - Respects `.gitignore` files via the `ignore` crate.
 /// - Normalizes path separators to `/` in `relative_path`.
 /// - Returns files sorted case-insensitively by `relative_path`.
+/// - Refuses trees that exceed [`DiscoveryLimits`] with a graceful error rather
+///   than collecting an unbounded set and OOM-ing the in-memory index build.
 pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
     use ignore::WalkBuilder;
 
@@ -47,35 +129,49 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    let mut files: Vec<DiscoveredFile> = WalkBuilder::new(&root)
-        .build()
-        .filter_map(|entry_result| {
-            let entry = entry_result.ok()?;
-            let path =
-                std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
+    // Bound the walk by accepted file count. This pass only tracks files with a
+    // recognized language, so byte ceilings are enforced by `discover_all_files`
+    // (the full-load entry point that has file sizes from the walk metadata).
+    let limits = DiscoveryLimits::from_env();
+    let mut files: Vec<DiscoveredFile> = Vec::new();
+    for entry_result in WalkBuilder::new(&root).build() {
+        let Ok(entry) = entry_result else { continue };
+        let path =
+            std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
 
-            // Use the already-known file_type from the walker instead of
-            // path.is_file() which would issue a redundant stat() syscall.
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                return None;
-            }
+        // Use the already-known file_type from the walker instead of
+        // path.is_file() which would issue a redundant stat() syscall.
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
 
-            let ext = path.extension()?.to_str()?;
-            let language = LanguageId::from_extension(ext)?;
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let Some(language) = LanguageId::from_extension(ext) else {
+            continue;
+        };
 
-            // Compute relative path from root
-            let relative = path.strip_prefix(&root).ok()?;
-            // Normalize backslashes to forward slashes
-            let relative_path = relative.to_string_lossy().replace('\\', "/");
+        // Compute relative path from root
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        // Normalize backslashes to forward slashes
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
 
-            Some(DiscoveredFile {
-                classification: FileClassification::for_code_path(&relative_path),
-                relative_path,
-                absolute_path: path,
-                language,
-            })
-        })
-        .collect();
+        // Refuse BEFORE growing the set past the ceiling, so a huge tree returns
+        // a graceful error rather than collecting an unbounded path vector.
+        if files.len() as u64 >= limits.max_files {
+            return Err(tree_too_large_error(files.len() as u64 + 1, 0, &limits));
+        }
+
+        files.push(DiscoveredFile {
+            classification: FileClassification::for_code_path(&relative_path),
+            relative_path,
+            absolute_path: path,
+            language,
+        });
+    }
 
     // Cache sort keys once instead of lowercasing paths on every comparator call.
     files.sort_by_cached_key(|file| file.relative_path.to_lowercase());
@@ -90,6 +186,13 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
 /// - Captures file size from walk metadata (avoids a separate stat() call).
 /// - Sets `language = None` for files with unrecognized extensions.
 /// - Returns files sorted case-insensitively by `relative_path`.
+/// - Refuses trees that exceed [`DiscoveryLimits`] (file count AND cumulative
+///   bytes) with a graceful error rather than collecting an unbounded set and
+///   OOM-ing / panicking the in-memory index build in `LiveIndex::load`.
+///
+/// This is the discovery entry point used by the full `LiveIndex::load`, so the
+/// byte ceiling is enforced here (file sizes are already known from the walk
+/// metadata, so no extra `stat` is needed to track cumulative bytes).
 pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     use ignore::WalkBuilder;
 
@@ -97,46 +200,65 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    let mut entries: Vec<DiscoveredEntry> = WalkBuilder::new(&root)
-        .build()
-        .filter_map(|entry_result| {
-            let entry = entry_result.ok()?;
-            let path =
-                std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
+    // Bound the streaming walk by accepted file count AND cumulative bytes,
+    // refusing the moment either ceiling is crossed — before the unbounded
+    // path/byte set is handed to the in-memory index build.
+    let limits = DiscoveryLimits::from_env();
+    let mut total_bytes: u64 = 0;
+    let mut entries: Vec<DiscoveredEntry> = Vec::new();
+    for entry_result in WalkBuilder::new(&root).build() {
+        let Ok(entry) = entry_result else { continue };
+        let path =
+            std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
 
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                return None;
-            }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
 
-            // Get file size from the walk metadata (DirEntry has it on most platforms).
-            // Fall back to a stat call only when metadata is unavailable.
-            let file_size = entry
-                .metadata()
-                .ok()
-                .map(|m| m.len())
-                .unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
+        // Get file size from the walk metadata (DirEntry has it on most platforms).
+        // Fall back to a stat call only when metadata is unavailable.
+        let file_size = entry
+            .metadata()
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or_else(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
 
-            // Compute relative path from root
-            let relative = path.strip_prefix(&root).ok()?;
-            let relative_path = relative.to_string_lossy().replace('\\', "/");
+        // Compute relative path from root
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
 
-            // Attempt language detection; None for unknown/denylisted extensions.
-            let language = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(LanguageId::from_extension);
+        // Attempt language detection; None for unknown/denylisted extensions.
+        let language = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(LanguageId::from_extension);
 
-            let classification = FileClassification::for_code_path(&relative_path);
+        let classification = FileClassification::for_code_path(&relative_path);
 
-            Some(DiscoveredEntry {
-                relative_path,
-                absolute_path: path,
-                file_size,
-                language,
-                classification,
-            })
-        })
-        .collect();
+        // Refuse BEFORE pushing past either ceiling. `saturating_add` keeps the
+        // byte counter from wrapping on a pathological tree; once it crosses the
+        // limit we return the graceful error instead of continuing to allocate.
+        let projected_files = entries.len() as u64 + 1;
+        let projected_bytes = total_bytes.saturating_add(file_size);
+        if projected_files > limits.max_files || projected_bytes > limits.max_bytes {
+            return Err(tree_too_large_error(
+                projected_files,
+                projected_bytes,
+                &limits,
+            ));
+        }
+        total_bytes = projected_bytes;
+
+        entries.push(DiscoveredEntry {
+            relative_path,
+            absolute_path: path,
+            file_size,
+            language,
+            classification,
+        });
+    }
 
     // Cache sort keys once instead of lowercasing paths on every comparator call.
     entries.sort_by_cached_key(|entry| entry.relative_path.to_lowercase());
@@ -208,15 +330,17 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
 pub fn find_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Try to find a git root first (always safe — scoped by repo boundary).
-    // TODO(security): the `.git` fast-path returns before `is_forbidden_root`
-    // runs, so a `.git` placed at a sensitive root (e.g. `git init` in
-    // `C:\Users\<name>`) would bypass the unified guard. Run the sensitive-path
-    // check on the resolved `.git` root before returning. Deferred — separate
-    // hardening from the attacker-facing index-tool guard unification.
+    // Try to find a git root first (scoped by repo boundary), BUT run the same
+    // sensitive/forbidden guard on the discovered `.git` root that the cwd
+    // fallback below uses. A `.git` planted at a sensitive ancestor (e.g.
+    // `git init` in `C:\Users\<name>` or a malicious `/etc/.git`) must NOT be
+    // selected and indexed unguarded: if the `.git`-bearing ancestor is
+    // forbidden we skip it and keep walking up, exactly as the rest of the
+    // guard does, so a deeper legitimate `.git` is still found and a genuine
+    // project `.git` continues to be selected.
     let mut current = cwd.clone();
     loop {
-        if current.join(".git").exists() {
+        if current.join(".git").exists() && !is_forbidden_root(&current) {
             return Some(current);
         }
         match current.parent() {
@@ -981,6 +1105,235 @@ mod tests {
             Some(SkipReason::BinaryContent),
             "custom.dat skip reason must be BinaryContent"
         );
+    }
+
+    // ── bounded discovery (resource ceilings) ──
+    //
+    // These guard against OOM/panic on a huge but NON-sensitive tree: discovery
+    // must refuse with a graceful, explicit error before committing the full set
+    // to the in-memory index build. Env-mutating cases are serialized by a mutex
+    // and restore the prior value on drop so they don't race other env readers.
+    mod bounded_discovery {
+        use super::*;
+        use std::ffi::OsString;
+        use std::sync::Mutex;
+
+        // Serializes the env-mutating limit tests against each other. Discovery
+        // env vars are process-global, so two tests setting them concurrently
+        // would interfere.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct LimitEnvGuard {
+            files_prev: Option<OsString>,
+            bytes_prev: Option<OsString>,
+        }
+
+        #[allow(unsafe_code)] // test-only env guard; mutation is serialized by ENV_LOCK.
+        impl LimitEnvGuard {
+            /// Set both limit env vars (any `None` clears that var) and capture
+            /// the prior values for restoration on drop.
+            fn set(max_files: Option<&str>, max_bytes: Option<&str>) -> Self {
+                let files_prev = std::env::var_os(MAX_INDEX_FILES_ENV);
+                let bytes_prev = std::env::var_os(MAX_INDEX_BYTES_ENV);
+                // SAFETY: env mutation is serialized by ENV_LOCK held by the caller;
+                // no concurrent env readers in this single-threaded test section.
+                unsafe {
+                    match max_files {
+                        Some(v) => std::env::set_var(MAX_INDEX_FILES_ENV, v),
+                        None => std::env::remove_var(MAX_INDEX_FILES_ENV),
+                    }
+                    match max_bytes {
+                        Some(v) => std::env::set_var(MAX_INDEX_BYTES_ENV, v),
+                        None => std::env::remove_var(MAX_INDEX_BYTES_ENV),
+                    }
+                }
+                Self {
+                    files_prev,
+                    bytes_prev,
+                }
+            }
+        }
+
+        #[allow(unsafe_code)] // test-only env guard; restores serialized env mutation.
+        impl Drop for LimitEnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: env mutation is serialized by ENV_LOCK; restore prior state.
+                unsafe {
+                    match &self.files_prev {
+                        Some(v) => std::env::set_var(MAX_INDEX_FILES_ENV, v),
+                        None => std::env::remove_var(MAX_INDEX_FILES_ENV),
+                    }
+                    match &self.bytes_prev {
+                        Some(v) => std::env::set_var(MAX_INDEX_BYTES_ENV, v),
+                        None => std::env::remove_var(MAX_INDEX_BYTES_ENV),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn default_limits_are_generous() {
+            let limits = DiscoveryLimits::default();
+            assert_eq!(limits.max_files, DEFAULT_MAX_INDEX_FILES);
+            assert_eq!(limits.max_bytes, DEFAULT_MAX_INDEX_BYTES);
+            // 200k files is comfortably above a very large real monorepo.
+            assert!(limits.max_files >= 200_000);
+        }
+
+        #[test]
+        fn parse_positive_env_rejects_zero_empty_and_garbage() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _guard = LimitEnvGuard::set(Some("0"), Some("not-a-number"));
+            // Zero and non-numeric overrides are ignored, so the defaults stand —
+            // a typo can never silently disable indexing.
+            assert_eq!(parse_positive_env(MAX_INDEX_FILES_ENV), None);
+            assert_eq!(parse_positive_env(MAX_INDEX_BYTES_ENV), None);
+            let limits = DiscoveryLimits::from_env();
+            assert_eq!(limits.max_files, DEFAULT_MAX_INDEX_FILES);
+            assert_eq!(limits.max_bytes, DEFAULT_MAX_INDEX_BYTES);
+        }
+
+        #[test]
+        fn from_env_honors_valid_override() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _guard = LimitEnvGuard::set(Some("5"), Some("4096"));
+            let limits = DiscoveryLimits::from_env();
+            assert_eq!(limits.max_files, 5);
+            assert_eq!(limits.max_bytes, 4096);
+        }
+
+        #[test]
+        fn normal_repo_indexes_under_default_cap() {
+            // No env override: the generous default cap must not interfere with a
+            // small, ordinary project.
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _guard = LimitEnvGuard::set(None, None);
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "main.rs", "fn main() {}");
+            create_file(tmp.path(), "lib.rs", "pub fn f() {}");
+            create_file(tmp.path(), "README.md", "# hi");
+
+            let files = discover_files(tmp.path()).expect("normal repo indexes fine");
+            assert_eq!(files.len(), 3);
+
+            let entries = discover_all_files(tmp.path()).expect("normal repo full-discovery fine");
+            assert!(entries.len() >= 3);
+        }
+
+        #[test]
+        fn over_file_cap_yields_graceful_error_not_panic() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            // Cap at 2 files; create 5 source files to exceed it.
+            let _guard = LimitEnvGuard::set(Some("2"), None);
+            let tmp = TempDir::new().unwrap();
+            for i in 0..5 {
+                create_file(tmp.path(), &format!("f{i}.rs"), "fn x() {}");
+            }
+
+            let err = discover_files(tmp.path()).expect_err("over file cap must error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tree too large to index"),
+                "error must be the graceful over-cap message: {msg}"
+            );
+            assert!(
+                msg.contains(MAX_INDEX_FILES_ENV),
+                "error must name the override knob: {msg}"
+            );
+
+            let err2 = discover_all_files(tmp.path()).expect_err("full discovery over cap errors");
+            assert!(err2.to_string().contains("tree too large to index"));
+        }
+
+        #[test]
+        fn over_byte_cap_yields_graceful_error() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            // Very high file cap, tiny byte cap (8 bytes). A single non-empty file
+            // exceeds the byte ceiling, exercising the cumulative-bytes path that
+            // only `discover_all_files` enforces.
+            let _guard = LimitEnvGuard::set(Some("1000000"), Some("8"));
+            let tmp = TempDir::new().unwrap();
+            create_file(
+                tmp.path(),
+                "big.rs",
+                "fn this_is_more_than_eight_bytes() {}",
+            );
+
+            let err = discover_all_files(tmp.path()).expect_err("over byte cap must error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tree too large to index"),
+                "error must be the graceful over-cap message: {msg}"
+            );
+            assert!(
+                msg.contains(MAX_INDEX_BYTES_ENV),
+                "error must name the byte override knob: {msg}"
+            );
+        }
+
+        #[test]
+        fn raised_cap_lets_a_previously_over_cap_tree_index() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            for i in 0..4 {
+                create_file(tmp.path(), &format!("f{i}.rs"), "fn x() {}");
+            }
+            // Low cap: refused.
+            {
+                let _guard = LimitEnvGuard::set(Some("2"), None);
+                assert!(discover_files(tmp.path()).is_err());
+            }
+            // Raised cap: accepted — the limit is genuinely configurable.
+            {
+                let _guard = LimitEnvGuard::set(Some("100"), None);
+                let files = discover_files(tmp.path()).expect("raised cap indexes the tree");
+                assert_eq!(files.len(), 4);
+            }
+        }
+    }
+
+    // ── `.git` fast-path sensitive-root guard (find_project_root) ──
+    //
+    // A `.git` planted under a forbidden/sensitive ancestor must NOT be selected
+    // as the project root; a genuine project `.git` still is. We exercise the
+    // guard helper `is_forbidden_root` that the fast-path now consults, on
+    // synthetic sensitive shapes, plus a positive case for an ordinary repo.
+    mod git_fast_path_guard {
+        use super::*;
+
+        #[test]
+        fn ordinary_project_with_git_is_not_forbidden() {
+            // A normal temp project dir is not sensitive/forbidden, so a `.git`
+            // there would be selected by the fast-path.
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join(".git")).unwrap();
+            assert!(
+                !is_forbidden_root(tmp.path()),
+                "an ordinary project dir must remain selectable as a git root"
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        #[test]
+        fn sensitive_unix_root_with_git_is_forbidden() {
+            // `/etc` is sensitive; a planted `/etc/.git` must NOT be selected.
+            // We assert the guard the fast-path consults rejects the root itself,
+            // independent of whether the path exists on the test host.
+            assert!(
+                is_forbidden_root(Path::new("/etc")),
+                "/etc must be forbidden even if a `.git` is planted there"
+            );
+            assert!(crate::paths::is_sensitive_path(Path::new("/etc")));
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn sensitive_windows_root_with_git_is_forbidden() {
+            // A bare drive root and the Windows user container are sensitive; a
+            // planted `.git` there must NOT be selected by the fast-path.
+            assert!(is_forbidden_root(Path::new("C:\\Windows")));
+            assert!(crate::paths::is_sensitive_path(Path::new("C:\\Windows")));
+        }
     }
 
     // WSL DrvFs Windows-profile / drive-root guard (rule 4c).

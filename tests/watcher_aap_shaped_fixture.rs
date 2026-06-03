@@ -293,12 +293,14 @@ async fn call_index_folder(
     daemon: &DaemonHandle,
     session_id: &str,
     root: &Path,
+    auth_token: &str,
 ) {
     let response = client
         .post(format!(
             "http://127.0.0.1:{}/v1/sessions/{session_id}/tools/index_folder",
             daemon.port
         ))
+        .bearer_auth(auth_token)
         .json(&json!({ "path": root.display().to_string() }))
         .send()
         .await
@@ -319,6 +321,10 @@ async fn run_aap_smoke(idle: Duration) -> SmokeObservation {
     let daemon_home = tempdir().expect("daemon home");
     let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
     let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "30");
+    // The daemon is fail-closed and always requires a token; pin a known one so
+    // the HTTP `index_folder` calls below can authenticate.
+    let auth_token = "watcher-aap-smoke-token";
+    let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
 
     let root_a = build_fixture("aap_a");
     let root_b = build_fixture("aap_b");
@@ -336,7 +342,14 @@ async fn run_aap_smoke(idle: Duration) -> SmokeObservation {
         .expect("open project session");
     let client = reqwest::Client::new();
 
-    call_index_folder(&client, &daemon, &open.session_id, root_a.root.path()).await;
+    call_index_folder(
+        &client,
+        &daemon,
+        &open.session_id,
+        root_a.root.path(),
+        auth_token,
+    )
+    .await;
     let root_a_index_before_idle = project_file_count(&daemon, root_a.root.path());
     tokio::time::sleep(idle).await;
     let root_a_index_after_idle = project_file_count(&daemon, root_a.root.path());
@@ -346,7 +359,14 @@ async fn run_aap_smoke(idle: Duration) -> SmokeObservation {
         root_a_index_after_idle,
     );
 
-    call_index_folder(&client, &daemon, &open.session_id, root_b.root.path()).await;
+    call_index_folder(
+        &client,
+        &daemon,
+        &open.session_id,
+        root_b.root.path(),
+        auth_token,
+    )
+    .await;
     let root_b_index_before_idle = project_file_count(&daemon, root_b.root.path());
     tokio::time::sleep(idle).await;
     let root_b_index_after_idle = project_file_count(&daemon, root_b.root.path());

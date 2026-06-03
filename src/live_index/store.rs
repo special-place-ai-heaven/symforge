@@ -80,6 +80,126 @@ fn indexing_thread_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Env override for the peak concurrent in-memory read budget enforced during
+/// the admission gate. Value is parsed as a byte count.
+const MAX_INFLIGHT_BYTES_ENV: &str = "SYMFORGE_MAX_INFLIGHT_BYTES";
+
+/// Default peak concurrent in-memory read budget: 512 MiB. High enough that
+/// normal repositories never block on it (their files are tiny), but low
+/// enough to bound peak resident memory when a tree contains many large
+/// recognized-source files that would otherwise be read fully in parallel.
+const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Files at or below this size are read with unbounded Rayon parallelism: they
+/// are too small to threaten peak memory, and forcing them through the budget
+/// would add pointless contention. Only files strictly above this threshold
+/// acquire permits against the in-flight budget before being read fully.
+///
+/// This is intentionally set BELOW [`crate::domain::index::METADATA_ONLY_BYTES`]
+/// (1 MiB), which is the effective per-file ceiling for the parse path: files
+/// larger than that are classified `MetadataOnly` and never read here. Choosing
+/// 256 KiB means the governor actually engages on the largest *parsed* files
+/// (those between 256 KiB and 1 MiB) — the ones whose concurrent reads dominate
+/// peak — while the bulk of tiny source files stay fully parallel. If the
+/// metadata ceiling is ever raised to admit larger source files, this budget
+/// keeps peak resident bytes bounded by the budget rather than by thread count.
+const INFLIGHT_GOVERNOR_THRESHOLD_BYTES: u64 = 256 * 1024;
+
+/// Bounds the PEAK concurrent in-memory bytes consumed by full-file reads
+/// during admission, without changing WHICH files are admitted.
+///
+/// The cumulative byte cap in discovery limits total tree size, but says
+/// nothing about how much is resident *at once*. The admission gate reads every
+/// `Normal`-tier file fully into a `Vec<u8>` in parallel via Rayon. Today the
+/// per-file read ceiling on that path is `METADATA_ONLY_BYTES` (1 MiB) — larger
+/// files are classified `MetadataOnly` and skipped without a read — so peak is
+/// already `num_threads * up-to-1-MiB`. This governor makes peak independent of
+/// `num_threads` AND robust to any future raise of that ceiling: a worker about
+/// to read a file above the threshold acquires permits equal to its size
+/// (clamped to the total budget, so a single
+/// file larger than the whole budget still proceeds — alone) and releases them
+/// once the bytes are no longer held. Large files therefore read with bounded
+/// concurrency while small files stay fully parallel. Coverage is unchanged:
+/// every file still gets read and classified exactly as before.
+struct InflightByteBudget {
+    total: u64,
+    state: std::sync::Mutex<u64>,
+    available: std::sync::Condvar,
+}
+
+impl InflightByteBudget {
+    fn new(total: u64) -> Self {
+        // A zero budget would deadlock acquisition; clamp to at least 1 byte.
+        let total = total.max(1);
+        Self {
+            total,
+            state: std::sync::Mutex::new(total),
+            available: std::sync::Condvar::new(),
+        }
+    }
+
+    fn from_env() -> Self {
+        let total = std::env::var(MAX_INFLIGHT_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_BYTES);
+        Self::new(total)
+    }
+
+    /// Acquire permits for `bytes`, blocking until enough budget is free.
+    ///
+    /// The requested amount is clamped to the total budget so that a single
+    /// file larger than the entire budget never deadlocks — it waits until the
+    /// budget is fully free, then runs alone. Returns an owned guard that
+    /// releases the permits (and wakes waiters) on drop. The guard is owned (it
+    /// holds an `Arc` to the budget) so it can travel alongside the file's bytes
+    /// and be released only once those bytes are dropped.
+    fn acquire(self: &Arc<Self>, bytes: u64) -> InflightPermit {
+        let want = bytes.min(self.total).max(1);
+        let mut available = self.state.lock().expect("inflight budget mutex poisoned");
+        while *available < want {
+            available = self
+                .available
+                .wait(available)
+                .expect("inflight budget condvar poisoned");
+        }
+        *available -= want;
+        InflightPermit {
+            budget: Arc::clone(self),
+            held: want,
+        }
+    }
+
+    /// Currently free budget, in bytes. Test-only observation hook.
+    #[cfg(test)]
+    fn available_bytes(&self) -> u64 {
+        *self.state.lock().expect("inflight budget mutex poisoned")
+    }
+}
+
+/// RAII permit that returns its held bytes to the [`InflightByteBudget`] and
+/// wakes waiters on drop. Dropping it is the point at which the large file's
+/// bytes are considered no longer in flight. Owned (holds an `Arc`) so it can be
+/// carried across Rayon stages alongside the bytes it accounts for.
+struct InflightPermit {
+    budget: Arc<InflightByteBudget>,
+    held: u64,
+}
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .budget
+            .state
+            .lock()
+            .expect("inflight budget mutex poisoned");
+        *available += self.held;
+        // Wake all waiters: a large release may unblock several small waiters.
+        self.budget.available.notify_all();
+    }
+}
+
 /// Per-file parse status stored in the index.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParseStatus {
@@ -1145,16 +1265,54 @@ impl LiveIndex {
         use crate::discovery::classify_admission;
         use crate::domain::index::{AdmissionTier, SkippedFile};
 
+        // An admitted file plus everything needed to parse it. Defined as a named
+        // struct (rather than a wide tuple) to keep the `to_parse` collection
+        // type simple and self-documenting.
+        struct ParseCandidate {
+            relative_path: String,
+            language: crate::domain::LanguageId,
+            classification: crate::domain::FileClassification,
+            bytes: Vec<u8>,
+            mtime_secs: u64,
+            /// Original on-disk size, used in the parse stage to re-acquire an
+            /// in-flight permit for large files (bounding concurrent parse
+            /// memory). Permits are NOT carried across the read→parse stage
+            /// boundary: doing so would deadlock the admission `par_iter`, whose
+            /// permits would only free in the later parse stage. Each stage
+            /// acquires and releases within its own closure instead.
+            file_size: u64,
+        }
+
         enum AdmissionOutcome {
-            Parse {
-                relative_path: String,
-                language: crate::domain::LanguageId,
-                classification: crate::domain::FileClassification,
-                bytes: Vec<u8>,
-                mtime_secs: u64,
-            },
+            Parse(ParseCandidate),
             Skip(SkippedFile),
         }
+
+        // Peak-memory governor: bounds the bytes resident across all concurrent
+        // full-file reads/parses so a tree of many large recognized-source files
+        // (each under the per-file hard-skip, cumulatively under the cap) cannot
+        // drive peak RSS to `num_threads * file_size`. Coverage is unchanged —
+        // every file is still read and classified; only concurrency of the large
+        // reads is bounded. `read_under_budget` returns the same bytes a bare
+        // `std::fs::read` would, just admission-throttled for big files.
+        let inflight_budget = Arc::new(InflightByteBudget::from_env());
+        // Read a file, acquiring an in-flight permit FIRST for files above the
+        // governor threshold. The returned permit (if any) must be held for as
+        // long as the returned bytes are alive, so peak resident bytes across all
+        // workers stay within the budget. Returns `(bytes, permit)`.
+        let read_under_budget =
+            |path: &Path, size: u64| -> std::io::Result<(Vec<u8>, Option<InflightPermit>)> {
+                if size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES {
+                    // Acquire BEFORE reading so the large allocation never races
+                    // ahead of the budget.
+                    let permit = inflight_budget.acquire(size);
+                    let bytes = std::fs::read(path)?;
+                    Ok((bytes, Some(permit)))
+                } else {
+                    let bytes = std::fs::read(path)?;
+                    Ok((bytes, None))
+                }
+            };
 
         let outcomes: Vec<AdmissionOutcome> = indexing_thread_pool().install(|| {
             all_entries
@@ -1192,13 +1350,16 @@ impl LiveIndex {
                         None => {
                             // Unknown extension, not on denylist, under size limit.
                             // Read content to do binary sniff, then store as skipped.
-                            let bytes = match std::fs::read(&entry.absolute_path) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                                    return None;
-                                }
-                            };
+                            // `_permit` stays alive until the end of this block so the
+                            // read bytes are accounted against the in-flight budget.
+                            let (bytes, _permit) =
+                                match read_under_budget(&entry.absolute_path, entry.file_size) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!("failed to read {:?}: {}", entry.absolute_path, e);
+                                        return None;
+                                    }
+                                };
                             let decision_post = classify_admission(
                                 &entry.absolute_path,
                                 entry.file_size,
@@ -1219,13 +1380,18 @@ impl LiveIndex {
                     };
 
                     // Phase 3: read content and do binary sniff before passing to parser.
-                    let bytes = match std::fs::read(&entry.absolute_path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                            return None;
-                        }
-                    };
+                    // `_permit` bounds the concurrent READ footprint and is released
+                    // at the end of this closure — it deliberately does NOT cross into
+                    // the parse stage (that would deadlock this `par_iter`). The parse
+                    // stage re-acquires its own permit from `file_size`.
+                    let (bytes, _permit) =
+                        match read_under_budget(&entry.absolute_path, entry.file_size) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("failed to read {:?}: {}", entry.absolute_path, e);
+                                return None;
+                            }
+                        };
                     let mtime_secs = std::fs::metadata(&entry.absolute_path)
                         .and_then(|m| m.modified())
                         .ok()
@@ -1239,6 +1405,8 @@ impl LiveIndex {
                     match decision_post.tier {
                         AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
                             // Binary sniff reclassified this file — do NOT parse.
+                            // Drop the bytes now; `_permit` releases at closure end.
+                            drop(bytes);
                             let sf = SkippedFile {
                                 path: entry.relative_path.clone(),
                                 size: entry.file_size,
@@ -1251,40 +1419,29 @@ impl LiveIndex {
                             };
                             Some(AdmissionOutcome::Skip(sf))
                         }
-                        AdmissionTier::Normal => Some(AdmissionOutcome::Parse {
+                        AdmissionTier::Normal => Some(AdmissionOutcome::Parse(ParseCandidate {
                             relative_path: entry.relative_path.clone(),
                             language,
                             classification: entry.classification,
                             bytes,
                             mtime_secs,
-                        }),
+                            file_size: entry.file_size,
+                        })),
                     }
                 })
                 .collect()
         });
 
-        // 3. Split outcomes into parse candidates and skipped files.
+        // 3. Split outcomes into parse candidates and skipped files. Each
+        //    candidate carries its on-disk `file_size` so the parse stage can
+        //    re-acquire an in-flight permit for large files.
         let mut skipped_files: Vec<SkippedFile> = Vec::new();
-        let mut to_parse: Vec<(
-            String,
-            crate::domain::LanguageId,
-            crate::domain::FileClassification,
-            Vec<u8>,
-            u64, // mtime_secs
-        )> = Vec::new();
+        let mut to_parse: Vec<ParseCandidate> = Vec::new();
 
         for outcome in outcomes {
             match outcome {
                 AdmissionOutcome::Skip(sf) => skipped_files.push(sf),
-                AdmissionOutcome::Parse {
-                    relative_path,
-                    language,
-                    classification,
-                    bytes,
-                    mtime_secs,
-                } => {
-                    to_parse.push((relative_path, language, classification, bytes, mtime_secs));
-                }
+                AdmissionOutcome::Parse(candidate) => to_parse.push(candidate),
             }
         }
 
@@ -1294,23 +1451,38 @@ impl LiveIndex {
             skipped_files.len()
         );
 
-        // 4. Parse all admitted files in parallel via Rayon.
+        // 4. Parse all admitted files in parallel via Rayon. Large files
+        //    re-acquire an in-flight permit (scoped to THIS closure, so it can
+        //    never deadlock the stage) for the duration of the parse, bounding
+        //    the concurrent parse memory the same way the read stage bounds the
+        //    concurrent read memory. Small files parse with full parallelism.
         let mut parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
             to_parse
                 .into_par_iter()
-                .map(
-                    |(relative_path, language, classification, bytes, mtime_secs)| {
-                        let result = parsing::process_file_with_classification(
-                            &relative_path,
-                            &bytes,
-                            language,
-                            classification,
-                        );
-                        let indexed =
-                            IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
-                        (relative_path, indexed)
-                    },
-                )
+                .map(|candidate| {
+                    let ParseCandidate {
+                        relative_path,
+                        language,
+                        classification,
+                        bytes,
+                        mtime_secs,
+                        file_size,
+                    } = candidate;
+                    // Permit held for read+parse residency of this large file;
+                    // released when this closure returns. `_permit` is None for
+                    // small files (unbounded parallelism).
+                    let _permit = (file_size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES)
+                        .then(|| inflight_budget.acquire(file_size));
+                    let result = parsing::process_file_with_classification(
+                        &relative_path,
+                        &bytes,
+                        language,
+                        classification,
+                    );
+                    let indexed =
+                        IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
+                    (relative_path, indexed)
+                })
                 .collect()
         });
 
@@ -2146,6 +2318,179 @@ mod tests {
         let shared = LiveIndex::load(tmp.path()).unwrap();
         let index = shared.read();
         assert_eq!(index.file_count(), 3);
+    }
+
+    // --- InflightByteBudget (Finding 2: peak-concurrent read footprint) ---
+
+    static INFLIGHT_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct InflightEnvGuard {
+        previous: Option<String>,
+    }
+
+    #[allow(unsafe_code)] // test-only env guard; callers hold INFLIGHT_ENV_LOCK.
+    impl InflightEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var(MAX_INFLIGHT_BYTES_ENV).ok();
+            // SAFETY: callers hold INFLIGHT_ENV_LOCK; tests run single-threaded.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(MAX_INFLIGHT_BYTES_ENV, value),
+                    None => std::env::remove_var(MAX_INFLIGHT_BYTES_ENV),
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // test-only env guard restores the serialized flag.
+    impl Drop for InflightEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold INFLIGHT_ENV_LOCK; tests run single-threaded.
+            unsafe {
+                match self.previous.as_deref() {
+                    Some(value) => std::env::set_var(MAX_INFLIGHT_BYTES_ENV, value),
+                    None => std::env::remove_var(MAX_INFLIGHT_BYTES_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inflight_budget_releases_on_permit_drop() {
+        let budget = Arc::new(InflightByteBudget::new(1000));
+        assert_eq!(budget.available_bytes(), 1000);
+
+        let permit_a = budget.acquire(400);
+        assert_eq!(budget.available_bytes(), 600);
+
+        let permit_b = budget.acquire(600);
+        assert_eq!(budget.available_bytes(), 0);
+
+        drop(permit_a);
+        assert_eq!(budget.available_bytes(), 400);
+
+        drop(permit_b);
+        assert_eq!(budget.available_bytes(), 1000);
+    }
+
+    #[test]
+    fn inflight_budget_clamps_oversized_request_to_total() {
+        // A request larger than the whole budget must not deadlock: it is
+        // clamped to the total so the file still reads (alone) and is admitted.
+        let budget = Arc::new(InflightByteBudget::new(256));
+        let permit = budget.acquire(10_000_000);
+        assert_eq!(budget.available_bytes(), 0, "clamped to the full budget");
+        drop(permit);
+        assert_eq!(budget.available_bytes(), 256);
+    }
+
+    #[test]
+    fn inflight_budget_zero_total_does_not_deadlock() {
+        // A zero/garbage budget is clamped to at least 1 byte so acquisition
+        // always makes progress rather than blocking forever.
+        let budget = Arc::new(InflightByteBudget::new(0));
+        assert!(budget.available_bytes() >= 1);
+        let permit = budget.acquire(123);
+        drop(permit);
+        assert!(budget.available_bytes() >= 1);
+    }
+
+    #[test]
+    fn inflight_budget_blocks_until_capacity_frees() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        // Budget only fits one large file at a time. A second acquirer must
+        // block until the first releases — proving the peak bound is enforced,
+        // not merely advisory.
+        let budget = Arc::new(InflightByteBudget::new(512 * 1024));
+        let first = budget.acquire(512 * 1024);
+        assert_eq!(budget.available_bytes(), 0);
+
+        let (tx, rx) = mpsc::channel();
+        let budget_clone = Arc::clone(&budget);
+        let waiter = thread::spawn(move || {
+            let _permit = budget_clone.acquire(512 * 1024);
+            tx.send(()).expect("send acquisition signal");
+            // Hold briefly so the main thread can observe the depleted budget.
+            thread::sleep(Duration::from_millis(20));
+        });
+
+        // The waiter must NOT have acquired yet — budget is full.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "second acquirer should block while the budget is exhausted"
+        );
+
+        // Release the first permit; the waiter should now proceed.
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("waiter should acquire once budget frees");
+        waiter.join().expect("waiter thread joins");
+        assert_eq!(budget.available_bytes(), 512 * 1024);
+    }
+
+    #[test]
+    fn load_under_tight_inflight_budget_still_indexes_all_large_files() {
+        let _lock = INFLIGHT_ENV_LOCK.lock().unwrap();
+        // Tight budget: 512 KiB total, well below the combined size of several
+        // over-threshold files. They must all still be indexed — only the PEAK
+        // concurrent read footprint is bounded, never which files are admitted.
+        let _env = InflightEnvGuard::set(Some(&(512 * 1024).to_string()));
+
+        let tmp = TempDir::new().unwrap();
+        // Build valid Rust files comfortably above the 256 KiB governor threshold
+        // but below the 1 MiB MetadataOnly ceiling, so they are Normal-tier and
+        // read fully through the governed path. Use a fixed function count and
+        // assert the resulting size lands in the intended window.
+        const FNS_PER_FILE: u32 = 24_000;
+        let mut body = String::with_capacity(400 * 1024);
+        for i in 0..FNS_PER_FILE {
+            use std::fmt::Write;
+            writeln!(body, "fn f_{i:07}() {{}}").unwrap();
+        }
+        assert!(
+            body.len() as u64 > INFLIGHT_GOVERNOR_THRESHOLD_BYTES,
+            "fixture ({} bytes) must exceed the governor threshold ({}) to exercise the bound",
+            body.len(),
+            INFLIGHT_GOVERNOR_THRESHOLD_BYTES
+        );
+        assert!(
+            (body.len() as u64) < crate::domain::index::METADATA_ONLY_BYTES,
+            "fixture ({} bytes) must stay Normal-tier (under the {} metadata ceiling)",
+            body.len(),
+            crate::domain::index::METADATA_ONLY_BYTES
+        );
+
+        const FILE_COUNT: usize = 6;
+        for n in 0..FILE_COUNT {
+            write_file(tmp.path(), &format!("big_{n}.rs"), &body);
+        }
+        // A tiny file to confirm small files index alongside the governed ones.
+        write_file(tmp.path(), "tiny.rs", "fn tiny() {}");
+
+        let shared = LiveIndex::load(tmp.path()).unwrap();
+        let index = shared.read();
+
+        assert!(
+            !index.cb_state.is_tripped(),
+            "valid large files must not trip the circuit breaker"
+        );
+        // Coverage invariant: every over-threshold file plus the tiny file is
+        // indexed despite the tight in-flight budget.
+        assert_eq!(
+            index.file_count(),
+            FILE_COUNT + 1,
+            "all large files plus the tiny file must remain indexed under the cap"
+        );
+        // Each large file's symbols were extracted, proving content was read and
+        // parsed, not skipped. FILE_COUNT * FNS_PER_FILE functions, plus tiny().
+        assert!(
+            index.symbol_count() as u64 >= FILE_COUNT as u64 * FNS_PER_FILE as u64,
+            "large files must be fully parsed ({} symbols), not metadata-skipped",
+            index.symbol_count()
+        );
     }
 
     #[test]

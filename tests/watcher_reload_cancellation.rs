@@ -223,6 +223,10 @@ fn reload_signals_token_before_new_watcher() {
 fn index_folder_for_session_signals_token_before_drop() {
     run_with_single_blocking_thread(async {
         let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "1");
+        // The daemon is fail-closed and always requires a token; pin a known one
+        // so the HTTP `index_folder` call below can authenticate.
+        let auth_token = "watcher-rebind-test-token";
+        let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
         let project_a = TempDir::new().expect("project a");
         let project_b = TempDir::new().expect("project b");
         let _a_paths = write_project_files(project_a.path(), "a_file", 40);
@@ -246,6 +250,7 @@ fn index_folder_for_session_signals_token_before_drop() {
                 "http://127.0.0.1:{}/v1/sessions/{}/tools/index_folder",
                 daemon.port, open.session_id
             ))
+            .bearer_auth(auth_token)
             .json(&json!({ "path": project_b.path().display().to_string() }))
             .send()
             .await
