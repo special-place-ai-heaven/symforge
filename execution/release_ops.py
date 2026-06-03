@@ -245,6 +245,60 @@ def publish_npm_tarball(root: Path, tarball_path: str, *, package_name: str, ver
     return "published"
 
 
+def cargo_version_exists(crate_name: str, version: str) -> bool:
+    """Return True when this exact crate version is already on crates.io.
+
+    Queries the crates.io HTTP API. The version endpoint returns HTTP 200 with a
+    JSON body describing the version when it has been published, and HTTP 404
+    when it has not. Only an authoritative 200 (existing) or 404 (missing)
+    answer is trusted; any other HTTP status, network failure, or malformed
+    payload raises so the caller fails loudly rather than silently republishing
+    or silently skipping.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"https://crates.io/api/v1/crates/{crate_name}/{version}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            # crates.io requires a descriptive User-Agent or it returns 403.
+            "User-Agent": "symforge-release-ops (https://github.com/special-place-administrator/symforge)",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise ReleaseOpsError(
+            f"crates.io existence check for {crate_name}@{version} failed with HTTP {error.code}"
+        ) from error
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise ReleaseOpsError(
+            f"crates.io existence check for {crate_name}@{version} failed: {error}"
+        ) from error
+
+    reported = payload.get("version", {}).get("num")
+    if reported != version:
+        raise ReleaseOpsError(
+            f"crates.io returned version '{reported}' for {crate_name}@{version}; "
+            "refusing to treat as an idempotent skip"
+        )
+    return True
+
+
+def publish_cargo_crate(root: Path, *, crate_name: str, version: str) -> str:
+    if cargo_version_exists(crate_name, version):
+        print(f"{crate_name}@{version} already exists on crates.io; skipping publish.")
+        return "skipped"
+
+    run_checked(["cargo", "publish"], cwd=root)
+    return "published"
+
+
 def preflight_steps(root: Path) -> list[tuple[str, list[str], Path]]:
     return [
         (
@@ -358,6 +412,18 @@ def cmd_publish_npm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_publish_cargo(args: argparse.Namespace) -> int:
+    root = repo_root(args.root)
+    result = publish_cargo_crate(
+        root,
+        crate_name=args.crate_name,
+        version=args.version,
+    )
+    if result == "published":
+        print(f"Published {args.crate_name}@{args.version} to crates.io.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Canonical operator commands for SymForge release and publish workflow."
@@ -404,6 +470,14 @@ def build_parser() -> argparse.ArgumentParser:
     publish_npm.add_argument("--package-name", required=True, help="Package name in the npm registry.")
     publish_npm.add_argument("--version", required=True, help="Version to check and publish.")
     publish_npm.set_defaults(func=cmd_publish_npm)
+
+    publish_cargo = subparsers.add_parser(
+        "publish-cargo",
+        help="Publish the crate to crates.io unless that exact version already exists in the registry.",
+    )
+    publish_cargo.add_argument("--crate-name", required=True, help="Crate name on crates.io.")
+    publish_cargo.add_argument("--version", required=True, help="Version to check and publish.")
+    publish_cargo.set_defaults(func=cmd_publish_cargo)
 
     return parser
 

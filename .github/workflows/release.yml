@@ -371,16 +371,32 @@ jobs:
         run: gh release upload "${{ needs.prepare-release.outputs.tag_name }}" artifacts/* --clobber
 
   cargo-publish:
-    needs: [prepare-release]
+    needs:
+      - prepare-release
+      - build
+      - build-npm-package
+      - upload-release-assets
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare-release.outputs.release_ref }}
-      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
       - name: Publish to crates.io
-        run: cargo publish
+        run: >
+          python execution/release_ops.py publish-cargo
+          --crate-name symforge
+          --version "${{ needs.prepare-release.outputs.version }}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

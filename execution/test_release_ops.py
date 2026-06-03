@@ -90,6 +90,84 @@ class ReleaseOpsTests(unittest.TestCase):
             cwd=root,
         )
 
+    def test_cargo_version_exists_returns_true_when_api_reports_matching_version(self) -> None:
+        response = mock.MagicMock()
+        response.read.return_value = b'{"version": {"num": "4.9.8"}}'
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            self.assertTrue(release_ops.cargo_version_exists("symforge", "4.9.8"))
+
+    def test_cargo_version_exists_returns_false_on_http_404(self) -> None:
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            url="https://crates.io/api/v1/crates/symforge/4.9.9",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        self.addCleanup(error.close)
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            self.assertFalse(release_ops.cargo_version_exists("symforge", "4.9.9"))
+
+    def test_cargo_version_exists_raises_on_version_identity_mismatch(self) -> None:
+        response = mock.MagicMock()
+        response.read.return_value = b'{"version": {"num": "9.9.9"}}'
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaises(release_ops.ReleaseOpsError):
+                release_ops.cargo_version_exists("symforge", "4.9.8")
+
+    def test_cargo_version_exists_raises_on_unexpected_http_status(self) -> None:
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            url="https://crates.io/api/v1/crates/symforge/4.9.8",
+            code=500,
+            msg="Server Error",
+            hdrs=None,
+            fp=None,
+        )
+        self.addCleanup(error.close)
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(release_ops.ReleaseOpsError):
+                release_ops.cargo_version_exists("symforge", "4.9.8")
+
+    def test_publish_cargo_crate_skips_when_version_already_exists(self) -> None:
+        root = release_ops.repo_root()
+        with mock.patch("release_ops.cargo_version_exists", return_value=True):
+            with mock.patch("release_ops.run_checked") as run_checked:
+                result = release_ops.publish_cargo_crate(
+                    root,
+                    crate_name="symforge",
+                    version="4.9.8",
+                )
+
+        self.assertEqual(result, "skipped")
+        run_checked.assert_not_called()
+
+    def test_publish_cargo_crate_runs_publish_when_version_missing(self) -> None:
+        root = release_ops.repo_root()
+        with mock.patch("release_ops.cargo_version_exists", return_value=False):
+            with mock.patch("release_ops.run_checked") as run_checked:
+                result = release_ops.publish_cargo_crate(
+                    root,
+                    crate_name="symforge",
+                    version="4.9.8",
+                )
+
+        self.assertEqual(result, "published")
+        run_checked.assert_called_once_with(["cargo", "publish"], cwd=root)
+
+    def test_release_workflow_publishes_cargo_through_release_ops(self) -> None:
+        root = release_ops.repo_root()
+        workflow = (root / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("release_ops.py publish-cargo", workflow)
+        self.assertNotIn("run: cargo publish", workflow)
+
     def test_release_workflow_publishes_platform_npm_packages_before_root(self) -> None:
         root = release_ops.repo_root()
         workflow = (root / ".github" / "workflows" / "release.yml").read_text(
