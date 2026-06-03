@@ -102,6 +102,93 @@ fn parse_positive_env(name: &str) -> Option<u64> {
         .filter(|&value| value > 0)
 }
 
+/// Environment variable Cargo honors to relocate the build directory. When set
+/// to a path whose final component is a direct child of the repo root, that
+/// child is a build dir and must be skipped regardless of `.gitignore`.
+const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
+
+/// Returns `true` when `name` is a Cargo build-directory name: exactly `target`
+/// or `target-<suffix>` where `<suffix>` is one or more ASCII alphanumerics or
+/// underscores (e.g. `target`, `target-wsl`, `target-x86_64`). This matches the
+/// regex `^target(-[A-Za-z0-9_]+)?$` without a per-call regex compile.
+///
+/// Used to hard-skip build dirs at the REPO ROOT independently of each user's
+/// `.gitignore`. `/target` is conventionally gitignored, but a `CARGO_TARGET_DIR`
+/// variant like `target-wsl` (common on dual Windows/WSL machines) usually is
+/// not, so it would otherwise be indexed as source.
+fn is_cargo_build_dir_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("target") else {
+        return false;
+    };
+    match rest.strip_prefix('-') {
+        // Bare `target`.
+        None if rest.is_empty() => true,
+        // `target` followed by something other than `-<suffix>` (e.g. `targets`,
+        // `target_dir`) is NOT a build dir.
+        None => false,
+        // `target-<suffix>`: suffix must be non-empty and [A-Za-z0-9_]+.
+        Some(suffix) => {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+    }
+}
+
+/// The repo-root child directory name designated by `CARGO_TARGET_DIR`, if that
+/// env var is set AND resolves to a direct child of `root`. Returns `None` when
+/// the var is unset, empty, or points somewhere that is not a single-segment
+/// child of the root (an absolute path outside the tree never produces
+/// discoverable entries, so it needs no skip entry here).
+///
+/// Comparison is done on canonicalized paths so a relative or symlinked
+/// `CARGO_TARGET_DIR` still matches the root child the walk actually traverses.
+fn cargo_target_dir_root_child(root: &Path) -> Option<String> {
+    let raw = std::env::var_os(CARGO_TARGET_DIR_ENV)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let target = PathBuf::from(&raw);
+    // Resolve against the root for relative values (Cargo interprets a relative
+    // CARGO_TARGET_DIR against the working directory; for discovery we only care
+    // about the case where it lands directly under the indexed root).
+    let target_abs = if target.is_absolute() {
+        target
+    } else {
+        root.join(&target)
+    };
+    let canon_target = std::fs::canonicalize(&target_abs).unwrap_or(target_abs);
+    let parent = canon_target.parent()?;
+    if parent != root {
+        return None;
+    }
+    canon_target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
+/// Returns `true` when `relative_path` (forward-slash normalized, relative to the
+/// repo root) lives under a repo-root-level Cargo build directory and must be
+/// skipped. Only the FIRST path component is inspected, so a legitimately-named
+/// nested source dir such as `src/target/mod.rs` is never over-skipped — only a
+/// `target*` (or `CARGO_TARGET_DIR`) directory that is a direct child of the root.
+fn is_under_repo_root_build_dir(relative_path: &str, target_dir_child: Option<&str>) -> bool {
+    let Some(first) = relative_path.split('/').next() else {
+        return false;
+    };
+    // A path with no separator is a root-level FILE, not a build dir; only treat
+    // it as build output when it is the first segment of a deeper path.
+    if first == relative_path {
+        return false;
+    }
+    if is_cargo_build_dir_name(first) {
+        return true;
+    }
+    matches!(target_dir_child, Some(child) if child == first)
+}
+
 /// Build the graceful, explicit over-cap error. Surfaced to the caller (and
 /// thus the MCP client) instead of an OOM/panic, and it names the override knob
 /// so an operator with a genuinely huge repo can raise the ceiling.
@@ -133,6 +220,8 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
     // recognized language, so byte ceilings are enforced by `discover_all_files`
     // (the full-load entry point that has file sizes from the walk metadata).
     let limits = DiscoveryLimits::from_env();
+    // Repo-root build-dir child designated by CARGO_TARGET_DIR, resolved once.
+    let target_dir_child = cargo_target_dir_root_child(&root);
     let mut files: Vec<DiscoveredFile> = Vec::new();
     for entry_result in WalkBuilder::new(&root).build() {
         let Ok(entry) = entry_result else { continue };
@@ -158,6 +247,15 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
         };
         // Normalize backslashes to forward slashes
         let relative_path = relative.to_string_lossy().replace('\\', "/");
+
+        // Repo-independent skip for Cargo build dirs at the REPO ROOT level
+        // (`target`, `target-wsl`, `CARGO_TARGET_DIR`, …). `/target` is usually
+        // gitignored, but variant build dirs often are not, so do not rely on
+        // each user's `.gitignore`. Nested source dirs like `src/target/` are
+        // unaffected because only the first path component is inspected.
+        if is_under_repo_root_build_dir(&relative_path, target_dir_child.as_deref()) {
+            continue;
+        }
 
         // Refuse BEFORE growing the set past the ceiling, so a huge tree returns
         // a graceful error rather than collecting an unbounded path vector.
@@ -204,6 +302,8 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     // refusing the moment either ceiling is crossed — before the unbounded
     // path/byte set is handed to the in-memory index build.
     let limits = DiscoveryLimits::from_env();
+    // Repo-root build-dir child designated by CARGO_TARGET_DIR, resolved once.
+    let target_dir_child = cargo_target_dir_root_child(&root);
     let mut total_bytes: u64 = 0;
     let mut entries: Vec<DiscoveredEntry> = Vec::new();
     for entry_result in WalkBuilder::new(&root).build() {
@@ -228,6 +328,15 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
             continue;
         };
         let relative_path = relative.to_string_lossy().replace('\\', "/");
+
+        // Repo-independent skip for Cargo build dirs at the REPO ROOT level
+        // (`target`, `target-wsl`, `CARGO_TARGET_DIR`, …), independent of each
+        // user's `.gitignore`. Skipping before the size/byte accounting keeps
+        // build output from counting against the discovery ceilings. Nested
+        // source dirs like `src/target/` are unaffected (first component only).
+        if is_under_repo_root_build_dir(&relative_path, target_dir_child.as_deref()) {
+            continue;
+        }
 
         // Attempt language detection; None for unknown/denylisted extensions.
         let language = path
@@ -800,6 +909,125 @@ mod tests {
                 .is_generated,
             "generated path should set is_generated"
         );
+    }
+
+    // ── repo-root Cargo build-dir skip (X6) ──
+    //
+    // Build dirs at the repo root (`target`, `target-wsl`, `CARGO_TARGET_DIR`)
+    // must be skipped independently of `.gitignore`, while normal source and a
+    // legitimately-named non-build dir stay indexed. The skip inspects only the
+    // first path component, so a nested `src/target/` source dir is preserved.
+    mod cargo_build_dir_skip {
+        use super::*;
+
+        #[test]
+        fn build_dir_name_matcher_classifies_correctly() {
+            // Matches: bare `target` and `target-<alnum/underscore suffix>`.
+            assert!(is_cargo_build_dir_name("target"));
+            assert!(is_cargo_build_dir_name("target-wsl"));
+            assert!(is_cargo_build_dir_name("target-debug"));
+            assert!(is_cargo_build_dir_name("target-x86_64"));
+            assert!(is_cargo_build_dir_name("target-CI_2"));
+            // Non-matches: lookalikes that are legitimate source dir names.
+            assert!(!is_cargo_build_dir_name("targets"));
+            assert!(!is_cargo_build_dir_name("target_dir"));
+            assert!(!is_cargo_build_dir_name("target-"));
+            assert!(!is_cargo_build_dir_name("target-foo/bar"));
+            assert!(!is_cargo_build_dir_name("my-target"));
+            assert!(!is_cargo_build_dir_name("src"));
+        }
+
+        #[test]
+        fn under_repo_root_build_dir_only_matches_root_child() {
+            // Root-level build dirs are skipped.
+            assert!(is_under_repo_root_build_dir("target/debug/foo.rs", None));
+            assert!(is_under_repo_root_build_dir(
+                "target-wsl/release/x.rs",
+                None
+            ));
+            // A nested source dir literally named `target` is NOT skipped.
+            assert!(!is_under_repo_root_build_dir("src/target/mod.rs", None));
+            // A root-level FILE (no separator) is not a build dir.
+            assert!(!is_under_repo_root_build_dir("target", None));
+            // Normal source is untouched.
+            assert!(!is_under_repo_root_build_dir("src/lib.rs", None));
+            // CARGO_TARGET_DIR child is skipped when supplied.
+            assert!(is_under_repo_root_build_dir(
+                "build-out/app.rs",
+                Some("build-out")
+            ));
+            assert!(!is_under_repo_root_build_dir(
+                "src/build-out/app.rs",
+                Some("build-out")
+            ));
+        }
+
+        #[test]
+        fn discover_files_skips_target_wsl_keeps_source() {
+            let tmp = TempDir::new().unwrap();
+            // A build-dir variant that is NOT gitignored here.
+            create_file(
+                tmp.path(),
+                "target-wsl/debug/build_artifact.rs",
+                "fn a() {}",
+            );
+            // Bare `target` build dir.
+            create_file(tmp.path(), "target/debug/other.rs", "fn b() {}");
+            // Normal source MUST be indexed.
+            create_file(tmp.path(), "src/lib.rs", "pub fn lib() {}");
+            // A legitimately-named non-build dir must NOT be over-skipped.
+            create_file(tmp.path(), "targets/config.rs", "fn cfg() {}");
+            // A nested source dir literally named `target` must be preserved.
+            create_file(tmp.path(), "src/target/mod.rs", "fn nested() {}");
+
+            let files = discover_files(tmp.path()).unwrap();
+            let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+
+            assert!(
+                !paths.contains(&"target-wsl/debug/build_artifact.rs"),
+                "target-wsl/ build output must be skipped: {paths:?}"
+            );
+            assert!(
+                !paths.contains(&"target/debug/other.rs"),
+                "target/ build output must be skipped: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/lib.rs"),
+                "normal source must be indexed: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"targets/config.rs"),
+                "non-build dir `targets/` must not be over-skipped: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/target/mod.rs"),
+                "nested source dir `src/target/` must be preserved: {paths:?}"
+            );
+        }
+
+        #[test]
+        fn discover_all_files_skips_target_wsl_keeps_source() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "target-wsl/debug/artifact.rs", "fn a() {}");
+            create_file(tmp.path(), "src/main.rs", "fn main() {}");
+            create_file(tmp.path(), "targets/x.rs", "fn x() {}");
+
+            let entries = discover_all_files(tmp.path()).unwrap();
+            let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+            assert!(
+                !paths.contains(&"target-wsl/debug/artifact.rs"),
+                "target-wsl/ build output must be skipped in full discovery: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/main.rs"),
+                "normal source must be discovered: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"targets/x.rs"),
+                "non-build dir `targets/` must not be over-skipped: {paths:?}"
+            );
+        }
     }
 
     #[test]
