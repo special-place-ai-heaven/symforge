@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 use symforge::cli::InitClient;
 use symforge::cli::init::{
     merge_hooks_into_settings, register_codex_mcp_server, register_kilo_mcp_server,

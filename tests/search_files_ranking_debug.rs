@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! Call-time ranking diagnostics coverage for `search_files(debug_ranking=true)`.
 
 use std::fs;

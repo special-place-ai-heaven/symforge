@@ -1,3 +1,8 @@
+// Server-only integration test: exercises `symforge::protocol`, which is
+// `#[cfg(feature = "server")]`. Gating the whole file keeps
+// `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 use serde_json::{Map, Value};
 use symforge::protocol::SymForgeServer;
 

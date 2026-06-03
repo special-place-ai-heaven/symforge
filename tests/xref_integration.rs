@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 /// Integration tests for end-to-end cross-reference extraction.
 ///
 /// Covers XREF-01 through XREF-08, TOOL-09, TOOL-10, TOOL-11.

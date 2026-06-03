@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! Golden-file contract tests for the sidecar HTTP surface.
 //!
 //! Every sidecar endpoint is a published contract consumed by hooks in user

@@ -3004,6 +3004,16 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_repo_map", &params.0).await {
             return result;
         }
+        // Single loading guard covering EVERY local path (estimate, compact, and
+        // the `full`/`tree` outline branches), consistent with how
+        // `search_symbols`/`search_text` guard at the top. Without this, an
+        // outline-only call on an empty/unloaded index could fall through to a
+        // bare empty map instead of the "index still loading / run index_folder"
+        // guidance. The per-branch guards below remain as harmless redundancy.
+        {
+            let guard = self.index.read();
+            loading_guard!(guard);
+        }
         if params.0.estimate == Some(true) {
             let guard = self.index.read();
             loading_guard!(guard);
@@ -5163,8 +5173,12 @@ impl SymForgeServer {
     #[tool(
         description = "Reindex a directory from scratch — replaces the current index, restarts watcher, triggers git temporal analysis. Use when switching projects. Destructive to current index. NOT for re-reading a single changed file (use analyze_file_impact). NOT for reading content from an existing index (use get_file_content).",
         annotations(
+            // Destructive: replaces the active index (discards current contents),
+            // matching the description. Also idempotent: re-running with the same
+            // path converges to the same index. Destructive + idempotent are
+            // independent MCP hints, so both are honestly true here.
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -5709,6 +5723,14 @@ impl SymForgeServer {
                 if let Some(root) = self.capture_repo_root() {
                     let canon_path = match edit::safe_repo_path(&root, &input.path) {
                         Ok(p) => p,
+                        // Distinguish a containment violation (path escapes the
+                        // repo root, e.g. `../../../etc/passwd`) from a genuine
+                        // in-repo miss. `safe_repo_path` reports the former with
+                        // an "outside the repository" message; surface that
+                        // explicitly instead of a misleading "File not found".
+                        Err(message) if message.contains("outside the repository") => {
+                            return format::path_outside_repo(&input.path);
+                        }
                         Err(_) => return format::not_found_file(&input.path),
                     };
                     if canon_path.is_file() {
@@ -6068,6 +6090,29 @@ impl SymForgeServer {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn find_dependents(&self, params: Parameters<FindDependentsInput>) -> String {
+        // Symbol-shaped misuse guard: `find_dependents` answers a FILE-level
+        // question ("what imports this file?"). A caller passing a `name`
+        // alongside `path` wants symbol-level callers and would otherwise get a
+        // file-level import graph that reads like symbol callers. Redirect
+        // explicitly to `find_references` instead of silently returning the
+        // wrong shape. Pure input validation — runs before proxy/index access so
+        // it is identical in local and daemon-proxied modes.
+        if let Some(name) = params
+            .0
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            return format!(
+                "find_dependents is file-level only (it lists files that import \"{path}\"). \
+                 You supplied name=\"{name}\", which is a symbol-level query. \
+                 Use find_references(name=\"{name}\") for who calls/uses that symbol, \
+                 or call find_dependents with only path=\"{path}\" for the file dependency graph.",
+                path = params.0.path,
+                name = name,
+            );
+        }
         if let Some(result) = self.proxy_tool_call("find_dependents", &params.0).await {
             return result;
         }
@@ -7430,6 +7475,7 @@ impl SymForgeServer {
             smart_query::QueryIntent::FindDependents { target } => {
                 let input = FindDependentsInput {
                     path: target.clone(),
+                    name: None,
                     limit: None,
                     max_per_file: None,
                     format: None,
@@ -8196,6 +8242,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_repo_map_outline_on_empty_index_returns_guard_message() {
+        // The outline (`detail="full"`) path must surface the empty-index
+        // guidance rather than a bare empty map. Regression for X4: previously
+        // only some branches guarded, so an outline-only call on an empty/
+        // unloaded index could fall through to an empty result.
+        let server = make_server(make_live_index_empty());
+        let result = server
+            .get_repo_map(Parameters(super::GetRepoMapInput {
+                detail: Some("full".to_string()),
+                path: None,
+                depth: None,
+                max_files: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert_eq!(
+            result,
+            crate::protocol::format::empty_guard_message(),
+            "empty index get_repo_map(detail=full) must return the guard message, got: {result}"
+        );
+
+        // The `tree` outline branch must guard identically.
+        let tree_result = server
+            .get_repo_map(Parameters(super::GetRepoMapInput {
+                detail: Some("tree".to_string()),
+                path: None,
+                depth: None,
+                max_files: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert_eq!(
+            tree_result,
+            crate::protocol::format::empty_guard_message(),
+            "empty index get_repo_map(detail=tree) must return the guard message, got: {tree_result}"
+        );
+
+        // And the default compact branch.
+        let compact_result = server
+            .get_repo_map(Parameters(super::GetRepoMapInput {
+                detail: None,
+                path: None,
+                depth: None,
+                max_files: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert_eq!(
+            compact_result,
+            crate::protocol::format::empty_guard_message(),
+            "empty index get_repo_map(compact) must return the guard message, got: {compact_result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_loading_guard_circuit_breaker_returns_degraded_message() {
         let server = make_server(make_live_index_tripped());
         let result = server
@@ -8599,6 +8703,50 @@ mod tests {
         assert!(
             !result.contains("Symbols extracted: 0"),
             "validator should report recovered symbols for malformed TOML; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_outside_root_returns_explicit_error() {
+        // L2: a path that escapes the repo root must yield an explicit
+        // "outside the repository root" error, not a misleading generic
+        // "File not found". A normal in-repo path is unaffected.
+        let repo = TempDir::new().expect("temp repo");
+        fs::write(repo.path().join("real.txt"), b"hello world\n").expect("write in-repo file");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let escaped = server
+            .get_file_content(Parameters(get_file_content_input("../../../etc/passwd")))
+            .await;
+        assert!(
+            escaped.contains("outside the repository root"),
+            "traversal path must report a containment violation; got: {escaped}"
+        );
+        assert!(
+            !escaped.starts_with("File not found"),
+            "traversal path must NOT be reported as a generic miss; got: {escaped}"
+        );
+
+        // A genuine in-repo file (not in the index) still reads from disk fine.
+        let ok = server
+            .get_file_content(Parameters(get_file_content_input("real.txt")))
+            .await;
+        assert!(
+            ok.contains("hello world"),
+            "normal in-repo path must still be read; got: {ok}"
+        );
+
+        // A genuine in-repo but missing path still reports a normal not-found,
+        // NOT an outside-root error.
+        let missing = server
+            .get_file_content(Parameters(get_file_content_input("does_not_exist.txt")))
+            .await;
+        assert!(
+            !missing.contains("outside the repository root"),
+            "an in-repo missing file must not be misreported as outside-root; got: {missing}"
         );
     }
 
@@ -16756,6 +16904,7 @@ mod tests {
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
                 path: "src/lib.rs".to_string(),
+                name: None,
                 limit: None,
                 max_per_file: None,
                 format: None,
@@ -17044,6 +17193,7 @@ mod tests {
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
                 path: "src/nonexistent.rs".to_string(),
+                name: None,
                 limit: None,
                 max_per_file: None,
                 format: None,
@@ -17057,6 +17207,66 @@ mod tests {
             "got: {result}"
         );
         assert!(result.contains("find_references"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_find_dependents_symbol_shaped_query_redirects_to_find_references() {
+        // L1: passing a `name` alongside `path` is a symbol-level query. The
+        // handler must redirect to find_references rather than silently return a
+        // file-level import graph that reads like symbol callers.
+        let server = make_server(make_live_index_ready(vec![]));
+        let result = server
+            .find_dependents(Parameters(super::FindDependentsInput {
+                path: "src/lib.rs".to_string(),
+                name: Some("my_symbol".to_string()),
+                limit: None,
+                max_per_file: None,
+                format: None,
+                compact: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("file-level only"),
+            "redirect must explain find_dependents is file-level, got: {result}"
+        );
+        assert!(
+            result.contains("find_references(name=\"my_symbol\")"),
+            "redirect must point at find_references for the symbol, got: {result}"
+        );
+        // Must NOT have produced a file-dependency graph header.
+        assert!(
+            !result.contains("No file-level dependents found"),
+            "symbol-shaped call must not fall through to the file graph, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_dependents_blank_name_still_runs_file_graph() {
+        // A blank/whitespace `name` is not a real symbol query — the file-level
+        // path must still run normally rather than redirecting.
+        let server = make_server(make_live_index_ready(vec![]));
+        let result = server
+            .find_dependents(Parameters(super::FindDependentsInput {
+                path: "src/nonexistent.rs".to_string(),
+                name: Some("   ".to_string()),
+                limit: None,
+                max_per_file: None,
+                format: None,
+                compact: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            !result.contains("file-level only"),
+            "blank name must not trigger the symbol redirect, got: {result}"
+        );
+        assert!(
+            result.contains("No file-level dependents found"),
+            "blank name must still run the file-level graph, got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -17084,6 +17294,7 @@ mod tests {
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
                 path: "src/target.rs".to_string(),
+                name: None,
                 compact: None,
                 format: Some("mermaid".to_string()),
                 limit: None,
@@ -17135,6 +17346,7 @@ mod tests {
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
                 path: "src/target.rs".to_string(),
+                name: None,
                 compact: None,
                 format: None,
                 limit: None,
@@ -17187,6 +17399,7 @@ mod tests {
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
                 path: "src/target.rs".to_string(),
+                name: None,
                 compact: None,
                 format: None,
                 limit: None,

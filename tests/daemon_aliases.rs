@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! Pins every backward-compat alias in `src/daemon.rs::execute_tool_call`.
 //!
 //! Aliases are deliberate compatibility routes for clients that learned an old

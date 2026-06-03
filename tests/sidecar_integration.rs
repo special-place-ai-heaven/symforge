@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 /// Integration tests for the HTTP sidecar and hook infrastructure.
 ///
 /// Proves HOOK-01 (sidecar binds ephemeral port, port file written, endpoints respond),

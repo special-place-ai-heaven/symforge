@@ -2583,6 +2583,18 @@ pub fn not_found_file(path: &str) -> String {
     format!("File not found: {path}")
 }
 
+/// Explicit "outside the repository root" error for a path that escapes the
+/// indexed repo (e.g. `../../../etc/passwd`). Distinct from `not_found_file` so a
+/// traversal attempt is reported as a containment violation rather than a
+/// misleading generic miss.
+pub fn path_outside_repo(path: &str) -> String {
+    format!(
+        "Path is outside the repository root: {path}. \
+         get_file_content only reads files within the indexed repository; \
+         supply a repo-relative path."
+    )
+}
+
 /// Richer "file not found" with suggested similar paths.
 /// Call this from tool handlers where the index is available.
 pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {

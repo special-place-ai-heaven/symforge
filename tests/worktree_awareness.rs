@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! Worktree-awareness acceptance tests (TDD red state).
 //!
 //! Mirrors §4 of the spec at `wiki/concepts/SymForge Worktree Awareness.md`

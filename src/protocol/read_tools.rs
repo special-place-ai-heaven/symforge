@@ -381,6 +381,13 @@ pub(crate) struct ValidateFileSyntaxInput {
 pub struct FindDependentsInput {
     /// Relative file path to find dependents for.
     pub path: String,
+    /// Symbol name. NOT a valid parameter for file-level dependents — present
+    /// only to detect a symbol-shaped misuse: if you pass `name` (symbol-level)
+    /// alongside `path`, the handler returns an explicit redirect to
+    /// `find_references`, which answers "who calls this symbol?". Leave unset for
+    /// the file-level dependency graph ("what imports this file?").
+    #[serde(default)]
+    pub name: Option<String>,
     /// Maximum number of dependent files to show (default 20, capped at 100).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,

@@ -1,3 +1,8 @@
+// Server-only integration test: depends on a `#[cfg(feature = "server")]`
+// module (protocol/daemon/cli/sidecar/watcher/analytics). Gating the whole
+// file keeps `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! End-to-end conformance suite — verifies every MCP tool is registered,
 //! schema-valid, deserializable, and that the tool surface matches the
 //! canonical allowlist.
@@ -560,7 +565,13 @@ fn all_tools_have_annotations() {
 
     const ADDITIVE_WRITE: &[&str] = &["insert_symbol", "edit_within_symbol", "batch_insert"];
 
-    const IDEMPOTENT_STATE: &[&str] = &["checkpoint_now", "index_folder", "analyze_file_impact"];
+    const IDEMPOTENT_STATE: &[&str] = &["checkpoint_now", "analyze_file_impact"];
+
+    // Destructive AND idempotent: `index_folder` replaces the active index
+    // (destructive) yet converges to the same result on re-run (idempotent).
+    // Both MCP hints are independent and honestly true, so it gets its own
+    // bucket rather than being mislabeled non-destructive.
+    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["index_folder"];
 
     let tools = SymForgeServer::tool_definitions();
 
@@ -608,14 +619,33 @@ fn all_tools_have_annotations() {
                 "idempotent tool '{name}'"
             );
             assert_eq!(ann.idempotent_hint, Some(true), "idempotent tool '{name}'");
+        } else if DESTRUCTIVE_IDEMPOTENT_STATE.contains(&name) {
+            assert_eq!(
+                ann.read_only_hint,
+                Some(false),
+                "destructive-idempotent tool '{name}'"
+            );
+            assert_eq!(
+                ann.destructive_hint,
+                Some(true),
+                "destructive-idempotent tool '{name}' must advertise destructive_hint = true"
+            );
+            assert_eq!(
+                ann.idempotent_hint,
+                Some(true),
+                "destructive-idempotent tool '{name}' must advertise idempotent_hint = true"
+            );
         } else {
             panic!("tool '{name}' is not in any annotation classification list");
         }
     }
 
     // Verify total coverage matches expected count
-    let classified =
-        READ_ONLY.len() + DESTRUCTIVE_WRITE.len() + ADDITIVE_WRITE.len() + IDEMPOTENT_STATE.len();
+    let classified = READ_ONLY.len()
+        + DESTRUCTIVE_WRITE.len()
+        + ADDITIVE_WRITE.len()
+        + IDEMPOTENT_STATE.len()
+        + DESTRUCTIVE_IDEMPOTENT_STATE.len();
     assert_eq!(
         classified,
         EXPECTED_TOOLS.len(),
