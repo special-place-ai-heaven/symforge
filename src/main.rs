@@ -260,7 +260,7 @@ async fn run_local_mcp_server_async(
                 .map(|(k, v)| (k.clone(), v.mtime_secs))
                 .collect();
 
-            let live = persist::snapshot_to_live_index(snapshot);
+            let live = persist::snapshot_to_live_index(snapshot, &root);
             tracing::info!(
                 files = file_count,
                 load_source = ?live.load_source(),
@@ -457,6 +457,7 @@ mod tests {
             is_empty: false,
             tier_counts: (0, 0, 0),
             local_empty_reason: None,
+            indexed_root: None,
         }
     }
 

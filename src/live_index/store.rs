@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -19,6 +19,26 @@ use crate::domain::{
     SymbolRecord, find_enclosing_symbol,
 };
 use crate::{discovery, parsing};
+
+/// Normalize a filesystem root into a stable comparison key.
+///
+/// Used to record the root an in-memory index was built from
+/// ([`LiveIndex::indexed_root`]) and to compare it against the current target
+/// root in `SymForgeServer::ensure_local_index`, so a changed project root
+/// always invalidates a stale index regardless of `\\?\` UNC prefixes,
+/// trailing separators, or path-separator/case differences.
+///
+/// Both sides of any root comparison MUST flow through this single helper so
+/// the steady-state path (same project, repeated calls) never reloads on a
+/// cosmetic path difference. We delegate to `dunce::canonicalize`, which on
+/// Windows strips the extended-length `\\?\` prefix and normalizes separators
+/// while resolving symlinks; on non-Windows it falls back to
+/// `std::fs::canonicalize`. When canonicalization fails (e.g. the path does not
+/// exist on disk — common in unit tests), we fall back to the input path so the
+/// comparison still works as a literal, normalized-once key.
+pub(crate) fn normalize_root(root: &Path) -> PathBuf {
+    dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
 
 #[cfg(windows)]
 const INDEXING_THREAD_STACK_SIZE_ENV: &str = "SYMFORGE_INDEXING_THREAD_STACK_BYTES";
@@ -537,6 +557,12 @@ pub struct PublishedIndexState {
     /// Reason the index is empty at startup (LocalEmpty branch). Surfaced as
     /// a banner in `health` output. `None` when the index has files.
     pub local_empty_reason: Option<String>,
+    /// Normalized filesystem root the published index was built from. `None`
+    /// for an empty bootstrap index. Read by `SymForgeServer::ensure_local_index`
+    /// to detect a project switch (root mismatch) and force a fresh reload, so
+    /// no caller must remember to call `reset_to_empty` to avoid serving a stale
+    /// project. Always populated via [`normalize_root`] for stable comparison.
+    pub indexed_root: Option<PathBuf>,
 }
 
 /// The in-memory index: file contents and parsed symbols for all discovered files.
@@ -577,6 +603,14 @@ pub struct LiveIndex {
     /// the startup-plan branch; surfaced in `health` output as an actionable
     /// banner. `None` when the index has files or after a reload.
     pub(crate) local_empty_reason: Arc<parking_lot::RwLock<Option<String>>>,
+    /// Normalized filesystem root this index was built from, recorded so a
+    /// changed target root can invalidate a stale in-memory index without any
+    /// caller having to remember to call `reset_to_empty`. `None` for an empty
+    /// bootstrap index (no root has been loaded yet). Populated via
+    /// [`normalize_root`] on full load and reload so comparisons are stable
+    /// across `\\?\` prefixes, trailing separators, and separator/case
+    /// differences. See `SymForgeServer::ensure_local_index`.
+    pub(crate) indexed_root: Option<PathBuf>,
 }
 
 /// Lightweight snapshot of a symbol for pre-update diffing in `analyze_file_impact`.
@@ -1146,6 +1180,7 @@ impl PublishedIndexState {
             is_empty: index.is_empty,
             tier_counts: stats.tier_counts,
             local_empty_reason: stats.local_empty_reason,
+            indexed_root: index.indexed_root.clone(),
         }
     }
 
@@ -1202,6 +1237,10 @@ pub(crate) struct ReloadData {
     pub derived: DerivedIndices,
     pub skipped_files: Vec<SkippedFile>,
     pub coupling_store: Option<Arc<super::coupling::CouplingStore>>,
+    /// Normalized root this reload was built from. Carried through so
+    /// `apply_reload_data` can record it on the live index (root-mismatch
+    /// invalidation in `ensure_local_index`).
+    pub indexed_root: PathBuf,
 }
 
 /// Build a reverse index from a file map (standalone, no `&self` needed).
@@ -1551,6 +1590,9 @@ impl LiveIndex {
             skipped_files,
             coupling_store,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            // Record the normalized root this fresh index was built from so a
+            // later project switch invalidates it (root-mismatch reload).
+            indexed_root: Some(normalize_root(root)),
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -1588,6 +1630,10 @@ impl LiveIndex {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            // An empty bootstrap index has no root: any non-empty target root
+            // is therefore a mismatch, which is the desired behaviour (the next
+            // local fallback reloads from the current root).
+            indexed_root: None,
         }
     }
 
@@ -1744,6 +1790,9 @@ impl LiveIndex {
             // will show 0 for Tier 2/3 after reload.
             skipped_files: Vec::new(),
             coupling_store: super::coupling::init_coupling_store(root),
+            // Record the normalized root so the reloaded index advertises which
+            // project it now serves (root-mismatch invalidation).
+            indexed_root: normalize_root(root),
         })
     }
 
@@ -1766,6 +1815,7 @@ impl LiveIndex {
         self.gitignore = data.gitignore;
         self.skipped_files = data.skipped_files;
         self.coupling_store = data.coupling_store;
+        self.indexed_root = Some(data.indexed_root);
     }
 
     /// Replaces all files, resets circuit breaker, and updates timestamps.
@@ -2910,6 +2960,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         }
     }
 

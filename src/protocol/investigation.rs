@@ -392,6 +392,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_path_indices();
         index

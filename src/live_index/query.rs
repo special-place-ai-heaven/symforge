@@ -2580,6 +2580,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         // Rebuild the reverse index so xref query tests work.
         index.rebuild_reverse_index();
@@ -3958,6 +3959,7 @@ impl Actor for MyActor {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         assert!(!index.is_ready());
     }
@@ -3996,6 +3998,7 @@ impl Actor for MyActor {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
 
         match index.index_state() {

@@ -422,18 +422,47 @@ impl SymForgeServer {
     /// Lazily initialize the local index when the daemon is unreachable.
     /// Uses `SharedIndexHandle::reload` to populate the empty in-process index
     /// from disk, enabling graceful degradation to local-only mode.
+    ///
+    /// Root-mismatch invalidation: the early return fires only when the index is
+    /// non-empty AND was built from the SAME root we are now targeting. If the
+    /// target `repo_root` changed (a project switch via any `set_repo_root`
+    /// caller) the recorded root no longer matches, so we fall through and
+    /// reload from the current root instead of serving the previous project.
+    /// This closes the stale-project class structurally — no caller has to
+    /// remember to call `reset_to_empty` for correctness (that path still works
+    /// and remains as defense in depth). Both roots are normalized via the same
+    /// [`normalize_root`](crate::live_index::store::normalize_root) helper so the
+    /// steady state (same project, repeated calls) never reloads on a cosmetic
+    /// `\\?\` / trailing-slash / separator / case difference.
     async fn ensure_local_index(&self) {
         {
             let mut watcher = self.watcher_info.lock();
             *watcher = WatcherInfo::detached_local_fallback();
         }
 
-        // If the index already has files, nothing to do.
-        if self.index.published_state().file_count > 0 {
-            return;
+        let repo_root = self.capture_repo_root();
+
+        // Early return only when the index is non-empty AND its recorded root
+        // matches the current target root (normalized compare). A non-empty
+        // index built from a different root is stale: fall through to reload.
+        let published = self.index.published_state();
+        if published.file_count > 0 {
+            let target_root = repo_root
+                .as_deref()
+                .map(crate::live_index::store::normalize_root);
+            match (&published.indexed_root, &target_root) {
+                // Same project: serve the loaded index, no reload.
+                (Some(indexed), Some(target)) if indexed == target => return,
+                // No target root to compare against (cannot do better than the
+                // already-loaded index): keep serving it rather than dropping to
+                // an empty index we cannot repopulate.
+                (_, None) => return,
+                // Root mismatch (or an index with no recorded root): stale —
+                // fall through and reload from the current target root.
+                _ => {}
+            }
         }
 
-        let repo_root = self.capture_repo_root();
         if let Some(root) = repo_root {
             tracing::info!(
                 root = %root.display(),
@@ -711,6 +740,118 @@ mod tests {
         assert!(
             !server.daemon_degraded.load(Ordering::Relaxed),
             "successful proxy call should clear daemon_degraded"
+        );
+    }
+
+    // ── ensure_local_index: root-mismatch invalidation (M2) ──────────────────
+
+    /// Build a local-mode server (no daemon proxy) starting from an empty index,
+    /// targeting `repo_root`. Mirrors the production `SymForgeServer::new` wiring
+    /// used by the local stdio path.
+    fn make_local_server(repo_root: Option<std::path::PathBuf>) -> SymForgeServer {
+        let index = crate::live_index::LiveIndex::empty();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        SymForgeServer::new(
+            index,
+            "test_project".to_string(),
+            watcher_info,
+            repo_root,
+            None,
+        )
+    }
+
+    /// Write a single `.rs` file under `dir` so a real local reload produces a
+    /// non-empty index whose contents identify the project.
+    fn seed_project(dir: &std::path::Path, file_name: &str, body: &str) {
+        std::fs::write(dir.join(file_name), body).expect("seed project source file");
+    }
+
+    /// Core M2 regression: a changed `repo_root` (WITHOUT `reset_to_empty`) must
+    /// force `ensure_local_index` to reload the new root instead of serving the
+    /// previous project. Fails without the root-mismatch guard.
+    #[tokio::test]
+    async fn ensure_local_index_reloads_on_root_mismatch_without_reset() {
+        let dir_a = tempfile::TempDir::new().expect("temp dir A");
+        let dir_b = tempfile::TempDir::new().expect("temp dir B");
+        seed_project(dir_a.path(), "alpha.rs", "fn alpha_only() {}\n");
+        seed_project(dir_b.path(), "beta.rs", "fn beta_only() {}\n");
+
+        // 1. Load project A.
+        let server = make_local_server(Some(dir_a.path().to_path_buf()));
+        server.ensure_local_index().await;
+
+        let published_a = server.index.published_state();
+        assert!(
+            published_a.file_count > 0,
+            "project A should have loaded a non-empty index"
+        );
+        assert_eq!(
+            published_a.indexed_root.as_deref(),
+            Some(crate::live_index::store::normalize_root(dir_a.path()).as_path()),
+            "loaded index must record project A's normalized root"
+        );
+        assert!(
+            server.index.read().get_file("alpha.rs").is_some(),
+            "project A's file should be present after the first load"
+        );
+
+        // 2. Switch the target root to B WITHOUT calling reset_to_empty.
+        server.set_repo_root(Some(dir_b.path().to_path_buf()));
+
+        // 3. The next ensure_local_index must detect the root mismatch and reload B.
+        server.ensure_local_index().await;
+
+        let published_b = server.index.published_state();
+        assert_eq!(
+            published_b.indexed_root.as_deref(),
+            Some(crate::live_index::store::normalize_root(dir_b.path()).as_path()),
+            "after a root switch, ensure_local_index must serve project B's root"
+        );
+        assert!(
+            server.index.read().get_file("beta.rs").is_some(),
+            "project B's file must be present after the root-mismatch reload"
+        );
+        assert!(
+            server.index.read().get_file("alpha.rs").is_none(),
+            "project A's stale file must be gone after switching to project B"
+        );
+    }
+
+    /// Steady-state guard: repeated `ensure_local_index` calls against the SAME
+    /// root must NOT rebuild the index. A spurious reload bumps the project
+    /// generation, so an unchanged generation (and unchanged recorded root)
+    /// proves no reload occurred — verifying normalization makes the common path
+    /// cheap rather than reloading on every call.
+    #[tokio::test]
+    async fn ensure_local_index_does_not_reload_on_repeated_same_root_calls() {
+        let dir_a = tempfile::TempDir::new().expect("temp dir A");
+        seed_project(dir_a.path(), "alpha.rs", "fn alpha_only() {}\n");
+
+        let server = make_local_server(Some(dir_a.path().to_path_buf()));
+
+        // First call performs the one and only load.
+        server.ensure_local_index().await;
+        let gen_after_first = server.index.current_project_generation();
+        let root_after_first = server.index.published_state().indexed_root.clone();
+        assert!(
+            server.index.published_state().file_count > 0,
+            "first ensure_local_index call should have loaded project A"
+        );
+
+        // Repeated calls with the same root must be no-ops (no reload).
+        for _ in 0..3 {
+            server.ensure_local_index().await;
+        }
+
+        assert_eq!(
+            server.index.current_project_generation(),
+            gen_after_first,
+            "repeated same-root ensure_local_index calls must not reload (project generation must not change)"
+        );
+        assert_eq!(
+            server.index.published_state().indexed_root,
+            root_after_first,
+            "repeated same-root calls must leave the recorded root unchanged"
         );
     }
 }

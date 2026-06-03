@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use crate::domain::{FileClassification, LanguageId, ReferenceRecord, SymbolRecord};
 use crate::live_index::store::{
     CircuitBreakerState, IndexLoadSource, IndexedFile, LiveIndex, ParseStatus, SnapshotVerifyState,
+    normalize_root,
 };
 use crate::paths;
 
@@ -374,7 +375,14 @@ pub fn load_snapshot(project_root: &Path) -> Option<IndexSnapshot> {
     Some(snapshot)
 }
 
-pub fn snapshot_to_live_index(snapshot: IndexSnapshot) -> LiveIndex {
+/// Rehydrate a `LiveIndex` from a persisted snapshot.
+///
+/// `project_root` is the filesystem root the snapshot was taken from; it is
+/// recorded as the index's normalized `indexed_root` so a later project switch
+/// triggers a root-mismatch reload (see `SymForgeServer::ensure_local_index`).
+/// The snapshot wire format itself does not carry the root, so the caller
+/// supplies it — the same root passed to [`load_snapshot`].
+pub fn snapshot_to_live_index(snapshot: IndexSnapshot, project_root: &Path) -> LiveIndex {
     let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::with_capacity(snapshot.files.len());
 
     for (path, snap_file) in snapshot.files {
@@ -414,6 +422,9 @@ pub fn snapshot_to_live_index(snapshot: IndexSnapshot) -> LiveIndex {
         skipped_files: Vec::new(),
         coupling_store: None,
         local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+        // A snapshot-restored index serves a real project; record its root so a
+        // project switch invalidates it the same way a freshly loaded one does.
+        indexed_root: Some(normalize_root(project_root)),
     };
     index.rebuild_reverse_index();
     index.rebuild_path_indices();
@@ -889,6 +900,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -909,7 +921,7 @@ mod tests {
 
         // Load
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
 
         // Verify
         assert_eq!(loaded.files.len(), 1);
@@ -941,7 +953,7 @@ mod tests {
         serialize_index(&index, tmp.path()).expect("serialize should succeed");
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let file = loaded
             .files
             .get("tests/generated/main.generated.rs")
@@ -960,7 +972,7 @@ mod tests {
         serialize_index(&index, tmp.path()).expect("serialize empty index should succeed");
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
 
         assert_eq!(loaded.files.len(), 0);
     }
@@ -972,7 +984,7 @@ mod tests {
 
         serialize_index(&index, tmp.path()).expect("serialize should succeed");
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
 
         assert_eq!(loaded.load_source(), IndexLoadSource::SnapshotRestore);
         assert_eq!(loaded.snapshot_verify_state(), SnapshotVerifyState::Pending);
@@ -994,7 +1006,7 @@ mod tests {
             .iter()
             .map(|(path, file)| (path.clone(), file.mtime_secs))
             .collect::<HashMap<_, _>>();
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
         {
@@ -1048,7 +1060,7 @@ mod tests {
             .iter()
             .map(|(path, file)| (path.clone(), file.mtime_secs))
             .collect::<HashMap<_, _>>();
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
         let before = shared.published_state();
@@ -1100,7 +1112,7 @@ mod tests {
             .iter()
             .map(|(path, file)| (path.clone(), file.mtime_secs))
             .collect::<HashMap<_, _>>();
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
         let shared = crate::live_index::SharedIndexHandle::shared(loaded);
 
         background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
@@ -1171,7 +1183,7 @@ mod tests {
         serialize_index(&index, tmp.path()).expect("serialize should succeed");
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
 
         assert_eq!(loaded.files.len(), 3);
         assert!(loaded.files.contains_key("a.rs"));
@@ -1277,13 +1289,14 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
 
         serialize_index(&index, tmp.path()).expect("serialize should succeed");
         let snapshot = load_snapshot(tmp.path()).expect("load should succeed");
-        let loaded = snapshot_to_live_index(snapshot);
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
 
         assert_eq!(
             loaded.files.get("ok.rs").unwrap().parse_status,
@@ -1454,6 +1467,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         before.rebuild_reverse_index();
         before.rebuild_path_indices();
@@ -1471,7 +1485,7 @@ mod tests {
         );
 
         let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
-        let after = snapshot_to_live_index(snapshot);
+        let after = snapshot_to_live_index(snapshot, tmp.path());
 
         // ── Query equivalence ────────────────────────────────────────────────
 
@@ -1762,6 +1776,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -1826,6 +1841,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -1898,6 +1914,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
@@ -1954,6 +1971,7 @@ mod tests {
             skipped_files: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
         };
         index.rebuild_reverse_index();
         index.rebuild_path_indices();

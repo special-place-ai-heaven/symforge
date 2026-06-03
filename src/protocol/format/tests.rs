@@ -93,6 +93,7 @@ fn make_index(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         skipped_files: Vec::new(),
         coupling_store: None,
         local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        indexed_root: None,
     };
     index.rebuild_path_indices();
     index
@@ -685,6 +686,7 @@ fn test_health_report_empty_state() {
         skipped_files: Vec::new(),
         coupling_store: None,
         local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        indexed_root: None,
     };
     let result = health_report(&index);
     assert!(result.contains("Status: Empty"), "got: {result}");
@@ -817,6 +819,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         ],
         tier_counts: (4, 0, 0),
         local_empty_reason: None,
+        indexed_root: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -874,6 +877,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        indexed_root: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -1317,6 +1321,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
+        indexed_root: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Active,
@@ -1367,6 +1372,7 @@ mod health_report_consistency {
             is_empty: false,
             tier_counts: (100, 0, 0),
             local_empty_reason: None,
+            indexed_root: None,
         }
     }
 
@@ -1574,6 +1580,7 @@ fn health_renders_rejected_stale_mutations_counter() {
         is_empty: false,
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        indexed_root: None,
     };
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -2277,6 +2284,7 @@ fn make_index_with_reverse(files: Vec<(String, IndexedFile)>) -> LiveIndex {
         skipped_files: Vec::new(),
         coupling_store: None,
         local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+        indexed_root: None,
     };
     index.rebuild_reverse_index();
     index.rebuild_path_indices();
