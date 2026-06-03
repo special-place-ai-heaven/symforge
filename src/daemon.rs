@@ -305,6 +305,7 @@ fn write_daemon_token_file(token: &str) -> io::Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
