@@ -1,5 +1,13 @@
 # Changelog
 
+## [7.18.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.4...v7.18.0) (2026-06-03)
+
+
+### Features
+
+* **launcher:** warn when a different symforge shadows the install on PATH ([c77241b](https://github.com/special-place-ai-heaven/symforge/commit/c77241bcb84752229e0dddf0cc0a7e640ed5b1dc))
+* **shadow:** detect and warn when a PATH shadow hides the installed symforge ([9764d33](https://github.com/special-place-ai-heaven/symforge/commit/9764d33ca36a6feb98731a7e6774860645ba4653))
+
 ## [7.17.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.3...v7.17.4) (2026-06-03)
 
 
