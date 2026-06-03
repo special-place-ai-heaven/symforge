@@ -1,5 +1,17 @@
 # Changelog
 
+## [7.18.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.18.0...v7.18.1) (2026-06-03)
+
+
+### Bug Fixes
+
+* **daemon:** import PermissionsExt for the Unix token-file 0o600 re-assert ([2065dc8](https://github.com/special-place-ai-heaven/symforge/commit/2065dc87ca6e9d8def240070bb628748ef194857))
+* **discovery:** skip Cargo build-dir variants (target-*) from indexing ([d43057b](https://github.com/special-place-ai-heaven/symforge/commit/d43057b9fd44316122ca3a1bf47a1e2a086b6bfb))
+* **hook:** route editor hooks through the daemon when the sidecar is dead ([eec28fe](https://github.com/special-place-ai-heaven/symforge/commit/eec28fe0c4209de1477520ee7b4edc37c4b3acd0))
+* **index:** reload local index on root mismatch to close the stale-project class ([d128b09](https://github.com/special-place-ai-heaven/symforge/commit/d128b093f9b10cc7e3c206ee69edc5b4385614ed))
+* **protocol:** index-state + misuse + honesty fixes; gate server-only tests for embed ([5da24d0](https://github.com/special-place-ai-heaven/symforge/commit/5da24d0de28107242415b3cdb8ac5cc3c7f4a6b5))
+* **security:** harden daemon auth, bound index resources, guard .git fast-path ([188f9cc](https://github.com/special-place-ai-heaven/symforge/commit/188f9cc0a536d3b661b6380e17db115c04db17c2))
+
 ## [7.18.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.4...v7.18.0) (2026-06-03)
 
 
