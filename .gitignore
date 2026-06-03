@@ -1,4 +1,6 @@
 /target
+# Custom CARGO_TARGET_DIR variants (e.g. target-wsl on dual Windows/WSL setups).
+/target-*/
 
 # Root-level tool and harness state directories.
 /.*/
