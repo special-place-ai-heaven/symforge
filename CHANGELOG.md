@@ -1,5 +1,14 @@
 # Changelog
 
+## [7.17.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.2...v7.17.3) (2026-06-03)
+
+
+### Bug Fixes
+
+* **ci:** gate cargo-publish on release validation and make it idempotent ([9277177](https://github.com/special-place-ai-heaven/symforge/commit/92771779972fa36b8d9f8cbfb9e4cbd16601b839))
+* **health:** report the running binary version in every runtime mode ([46d2252](https://github.com/special-place-ai-heaven/symforge/commit/46d2252241b5f5a4023fcb56af755d71736dfaa1))
+* **security:** enforce one sensitive-path guard on every index entrypoint ([83ad311](https://github.com/special-place-ai-heaven/symforge/commit/83ad31151fb1ce40b941efede54e0c81edd498fb))
+
 ## [7.17.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.1...v7.17.2) (2026-06-02)
 
 
