@@ -1,5 +1,12 @@
 # Changelog
 
+## [7.17.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.3...v7.17.4) (2026-06-03)
+
+
+### Bug Fixes
+
+* **update:** actually prune dead registry entries and retired durable bins ([f84fd31](https://github.com/special-place-ai-heaven/symforge/commit/f84fd31d3dfd4b3af1c64fa4bac23731eb222d38))
+
 ## [7.17.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.17.2...v7.17.3) (2026-06-03)
 
 
