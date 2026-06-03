@@ -360,43 +360,111 @@ pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
         eprintln!("[symforge-hook] HTTP GET 127.0.0.1:{port}{request_path}?{query}");
     }
 
+    // Keep a copy of the query so the stale-sidecar daemon fallback below can
+    // re-issue the same enrichment request — `sync_http_get` consumes `query`.
+    let fallback_query = query.clone();
+
     // Step 3/4 — make sync HTTP GET with 50 ms timeout.
-    let body = match sync_http_get(port, &request_path, query) {
-        Ok(b) => b,
+    let (body, outcome) = match sync_http_get(port, &request_path, query) {
+        Ok(b) => {
+            let initial_outcome = if used_daemon_fallback {
+                HookOutcome::DaemonFallback
+            } else {
+                HookOutcome::Routed
+            };
+            (b, initial_outcome)
+        }
         Err(_) => {
-            // Port file existed but HTTP call failed — sidecar is stale.
+            // Port file existed but the HTTP call failed — the sidecar is dead
+            // or stale. Before failing open to a NON-enriched pass-through, try
+            // routing the SAME enrichment request through the daemon, which
+            // holds the same index. This mirrors the missing-port branch above
+            // so a dead sidecar still yields enriched results.
+            //
+            // Skip the fallback when we were already talking to the daemon
+            // (`used_daemon_fallback`): the daemon is the thing that just
+            // failed, so a second round-trip would be pointless — and this
+            // guard guarantees at most one daemon attempt, never a loop.
             let repo_root = std::env::current_dir().unwrap_or_default();
             let port_file_path = repo_root.join(sidecar_port_file_rel());
+
+            // Honest liveness diagnostics (item b): probe the actual sidecar
+            // state so a dead sidecar is never a silent bypass. The probe does
+            // a real TCP connect, so it is gated behind verbose to avoid adding
+            // latency to the degraded path on every call. The always-on honest
+            // signal is the adoption-log outcome recorded below: a successful
+            // daemon fallback records `DaemonFallback` (sidecar dead/degraded,
+            // served via daemon), and a total miss records `sidecar_port_stale`.
             if verbose {
+                let sidecar_dir = repo_root.join(crate::sidecar::port_file::DIR_NAME);
+                let liveness =
+                    crate::sidecar::port_file::read_sidecar_status_at(&sidecar_dir, "127.0.0.1")
+                        .liveness
+                        .as_str();
                 eprintln!(
-                    "[symforge-hook] HTTP request failed — classifying as sidecar_port_stale"
+                    "[symforge-hook] HTTP request failed — sidecar liveness={liveness}, \
+                     attempting daemon fallback before fail-open"
                 );
             }
-            maybe_emit_sidecar_hint(&repo_root);
-            if verbose {
-                eprintln!("[symforge-hook] outcome=NoSidecar reason=sidecar_port_stale");
-            }
-            record_hook_outcome_with_detail(
-                workflow,
-                HookOutcome::NoSidecar,
-                effective_session_id.as_deref(),
-                Some(NoSidecarDetail {
-                    reason: "sidecar_port_stale",
-                    searched_path: &port_file_path.to_string_lossy(),
-                    suggestion: "restart_sidecar",
-                    project_root: &repo_root.to_string_lossy(),
-                }),
-            );
-            println!("{}", fail_open_json(event_name));
-            return Ok(());
-        }
-    };
 
-    // Track whether this was a daemon-fallback routed call.
-    let outcome = if used_daemon_fallback {
-        HookOutcome::DaemonFallback
-    } else {
-        HookOutcome::Routed
+            let daemon_enriched = if used_daemon_fallback {
+                None
+            } else {
+                try_daemon_fallback(&repo_root).and_then(|fallback| {
+                    let daemon_request_path = proxy_path(path, Some(&fallback.session_id));
+                    if verbose {
+                        eprintln!(
+                            "[symforge-hook] daemon fallback (stale sidecar): \
+                             port={}, session={}",
+                            fallback.daemon_port, fallback.session_id
+                        );
+                    }
+                    sync_http_get_with_timeout(
+                        fallback.daemon_port,
+                        &daemon_request_path,
+                        fallback_query,
+                        DAEMON_FALLBACK_DEADLINE,
+                    )
+                    .ok()
+                })
+            };
+
+            match daemon_enriched {
+                Some(b) => {
+                    if verbose {
+                        eprintln!(
+                            "[symforge-hook] daemon fallback succeeded — \
+                             sidecar dead/degraded, served enriched result via daemon"
+                        );
+                    }
+                    (b, HookOutcome::DaemonFallback)
+                }
+                None => {
+                    // Both sidecar and daemon are unreachable: degrade to a
+                    // pass-through, never hang, never error the editor.
+                    if verbose {
+                        eprintln!(
+                            "[symforge-hook] daemon fallback unavailable — \
+                             outcome=NoSidecar reason=sidecar_port_stale"
+                        );
+                    }
+                    maybe_emit_sidecar_hint(&repo_root);
+                    record_hook_outcome_with_detail(
+                        workflow,
+                        HookOutcome::NoSidecar,
+                        effective_session_id.as_deref(),
+                        Some(NoSidecarDetail {
+                            reason: "sidecar_port_stale",
+                            searched_path: &port_file_path.to_string_lossy(),
+                            suggestion: "restart_sidecar",
+                            project_root: &repo_root.to_string_lossy(),
+                        }),
+                    );
+                    println!("{}", fail_open_json(event_name));
+                    return Ok(());
+                }
+            }
+        }
     };
 
     if verbose {

@@ -10,7 +10,7 @@
 //! and the in-crate tests would still pass.
 //!
 //! These tests spawn the real `symforge` binary in a tempdir and pin each
-//! of the three sites end-to-end:
+//! site end-to-end:
 //!
 //!   1. `no_sidecar` — port file missing and daemon fallback fails.
 //!      Exercises `record_hook_outcome_with_detail(NoSidecar,
@@ -22,11 +22,20 @@
 //!   3. `routed_success` — port file points at a minimal in-test TCP
 //!      responder that returns `HTTP/1.1 200 OK`. Exercises the plain
 //!      `record_hook_outcome(Routed)` call on the success path.
+//!   4. `stale_sidecar_with_live_daemon` — port file present but the
+//!      sidecar is dead, while a mock daemon is reachable via
+//!      `SYMFORGE_HOME`. Pins the stale-sidecar daemon fallback: the hook
+//!      must serve the daemon's ENRICHED body and record `DaemonFallback`,
+//!      not fail open. This is the reliability-gap regression guard.
+//!   5. `stale_sidecar_and_dead_daemon` — both unreachable. Pins the
+//!      degrade-to-pass-through guarantee: no hang, no error, recorded as
+//!      `no-sidecar`.
 //!
-//! All three assert against the tab-separated substring format written by
-//! `append_hook_adoption_event*`: `<session>\t<workflow>\t<outcome>`. The
-//! session id is left unpinned (normalized to `-` when no daemon session
-//! file is present), leaving only the `(workflow, outcome)` pair checked.
+//! The adoption-log sites assert against the tab-separated substring format
+//! written by `append_hook_adoption_event*`:
+//! `<session>\t<workflow>\t<outcome>`. The session id is left unpinned
+//! (normalized to `-` when no daemon session file is present), leaving only
+//! the `(workflow, outcome)` pair checked.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -142,20 +151,238 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
     );
 }
 
+/// Pin the stale-sidecar daemon-fallback path: the sidecar port file points
+/// at a dead listener (HTTP times out), but a live mock daemon is reachable
+/// via `SYMFORGE_HOME`. The hook must route the SAME enrichment request
+/// through the daemon and emit ENRICHED output — never a bare pass-through.
+///
+/// Regression guard for the asymmetry where `run_hook` only attempted the
+/// daemon fallback on a MISSING port file, silently failing open whenever the
+/// port file existed but the sidecar was dead.
+#[test]
+fn run_hook_stale_sidecar_with_live_daemon_routes_via_daemon_fallback() {
+    // 1. Dead sidecar: bind-and-hold a port that never accepts, so the
+    //    subprocess's 50ms HTTP read trips into the stale-sidecar branch.
+    let dead_sidecar = TcpListener::bind("127.0.0.1:0").expect("bind dead sidecar listener");
+    let stale_port = dead_sidecar
+        .local_addr()
+        .expect("dead sidecar local_addr")
+        .port();
+
+    // 2. Live mock daemon serving the three fallback endpoints + enrichment.
+    let daemon = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon listener");
+    let daemon_port = daemon.local_addr().expect("daemon local_addr").port();
+
+    // The repo cwd whose canonical root the daemon must advertise.
+    let tmp = TempDir::new().expect("tempdir creation");
+    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
+    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), stale_port.to_string())
+        .expect("write stale port file");
+
+    // The daemon process matches projects by canonical root (same
+    // canonicalization + normalization the hook applies), so advertise the
+    // canonicalized tempdir.
+    let canonical_root = std::fs::canonicalize(tmp.path())
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // SYMFORGE_HOME hosts the daemon port file the hook's daemon fallback reads.
+    let home = TempDir::new().expect("home tempdir creation");
+    let daemon_port_file = home
+        .path()
+        .join(format!("daemon.{}.port", std::env::consts::OS));
+    std::fs::write(&daemon_port_file, daemon_port.to_string()).expect("write daemon port file");
+
+    let daemon_thread = thread::spawn(move || serve_mock_daemon(daemon, &canonical_root));
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+
+    drop(dead_sidecar);
+    let _ = daemon_thread.join();
+
+    // The enriched marker body served by the mock daemon must reach stdout —
+    // proves the hook served the daemon's enriched result, not a fail-open.
+    assert!(
+        stdout.contains(ENRICHED_MARKER),
+        "stdout must contain the daemon-served enriched body marker \
+         `{ENRICHED_MARKER}` (regression: stale-sidecar path failed open \
+         instead of routing through the daemon); got:\n{stdout}"
+    );
+    // The adoption log must record the degraded-but-routed state honestly.
+    assert!(
+        log.contains("\tsource-read\tdaemon-fallback"),
+        "log must contain a tab-separated `source-read\\tdaemon-fallback` \
+         entry (regression: stale sidecar served via daemon must record \
+         DaemonFallback, not no-sidecar); got:\n{log}"
+    );
+    assert!(
+        !log.contains("\tsource-read\tno-sidecar"),
+        "stale sidecar with a live daemon must NOT record no-sidecar; got:\n{log}"
+    );
+}
+
+/// Pin the degrade-to-pass-through guarantee: when BOTH the sidecar and the
+/// daemon are unreachable, the hook must still fail open cleanly (no hang, no
+/// error) and record `no-sidecar` with the stale reason.
+#[test]
+fn run_hook_stale_sidecar_and_dead_daemon_degrades_to_pass_through() {
+    // Dead sidecar (HTTP times out).
+    let dead_sidecar = TcpListener::bind("127.0.0.1:0").expect("bind dead sidecar listener");
+    let stale_port = dead_sidecar
+        .local_addr()
+        .expect("dead sidecar local_addr")
+        .port();
+
+    // Dead daemon: bind-and-hold a port pointed at by the daemon port file but
+    // never accept, so the daemon fallback's first HTTP round-trip times out.
+    let dead_daemon = TcpListener::bind("127.0.0.1:0").expect("bind dead daemon listener");
+    let dead_daemon_port = dead_daemon
+        .local_addr()
+        .expect("dead daemon local_addr")
+        .port();
+
+    let tmp = TempDir::new().expect("tempdir creation");
+    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
+    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), stale_port.to_string())
+        .expect("write stale port file");
+
+    let home = TempDir::new().expect("home tempdir creation");
+    std::fs::write(
+        home.path()
+            .join(format!("daemon.{}.port", std::env::consts::OS)),
+        dead_daemon_port.to_string(),
+    )
+    .expect("write daemon port file");
+
+    let (stdout, log) = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    );
+
+    drop(dead_sidecar);
+    drop(dead_daemon);
+
+    // Must degrade to a valid fail-open JSON pass-through, never the enriched
+    // marker (no daemon served it) and never a crash.
+    assert!(
+        !stdout.contains(ENRICHED_MARKER),
+        "no enrichment source is reachable, so stdout must not contain the \
+         daemon marker; got:\n{stdout}"
+    );
+    assert!(
+        log.contains("\tsource-read\tno-sidecar"),
+        "both sidecar and daemon unreachable must degrade to no-sidecar; \
+         got:\n{log}"
+    );
+}
+
+/// Marker body returned by the mock daemon's enrichment endpoint. Distinct
+/// from any fail-open output so the test can prove enrichment was served.
+const ENRICHED_MARKER: &str = "MOCK_DAEMON_ENRICHED_OUTLINE";
+
+/// Single-purpose mock daemon HTTP server for the fallback test. Serves each
+/// `Connection: close` request the hook makes — `/v1/projects`, the project's
+/// `/sessions` list, then the `/v1/sessions/{id}/sidecar/outline` enrichment —
+/// routing by request-line path. Loops until the enrichment request is served
+/// or the listener is dropped.
+fn serve_mock_daemon(listener: TcpListener, canonical_root: &str) {
+    // Non-blocking accept so a missing enrichment request can never hang the
+    // join() on the test thread — the deadline always wins.
+    listener
+        .set_nonblocking(true)
+        .expect("set mock daemon listener non-blocking");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let (mut stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return,
+        };
+        // The accepted stream inherits non-blocking; restore blocking + a read
+        // timeout so the request read below behaves like a normal server.
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("");
+
+        let body: String = if path.starts_with("/v1/projects/") && path.contains("/sessions") {
+            // Sessions list for the matched project.
+            r#"[{"session_id":"mock-session","last_seen_at_unix_secs":1}]"#.to_string()
+        } else if path.starts_with("/v1/projects") {
+            // Projects list — advertise our canonical root.
+            format!(
+                r#"[{{"project_id":"mock-project","canonical_root":"{}","session_count":1}}]"#,
+                canonical_root.replace('"', "\\\"")
+            )
+        } else {
+            // Enrichment endpoint (/v1/sessions/.../sidecar/outline).
+            let last = path.contains("sidecar");
+            let out = format!("{{\"enriched\":\"{ENRICHED_MARKER}\"}}");
+            write_http_ok(&mut stream, &out);
+            if last {
+                return;
+            }
+            continue;
+        };
+
+        write_http_ok(&mut stream, &body);
+    }
+}
+
+/// Write a minimal `200 OK` HTTP response with the given body and close.
+fn write_http_ok(stream: &mut std::net::TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
 /// Spawn `symforge hook` in `cwd`, pipe `payload` on stdin, wait for exit,
 /// and return the adoption log contents. Panics with a clear message if
 /// the subprocess doesn't exit, exits non-zero, or doesn't create the
 /// log file. Shared across all three site tests.
 fn run_hook_in_tempdir(cwd: &Path, payload: &str) -> String {
+    run_hook_in_tempdir_with_env(cwd, payload, &[]).1
+}
+
+/// Like `run_hook_in_tempdir` but allows injecting extra environment variables
+/// and returns `(stdout, adoption_log_contents)` so callers can assert on the
+/// enriched body emitted to stdout as well as the recorded outcome.
+fn run_hook_in_tempdir_with_env(
+    cwd: &Path,
+    payload: &str,
+    extra_env: &[(&str, &str)],
+) -> (String, String) {
     let bin = env!("CARGO_BIN_EXE_symforge");
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("hook")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("symforge binary should spawn");
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("symforge binary should spawn");
 
     child
         .stdin
@@ -173,6 +400,13 @@ fn run_hook_in_tempdir(cwd: &Path, payload: &str) -> String {
         "symforge hook exited non-zero: {status:?}"
     );
 
+    // Capture stdout after exit. The hook emits a single short JSON line, far
+    // below the pipe buffer size, so reading post-exit cannot deadlock.
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+
     let log_path = cwd.join(ADOPTION_LOG_RELATIVE);
     assert!(
         log_path.exists(),
@@ -182,7 +416,8 @@ fn run_hook_in_tempdir(cwd: &Path, payload: &str) -> String {
         log_path.display()
     );
 
-    std::fs::read_to_string(&log_path).expect("log readable")
+    let log = std::fs::read_to_string(&log_path).expect("log readable");
+    (stdout, log)
 }
 
 /// Poll the child for exit with a timeout. `Ok(Some)` on clean exit,
