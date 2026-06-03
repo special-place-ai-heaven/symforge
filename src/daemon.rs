@@ -446,6 +446,17 @@ impl DaemonState {
         request: OpenProjectRequest,
     ) -> anyhow::Result<OpenProjectResponse> {
         let canonical_root = canonical_project_root(Path::new(&request.project_root))?;
+        // Trust boundary: `open_project_session` performs a full `LiveIndex::load`
+        // with no guard of its own, so a session-open on a sensitive system or
+        // credential-bearing root would read system/credential files. Apply the
+        // same unified guard used by `index_folder_for_session`, immediately
+        // after canonicalization and before any load, refusing cleanly (no panic).
+        if crate::paths::is_sensitive_path(&canonical_root) {
+            anyhow::bail!(
+                "Refused to open session for sensitive system path: {}. Use a project directory instead.",
+                canonical_root.display()
+            );
+        }
         let project_id = project_key(&canonical_root);
 
         // Fast path: project already loaded — just add session.
@@ -632,6 +643,24 @@ impl DaemonState {
         input: IndexFolderInput,
     ) -> anyhow::Result<String> {
         let target_root = canonical_project_root(Path::new(&input.path))?;
+        // TODO(security): require a fail-closed daemon `auth_token`. The path
+        // guard below stops sensitive-root indexing, but the daemon currently
+        // serves any local client that can reach its loopback port. A mandatory
+        // per-daemon token (rejecting unauthenticated callers) would close the
+        // ambient-authority surface entirely. Deferred — separate hardening.
+        //
+        // Trust boundary: refuse sensitive system paths before any reload/IO.
+        // The local `tools::index_folder` already guards this; the daemon path
+        // canonicalizes via `canonical_project_root` (which yields the `\\?\`
+        // extended-length form on Windows) and must apply the same hardened,
+        // prefix-aware guard so a daemon-routed call cannot index system files
+        // or drive a reload into a denial-of-service.
+        if crate::paths::is_sensitive_path(&target_root) {
+            return Ok(format!(
+                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
+                target_root.display()
+            ));
+        }
         let target_project_id = project_key(&target_root);
         let current_session_root = {
             let projects = self.projects.read();
@@ -2574,6 +2603,83 @@ mod tests {
         assert_ne!(first.project_id, second.project_id);
         assert_eq!(state.list_projects().len(), 2);
         assert_eq!(state.health().session_count, 2);
+    }
+
+    #[test]
+    fn test_index_folder_for_session_refuses_sensitive_root() {
+        // Regression: the daemon path historically never called the sensitive
+        // -path guard, so a daemon-routed `index_folder` on a system root could
+        // index system files and drive a reload into a denial-of-service.
+        let project = project_dir("symforge-daemon-sensitive");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("session");
+
+        // A sensitive system root that exists and canonicalizes on this host.
+        #[cfg(windows)]
+        let sensitive = r"C:\Windows";
+        #[cfg(unix)]
+        let sensitive = "/etc";
+
+        let result = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: sensitive.to_string(),
+                    idempotency_key: None,
+                },
+            )
+            .expect("refusal must be a clean Ok response, never an Err or panic");
+        assert!(
+            result.contains("Refused to index sensitive system path"),
+            "daemon path must refuse sensitive root `{sensitive}`, got: {result}"
+        );
+
+        // The session must remain bound to the original project (no reassign).
+        let projects = state.list_projects();
+        assert_eq!(
+            projects.len(),
+            1,
+            "refusal must not create a project for the sensitive root"
+        );
+    }
+
+    #[test]
+    fn test_open_project_session_refuses_sensitive_root() {
+        // Regression: `open_project_session` performs a full `LiveIndex::load`
+        // with no guard of its own. A session-open on a sensitive root must be
+        // refused cleanly (an `Err`, never a panic, never a load) before any IO.
+        let state = DaemonState::new();
+
+        // A sensitive system root that exists and canonicalizes on this host.
+        #[cfg(windows)]
+        let sensitive = r"C:\Windows";
+        #[cfg(unix)]
+        let sensitive = "/etc";
+
+        let result = state.open_project_session(OpenProjectRequest {
+            project_root: sensitive.to_string(),
+            client_name: "claude".to_string(),
+            pid: None,
+        });
+
+        let err = result.expect_err("sensitive root must be refused, not opened");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Refused to open session for sensitive system path"),
+            "open_project_session must refuse sensitive root `{sensitive}`, got: {msg}"
+        );
+
+        // The refusal must not have created any project.
+        assert!(
+            state.list_projects().is_empty(),
+            "refusal must not create a project for the sensitive root"
+        );
     }
 
     #[test]

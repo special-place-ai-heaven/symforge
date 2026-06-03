@@ -209,6 +209,11 @@ pub fn find_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Try to find a git root first (always safe — scoped by repo boundary).
+    // TODO(security): the `.git` fast-path returns before `is_forbidden_root`
+    // runs, so a `.git` placed at a sensitive root (e.g. `git init` in
+    // `C:\Users\<name>`) would bypass the unified guard. Run the sensitive-path
+    // check on the resolved `.git` root before returning. Deferred — separate
+    // hardening from the attacker-facing index-tool guard unification.
     let mut current = cwd.clone();
     loop {
         if current.join(".git").exists() {
@@ -237,6 +242,18 @@ pub fn find_project_root() -> Option<PathBuf> {
 fn is_forbidden_root(path: &Path) -> bool {
     // Canonicalize for reliable comparison (resolves symlinks, normalizes separators).
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // 0. Unified trust-boundary guard. `paths::is_sensitive_path` is the SINGLE
+    //    canonical guard shared with the attacker-facing index tools
+    //    (`tools::index_folder`, `daemon::index_folder_for_session`,
+    //    `daemon::open_project_session`). Delegating here makes the trusted
+    //    launcher AT LEAST as strict as the tool surface, so the two can never
+    //    drift apart again — the drift that caused the original daemon bypass.
+    //    The launcher-specific rules below (running-user `$HOME`, WSL probe)
+    //    remain as additional, narrower checks on top of this shared floor.
+    if crate::paths::is_sensitive_path(&path) {
+        return true;
+    }
 
     // 1. Drive roots: C:\, D:\, /, etc.
     if path.parent().is_none() {

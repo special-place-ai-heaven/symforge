@@ -2766,35 +2766,6 @@ macro_rules! loading_guard {
     };
 }
 
-/// Returns true if the path is a sensitive system directory that should not be indexed.
-/// Guards against accidental or malicious indexing of /, /etc, /proc, Windows system dirs, etc.
-fn is_sensitive_path(canonical: &std::path::Path) -> bool {
-    let s = canonical.to_string_lossy();
-
-    // Unix sensitive roots
-    #[cfg(unix)]
-    {
-        const BLOCKED: &[&str] = &[
-            "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/run", "/sbin",
-            "/sys", "/usr", "/var",
-        ];
-        if BLOCKED.iter().any(|b| s == *b) {
-            return true;
-        }
-    }
-
-    // Windows sensitive roots (case-insensitive)
-    #[cfg(windows)]
-    {
-        let lower = s.to_ascii_lowercase();
-        if lower == r"c:\" || lower == r"c:/" || lower.starts_with(r"c:\windows") {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn loading_guard_message_from_published(
     published: &crate::live_index::PublishedIndexState,
 ) -> Option<String> {
@@ -5209,12 +5180,17 @@ impl SymForgeServer {
             Ok(p) => p,
             Err(e) => return format!("Cannot resolve path: {e}"),
         };
-        if is_sensitive_path(&root) {
+        if crate::paths::is_sensitive_path(&root) {
             return format!(
                 "Refused to index sensitive system path: {}.                  Use a project directory instead.",
                 root.display()
             );
         }
+        // TODO(security): bound discovery. The sensitive-path guard above blocks
+        // known system/credential roots, but a huge NON-sensitive tree (e.g. a
+        // deep monorepo or a user-pointed scratch dir) can still OOM or panic the
+        // reload. Add a file-count / byte ceiling to `discover_*` and refuse or
+        // degrade gracefully past it. Deferred — separate hardening.
         let reset_requested = index_folder_reset_requested();
         let current_root = self.capture_repo_root();
         let idempotency = match input.idempotency_key.as_deref() {
