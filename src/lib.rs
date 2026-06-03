@@ -31,6 +31,11 @@ pub mod cli;
 pub mod daemon;
 #[cfg(feature = "server")]
 pub mod observability;
+// Proactive PATH-shadow detection: warns when a bare `symforge` resolves to a
+// different (stale) install than the one we believe we are. Used by cli::init,
+// cli::update, and protocol health — all server-only.
+#[cfg(feature = "server")]
+pub mod path_shadow;
 #[cfg(feature = "server")]
 pub mod protocol;
 #[cfg(feature = "server")]

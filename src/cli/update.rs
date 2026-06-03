@@ -182,6 +182,13 @@ pub(crate) trait UpdateOps {
     /// break them). Registry pruning is handled separately by [`prune_registry`].
     /// Returns summary lines.
     fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String>;
+    /// Detect whether a DIFFERENT install shadows the binary npm just installed
+    /// on `$PATH`. Derives "our binary" from the global npm prefix and compares
+    /// it to the PATH-first `symforge`. Returns `None` when our install wins, the
+    /// prefix is unresolvable, or no shadow exists. This is ADDITIVE to the
+    /// reactive stale-version bail: it also fires when the shadow is the SAME
+    /// version (which the stale-version check cannot see).
+    fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport>;
 }
 
 struct RealUpdateOps;
@@ -301,6 +308,47 @@ impl UpdateOps for RealUpdateOps {
             Vec::new()
         }
     }
+
+    fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport> {
+        let installed = npm_installed_launcher_path()?;
+        crate::path_shadow::detect_shadow(&installed)
+    }
+}
+
+/// Resolve the global npm prefix via `npm prefix -g`, then derive the path of
+/// the `symforge` launcher npm installs there. On Windows the shim lives at the
+/// prefix root (`<prefix>/symforge.cmd`); on Unix it lives in `<prefix>/bin/symforge`.
+/// Returns `None` when `npm` is unavailable or the prefix cannot be parsed.
+fn npm_installed_launcher_path() -> Option<std::path::PathBuf> {
+    let program = npm_executable_for_os(std::env::consts::OS);
+    let output = Command::new(program)
+        .args(["prefix", "-g"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&output.stdout);
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(launcher_path_in_prefix(
+        std::path::Path::new(prefix),
+        std::env::consts::OS,
+    ))
+}
+
+/// Pure mapping from an npm global prefix to the `symforge` launcher path it
+/// installs, given the target OS. Windows places the shim at the prefix root;
+/// every other platform uses the conventional `<prefix>/bin/<name>` layout.
+fn launcher_path_in_prefix(prefix: &std::path::Path, os: &str) -> std::path::PathBuf {
+    if os == "windows" {
+        prefix.join("symforge.cmd")
+    } else {
+        prefix.join("bin").join("symforge")
+    }
 }
 
 pub fn run_update() -> anyhow::Result<()> {
@@ -406,6 +454,15 @@ pub(crate) fn orchestrate_update(
         }
     }
 
+    // Proactive PATH-shadow check. The version-verification above bails only when
+    // the resolved binary is BEHIND the target; it cannot see a same-version
+    // shadow (a stale install that happens to match) or name the exact offending
+    // path and fix. Compare the binary npm just installed to the PATH-first
+    // `symforge` and, when a different install wins, print the precise remediation.
+    if let Some(report) = ops.shadow_report() {
+        eprintln!("{}", crate::path_shadow::format_shadow_warning(&report));
+    }
+
     // Re-point all clients at the freshly-installed binary. Only AFTER a confirmed
     // re-registration do we clear the retired durable-install artifacts — deleting
     // the orphan while a client still references it would break that client.
@@ -459,6 +516,8 @@ mod tests {
         reconciled_with: Option<bool>,
         pruned_before_install: Option<bool>,
         prune_calls: usize,
+        shadow: Option<crate::path_shadow::ShadowReport>,
+        shadow_checked_after_install: Option<bool>,
     }
 
     impl Default for FakeOps {
@@ -475,6 +534,8 @@ mod tests {
                 reconciled_with: None,
                 pruned_before_install: None,
                 prune_calls: 0,
+                shadow: None,
+                shadow_checked_after_install: None,
             }
         }
     }
@@ -514,6 +575,12 @@ mod tests {
         fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String> {
             self.reconciled_with = Some(reregistered);
             Vec::new()
+        }
+        fn shadow_report(&mut self) -> Option<crate::path_shadow::ShadowReport> {
+            // Record that the shadow check runs only AFTER a successful install,
+            // so tests can assert ordering relative to the npm swap.
+            self.shadow_checked_after_install = Some(!self.install_calls.is_empty());
+            self.shadow.clone()
         }
     }
 
@@ -596,6 +663,54 @@ mod tests {
             ops.reconciled_with,
             Some(true),
             "orphan reconcile must run with reregistered=true on success"
+        );
+        assert_eq!(
+            ops.shadow_checked_after_install,
+            Some(true),
+            "PATH-shadow check must run, and only after a successful install"
+        );
+    }
+
+    #[test]
+    fn orchestrate_update_warns_but_succeeds_when_a_same_version_shadow_wins() {
+        // The shadow reports the SAME version the install resolved to (7.15.4),
+        // which the reactive stale-version bail cannot detect. The proactive
+        // shadow check must still fire; the update must still SUCCEED (the
+        // warning is advisory, not a failure).
+        let mut ops = ok_ops();
+        ops.shadow = Some(crate::path_shadow::ShadowReport {
+            our_path: std::path::PathBuf::from("/home/you/.npm-global/bin/symforge"),
+            our_version: Some("7.15.4".to_string()),
+            shadow_path: std::path::PathBuf::from("/usr/local/bin/symforge"),
+            shadow_version: Some("7.15.4".to_string()),
+            kind: crate::path_shadow::ShadowKind::RootSystem,
+        });
+
+        orchestrate_update("linux", "x86_64", &mut ops)
+            .expect("a same-version shadow is advisory, not fatal");
+
+        assert_eq!(
+            ops.shadow_checked_after_install,
+            Some(true),
+            "shadow check ran after the install even on the same-version case"
+        );
+        assert!(
+            ops.reregistered_after_install,
+            "the advisory shadow warning must not short-circuit re-registration"
+        );
+    }
+
+    #[test]
+    fn launcher_path_in_prefix_maps_per_os_layout() {
+        // Windows: npm places the shim at the prefix root.
+        assert_eq!(
+            launcher_path_in_prefix(std::path::Path::new("C:/npm-prefix"), "windows"),
+            std::path::Path::new("C:/npm-prefix").join("symforge.cmd")
+        );
+        // Unix: conventional <prefix>/bin/<name>.
+        assert_eq!(
+            launcher_path_in_prefix(std::path::Path::new("/home/you/.npm-global"), "linux"),
+            std::path::Path::new("/home/you/.npm-global/bin/symforge")
         );
     }
 

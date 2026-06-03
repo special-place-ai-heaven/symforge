@@ -2659,6 +2659,16 @@ fn sidecar_status_for_server(server: &SymForgeServer) -> crate::sidecar::port_fi
     crate::sidecar::port_file::read_sidecar_status(&bind_host)
 }
 
+/// Best-effort PATH-shadow report for the binary serving this runtime.
+///
+/// Uses `std::env::current_exe()` as "our binary" and asks `path_shadow` whether
+/// a bare `symforge` on `$PATH` would run a different install. Returns `None`
+/// when we win, when there is no shadow, or when `current_exe()` is unresolvable.
+fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
+    let our_binary = std::env::current_exe().ok()?;
+    crate::path_shadow::detect_shadow(&our_binary)
+}
+
 fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &str) -> Vec<String> {
     let mut candidates: Vec<String> = index
         .all_files()
@@ -4946,6 +4956,14 @@ impl SymForgeServer {
             result.push_str(&drift);
         }
 
+        // Surface a PATH-shadow warning when a bare `symforge` would run a
+        // DIFFERENT install than the binary serving this runtime. Read-only;
+        // emits the exact remediation commands, never executes them.
+        if let Some(report) = current_exe_shadow_report() {
+            result.push('\n');
+            result.push_str(&crate::path_shadow::format_shadow_warning(&report));
+        }
+
         result
     }
 
@@ -5018,6 +5036,13 @@ impl SymForgeServer {
         if let Some(drift) = crate::version_registry::drift_banner_default() {
             result.push('\n');
             result.push_str(&drift);
+        }
+
+        // Compact PATH-shadow banner (one line, points at full health for the
+        // exact fix). See `health_for_runtime` for the full block.
+        if let Some(report) = current_exe_shadow_report() {
+            result.push('\n');
+            result.push_str(&crate::path_shadow::format_shadow_warning_compact(&report));
         }
 
         result

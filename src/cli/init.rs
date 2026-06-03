@@ -246,6 +246,15 @@ fn run_init_with_paths(
     paths::ensure_symforge_dir(working_dir)
         .with_context(|| format!("ensuring {}", working_dir.join(".symforge").display()))?;
 
+    // Registration writes ABSOLUTE binary paths, so the MCP clients we just wired
+    // always launch this exact binary. But the user's own bare `symforge` CLI
+    // invocations resolve through `$PATH` and may hit a DIFFERENT (stale) install
+    // that shadows the one being registered. Warn loudly with the exact fix; the
+    // detector never executes anything.
+    if let Some(report) = crate::path_shadow::detect_shadow(&registration_binary_path) {
+        eprintln!("{}", crate::path_shadow::format_shadow_warning(&report));
+    }
+
     eprintln!("symforge init complete");
 
     Ok(())
