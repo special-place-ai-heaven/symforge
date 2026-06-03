@@ -156,22 +156,27 @@ pub fn detect_stale(home: &Path) -> Option<StaleBinary> {
     })
 }
 
-/// Remove registry entries whose recorded binary path no longer exists on disk.
+/// Remove registry entries whose recorded binary path no longer exists on disk,
+/// while preserving entries on a transiently-offline mount (one whose whole
+/// ancestor chain is unreachable — e.g. an unplugged removable or network drive).
 /// Best-effort and advisory: returns the number of entries removed (`0` on any
-/// I/O error or when nothing changed). `symforge update` calls this after a
-/// version swap so the registry does not accumulate dead entries (e.g. the
-/// retired `~/.symforge/bin` durable binary once it is removed).
+/// I/O error or when nothing changed). `symforge update` calls this so the
+/// registry does not accumulate dead entries (e.g. removed git-worktree dev
+/// builds, or the retired `~/.symforge/bin` durable binary once it is removed).
 pub fn prune_missing_entries(home: &Path) -> usize {
     let map = load(home);
     let before = map.len();
     let pruned: BTreeMap<String, String> = map
         .into_iter()
+        // Keep an entry when its binary still exists, OR when its WHOLE mount is
+        // unreachable (an unplugged removable / offline network drive). Drop a
+        // vanished file only when the drive is online — e.g. a removed git
+        // worktree's `target/debug/symforge.exe` whose entire subtree is gone.
+        // Checking only the immediate parent (the old behavior) wrongly kept such
+        // dead entries forever whenever a directory subtree was deleted.
         .filter(|(path, _)| {
             let candidate = Path::new(path);
-            // Keep an entry whose PARENT is unreachable (e.g. an offline network
-            // or removable mount) so a transiently-missing path is not permanently
-            // purged; only drop a leaf whose parent exists but the file is gone.
-            candidate.exists() || candidate.parent().is_some_and(|parent| !parent.exists())
+            candidate.exists() || !mount_is_reachable(candidate)
         })
         .collect();
     let removed = before - pruned.len();
@@ -179,6 +184,30 @@ pub fn prune_missing_entries(home: &Path) -> usize {
         let _ = atomic_write(home, &pruned);
     }
     removed
+}
+
+/// Whether the mount/drive holding `candidate` is currently reachable: true if
+/// any *real* ancestor exists on disk. "Real" deliberately excludes the Windows
+/// verbatim/UNC pseudo-roots `\\?` and `\\`, which `Path::exists()` reports as
+/// existing for EVERY path (so a canonicalized `\\?\C:\...` entry would otherwise
+/// always look reachable, defeating the offline-mount check). The genuine drive
+/// root — `C:\` for a plain path, `\\?\C:` for a verbatim one — is retained, so
+/// an unplugged `Z:` drive yields no reachable ancestor and its entry is kept.
+fn mount_is_reachable(candidate: &Path) -> bool {
+    candidate.ancestors().any(|ancestor| {
+        if is_universal_pseudo_root(ancestor) {
+            return false;
+        }
+        ancestor.exists()
+    })
+}
+
+/// True for the Windows verbatim/UNC prefix pseudo-roots (`\\` and `\\?`) that
+/// `Path::exists()` universally reports as existing. Everywhere else (including
+/// the Unix root `/` and real drive roots like `C:\` / `\\?\C:`) returns false so
+/// their genuine existence is honored.
+fn is_universal_pseudo_root(ancestor: &Path) -> bool {
+    matches!(ancestor.as_os_str().to_str(), Some(r"\\") | Some(r"\\?"))
 }
 
 /// Human-readable, EDR-safe drift warning. Surfaces a command the **user**
@@ -278,6 +307,98 @@ mod tests {
 
         // Idempotent: a second prune removes nothing.
         assert_eq!(prune_missing_entries(home), 0);
+    }
+
+    #[test]
+    fn prune_missing_entries_drops_dead_entry_when_whole_subtree_was_deleted() {
+        // Regression: a removed git worktree's binary lives several directories
+        // deep. The immediate parent (and its parents) were all deleted along with
+        // the subtree, but the temp root still exists (the drive is online). The
+        // old immediate-parent-only check kept this dead entry forever; it must be
+        // pruned now.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+
+        let gone_root = tmp.path().join("gone");
+        let dead = gone_root.join("deep").join("symforge.exe");
+        // Materialize then remove the whole `gone/` subtree, so `gone`, `gone/deep`
+        // and the leaf are all absent while `tmp` (an ancestor) still exists.
+        std::fs::create_dir_all(dead.parent().unwrap()).unwrap();
+        std::fs::write(&dead, b"binary").unwrap();
+        std::fs::remove_dir_all(&gone_root).unwrap();
+        assert!(!gone_root.exists(), "subtree must be gone for the test");
+        assert!(
+            tmp.path().exists(),
+            "an ancestor must remain (drive online)"
+        );
+
+        let dead_key = dead.to_string_lossy().into_owned();
+
+        let live = tmp.path().join("live-symforge");
+        std::fs::write(&live, b"binary").unwrap();
+        let live_key = live.to_string_lossy().into_owned();
+
+        write_registry(
+            home,
+            &[(live_key.as_str(), "7.15.4"), (dead_key.as_str(), "7.14.4")],
+        );
+
+        let removed = prune_missing_entries(home);
+
+        assert_eq!(removed, 1, "the deleted-subtree entry must be pruned");
+        let map = load(home);
+        assert!(map.contains_key(&live_key), "live entry kept");
+        assert!(
+            !map.contains_key(&dead_key),
+            "dead deleted-subtree entry removed"
+        );
+    }
+
+    // An offline removable/network mount means EVERY ancestor up to the drive root
+    // is unreachable. That can only be modelled where a drive root itself can be
+    // absent — on Windows a `Z:\` root does not exist when the drive is unplugged.
+    // On Unix the filesystem root `/` always exists, so a transiently-offline mount
+    // there still has a reachable ancestor and, by design, a vanished file under it
+    // is treated as a genuine deletion. We therefore exercise the offline-keep path
+    // on Windows only; the Unix prune-on-deletion behavior is covered by the
+    // deleted-subtree test above.
+    //
+    // The registry stores canonicalized paths, which on Windows are VERBATIM
+    // (`\\?\C:\...`). Their ancestor chain ends in the pseudo-roots `\\?` and `\\`,
+    // both of which `Path::exists()` always reports as existing — so we verify the
+    // verbatim form specifically to prove `mount_is_reachable` ignores those
+    // pseudo-roots and still keeps an offline entry. We pick an unmapped drive
+    // letter at runtime so the test is independent of the host's drive layout.
+    #[cfg(windows)]
+    #[test]
+    fn prune_missing_entries_keeps_entry_on_offline_mount() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+
+        // Find a drive letter whose root does not exist (genuinely unmapped).
+        let absent = ('D'..='Z')
+            .rev()
+            .find(|d| !Path::new(&format!(r"{d}:\")).exists())
+            .expect("at least one drive letter D..=Z should be unmapped on the test host");
+
+        // Verbatim canonical form (what `current_exe_key` records on Windows).
+        // The genuine drive root `\\?\{absent}:` is absent; only the universal
+        // pseudo-roots (`\\?`, `\\`) may report as existing — which `Path::exists()`
+        // does inconsistently depending on the path's internal representation. The
+        // load-bearing predicate `mount_is_reachable` must ignore those pseudo-roots
+        // and classify the mount as UNREACHABLE regardless.
+        let offline_key = format!(r"\\?\{absent}:\offline-mount\bin\symforge.exe");
+        assert!(
+            !mount_is_reachable(Path::new(&offline_key)),
+            "an unmapped drive must be classified unreachable despite the pseudo-root"
+        );
+
+        write_registry(home, &[(offline_key.as_str(), "7.14.4")]);
+
+        let removed = prune_missing_entries(home);
+
+        assert_eq!(removed, 0, "an offline-mount entry must be kept");
+        assert!(load(home).contains_key(&offline_key), "offline entry kept");
     }
 
     #[test]

@@ -102,20 +102,25 @@ fn clear_dead_sidecar_record() -> Option<String> {
     }
 }
 
-/// Remove the retired durable-install artifacts under the DEFAULT `~/.symforge/bin`
-/// (the only place the retired durable mechanism ever wrote). Guarded: skipped
-/// entirely when `$SYMFORGE_HOME` is set (a binary may legitimately live under a
-/// custom home), and never deletes the binary backing the current process.
+/// Resolve the durable-install `bin` directory the same way the rest of SymForge
+/// resolves its home: `$SYMFORGE_HOME/bin` when `SYMFORGE_HOME` is set (it is set
+/// in the standard MCP server config and routinely points at the SAME default
+/// `~/.symforge`), else `~/.symforge/bin`. Returns `None` only when neither is
+/// resolvable.
+fn durable_bin_dir() -> Option<std::path::PathBuf> {
+    crate::version_registry::resolve_home().map(|home| home.join("bin"))
+}
+
+/// Remove the retired durable-install artifacts under the resolved durable `bin`
+/// directory (`$SYMFORGE_HOME/bin` when set, else `~/.symforge/bin`) — the only
+/// place the retired durable mechanism ever wrote. The real safety invariant is
+/// the self-exe guard: it never deletes the binary backing the current process.
 /// Best-effort; callers must only invoke this AFTER clients are re-registered off
 /// the orphan.
 fn remove_orphan_durable_bin() -> Vec<String> {
-    if std::env::var_os("SYMFORGE_HOME").is_some() {
-        return Vec::new();
-    }
-    let Some(home) = dirs::home_dir() else {
+    let Some(bin) = durable_bin_dir() else {
         return Vec::new();
     };
-    let bin = home.join(".symforge").join("bin");
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok());
@@ -164,12 +169,18 @@ pub(crate) trait UpdateOps {
     fn installed_version(&mut self) -> InstalledProbe;
     /// Latest version published to the npm registry, or `None` when offline.
     fn latest_version(&mut self) -> Option<String>;
+    /// Prune dead version-registry entries (paths whose binary was deleted while
+    /// the drive is online). Runs UNCONDITIONALLY and early — even when the npm
+    /// swap is blocked (Windows `EBUSY`) — so a blocked update still cleans cruft.
+    /// Returns summary lines (empty when nothing was pruned).
+    fn prune_registry(&mut self) -> Vec<String>;
     /// Re-register every MCP client onto the freshly-installed binary by spawning
     /// the NEW launcher's `init`. Returns `true` on success.
     fn reregister_clients(&mut self) -> anyhow::Result<bool>;
-    /// Prune dead version-registry entries; remove the retired durable-install
-    /// leftovers ONLY when `reregistered` is true (otherwise clients still point
-    /// at the orphan and deleting it would break them). Returns summary lines.
+    /// Remove the retired durable-install leftovers ONLY when `reregistered` is
+    /// true (otherwise clients still point at the orphan and deleting it would
+    /// break them). Registry pruning is handled separately by [`prune_registry`].
+    /// Returns summary lines.
     fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String>;
 }
 
@@ -255,6 +266,21 @@ impl UpdateOps for RealUpdateOps {
         crate::cli::version::latest_npm_version()
     }
 
+    fn prune_registry(&mut self) -> Vec<String> {
+        let Some(home) = crate::version_registry::resolve_home() else {
+            return Vec::new();
+        };
+        let pruned = crate::version_registry::prune_missing_entries(&home);
+        if pruned > 0 {
+            vec![format!(
+                "pruned {pruned} stale version-registry entr{}",
+                if pruned == 1 { "y" } else { "ies" }
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn reregister_clients(&mut self) -> anyhow::Result<bool> {
         // Spawn the NEW launcher's init so clients are registered at the freshly
         // installed binary (this update process is still the OLD binary, so an
@@ -269,20 +295,11 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn reconcile_durable(&mut self, reregistered: bool) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(home) = crate::version_registry::resolve_home() {
-            let pruned = crate::version_registry::prune_missing_entries(&home);
-            if pruned > 0 {
-                out.push(format!(
-                    "pruned {pruned} stale version-registry entr{}",
-                    if pruned == 1 { "y" } else { "ies" }
-                ));
-            }
-        }
         if reregistered {
-            out.extend(remove_orphan_durable_bin());
+            remove_orphan_durable_bin()
+        } else {
+            Vec::new()
         }
-        out
     }
 }
 
@@ -304,6 +321,14 @@ pub(crate) fn orchestrate_update(
     let stop_summary = ops.stop_processes();
     eprintln!("symforge update: {stop_summary}.");
 
+    // Prune dead version-registry entries UNCONDITIONALLY and BEFORE the npm swap.
+    // The swap can be blocked (Windows `EBUSY`: a running MCP client still holds
+    // the `.exe`) and bail below — but registry cruft (e.g. removed git-worktree
+    // dev builds) should be cleaned regardless of whether the swap succeeds.
+    for line in ops.prune_registry() {
+        eprintln!("symforge update: {line}");
+    }
+
     let program = npm_executable_for_os(os);
     let specs = install_specs(os, arch);
     let args: Vec<&str> = ["install", "-g"]
@@ -313,7 +338,10 @@ pub(crate) fn orchestrate_update(
 
     if !ops.npm_install(program, &args)? {
         bail!(
-            "symforge update failed: `{}` exited unsuccessfully",
+            "symforge update failed: `{}` exited unsuccessfully.\n\
+             On Windows this is usually a running symforge or MCP client (Cursor, Claude) \
+             holding the binary (EBUSY). Close your MCP clients and rerun `symforge update`. \
+             (The version registry was already pruned.)",
             invocation_text(program, &args)
         );
     }
@@ -425,9 +453,12 @@ mod tests {
         installed: InstalledProbe,
         latest: Option<String>,
         reregister_result: anyhow::Result<bool>,
+        prune_lines: Vec<String>,
         stopped_before_install: bool,
         reregistered_after_install: bool,
         reconciled_with: Option<bool>,
+        pruned_before_install: Option<bool>,
+        prune_calls: usize,
     }
 
     impl Default for FakeOps {
@@ -438,9 +469,12 @@ mod tests {
                 installed: InstalledProbe::Unprobeable,
                 latest: None,
                 reregister_result: Ok(true),
+                prune_lines: Vec::new(),
                 stopped_before_install: false,
                 reregistered_after_install: false,
                 reconciled_with: None,
+                pruned_before_install: None,
+                prune_calls: 0,
             }
         }
     }
@@ -462,6 +496,13 @@ mod tests {
         }
         fn latest_version(&mut self) -> Option<String> {
             self.latest.clone()
+        }
+        fn prune_registry(&mut self) -> Vec<String> {
+            // Record that the prune ran before any npm install was attempted, so
+            // tests can assert the prune is unconditional and precedes the swap.
+            self.prune_calls += 1;
+            self.pruned_before_install = Some(self.install_calls.is_empty());
+            self.prune_lines.clone()
         }
         fn reregister_clients(&mut self) -> anyhow::Result<bool> {
             self.reregistered_after_install = !self.install_calls.is_empty();
@@ -572,15 +613,45 @@ mod tests {
     fn orchestrate_update_reports_failed_npm_without_reregistering() {
         let mut ops = FakeOps {
             install_result: false,
+            prune_lines: vec!["pruned 1 stale version-registry entry".to_string()],
             ..Default::default()
         };
 
         let err = orchestrate_update("linux", "x86_64", &mut ops)
             .expect_err("failed npm install should be reported");
 
-        assert!(err.to_string().contains("exited unsuccessfully"), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("exited unsuccessfully"), "{msg}");
+        // The new actionable hint for the Windows EBUSY (locked .exe) case.
+        assert!(msg.contains("Close your MCP clients"), "{msg}");
+        // The registry prune must run UNCONDITIONALLY and BEFORE the (blocked) swap,
+        // so a blocked update still cleans cruft.
+        assert_eq!(
+            ops.prune_calls, 1,
+            "prune must run even on a blocked update"
+        );
+        assert_eq!(
+            ops.pruned_before_install,
+            Some(true),
+            "prune must run before the npm swap is attempted"
+        );
         assert!(!ops.reregistered_after_install);
         assert_eq!(ops.reconciled_with, None, "no reconcile on failed install");
+    }
+
+    #[test]
+    fn orchestrate_update_prunes_registry_before_install_on_success() {
+        let mut ops = ok_ops();
+        ops.prune_lines = vec!["pruned 2 stale version-registry entries".to_string()];
+
+        orchestrate_update("linux", "x86_64", &mut ops).expect("update should succeed");
+
+        assert_eq!(ops.prune_calls, 1, "prune runs exactly once");
+        assert_eq!(
+            ops.pruned_before_install,
+            Some(true),
+            "prune precedes the npm swap"
+        );
     }
 
     #[test]
@@ -695,5 +766,137 @@ mod tests {
         assert!(!text.contains("powershell"));
         assert!(!text.contains("cmd /c"));
         assert!(!text.contains("executionpolicy"));
+    }
+
+    // Tests that mutate `SYMFORGE_HOME` serialize on this lock and rely on
+    // `--test-threads=1`, so no concurrent env reader observes the transition.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: set `SYMFORGE_HOME` for the body's duration and restore the
+    /// prior value (set or unset) on drop, so the env mutation never leaks to
+    /// other tests even on panic.
+    struct SymforgeHomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl SymforgeHomeGuard {
+        #[allow(unsafe_code)] // test-only env mutation under ENV_LOCK + --test-threads=1.
+        fn set(value: &std::path::Path) -> Self {
+            let prev = std::env::var_os("SYMFORGE_HOME");
+            // SAFETY: the caller holds ENV_LOCK and the suite runs single-threaded,
+            // so no other thread can read or write the environment concurrently.
+            unsafe { std::env::set_var("SYMFORGE_HOME", value) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for SymforgeHomeGuard {
+        #[allow(unsafe_code)] // test-only env restore under ENV_LOCK + --test-threads=1.
+        fn drop(&mut self) {
+            // SAFETY: see `SymforgeHomeGuard::set`.
+            match &self.prev {
+                Some(prev) => unsafe { std::env::set_var("SYMFORGE_HOME", prev) },
+                None => unsafe { std::env::remove_var("SYMFORGE_HOME") },
+            }
+        }
+    }
+
+    #[test]
+    fn remove_orphan_durable_bin_cleans_under_symforge_home_and_spares_self_exe() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // A retired durable leftover that is NOT the running process binary.
+        let leftover = bin.join("symforge.exe");
+        std::fs::write(&leftover, b"old-7.14.4-binary").unwrap();
+        // An unrelated file that is not in the watched set must be left untouched.
+        let bystander = bin.join("notes.txt");
+        std::fs::write(&bystander, b"keep me").unwrap();
+
+        // Point SYMFORGE_HOME at this temp home: Bug 2 is that the cleanup used to
+        // bail entirely whenever SYMFORGE_HOME was set. It must now run.
+        let _home_guard = SymforgeHomeGuard::set(home.path());
+
+        // Sanity: the running test binary is a real, canonicalizable path and is
+        // NOT inside this temp bin, so the self-exe guard must never delete it.
+        let self_exe = std::env::current_exe().unwrap();
+        assert!(self_exe.exists(), "precondition: running exe exists");
+
+        let summary = remove_orphan_durable_bin();
+
+        assert!(
+            !leftover.exists(),
+            "the retired durable leftover under $SYMFORGE_HOME/bin must be removed"
+        );
+        assert_eq!(summary.len(), 1, "exactly one summary line: {summary:?}");
+        assert!(
+            summary[0].contains("symforge.exe"),
+            "summary names what was removed: {summary:?}"
+        );
+        assert!(bystander.exists(), "an unwatched file must be left alone");
+        // The self-exe guard's invariant: the running process binary still exists.
+        assert!(
+            self_exe.exists(),
+            "the binary backing the running process must never be deleted"
+        );
+    }
+
+    #[test]
+    fn remove_orphan_durable_bin_skips_the_running_binary_when_it_lives_in_the_bin_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Directly exercise the self-exe guard's `continue` branch: place the
+        // running test binary INTO `$SYMFORGE_HOME/bin` under a watched name via a
+        // symlink (so canonicalization resolves it back to the same file, matching
+        // the guard's canonical-path identity check). A plain copy would have a
+        // distinct canonical path and would not be a fair test of the guard.
+        let self_exe = match std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+        {
+            Some(p) => p,
+            None => return, // no canonicalizable current exe — nothing to assert
+        };
+
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let watched = bin.join("symforge.exe");
+
+        if make_symlink(&self_exe, &watched).is_err() {
+            // Symlink creation may require privilege (Windows) — skip rather than
+            // fail; the other durable test still covers the spare-self invariant.
+            return;
+        }
+        // Confirm the link resolves to the running binary, so the guard must skip it.
+        let resolves_to_self =
+            std::fs::canonicalize(&watched).ok().as_deref() == Some(self_exe.as_path());
+        if !resolves_to_self {
+            return;
+        }
+
+        let _home_guard = SymforgeHomeGuard::set(home.path());
+        let summary = remove_orphan_durable_bin();
+
+        assert!(
+            watched.exists() || std::fs::symlink_metadata(&watched).is_ok(),
+            "the entry resolving to the running binary must NOT be removed"
+        );
+        assert!(self_exe.exists(), "the running binary itself must survive");
+        assert!(
+            summary.is_empty(),
+            "nothing should be reported removed: {summary:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn make_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(src, dst)
+    }
+
+    #[cfg(windows)]
+    fn make_symlink(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(src, dst)
     }
 }
