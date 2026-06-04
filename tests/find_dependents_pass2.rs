@@ -395,3 +395,135 @@ pub fn build_{i}() {{
         );
     }
 }
+
+/// SF-001 real-parser regression coverage.
+///
+/// The hand-built-`ReferenceRecord` tests above exercise `find_dependents_for_file`
+/// against synthetic refs. This module closes the one coverage gap the SF-001 audit
+/// surfaced: prove that the REAL parser (`symforge::parsing::process_file`) plus the
+/// real `find_dependents_for_file` query do NOT manufacture a false dependent edge for
+/// a file that shares only generic bare method names (`new`/`get`/`state`) with the
+/// target and has ZERO textual reference to it.
+///
+/// This mirrors the actual Agent_Army_Professionals (AAP) collision the audit hit:
+/// `WorkItemStore` exposes `new`/`get`/`state`; the actor files call `SomeType::new()`,
+/// `.get()`, `.state` on UNRELATED types and never mention `work_item`/`WorkItemStore`.
+mod find_dependents_real_parser {
+    use super::*;
+    use symforge::parsing::process_file;
+
+    /// Parse `content` with the real tree-sitter pipeline and lower the result into
+    /// an `IndexedFile` exactly as the live-index ingest path does
+    /// (`IndexedFile::from_parse_result`), so references/enclosing-symbol indices are
+    /// produced by the parser, not hand-built.
+    fn parsed_indexed_file(relative_path: &str, content: &str) -> IndexedFile {
+        let result = process_file(relative_path, content.as_bytes(), LanguageId::Rust);
+        assert!(
+            !matches!(result.outcome, symforge::domain::FileOutcome::Failed { .. }),
+            "fixture {relative_path} failed to parse: {:?}",
+            result.outcome
+        );
+        IndexedFile::from_parse_result(result, content.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn aap_bare_name_collision_no_false_dependent_with_real_parser() {
+        // Target: a WorkItemStore whose public methods share generic bare names
+        // (`new`, `get`, `state`) with countless unrelated call sites across a repo.
+        let work_item_src = r#"
+pub struct WorkItem {
+    pub id: u64,
+}
+
+pub struct WorkItemStore {
+    items: Vec<WorkItem>,
+    state: u32,
+}
+
+impl WorkItemStore {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            state: 0,
+        }
+    }
+
+    pub fn get(&self, id: u64) -> Option<&WorkItem> {
+        self.items.iter().find(|item| item.id == id)
+    }
+
+    pub fn state(&self) -> u32 {
+        self.state
+    }
+}
+"#;
+
+        // Collider: an actor that calls the SAME bare names (`new`/`get`/`state`) on
+        // UNRELATED types and has ZERO textual reference to work_item/WorkItemStore.
+        let actor_src = r#"
+use std::collections::HashMap;
+
+pub struct ActorState {
+    state: u8,
+}
+
+pub struct Mailbox {
+    inbox: HashMap<u64, String>,
+}
+
+impl Mailbox {
+    pub fn new() -> Self {
+        Mailbox {
+            inbox: HashMap::new(),
+        }
+    }
+
+    pub fn run(&self, actor: &ActorState) -> u8 {
+        let _scratch: Vec<u32> = Vec::new();
+        let _name = String::new();
+        let _maybe = self.inbox.get(&7);
+        actor.state
+    }
+}
+"#;
+
+        let work_item = parsed_indexed_file("src/stores/work_item.rs", work_item_src);
+        let actor = parsed_indexed_file("src/actors/actor.rs", actor_src);
+
+        // Sanity: the parser really did extract the bare-name public methods on the
+        // target, otherwise the collision the test guards against would be vacuous.
+        let target_names: Vec<&str> = work_item.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            target_names.contains(&"new")
+                && target_names.contains(&"get")
+                && target_names.contains(&"state"),
+            "target must expose bare-name methods new/get/state; got {target_names:?}"
+        );
+
+        // Sanity: the collider truly has ZERO textual reference to the target — this is
+        // the structural precondition that makes a dependent edge impossible.
+        let actor_text = String::from_utf8(actor.content.clone()).unwrap();
+        assert!(
+            !actor_text.contains("work_item") && !actor_text.contains("WorkItemStore"),
+            "actor fixture must not textually reference the target"
+        );
+
+        let shared = build_index(vec![
+            ("src/stores/work_item.rs", work_item),
+            ("src/actors/actor.rs", actor),
+        ]);
+        let index = shared.read();
+
+        let refs = dependent_refs_for(&index, "src/stores/work_item.rs");
+
+        let actor_edges: Vec<_> = refs
+            .iter()
+            .filter(|(path, _, _, _)| path.contains("actor.rs"))
+            .collect();
+        assert!(
+            actor_edges.is_empty(),
+            "real-parser bare-name collision (new/get/state) must NOT produce a \
+             work_item.rs dependent edge for actor.rs; got {actor_edges:?}"
+        );
+    }
+}

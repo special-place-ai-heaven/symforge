@@ -2737,6 +2737,68 @@ fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     crate::path_shadow::detect_shadow(&our_binary)
 }
 
+/// Extract the `version=<token>` value emitted on the runtime-status line of a
+/// `health` / `health_compact` report (see `format::format_runtime_status`).
+///
+/// The runtime line is ` | `-delimited, e.g.
+/// `Runtime: mode=... | version=7.18.1 | project_root=...`, and round-2 guarantees
+/// a `version=` token is present in EVERY mode (regression:
+/// `test_runtime_status_includes_binary_version_in_every_mode`). Returns the raw
+/// token (e.g. `"7.18.1"`) or `None` when no such token is present.
+fn extract_runtime_version(health_output: &str) -> Option<&str> {
+    let after = health_output.split("version=").nth(1)?;
+    // The version token runs until the next field separator, whitespace, or EOL.
+    let token = after
+        .split(['|', ' ', '\n', '\r', '\t'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(token)
+}
+
+/// LOUD operations guard (SF-001 / SF-009 root-cause class): when the MCP
+/// front-end is proxying to a daemon, the daemon's reported binary version can be
+/// OLDER than the front-end's own build — a stale/shadowed daemon serving
+/// pre-fix behavior, which is exactly what masked the SF-001 fix during the audit.
+///
+/// Compares the daemon version parsed out of the proxied health report against the
+/// front-end's `frontend_version` (its `env!("CARGO_PKG_VERSION")`). Returns a
+/// warning string ONLY when the daemon version is strictly OLDER than the
+/// front-end. Fail-safe by construction: a missing/unparseable token or an
+/// equal/newer daemon yields `None` (no warning).
+///
+/// Product decision: WARN, do NOT auto-restart. Auto-restarting risks killing a
+/// daemon mid-session for other clients; a loud, idempotent health warning is the
+/// safe, sufficient remedy and tells the operator to reconnect/restart.
+fn daemon_staleness_warning(proxied_health: &str, frontend_version: &str) -> Option<String> {
+    let daemon_version = extract_runtime_version(proxied_health)?;
+
+    // `is_newer_version(latest, current)` is true iff `latest` > `current`. The
+    // daemon is stale exactly when the front-end is newer than the daemon.
+    if !crate::cli::version::is_newer_version(frontend_version, daemon_version) {
+        return None;
+    }
+
+    Some(format!(
+        "\n── \u{26a0} Daemon serving stale code ──\n\
+         The MCP daemon answering this session reports version {daemon_version}, but this\n\
+         front-end is version {frontend_version} (newer). The daemon is serving an OLDER\n\
+         binary, so tool behavior may be stale (this is the operational root cause behind\n\
+         masked fixes such as SF-001). Reconnect your MCP client (e.g. /mcp) or restart the\n\
+         daemon so it picks up the newer binary; this is a WARNING only — no automatic\n\
+         restart is performed."
+    ))
+}
+
+/// Append `daemon_staleness_warning` to a proxied health report when the daemon is
+/// older than the front-end; otherwise return the report unchanged.
+fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version: &str) -> String {
+    if let Some(warning) = daemon_staleness_warning(&proxied_health, frontend_version) {
+        proxied_health.push_str(&warning);
+    }
+    proxied_health
+}
+
 fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &str) -> Vec<String> {
     let mut candidates: Vec<String> = index
         .all_files()
@@ -5171,7 +5233,9 @@ impl SymForgeServer {
     )]
     pub(crate) async fn health(&self) -> String {
         if let Some(result) = self.proxy_tool_call_without_params("health").await {
-            return result;
+            // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
+            // we proxied to is serving an OLDER binary than this front-end.
+            return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
         let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context
@@ -5186,7 +5250,9 @@ impl SymForgeServer {
     )]
     pub(crate) async fn health_compact(&self) -> String {
         if let Some(result) = self.proxy_tool_call_without_params("health_compact").await {
-            return result;
+            // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
+            // we proxied to is serving an OLDER binary than this front-end.
+            return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
 
         let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
@@ -7774,6 +7840,78 @@ mod tests {
             line_range: (line_start, line_end),
             doc_byte_range: None,
         }
+    }
+
+    // ── SF-001 Part 2: daemon served-binary staleness guard ──────────────────
+
+    /// Build a minimal proxied-health string carrying the daemon's runtime
+    /// `version=` token, exactly as `format::format_runtime_status` emits it.
+    fn proxied_health_with_version(daemon_version: &str) -> String {
+        format!(
+            "Runtime: mode=daemon_reused_session | runtime_state=daemon_reused_session | \
+             version={daemon_version} | project_root=/repo | project_id=p | session_id=s | \
+             index_id=i | index_generation=1 | project_generation=1 | load_source=fresh_load | \
+             reset_state=none | index_state=fresh_process"
+        )
+    }
+
+    #[test]
+    fn daemon_staleness_warning_fires_when_daemon_older_than_front_end() {
+        let proxied = proxied_health_with_version("7.17.2");
+        let out = super::append_daemon_staleness_warning(proxied, "7.18.1");
+        assert!(
+            out.contains("Daemon serving stale code"),
+            "older daemon must trigger the staleness warning; got: {out}"
+        );
+        assert!(
+            out.contains("7.17.2"),
+            "warning should name the daemon version"
+        );
+        assert!(
+            out.contains("7.18.1"),
+            "warning should name the front-end version"
+        );
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_versions_equal() {
+        let proxied = proxied_health_with_version("7.18.1");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(
+            out, proxied,
+            "equal versions must not append any staleness warning"
+        );
+        assert!(!out.contains("Daemon serving stale code"));
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_daemon_newer() {
+        let proxied = proxied_health_with_version("7.19.0");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied, "a newer daemon must not be flagged as stale");
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_version_token_absent() {
+        // Fail-safe: a report with no `version=` token yields no warning.
+        let proxied = "Runtime: mode=daemon_reused_session | project_root=/repo".to_string();
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied);
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_version_unparseable() {
+        // Fail-safe: a non-numeric version token cannot be compared, so no warning.
+        let proxied = proxied_health_with_version("unknown");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied);
+    }
+
+    #[test]
+    fn extract_runtime_version_pulls_token_from_runtime_line() {
+        let proxied = proxied_health_with_version("7.17.2");
+        assert_eq!(super::extract_runtime_version(&proxied), Some("7.17.2"));
+        assert_eq!(super::extract_runtime_version("no version here"), None);
     }
 
     fn make_symbol_with_bytes(
