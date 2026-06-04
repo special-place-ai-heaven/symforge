@@ -4020,3 +4020,113 @@ fn test_runtime_status_includes_binary_version_in_every_mode() {
         );
     }
 }
+
+// SF-003: validate_file_syntax_result must report the import-type-array grammar
+// limitation as `Status: ok`, not `Status: partial`.
+
+fn indexed_ts_file(path: &str, source: &[u8]) -> IndexedFile {
+    let result = crate::parsing::process_file(path, source, LanguageId::TypeScript);
+    IndexedFile::from_parse_result(result, source.to_vec())
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_reports_ok_for_import_type_array() {
+    let source = b"class C { private subs: import('rxjs').Subscription[] = []; }";
+    let file = indexed_ts_file("workflow-builder.component.ts", source);
+    // Precondition: tree-sitter still classifies this as a partial parse.
+    assert!(
+        matches!(file.parse_status, ParseStatus::PartialParse { .. }),
+        "precondition: grammar reports a partial parse"
+    );
+
+    let rendered = validate_file_syntax_result("workflow-builder.component.ts", &file);
+    assert!(
+        rendered.contains("Status: ok"),
+        "SF-003 import-type-array must render `Status: ok`, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Status: partial"),
+        "SF-003 import-type-array must NOT render `Status: partial`, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("parser limitation"),
+        "the ok status should carry the parser-limitation note, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_reports_ok_for_type_alias_array() {
+    let source = b"type S = import('rxjs').Subscription[];";
+    let file = indexed_ts_file("types.ts", source);
+    let rendered = validate_file_syntax_result("types.ts", &file);
+    assert!(
+        rendered.contains("Status: ok"),
+        "type-alias import-type-array must render `Status: ok`, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_keeps_partial_for_genuine_error() {
+    // Negative control at the render layer: a genuinely broken file sharing the
+    // import-type-array prefix must still render `Status: partial`.
+    let source = b"class C { private subs: import('rxjs').Subscription[] = [ ; foo bar baz }";
+    let file = indexed_ts_file("broken.ts", source);
+    let rendered = validate_file_syntax_result("broken.ts", &file);
+    assert!(
+        rendered.contains("Status: partial"),
+        "a genuinely broken file must still render `Status: partial`, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Status: ok"),
+        "a genuinely broken file must NOT render `Status: ok`, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_health_excludes_import_type_array_from_unexpected_partials() {
+    let valid = indexed_ts_file(
+        "workflow-builder.component.ts",
+        b"class C { private subs: import('rxjs').Subscription[] = []; }",
+    );
+    let broken = indexed_ts_file(
+        "broken.ts",
+        b"class C { private subs: import('rxjs').Subscription[] = [ ; foo bar baz }",
+    );
+    assert!(
+        matches!(valid.parse_status, ParseStatus::PartialParse { .. }),
+        "precondition: the valid SF-003 file is a partial parse"
+    );
+
+    let index = make_index(vec![
+        ("workflow-builder.component.ts".to_string(), valid),
+        ("broken.ts".to_string(), broken),
+    ]);
+    let stats = index.health_stats();
+
+    // The valid SF-003 file must NOT be flagged as an unexpected repo-owned partial.
+    assert!(
+        !stats
+            .unexpected_partial_parse_files
+            .iter()
+            .any(|p| p == "workflow-builder.component.ts"),
+        "SF-003 valid file must not appear in unexpected_partial_parse_files, got: {:?}",
+        stats.unexpected_partial_parse_files
+    );
+    // It still appears in the partial superset (grammar genuinely returned partial).
+    assert!(
+        stats
+            .partial_parse_files
+            .iter()
+            .any(|p| p == "workflow-builder.component.ts"),
+        "SF-003 valid file should still be in the partial_parse_files superset"
+    );
+    // The genuinely broken file IS still reported as an unexpected partial.
+    assert!(
+        stats
+            .unexpected_partial_parse_files
+            .iter()
+            .any(|p| p == "broken.ts"),
+        "a genuinely broken file must remain an unexpected partial, got: {:?}",
+        stats.unexpected_partial_parse_files
+    );
+}

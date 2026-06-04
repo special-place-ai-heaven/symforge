@@ -129,10 +129,23 @@ fn context_source_authority_label(authority: ContextSourceAuthority) -> &'static
     }
 }
 
-fn parse_state_label(status: &crate::live_index::store::ParseStatus) -> &'static str {
-    match status {
+fn parse_state_label(file: &crate::live_index::store::IndexedFile) -> &'static str {
+    match &file.parse_status {
         crate::live_index::store::ParseStatus::Parsed => "parsed",
-        crate::live_index::store::ParseStatus::PartialParse { .. } => "partial",
+        crate::live_index::store::ParseStatus::PartialParse { .. } => {
+            // SF-003: a partial parse caused only by the tree-sitter-typescript
+            // 0.23.2 import-type-array grammar limitation is valid TypeScript;
+            // surface it as parsed rather than partial in the file-context
+            // envelope (the report's repro surface).
+            if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                &file.language,
+                &file.content,
+            ) {
+                "parsed"
+            } else {
+                "partial"
+            }
+        }
         crate::live_index::store::ParseStatus::Failed { .. } => "degraded",
     }
 }
@@ -361,6 +374,21 @@ fn append_parse_status_lines(
     match &file.parse_status {
         crate::live_index::store::ParseStatus::Parsed => {}
         crate::live_index::store::ParseStatus::PartialParse { warning } => {
+            // SF-003: suppress the partial-parse diagnostic when the only cause
+            // is the known tree-sitter-typescript 0.23.2 import-type-array
+            // grammar limitation (valid TypeScript). Surface a non-alarming note
+            // instead so the file-context envelope does not flag valid source.
+            if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                &file.language,
+                &file.content,
+            ) {
+                lines.push(
+                    "Parse status: ok (parser limitation: tree-sitter-typescript 0.23.2 \
+                     mis-parses an import-type followed by `[]`; source is valid TypeScript)"
+                        .to_string(),
+                );
+                return;
+            }
             lines.push("Parse status: partial".to_string());
             if let Some(diagnostic) = &file.parse_diagnostic {
                 lines.push(format!("Diagnostic: {}", diagnostic.summary()));
@@ -398,7 +426,7 @@ fn outline_text(
 
     let file_bytes = file.byte_len;
     let language = format!("{:?}", file.language);
-    let parse_state = parse_state_label(&file.parse_status);
+    let parse_state = parse_state_label(file);
 
     let include_section = |name: &str| -> bool {
         match &params.sections {
@@ -1239,12 +1267,12 @@ fn symbol_context_text(
     let parse_state = if let Some(path) = params.path.as_deref() {
         guard
             .get_file(path)
-            .map(|file| parse_state_label(&file.parse_status))
+            .map(parse_state_label)
             .unwrap_or_else(|| aggregate_parse_state_label(std::iter::empty(), &published))
     } else if let Some(file) = params.file.as_deref() {
         guard
             .get_file(file)
-            .map(|indexed| parse_state_label(&indexed.parse_status))
+            .map(parse_state_label)
             .unwrap_or_else(|| aggregate_parse_state_label(std::iter::empty(), &published))
     } else {
         aggregate_parse_state_label(

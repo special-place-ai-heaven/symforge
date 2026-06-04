@@ -176,6 +176,15 @@ impl LiveIndex {
                 partial_parse_files.push(path.clone());
                 if is_expected_vendor_partial_parse_noise(path, file, self.gitignore.as_ref()) {
                     expected_vendor_partial_parse_files.push(path.clone());
+                } else if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                    &file.language,
+                    &file.content,
+                ) {
+                    // SF-003: a partial parse caused only by the known
+                    // tree-sitter-typescript 0.23.2 import-type-array grammar
+                    // limitation is valid TypeScript. It stays in the
+                    // `partial_parse_files` superset but is never counted as an
+                    // unexpected repo-owned partial (it is not a real defect).
                 } else {
                     unexpected_partial_parse_files.push(path.clone());
                 }

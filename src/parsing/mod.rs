@@ -292,6 +292,100 @@ pub(crate) fn parse_source(
     Ok((symbols, has_error, diagnostic, references, alias_map))
 }
 
+/// Matches a TypeScript import-type member (`import('mod').Member`) immediately
+/// followed by one or more postfix array suffixes (`[]`), allowing interior
+/// whitespace. Capture group 1 is the scalar import-type member alone; the
+/// trailing array suffixes are replaced with a single space when this is used
+/// as a `${1} ` replacement (token-preserving: never fuses the member with a
+/// following identifier fragment).
+///
+/// This is the construct that `tree-sitter-typescript 0.23.2` mis-parses
+/// (SF-003): scalar `import('rxjs').Subscription` parses clean everywhere, but
+/// the `[]` array suffix breaks the parse.
+static IMPORT_TYPE_ARRAY_SUFFIX_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(import\s*\(\s*['"][^'"]+['"]\s*\)\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*\[\s*\])+"#,
+        )
+        .expect("SF-003 import-type-array regex is a valid pattern")
+    });
+
+/// SF-003: recognize a partial parse whose ONLY cause is the known
+/// `tree-sitter-typescript 0.23.2` grammar limitation on an import-type
+/// immediately followed by a `[]` array suffix (e.g.
+/// `import('rxjs').Subscription[]`).
+///
+/// Soundness — this validates the WHOLE construct, not just the error prefix.
+/// The naive "error node text starts with `import(` and the next char is `[`"
+/// heuristic is UNSOUND: a genuinely broken file such as
+/// `import('rxjs').Subscription[] = [ ; foo bar` produces a byte-identical
+/// error node, so a prefix check would wrongly mark it clean.
+///
+/// Instead we neutralize only the suspected limitation and re-parse the whole
+/// file: replace the `[]` array suffix on every import-type member with a single
+/// space (leaving the scalar import-type, which parses clean in every position)
+/// and re-parse. The replacement is a SPACE rather than a deletion so it is
+/// token-preserving: deleting an empty `[]` between an import-type member and a
+/// trailing identifier fragment (`import('x').Sub[]scription`) would glue them
+/// into one valid identifier and falsely excuse a broken file; a space keeps
+/// them as two tokens, so the broken file stays broken.
+/// We return `true` iff:
+///   1. the language is TypeScript, AND
+///   2. the original source genuinely has a parse error, AND
+///   3. at least one import-type-array construct is present (the regex matched),
+///      AND
+///   4. after stripping ONLY those array suffixes the file parses completely
+///      clean (no ERROR/MISSING node anywhere).
+///
+/// Because the transform changes nothing but the array suffix (replaced by a
+/// single space), a clean re-parse proves the array suffix was the SOLE cause of
+/// the error. Any unrelated error elsewhere keeps the transformed parse dirty, so
+/// a genuinely broken file stays classified as a partial parse.
+pub(crate) fn is_expected_typescript_import_type_array_limitation(
+    language: &LanguageId,
+    content: &[u8],
+) -> bool {
+    if !matches!(language, LanguageId::TypeScript) {
+        return false;
+    }
+
+    let source = String::from_utf8_lossy(content);
+
+    // The construct must actually be present; otherwise this limitation is not
+    // what we are looking at.
+    if !IMPORT_TYPE_ARRAY_SUFFIX_RE.is_match(&source) {
+        return false;
+    }
+
+    // Defensive: only meaningful for files that genuinely failed to parse. If
+    // the original parses clean there is no limitation to excuse.
+    let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
+        Ok(Ok((_, has_error, _, _, _))) => has_error,
+        _ => return false,
+    };
+    if !original_has_error {
+        return false;
+    }
+
+    // Neutralize ONLY the array suffix on import-type members, then re-parse the
+    // whole file. A clean re-parse proves the array suffix was the sole cause.
+    //
+    // The `[]` run is replaced with a SINGLE SPACE (not deleted) so the
+    // neutralization is token-preserving. Deleting an empty `[]` between an
+    // import-type member and a trailing identifier fragment would GLUE them into
+    // a single valid identifier (e.g. `import('x').Sub[]scription` ->
+    // `import('x').Subscription`), making a genuinely broken file re-parse clean
+    // and be falsely excused. A space keeps `Sub[]scription` as two tokens
+    // (`Sub scription`, still broken) while the legitimate `Subscription[]`
+    // becomes `Subscription ` (a scalar import-type with trailing whitespace,
+    // still clean). Multi-dim `[][]` is one match, replaced by one space.
+    let neutralized = IMPORT_TYPE_ARRAY_SUFFIX_RE.replace_all(&source, "${1} ");
+    match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+        Ok(Ok((_, has_error, _, _, _))) => !has_error,
+        _ => false,
+    }
+}
+
 /// Extract symbol name → body-hash pairs from source code using tree-sitter.
 ///
 /// Used by `diff_symbols` to compare symbol-level changes between git refs.
@@ -389,6 +483,159 @@ mod tests {
             .find(|s| s.kind == SymbolKind::Interface);
         assert!(interface.is_some());
         assert_eq!(interface.unwrap().name, "Greeter");
+    }
+
+    // SF-003: tree-sitter-typescript 0.23.2 mis-parses an import-type immediately
+    // followed by `[]` (valid TS). The detector must recognize this known grammar
+    // limitation WITHOUT over-broadening to mask genuine syntax errors.
+
+    #[test]
+    fn test_sf003_class_field_import_type_array_is_expected_limitation() {
+        // The exact reported repro shape: `private subs: import('rxjs').Subscription[] = [];`
+        let source = b"class C { private subs: import('rxjs').Subscription[] = []; }";
+        let result = process_file(
+            "workflow-builder.component.ts",
+            source,
+            LanguageId::TypeScript,
+        );
+        // tree-sitter still flags it as a partial parse...
+        assert!(
+            matches!(result.outcome, FileOutcome::PartialParse { .. }),
+            "expected grammar still reports a partial parse for the limitation case"
+        );
+        // ...but the SF-003 detector recognizes it as the known grammar limitation.
+        assert!(
+            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "class-field import-type-array must be recognized as an expected grammar limitation"
+        );
+        // Symbols are still extracted (the class `C` is present).
+        assert!(
+            result.symbols.iter().any(|s| s.name == "C"),
+            "class symbol C must still be extracted despite the partial parse"
+        );
+    }
+
+    #[test]
+    fn test_sf003_type_alias_import_type_array_is_expected_limitation() {
+        // The variant a naive `[`-prefix detector would miss (the error node here is
+        // a MISSING `;`, not the import-type itself).
+        let source = b"type S = import('rxjs').Subscription[];";
+        let result = process_file("types.ts", source, LanguageId::TypeScript);
+        assert!(
+            matches!(result.outcome, FileOutcome::PartialParse { .. }),
+            "type-alias import-type-array still reports a partial parse"
+        );
+        assert!(
+            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "type-alias import-type-array must be recognized as an expected grammar limitation"
+        );
+    }
+
+    #[test]
+    fn test_sf003_multidim_import_type_array_is_expected_limitation() {
+        let source = b"type S = import('rxjs').Subscription[][];";
+        assert!(
+            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "multi-dimensional import-type-array must be recognized as an expected limitation"
+        );
+    }
+
+    #[test]
+    fn test_sf003_negative_control_genuinely_broken_array_stays_partial() {
+        // REQUIRED negative control: a genuinely broken file that begins with the
+        // SAME import-type-array prefix (byte-identical error node) MUST NOT be
+        // excused. This proves the detector validates the WHOLE construct, not just
+        // the error-node prefix.
+        let source = b"class C { private subs: import('rxjs').Subscription[] = [ ; foo bar baz }";
+        let result = process_file("broken.ts", source, LanguageId::TypeScript);
+        assert!(
+            matches!(result.outcome, FileOutcome::PartialParse { .. }),
+            "the genuinely broken file is a partial parse"
+        );
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "a genuinely broken file sharing the import-type-array prefix MUST stay partial"
+        );
+    }
+
+    #[test]
+    fn test_sf003_negative_control_identifier_glue_stays_partial() {
+        // SOUNDNESS REGRESSION (glue bypass): a genuinely broken file where an
+        // EMPTY `[]` sits between an import-type member and a trailing identifier
+        // fragment. A token-destroying neutralization (deleting the `[]`) would
+        // fuse `Sub[]scription` into the valid identifier `Subscription` and falsely
+        // re-parse clean. The token-preserving (space) neutralization keeps it as
+        // `Sub scription` (two tokens), so it stays partial and is NOT excused.
+        let source = b"type S = import('x').Sub[]scription;";
+        let result = process_file("glue-type-alias.ts", source, LanguageId::TypeScript);
+        assert!(
+            matches!(result.outcome, FileOutcome::PartialParse { .. }),
+            "the genuinely broken identifier-glue file is a partial parse"
+        );
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "deleting `[]` would glue `Sub[]scription` into a valid identifier; the \
+             token-preserving neutralization must keep this broken file partial"
+        );
+    }
+
+    #[test]
+    fn test_sf003_negative_control_identifier_glue_class_field_stays_partial() {
+        // Same glue bypass in a class-field position (the reported repro shape):
+        // `import('rxjs').Sub[]scription` must NOT be excused.
+        let source = b"class C { private a: import('rxjs').Sub[]scription = x; }";
+        let result = process_file("glue-class-field.ts", source, LanguageId::TypeScript);
+        assert!(
+            matches!(result.outcome, FileOutcome::PartialParse { .. }),
+            "the genuinely broken class-field identifier-glue file is a partial parse"
+        );
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "a class-field import-type member glued to a trailing identifier fragment \
+             must stay partial under the token-preserving neutralization"
+        );
+    }
+
+    #[test]
+    fn test_sf003_negative_control_unrelated_syntax_error_stays_partial() {
+        // A plain malformed class with no import-type-array at all stays partial.
+        let source = b"class C { private x: = ; }";
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "an unrelated syntax error must not be excused as an import-type-array limitation"
+        );
+    }
+
+    #[test]
+    fn test_sf003_negative_control_valid_array_plus_real_error_stays_partial() {
+        // A valid import-type-array PLUS a separate real error elsewhere: neutralizing
+        // the array suffix does NOT make the file clean, so it stays partial. The
+        // detector never masks the real defect.
+        let source = b"type S = import('rxjs').Subscription[]; class C { private x: = ; }";
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "a real error elsewhere must keep the file partial even when an import-type-array is present"
+        );
+    }
+
+    #[test]
+    fn test_sf003_detector_is_typescript_gated() {
+        // The detector only applies to TypeScript. Other languages are never excused.
+        let source = b"type S = import('rxjs').Subscription[];";
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::JavaScript, source),
+            "the import-type-array limitation detector must be TypeScript-gated"
+        );
+    }
+
+    #[test]
+    fn test_sf003_detector_false_on_clean_typescript() {
+        // A clean TS file with no import-type-array is never flagged as the limitation.
+        let source = b"type S = import('rxjs').Subscription;";
+        assert!(
+            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            "clean scalar import-type must not be classified as a limitation"
+        );
     }
 
     #[test]
