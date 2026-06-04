@@ -131,6 +131,28 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
         );
     }
 
+    // --- Pattern: "find file X" or "path to X" ---
+    // NOTE: this MUST precede the bare "where is " FindSymbol branch below so
+    // that "where is file tools.rs" routes to FindFile, not to a FindSymbol
+    // whose leading token would be "file".
+    if let Some(hint) = strip_prefix_phrase(
+        &lower,
+        &[
+            "find file ",
+            "path to ",
+            "where is file ",
+            "locate file ",
+            "which file ",
+        ],
+    ) {
+        return (
+            QueryIntent::FindFile {
+                hint: hint.to_string(),
+            },
+            true,
+        );
+    }
+
     // --- Pattern: "where is X defined" or "find symbol X" or "definition of X" ---
     if let Some(name) = strip_prefix_phrase(
         &lower,
@@ -156,32 +178,25 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
         let name = name
             .trim_end_matches(" defined")
             .trim_end_matches(" declaration");
-        let (kind, clean_name) = extract_kind_hint(name);
+        // Handle interior articles ("where is the User class defined") that
+        // strip_leading_articles could not reach before the prefix matched.
+        let name = strip_leading_articles(name);
+        let (kind, after_kind) = extract_kind_hint(name);
+        // A symbol is a single whitespace-delimited token. Take the first one
+        // as the candidate. If the query carried more than that token — e.g. a
+        // compound lookup like "X defined and what module imports it?" — the
+        // extra words are NOT part of the symbol; downgrade routing confidence
+        // (matched_prefix=false) so assess_route reports `Inferred` and chains a
+        // follow-up hint instead of a confident false negative.
+        let mut tokens = after_kind.split_whitespace();
+        let first = tokens.next().unwrap_or(after_kind);
+        let truncated = tokens.next().is_some();
         return (
             QueryIntent::FindSymbol {
-                name: clean_symbol_name(clean_name, q),
+                name: clean_symbol_name(first, q),
                 kind,
             },
-            true,
-        );
-    }
-
-    // --- Pattern: "find file X" or "path to X" ---
-    if let Some(hint) = strip_prefix_phrase(
-        &lower,
-        &[
-            "find file ",
-            "path to ",
-            "where is file ",
-            "locate file ",
-            "which file ",
-        ],
-    ) {
-        return (
-            QueryIntent::FindFile {
-                hint: hint.to_string(),
-            },
-            true,
+            !truncated,
         );
     }
 
@@ -352,7 +367,7 @@ pub fn assess_route(intent: &QueryIntent, matched_prefix: bool) -> RouteAssessme
                     confidence: RouteConfidence::Inferred,
                     rationale: "inferred a symbol lookup from a symbol-like query",
                     suggested_next_step: Some(
-                        "If this route looks wrong, call `search_files` for paths or `search_text` for literal text instead.",
+                        "Chain `search_symbols -> find_references` to locate the definition and then who imports or calls it. If the route looks wrong, call `search_files` for paths or `search_text` for literal text instead.",
                     ),
                 }
             }
@@ -854,6 +869,93 @@ mod tests {
         let (intent, matched_prefix) = classify_intent_with_match("LiveIndex");
         assert!(!matched_prefix);
         assert!(matches!(intent, QueryIntent::FindSymbol { .. }));
+    }
+
+    #[test]
+    fn test_classify_intent_compound_lookup_extracts_leading_token() {
+        // SF-005: a compound lookup must extract only the leading symbol token and
+        // downgrade routing confidence (matched_prefix=false) so the route is
+        // reported as `Inferred`, not a confident false negative.
+        let (intent, matched_prefix) = classify_intent_with_match(
+            "Where is TestingController defined and what module imports it?",
+        );
+        match &intent {
+            QueryIntent::FindSymbol { name, .. } => {
+                assert_eq!(
+                    name, "TestingController",
+                    "leading token only; intent: {intent:?}"
+                );
+            }
+            other => panic!("expected FindSymbol, got {other:?}"),
+        }
+        // Assert BOTH the name AND the truncation signal: matched_prefix must be
+        // false so assess_route downgrades Exact -> Inferred.
+        assert!(
+            !matched_prefix,
+            "compound lookup truncated extra tokens, so confidence must be downgraded"
+        );
+        let assessment = assess_route(&intent, matched_prefix);
+        assert_eq!(assessment.confidence, RouteConfidence::Inferred);
+        let next = assessment
+            .suggested_next_step
+            .expect("downgraded route must chain a follow-up hint");
+        assert!(
+            next.contains("search_symbols") && next.contains("find_references"),
+            "next step must name the chained sequence: {next}"
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_clean_single_symbol_lookup_stays_exact() {
+        // A clean single-symbol lookup with a trailing suffix word must still
+        // extract the symbol AND keep Exact confidence (nothing was truncated).
+        let (intent, matched_prefix) =
+            classify_intent_with_match("where is optimize_deterministic defined");
+        match &intent {
+            QueryIntent::FindSymbol { name, .. } => {
+                assert_eq!(name, "optimize_deterministic");
+            }
+            other => panic!("expected FindSymbol, got {other:?}"),
+        }
+        assert!(matched_prefix, "single token, no truncation -> stays Exact");
+        assert_eq!(
+            assess_route(&intent, matched_prefix).confidence,
+            RouteConfidence::Exact
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_interior_article_and_kind() {
+        // SF-005: "where is the User class defined" — interior article + trailing
+        // suffix + kind-as-suffix. Leading-token extraction after article stripping
+        // must yield "User", and the leftover words must downgrade confidence.
+        let (intent, matched_prefix) =
+            classify_intent_with_match("where is the User class defined");
+        match &intent {
+            QueryIntent::FindSymbol { name, .. } => {
+                assert_eq!(
+                    name, "User",
+                    "interior article stripped; intent: {intent:?}"
+                );
+            }
+            other => panic!("expected FindSymbol, got {other:?}"),
+        }
+        assert!(
+            !matched_prefix,
+            "the trailing 'class' word is not part of the symbol -> Inferred"
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_where_is_file_routes_to_find_file() {
+        // SF-005 guard: after reordering "where is file " ahead of bare "where is ",
+        // a file lookup must route to FindFile, not FindSymbol with name "file".
+        let (intent, matched_prefix) = classify_intent_with_match("where is file tools.rs");
+        assert!(matched_prefix);
+        match &intent {
+            QueryIntent::FindFile { hint } => assert_eq!(hint, "tools.rs"),
+            other => panic!("expected FindFile, got {other:?}"),
+        }
     }
 
     #[test]

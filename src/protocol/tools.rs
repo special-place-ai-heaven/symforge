@@ -19886,6 +19886,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ask_compound_lookup_extracts_leading_symbol() {
+        // SF-005: a compound lookup like "Where is X defined and what module
+        // imports it?" must route to search_symbols with ONLY the leading symbol
+        // token, report `inferred` confidence (not a confident false negative), and
+        // chain a follow-up hint naming search_symbols -> find_references.
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("controller.ts"),
+            b"class TestingController {}\n",
+        )
+        .unwrap();
+
+        let mut indexed = make_file(
+            "src/controller.ts",
+            b"class TestingController {}\n",
+            vec![make_symbol("TestingController", SymbolKind::Class, 1, 1)],
+        );
+        indexed.1.language = LanguageId::TypeScript;
+        let server = make_server_with_root(
+            make_live_index_ready(vec![indexed]),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let input = super::SmartQueryInput {
+            query: "Where is TestingController defined and what module imports it?".to_string(),
+            max_tokens: None,
+        };
+        let result = server.ask(Parameters(input)).await;
+
+        assert!(
+            result.contains("Route confidence: inferred"),
+            "compound lookup must downgrade to inferred, not exact: {result}"
+        );
+        assert!(
+            result.contains("Chosen tool: search_symbols"),
+            "result: {result}"
+        );
+        assert!(
+            result.contains("Invocation: search_symbols(query=\"TestingController\")"),
+            "invocation must echo the leading symbol token only: {result}"
+        );
+        assert!(
+            !result.contains("imports it"),
+            "the trailing clause must not leak into the symbol query: {result}"
+        );
+        assert!(
+            result.contains("Suggested next step:"),
+            "downgraded route must chain a follow-up hint: {result}"
+        );
+        assert!(
+            result.contains("search_symbols -> find_references"),
+            "follow-up hint must name the chained sequence: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ask_reports_fallback_route_confidence() {
         let server = make_server(make_live_index_ready(vec![]));
         let input = super::SmartQueryInput {
