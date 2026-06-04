@@ -53,6 +53,14 @@ pub struct HealthStats {
     /// Reason the index is empty at startup (e.g. no safe root, auto-index off).
     /// Surfaced as a banner in `health` output so MCP clients see why no symbols loaded.
     pub local_empty_reason: Option<String>,
+    /// SF-009: number of Tier-1 (recognized-extension, symbol-bearing) indexed
+    /// files that are NOT git-tracked AND NOT gitignored. Surfaced so a user can
+    /// SEE when the index holds non-version-controlled scratch source without
+    /// changing what gets admitted. FAILS OPEN to `0` when there is no git
+    /// repository / no readable index (so a non-git tempdir does not report
+    /// every file as untracked). Computed via the git index (`git ls-files`
+    /// semantics), NOT the `ignore` crate, which has no tracked-files concept.
+    pub untracked_indexed: usize,
 }
 
 pub const EXPECTED_VENDOR_PARTIAL_PARSE_REASON: &str =
@@ -215,6 +223,58 @@ impl LiveIndex {
         self.loaded_at_system
     }
 
+    /// SF-009: count Tier-1 indexed files that are NOT git-tracked AND NOT
+    /// gitignored — i.e. recognized-extension source files that have been admitted
+    /// into the index but are not under version control. Surfacing only; this does
+    /// NOT change admission.
+    ///
+    /// **Fails open to `0`** when:
+    ///   - the index has no recorded root (`indexed_root` is `None`), or
+    ///   - no git repository is discoverable from that root, or
+    ///   - the git index cannot be read (e.g. a freshly `git init`-ed repo with no
+    ///     index yet).
+    ///
+    /// Without this fail-open, every file in a non-git working tree would count as
+    /// "untracked", which is noise, not signal. The tracked set is derived from the
+    /// git index (`git ls-files` semantics) via [`crate::git::GitRepo`], NOT the
+    /// `ignore` crate — the `ignore` crate models gitignore rules but has no concept
+    /// of which files are tracked.
+    ///
+    /// Covers BOTH discovery paths uniformly: it reads `self.files` (the Tier-1
+    /// population) regardless of whether the index was built by `LiveIndex::load`
+    /// (`discover_all_files`) or the watcher's `build_reload_data`
+    /// (`discover_files`). The two paths admit different Tier-2 populations, but the
+    /// Tier-1 set this count inspects lives in `self.files` either way.
+    fn count_untracked_indexed(&self) -> usize {
+        // Fail open: no recorded root means we cannot anchor a git lookup.
+        let Some(root) = self.indexed_root.as_ref() else {
+            return 0;
+        };
+
+        // Fail open: no git repo discoverable, or no readable index.
+        let Ok(git_repo) = crate::git::GitRepo::open(root) else {
+            return 0;
+        };
+        let Ok(tracked) = git_repo.tracked_paths() else {
+            return 0;
+        };
+
+        // Empty tracked set: treat as fail-open. A repo with a readable but empty
+        // index (no committed/staged files) would otherwise flag every indexed file
+        // as untracked, which is the every-file-counts failure mode we avoid.
+        if tracked.is_empty() {
+            return 0;
+        }
+
+        let tracked_set: std::collections::HashSet<&str> =
+            tracked.iter().map(|p| p.as_str()).collect();
+
+        self.files
+            .keys()
+            .filter(|path| !tracked_set.contains(path.as_str()) && !self.is_path_gitignored(path))
+            .count()
+    }
+
     /// Compute health statistics for the index.
     ///
     /// Watcher fields are populated with safe defaults (Off state, zero counts).
@@ -312,6 +372,7 @@ impl LiveIndex {
             failed_files,
             tier_counts: self.tier_counts(),
             local_empty_reason: self.local_empty_reason(),
+            untracked_indexed: self.count_untracked_indexed(),
         }
     }
 

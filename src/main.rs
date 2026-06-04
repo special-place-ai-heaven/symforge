@@ -459,6 +459,7 @@ mod tests {
             is_empty: false,
             tier_counts: (0, 0, 0),
             local_empty_reason: None,
+            untracked_indexed: 0,
             indexed_root: None,
         }
     }

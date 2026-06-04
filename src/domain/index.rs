@@ -486,6 +486,11 @@ pub enum SkipReason {
     DenylistedExtension,
     SizeThreshold,
     BinaryContent,
+    /// SF-009: file demoted to Tier-2 because it is not git-tracked, under the
+    /// opt-in `SYMFORGE_EXCLUDE_UNTRACKED` policy (default OFF). Only minted when
+    /// that env gate is explicitly enabled; the default admission path never
+    /// produces this reason, so admission defaults are unchanged.
+    Untracked,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -495,6 +500,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::DenylistedExtension => write!(f, "artifact"),
             SkipReason::SizeThreshold => write!(f, ">1MB"),
             SkipReason::BinaryContent => write!(f, "binary"),
+            SkipReason::Untracked => write!(f, "untracked"),
         }
     }
 }

@@ -821,6 +821,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         ],
         tier_counts: (4, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -881,6 +882,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -941,6 +943,7 @@ fn test_health_report_lists_partial_parse_files() {
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -996,6 +999,7 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
 
@@ -1054,6 +1058,7 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
 
@@ -1107,6 +1112,7 @@ fn test_health_report_caps_partial_list_at_10() {
         failed_files: vec![],
         tier_counts: (50, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1151,6 +1157,7 @@ fn test_health_report_shows_tier_breakdown() {
         failed_files: vec![],
         tier_counts: (8200, 1280, 20),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1201,6 +1208,7 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         failed_files: vec![],
         tier_counts: (1, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
 
     let report = health_report_from_stats("Ready", &stats, 0);
@@ -1239,6 +1247,7 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         local_empty_reason: Some(
             "no safe project root found — starting with empty index".to_string(),
         ),
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1295,6 +1304,7 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1343,6 +1353,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -1396,6 +1407,7 @@ mod health_report_consistency {
             is_empty: false,
             tier_counts: (100, 0, 0),
             local_empty_reason: None,
+            untracked_indexed: 0,
             indexed_root: None,
         }
     }
@@ -1431,6 +1443,7 @@ mod health_report_consistency {
             failed_files: published.failed_files.clone(),
             tier_counts: published.tier_counts,
             local_empty_reason: published.local_empty_reason.clone(),
+            untracked_indexed: published.untracked_indexed,
         }
     }
 
@@ -1611,6 +1624,7 @@ fn health_renders_rejected_stale_mutations_counter() {
         is_empty: false,
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {

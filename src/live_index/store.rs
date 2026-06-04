@@ -563,6 +563,11 @@ pub struct PublishedIndexState {
     /// Reason the index is empty at startup (LocalEmpty branch). Surfaced as
     /// a banner in `health` output. `None` when the index has files.
     pub local_empty_reason: Option<String>,
+    /// SF-009: count of Tier-1 indexed files that are NOT git-tracked AND NOT
+    /// gitignored. Carried across the daemon-proxy boundary (no serde) so
+    /// proxied health reports the same "indexed untracked files: N" surfacing.
+    /// Fails open to `0` (see `HealthStats::untracked_indexed`).
+    pub untracked_indexed: usize,
     /// Normalized filesystem root the published index was built from. `None`
     /// for an empty bootstrap index. Read by `SymForgeServer::ensure_local_index`
     /// to detect a project switch (root mismatch) and force a fresh reload, so
@@ -1192,6 +1197,7 @@ impl PublishedIndexState {
             is_empty: index.is_empty,
             tier_counts: stats.tier_counts,
             local_empty_reason: stats.local_empty_reason,
+            untracked_indexed: stats.untracked_indexed,
             indexed_root: index.indexed_root.clone(),
         }
     }
@@ -1308,6 +1314,16 @@ impl LiveIndex {
             "discovered {} total files (pre-admission)",
             all_entries.len()
         );
+
+        // SF-009 opt-in: when `SYMFORGE_EXCLUDE_UNTRACKED` is enabled, compute
+        // the git-tracked path set so recognized-extension files that are not
+        // under version control can be demoted to Tier-2 below. `None` (the
+        // default, and the fail-open result for non-git trees) means "demote
+        // nothing", so admission defaults are unchanged. Files reaching the
+        // admission gate are already non-gitignored (the `ignore`-crate walk in
+        // `discover_all_files` prunes gitignored paths), so an untracked check
+        // alone is sufficient here.
+        let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
         // 2. Run admission gate in parallel.
         //    For files that pass Tier-1 initially (size/extension checks), we read content
@@ -1470,14 +1486,39 @@ impl LiveIndex {
                             };
                             Some(AdmissionOutcome::Skip(sf))
                         }
-                        AdmissionTier::Normal => Some(AdmissionOutcome::Parse(ParseCandidate {
-                            relative_path: entry.relative_path.clone(),
-                            language,
-                            classification: entry.classification,
-                            bytes,
-                            mtime_secs,
-                            file_size: entry.file_size,
-                        })),
+                        AdmissionTier::Normal => {
+                            // SF-009 opt-in demotion: if the exclude-untracked
+                            // policy is active and this recognized-extension file
+                            // is NOT git-tracked, demote it to Tier-2 instead of
+                            // parsing it. Default (`None`) skips this entirely.
+                            if let Some(tracked) = exclude_untracked_set.as_ref()
+                                && !tracked.contains(&entry.relative_path)
+                            {
+                                drop(bytes);
+                                let sf = SkippedFile {
+                                    path: entry.relative_path.clone(),
+                                    size: entry.file_size,
+                                    extension: entry
+                                        .absolute_path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|s| s.to_string()),
+                                    decision: crate::domain::index::AdmissionDecision::skip(
+                                        AdmissionTier::MetadataOnly,
+                                        crate::domain::index::SkipReason::Untracked,
+                                    ),
+                                };
+                                return Some(AdmissionOutcome::Skip(sf));
+                            }
+                            Some(AdmissionOutcome::Parse(ParseCandidate {
+                                relative_path: entry.relative_path.clone(),
+                                language,
+                                classification: entry.classification,
+                                bytes,
+                                mtime_secs,
+                                file_size: entry.file_size,
+                            }))
+                        }
                     }
                 })
                 .collect()
@@ -1717,11 +1758,30 @@ impl LiveIndex {
         let discovered = discovery::discover_files(root)?;
         info!("discovered {} source files", discovered.len());
 
+        // SF-009 opt-in: compute the git-tracked set so untracked
+        // recognized-extension files can be demoted out of Tier-1 below.
+        // `None` (default + fail-open for non-git trees) means "keep
+        // everything", so admission defaults are unchanged. This is the watcher
+        // incremental path (`discover_files`, which hard-filters on extension
+        // before tiering); it records no Tier-2 metadata, so a demoted file is
+        // simply not parsed here. The `untracked_indexed` health count derives
+        // from `self.files`, so excluded files correctly drop out of the count
+        // on both discovery paths.
+        let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
+
         // 2. Parse all files in parallel via Rayon
         let parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
             discovered
                 .par_iter()
                 .filter_map(|df| {
+                    // SF-009 opt-in: skip parsing untracked recognized-extension
+                    // files when the exclude-untracked policy is active. `None`
+                    // (default) keeps every file.
+                    if let Some(tracked) = exclude_untracked_set.as_ref()
+                        && !tracked.contains(&df.relative_path)
+                    {
+                        return None;
+                    }
                     let bytes = match std::fs::read(&df.absolute_path) {
                         Ok(b) => b,
                         Err(e) => {
@@ -3578,6 +3638,262 @@ mod tests {
             trip_sorted, trip_unsorted,
             "unsorted order should trip at a different (earlier) path, proving sort is needed"
         );
+    }
+
+    /// SF-009: surfacing of indexed-but-untracked files, and the opt-in
+    /// exclude-untracked admission policy. The mechanism in the original bug report
+    /// (text scratch files inflating symbol counts) is REFUTED — these tests both
+    /// document that the reported bug does not reproduce and exercise the real
+    /// surfacing fix.
+    mod sf009_untracked_surfacing {
+        use super::*;
+        use crate::discovery::{self, EXCLUDE_UNTRACKED_ENV};
+        use std::process::Command;
+
+        /// Serialize all tests that touch the process-global
+        /// `SYMFORGE_EXCLUDE_UNTRACKED` env var.
+        static EXCLUDE_UNTRACKED_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+        /// RAII guard for the process-global `SYMFORGE_EXCLUDE_UNTRACKED` env var.
+        /// Restores the previous value on drop so the flag never leaks across tests.
+        /// Callers must hold `EXCLUDE_UNTRACKED_ENV_LOCK` for the guard's lifetime.
+        struct ExcludeUntrackedEnvGuard {
+            previous: Option<String>,
+        }
+
+        #[allow(unsafe_code)] // test-only env guard serializes the exclude-untracked flag.
+        impl ExcludeUntrackedEnvGuard {
+            fn set(value: Option<&str>) -> Self {
+                let previous = std::env::var(EXCLUDE_UNTRACKED_ENV).ok();
+                // SAFETY: callers hold EXCLUDE_UNTRACKED_ENV_LOCK; these tests run single-threaded.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(EXCLUDE_UNTRACKED_ENV, v),
+                        None => std::env::remove_var(EXCLUDE_UNTRACKED_ENV),
+                    }
+                }
+                Self { previous }
+            }
+
+            /// Set the live env var to `value` WITHOUT changing the saved
+            /// original, so restore-on-drop stays correct across phase
+            /// transitions.
+            fn apply(&self, value: Option<&str>) {
+                // SAFETY: callers hold EXCLUDE_UNTRACKED_ENV_LOCK; these tests run single-threaded.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(EXCLUDE_UNTRACKED_ENV, v),
+                        None => std::env::remove_var(EXCLUDE_UNTRACKED_ENV),
+                    }
+                }
+            }
+        }
+
+        #[allow(unsafe_code)] // test-only env guard restores the serialized exclude-untracked flag.
+        impl Drop for ExcludeUntrackedEnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: callers hold EXCLUDE_UNTRACKED_ENV_LOCK; these tests run single-threaded.
+                unsafe {
+                    match self.previous.as_deref() {
+                        Some(v) => std::env::set_var(EXCLUDE_UNTRACKED_ENV, v),
+                        None => std::env::remove_var(EXCLUDE_UNTRACKED_ENV),
+                    }
+                }
+            }
+        }
+
+        fn git(root: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git command should run");
+            assert!(
+                status.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+
+        fn init_repo(root: &Path) {
+            git(root, &["init"]);
+            git(root, &["config", "user.email", "test@test.com"]);
+            git(root, &["config", "user.name", "Test"]);
+        }
+
+        /// Documents that the report's stated mechanism does NOT reproduce:
+        /// a dotfile scratch file is filtered by the `ignore` crate's default
+        /// `hidden:true` BEFORE admission, and an unknown-extension text file is
+        /// Tier-2 metadata-only with zero symbols.
+        #[test]
+        fn report_bug_does_not_reproduce_dotfile_filtered_unknown_ext_tier2() {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            write_file(tmp.path(), "src/main.rs", "fn main() {}");
+            write_file(tmp.path(), "notes.txt", "scratch notes, unknown ext");
+            write_file(tmp.path(), ".probe.txt", "dotfile scratch");
+            git(tmp.path(), &["add", "src/main.rs", "notes.txt"]);
+            git(tmp.path(), &["commit", "-m", "init"]);
+
+            let entries = discovery::discover_all_files(tmp.path()).unwrap();
+            let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+            // The dotfile is filtered by the `ignore` crate before admission.
+            assert!(
+                !paths.contains(&".probe.txt"),
+                "dotfile must be filtered before admission (report bug does not reproduce): {paths:?}"
+            );
+            // The unknown-extension text file is discovered but has no language.
+            let notes = entries
+                .iter()
+                .find(|e| e.relative_path == "notes.txt")
+                .expect("notes.txt should be discovered");
+            assert!(
+                notes.language.is_none(),
+                "unknown-extension .txt maps to no language (Tier-2 metadata-only, 0 symbols)"
+            );
+
+            // And once loaded, the .txt contributes 0 symbols and is not Tier-1.
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let index = shared.read();
+            assert!(
+                !index.files.contains_key("notes.txt"),
+                "unknown-extension text file must not be a Tier-1 indexed file"
+            );
+        }
+
+        /// A non-dotfile untracked recognized-extension source file is surfaced as
+        /// `untracked_indexed == 1` and rendered in the health line.
+        #[test]
+        fn untracked_recognized_ext_file_is_surfaced() {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            write_file(tmp.path(), "src/main.rs", "fn main() {}");
+            git(tmp.path(), &["add", "src/main.rs"]);
+            git(tmp.path(), &["commit", "-m", "init"]);
+            // Untracked recognized-extension source (NOT git-added).
+            write_file(tmp.path(), "scratch.rs", "fn scratch() {}");
+
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let index = shared.read();
+            let stats = index.health_stats();
+
+            assert_eq!(
+                stats.untracked_indexed, 1,
+                "exactly one untracked recognized-ext indexed file expected"
+            );
+
+            let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
+            assert!(
+                report.contains("indexed untracked files: 1"),
+                "health line should surface the untracked count: {report}"
+            );
+        }
+
+        /// FAIL-OPEN: a plain tempdir with NO git repository must report
+        /// `untracked_indexed == 0` — NOT every-file-counts.
+        #[test]
+        fn fail_open_no_git_repo_reports_zero() {
+            let tmp = TempDir::new().unwrap();
+            // No `git init`. Several recognized-extension source files.
+            write_file(tmp.path(), "src/main.rs", "fn main() {}");
+            write_file(tmp.path(), "src/lib.rs", "pub fn lib() {}");
+            write_file(tmp.path(), "scratch.rs", "fn scratch() {}");
+
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let index = shared.read();
+            let stats = index.health_stats();
+
+            assert_eq!(
+                stats.untracked_indexed, 0,
+                "with no git repo the feature must fail open to 0, not count every file"
+            );
+            let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
+            assert!(
+                !report.contains("indexed untracked files:"),
+                "no untracked line should appear when the count is 0: {report}"
+            );
+        }
+
+        /// A fully-tracked repo reports `untracked_indexed == 0`.
+        #[test]
+        fn fully_tracked_repo_reports_zero() {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            write_file(tmp.path(), "src/main.rs", "fn main() {}");
+            write_file(tmp.path(), "src/lib.rs", "pub fn lib() {}");
+            git(tmp.path(), &["add", "."]);
+            git(tmp.path(), &["commit", "-m", "init"]);
+
+            let shared = LiveIndex::load(tmp.path()).unwrap();
+            let index = shared.read();
+            let stats = index.health_stats();
+
+            assert_eq!(
+                stats.untracked_indexed, 0,
+                "a fully-tracked repo must report zero untracked indexed files"
+            );
+        }
+
+        /// Opt-in `SYMFORGE_EXCLUDE_UNTRACKED` demotes untracked recognized-ext
+        /// files out of Tier-1; with the default OFF it is a strict no-op.
+        #[test]
+        fn exclude_untracked_env_gate_demotes_only_when_enabled() {
+            let _lock = EXCLUDE_UNTRACKED_ENV_LOCK.lock().unwrap();
+            // One RAII guard for the whole test: it captures the ORIGINAL value once
+            // and restores it on drop (even on panic). Phase transitions use
+            // `apply()`, which mutates the live env WITHOUT touching the saved
+            // original, so the restore-on-drop is always correct.
+            let env = ExcludeUntrackedEnvGuard::set(None);
+
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            write_file(tmp.path(), "src/main.rs", "fn main() {}");
+            git(tmp.path(), &["add", "src/main.rs"]);
+            git(tmp.path(), &["commit", "-m", "init"]);
+            write_file(tmp.path(), "scratch.rs", "fn scratch() {}");
+
+            // Default OFF: untracked file is still admitted (Tier-1), only surfaced.
+            {
+                assert!(!discovery::exclude_untracked_enabled());
+                let shared = LiveIndex::load(tmp.path()).unwrap();
+                let index = shared.read();
+                assert!(
+                    index.files.contains_key("scratch.rs"),
+                    "default policy must still index the untracked file (admission unchanged)"
+                );
+                assert_eq!(index.health_stats().untracked_indexed, 1);
+            }
+
+            // Opt-in ON: untracked recognized-ext file is demoted to Tier-2.
+            env.apply(Some("1"));
+            {
+                assert!(discovery::exclude_untracked_enabled());
+                let shared = LiveIndex::load(tmp.path()).unwrap();
+                let index = shared.read();
+                assert!(
+                    !index.files.contains_key("scratch.rs"),
+                    "with the opt-in policy ON the untracked file is demoted out of Tier-1"
+                );
+                assert!(
+                    index.files.contains_key("src/main.rs"),
+                    "tracked files remain Tier-1 under the opt-in policy"
+                );
+                // Demoted to Tier-2: recorded as a skipped file with the Untracked reason.
+                assert!(
+                    index
+                        .skipped_files()
+                        .iter()
+                        .any(|sf| sf.path == "scratch.rs"
+                            && sf.reason() == Some(crate::domain::index::SkipReason::Untracked)),
+                    "demoted file should be a Tier-2 skip with the Untracked reason"
+                );
+                // It is no longer a Tier-1 file, so it does not count as untracked-indexed.
+                assert_eq!(index.health_stats().untracked_indexed, 0);
+            }
+            // `env` restores the original env state on drop.
+        }
     }
 
     #[test]

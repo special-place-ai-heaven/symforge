@@ -1602,6 +1602,7 @@ pub fn health_report_from_published_state(
         failed_files: published.failed_files.clone(),
         tier_counts: published.tier_counts,
         local_empty_reason: published.local_empty_reason.clone(),
+        untracked_indexed: published.untracked_indexed,
     };
     // Preserve the existing formatter shape by reusing HealthStats.
     if matches!(stats.watcher_state, crate::watcher::WatcherState::Off) {
@@ -1796,10 +1797,19 @@ pub fn health_report_from_stats(
 
     let (tier1, tier2, tier3) = stats.tier_counts;
     let total_discovered = tier1 + tier2 + tier3;
-    let admission_section = format!(
+    let mut admission_section = format!(
         "\nAdmission: {} files discovered\n  Tier 1 (indexed): {}\n  Tier 2 (metadata only): {}\n  Tier 3 (hard-skipped): {}",
         total_discovered, tier1, tier2, tier3
     );
+    // SF-009: surface how many Tier-1 files are not under version control.
+    // Shown only when > 0 to keep clean, fully-tracked repos quiet; the count
+    // fails open to 0 (and is therefore hidden) outside a git working tree.
+    if stats.untracked_indexed > 0 {
+        admission_section.push_str(&format!(
+            "\n  indexed untracked files: {}",
+            stats.untracked_indexed
+        ));
+    }
 
     let mut output = format!(
         "Status: {}\nFiles:  {} indexed ({} parsed, {} partial, {} failed)\nSymbols: {}\nLoaded in: {}ms\n{}\nStale-mutation rejections: {}{}",

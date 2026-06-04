@@ -775,6 +775,51 @@ pub fn classify_admission(
     AdmissionDecision::normal()
 }
 
+/// Env var gating the SF-009 opt-in "exclude untracked" admission policy.
+/// Default OFF — when unset (or set to anything other than a truthy value) the
+/// index admits files exactly as before, so admission defaults are unchanged.
+pub const EXCLUDE_UNTRACKED_ENV: &str = "SYMFORGE_EXCLUDE_UNTRACKED";
+
+/// Returns `true` when the opt-in `SYMFORGE_EXCLUDE_UNTRACKED` policy is enabled.
+///
+/// Accepts the usual truthy spellings (`1`, `true`, `yes`, `on`,
+/// case-insensitive). Anything else — including unset — is treated as OFF, so
+/// the default is a strict no-op. This gate is the ONLY thing that can demote a
+/// recognized-extension file to Tier-2 on the basis of git-tracking; with it
+/// off, the admission gate behaves identically to before SF-009.
+pub fn exclude_untracked_enabled() -> bool {
+    std::env::var(EXCLUDE_UNTRACKED_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Compute the set of git-tracked relative paths (forward-slash normalized) for
+/// the repository containing `root`, for the SF-009 exclude-untracked policy.
+///
+/// **Fails open to `None`** when the policy is disabled, when no git repository
+/// is discoverable, or when the git index cannot be read. A `None` result means
+/// "do not demote anything" — never "treat every file as untracked". An empty
+/// tracked set (readable but empty index) also yields `None` for the same
+/// reason, so a freshly `git init`-ed tree does not demote every source file.
+///
+/// Uses the git index (`git ls-files` semantics) via [`crate::git::GitRepo`],
+/// NOT the `ignore` crate — the `ignore` crate models gitignore rules but has no
+/// concept of which files are tracked.
+pub fn tracked_path_set_for_exclusion(root: &Path) -> Option<std::collections::HashSet<String>> {
+    if !exclude_untracked_enabled() {
+        return None;
+    }
+    let git_repo = crate::git::GitRepo::open(root).ok()?;
+    let tracked = git_repo.tracked_paths().ok()?;
+    if tracked.is_empty() {
+        return None;
+    }
+    Some(tracked.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

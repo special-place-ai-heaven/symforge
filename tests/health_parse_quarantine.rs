@@ -52,6 +52,7 @@ fn published_state(
         is_empty: false,
         tier_counts: (partial_parse_count + failed_count + 1, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     }
 }
