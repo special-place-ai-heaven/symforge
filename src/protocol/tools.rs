@@ -5133,8 +5133,14 @@ impl SymForgeServer {
         )
     )]
     pub(crate) async fn checkpoint_now(&self, params: Parameters<CheckpointNowInput>) -> String {
-        if self.daemon_client.is_some() {
-            return "Checkpoint failed: checkpoint_now is unavailable in daemon-proxy mode; restart with SYMFORGE_NO_DAEMON=1 for local in-process checkpointing.".to_string();
+        // Proxy-first: in daemon-proxy mode the daemon owns the authoritative
+        // live index, while this process holds only `LiveIndex::empty()`.
+        // Forward to the daemon (where `daemon_client` is None and `repo_root`
+        // is real) so the checkpoint runs against the populated index. On
+        // local-fallback the proxy returns None and the in-process logic below
+        // checkpoints the locally reloaded index.
+        if let Some(result) = self.proxy_tool_call("checkpoint_now", &params.0).await {
+            return result;
         }
         let repo_root = match self.capture_repo_root() {
             Some(root) => root,
