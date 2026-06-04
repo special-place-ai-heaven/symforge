@@ -2770,6 +2770,59 @@ fn test_context_bundle_result_view_ambiguous_symbol() {
 }
 
 #[test]
+fn test_context_bundle_result_view_renders_unresolved_same_name_member_calls() {
+    // SF-002: the surfaced section must render under a clearly-labeled line,
+    // distinct from the Callers/Callees counts (which exclude it).
+    let empty_section = ContextBundleSectionView {
+        total_count: 0,
+        overflow_count: 0,
+        entries: vec![],
+        unique_count: 0,
+    };
+    let result = context_bundle_result_view(
+        &ContextBundleView::Found(Box::new(ContextBundleFoundView {
+            file_path: "src/testing.ts".to_string(),
+            body: "startExploration() { return this.service.startExploration(); }".to_string(),
+            kind_label: "fn".to_string(),
+            line_range: (1, 1),
+            byte_count: 60,
+            callers: empty_section.clone(),
+            callees: empty_section.clone(),
+            type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![ContextBundleReferenceView {
+                display_name: "startExploration".to_string(),
+                file_path: "src/testing.ts".to_string(),
+                line_number: 2,
+                enclosing: None,
+                occurrence_count: 1,
+            }],
+            dependencies: vec![],
+            implementation_suggestions: vec![],
+        })),
+        "full",
+    );
+
+    // The exact counts stay zero — the surfaced call is NOT a caller/callee.
+    assert!(result.contains("Callers (0)"), "got: {result}");
+    assert!(result.contains("Callees (0)"), "got: {result}");
+    // The new section is rendered with its clearly-labeled header.
+    assert!(
+        result.contains(
+            "Unresolved same-name member calls (1) [receiver type unresolved; not counted as callers/callees]:"
+        ),
+        "missing unresolved-member-call header: {result}"
+    );
+    assert!(
+        result.contains("startExploration"),
+        "missing surfaced call name: {result}"
+    );
+    assert!(
+        result.contains("src/testing.ts:2"),
+        "missing surfaced call location: {result}"
+    );
+}
+
+#[test]
 fn test_context_bundle_result_view_suggests_impl_blocks_for_zero_caller_struct() {
     let empty_section = ContextBundleSectionView {
         total_count: 0,
@@ -2787,6 +2840,7 @@ fn test_context_bundle_result_view_suggests_impl_blocks_for_zero_caller_struct()
             callers: empty_section.clone(),
             callees: empty_section.clone(),
             type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![],
             dependencies: vec![],
             implementation_suggestions: vec![
                 ImplBlockSuggestionView {
@@ -2836,6 +2890,7 @@ fn test_context_bundle_result_view_with_max_tokens_truncates_dependencies_in_pri
             callers: empty_section.clone(),
             callees: empty_section.clone(),
             type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![],
             dependencies: vec![
                 TypeDependencyView {
                     name: "Alpha".to_string(),

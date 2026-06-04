@@ -36,12 +36,12 @@ impl Default for OutputLimits {
 use crate::domain::index::{AdmissionTier, SkippedFile};
 use crate::live_index::query::EXPECTED_VENDOR_PARTIAL_PARSE_REASON;
 use crate::live_index::{
-    ContextBundleFoundView, ContextBundleSectionView, ContextBundleView, FileContentView,
-    FileOutlineView, FindDependentsView, FindReferencesView, HealthStats, ImplBlockSuggestionView,
-    ImplementationsView, IndexLoadSource, IndexedFile, InspectMatchView, LiveIndex,
-    PublishedIndexState, RepoOutlineFileView, RepoOutlineView, SearchFilesResolveView,
-    SearchFilesTier, SearchFilesView, SnapshotVerifyState, SymbolDetailView, TypeDependencyView,
-    WhatChangedTimestampView, search,
+    ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
+    ContextBundleView, FileContentView, FileOutlineView, FindDependentsView, FindReferencesView,
+    HealthStats, ImplBlockSuggestionView, ImplementationsView, IndexLoadSource, IndexedFile,
+    InspectMatchView, LiveIndex, PublishedIndexState, RepoOutlineFileView, RepoOutlineView,
+    SearchFilesResolveView, SearchFilesTier, SearchFilesView, SnapshotVerifyState,
+    SymbolDetailView, TypeDependencyView, WhatChangedTimestampView, search,
 };
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
@@ -3234,6 +3234,9 @@ fn render_context_bundle_found_with_max_tokens(
     }
     output.push_str(&format_context_bundle_section("Callers", &view.callers));
     output.push_str(&format_context_bundle_section("Callees", &view.callees));
+    output.push_str(&format_unresolved_same_name_member_calls(
+        &view.unresolved_same_name_member_calls,
+    ));
     output.push_str(&format_context_bundle_section(
         "Type usages",
         &view.type_usages,
@@ -3592,6 +3595,34 @@ fn format_context_bundle_section(title: &str, section: &ContextBundleSectionView
                 title.to_lowercase()
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+/// Render the SF-002 "unresolved same-name member calls" section.
+///
+/// These are `receiver.<target_name>()` calls made from inside the target
+/// symbol's body where the receiver type could not be resolved — for example a
+/// TypeScript `Controller.foo` whose body calls `this.service.foo()`. They are
+/// surfaced under a clearly-labeled line so they are visibly distinct from the
+/// exact `Callers`/`Callees` counts, which deliberately exclude them. Renders
+/// nothing when empty so the common case keeps its existing output shape.
+fn format_unresolved_same_name_member_calls(entries: &[ContextBundleReferenceView]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![format!(
+        "\nUnresolved same-name member calls ({}) [receiver type unresolved; not counted as callers/callees]:",
+        entries.len()
+    )];
+
+    for entry in entries {
+        lines.push(format!(
+            "  {:<30} {}:{}",
+            entry.display_name, entry.file_path, entry.line_number
+        ));
     }
 
     lines.join("\n")

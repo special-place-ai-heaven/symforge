@@ -13,7 +13,7 @@ pub(crate) use super::disambiguation::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
 use super::disambiguation::{
-    matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
+    is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
     parse_reference_kind_filter,
 };
 pub use super::health_view::{
@@ -1555,10 +1555,32 @@ impl LiveIndex {
     ) -> Vec<(&'a str, &'a ReferenceRecord)> {
         let target_name = target_symbol.name.as_str();
         let module_path = resolve_module_path(path, &file.language);
+
+        // Index of the target symbol within its own file's symbol list. Used to
+        // suppress the SF-002 self-member-call false positive: a method whose
+        // body calls a same-named member on another object (e.g. TS
+        // `this.service.foo()` from `Controller.foo`) must not be reported as
+        // its own caller. We reject a same-file `Call` ref only when it is
+        // BOTH enclosed by the target itself AND a receiver method call. Bare
+        // intra-body recursion (`foo()`) and same-named `this.foo()` calls from
+        // OTHER methods are deliberately preserved as legitimate callers.
+        let target_symbol_index = file
+            .symbols
+            .iter()
+            .position(|symbol| symbol.byte_range == target_symbol.byte_range)
+            .map(|idx| idx as u32);
+
         let mut refs: Vec<(&str, &ReferenceRecord)> = file
             .references
             .iter()
             .filter(|reference| {
+                if reference.kind == ReferenceKind::Call
+                    && target_symbol_index.is_some()
+                    && reference.enclosing_symbol_index == target_symbol_index
+                    && is_receiver_method_call(file, reference)
+                {
+                    return false;
+                }
                 matches_exact_symbol_reference(
                     reference,
                     target_name,
@@ -2607,6 +2629,30 @@ mod tests {
         }
     }
 
+    /// Build a `Call` reference with byte_range and line_range decoupled.
+    ///
+    /// `make_ref` hardcodes `line_range = (byte_start/100, byte_start/100)`, which
+    /// couples the two and makes it impossible to land a ref both at a real byte
+    /// offset (needed for the SF-002 byte-before-`.` receiver check) AND inside a
+    /// method's line range (needed for the callee line-containment filter). This
+    /// builder lets a test pass the exact byte offset of a call name together with
+    /// the line it sits on.
+    fn make_call_ref_lines(
+        name: &str,
+        byte_start: u32,
+        line: u32,
+        enclosing: Option<u32>,
+    ) -> ReferenceRecord {
+        ReferenceRecord {
+            name: name.to_string(),
+            qualified_name: None,
+            kind: ReferenceKind::Call,
+            byte_range: (byte_start, byte_start + name.len() as u32),
+            line_range: (line, line),
+            enclosing_symbol_index: enclosing,
+        }
+    }
+
     fn make_file_with_refs(
         path: &str,
         refs: Vec<ReferenceRecord>,
@@ -3616,6 +3662,239 @@ mod tests {
         assert_eq!(found.callers.total_count, 1);
         assert_eq!(found.callers.entries.len(), 1);
         assert_eq!(found.callers.entries[0].file_path, "src/service.rs");
+    }
+
+    #[test]
+    fn test_sf002_ts_same_name_member_call_not_self_caller_or_callee() {
+        // SF-002: a TS method whose body delegates to a same-named method on
+        // another object (`this.testingService.startExploration()`) must NOT be
+        // reported as its own caller or its own callee. The cross-object call is
+        // surfaced in the unresolved-same-name-member-call section instead.
+        let line0 = "class TestingService { startExploration() {} }";
+        let line1 = "class TestingController { startExploration() { return this.testingService.startExploration(); } }";
+        let content = format!("{line0}\n{line1}\n");
+
+        let service_method_byte = content.find("startExploration() {}").unwrap() as u32;
+        let controller_method_byte = content.find("startExploration() { return").unwrap() as u32;
+        // The delegated member call: the `startExploration` that follows a `.`.
+        let member_call_byte = content.find("testingService.startExploration()").unwrap() as u32
+            + "testingService.".len() as u32;
+        // Sanity: the byte immediately before the member call must be a `.`.
+        assert_eq!(content.as_bytes()[member_call_byte as usize - 1], b'.');
+
+        let target = make_file_with_refs_and_content(
+            "src/testing.ts",
+            LanguageId::TypeScript,
+            &content,
+            vec![make_call_ref_lines(
+                "startExploration",
+                member_call_byte,
+                1,
+                // Enclosed by the controller method (symbol index 1).
+                Some(1),
+            )],
+            vec![
+                // Index 0: service method on line 0.
+                make_symbol_with_kind_line_and_bytes(
+                    "startExploration",
+                    SymbolKind::Method,
+                    0,
+                    (service_method_byte, service_method_byte + 20),
+                ),
+                // Index 1: controller method on line 1 (the target).
+                make_symbol_with_kind_line_and_bytes(
+                    "startExploration",
+                    SymbolKind::Method,
+                    1,
+                    (
+                        controller_method_byte,
+                        controller_method_byte
+                            + "startExploration() { return this.testingService.startExploration(); }"
+                                .len() as u32,
+                    ),
+                ),
+            ],
+        );
+        let index = make_index(vec![("src/testing.ts", target)], false);
+
+        let view = index.capture_context_bundle_view(
+            "src/testing.ts",
+            "startExploration",
+            Some("fn"),
+            Some(2),
+        );
+
+        let ContextBundleView::Found(found) = view else {
+            panic!("expected found view");
+        };
+
+        // (1) The controller method is NOT its own caller.
+        assert_eq!(
+            found.callers.total_count, 0,
+            "self member-call must not be counted as a caller; got {:?}",
+            found.callers.entries
+        );
+        // (2) The controller method is NOT its own callee.
+        assert!(
+            found
+                .callees
+                .entries
+                .iter()
+                .all(|e| e.display_name != "startExploration"),
+            "self member-call must not be rendered as a callee; got {:?}",
+            found.callees.entries
+        );
+        // (3) The cross-object same-name call is surfaced separately.
+        assert_eq!(
+            found.unresolved_same_name_member_calls.len(),
+            1,
+            "expected the unresolved member call to be surfaced; got {:?}",
+            found.unresolved_same_name_member_calls
+        );
+        assert_eq!(
+            found.unresolved_same_name_member_calls[0].display_name,
+            "startExploration"
+        );
+    }
+
+    #[test]
+    fn test_sf002_csharp_same_name_member_call_not_self_caller_or_callee() {
+        // C# parallel: `this.testingService.StartExploration()` from inside
+        // `Controller.StartExploration` must not be self-caller/self-callee.
+        let line0 = "class TestingService { public void StartExploration() {} }";
+        let line1 = "class TestingController { public void StartExploration() { this.testingService.StartExploration(); } }";
+        let content = format!("{line0}\n{line1}\n");
+
+        let service_method_byte = content.find("StartExploration() {}").unwrap() as u32;
+        let controller_method_byte = content.find("StartExploration() { this").unwrap() as u32;
+        let member_call_byte = content.find("testingService.StartExploration()").unwrap() as u32
+            + "testingService.".len() as u32;
+        assert_eq!(content.as_bytes()[member_call_byte as usize - 1], b'.');
+
+        let target = make_file_with_refs_and_content(
+            "src/Testing.cs",
+            LanguageId::CSharp,
+            &content,
+            vec![make_call_ref_lines(
+                "StartExploration",
+                member_call_byte,
+                1,
+                Some(1),
+            )],
+            vec![
+                make_symbol_with_kind_line_and_bytes(
+                    "StartExploration",
+                    SymbolKind::Method,
+                    0,
+                    (service_method_byte, service_method_byte + 20),
+                ),
+                make_symbol_with_kind_line_and_bytes(
+                    "StartExploration",
+                    SymbolKind::Method,
+                    1,
+                    (
+                        controller_method_byte,
+                        controller_method_byte
+                            + "StartExploration() { this.testingService.StartExploration(); }".len()
+                                as u32,
+                    ),
+                ),
+            ],
+        );
+        let index = make_index(vec![("src/Testing.cs", target)], false);
+
+        let view = index.capture_context_bundle_view(
+            "src/Testing.cs",
+            "StartExploration",
+            Some("fn"),
+            Some(2),
+        );
+
+        let ContextBundleView::Found(found) = view else {
+            panic!("expected found view");
+        };
+
+        assert_eq!(found.callers.total_count, 0);
+        assert!(
+            found
+                .callees
+                .entries
+                .iter()
+                .all(|e| e.display_name != "StartExploration")
+        );
+        assert_eq!(found.unresolved_same_name_member_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_sf002_bare_top_level_call_still_counted_as_caller() {
+        // Guard against over-broadening: a true bare `foo()` call (no preceding
+        // `.`) from a SIBLING symbol must still be counted as a caller, and a bare
+        // intra-body recursive `foo()` must NOT be suppressed by the receiver guard.
+        let line0 = "fn target() { target(); }";
+        let line1 = "fn sibling() { target(); }";
+        let content = format!("{line0}\n{line1}\n");
+
+        let target_byte = content.find("fn target").unwrap() as u32;
+        let sibling_byte = content.find("fn sibling").unwrap() as u32;
+        // The recursive call inside target's body: the `target` after `{ `.
+        let recursive_call_byte = content.find("{ target()").unwrap() as u32 + "{ ".len() as u32;
+        // The sibling's call to target.
+        let sibling_call_byte = content.find("fn sibling() { target()").unwrap() as u32
+            + "fn sibling() { ".len() as u32;
+        // Neither call is a receiver method call (no preceding `.`).
+        assert_ne!(content.as_bytes()[recursive_call_byte as usize - 1], b'.');
+        assert_ne!(content.as_bytes()[sibling_call_byte as usize - 1], b'.');
+
+        let target = make_file_with_refs_and_content(
+            "src/recur.rs",
+            LanguageId::Rust,
+            &content,
+            vec![
+                // Recursive bare call inside target (enclosing = target, index 0).
+                make_call_ref_lines("target", recursive_call_byte, 0, Some(0)),
+                // Bare call from sibling (enclosing = sibling, index 1).
+                make_call_ref_lines("target", sibling_call_byte, 1, Some(1)),
+            ],
+            vec![
+                make_symbol_with_kind_line_and_bytes(
+                    "target",
+                    SymbolKind::Function,
+                    0,
+                    (
+                        target_byte,
+                        target_byte + "fn target() { target(); }".len() as u32,
+                    ),
+                ),
+                make_symbol_with_kind_line_and_bytes(
+                    "sibling",
+                    SymbolKind::Function,
+                    1,
+                    (
+                        sibling_byte,
+                        sibling_byte + "fn sibling() { target(); }".len() as u32,
+                    ),
+                ),
+            ],
+        );
+        let index = make_index(vec![("src/recur.rs", target)], false);
+
+        let view = index.capture_context_bundle_view("src/recur.rs", "target", Some("fn"), Some(1));
+
+        let ContextBundleView::Found(found) = view else {
+            panic!("expected found view");
+        };
+
+        // Both bare calls (recursion + sibling) remain exact callers; the receiver
+        // guard suppresses neither because neither is preceded by a `.`.
+        assert_eq!(
+            found.callers.total_count, 2,
+            "bare calls must still be counted as callers; got {:?}",
+            found.callers.entries
+        );
+        assert!(
+            found.unresolved_same_name_member_calls.is_empty(),
+            "bare calls must not be surfaced as unresolved member calls"
+        );
     }
 
     #[test]

@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use crate::domain::{ReferenceKind, ReferenceRecord, SymbolKind};
 
-use super::disambiguation::{SymbolSelectorMatch, resolve_symbol_selector};
+use super::disambiguation::{
+    SymbolSelectorMatch, is_receiver_method_call, resolve_symbol_selector,
+};
 use super::query::is_filtered_name;
 use super::store::LiveIndex;
 /// One compact reference entry rendered inside a context-bundle section.
@@ -64,6 +66,11 @@ pub struct ContextBundleFoundView {
     pub callers: ContextBundleSectionView,
     pub callees: ContextBundleSectionView,
     pub type_usages: ContextBundleSectionView,
+    /// Same-name member calls (`receiver.<target_name>()`) made from within this
+    /// symbol's body where the receiver type is unresolved (SF-002). These are
+    /// surfaced separately rather than being miscounted as the symbol calling
+    /// itself or being its own caller. Never included in `callers`/`callees`.
+    pub unresolved_same_name_member_calls: Vec<ContextBundleReferenceView>,
     /// Resolved type definitions used by this symbol (recursive, depth-limited).
     pub dependencies: Vec<TypeDependencyView>,
     /// Suggested impl blocks for struct/enum symbols with no direct callers.
@@ -242,8 +249,35 @@ impl LiveIndex {
         let callers =
             self.collect_exact_symbol_references(path, file, sym_rec, Some(ReferenceKind::Call));
         let callees = self.callees_for_symbol(path, sym_idx);
-        let callee_pairs: Vec<(&str, &ReferenceRecord)> =
-            callees.iter().map(|reference| (path, *reference)).collect();
+        // SF-002: a same-name member call (`receiver.<name>()`) from inside this
+        // symbol's body resolves to a same-named method on an unresolved receiver
+        // type, NOT to this symbol calling itself. Split those out and surface
+        // them separately rather than rendering the method as its own callee.
+        let (unresolved_self_calls, resolved_callees): (
+            Vec<&ReferenceRecord>,
+            Vec<&ReferenceRecord>,
+        ) = callees.iter().partition(|reference| {
+            reference.name == name && is_receiver_method_call(file, reference)
+        });
+        let callee_pairs: Vec<(&str, &ReferenceRecord)> = resolved_callees
+            .iter()
+            .map(|reference| (path, *reference))
+            .collect();
+        let unresolved_same_name_member_calls: Vec<ContextBundleReferenceView> =
+            unresolved_self_calls
+                .iter()
+                .map(|reference| ContextBundleReferenceView {
+                    display_name: reference
+                        .qualified_name
+                        .as_deref()
+                        .unwrap_or(&reference.name)
+                        .to_string(),
+                    file_path: path.to_string(),
+                    line_number: reference.line_range.0 + 1,
+                    enclosing: None,
+                    occurrence_count: 1,
+                })
+                .collect();
         let type_usages = self.collect_exact_symbol_references(
             path,
             file,
@@ -282,6 +316,7 @@ impl LiveIndex {
             callers: capture_section(&callers),
             callees: capture_callee_section(&callee_pairs),
             type_usages: capture_section(&type_usages),
+            unresolved_same_name_member_calls,
             dependencies,
             implementation_suggestions,
         }))
