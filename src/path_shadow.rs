@@ -334,14 +334,35 @@ pub fn format_shadow_warning(report: &ShadowReport) -> String {
                 .as_deref()
                 .map(|d| d.display().to_string())
                 .unwrap_or_else(|| runs.to_string());
-            format!(
-                "WARNING: `symforge` on PATH resolves to a different install than the one you installed.\n  \
-                 runs:      {runs} {runs_ver}   [foreign prefix shadow]\n  \
-                 installed: {installed} {installed_ver}\n\
-                 Fix (ensure your install's bin precedes the shadow on PATH):\n  \
-                 add to ~/.profile:  export PATH=\"{our_dir}:$PATH\"\n  \
-                 (it currently resolves to {shadow_dir} first)"
-            )
+            // The ForeignPrefix arm is the ONLY one whose remediation depends on
+            // the host OS: a `C:\` shadow on native Windows classifies here, and
+            // POSIX `~/.profile`/`export PATH` is meaningless in PowerShell (`$PATH`
+            // is not even a PowerShell variable). Key off `cfg!(windows)` (the build
+            // host) per project precedent (`daemon.rs`). The other arms stay POSIX:
+            // RootSystem/WindowsMntBleed only ever describe Linux/WSL shadows.
+            if cfg!(windows) {
+                format!(
+                    "WARNING: `symforge` on PATH resolves to a different install than the one you installed.\n  \
+                     runs:      {runs} {runs_ver}   [foreign prefix shadow]\n  \
+                     installed: {installed} {installed_ver}\n\
+                     Fix: your install's bin dir must come BEFORE the shadow's on PATH.\n  \
+                     {our_dir} must precede {shadow_dir}\n  \
+                     verify with:  Get-Command symforge -All  (the first hit is what runs)\n  \
+                     reorder your user PATH so {our_dir} comes first, e.g. in PowerShell:\n  \
+                     [Environment]::SetEnvironmentVariable('Path', '{our_dir};' + [Environment]::GetEnvironmentVariable('Path','User'), 'User')\n  \
+                     (or edit it via System Properties > Environment Variables > Path), then open a new shell.\n  \
+                     note: with nvm-for-windows the active node prefix bin wins, so `nvm use` can re-shadow you."
+                )
+            } else {
+                format!(
+                    "WARNING: `symforge` on PATH resolves to a different install than the one you installed.\n  \
+                     runs:      {runs} {runs_ver}   [foreign prefix shadow]\n  \
+                     installed: {installed} {installed_ver}\n\
+                     Fix (ensure your install's bin precedes the shadow on PATH):\n  \
+                     add to ~/.profile:  export PATH=\"{our_dir}:$PATH\"\n  \
+                     (it currently resolves to {shadow_dir} first)"
+                )
+            }
         }
     }
 }
@@ -649,6 +670,7 @@ mod tests {
         assert!(warning.is_ascii());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn format_warning_foreign_prefix_orders_our_bin_before_shadow() {
         let report = ShadowReport {
@@ -670,6 +692,55 @@ mod tests {
         assert!(warning.contains("(7.17.3)"));
         assert!(warning.contains("(7.10.0)"));
         assert!(warning.is_ascii());
+    }
+
+    /// On native Windows a `C:\` shadow classifies as `ForeignPrefix`, and the
+    /// remediation MUST be PowerShell-native: no POSIX `~/.profile`/`export PATH`
+    /// (which is meaningless in PowerShell), a `Get-Command symforge -All` verify
+    /// step, both bin dirs named, and plain ASCII. `Display` renders backslashes
+    /// and this arm does not normalize them, so we assert the backslash form.
+    #[cfg(windows)]
+    #[test]
+    fn format_warning_foreign_prefix_is_powershell_native_on_windows() {
+        let report = ShadowReport {
+            our_path: PathBuf::from(r"C:\Users\me\.npm-global\bin\symforge.exe"),
+            our_version: Some("7.18.1".to_string()),
+            shadow_path: PathBuf::from(r"C:\Program Files\nodejs\symforge.exe"),
+            shadow_version: Some("7.10.0".to_string()),
+            kind: ShadowKind::ForeignPrefix,
+        };
+        let warning = format_shadow_warning(&report);
+
+        // No POSIX remediation leaks onto Windows.
+        assert!(
+            !warning.contains("~/.profile"),
+            "must not emit POSIX ~/.profile on Windows, got: {warning}"
+        );
+        assert!(
+            !warning.contains("export PATH"),
+            "must not emit POSIX export PATH on Windows, got: {warning}"
+        );
+
+        // PowerShell-native verification step.
+        assert!(
+            warning.contains("Get-Command symforge -All"),
+            "must point at the PowerShell verify command, got: {warning}"
+        );
+
+        // Names BOTH bin dirs (backslash form, as `Display` renders them).
+        assert!(
+            warning.contains(r"C:\Users\me\.npm-global\bin"),
+            "must name our bin dir, got: {warning}"
+        );
+        assert!(
+            warning.contains(r"C:\Program Files\nodejs"),
+            "must name the shadow bin dir, got: {warning}"
+        );
+
+        // Both versions and plain ASCII as the other arms guarantee.
+        assert!(warning.contains("(7.18.1)"));
+        assert!(warning.contains("(7.10.0)"));
+        assert!(warning.is_ascii(), "warning must be plain ASCII");
     }
 
     #[test]
