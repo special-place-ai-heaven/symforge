@@ -7584,6 +7584,9 @@ impl SymForgeServer {
                 };
                 self.find_references(Parameters(input)).await
             }
+            smart_query::QueryIntent::ToolHelp { topic } => {
+                smart_query::render_tool_catalog_for_topic(topic.as_deref())
+            }
             smart_query::QueryIntent::Explore { query } => {
                 let input = ExploreInput {
                     query: query.clone(),
@@ -19850,6 +19853,47 @@ mod tests {
             result.contains("matched explicit caller/reference phrasing"),
             "result: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ask_tool_help_returns_impact_analysis_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let content = b"fn helper() {}\n";
+        std::fs::write(src_dir.join("lib.rs"), content).unwrap();
+
+        let result = crate::parsing::process_file("src/lib.rs", content, LanguageId::Rust);
+        let indexed =
+            crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let input = super::SmartQueryInput {
+            query: "what tools can I use for impact analysis?".to_string(),
+            max_tokens: None,
+        };
+        let result = server.ask(Parameters(input)).await;
+
+        // Routed to the tool catalog, not a code search.
+        assert!(result.contains("Chosen tool: ask"), "result: {result}");
+        // The impact-analysis catalog group must list all impact tools.
+        for tool in [
+            "find_references",
+            "find_dependents",
+            "get_symbol_context",
+            "analyze_file_impact",
+            "what_changed",
+            "diff_symbols",
+        ] {
+            assert!(
+                result.contains(tool),
+                "impact-analysis catalog missing `{tool}`; result:\n{result}"
+            );
+        }
     }
 
     #[tokio::test]

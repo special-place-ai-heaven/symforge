@@ -27,6 +27,10 @@ pub enum QueryIntent {
     FindDependents { target: String },
     /// "implementations of X", "who implements X"
     FindImplementations { name: String },
+    /// "which tool should I use for X", "what tools can I use for impact analysis"
+    /// — a meta question about SymForge's own tool surface, NOT a code query.
+    /// `topic` is an optional workflow keyword (e.g. "impact") to filter the catalog.
+    ToolHelp { topic: Option<String> },
     /// Fallback: explore the concept
     Explore { query: String },
 }
@@ -72,6 +76,18 @@ pub(crate) fn strip_leading_articles(q: &str) -> &str {
 pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
     let q = strip_leading_articles(query.trim());
     let lower = q.to_ascii_lowercase();
+
+    // --- Meta: "which tool should I use", "what tools can I use for impact analysis" ---
+    // Detected EARLY so a tool-recommendation question routes to the catalog instead
+    // of falling through to `what is .../search for ...` code routing. Scoped narrowly
+    // to (the word `tool`/`tools`) AND (a recommendation verb) so ordinary code queries
+    // that merely mention a `Tool` type — e.g. "how does the Tool registry work" — are
+    // NOT hijacked. This variant is intentionally kept OUT of the Understand|Explore
+    // upgrade guard in `ask`, so a topic word matching an indexed symbol cannot clobber
+    // it into UnderstandSymbol.
+    if let Some(topic) = detect_tool_help(&lower) {
+        return (QueryIntent::ToolHelp { topic }, true);
+    }
 
     // --- Pattern: "who/what calls X" or "callers of X" or "references to X" ---
     if let Some(sym) = strip_prefix_phrase(
@@ -442,6 +458,13 @@ pub fn assess_route(intent: &QueryIntent, matched_prefix: bool) -> RouteAssessme
                 }
             }
         }
+        QueryIntent::ToolHelp { .. } => RouteAssessment {
+            confidence: RouteConfidence::Exact,
+            rationale: "matched a tool-recommendation question about SymForge's own tool surface",
+            suggested_next_step: Some(
+                "Pick a tool from the catalog below, or ask `which tool should I use for <topic>?` to narrow it.",
+            ),
+        },
         QueryIntent::Explore { .. } => RouteAssessment {
             confidence: RouteConfidence::Fallback,
             rationale: "no stronger route matched, so SymForge fell back to conceptual exploration",
@@ -498,6 +521,10 @@ pub fn route_invocation(intent: &QueryIntent) -> String {
         QueryIntent::FindImplementations { name } => {
             format!("find_references(name=\"{name}\", mode=\"implementations\")")
         }
+        QueryIntent::ToolHelp { topic } => match topic {
+            Some(topic) => format!("ask(query=\"which tool should I use for {topic}?\")"),
+            None => "ask(query=\"which tool should I use?\")".to_string(),
+        },
         QueryIntent::Explore { query } => {
             format!("explore(query=\"{query}\")")
         }
@@ -516,6 +543,7 @@ pub fn route_tool_name(intent: &QueryIntent) -> &'static str {
         QueryIntent::SearchCode { .. } => "search_text",
         QueryIntent::FindDependents { .. } => "find_dependents",
         QueryIntent::FindImplementations { .. } => "find_references",
+        QueryIntent::ToolHelp { .. } => "ask",
         QueryIntent::Explore { .. } => "explore",
     }
 }
@@ -652,6 +680,266 @@ fn looks_like_code_pattern(q: &str) -> bool {
 /// Describe which tool was routed to, for the LLM to learn the mapping.
 pub fn route_description(intent: &QueryIntent) -> String {
     format!("[Routed to: {}]", route_invocation(intent))
+}
+
+// ---------------------------------------------------------------------------
+// Tool catalog — workflow-grouped index of SymForge's own tool surface.
+//
+// This powers the `ask` ToolHelp intent and the `symforge://tools/catalog`
+// resource. Every tool name listed here MUST exist in `SYMFORGE_TOOL_NAMES`
+// (asserted by a drift-guard test in `cli/init.rs`) so the catalog cannot
+// silently drift from the real registered surface.
+// ---------------------------------------------------------------------------
+
+/// One workflow group in the tool catalog.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolGroup {
+    /// Stable group key, also used as the primary topic-filter keyword.
+    pub key: &'static str,
+    /// Additional topic-filter keywords that select this group.
+    pub aliases: &'static [&'static str],
+    /// One-line description of what this group of tools is for.
+    pub blurb: &'static str,
+    /// Bare tool names (no `mcp__symforge__` prefix) belonging to this group.
+    pub tools: &'static [&'static str],
+}
+
+/// The static workflow-grouped catalog of SymForge tools.
+pub fn tool_catalog_groups() -> &'static [ToolGroup] {
+    const GROUPS: &[ToolGroup] = &[
+        ToolGroup {
+            key: "orientation",
+            aliases: &["orient", "overview", "explore", "start", "navigate"],
+            blurb: "Get your bearings in an unfamiliar repository.",
+            tools: &[
+                "get_repo_map",
+                "get_file_context",
+                "explore",
+                "ask",
+                "conventions",
+            ],
+        },
+        ToolGroup {
+            key: "search",
+            aliases: &["find", "grep", "lookup", "discover"],
+            blurb: "Locate files, symbols, and text across the codebase.",
+            tools: &[
+                "search_symbols",
+                "search_text",
+                "search_files",
+                "inspect_match",
+            ],
+        },
+        ToolGroup {
+            key: "symbol-context",
+            aliases: &["symbol", "definition", "callers", "callees", "references"],
+            blurb: "Read a symbol's source and trace how it connects to the rest of the code.",
+            tools: &[
+                "get_symbol",
+                "get_symbol_context",
+                "find_references",
+                "get_file_content",
+            ],
+        },
+        ToolGroup {
+            key: "impact-analysis",
+            aliases: &[
+                "impact",
+                "blast-radius",
+                "dependents",
+                "what-breaks",
+                "change",
+            ],
+            blurb: "Understand what a change touches and what would break.",
+            tools: &[
+                "find_references",
+                "find_dependents",
+                "get_symbol_context",
+                "analyze_file_impact",
+                "what_changed",
+                "diff_symbols",
+            ],
+        },
+        ToolGroup {
+            key: "dry-run-edits",
+            aliases: &["edit", "edits", "refactor", "rename", "modify", "mutate"],
+            blurb: "Make structural source edits (preview with dry_run before writing).",
+            tools: &[
+                "edit_plan",
+                "replace_symbol_body",
+                "edit_within_symbol",
+                "insert_symbol",
+                "delete_symbol",
+                "batch_edit",
+                "batch_insert",
+                "batch_rename",
+            ],
+        },
+        ToolGroup {
+            key: "project-switching",
+            aliases: &["switch", "reindex", "index", "checkpoint", "project"],
+            blurb: "Re-index a different folder or persist the current index.",
+            tools: &["index_folder", "checkpoint_now"],
+        },
+        ToolGroup {
+            key: "diagnostics",
+            aliases: &["diagnostic", "health", "status", "validate", "session"],
+            blurb: "Check index health, validate syntax, and inspect session context.",
+            tools: &[
+                "health",
+                "health_compact",
+                "validate_file_syntax",
+                "context_inventory",
+                "investigation_suggest",
+            ],
+        },
+    ];
+    GROUPS
+}
+
+/// Render the full tool catalog as a human-readable workflow guide.
+pub fn render_tool_catalog() -> String {
+    let mut out = String::from(
+        "SymForge tool catalog — grouped by workflow.\nCall any tool by name; pass `dry_run=true` to edit tools to preview without writing.\n",
+    );
+    for group in tool_catalog_groups() {
+        push_group(&mut out, group);
+    }
+    out.push_str(
+        "\nTip: ask `which tool should I use for <topic>?` (e.g. impact, search, edits) to filter this catalog.",
+    );
+    out
+}
+
+/// Render only the catalog group(s) matching `topic`. Falls back to the full
+/// catalog when `topic` is `None` or matches no group.
+pub fn render_tool_catalog_for_topic(topic: Option<&str>) -> String {
+    let Some(topic) = topic
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+    else {
+        return render_tool_catalog();
+    };
+
+    let matches: Vec<&ToolGroup> = tool_catalog_groups()
+        .iter()
+        .filter(|group| group_matches_topic(group, &topic))
+        .collect();
+
+    if matches.is_empty() {
+        // Unknown topic — give the full catalog rather than nothing.
+        return render_tool_catalog();
+    }
+
+    let mut out = format!("SymForge tools for \"{topic}\":\n");
+    for group in matches {
+        push_group(&mut out, group);
+    }
+    out.push_str("\nTip: omit the topic to see the full tool catalog.");
+    out
+}
+
+/// True when `topic` (already lowercased) selects this group via its key or aliases.
+fn group_matches_topic(group: &ToolGroup, topic: &str) -> bool {
+    if group.key.contains(topic) || topic.contains(group.key) {
+        return true;
+    }
+    group
+        .aliases
+        .iter()
+        .any(|alias| alias.contains(topic) || topic.contains(alias))
+}
+
+fn push_group(out: &mut String, group: &ToolGroup) {
+    out.push_str(&format!("\n## {} — {}\n", group.key, group.blurb));
+    out.push_str(&format!("  {}\n", group.tools.join(", ")));
+}
+
+/// Recommendation verbs that, combined with the word `tool`/`tools`, indicate a
+/// question ABOUT SymForge's tool surface rather than a code query that merely
+/// mentions a `Tool` type.
+const TOOL_HELP_VERBS: &[&str] = &[
+    "which ",
+    "recommend",
+    "should i use",
+    "can i use",
+    "do i use",
+    "what tool",
+    "what tools",
+    "best tool",
+    "right tool",
+    "use for",
+];
+
+/// Detect a tool-recommendation meta-question and extract its optional topic.
+///
+/// Returns `Some(topic)` when the query is asking which SymForge tool to use:
+/// it must contain the word `tool`/`tools` AND a recommendation verb. The inner
+/// `Option<String>` is the workflow topic (e.g. `Some("impact")`) or `None` when
+/// no recognizable topic keyword is present.
+///
+/// `lower` is the already-lowercased, article-stripped query.
+fn detect_tool_help(lower: &str) -> Option<Option<String>> {
+    let mentions_tool = contains_word(lower, "tool") || contains_word(lower, "tools");
+    if !mentions_tool {
+        return None;
+    }
+    let has_verb = TOOL_HELP_VERBS.iter().any(|verb| lower.contains(verb));
+    if !has_verb {
+        return None;
+    }
+    Some(extract_tool_help_topic(lower))
+}
+
+/// True when `needle` appears in `haystack` as a whole word (alnum/underscore
+/// boundaries). Avoids matching "tool" inside "toolkit" or, more importantly,
+/// avoids a substring false positive bleeding into unrelated detection.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !is_word_byte(bytes[abs - 1]);
+        let after = abs + nbytes.len();
+        let after_ok = after >= bytes.len() || !is_word_byte(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Pull a workflow topic keyword out of a tool-help query, if one is present.
+/// Matches against each catalog group's key and aliases so "impact analysis"
+/// resolves to the "impact-analysis" group.
+fn extract_tool_help_topic(lower: &str) -> Option<String> {
+    // Prefer the canonical group key when a key token appears, then fall back
+    // to aliases. Return the matched keyword so the renderer can re-resolve it.
+    for group in tool_catalog_groups() {
+        // Match the leading token of a hyphenated key too ("impact" in
+        // "impact-analysis") so natural phrasing like "impact analysis" hits.
+        let key_head = group.key.split('-').next().unwrap_or(group.key);
+        if contains_word(lower, group.key) || contains_word(lower, key_head) {
+            return Some(key_head.to_string());
+        }
+    }
+    for group in tool_catalog_groups() {
+        for alias in group.aliases {
+            if contains_word(lower, alias) {
+                return Some((*alias).to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -996,5 +1284,109 @@ mod tests {
             intent,
             QueryIntent::Understand { .. } | QueryIntent::Explore { .. }
         ));
+    }
+
+    // --- SF-010: ToolHelp intent ------------------------------------------
+
+    #[test]
+    fn test_classify_tool_help_with_impact_topic() {
+        let (intent, matched) =
+            classify_intent_with_match("what tools can I use for impact analysis?");
+        match intent {
+            QueryIntent::ToolHelp { topic } => {
+                assert_eq!(topic.as_deref(), Some("impact"));
+            }
+            other => panic!("expected ToolHelp, got {other:?}"),
+        }
+        assert!(matched, "tool-recommendation phrasing is an explicit match");
+    }
+
+    #[test]
+    fn test_classify_tool_help_without_topic() {
+        let (intent, _) = classify_intent_with_match("which tool should I use?");
+        assert!(
+            matches!(intent, QueryIntent::ToolHelp { topic: None }),
+            "a topic-less tool-recommendation question routes to ToolHelp {{ None }}; got {intent:?}"
+        );
+    }
+
+    #[test]
+    fn test_classify_tool_help_does_not_hijack_code_query_mentioning_tool() {
+        // CRITICAL hijack guard: a code query that merely mentions a `Tool` type
+        // (no recommendation verb) must NOT be classified as ToolHelp.
+        let (intent, _) = classify_intent_with_match("how does the Tool registry work");
+        assert!(
+            matches!(
+                intent,
+                QueryIntent::Understand { .. } | QueryIntent::Explore { .. }
+            ),
+            "code query mentioning `Tool` must stay Understand/Explore; got {intent:?}"
+        );
+        assert!(!matches!(intent, QueryIntent::ToolHelp { .. }));
+    }
+
+    #[test]
+    fn test_classify_tool_help_recommend_verb_variants() {
+        for q in [
+            "which tool should I use for refactoring",
+            "recommend a tool for searching",
+            "can I use a tool for diagnostics",
+        ] {
+            let (intent, _) = classify_intent_with_match(q);
+            assert!(
+                matches!(intent, QueryIntent::ToolHelp { .. }),
+                "{q:?} should route to ToolHelp; got {intent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_tool_catalog_for_impact_lists_impact_tools() {
+        let rendered = render_tool_catalog_for_topic(Some("impact"));
+        for tool in [
+            "find_references",
+            "find_dependents",
+            "get_symbol_context",
+            "analyze_file_impact",
+            "what_changed",
+            "diff_symbols",
+        ] {
+            assert!(
+                rendered.contains(tool),
+                "impact catalog missing {tool}; got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_tool_catalog_unknown_topic_falls_back_to_full() {
+        let rendered = render_tool_catalog_for_topic(Some("nonsense-xyzzy"));
+        // Full catalog covers every group, including diagnostics.
+        assert!(rendered.contains("health"));
+        assert!(rendered.contains("search_symbols"));
+        assert!(rendered.contains("replace_symbol_body"));
+    }
+
+    #[test]
+    fn test_render_tool_catalog_none_topic_is_full() {
+        let rendered = render_tool_catalog_for_topic(None);
+        assert!(rendered.contains("orientation"));
+        assert!(rendered.contains("diagnostics"));
+    }
+
+    #[test]
+    fn test_tool_catalog_groups_cover_all_workflow_keys() {
+        let keys: Vec<&str> = tool_catalog_groups().iter().map(|g| g.key).collect();
+        for expected in [
+            "orientation",
+            "search",
+            "symbol-context",
+            "impact-analysis",
+            "dry-run-edits",
+            "project-switching",
+            "diagnostics",
+        ] {
+            assert!(keys.contains(&expected), "missing catalog group {expected}");
+        }
     }
 }

@@ -16,6 +16,7 @@ pub(crate) const REPO_HEALTH_URI: &str = "symforge://repo/health";
 pub(crate) const REPO_OUTLINE_URI: &str = "symforge://repo/outline";
 pub(crate) const REPO_MAP_URI: &str = "symforge://repo/map";
 pub(crate) const REPO_CHANGES_URI: &str = "symforge://repo/changes/uncommitted";
+pub(crate) const TOOLS_CATALOG_URI: &str = "symforge://tools/catalog";
 
 pub(crate) const FILE_CONTEXT_TEMPLATE: &str =
     "symforge://file/context?path={path}&max_tokens={max_tokens}";
@@ -30,6 +31,7 @@ enum ResourceRequest {
     RepoOutline,
     RepoMap,
     RepoChangesUncommitted,
+    ToolsCatalog,
     FileContext {
         path: String,
         max_tokens: Option<u64>,
@@ -82,6 +84,12 @@ impl SymForgeServer {
                 "repo-changes-uncommitted",
                 "Uncommitted changes",
                 "Changed files in the current worktree.",
+            ),
+            make_resource(
+                TOOLS_CATALOG_URI,
+                "tools-catalog",
+                "Tool catalog",
+                "Workflow-grouped index of SymForge's tools.",
             ),
         ]
     }
@@ -170,6 +178,7 @@ impl SymForgeServer {
                 }))
                 .await
             }
+            ResourceRequest::ToolsCatalog => crate::protocol::smart_query::render_tool_catalog(),
             ResourceRequest::FileContext { path, max_tokens } => {
                 self.get_file_context(Parameters(GetFileContextInput {
                     path,
@@ -280,6 +289,15 @@ pub(crate) fn repo_changes_resource() -> Resource {
     )
 }
 
+pub(crate) fn tools_catalog_resource() -> Resource {
+    make_resource(
+        TOOLS_CATALOG_URI,
+        "tools-catalog",
+        "Tool catalog",
+        "Workflow-grouped index of SymForge's tools.",
+    )
+}
+
 pub(crate) fn file_context_resource(path: &str, max_tokens: Option<u64>) -> Resource {
     let uri = build_uri(
         "symforge://file/context",
@@ -343,6 +361,7 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceRequest, String> {
         (Some("repo"), "/outline") => Ok(ResourceRequest::RepoOutline),
         (Some("repo"), "/map") => Ok(ResourceRequest::RepoMap),
         (Some("repo"), "/changes/uncommitted") => Ok(ResourceRequest::RepoChangesUncommitted),
+        (Some("tools"), "/catalog") => Ok(ResourceRequest::ToolsCatalog),
         (Some("file"), "/context") => Ok(ResourceRequest::FileContext {
             path: required_query(&query, "path")?,
             max_tokens: optional_query(&query, "max_tokens").transpose()?,
@@ -495,6 +514,22 @@ mod tests {
             .collect();
         assert!(uris.contains(&REPO_HEALTH_URI));
         assert!(uris.contains(&REPO_MAP_URI));
+        assert!(uris.contains(&TOOLS_CATALOG_URI));
+    }
+
+    #[tokio::test]
+    async fn test_read_tools_catalog_resource() {
+        let server = make_server();
+        let result = server
+            .read_resource_uri(TOOLS_CATALOG_URI)
+            .await
+            .expect("read resource");
+        let text = match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text resource, got {other:?}"),
+        };
+        assert!(text.contains("impact-analysis"), "catalog text: {text}");
+        assert!(text.contains("analyze_file_impact"), "catalog text: {text}");
     }
 
     #[test]
