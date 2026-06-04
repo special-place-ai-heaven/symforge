@@ -16,12 +16,16 @@ use symforge::watcher::{WatcherInfo, WatcherState};
 fn published_state(
     unexpected_partial_files: Vec<String>,
     expected_vendor_partial_files: Vec<String>,
+    expected_framework_partial_files: Vec<String>,
     failed_files: Vec<(String, String)>,
 ) -> PublishedIndexState {
-    let partial_parse_count = unexpected_partial_files.len() + expected_vendor_partial_files.len();
+    let partial_parse_count = unexpected_partial_files.len()
+        + expected_vendor_partial_files.len()
+        + expected_framework_partial_files.len();
     let failed_count = failed_files.len();
     let mut partial_parse_files = unexpected_partial_files.clone();
     partial_parse_files.extend(expected_vendor_partial_files.iter().cloned());
+    partial_parse_files.extend(expected_framework_partial_files.iter().cloned());
     partial_parse_files.sort();
 
     PublishedIndexState {
@@ -33,10 +37,12 @@ fn published_state(
         partial_parse_count,
         unexpected_partial_parse_count: unexpected_partial_files.len(),
         expected_vendor_partial_parse_count: expected_vendor_partial_files.len(),
+        expected_framework_partial_parse_count: expected_framework_partial_files.len(),
         failed_count,
         partial_parse_files,
         unexpected_partial_parse_files: unexpected_partial_files,
         expected_vendor_partial_parse_files: expected_vendor_partial_files,
+        expected_framework_partial_parse_files: expected_framework_partial_files,
         failed_files,
         symbol_count: 7,
         loaded_at_system: SystemTime::now(),
@@ -55,6 +61,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let published = published_state(
         vec!["src/broken.rs".to_string()],
         vec!["vendor/tree-sitter-scss/src/parser.c".to_string()],
+        vec!["src/app/app.html".to_string()],
         vec![("src/unparseable.rs".to_string(), "lexer panic".to_string())],
     );
     let watcher = WatcherInfo {
@@ -65,7 +72,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=3 unexpected_partial=1 expected_vendor_partial=1 failed=1 showing=3 omitted=0"
+            "Parse/span quarantine registry: total=4 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 failed=1 showing=4 omitted=0"
         ),
         "full health should summarize parse/span quarantine evidence: {full}"
     );
@@ -78,6 +85,10 @@ fn health_reports_parse_span_quarantine_registry() {
         "expected vendor partial should be listed separately: {full}"
     );
     assert!(
+        full.contains("src/app/app.html [expected_framework_partial]"),
+        "expected framework (Angular) partial should be listed separately: {full}"
+    );
+    assert!(
         full.contains("src/unparseable.rs [failed] - lexer panic"),
         "failed parse should be listed with its reason: {full}"
     );
@@ -85,7 +96,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=3 unexpected_partial=1 expected_vendor_partial=1 failed=1 showing=3 omitted=0"
+            "Parse/span quarantine: total=4 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 failed=1 showing=4 omitted=0"
         ),
         "compact health should retain bounded quarantine counts: {compact}"
     );
@@ -93,7 +104,7 @@ fn health_reports_parse_span_quarantine_registry() {
 
 #[test]
 fn clean_health_omits_parse_span_quarantine_registry() {
-    let published = published_state(vec![], vec![], vec![]);
+    let published = published_state(vec![], vec![], vec![], vec![]);
     let watcher = WatcherInfo {
         state: WatcherState::Off,
         ..WatcherInfo::default()
@@ -117,7 +128,7 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let unexpected_partial_files: Vec<String> = (0..12)
         .map(|index| format!("src/broken_{index:02}.rs"))
         .collect();
-    let published = published_state(unexpected_partial_files, vec![], vec![]);
+    let published = published_state(unexpected_partial_files, vec![], vec![], vec![]);
     let watcher = WatcherInfo {
         state: WatcherState::Off,
         ..WatcherInfo::default()
@@ -126,7 +137,7 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=12 unexpected_partial=12 expected_vendor_partial=0 failed=0 showing=10 omitted=2"
+            "Parse/span quarantine registry: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_framework_partial=0 failed=0 showing=10 omitted=2"
         ),
         "full health should cap quarantine evidence and report omitted entries: {full}"
     );
@@ -142,8 +153,53 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=12 unexpected_partial=12 expected_vendor_partial=0 failed=0 showing=10 omitted=2"
+            "Parse/span quarantine: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_framework_partial=0 failed=0 showing=10 omitted=2"
         ),
         "compact health should expose the bounded quarantine count: {compact}"
+    );
+}
+
+#[test]
+fn health_labels_angular_template_partial_as_expected_framework() {
+    // SF-004: an Angular `.html` template whose only parse defect is template
+    // control-flow (`@if (a > b) {`) lands under the framework bucket, not the
+    // repo-owned unexpected bucket.
+    let published = published_state(
+        vec![],
+        vec![],
+        vec!["src/app/app.component.html".to_string()],
+        vec![],
+    );
+    let watcher = WatcherInfo {
+        state: WatcherState::Off,
+        ..WatcherInfo::default()
+    };
+
+    let full = health_report_from_published_state(&published, &watcher, 0);
+    assert!(
+        full.contains(
+            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=1 failed=0 showing=1 omitted=0"
+        ),
+        "framework partial should be counted in its own bucket: {full}"
+    );
+    assert!(
+        full.contains("src/app/app.component.html [expected_framework_partial]"),
+        "Angular template partial should be labeled as a framework limitation: {full}"
+    );
+    assert!(
+        !full.contains("src/app/app.component.html [unexpected_partial]"),
+        "Angular template partial must NOT be reported as a repo-owned unexpected partial: {full}"
+    );
+    assert!(
+        full.contains("Expected framework partial parse noise (1):"),
+        "framework partials should get their own labeled detail section: {full}"
+    );
+
+    let compact = health_report_compact_from_published_state(&published, &watcher, 0);
+    assert!(
+        compact.contains(
+            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=1 failed=0 showing=1 omitted=0"
+        ),
+        "compact health should carry the framework bucket count: {compact}"
     );
 }

@@ -386,6 +386,121 @@ pub(crate) fn is_expected_typescript_import_type_array_limitation(
     }
 }
 
+/// Matches an Angular control-flow opener (`@if`/`@for`/`@switch`/`@defer`/
+/// `@else if`) together with its parenthesized control expression. Capture
+/// groups:
+///   1. the boundary char before `@` (start-of-line or a non-identifier char),
+///      preserved so we never match a keyword embedded in an identifier (e.g.
+///      `foo@if`),
+///   2. the opener keyword plus the opening `(`,
+///   3. the control expression body (no nested parens — `[^()]*` keeps the
+///      match scoped to a single, balanced opener expression),
+///   4. the closing `)`.
+///
+/// Only the relational operators (`<`/`>`, covering `<`, `>`, `<=`, `>=`) inside
+/// group 3 are the `tree-sitter-html 0.23.2` grammar trigger (SF-004): the `>` in
+/// `@if (a > b) {` is lexed as a tag close, producing an ERROR node. Neutralizing
+/// those operators within group 3 only — never elsewhere in the file — lets us
+/// re-parse the whole file and prove whether the operators were the SOLE cause.
+static ANGULAR_CONTROL_FLOW_OPENER_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?m)(^|[^A-Za-z0-9_$])(@(?:if|for|switch|defer|else\s+if)\s*\()([^()]*)(\))",
+        )
+        .expect("SF-004 Angular control-flow opener regex is a valid pattern")
+    });
+
+/// SF-004: recognize a partial parse whose ONLY cause is the known
+/// `tree-sitter-html 0.23.2` grammar limitation on Angular template control-flow
+/// relational operators (`@if (a > b) {`, `@for`, `@switch`, `@defer`,
+/// `@else if`). `tree-sitter-html` has zero Angular rules; the `<`/`>` relational
+/// operator inside a control expression is lexed as a tag delimiter, producing an
+/// ERROR node even though SymForge text-scans the construct and still extracts
+/// symbols.
+///
+/// Soundness — this validates the WHOLE file, not a single diagnostic line. The
+/// previous heuristic trusted `parse_diagnostic.line` to point at the Angular
+/// opener; that is UNSOUND, because tree-sitter's deepest-smallest ERROR node can
+/// pin the diagnostic to a valid `@if` line even when the real defect is an
+/// unclosed `<div>` or a stray `</div>` elsewhere (verified empirically against
+/// tree-sitter-html 0.23.2: a stray end tag after a closed structure reports its
+/// error on the `@if` opener line, masking the real defect). A no-diagnostic
+/// fallback was even worse — it excused arbitrary broken HTML.
+///
+/// Instead we mirror SF-003: neutralize ONLY the suspected limitation and
+/// re-parse the whole file. For every Angular control-flow opener we replace each
+/// `<`/`>` inside its `(...)` control expression with a single space (length- and
+/// token-preserving; a space cannot fuse adjacent tokens), leaving the rest of the
+/// file — including every ordinary HTML tag's `<`/`>` — byte-for-byte unchanged.
+/// We return `true` iff:
+///   1. the language is HTML, AND
+///   2. the original source genuinely has a parse error, AND
+///   3. at least one Angular control-flow opener is present (the regex matched),
+///      AND
+///   4. after neutralizing ONLY those openers' relational operators the file
+///      parses completely clean (no ERROR/MISSING node anywhere).
+///
+/// Because the transform changes nothing but the relational operators inside the
+/// Angular openers, a clean re-parse proves those operators were the SOLE cause of
+/// the error. Any unrelated defect (unclosed `<div>`, stray `</div>`/
+/// erroneous_end_tag, broken attribute anywhere) keeps the transformed parse dirty,
+/// so a genuinely broken file is NOT excused. This closes both the masked-defect
+/// hole and the no-diagnostic-fallback hole by construction.
+///
+/// Known limitation (safe direction): `tree-sitter-html` also mis-lexes `&&`
+/// inside a control expression, and we do not neutralize it. A valid Angular
+/// template whose control expression uses `&&` therefore stays dirty after
+/// neutralization and is NOT excused — it surfaces as an unexpected partial rather
+/// than being masked. Under-excusing is the safe failure mode; we never falsely
+/// excuse a broken file.
+pub(crate) fn is_expected_angular_template_control_flow_limitation(
+    language: &LanguageId,
+    content: &[u8],
+) -> bool {
+    if !matches!(language, LanguageId::Html) {
+        return false;
+    }
+
+    let source = String::from_utf8_lossy(content);
+
+    // The construct must actually be present; otherwise this limitation is not
+    // what we are looking at.
+    if !ANGULAR_CONTROL_FLOW_OPENER_RE.is_match(&source) {
+        return false;
+    }
+
+    // Defensive: only meaningful for files that genuinely failed to parse. If the
+    // original parses clean there is no limitation to excuse.
+    let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
+        Ok(Ok((_, has_error, _, _, _))) => has_error,
+        _ => return false,
+    };
+    if !original_has_error {
+        return false;
+    }
+
+    // Neutralize ONLY the relational operators inside each Angular control-flow
+    // opener's `(...)` expression, then re-parse the whole file. Each `<`/`>` in
+    // capture group 3 becomes a single space; the opener keyword, the parens, and
+    // every byte outside the matched openers (including ordinary HTML tag `<`/`>`)
+    // are preserved verbatim. A clean re-parse proves the relational operators were
+    // the sole cause.
+    let neutralized =
+        ANGULAR_CONTROL_FLOW_OPENER_RE.replace_all(&source, |caps: &regex::Captures| {
+            format!(
+                "{}{}{}{}",
+                &caps[1],
+                &caps[2],
+                caps[3].replace(['<', '>'], " "),
+                &caps[4],
+            )
+        });
+    match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+        Ok(Ok((_, has_error, _, _, _))) => !has_error,
+        _ => false,
+    }
+}
+
 /// Extract symbol name → body-hash pairs from source code using tree-sitter.
 ///
 /// Used by `diff_symbols` to compare symbol-level changes between git refs.

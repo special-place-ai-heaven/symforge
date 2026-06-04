@@ -524,4 +524,32 @@ mod tests {
         // We don't assert specific output — just no panic
         let _ = symbols;
     }
+
+    // ─── SF-004: Angular control-flow `>` trips tree-sitter-html ────────
+
+    #[test]
+    fn test_sf004_angular_if_relational_operator_is_partial_but_extracts_symbol() {
+        // tree-sitter-html 0.23.2 has zero Angular rules; the `>` relational
+        // operator in `@if (items.length > 0) {` is lexed as a tag close, so the
+        // grammar reports a parse error even though SymForge text-scans the
+        // construct and still extracts the `@if` symbol. This pins BOTH halves of
+        // the SF-004 root cause: has_error=true AND the symbol survives.
+        let source = "<div>\n  @if (items.length > 0) {\n    <span>{{ items.length }}</span>\n  }\n</div>";
+        let (symbols, has_error, _diagnostic, _refs, _aliases) =
+            crate::parsing::parse_source(source, &LanguageId::Html)
+                .expect("HTML parse should not hard-fail");
+
+        assert!(
+            has_error,
+            "the `>` inside an Angular @if expression must trip tree-sitter-html into an error node"
+        );
+        let if_sym = symbols
+            .iter()
+            .find(|s| s.name == "@if" && s.kind == SymbolKind::Module);
+        assert!(
+            if_sym.is_some(),
+            "the @if control-flow symbol must still be text-scanned despite the parse error, got: {:?}",
+            symbols
+        );
+    }
 }

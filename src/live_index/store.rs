@@ -541,10 +541,16 @@ pub struct PublishedIndexState {
     pub partial_parse_count: usize,
     pub unexpected_partial_parse_count: usize,
     pub expected_vendor_partial_parse_count: usize,
+    /// SF-004: count of partial parses excused as a framework template grammar
+    /// limitation (Angular `@if`/`@for`/... in `.html`). Carried across the
+    /// daemon-proxy boundary so proxied health reports the same third bucket.
+    pub expected_framework_partial_parse_count: usize,
     pub failed_count: usize,
     pub partial_parse_files: Vec<String>,
     pub unexpected_partial_parse_files: Vec<String>,
     pub expected_vendor_partial_parse_files: Vec<String>,
+    /// SF-004: bounded list of framework-template partial-parse files.
+    pub expected_framework_partial_parse_files: Vec<String>,
     pub failed_files: Vec<(String, String)>,
     pub symbol_count: usize,
     pub loaded_at_system: SystemTime,
@@ -1159,6 +1165,7 @@ impl PublishedIndexState {
             partial_parse_count: stats.partial_parse_count,
             unexpected_partial_parse_count: stats.unexpected_partial_parse_count,
             expected_vendor_partial_parse_count: stats.expected_vendor_partial_parse_count,
+            expected_framework_partial_parse_count: stats.expected_framework_partial_parse_count,
             failed_count: stats.failed_count,
             partial_parse_files: stats.partial_parse_files.into_iter().take(10).collect(),
             unexpected_partial_parse_files: stats
@@ -1168,6 +1175,11 @@ impl PublishedIndexState {
                 .collect(),
             expected_vendor_partial_parse_files: stats
                 .expected_vendor_partial_parse_files
+                .into_iter()
+                .take(10)
+                .collect(),
+            expected_framework_partial_parse_files: stats
+                .expected_framework_partial_parse_files
                 .into_iter()
                 .take(10)
                 .collect(),

@@ -16,8 +16,10 @@ use super::disambiguation::{
     is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
     parse_reference_kind_filter,
 };
+pub(crate) use super::health_view::is_expected_framework_partial_parse;
 pub use super::health_view::{
-    AdmissionTierLookupView, EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
+    AdmissionTierLookupView, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
+    EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
 };
 use super::search::{NoiseClass, NoisePolicy, PathScope};
 use super::store::{IndexedFile, LiveIndex};
@@ -4199,6 +4201,146 @@ impl Actor for MyActor {
                 "vendor/tree-sitter-scss/src/parser.c".to_string(),
                 "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_health_stats_categorizes_angular_template_partial_as_framework() {
+        // POSITIVE control, real parser end-to-end: a clean Angular template whose
+        // ONLY parse defect is the `>` relational operator inside `@if (...)`.
+        // tree-sitter-html 0.23.2 reports an error, but neutralize-and-reparse
+        // proves the operator was the sole cause, so it is bucketed as a framework
+        // partial and never counted as an unexpected repo-owned partial. The `@if`
+        // symbol is still extracted best-effort.
+        let content = "<div>\n  @if (items.length > 0) {\n    <span></span>\n  }\n</div>";
+        let app_html = make_real_html_indexed_file("src/app/app.html", content);
+
+        // Sanity: the real parser must have produced a partial parse that still
+        // carries the text-scanned `@if` symbol (both halves of the SF-004 root
+        // cause), otherwise the test would be vacuous.
+        assert!(
+            matches!(app_html.parse_status, ParseStatus::PartialParse { .. }),
+            "real parser must report a partial parse for the Angular template"
+        );
+        assert!(
+            app_html
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if control-flow symbol must survive the partial parse"
+        );
+
+        let index = make_index(vec![("src/app/app.html", app_html)], false);
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.partial_parse_count, 1);
+        assert_eq!(stats.expected_framework_partial_parse_count, 1);
+        assert_eq!(stats.unexpected_partial_parse_count, 0);
+        assert_eq!(
+            stats.expected_framework_partial_parse_files,
+            vec!["src/app/app.html".to_string()]
+        );
+        assert!(stats.unexpected_partial_parse_files.is_empty());
+    }
+
+    /// Build an `IndexedFile` for an HTML `path`/`content` by running the REAL
+    /// parser pipeline (`process_file` -> `IndexedFile::from_parse_result`), the
+    /// same path the live index uses. No faked diagnostic, no hand-built symbols:
+    /// the classifier under test sees exactly what production sees.
+    fn make_real_html_indexed_file(path: &str, content: &str) -> IndexedFile {
+        let bytes = content.as_bytes().to_vec();
+        let result = crate::parsing::process_file(path, &bytes, LanguageId::Html);
+        IndexedFile::from_parse_result(result, bytes)
+    }
+
+    #[test]
+    fn test_health_stats_angular_if_plus_unclosed_div_stays_unexpected() {
+        // NEGATIVE control C1, real parser end-to-end: a valid `@if (x > 0)` PLUS a
+        // genuine structural defect (an unclosed `<div`) elsewhere in the file.
+        // Neutralizing the `@if` relational operator does NOT clean the unclosed
+        // tag, so the whole-file re-parse stays dirty and the file is NOT excused.
+        // This is the masked-defect hole the old single-diagnostic-line logic
+        // allowed; it must now stay an unexpected partial.
+        let content = "<div>\n  @if (items.length > 0) {\n  }\n  <div\n  <span></span\n</div>";
+        let broken = make_real_html_indexed_file("src/app/broken_c1.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/broken_c1.html", broken)], false);
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.expected_framework_partial_parse_count, 0);
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/app/broken_c1.html".to_string()]
+        );
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_angular_if_plus_stray_end_tag_stays_unexpected() {
+        // NEGATIVE control C2, real parser end-to-end: a valid `@if (x > 0)` PLUS a
+        // stray trailing `</div>` (an erroneous_end_tag — a real defect that is
+        // neither an ERROR nor a MISSING node, so the old no-diagnostic fallback
+        // would have excused it). Empirically the diagnostic for THIS arrangement
+        // pins to the `@if` opener line, which the old line-correlation logic would
+        // also have falsely excused. Neutralizing the `@if` operator leaves the
+        // stray end tag, so the re-parse stays dirty and the file is NOT excused.
+        let content = "<div>\n  @if (x > 0) {\n  }\n</div>\n</div>";
+        let broken = make_real_html_indexed_file("src/app/broken_c2.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/broken_c2.html", broken)], false);
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.expected_framework_partial_parse_count, 0);
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/app/broken_c2.html".to_string()]
+        );
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_broken_html_without_angular_stays_unexpected() {
+        // NEGATIVE control, real parser end-to-end: broken HTML (unclosed `<a`)
+        // with NO Angular construct at all. The cheap symbol-name pre-gate fails
+        // (no `@if`/`@for`/... symbol), so the classifier never excuses it. Stays
+        // an unexpected partial.
+        let content = "<div>\n  <a href=\n</div>";
+        let broken = make_real_html_indexed_file("src/app/plain_broken.html", content);
+        assert!(
+            matches!(broken.parse_status, ParseStatus::PartialParse { .. }),
+            "plain broken HTML must be a partial parse for this test to be meaningful"
+        );
+        assert!(
+            !broken.symbols.iter().any(|s| s.kind == SymbolKind::Module
+                && ["@if", "@for", "@switch", "@defer"].contains(&s.name.as_str())),
+            "there must be no Angular control-flow symbol in this fixture"
+        );
+        let index = make_index(vec![("src/app/plain_broken.html", broken)], false);
+
+        let stats = index.health_stats();
+
+        assert_eq!(stats.expected_framework_partial_parse_count, 0);
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/app/plain_broken.html".to_string()]
         );
     }
 

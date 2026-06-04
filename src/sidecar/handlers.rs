@@ -133,6 +133,14 @@ fn parse_state_label(file: &crate::live_index::store::IndexedFile) -> &'static s
     match &file.parse_status {
         crate::live_index::store::ParseStatus::Parsed => "parsed",
         crate::live_index::store::ParseStatus::PartialParse { .. } => {
+            // SF-004: a partial parse caused only by Angular template control-flow
+            // (`@if`/`@for`/... in `.html`) that tree-sitter-html cannot model is
+            // a known framework limitation; symbols are extracted best-effort, so
+            // surface it as parsed rather than a bare "partial" in the
+            // file-context envelope (the report's actual repro surface).
+            if crate::live_index::query::is_expected_framework_partial_parse(file) {
+                return "parsed";
+            }
             // SF-003: a partial parse caused only by the tree-sitter-typescript
             // 0.23.2 import-type-array grammar limitation is valid TypeScript;
             // surface it as parsed rather than partial in the file-context
@@ -374,6 +382,19 @@ fn append_parse_status_lines(
     match &file.parse_status {
         crate::live_index::store::ParseStatus::Parsed => {}
         crate::live_index::store::ParseStatus::PartialParse { warning } => {
+            // SF-004: suppress the partial-parse diagnostic when the only cause
+            // is Angular template control-flow (`@if`/`@for`/... in `.html`) that
+            // tree-sitter-html cannot model. Surface a non-alarming framework note
+            // instead so the file-context envelope does not flag a known
+            // framework-template limitation as a defect (the report's repro tool).
+            if crate::live_index::query::is_expected_framework_partial_parse(file) {
+                lines.push(
+                    "Parse status: ok (framework limitation: Angular template control-flow \
+                     is not supported by tree-sitter-html; symbols extracted best-effort)"
+                        .to_string(),
+                );
+                return;
+            }
             // SF-003: suppress the partial-parse diagnostic when the only cause
             // is the known tree-sitter-typescript 0.23.2 import-type-array
             // grammar limitation (valid TypeScript). Surface a non-alarming note
@@ -2273,6 +2294,78 @@ mod tests {
             alias_map: HashMap::new(),
             mtime_secs: 0,
         }
+    }
+
+    /// SF-004 helper: an HTML `IndexedFile` whose only parse defect is Angular
+    /// template control-flow that trips tree-sitter-html on the `>` operator.
+    fn make_angular_html_partial(path: &str) -> IndexedFile {
+        let content = "<div>\n  @if (items.length > 0) {\n  }\n</div>";
+        let if_symbol = SymbolRecord {
+            name: "@if".to_string(),
+            kind: SymbolKind::Module,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (8, 9),
+            item_byte_range: Some((8, 9)),
+            // `@if (...)` is on 0-based line 1; diagnostic below is 1-based line 2.
+            line_range: (1, 1),
+            doc_byte_range: None,
+        };
+        IndexedFile {
+            relative_path: path.to_string(),
+            language: LanguageId::Html,
+            classification: crate::domain::FileClassification::for_code_path(path),
+            content: content.as_bytes().to_vec(),
+            symbols: vec![if_symbol],
+            parse_status: ParseStatus::PartialParse {
+                warning: "tree-sitter reported syntax errors".to_string(),
+            },
+            parse_diagnostic: Some(crate::domain::index::ParseDiagnostic {
+                parser: "tree-sitter".to_string(),
+                message: "syntax error".to_string(),
+                line: Some(2),
+                column: Some(20),
+                byte_span: Some((8, 31)),
+                fallback_used: false,
+            }),
+            byte_len: content.len() as u64,
+            content_hash: "html".to_string(),
+            references: vec![],
+            alias_map: HashMap::new(),
+            mtime_secs: 0,
+        }
+    }
+
+    #[test]
+    fn test_sf004_parse_state_label_marks_angular_template_partial_parsed() {
+        let file = make_angular_html_partial("src/app/app.html");
+        assert_eq!(
+            parse_state_label(&file),
+            "parsed",
+            "an Angular template partial must surface as parsed, not a bare partial, \
+             in the file-context envelope"
+        );
+    }
+
+    #[test]
+    fn test_sf004_outline_status_line_labels_angular_template_as_framework() {
+        let file = make_angular_html_partial("src/app/app.html");
+        let mut lines: Vec<String> = Vec::new();
+        append_parse_status_lines(&mut lines, &file);
+        let rendered = lines.join("\n");
+
+        assert!(
+            !rendered.contains("Parse status: partial"),
+            "Angular template partial must not render a bare partial status: {rendered}"
+        );
+        assert!(
+            rendered.contains("Parse status: ok (framework limitation:"),
+            "Angular template partial should render the framework-limitation note: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Diagnostic: tree-sitter: syntax error"),
+            "the alarming raw diagnostic must be suppressed for the framework case: {rendered}"
+        );
     }
 
     fn build_shared_index(
