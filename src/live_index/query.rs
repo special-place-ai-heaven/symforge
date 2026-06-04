@@ -539,6 +539,29 @@ fn tokenize_path_query(normalized_query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Compute the [`PathMatchSignal`] tier score the given anchor path earns for
+/// `query`, using the same normalization and tokenization `search_files` uses
+/// for candidate classification. The co-change anchor-confidence gate compares
+/// this score against `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR`; the caller reuses it
+/// to report a precise fallback reason without re-tokenizing the query inline.
+pub(crate) fn anchor_path_match_score(query: &str, anchor_path: &str) -> f32 {
+    let normalized_query = normalize_path_query(query);
+    let tokens = tokenize_path_query(&normalized_query);
+    let ctx = super::rank_signals::RankCtx {
+        query: &normalized_query,
+        tokens: &tokens,
+        current_file: None,
+        target_path: None,
+        co_change_count: None,
+        co_change_weighted_score: None,
+    };
+    <super::rank_signals::PathMatchSignal as super::rank_signals::RankSignal>::score(
+        &super::rank_signals::PathMatchSignal,
+        std::path::Path::new(anchor_path),
+        &ctx,
+    )
+}
+
 pub(super) fn path_has_component(path: &str, component: &str) -> bool {
     path.split('/')
         .any(|part| part.eq_ignore_ascii_case(component))

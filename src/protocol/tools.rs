@@ -881,6 +881,62 @@ fn cochange_ranking_evidence(
         .with_detail(detail)
 }
 
+/// Build the precise `FallbackUsed` co-change detail for the case where the
+/// coupling store loaded usable partner rows for the anchor, yet no returned
+/// candidate landed in the co-change tier. The four distinguishable reasons:
+///
+/// 1. chore-anchor excluded (`is_chore_anchor_path` fires before the gate),
+/// 2. anchor reached only prefix-tier path confidence (below the basename
+///    floor), with a `query="<basename>"` hint to clear it,
+/// 3. neighbors exist but none of them appear among the returned candidates
+///    (the genuine path-mismatch case),
+/// 4. neighbors appear among candidates but were filtered out by a later gate.
+///
+/// The anchor-confidence reason (1 and 2) is computed once at anchor level via
+/// [`classify_anchor_cochange_rejection`], not per candidate.
+fn cochange_fallback_detail(
+    query: &str,
+    anchor_path: &str,
+    neighbors: &SearchFilesCouplingNeighbors,
+    candidate_paths: &[&str],
+) -> String {
+    let partner_count = neighbors.len();
+    let anchor_score = crate::live_index::query::anchor_path_match_score(query, anchor_path);
+    match crate::live_index::rank_signals::classify_anchor_cochange_rejection(
+        anchor_path,
+        anchor_score,
+    ) {
+        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::ChoreAnchor) => {
+            format!(
+                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but it is a chore anchor (lockfile/changelog/workflow) excluded from co-change promotion; path ranking returned"
+            )
+        }
+        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::BelowConfidenceFloor) => {
+            let anchor_basename = std::path::Path::new(anchor_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(anchor_path);
+            format!(
+                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but the query reached only prefix-tier path confidence for the anchor (below the basename-tier floor); pass query=\"{anchor_basename}\" to clear it; path ranking returned"
+            )
+        }
+        None => {
+            let any_partner_in_candidates = candidate_paths
+                .iter()
+                .any(|path| neighbors.contains_key(*path));
+            if any_partner_in_candidates {
+                format!(
+                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s) present among returned candidates, but a later rank gate filtered them; path ranking returned"
+                )
+            } else {
+                format!(
+                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but none appear among the returned candidates; path ranking returned"
+                )
+            }
+        }
+    }
+}
+
 fn cochange_lazy_prepare_evidence(
     root: &Path,
     reason: &str,
@@ -4596,13 +4652,21 @@ impl SymForgeServer {
                         ),
                     ))
                 } else {
+                    let candidate_paths: Vec<&str> = match &view {
+                        SearchFilesView::Found { hits, .. } => {
+                            hits.iter().map(|hit| hit.path.as_str()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
                     Some(cochange_ranking_evidence(
                         CapabilityStatus::FallbackUsed,
                         CapabilityFreshness::Current,
                         CapabilityCost::Low,
-                        format!(
-                            "anchor_path={anchor_path} loaded {} usable coupling partner(s), but none matched returned candidates or passed rank gates; path ranking returned",
-                            neighbors.len()
+                        cochange_fallback_detail(
+                            &params.0.query,
+                            anchor_path,
+                            neighbors,
+                            &candidate_paths,
                         ),
                     ))
                 };

@@ -196,10 +196,14 @@ async fn weak_prefix_anchor_keeps_baseline_path_order_for_path_cochange() {
 
     assert_eq!(returned_paths(&reranked), returned_paths(&baseline));
     assert_contains(&reranked, "Capability: co-change ranking fallback used");
+    // SF-006: a true stem prefix (`rou` for `routes.rs`) reaches only
+    // prefix-tier anchor confidence, below the basename-tier floor. The
+    // fallback now names that precise reason and hints the basename query.
     assert_contains(
         &reranked,
-        "none matched returned candidates or passed rank gates; path ranking returned",
+        "the query reached only prefix-tier path confidence for the anchor (below the basename-tier floor)",
     );
+    assert_contains(&reranked, "pass query=\"routes.rs\" to clear it");
 }
 
 #[tokio::test]
@@ -233,8 +237,111 @@ async fn hardcoded_changelog_chore_anchor_keeps_baseline_path_order_for_path_coc
 
     assert_eq!(returned_paths(&reranked), returned_paths(&baseline));
     assert_contains(&reranked, "Capability: co-change ranking fallback used");
+    // SF-006: CHANGELOG.md is a hardcoded chore anchor excluded from co-change
+    // promotion BEFORE the confidence gate. The fallback now names that reason.
     assert_contains(
         &reranked,
-        "none matched returned candidates or passed rank gates; path ranking returned",
+        "it is a chore anchor (lockfile/changelog/workflow) excluded from co-change promotion; path ranking returned",
+    );
+}
+
+/// SF-006 core regression: a stem-only query (`work_item`) that names the
+/// anchor basename stem (`work_item.rs`) must reach BASENAME-tier path
+/// confidence so co-change fusion clears the anchor floor. The 3/3-shared-commit
+/// partner `work_item_store.rs` must be promoted to the co-change tier rather
+/// than triggering the misleading "fallback used" message.
+#[tokio::test]
+async fn stem_query_anchor_applies_cochange_for_basename_tier() {
+    let _coupling = EnvGuard::remove("SYMFORGE_COUPLING");
+    let fx = Fixture::new(
+        &[
+            ("src/stores/work_item.rs", "pub fn work_item() {}\n"),
+            (
+                "tests/work_item_store.rs",
+                "pub fn work_item_store_test() {}\n",
+            ),
+            ("src/stores/mod.rs", "pub mod work_item;\n"),
+        ],
+        &[row(
+            "src/stores/work_item.rs",
+            "tests/work_item_store.rs",
+            3,
+            11.0,
+        )],
+    );
+
+    let reranked = call(
+        &fx.server,
+        json!({
+            "query": "work_item",
+            "limit": 10,
+            "rank_by": "path+cochange",
+            "anchor_path": "src/stores/work_item.rs",
+            "debug_ranking": true
+        }),
+    )
+    .await;
+
+    // Fusion applied — NOT a fallback.
+    assert!(
+        !reranked.contains("Capability: co-change ranking fallback used"),
+        "expected applied co-change, got fallback; result was:\n{reranked}"
+    );
+    assert_contains(&reranked, "Capability: co-change ranking applied");
+    assert_contains(
+        &reranked,
+        "rows with shared-commit counts show applied evidence",
+    );
+    assert_contains(&reranked, "co-change signal: applied");
+    // The partner is surfaced under the co-change tier of the result.
+    assert_contains(&reranked, "tests/work_item_store.rs");
+}
+
+/// SF-006 reason precision: a true partial token (`work`, a strict prefix of
+/// the anchor stem `work_item`) stays prefix-tier — it does NOT jump to
+/// basename tier — so co-change fusion still falls back, but the fallback now
+/// names the precise prefix-tier reason and hints the basename query.
+#[tokio::test]
+async fn partial_token_anchor_still_falls_back() {
+    let _coupling = EnvGuard::remove("SYMFORGE_COUPLING");
+    let fx = Fixture::new(
+        &[
+            ("src/stores/work_item.rs", "pub fn work_item() {}\n"),
+            (
+                "tests/work_item_store.rs",
+                "pub fn work_item_store_test() {}\n",
+            ),
+            ("src/stores/mod.rs", "pub mod work_item;\n"),
+        ],
+        &[row(
+            "src/stores/work_item.rs",
+            "tests/work_item_store.rs",
+            3,
+            11.0,
+        )],
+    );
+
+    let reranked = call(
+        &fx.server,
+        json!({
+            "query": "work",
+            "limit": 10,
+            "rank_by": "path+cochange",
+            "anchor_path": "src/stores/work_item.rs",
+            "debug_ranking": true
+        }),
+    )
+    .await;
+
+    assert_contains(&reranked, "Capability: co-change ranking fallback used");
+    assert_contains(
+        &reranked,
+        "the query reached only prefix-tier path confidence for the anchor (below the basename-tier floor)",
+    );
+    assert_contains(&reranked, "pass query=\"work_item.rs\" to clear it");
+    // The old misleading catch-all must be gone.
+    assert!(
+        !reranked.contains("none matched returned candidates or passed rank gates"),
+        "stale catch-all fallback message still present; result was:\n{reranked}"
     );
 }
