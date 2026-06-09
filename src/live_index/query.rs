@@ -16,6 +16,10 @@ use super::disambiguation::{
     is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
     parse_reference_kind_filter,
 };
+// Only consumed by the server-gated `sidecar::handlers`; gating the re-export
+// keeps the engine-only `embed` build free of an unused-import error under
+// `warnings = "deny"` (the consumer is absent when `server` is off).
+#[cfg(feature = "server")]
 pub(crate) use super::health_view::is_expected_framework_partial_parse;
 pub use super::health_view::{
     AdmissionTierLookupView, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,

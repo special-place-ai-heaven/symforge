@@ -3784,11 +3784,17 @@ mod tests {
                 "exactly one untracked recognized-ext indexed file expected"
             );
 
-            let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
-            assert!(
-                report.contains("indexed untracked files: 1"),
-                "health line should surface the untracked count: {report}"
-            );
+            // The health-report rendering lives in the server-gated `protocol`
+            // module, so assert it only when `server` is compiled. The engine-side
+            // `untracked_indexed` stat above is still exercised under `embed`.
+            #[cfg(feature = "server")]
+            {
+                let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
+                assert!(
+                    report.contains("indexed untracked files: 1"),
+                    "health line should surface the untracked count: {report}"
+                );
+            }
         }
 
         /// FAIL-OPEN: a plain tempdir with NO git repository must report
@@ -3809,11 +3815,16 @@ mod tests {
                 stats.untracked_indexed, 0,
                 "with no git repo the feature must fail open to 0, not count every file"
             );
-            let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
-            assert!(
-                !report.contains("indexed untracked files:"),
-                "no untracked line should appear when the count is 0: {report}"
-            );
+            // Server-gated formatter assertion (see note above); the engine-side
+            // fail-open `untracked_indexed == 0` check above runs under `embed`.
+            #[cfg(feature = "server")]
+            {
+                let report = crate::protocol::format::health_report_from_stats("Ready", &stats, 0);
+                assert!(
+                    !report.contains("indexed untracked files:"),
+                    "no untracked line should appear when the count is 0: {report}"
+                );
+            }
         }
 
         /// A fully-tracked repo reports `untracked_indexed == 0`.
