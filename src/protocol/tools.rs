@@ -746,7 +746,19 @@ where
 fn parse_state_for_file(file: &IndexedFile) -> &'static str {
     match &file.parse_status {
         crate::live_index::store::ParseStatus::Parsed => "parsed",
-        crate::live_index::store::ParseStatus::PartialParse { .. } => "partial",
+        crate::live_index::store::ParseStatus::PartialParse { .. } => {
+            // SF-003: a partial parse caused only by the tree-sitter-typescript
+            // 0.23.2 import-type-array grammar limitation is valid TypeScript;
+            // report it as parsed rather than partial.
+            if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                &file.language,
+                &file.content,
+            ) {
+                "parsed"
+            } else {
+                "partial"
+            }
+        }
         crate::live_index::store::ParseStatus::Failed { .. } => "degraded",
     }
 }
@@ -879,6 +891,62 @@ fn cochange_ranking_evidence(
         .with_cost(cost)
         .with_safety(CapabilitySafety::ReadOnly)
         .with_detail(detail)
+}
+
+/// Build the precise `FallbackUsed` co-change detail for the case where the
+/// coupling store loaded usable partner rows for the anchor, yet no returned
+/// candidate landed in the co-change tier. The four distinguishable reasons:
+///
+/// 1. chore-anchor excluded (`is_chore_anchor_path` fires before the gate),
+/// 2. anchor reached only prefix-tier path confidence (below the basename
+///    floor), with a `query="<basename>"` hint to clear it,
+/// 3. neighbors exist but none of them appear among the returned candidates
+///    (the genuine path-mismatch case),
+/// 4. neighbors appear among candidates but were filtered out by a later gate.
+///
+/// The anchor-confidence reason (1 and 2) is computed once at anchor level via
+/// [`classify_anchor_cochange_rejection`], not per candidate.
+fn cochange_fallback_detail(
+    query: &str,
+    anchor_path: &str,
+    neighbors: &SearchFilesCouplingNeighbors,
+    candidate_paths: &[&str],
+) -> String {
+    let partner_count = neighbors.len();
+    let anchor_score = crate::live_index::query::anchor_path_match_score(query, anchor_path);
+    match crate::live_index::rank_signals::classify_anchor_cochange_rejection(
+        anchor_path,
+        anchor_score,
+    ) {
+        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::ChoreAnchor) => {
+            format!(
+                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but it is a chore anchor (lockfile/changelog/workflow) excluded from co-change promotion; path ranking returned"
+            )
+        }
+        Some(crate::live_index::rank_signals::AnchorCoChangeRejection::BelowConfidenceFloor) => {
+            let anchor_basename = std::path::Path::new(anchor_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(anchor_path);
+            format!(
+                "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but the query reached only prefix-tier path confidence for the anchor (below the basename-tier floor); pass query=\"{anchor_basename}\" to clear it; path ranking returned"
+            )
+        }
+        None => {
+            let any_partner_in_candidates = candidate_paths
+                .iter()
+                .any(|path| neighbors.contains_key(*path));
+            if any_partner_in_candidates {
+                format!(
+                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s) present among returned candidates, but a later rank gate filtered them; path ranking returned"
+                )
+            } else {
+                format!(
+                    "anchor_path={anchor_path} loaded {partner_count} usable coupling partner(s), but none appear among the returned candidates; path ranking returned"
+                )
+            }
+        }
+    }
 }
 
 fn cochange_lazy_prepare_evidence(
@@ -2667,6 +2735,68 @@ fn sidecar_status_for_server(server: &SymForgeServer) -> crate::sidecar::port_fi
 fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     let our_binary = std::env::current_exe().ok()?;
     crate::path_shadow::detect_shadow(&our_binary)
+}
+
+/// Extract the `version=<token>` value emitted on the runtime-status line of a
+/// `health` / `health_compact` report (see `format::format_runtime_status`).
+///
+/// The runtime line is ` | `-delimited, e.g.
+/// `Runtime: mode=... | version=7.18.1 | project_root=...`, and round-2 guarantees
+/// a `version=` token is present in EVERY mode (regression:
+/// `test_runtime_status_includes_binary_version_in_every_mode`). Returns the raw
+/// token (e.g. `"7.18.1"`) or `None` when no such token is present.
+fn extract_runtime_version(health_output: &str) -> Option<&str> {
+    let after = health_output.split("version=").nth(1)?;
+    // The version token runs until the next field separator, whitespace, or EOL.
+    let token = after
+        .split(['|', ' ', '\n', '\r', '\t'])
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(token)
+}
+
+/// LOUD operations guard (SF-001 / SF-009 root-cause class): when the MCP
+/// front-end is proxying to a daemon, the daemon's reported binary version can be
+/// OLDER than the front-end's own build — a stale/shadowed daemon serving
+/// pre-fix behavior, which is exactly what masked the SF-001 fix during the audit.
+///
+/// Compares the daemon version parsed out of the proxied health report against the
+/// front-end's `frontend_version` (its `env!("CARGO_PKG_VERSION")`). Returns a
+/// warning string ONLY when the daemon version is strictly OLDER than the
+/// front-end. Fail-safe by construction: a missing/unparseable token or an
+/// equal/newer daemon yields `None` (no warning).
+///
+/// Product decision: WARN, do NOT auto-restart. Auto-restarting risks killing a
+/// daemon mid-session for other clients; a loud, idempotent health warning is the
+/// safe, sufficient remedy and tells the operator to reconnect/restart.
+fn daemon_staleness_warning(proxied_health: &str, frontend_version: &str) -> Option<String> {
+    let daemon_version = extract_runtime_version(proxied_health)?;
+
+    // `is_newer_version(latest, current)` is true iff `latest` > `current`. The
+    // daemon is stale exactly when the front-end is newer than the daemon.
+    if !crate::cli::version::is_newer_version(frontend_version, daemon_version) {
+        return None;
+    }
+
+    Some(format!(
+        "\n── \u{26a0} Daemon serving stale code ──\n\
+         The MCP daemon answering this session reports version {daemon_version}, but this\n\
+         front-end is version {frontend_version} (newer). The daemon is serving an OLDER\n\
+         binary, so tool behavior may be stale (this is the operational root cause behind\n\
+         masked fixes such as SF-001). Reconnect your MCP client (e.g. /mcp) or restart the\n\
+         daemon so it picks up the newer binary; this is a WARNING only — no automatic\n\
+         restart is performed."
+    ))
+}
+
+/// Append `daemon_staleness_warning` to a proxied health report when the daemon is
+/// older than the front-end; otherwise return the report unchanged.
+fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version: &str) -> String {
+    if let Some(warning) = daemon_staleness_warning(&proxied_health, frontend_version) {
+        proxied_health.push_str(&warning);
+    }
+    proxied_health
 }
 
 fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &str) -> Vec<String> {
@@ -4596,13 +4726,21 @@ impl SymForgeServer {
                         ),
                     ))
                 } else {
+                    let candidate_paths: Vec<&str> = match &view {
+                        SearchFilesView::Found { hits, .. } => {
+                            hits.iter().map(|hit| hit.path.as_str()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
                     Some(cochange_ranking_evidence(
                         CapabilityStatus::FallbackUsed,
                         CapabilityFreshness::Current,
                         CapabilityCost::Low,
-                        format!(
-                            "anchor_path={anchor_path} loaded {} usable coupling partner(s), but none matched returned candidates or passed rank gates; path ranking returned",
-                            neighbors.len()
+                        cochange_fallback_detail(
+                            &params.0.query,
+                            anchor_path,
+                            neighbors,
+                            &candidate_paths,
                         ),
                     ))
                 };
@@ -5095,7 +5233,9 @@ impl SymForgeServer {
     )]
     pub(crate) async fn health(&self) -> String {
         if let Some(result) = self.proxy_tool_call_without_params("health").await {
-            return result;
+            // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
+            // we proxied to is serving an OLDER binary than this front-end.
+            return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
         let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None);
         self.session_context
@@ -5110,7 +5250,9 @@ impl SymForgeServer {
     )]
     pub(crate) async fn health_compact(&self) -> String {
         if let Some(result) = self.proxy_tool_call_without_params("health_compact").await {
-            return result;
+            // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
+            // we proxied to is serving an OLDER binary than this front-end.
+            return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
 
         let result = self.health_compact_for_runtime(self.local_runtime_mode(), None, None, None);
@@ -5133,8 +5275,14 @@ impl SymForgeServer {
         )
     )]
     pub(crate) async fn checkpoint_now(&self, params: Parameters<CheckpointNowInput>) -> String {
-        if self.daemon_client.is_some() {
-            return "Checkpoint failed: checkpoint_now is unavailable in daemon-proxy mode; restart with SYMFORGE_NO_DAEMON=1 for local in-process checkpointing.".to_string();
+        // Proxy-first: in daemon-proxy mode the daemon owns the authoritative
+        // live index, while this process holds only `LiveIndex::empty()`.
+        // Forward to the daemon (where `daemon_client` is None and `repo_root`
+        // is real) so the checkpoint runs against the populated index. On
+        // local-fallback the proxy returns None and the in-process logic below
+        // checkpoints the locally reloaded index.
+        if let Some(result) = self.proxy_tool_call("checkpoint_now", &params.0).await {
+            return result;
         }
         let repo_root = match self.capture_repo_root() {
             Some(root) => root,
@@ -7502,6 +7650,9 @@ impl SymForgeServer {
                 };
                 self.find_references(Parameters(input)).await
             }
+            smart_query::QueryIntent::ToolHelp { topic } => {
+                smart_query::render_tool_catalog_for_topic(topic.as_deref())
+            }
             smart_query::QueryIntent::Explore { query } => {
                 let input = ExploreInput {
                     query: query.clone(),
@@ -7689,6 +7840,78 @@ mod tests {
             line_range: (line_start, line_end),
             doc_byte_range: None,
         }
+    }
+
+    // ── SF-001 Part 2: daemon served-binary staleness guard ──────────────────
+
+    /// Build a minimal proxied-health string carrying the daemon's runtime
+    /// `version=` token, exactly as `format::format_runtime_status` emits it.
+    fn proxied_health_with_version(daemon_version: &str) -> String {
+        format!(
+            "Runtime: mode=daemon_reused_session | runtime_state=daemon_reused_session | \
+             version={daemon_version} | project_root=/repo | project_id=p | session_id=s | \
+             index_id=i | index_generation=1 | project_generation=1 | load_source=fresh_load | \
+             reset_state=none | index_state=fresh_process"
+        )
+    }
+
+    #[test]
+    fn daemon_staleness_warning_fires_when_daemon_older_than_front_end() {
+        let proxied = proxied_health_with_version("7.17.2");
+        let out = super::append_daemon_staleness_warning(proxied, "7.18.1");
+        assert!(
+            out.contains("Daemon serving stale code"),
+            "older daemon must trigger the staleness warning; got: {out}"
+        );
+        assert!(
+            out.contains("7.17.2"),
+            "warning should name the daemon version"
+        );
+        assert!(
+            out.contains("7.18.1"),
+            "warning should name the front-end version"
+        );
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_versions_equal() {
+        let proxied = proxied_health_with_version("7.18.1");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(
+            out, proxied,
+            "equal versions must not append any staleness warning"
+        );
+        assert!(!out.contains("Daemon serving stale code"));
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_daemon_newer() {
+        let proxied = proxied_health_with_version("7.19.0");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied, "a newer daemon must not be flagged as stale");
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_version_token_absent() {
+        // Fail-safe: a report with no `version=` token yields no warning.
+        let proxied = "Runtime: mode=daemon_reused_session | project_root=/repo".to_string();
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied);
+    }
+
+    #[test]
+    fn daemon_staleness_warning_silent_when_version_unparseable() {
+        // Fail-safe: a non-numeric version token cannot be compared, so no warning.
+        let proxied = proxied_health_with_version("unknown");
+        let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
+        assert_eq!(out, proxied);
+    }
+
+    #[test]
+    fn extract_runtime_version_pulls_token_from_runtime_line() {
+        let proxied = proxied_health_with_version("7.17.2");
+        assert_eq!(super::extract_runtime_version(&proxied), Some("7.17.2"));
+        assert_eq!(super::extract_runtime_version("no version here"), None);
     }
 
     fn make_symbol_with_bytes(
@@ -19771,6 +19994,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ask_tool_help_returns_impact_analysis_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let content = b"fn helper() {}\n";
+        std::fs::write(src_dir.join("lib.rs"), content).unwrap();
+
+        let result = crate::parsing::process_file("src/lib.rs", content, LanguageId::Rust);
+        let indexed =
+            crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let input = super::SmartQueryInput {
+            query: "what tools can I use for impact analysis?".to_string(),
+            max_tokens: None,
+        };
+        let result = server.ask(Parameters(input)).await;
+
+        // Routed to the tool catalog, not a code search.
+        assert!(result.contains("Chosen tool: ask"), "result: {result}");
+        // The impact-analysis catalog group must list all impact tools.
+        for tool in [
+            "find_references",
+            "find_dependents",
+            "get_symbol_context",
+            "analyze_file_impact",
+            "what_changed",
+            "diff_symbols",
+        ] {
+            assert!(
+                result.contains(tool),
+                "impact-analysis catalog missing `{tool}`; result:\n{result}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_ask_reports_inferred_route_confidence() {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = dir.path().join("src");
@@ -19801,6 +20065,64 @@ mod tests {
             "result: {result}"
         );
         assert!(result.contains("Suggested next step:"), "result: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_ask_compound_lookup_extracts_leading_symbol() {
+        // SF-005: a compound lookup like "Where is X defined and what module
+        // imports it?" must route to search_symbols with ONLY the leading symbol
+        // token, report `inferred` confidence (not a confident false negative), and
+        // chain a follow-up hint naming search_symbols -> find_references.
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("controller.ts"),
+            b"class TestingController {}\n",
+        )
+        .unwrap();
+
+        let mut indexed = make_file(
+            "src/controller.ts",
+            b"class TestingController {}\n",
+            vec![make_symbol("TestingController", SymbolKind::Class, 1, 1)],
+        );
+        indexed.1.language = LanguageId::TypeScript;
+        let server = make_server_with_root(
+            make_live_index_ready(vec![indexed]),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let input = super::SmartQueryInput {
+            query: "Where is TestingController defined and what module imports it?".to_string(),
+            max_tokens: None,
+        };
+        let result = server.ask(Parameters(input)).await;
+
+        assert!(
+            result.contains("Route confidence: inferred"),
+            "compound lookup must downgrade to inferred, not exact: {result}"
+        );
+        assert!(
+            result.contains("Chosen tool: search_symbols"),
+            "result: {result}"
+        );
+        assert!(
+            result.contains("Invocation: search_symbols(query=\"TestingController\")"),
+            "invocation must echo the leading symbol token only: {result}"
+        );
+        assert!(
+            !result.contains("imports it"),
+            "the trailing clause must not leak into the symbol query: {result}"
+        );
+        assert!(
+            result.contains("Suggested next step:"),
+            "downgraded route must chain a follow-up hint: {result}"
+        );
+        assert!(
+            result.contains("search_symbols -> find_references"),
+            "follow-up hint must name the chained sequence: {result}"
+        );
     }
 
     #[tokio::test]

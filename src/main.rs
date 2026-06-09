@@ -444,10 +444,12 @@ mod tests {
             partial_parse_count: 1,
             unexpected_partial_parse_count: 1,
             expected_vendor_partial_parse_count: 0,
+            expected_framework_partial_parse_count: 0,
             failed_count: 1,
             partial_parse_files: vec!["src/partial.rs".to_string()],
             unexpected_partial_parse_files: vec!["src/partial.rs".to_string()],
             expected_vendor_partial_parse_files: vec![],
+            expected_framework_partial_parse_files: vec![],
             failed_files: vec![("src/failed.rs".to_string(), "syntax error".to_string())],
             symbol_count: 34,
             loaded_at_system: SystemTime::now(),
@@ -457,6 +459,7 @@ mod tests {
             is_empty: false,
             tier_counts: (0, 0, 0),
             local_empty_reason: None,
+            untracked_indexed: 0,
             indexed_root: None,
         }
     }

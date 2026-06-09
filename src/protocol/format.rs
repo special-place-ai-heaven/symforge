@@ -34,14 +34,16 @@ impl Default for OutputLimits {
 }
 
 use crate::domain::index::{AdmissionTier, SkippedFile};
-use crate::live_index::query::EXPECTED_VENDOR_PARTIAL_PARSE_REASON;
+use crate::live_index::query::{
+    EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
+};
 use crate::live_index::{
-    ContextBundleFoundView, ContextBundleSectionView, ContextBundleView, FileContentView,
-    FileOutlineView, FindDependentsView, FindReferencesView, HealthStats, ImplBlockSuggestionView,
-    ImplementationsView, IndexLoadSource, IndexedFile, InspectMatchView, LiveIndex,
-    PublishedIndexState, RepoOutlineFileView, RepoOutlineView, SearchFilesResolveView,
-    SearchFilesTier, SearchFilesView, SnapshotVerifyState, SymbolDetailView, TypeDependencyView,
-    WhatChangedTimestampView, search,
+    ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
+    ContextBundleView, FileContentView, FileOutlineView, FindDependentsView, FindReferencesView,
+    HealthStats, ImplBlockSuggestionView, ImplementationsView, IndexLoadSource, IndexedFile,
+    InspectMatchView, LiveIndex, PublishedIndexState, RepoOutlineFileView, RepoOutlineView,
+    SearchFilesResolveView, SearchFilesTier, SearchFilesView, SnapshotVerifyState,
+    SymbolDetailView, TypeDependencyView, WhatChangedTimestampView, search,
 };
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
@@ -51,6 +53,7 @@ const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
 enum ParseQuarantineKind {
     UnexpectedPartial,
     ExpectedVendorPartial,
+    ExpectedFrameworkPartial,
     Failed,
 }
 
@@ -59,6 +62,7 @@ impl ParseQuarantineKind {
         match self {
             Self::UnexpectedPartial => "unexpected_partial",
             Self::ExpectedVendorPartial => "expected_vendor_partial",
+            Self::ExpectedFrameworkPartial => "expected_framework_partial",
             Self::Failed => "failed",
         }
     }
@@ -76,6 +80,7 @@ struct ParseQuarantineSummary {
     total_count: usize,
     unexpected_partial_count: usize,
     expected_vendor_partial_count: usize,
+    expected_framework_partial_count: usize,
     failed_count: usize,
     entries: Vec<ParseQuarantineEntry>,
 }
@@ -85,6 +90,7 @@ impl ParseQuarantineSummary {
         let mut summary = Self::new(
             stats.unexpected_partial_parse_count,
             stats.expected_vendor_partial_parse_count,
+            stats.expected_framework_partial_parse_count,
             stats.failed_count,
         );
         for path in &stats.unexpected_partial_parse_files {
@@ -101,6 +107,13 @@ impl ParseQuarantineSummary {
                 EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
             );
         }
+        for path in &stats.expected_framework_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedFrameworkPartial,
+                EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
+            );
+        }
         for (path, error) in &stats.failed_files {
             summary.push(path, ParseQuarantineKind::Failed, error);
         }
@@ -111,6 +124,7 @@ impl ParseQuarantineSummary {
         let mut summary = Self::new(
             published.unexpected_partial_parse_count,
             published.expected_vendor_partial_parse_count,
+            published.expected_framework_partial_parse_count,
             published.failed_count,
         );
         for path in &published.unexpected_partial_parse_files {
@@ -127,6 +141,13 @@ impl ParseQuarantineSummary {
                 EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
             );
         }
+        for path in &published.expected_framework_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedFrameworkPartial,
+                EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
+            );
+        }
         for (path, error) in &published.failed_files {
             summary.push(path, ParseQuarantineKind::Failed, error);
         }
@@ -136,12 +157,17 @@ impl ParseQuarantineSummary {
     fn new(
         unexpected_partial_count: usize,
         expected_vendor_partial_count: usize,
+        expected_framework_partial_count: usize,
         failed_count: usize,
     ) -> Self {
         Self {
-            total_count: unexpected_partial_count + expected_vendor_partial_count + failed_count,
+            total_count: unexpected_partial_count
+                + expected_vendor_partial_count
+                + expected_framework_partial_count
+                + failed_count,
             unexpected_partial_count,
             expected_vendor_partial_count,
+            expected_framework_partial_count,
             failed_count,
             entries: Vec::new(),
         }
@@ -172,10 +198,11 @@ impl ParseQuarantineSummary {
         }
 
         let mut section = format!(
-            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} failed={} showing={} omitted={}",
+            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} failed={} showing={} omitted={}",
             self.total_count,
             self.unexpected_partial_count,
             self.expected_vendor_partial_count,
+            self.expected_framework_partial_count,
             self.failed_count,
             self.entries.len(),
             self.omitted_count()
@@ -198,10 +225,11 @@ impl ParseQuarantineSummary {
         }
 
         Some(format!(
-            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} failed={} showing={} omitted={}",
+            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} failed={} showing={} omitted={}",
             self.total_count,
             self.unexpected_partial_count,
             self.expected_vendor_partial_count,
+            self.expected_framework_partial_count,
             self.failed_count,
             self.entries.len(),
             self.omitted_count()
@@ -1554,6 +1582,7 @@ pub fn health_report_from_published_state(
         partial_parse_count: published.partial_parse_count,
         unexpected_partial_parse_count: published.unexpected_partial_parse_count,
         expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
+        expected_framework_partial_parse_count: published.expected_framework_partial_parse_count,
         failed_count: published.failed_count,
         load_duration: published.load_duration,
         watcher_state: watcher.state.clone(),
@@ -1567,9 +1596,13 @@ pub fn health_report_from_published_state(
         partial_parse_files: published.partial_parse_files.clone(),
         unexpected_partial_parse_files: published.unexpected_partial_parse_files.clone(),
         expected_vendor_partial_parse_files: published.expected_vendor_partial_parse_files.clone(),
+        expected_framework_partial_parse_files: published
+            .expected_framework_partial_parse_files
+            .clone(),
         failed_files: published.failed_files.clone(),
         tier_counts: published.tier_counts,
         local_empty_reason: published.local_empty_reason.clone(),
+        untracked_indexed: published.untracked_indexed,
     };
     // Preserve the existing formatter shape by reusing HealthStats.
     if matches!(stats.watcher_state, crate::watcher::WatcherState::Off) {
@@ -1764,10 +1797,19 @@ pub fn health_report_from_stats(
 
     let (tier1, tier2, tier3) = stats.tier_counts;
     let total_discovered = tier1 + tier2 + tier3;
-    let admission_section = format!(
+    let mut admission_section = format!(
         "\nAdmission: {} files discovered\n  Tier 1 (indexed): {}\n  Tier 2 (metadata only): {}\n  Tier 3 (hard-skipped): {}",
         total_discovered, tier1, tier2, tier3
     );
+    // SF-009: surface how many Tier-1 files are not under version control.
+    // Shown only when > 0 to keep clean, fully-tracked repos quiet; the count
+    // fails open to 0 (and is therefore hidden) outside a git working tree.
+    if stats.untracked_indexed > 0 {
+        admission_section.push_str(&format!(
+            "\n  indexed untracked files: {}",
+            stats.untracked_indexed
+        ));
+    }
 
     let mut output = format!(
         "Status: {}\nFiles:  {} indexed ({} parsed, {} partial, {} failed)\nSymbols: {}\nLoaded in: {}ms\n{}\nStale-mutation rejections: {}{}",
@@ -1810,6 +1852,10 @@ pub fn health_report_from_stats(
     } else if stats.expected_vendor_partial_parse_count > 0 {
         output.push_str(
             "\nParse resilience: expected vendor partial files kept best-effort symbols; they are labeled as vendor parser noise below.",
+        );
+    } else if stats.expected_framework_partial_parse_count > 0 {
+        output.push_str(
+            "\nParse resilience: expected framework partial files kept best-effort symbols; they are labeled as framework template parser noise below.",
         );
     }
 
@@ -1868,6 +1914,36 @@ pub fn health_report_from_stats(
         if omitted > 0 {
             output.push_str(&format!(
                 "  ... and {} more expected vendor partial files\n",
+                omitted
+            ));
+        }
+    }
+
+    if stats.expected_framework_partial_parse_count > 0 {
+        output.push_str(&format!(
+            "\nExpected framework partial parse noise ({}):\n",
+            stats.expected_framework_partial_parse_count
+        ));
+        for (i, path) in stats
+            .expected_framework_partial_parse_files
+            .iter()
+            .take(10)
+            .enumerate()
+        {
+            output.push_str(&format!(
+                "  {}. {} [{}]\n",
+                i + 1,
+                path,
+                EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON
+            ));
+        }
+        let rendered = stats.expected_framework_partial_parse_files.len().min(10);
+        let omitted = stats
+            .expected_framework_partial_parse_count
+            .saturating_sub(rendered);
+        if omitted > 0 {
+            output.push_str(&format!(
+                "  ... and {} more expected framework partial files\n",
                 omitted
             ));
         }
@@ -2125,14 +2201,32 @@ pub fn validate_file_syntax_result(path: &str, file: &IndexedFile) -> String {
             lines.push("Status: ok".to_string());
         }
         crate::live_index::ParseStatus::PartialParse { warning } => {
-            lines.push("Status: partial".to_string());
-            if let Some(diagnostic) = &file.parse_diagnostic {
-                lines.push(format!("Diagnostic: {}", diagnostic.summary()));
-                if let Some((start, end)) = diagnostic.byte_span {
-                    lines.push(format!("Byte span: {start}..{end}"));
-                }
+            // SF-003: a TypeScript import-type immediately followed by `[]`
+            // (e.g. `import('rxjs').Subscription[]`) is mis-parsed by
+            // tree-sitter-typescript 0.23.2 even though it is valid TS. When the
+            // partial parse is provably caused only by this grammar limitation,
+            // report it as ok with an explanatory note rather than a syntax
+            // error.
+            if crate::parsing::is_expected_typescript_import_type_array_limitation(
+                &file.language,
+                &file.content,
+            ) {
+                lines.push("Status: ok".to_string());
+                lines.push(
+                    "Note: parser limitation (tree-sitter-typescript 0.23.2 mis-parses an \
+                     import-type followed by `[]`; the source is valid TypeScript)"
+                        .to_string(),
+                );
             } else {
-                lines.push(format!("Diagnostic: {warning}"));
+                lines.push("Status: partial".to_string());
+                if let Some(diagnostic) = &file.parse_diagnostic {
+                    lines.push(format!("Diagnostic: {}", diagnostic.summary()));
+                    if let Some((start, end)) = diagnostic.byte_span {
+                        lines.push(format!("Byte span: {start}..{end}"));
+                    }
+                } else {
+                    lines.push(format!("Diagnostic: {warning}"));
+                }
             }
         }
         crate::live_index::ParseStatus::Failed { error } => {
@@ -3234,6 +3328,9 @@ fn render_context_bundle_found_with_max_tokens(
     }
     output.push_str(&format_context_bundle_section("Callers", &view.callers));
     output.push_str(&format_context_bundle_section("Callees", &view.callees));
+    output.push_str(&format_unresolved_same_name_member_calls(
+        &view.unresolved_same_name_member_calls,
+    ));
     output.push_str(&format_context_bundle_section(
         "Type usages",
         &view.type_usages,
@@ -3592,6 +3689,34 @@ fn format_context_bundle_section(title: &str, section: &ContextBundleSectionView
                 title.to_lowercase()
             ));
         }
+    }
+
+    lines.join("\n")
+}
+
+/// Render the SF-002 "unresolved same-name member calls" section.
+///
+/// These are `receiver.<target_name>()` calls made from inside the target
+/// symbol's body where the receiver type could not be resolved — for example a
+/// TypeScript `Controller.foo` whose body calls `this.service.foo()`. They are
+/// surfaced under a clearly-labeled line so they are visibly distinct from the
+/// exact `Callers`/`Callees` counts, which deliberately exclude them. Renders
+/// nothing when empty so the common case keeps its existing output shape.
+fn format_unresolved_same_name_member_calls(entries: &[ContextBundleReferenceView]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![format!(
+        "\nUnresolved same-name member calls ({}) [receiver type unresolved; not counted as callers/callees]:",
+        entries.len()
+    )];
+
+    for entry in entries {
+        lines.push(format!(
+            "  {:<30} {}:{}",
+            entry.display_name, entry.file_path, entry.line_number
+        ));
     }
 
     lines.join("\n")

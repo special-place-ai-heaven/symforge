@@ -35,6 +35,33 @@ impl GitRepo {
         Ok(Self { repo })
     }
 
+    /// Return the set of paths tracked by the git index (staged tree), using
+    /// `git ls-files` semantics: every entry currently recorded in the index.
+    ///
+    /// Paths are normalized to forward slashes to match the rest of SymForge's
+    /// relative-path convention. This is the authoritative "is this file under
+    /// version control?" source — the `ignore` crate has no tracked-files concept,
+    /// so it cannot answer this question.
+    ///
+    /// Returns `Err` when the index cannot be read (e.g. a freshly `git init`-ed
+    /// repo with no index yet). Callers treat that as fail-open (no tracked set).
+    pub fn tracked_paths(&self) -> Result<Vec<String>, String> {
+        let index = self
+            .repo
+            .index()
+            .map_err(|e| format!("cannot read git index: {e}"))?;
+
+        let mut paths: Vec<String> = index
+            .iter()
+            .filter_map(|entry| String::from_utf8(entry.path).ok())
+            .map(|p| p.replace('\\', "/"))
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        Ok(paths)
+    }
+
     /// Return paths with uncommitted changes (staged + unstaged + untracked).
     ///
     /// Replaces: `git status --porcelain --untracked-files=all`
@@ -514,6 +541,40 @@ mod tests {
         let paths = repo.untracked_paths().unwrap();
 
         assert_eq!(paths, vec!["new_file.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_tracked_paths_lists_committed_files() {
+        let (dir, repo) = make_test_repo();
+        // Add a brand-new untracked file: it must NOT appear in tracked_paths.
+        fs::write(dir.path().join("scratch.rs"), "fn scratch() {}").unwrap();
+
+        let tracked = repo.tracked_paths().unwrap();
+
+        assert!(tracked.contains(&"file1.rs".to_string()));
+        assert!(tracked.contains(&"file2.rs".to_string()));
+        assert!(tracked.contains(&"README.md".to_string()));
+        assert!(
+            !tracked.contains(&"scratch.rs".to_string()),
+            "an untracked working-tree file must not be reported as tracked"
+        );
+    }
+
+    #[test]
+    fn test_tracked_paths_empty_repo_has_no_tracked_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        let repo = GitRepo::open(dir.path()).expect("open repo");
+        // A fresh repo with no commits and nothing staged has an empty index.
+        let tracked = repo.tracked_paths().unwrap();
+        assert!(
+            tracked.is_empty(),
+            "fresh repo should report no tracked paths, got {tracked:?}"
+        );
     }
 
     #[test]

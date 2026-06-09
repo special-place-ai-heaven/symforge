@@ -98,16 +98,28 @@ fn is_rust_receiver_method_call(
     reference_file: Option<&IndexedFile>,
     reference: &ReferenceRecord,
 ) -> bool {
-    if reference.kind != ReferenceKind::Call {
-        return false;
-    }
     let Some(file) = reference_file else {
         return false;
     };
     if file.language != LanguageId::Rust {
         return false;
     }
+    is_receiver_method_call(file, reference)
+}
 
+/// Language-agnostic test for whether a `Call` reference is a receiver method
+/// call (`receiver.method()`), detected by the byte immediately preceding the
+/// call name being a `.`.
+///
+/// Used by the SF-002 self-member-call guards. It is intentionally only applied
+/// in narrow contexts (a same-named call inside the target's own body, or a
+/// same-named callee), never broadened into a global caller filter — doing so
+/// would reclassify legitimate intra-class `this.target()` callers from OTHER
+/// methods as non-callers.
+pub(super) fn is_receiver_method_call(file: &IndexedFile, reference: &ReferenceRecord) -> bool {
+    if reference.kind != ReferenceKind::Call {
+        return false;
+    }
     let start = reference.byte_range.0 as usize;
     start > 0 && file.content.get(start - 1) == Some(&b'.')
 }

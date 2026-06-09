@@ -156,7 +156,16 @@ impl RankSignal for PathMatchSignal {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let has_basename_match = !basename_token.is_empty() && file_basename == basename_token;
+        // A stem-only query that names the anchor (e.g. `work_item` for
+        // `work_item.rs`) promotes to BASENAME tier so co-change fusion clears
+        // the anchor-confidence floor. The `file_stem == basename_token` arm is
+        // gated behind the same `>= 3` length guard the prefix path uses below
+        // (query.rs:~1236) so 1-2 char stems (`a`, `io`) stay prefix-tier and do
+        // not jump to basename tier; genuine prefixes (`work` vs `work_item`)
+        // also stay prefix-tier because neither basename nor stem equals them.
+        let has_basename_match = !basename_token.is_empty()
+            && (file_basename == basename_token
+                || (basename_token.len() >= 3 && file_stem == basename_token));
         let has_all_components = !component_tokens.is_empty()
             && component_tokens
                 .iter()
@@ -222,7 +231,39 @@ impl RankSignal for CoChangeSignal {
     }
 }
 
-fn is_chore_anchor_path(path: &str) -> bool {
+/// Reason a co-change anchor failed to drive promotion, computed once per
+/// `search_files` call at anchor level (not per candidate). Mirrors the gate
+/// order inside [`CoChangeSignal::score`]: chore-anchor exclusion fires before
+/// the anchor-confidence floor, so the variants are checked in that same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorCoChangeRejection {
+    /// The anchor is a hardcoded chore file (lockfile, changelog, workflow);
+    /// excluded from co-change promotion before the confidence gate.
+    ChoreAnchor,
+    /// The anchor reached only prefix-tier path confidence (a stem prefix, not
+    /// the anchor basename), below the basename-tier floor.
+    BelowConfidenceFloor,
+}
+
+/// Classify why a co-change anchor was rejected, given the anchor's path-match
+/// score and its on-disk path. Returns `None` when the anchor cleared both
+/// gates (chore-anchor exclusion and the basename-tier confidence floor), in
+/// which case any fallback is a downstream cause (e.g. no neighbor key matched
+/// a returned candidate). Computed once at anchor level by the caller.
+pub fn classify_anchor_cochange_rejection(
+    anchor_path: &str,
+    anchor_path_match_score: f32,
+) -> Option<AnchorCoChangeRejection> {
+    if is_chore_anchor_path(anchor_path) {
+        return Some(AnchorCoChangeRejection::ChoreAnchor);
+    }
+    if anchor_path_match_score < CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR {
+        return Some(AnchorCoChangeRejection::BelowConfidenceFloor);
+    }
+    None
+}
+
+pub(crate) fn is_chore_anchor_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let normalized = normalized.trim_start_matches("./");
     let file_name = normalized.rsplit('/').next().unwrap_or(normalized);

@@ -803,6 +803,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 2,
         symbol_count: 12,
         loaded_at_system: SystemTime::now(),
@@ -813,12 +814,14 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![
             ("src/bad.rs".to_string(), "syntax error".to_string()),
             ("src/worse.rs".to_string(), "lexer panic".to_string()),
         ],
         tier_counts: (4, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -858,6 +861,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         partial_parse_count: 2,
         unexpected_partial_parse_count: 2,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
@@ -874,9 +878,11 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
             "src/partial_b.rs".to_string(),
         ],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -911,6 +917,7 @@ fn test_health_report_lists_partial_parse_files() {
         partial_parse_count: 3,
         unexpected_partial_parse_count: 3,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -932,9 +939,11 @@ fn test_health_report_lists_partial_parse_files() {
             "src/c.rs".to_string(),
         ],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -966,6 +975,7 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
         partial_parse_count: 2,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 2,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -985,9 +995,11 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
             "vendor/tree-sitter-scss/src/parser.c".to_string(),
             "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
         ],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
 
@@ -1023,6 +1035,7 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
         partial_parse_count: 2,
         unexpected_partial_parse_count: 1,
         expected_vendor_partial_parse_count: 1,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -1041,9 +1054,11 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
         expected_vendor_partial_parse_files: vec![
             "vendor/tree-sitter-scss/src/tree_sitter/array.h".to_string(),
         ],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
 
@@ -1079,6 +1094,7 @@ fn test_health_report_caps_partial_list_at_10() {
         partial_parse_count: 50,
         unexpected_partial_parse_count: 50,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -1092,9 +1108,11 @@ fn test_health_report_caps_partial_list_at_10() {
         partial_parse_files: partial_parse_files.clone(),
         unexpected_partial_parse_files: partial_parse_files,
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (50, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1121,6 +1139,7 @@ fn test_health_report_shows_tier_breakdown() {
         partial_parse_count: 15,
         unexpected_partial_parse_count: 15,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 5,
         load_duration: Duration::from_millis(120),
         watcher_state: WatcherState::Off,
@@ -1134,9 +1153,11 @@ fn test_health_report_shows_tier_breakdown() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (8200, 1280, 20),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1169,6 +1190,7 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(10),
         watcher_state: WatcherState::Active,
@@ -1182,9 +1204,11 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (1, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
 
     let report = health_report_from_stats("Ready", &stats, 0);
@@ -1203,6 +1227,7 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::ZERO,
         watcher_state: crate::watcher::WatcherState::Off,
@@ -1216,11 +1241,13 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (0, 0, 0),
         local_empty_reason: Some(
             "no safe project root found — starting with empty index".to_string(),
         ),
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1259,6 +1286,7 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::from_millis(500),
         watcher_state: crate::watcher::WatcherState::Active,
@@ -1272,9 +1300,11 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
@@ -1308,6 +1338,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 1000,
         loaded_at_system: SystemTime::now(),
@@ -1318,9 +1349,11 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -1359,10 +1392,12 @@ mod health_report_consistency {
             partial_parse_count: 0,
             unexpected_partial_parse_count: 0,
             expected_vendor_partial_parse_count: 0,
+            expected_framework_partial_parse_count: 0,
             failed_count: 0,
             partial_parse_files: vec![],
             unexpected_partial_parse_files: vec![],
             expected_vendor_partial_parse_files: vec![],
+            expected_framework_partial_parse_files: vec![],
             failed_files: vec![],
             symbol_count: 1000,
             loaded_at_system: SystemTime::now(),
@@ -1372,6 +1407,7 @@ mod health_report_consistency {
             is_empty: false,
             tier_counts: (100, 0, 0),
             local_empty_reason: None,
+            untracked_indexed: 0,
             indexed_root: None,
         }
     }
@@ -1384,6 +1420,8 @@ mod health_report_consistency {
             partial_parse_count: published.partial_parse_count,
             unexpected_partial_parse_count: published.unexpected_partial_parse_count,
             expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
+            expected_framework_partial_parse_count: published
+                .expected_framework_partial_parse_count,
             failed_count: published.failed_count,
             load_duration: published.load_duration,
             watcher_state: watcher.state.clone(),
@@ -1399,9 +1437,13 @@ mod health_report_consistency {
             expected_vendor_partial_parse_files: published
                 .expected_vendor_partial_parse_files
                 .clone(),
+            expected_framework_partial_parse_files: published
+                .expected_framework_partial_parse_files
+                .clone(),
             failed_files: published.failed_files.clone(),
             tier_counts: published.tier_counts,
             local_empty_reason: published.local_empty_reason.clone(),
+            untracked_indexed: published.untracked_indexed,
         }
     }
 
@@ -1567,10 +1609,12 @@ fn health_renders_rejected_stale_mutations_counter() {
         partial_parse_count: 0,
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
         failed_count: 0,
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
         failed_files: vec![],
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
@@ -1580,6 +1624,7 @@ fn health_renders_rejected_stale_mutations_counter() {
         is_empty: false,
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
+        untracked_indexed: 0,
         indexed_root: None,
     };
     let watcher = WatcherInfo {
@@ -2770,6 +2815,59 @@ fn test_context_bundle_result_view_ambiguous_symbol() {
 }
 
 #[test]
+fn test_context_bundle_result_view_renders_unresolved_same_name_member_calls() {
+    // SF-002: the surfaced section must render under a clearly-labeled line,
+    // distinct from the Callers/Callees counts (which exclude it).
+    let empty_section = ContextBundleSectionView {
+        total_count: 0,
+        overflow_count: 0,
+        entries: vec![],
+        unique_count: 0,
+    };
+    let result = context_bundle_result_view(
+        &ContextBundleView::Found(Box::new(ContextBundleFoundView {
+            file_path: "src/testing.ts".to_string(),
+            body: "startExploration() { return this.service.startExploration(); }".to_string(),
+            kind_label: "fn".to_string(),
+            line_range: (1, 1),
+            byte_count: 60,
+            callers: empty_section.clone(),
+            callees: empty_section.clone(),
+            type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![ContextBundleReferenceView {
+                display_name: "startExploration".to_string(),
+                file_path: "src/testing.ts".to_string(),
+                line_number: 2,
+                enclosing: None,
+                occurrence_count: 1,
+            }],
+            dependencies: vec![],
+            implementation_suggestions: vec![],
+        })),
+        "full",
+    );
+
+    // The exact counts stay zero — the surfaced call is NOT a caller/callee.
+    assert!(result.contains("Callers (0)"), "got: {result}");
+    assert!(result.contains("Callees (0)"), "got: {result}");
+    // The new section is rendered with its clearly-labeled header.
+    assert!(
+        result.contains(
+            "Unresolved same-name member calls (1) [receiver type unresolved; not counted as callers/callees]:"
+        ),
+        "missing unresolved-member-call header: {result}"
+    );
+    assert!(
+        result.contains("startExploration"),
+        "missing surfaced call name: {result}"
+    );
+    assert!(
+        result.contains("src/testing.ts:2"),
+        "missing surfaced call location: {result}"
+    );
+}
+
+#[test]
 fn test_context_bundle_result_view_suggests_impl_blocks_for_zero_caller_struct() {
     let empty_section = ContextBundleSectionView {
         total_count: 0,
@@ -2787,6 +2885,7 @@ fn test_context_bundle_result_view_suggests_impl_blocks_for_zero_caller_struct()
             callers: empty_section.clone(),
             callees: empty_section.clone(),
             type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![],
             dependencies: vec![],
             implementation_suggestions: vec![
                 ImplBlockSuggestionView {
@@ -2836,6 +2935,7 @@ fn test_context_bundle_result_view_with_max_tokens_truncates_dependencies_in_pri
             callers: empty_section.clone(),
             callees: empty_section.clone(),
             type_usages: empty_section,
+            unresolved_same_name_member_calls: vec![],
             dependencies: vec![
                 TypeDependencyView {
                     name: "Alpha".to_string(),
@@ -3964,4 +4064,114 @@ fn test_runtime_status_includes_binary_version_in_every_mode() {
             "compact runtime status for {mode:?} must include `{expected}`, got: {compact}"
         );
     }
+}
+
+// SF-003: validate_file_syntax_result must report the import-type-array grammar
+// limitation as `Status: ok`, not `Status: partial`.
+
+fn indexed_ts_file(path: &str, source: &[u8]) -> IndexedFile {
+    let result = crate::parsing::process_file(path, source, LanguageId::TypeScript);
+    IndexedFile::from_parse_result(result, source.to_vec())
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_reports_ok_for_import_type_array() {
+    let source = b"class C { private subs: import('rxjs').Subscription[] = []; }";
+    let file = indexed_ts_file("workflow-builder.component.ts", source);
+    // Precondition: tree-sitter still classifies this as a partial parse.
+    assert!(
+        matches!(file.parse_status, ParseStatus::PartialParse { .. }),
+        "precondition: grammar reports a partial parse"
+    );
+
+    let rendered = validate_file_syntax_result("workflow-builder.component.ts", &file);
+    assert!(
+        rendered.contains("Status: ok"),
+        "SF-003 import-type-array must render `Status: ok`, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Status: partial"),
+        "SF-003 import-type-array must NOT render `Status: partial`, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("parser limitation"),
+        "the ok status should carry the parser-limitation note, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_reports_ok_for_type_alias_array() {
+    let source = b"type S = import('rxjs').Subscription[];";
+    let file = indexed_ts_file("types.ts", source);
+    let rendered = validate_file_syntax_result("types.ts", &file);
+    assert!(
+        rendered.contains("Status: ok"),
+        "type-alias import-type-array must render `Status: ok`, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_validate_file_syntax_keeps_partial_for_genuine_error() {
+    // Negative control at the render layer: a genuinely broken file sharing the
+    // import-type-array prefix must still render `Status: partial`.
+    let source = b"class C { private subs: import('rxjs').Subscription[] = [ ; foo bar baz }";
+    let file = indexed_ts_file("broken.ts", source);
+    let rendered = validate_file_syntax_result("broken.ts", &file);
+    assert!(
+        rendered.contains("Status: partial"),
+        "a genuinely broken file must still render `Status: partial`, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Status: ok"),
+        "a genuinely broken file must NOT render `Status: ok`, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_sf003_health_excludes_import_type_array_from_unexpected_partials() {
+    let valid = indexed_ts_file(
+        "workflow-builder.component.ts",
+        b"class C { private subs: import('rxjs').Subscription[] = []; }",
+    );
+    let broken = indexed_ts_file(
+        "broken.ts",
+        b"class C { private subs: import('rxjs').Subscription[] = [ ; foo bar baz }",
+    );
+    assert!(
+        matches!(valid.parse_status, ParseStatus::PartialParse { .. }),
+        "precondition: the valid SF-003 file is a partial parse"
+    );
+
+    let index = make_index(vec![
+        ("workflow-builder.component.ts".to_string(), valid),
+        ("broken.ts".to_string(), broken),
+    ]);
+    let stats = index.health_stats();
+
+    // The valid SF-003 file must NOT be flagged as an unexpected repo-owned partial.
+    assert!(
+        !stats
+            .unexpected_partial_parse_files
+            .iter()
+            .any(|p| p == "workflow-builder.component.ts"),
+        "SF-003 valid file must not appear in unexpected_partial_parse_files, got: {:?}",
+        stats.unexpected_partial_parse_files
+    );
+    // It still appears in the partial superset (grammar genuinely returned partial).
+    assert!(
+        stats
+            .partial_parse_files
+            .iter()
+            .any(|p| p == "workflow-builder.component.ts"),
+        "SF-003 valid file should still be in the partial_parse_files superset"
+    );
+    // The genuinely broken file IS still reported as an unexpected partial.
+    assert!(
+        stats
+            .unexpected_partial_parse_files
+            .iter()
+            .any(|p| p == "broken.ts"),
+        "a genuinely broken file must remain an unexpected partial, got: {:?}",
+        stats.unexpected_partial_parse_files
+    );
 }

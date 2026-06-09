@@ -1,5 +1,51 @@
 # Changelog
 
+<!--
+  MAINTAINED BY HAND -- DO NOT DELETE.
+  This block lives in the changelog preamble (above the first `## [x.y.z]`
+  version entry) on purpose. release-please prepends each new release entry
+  *below* this preamble and never rewrites text above the first version
+  header, so this section persists across automated regenerations. Keep its
+  heading non-version-shaped (no `## [x.y.z](...)` form) so release-please
+  does not treat it as a release block. When the `embed` facade surface
+  changes, update this section in the same PR as the code change.
+-->
+
+## Embedder API (`embed`) changes
+
+The `symforge::embed::*` re-export facade is the SOLE semver-public coupling
+surface for library embedders (e.g. AAP). Anything reachable through
+`symforge::embed` is a public API promise; anything else in the crate is
+internal and may change without notice.
+
+**Semver policy:** a breaking change to ANY `symforge::embed::*` name --
+removal, rename, signature change, or an incompatible change to a re-exported
+type -- is a MAJOR version bump. Additive changes (new re-exports) are MINOR.
+
+This log tracks only changes to the `embed` facade itself, so embedders can
+see at a glance what moved in their public coupling surface. General release
+notes remain in the per-version entries below.
+
+### 7.x -- facade introduced
+
+- **Added:** the flat `symforge::embed::*` re-export facade. Previously
+  `embed` was a thin module pass-through
+  (`pub use crate::{domain, git, live_index, parsing};`); it now flat-exports
+  a curated, semver-public set of items and is the sole supported coupling
+  surface for embedders.
+- Facade surface (all items below are semver-public via `symforge::embed`):
+  - From `domain`: `FileClassification`, `FileProcessingResult`,
+    `LanguageId`, `ReferenceKind`, `SymbolKind`, `SymbolRecord`
+  - From `live_index::query`: `SearchFilesTier`, `SearchFilesView`
+  - From `live_index::search`: `search_symbols`, `search_text`,
+    `SymbolSearchResult`, `TextSearchResult`, `TextSearchError`
+  - From `live_index::store`: `IndexLoadSource`, `IndexedFile`, `ParseStatus`,
+    `PublishedIndexState`, `PublishedIndexStatus`, `SharedIndex`,
+    `SnapshotVerifyState`
+  - From `live_index`: `LiveIndex`
+  - From `parsing`: the `parsing` module and `process_file`
+  - From `git`: the `git` module and `GitRepo`
+
 ## [7.18.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.18.0...v7.18.1) (2026-06-03)
 
 

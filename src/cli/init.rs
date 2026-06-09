@@ -1741,6 +1741,32 @@ mod tests {
         );
     }
 
+    /// SF-010 drift guard: every tool referenced by the `ask` ToolHelp catalog
+    /// (`tool_catalog_groups`) must be a real, registered tool. We compare against
+    /// the `SYMFORGE_TOOL_NAMES` allow list (which the test above pins to the
+    /// registered surface), so the catalog can never advertise a tool that does
+    /// not exist.
+    #[test]
+    fn test_tool_catalog_names_exist_in_tool_surface() {
+        use std::collections::BTreeSet;
+
+        let known: BTreeSet<&str> = SYMFORGE_TOOL_NAMES
+            .iter()
+            .map(|n| n.trim_start_matches("mcp__symforge__"))
+            .collect();
+
+        for group in crate::protocol::smart_query::tool_catalog_groups() {
+            for tool in group.tools {
+                assert!(
+                    known.contains(tool),
+                    "tool_catalog_groups() advertises `{tool}` (group `{}`) which is not in \
+                     SYMFORGE_TOOL_NAMES — the catalog drifted from the real tool surface",
+                    group.key
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_codex_registration_includes_allow_list() {
         let dir = tempfile::tempdir().unwrap();

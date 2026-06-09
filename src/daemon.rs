@@ -27,11 +27,11 @@ use crate::protocol::edit::{
     InsertSymbolInput, ReplaceSymbolBodyInput,
 };
 use crate::protocol::tools::{
-    AnalyzeFileImpactInput, DiffSymbolsInput, EditPlanInput, ExploreInput, FindDependentsInput,
-    FindReferencesInput, GetFileContentInput, GetFileContextInput, GetRepoMapInput,
-    GetSymbolContextInput, GetSymbolInput, IndexFolderInput, InspectMatchInput, InvestigationInput,
-    SearchFilesInput, SearchSymbolsInput, SearchTextInput, SmartQueryInput, TraceSymbolInput,
-    ValidateFileSyntaxInput, WhatChangedInput,
+    AnalyzeFileImpactInput, CheckpointNowInput, DiffSymbolsInput, EditPlanInput, ExploreInput,
+    FindDependentsInput, FindReferencesInput, GetFileContentInput, GetFileContextInput,
+    GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, IndexFolderInput, InspectMatchInput,
+    InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput, SmartQueryInput,
+    TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
 };
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
@@ -327,7 +327,7 @@ fn write_daemon_token_file(token: &str) -> io::Result<()> {
         // Best-effort re-assert mode in case a restrictive umask still widened it
         // (OpenOptions mode is ANDed with the complement of umask).
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -2417,6 +2417,9 @@ async fn execute_tool_call(
         "ask" => Ok(server
             .ask(Parameters(decode_params::<SmartQueryInput>(params)?))
             .await),
+        "checkpoint_now" => Ok(server
+            .checkpoint_now(Parameters(decode_params::<CheckpointNowInput>(params)?))
+            .await),
         other => anyhow::bail!("unknown tool '{other}'"),
     }
 }
@@ -3690,6 +3693,84 @@ mod tests {
         assert!(
             health.contains("index_id=index-"),
             "daemon health should surface index identity, got: {health}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+    }
+
+    /// SF-007 regression: `checkpoint_now` must forward to the daemon in
+    /// daemon-proxy mode and checkpoint the daemon's authoritative live index,
+    /// instead of hard-failing with "unavailable in daemon-proxy mode" (the old
+    /// proxy-side guard) or "unknown tool" (the missing daemon dispatch arm).
+    #[tokio::test]
+    async fn test_daemon_executes_checkpoint_now_tool_call() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project = project_dir("symforge-daemon-checkpoint");
+        std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
+            .expect("write source");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(9101),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let response = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/checkpoint_now",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "verify_after_write": true
+            }))
+            .send()
+            .await
+            .expect("checkpoint_now request");
+
+        assert!(
+            response.status().is_success(),
+            "checkpoint_now endpoint should succeed, got {}",
+            response.status()
+        );
+
+        let body = response.text().await.expect("checkpoint_now body");
+        assert!(
+            body.contains("Checkpoint complete"),
+            "checkpoint_now should report completion, got: {body}"
+        );
+        assert!(
+            !body.contains("unavailable in daemon-proxy mode"),
+            "checkpoint_now must not hard-fail in daemon-proxy mode, got: {body}"
+        );
+        assert!(
+            !body.contains("unknown tool"),
+            "daemon must dispatch checkpoint_now, got: {body}"
+        );
+
+        // The snapshot was written to the daemon's authoritative project root
+        // (the canonical root the session is bound to) and must deserialize.
+        let canonical_root = PathBuf::from(&opened.canonical_root);
+        assert!(
+            crate::live_index::persist::load_snapshot(&canonical_root).is_some(),
+            "checkpoint should write a loadable snapshot under {}/.symforge/index.bin",
+            canonical_root.display()
         );
 
         let _ = handle.shutdown_tx.send(());

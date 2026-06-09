@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::SymForgeServer;
 use crate::protocol::resources::{
     file_context_resource, repo_changes_resource, repo_health_resource, repo_map_resource,
-    repo_outline_resource,
+    repo_outline_resource, tools_catalog_resource,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -155,6 +155,7 @@ impl SymForgeServer {
             PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
             PromptMessage::new_resource_link(PromptMessageRole::User, repo_outline_resource()),
             PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
+            PromptMessage::new_resource_link(PromptMessageRole::User, tools_catalog_resource()),
         ];
 
         if let Some(area) = params.0.area.as_deref() {
