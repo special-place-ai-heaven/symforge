@@ -26,6 +26,29 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.19.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.18.1...v7.19.0) (2026-06-09)
+
+
+### Features
+
+* **ask:** tool-catalog ToolHelp intent + symforge://tools/catalog resource (SF-010) ([431169b](https://github.com/special-place-ai-heaven/symforge/commit/431169b4f4b27f641e614678d2e30c0c44ee2086))
+* **embed:** flat semver-public facade with compile-time contract test ([d5437a3](https://github.com/special-place-ai-heaven/symforge/commit/d5437a346deaf8414ac98bdb3085c3da1c0c1436))
+* **embed:** seal the AAP embed boundary (flat facade, musl CI, changelog) ([94293b6](https://github.com/special-place-ai-heaven/symforge/commit/94293b66c80dd83b3c70d79e28d47d56d4be7c7b))
+* **health:** surface indexed untracked files; opt-in exclude gate (SF-009) ([a5b00e0](https://github.com/special-place-ai-heaven/symforge/commit/a5b00e0699f9c9100085a38106be27789fe3bc46))
+
+
+### Bug Fixes
+
+* **conventions:** language-aware detection for TS/JS projects (SF-011) ([15d92a4](https://github.com/special-place-ai-heaven/symforge/commit/15d92a4d0a89b33c996048c4b7d92f93733d0cef))
+* **embed:** gate server-only refs unused under the engine-only build ([5ae290a](https://github.com/special-place-ai-heaven/symforge/commit/5ae290a31dd468fc6442282ebfaa31b9975473fd))
+* **health:** classify Angular template control-flow as expected framework partial (SF-004) ([94a331a](https://github.com/special-place-ai-heaven/symforge/commit/94a331ac9ec4478652350426aee891da1f96a989))
+* **parsing:** classify valid TS import-type[] as an expected grammar limitation (SF-003) ([6025bc9](https://github.com/special-place-ai-heaven/symforge/commit/6025bc958f8d8a20e4226e8269398eafe832080d))
+* **protocol:** forward checkpoint_now to the daemon in proxy mode (SF-007) ([ee92e5d](https://github.com/special-place-ai-heaven/symforge/commit/ee92e5de6f09981c9aae1ada036f8393f70e9845))
+* **query:** extract the leading symbol from compound ask lookups (SF-005) ([32a6159](https://github.com/special-place-ai-heaven/symforge/commit/32a615950e64a99c557e199d688cf565c1ddc53e))
+* **query:** stop a method being its own caller/callee on same-name delegation (SF-002) ([1a18878](https://github.com/special-place-ai-heaven/symforge/commit/1a18878b58e5d5907030830e5b06e4a86bfe7df8))
+* **rank:** apply co-change for stem queries naming the anchor + precise fallbacks (SF-006) ([a71fc84](https://github.com/special-place-ai-heaven/symforge/commit/a71fc842b25fd47d3f83db4ff7b5db59326ed90c))
+* **shadow:** Windows-native PATH remediation in the ForeignPrefix arm (SF-008) ([b12ec86](https://github.com/special-place-ai-heaven/symforge/commit/b12ec86483071d6a71cf34ad6bbd950f2c97aa98))
+
 ### 7.x -- facade introduced
 
 - **Added:** the flat `symforge::embed::*` re-export facade. Previously
