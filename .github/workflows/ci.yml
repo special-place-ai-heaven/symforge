@@ -102,6 +102,45 @@ jobs:
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
+  embed-musl:
+    needs: release-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-musl
+
+      # Cross-compile the engine-only embed build to musl. AAP compiles the
+      # SymForge engine inside musl guest-agent VMs, so a musl regression must
+      # fail SymForge's own CI here, not downstream in AAP.
+      #
+      # musl-tools provides musl-gcc; the embed build statically links C deps
+      # built by the `cc` crate (19 tree-sitter grammars, rusqlite `bundled`
+      # sqlite) and by libgit2-sys (git2 `vendored-libgit2`, built via cmake,
+      # which is preinstalled on ubuntu-latest). Both `cc` and cmake-rs honor
+      # the target-scoped CC env var, so pointing it at musl-gcc makes every
+      # C-compiled crate link cleanly against musl. All currently pinned
+      # tree-sitter grammars ship pure-C scanners; if a future grammar bump
+      # reintroduces a C++ (.cc) scanner, also set
+      # CXX_x86_64_unknown_linux_musl (e.g. to a musl g++), since CC_<target>
+      # does not redirect the C++ compiler.
+      - name: Install musl C toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build engine-only embed feature for musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --no-default-features --features embed --target x86_64-unknown-linux-musl
+
+      - name: Clippy engine-only embed feature for musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings
+
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
