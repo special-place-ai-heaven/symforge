@@ -327,7 +327,7 @@ fn write_daemon_token_file(token: &str) -> io::Result<()> {
         // Best-effort re-assert mode in case a restrictive umask still widened it
         // (OpenOptions mode is ANDed with the complement of umask).
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
