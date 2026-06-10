@@ -1641,6 +1641,7 @@ pub fn health_report_compact_from_published_state(
                 "active (events: {}, overflows: {}, repairs: {})",
                 watcher.events_processed, watcher.overflow_count, watcher.stale_files_found
             ),
+            WatcherState::Starting => "starting (registering filesystem watch)".to_string(),
             WatcherState::Degraded => format!(
                 "degraded (events: {}, overflows: {}, repairs: {})",
                 watcher.events_processed, watcher.overflow_count, watcher.stale_files_found
@@ -1784,6 +1785,9 @@ pub fn health_report_from_stats(
             relative_age(stats.last_overflow_at),
             relative_age(stats.last_reconcile_at)
         ),
+        WatcherState::Starting => {
+            "Watcher: starting (registering filesystem watch; index will stay fresh once the watch is registered)".to_string()
+        }
         WatcherState::Degraded => format!(
             "Watcher: degraded (event stream failed after {} processed events, overflows: {}, reconcile repairs: {}, last overflow: {}, last reconcile: {})",
             stats.events_processed,

@@ -565,8 +565,9 @@ pub(crate) fn process_events(
 /// Main watcher supervision loop. Spawned as a background tokio task by `main.rs`.
 ///
 /// Lifecycle:
-/// 1. Set state to Active
-/// 2. Loop: start_watcher → process events → restart on error with 1s backoff
+/// 1. Set state to Starting (watch not yet registered)
+/// 2. Loop: start_watcher → on Ok set Active → process events → restart on error
+///    with 1s backoff (state stays Starting while retrying)
 /// 3. After 3 consecutive failures: set state to Degraded and stop
 pub async fn run_watcher_with_stop(
     repo_root: PathBuf,
@@ -582,8 +583,12 @@ pub async fn run_watcher_with_stop(
     }
 
     {
+        // Mark Starting until the recursive filesystem watch is actually
+        // registered. The transition to Active happens only when start_watcher
+        // returns Ok (below) — registering the watch is the slow step on large
+        // trees, and reporting Active before it succeeds is misleading.
         let mut info = watcher_info.lock();
-        info.state = WatcherState::Active;
+        info.state = WatcherState::Starting;
     }
 
     let mut consecutive_failures: u32 = 0;
@@ -820,8 +825,13 @@ pub fn restart_watcher(
     prev: Option<WatcherTaskHandle>,
 ) -> WatcherTaskHandle {
     {
+        // A (re)start has been initiated: mark Starting (not Off) so health can
+        // distinguish "watcher is coming up" from "watcher is not running". The
+        // spawned task may wait up to 2s for the previous watcher to stop and
+        // then register a recursive filesystem watch, which is the slow part on
+        // large trees — health reads during that window should not report Off.
         let mut info = watcher_info.lock();
-        info.state = WatcherState::Off;
+        info.state = WatcherState::Starting;
     }
     let stop_token = Arc::new(AtomicBool::new(false));
     let stop_for_task = Arc::clone(&stop_token);
@@ -856,13 +866,62 @@ mod tests {
 
     #[test]
     fn test_watcher_state_variants() {
-        // All three variants exist and are distinct
+        // All four variants exist and are distinct.
         let active = WatcherState::Active;
+        let starting = WatcherState::Starting;
         let degraded = WatcherState::Degraded;
         let off = WatcherState::Off;
         assert_ne!(active, degraded);
         assert_ne!(active, off);
         assert_ne!(degraded, off);
+        assert_ne!(starting, active);
+        assert_ne!(starting, degraded);
+        assert_ne!(starting, off);
+    }
+
+    #[test]
+    fn test_restart_watcher_sets_starting_state() {
+        // restart_watcher must publish Starting synchronously when a (re)start
+        // is initiated — not Off — so a health probe during startup does not
+        // mistake "watcher coming up" for "watcher not running". We drive this
+        // on a current-thread runtime so the spawned supervision task cannot be
+        // polled before we read the state: the synchronous lock write in
+        // restart_watcher is the contract under test.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let shared = crate::live_index::store::LiveIndex::empty();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        assert_eq!(
+            watcher_info.lock().state,
+            WatcherState::Off,
+            "precondition: default watcher state is Off"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let handle = restart_watcher(
+            tmp.path().to_path_buf(),
+            shared,
+            Arc::clone(&watcher_info),
+            None,
+        );
+
+        // The current-thread runtime has not been driven, so the spawned task
+        // is still pending: the only state write that has executed is the
+        // synchronous Starting transition inside restart_watcher.
+        assert_eq!(
+            watcher_info.lock().state,
+            WatcherState::Starting,
+            "restart_watcher should publish Starting synchronously, not Off"
+        );
+
+        // Tear down: signal stop and abort the pending task without driving the
+        // runtime to completion.
+        handle.stop_token.store(true, Ordering::Release);
+        handle.task.abort();
     }
 
     #[test]

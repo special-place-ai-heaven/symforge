@@ -723,6 +723,28 @@ fn test_health_report_shows_watcher_active() {
 }
 
 #[test]
+fn test_health_report_shows_watcher_starting() {
+    // A watcher mid-startup (recursive watch not yet registered) must render a
+    // distinct "starting" line, never "off", so an agent does not conclude the
+    // index will go stale while the watch is still registering.
+    use crate::watcher::{WatcherInfo, WatcherState};
+    let index = make_index(vec![]);
+    let watcher = WatcherInfo {
+        state: WatcherState::Starting,
+        ..WatcherInfo::default()
+    };
+    let result = health_report_with_watcher(&index, &watcher);
+    assert!(
+        result.contains("Watcher: starting (registering filesystem watch"),
+        "got: {result}"
+    );
+    assert!(
+        !result.contains("Watcher: off"),
+        "starting watcher must not render as off: {result}"
+    );
+}
+
+#[test]
 fn test_health_report_active_watcher_shows_last_change_when_events_exist() {
     use crate::watcher::{WatcherInfo, WatcherState};
 
@@ -1373,6 +1395,58 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
     );
 }
 
+#[test]
+fn test_health_compact_watcher_starting() {
+    // The compact health line must also distinguish a starting watcher from an
+    // off one, mirroring the full health report.
+    use crate::live_index::store::{
+        IndexLoadSource, PublishedIndexState, PublishedIndexStatus, SnapshotVerifyState,
+    };
+    use crate::watcher::{WatcherInfo, WatcherState};
+    use std::time::{Duration, SystemTime};
+
+    let published = PublishedIndexState {
+        generation: 1,
+        status: PublishedIndexStatus::Ready,
+        degraded_summary: None,
+        file_count: 100,
+        parsed_count: 100,
+        partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
+        failed_count: 0,
+        symbol_count: 1000,
+        loaded_at_system: SystemTime::now(),
+        load_duration: Duration::from_millis(500),
+        load_source: IndexLoadSource::FreshLoad,
+        snapshot_verify_state: SnapshotVerifyState::NotNeeded,
+        is_empty: false,
+        partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
+        failed_files: vec![],
+        tier_counts: (100, 0, 0),
+        local_empty_reason: None,
+        untracked_indexed: 0,
+        indexed_root: None,
+    };
+    let watcher = WatcherInfo {
+        state: WatcherState::Starting,
+        ..WatcherInfo::default()
+    };
+    let report = health_report_compact_from_published_state(&published, &watcher, 0);
+    assert!(
+        report.contains("Watcher: starting (registering filesystem watch)"),
+        "compact health must render starting watcher distinctly; got:\n{report}"
+    );
+    assert!(
+        !report.contains("Watcher: off"),
+        "compact starting watcher must not render as off; got:\n{report}"
+    );
+}
+
 mod health_report_consistency {
     use super::*;
     use crate::live_index::HealthStats;
@@ -1458,6 +1532,8 @@ mod health_report_consistency {
         let line = watcher_line(report);
         if line.contains("local-fallback") {
             "local-fallback"
+        } else if line.contains("starting") {
+            "starting"
         } else if line.contains("degraded") {
             "degraded"
         } else if line.contains("active/idle") || line.contains("active (idle; event-driven") {
@@ -1546,6 +1622,15 @@ mod health_report_consistency {
                     ..WatcherInfo::default()
                 },
                 "degraded",
+            ),
+            (
+                "starting",
+                WatcherInfo {
+                    state: WatcherState::Starting,
+                    debounce_window_ms: 200,
+                    ..WatcherInfo::default()
+                },
+                "starting",
             ),
             (
                 "off",
