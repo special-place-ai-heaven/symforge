@@ -742,19 +742,31 @@ use crate::domain::index::{
 ///
 /// Precedence (first match wins):
 /// 1. Hard-skip size ceiling (>100MB) → Tier 3
-/// 2. Extension denylist → Tier 2
-/// 3. Metadata-only size threshold (>1MB) → Tier 2
-/// 4. Binary sniff (null bytes in first 8KB) → Tier 2
-/// 5. All else → Tier 1
+/// 2. Dependency lockfile (exact basename) → Tier 2
+/// 3. Extension denylist → Tier 2
+/// 4. Metadata-only size threshold (>1MB) → Tier 2
+/// 5. Binary sniff (null bytes in first 8KB) → Tier 2
+/// 6. All else → Tier 1
 pub fn classify_admission(
     path: &std::path::Path,
     file_size: u64,
     content_sample: Option<&[u8]>,
 ) -> AdmissionDecision {
-    use crate::domain::index::is_denylisted_extension;
+    use crate::domain::index::{is_denylisted_extension, is_dependency_lockfile};
 
     if file_size > HARD_SKIP_BYTES {
         return AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling);
+    }
+    // Dependency lockfiles are machine-generated manifests: their resolved
+    // dependency trees parse into thousands of meaningless key/value symbols that
+    // pollute symbol counts and `conventions` complexity stats. Demote to Tier-2
+    // metadata-only (path stays searchable; no symbol extraction). Checked before
+    // the size threshold so a >1MB lockfile still reports `lockfile`, not `>1MB`.
+    if is_dependency_lockfile(path) {
+        return AdmissionDecision::skip(
+            AdmissionTier::MetadataOnly,
+            SkipReason::DependencyLockfile,
+        );
     }
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
         && is_denylisted_extension(ext)

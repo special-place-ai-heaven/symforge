@@ -486,6 +486,13 @@ pub enum SkipReason {
     DenylistedExtension,
     SizeThreshold,
     BinaryContent,
+    /// File is a dependency lockfile (e.g. `package-lock.json`, `Cargo.lock`).
+    /// Demoted to Tier-2 metadata-only so its machine-generated content does not
+    /// flood the index with thousands of junk key/value symbols (a single
+    /// `package-lock.json` can mint ~9k JSON-key symbols, dominating symbol counts
+    /// and `conventions` complexity heuristics). The path stays searchable as
+    /// metadata; only symbol extraction is skipped. See `LOCKFILE_BASENAMES`.
+    DependencyLockfile,
     /// SF-009: file demoted to Tier-2 because it is not git-tracked, under the
     /// opt-in `SYMFORGE_EXCLUDE_UNTRACKED` policy (default OFF). Only minted when
     /// that env gate is explicitly enabled; the default admission path never
@@ -500,6 +507,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::DenylistedExtension => write!(f, "artifact"),
             SkipReason::SizeThreshold => write!(f, ">1MB"),
             SkipReason::BinaryContent => write!(f, "binary"),
+            SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),
         }
     }
@@ -606,6 +614,46 @@ const DENYLISTED_EXTENSIONS: &[&str] = &[
 
 pub fn is_denylisted_extension(ext: &str) -> bool {
     DENYLISTED_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+/// Dependency lockfiles matched by exact basename (case-sensitive, as these
+/// names are conventionally fixed). These are machine-generated manifests whose
+/// content (resolved dependency trees) parses into thousands of structurally
+/// meaningless symbols — e.g. a single `package-lock.json` can mint ~9k JSON-key
+/// symbols, dwarfing real source and skewing `conventions` complexity stats.
+/// Admission demotes them to Tier-2 (metadata only): the path stays searchable,
+/// but no symbols are extracted.
+///
+/// Cross-reference: the search ranker keeps an OVERLAPPING but distinct list,
+/// `CHORE_ANCHOR_FILENAMES` in `src/live_index/rank_signals.rs`, used to suppress
+/// co-change promotion. That list is intentionally NOT shared: it also contains
+/// non-lockfile chore anchors (`CHANGELOG.md`, `.release-please-manifest.json`)
+/// and lives in the `live_index` layer, which `domain` must not depend on. The
+/// two lists answer different questions (admission vs. ranking) and are kept
+/// separate on purpose; update both when the lockfile ecosystem changes.
+const LOCKFILE_BASENAMES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "flake.lock",
+    "packages.lock.json",
+    "go.sum",
+];
+
+/// Returns `true` when `path`'s file name is an exact (case-sensitive) match for
+/// a known dependency lockfile. See [`LOCKFILE_BASENAMES`].
+pub fn is_dependency_lockfile(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| LOCKFILE_BASENAMES.contains(&name))
 }
 
 #[cfg(test)]
