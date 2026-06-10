@@ -6902,14 +6902,34 @@ impl SymForgeServer {
         let mut all_text_queries = text_queries.clone();
         all_text_queries.extend(remainder_terms.iter().cloned());
 
+        // Lowercased remainder terms drive "specific term" detection below: a
+        // remainder noun that matches an indexed symbol name (e.g. "admission"
+        // -> AdmissionTier) must never be outranked by the concept bucket's
+        // generic symbol_queries (e.g. "index"), and it should keep the topic
+        // visible in the header instead of collapsing it to the concept label.
+        let remainder_term_keys: HashSet<String> = remainder_terms
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        // Remainder terms that actually resolve to an indexed symbol name via
+        // search_symbols' substring semantics. Populated during the symbol
+        // search loop so we don't pay for a second index pass.
+        let mut specific_terms: HashSet<String> = HashSet::new();
+
         let fallback_mode = concept.is_none();
         for sq in &all_symbol_queries {
             let term_key = sq.to_ascii_lowercase();
             let result = search::search_symbols(&guard, sq, None, limit * 3);
+            let is_remainder_term = remainder_term_keys.contains(&term_key);
             let mut seen_paths = HashSet::new();
             for hit in &result.hits {
                 if fallback_mode && !Self::explore_fallback_symbol_match(&hit.name, &term_key) {
                     continue;
+                }
+                // A remainder noun that lands on a real symbol name is a
+                // load-bearing query term, not generic concept noise.
+                if !fallback_mode && is_remainder_term {
+                    specific_terms.insert(term_key.clone());
                 }
                 let entry = (hit.name.clone(), hit.kind.clone(), hit.path.clone());
                 let score = match_scores.entry(entry).or_default();
@@ -7122,7 +7142,22 @@ impl SymForgeServer {
                 };
                 let classification = guard.get_file(&path).map(|file| &file.classification);
                 let path_penalty = explore_path_penalty(&path, classification);
-                let coverage_bonus: u64 = match score_data.matched_terms.len() as u64 {
+                // Specific remainder terms (query nouns that resolved to a real
+                // indexed symbol name, e.g. "admission" -> AdmissionTier) are
+                // load-bearing, not generic concept noise. Each one counts as
+                // two extra terms toward coverage: enough that a single specific
+                // noun outranks a generic two-term concept-bucket hit (the
+                // failure this fix targets), but a symbol with genuine
+                // three-plus-term co-occurrence still wins. This only affects
+                // concept mode; fallback mode never populates the set.
+                let specific_match_count = score_data
+                    .matched_terms
+                    .iter()
+                    .filter(|term| specific_terms.contains(*term))
+                    .count() as u64;
+                let effective_terms =
+                    score_data.matched_terms.len() as u64 + 2 * specific_match_count;
+                let coverage_bonus: u64 = match effective_terms {
                     0 | 1 => 1,
                     n => n * n,
                 };
@@ -7300,8 +7335,23 @@ impl SymForgeServer {
             }
         }
 
+        // When a concept matched but the query also named specific terms that
+        // resolve to indexed symbols, keep those nouns visible in the header so
+        // the topic isn't silently collapsed to the generic concept label.
+        // Order by query position (remainder_terms preserves it) for stability.
+        let display_label = if !specific_terms.is_empty() {
+            let ordered: Vec<&str> = remainder_terms
+                .iter()
+                .filter(|t| specific_terms.contains(t.as_str()))
+                .map(|t| t.as_str())
+                .collect();
+            format!("{label} + {}", ordered.join(", "))
+        } else {
+            label.clone()
+        };
+
         let mut output = format::explore_result_view(format::ExploreResultViewInput {
-            label: &label,
+            label: &display_label,
             symbol_hits: &symbol_hits,
             text_hits: &text_hits,
             related_files: &related_files,
@@ -16510,6 +16560,112 @@ mod tests {
             result.contains("handle_watcher_error") || result.contains("watcher"),
             "concept+remainder should surface watcher results: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explore_concept_remainder_matching_symbol_outranks_generic_bucket() {
+        // Regression: query "admission tiering decide which files get indexed"
+        // matches the "Indexing" concept (via "indexed" -> "index" stemming),
+        // which previously collapsed the topic and buried the real admission
+        // symbols under generic Indexing/LiveIndex hits. The remainder noun
+        // "admission" resolves to indexed symbol names and must win.
+        let admission_content =
+            b"pub enum AdmissionTier { Indexed, MetadataOnly, HardSkip }\npub struct AdmissionDecision { pub tier: AdmissionTier }\n";
+        let admission_symbols = vec![
+            SymbolRecord {
+                name: "AdmissionTier".to_string(),
+                kind: SymbolKind::Enum,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, 58),
+                line_range: (0, 0),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+            SymbolRecord {
+                name: "AdmissionDecision".to_string(),
+                kind: SymbolKind::Struct,
+                depth: 0,
+                sort_order: 1,
+                byte_range: (58, admission_content.len() as u32),
+                line_range: (1, 1),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+        ];
+
+        // Generic indexing symbols the "Indexing" concept bucket targets
+        // directly ("index"/"reindex"). These previously dominated the output.
+        let index_content = b"pub struct LiveIndex {}\npub fn reindex_all() {}\n";
+        let index_symbols = vec![
+            SymbolRecord {
+                name: "LiveIndex".to_string(),
+                kind: SymbolKind::Struct,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, 23),
+                line_range: (0, 0),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+            SymbolRecord {
+                name: "reindex_all".to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 1,
+                byte_range: (24, index_content.len() as u32),
+                line_range: (1, 1),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+        ];
+
+        let server = make_server(make_live_index_ready(vec![
+            make_file("src/domain/index.rs", admission_content, admission_symbols),
+            make_file("src/live_index/store.rs", index_content, index_symbols),
+        ]));
+
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "admission tiering decide which files get indexed".to_string(),
+                limit: Some(10),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+
+        // The load-bearing query noun must surface its symbols.
+        assert!(
+            result.contains("AdmissionTier"),
+            "explore must surface AdmissionTier for an 'admission' query: {result}"
+        );
+
+        // The header must not silently collapse the topic to "Indexing": the
+        // specific matching noun stays visible.
+        assert!(
+            result.contains("Exploring: Indexing + admission"),
+            "header should keep the specific query noun, not collapse to the concept: {result}"
+        );
+
+        // The specific admission match must rank above the generic concept
+        // bucket symbols (LiveIndex, reindex_all), not be buried beneath them.
+        let admission_pos = result
+            .find("AdmissionTier")
+            .expect("AdmissionTier must be present");
+        for generic in ["LiveIndex", "reindex_all"] {
+            if let Some(generic_pos) = result.find(generic) {
+                assert!(
+                    admission_pos < generic_pos,
+                    "AdmissionTier should rank above the generic '{generic}' bucket hit: {result}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
