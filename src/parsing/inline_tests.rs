@@ -10,7 +10,7 @@ macro_rules! inline_test {
             let language: $crate::domain::LanguageId = $language;
             let source: &str = $source;
             let (symbols, has_error, diagnostic, _, _) =
-                $crate::parsing::parse_source(source, &language)
+                $crate::parsing::parse_source(source, &language, false)
                     .expect("inline language test source should parse");
 
             assert!(

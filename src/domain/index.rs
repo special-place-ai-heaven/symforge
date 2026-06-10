@@ -62,6 +62,22 @@ impl LanguageId {
         }
     }
 
+    /// Returns `true` when `relative_path` is a TSX source file (`.tsx`).
+    ///
+    /// `.tsx` and `.ts` both map to [`LanguageId::TypeScript`], but they require
+    /// different tree-sitter grammars: `.tsx` needs the TSX grammar (JSX-aware,
+    /// rejects legacy `<T>expr` casts) while `.ts` needs the plain TypeScript
+    /// grammar (no JSX, accepts angle-bracket casts). The grammar is therefore
+    /// selected from the file extension, not the [`LanguageId`], so this helper
+    /// threads the TSX flavor to the parse sites.
+    pub fn is_tsx_path(relative_path: &str) -> bool {
+        relative_path
+            .rsplit(['/', '\\'])
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tsx"))
+    }
+
     pub fn extensions(&self) -> &[&str] {
         match self {
             Self::Rust => &["rs"],

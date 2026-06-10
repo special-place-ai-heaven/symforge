@@ -2210,6 +2210,7 @@ pub fn validate_file_syntax_result(path: &str, file: &IndexedFile) -> String {
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 lines.push("Status: ok".to_string());
                 lines.push(

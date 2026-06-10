@@ -55,7 +55,7 @@ fn pre_process_pattern(expando: char, query: &str) -> Cow<'_, str> {
 impl SgLang {
     /// Returns `None` for config-only languages (JSON, TOML, YAML, Markdown, Env)
     /// that have no meaningful AST patterns.
-    pub fn from_language_id(lang: &LanguageId) -> Option<Self> {
+    pub fn from_language_id(lang: &LanguageId, is_tsx: bool) -> Option<Self> {
         // Expando chars sourced from the official ast-grep-language crate.
         // Languages that accept `$` as an identifier char use '$' (no replacement).
         // Languages that don't accept `$` use a Unicode letter the grammar allows.
@@ -76,6 +76,9 @@ impl SgLang {
             LanguageId::Scss => (tree_sitter_scss::language(), '_'),
             // Stub languages (accept $ in identifiers — no expando needed)
             LanguageId::JavaScript => (tree_sitter_javascript::LANGUAGE.into(), '$'),
+            // `.tsx` uses the JSX-aware TSX grammar so structural patterns can
+            // match inside JSX; `.ts` stays on the plain TypeScript grammar.
+            LanguageId::TypeScript if is_tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), '$'),
             LanguageId::TypeScript => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), '$'),
             LanguageId::Java => (tree_sitter_java::LANGUAGE.into(), '$'),
             LanguageId::Dart => (tree_sitter_dart::language(), '$'),
@@ -148,8 +151,9 @@ pub struct CompiledStructuralPattern {
 pub fn compile_structural_pattern(
     pattern_str: &str,
     lang: &LanguageId,
+    is_tsx: bool,
 ) -> Result<CompiledStructuralPattern, String> {
-    let sg_lang = SgLang::from_language_id(lang)
+    let sg_lang = SgLang::from_language_id(lang, is_tsx)
         .ok_or_else(|| format!("structural search not supported for {:?}", lang))?;
 
     let pattern = Pattern::try_new(pattern_str, sg_lang.clone())
@@ -218,8 +222,9 @@ pub fn structural_search(
     source: &str,
     pattern_str: &str,
     lang: &LanguageId,
+    is_tsx: bool,
 ) -> Result<Vec<StructuralMatch>, String> {
-    let compiled = compile_structural_pattern(pattern_str, lang)?;
+    let compiled = compile_structural_pattern(pattern_str, lang, is_tsx)?;
     Ok(structural_search_with_compiled(source, &compiled))
 }
 
@@ -237,7 +242,7 @@ fn world(x: i32) {
     println!("{}", x);
 }
 "#;
-        let matches = structural_search(source, "fn $NAME($$$) { $$$ }", &LanguageId::Rust)
+        let matches = structural_search(source, "fn $NAME($$$) { $$$ }", &LanguageId::Rust, false)
             .expect("pattern should compile");
         assert_eq!(matches.len(), 2);
         assert!(matches[0].text.contains("hello"));
@@ -247,7 +252,7 @@ fn world(x: i32) {
     #[test]
     fn test_structural_search_captures() {
         let source = "let x = 42;\nlet y = 100;";
-        let matches = structural_search(source, "let $NAME = $VALUE", &LanguageId::Rust)
+        let matches = structural_search(source, "let $NAME = $VALUE", &LanguageId::Rust, false)
             .expect("pattern should compile");
         assert_eq!(matches.len(), 2);
         assert!(!matches[0].captures.is_empty());
@@ -256,22 +261,32 @@ fn world(x: i32) {
     #[test]
     fn test_structural_search_no_match() {
         let source = "fn main() {}";
-        let matches = structural_search(source, "struct $NAME { $$$FIELDS }", &LanguageId::Rust)
-            .expect("pattern should compile");
+        let matches = structural_search(
+            source,
+            "struct $NAME { $$$FIELDS }",
+            &LanguageId::Rust,
+            false,
+        )
+        .expect("pattern should compile");
         assert!(matches.is_empty());
     }
 
     #[test]
     fn test_structural_search_config_language_rejected() {
-        let result = structural_search("{}", "{ $$$BODY }", &LanguageId::Json);
+        let result = structural_search("{}", "{ $$$BODY }", &LanguageId::Json, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_structural_search_javascript() {
         let source = "const x = 42;\nconst y = 100;";
-        let matches = structural_search(source, "const $NAME = $VALUE", &LanguageId::JavaScript)
-            .expect("pattern should compile");
+        let matches = structural_search(
+            source,
+            "const $NAME = $VALUE",
+            &LanguageId::JavaScript,
+            false,
+        )
+        .expect("pattern should compile");
         assert_eq!(matches.len(), 2);
     }
 
@@ -287,14 +302,23 @@ struct Bar {
 }
 "#;
         // `struct $NAME` matches bare structs; `pub struct` needs explicit `pub` in pattern
-        let bare = structural_search(source, "struct $NAME { $$$FIELDS }", &LanguageId::Rust)
-            .expect("pattern should compile");
+        let bare = structural_search(
+            source,
+            "struct $NAME { $$$FIELDS }",
+            &LanguageId::Rust,
+            false,
+        )
+        .expect("pattern should compile");
         assert_eq!(bare.len(), 1, "bare struct pattern matches Bar");
         assert!(bare[0].text.contains("Bar"));
 
-        let pub_matches =
-            structural_search(source, "pub struct $NAME { $$$FIELDS }", &LanguageId::Rust)
-                .expect("pattern should compile");
+        let pub_matches = structural_search(
+            source,
+            "pub struct $NAME { $$$FIELDS }",
+            &LanguageId::Rust,
+            false,
+        )
+        .expect("pattern should compile");
         assert_eq!(pub_matches.len(), 1, "pub struct pattern matches Foo");
         assert!(pub_matches[0].text.contains("Foo"));
     }
@@ -302,7 +326,7 @@ struct Bar {
     #[test]
     fn test_structural_search_rust_impl() {
         let source = "impl Foo { fn bar(&self) {} }";
-        let matches = structural_search(source, "impl $TYPE { $$$ }", &LanguageId::Rust)
+        let matches = structural_search(source, "impl $TYPE { $$$ }", &LanguageId::Rust, false)
             .expect("pattern should compile");
         assert_eq!(matches.len(), 1);
         assert!(matches[0].text.contains("Foo"));
@@ -311,16 +335,51 @@ struct Bar {
     #[test]
     fn test_structural_search_python_function() {
         let source = "def greet(name):\n    print(name)\n";
-        let matches = structural_search(source, "def $FNAME($$$):\n    $$$", &LanguageId::Python)
-            .expect("pattern should compile");
+        let matches = structural_search(
+            source,
+            "def $FNAME($$$):\n    $$$",
+            &LanguageId::Python,
+            false,
+        )
+        .expect("pattern should compile");
         assert!(!matches.is_empty(), "should match Python function def");
     }
 
     #[test]
     fn test_structural_search_go_function() {
         let source = "func hello() { fmt.Println(\"hello\") }";
-        let matches = structural_search(source, "func $NAME() { $$$ }", &LanguageId::Go)
+        let matches = structural_search(source, "func $NAME() { $$$ }", &LanguageId::Go, false)
             .expect("pattern should compile");
         assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn test_structural_search_tsx_jsx_component() {
+        // A JSX component body only parses under the TSX grammar. With the plain
+        // TypeScript grammar this yields a partial parse and the structural
+        // pattern matches nothing; with the TSX grammar (is_tsx=true) the
+        // function declaration is matched.
+        let source = r#"
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  );
+}
+"#;
+        let matches = structural_search(
+            source,
+            "function $NAME() { $$$ }",
+            &LanguageId::TypeScript,
+            true,
+        )
+        .expect("pattern should compile against the TSX grammar");
+        assert_eq!(
+            matches.len(),
+            1,
+            "TSX grammar must match the JSX component function"
+        );
+        assert!(matches[0].text.contains("App"));
     }
 }

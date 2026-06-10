@@ -88,7 +88,11 @@ pub fn process_file_with_classification(
 
     let source = String::from_utf8_lossy(bytes);
 
-    let parse_result = panic::catch_unwind(|| parse_source(&source, &language));
+    // `.tsx` requires the TSX grammar; `.ts` stays on plain TypeScript. The
+    // distinction is carried by the file extension, not the LanguageId.
+    let is_tsx = LanguageId::is_tsx_path(relative_path);
+
+    let parse_result = panic::catch_unwind(|| parse_source(&source, &language, is_tsx));
 
     match parse_result {
         Ok(Ok((symbols, has_error, diagnostic, references, alias_map))) => {
@@ -231,6 +235,7 @@ fn error_candidate_is_better(
 pub(crate) fn parse_source(
     source: &str,
     language: &LanguageId,
+    is_tsx: bool,
 ) -> Result<ParseSourceOutput, String> {
     let mut parser = Parser::new();
 
@@ -238,6 +243,9 @@ pub(crate) fn parse_source(
         LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),
         LanguageId::Python => tree_sitter_python::LANGUAGE.into(),
         LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        // `.tsx` needs the JSX-aware TSX grammar; `.ts` keeps the plain
+        // TypeScript grammar (which still accepts legacy `<T>expr` casts).
+        LanguageId::TypeScript if is_tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         LanguageId::Go => tree_sitter_go::LANGUAGE.into(),
         LanguageId::Java => tree_sitter_java::LANGUAGE.into(),
@@ -272,7 +280,7 @@ pub(crate) fn parse_source(
     let root = tree.root_node();
     let has_error = root.has_error();
     let symbols = languages::extract_symbols(&root, source, language);
-    let (references, alias_map) = xref::extract_references(&root, source, language);
+    let (references, alias_map) = xref::extract_references(&root, source, language, is_tsx);
 
     let diagnostic = if has_error {
         collect_deepest_error_node(&root, source).map(|(message, line, column, span)| {
@@ -416,6 +424,7 @@ static IMPORT_TYPE_ARRAY_SUFFIX_RE: std::sync::LazyLock<regex::Regex> =
 pub(crate) fn is_expected_typescript_import_type_array_limitation(
     language: &LanguageId,
     content: &[u8],
+    is_tsx: bool,
 ) -> bool {
     if !matches!(language, LanguageId::TypeScript) {
         return false;
@@ -435,10 +444,11 @@ pub(crate) fn is_expected_typescript_import_type_array_limitation(
 
         // Defensive: only meaningful for files that genuinely failed to parse. If
         // the original parses clean there is no limitation to excuse.
-        let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
-            Ok(Ok((_, has_error, _, _, _))) => has_error,
-            _ => return false,
-        };
+        let original_has_error =
+            match panic::catch_unwind(|| parse_source(&source, language, is_tsx)) {
+                Ok(Ok((_, has_error, _, _, _))) => has_error,
+                _ => return false,
+            };
         if !original_has_error {
             return false;
         }
@@ -456,7 +466,7 @@ pub(crate) fn is_expected_typescript_import_type_array_limitation(
         // becomes `Subscription ` (a scalar import-type with trailing whitespace,
         // still clean). Multi-dim `[][]` is one match, replaced by one space.
         let neutralized = IMPORT_TYPE_ARRAY_SUFFIX_RE.replace_all(&source, "${1} ");
-        match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+        match panic::catch_unwind(|| parse_source(&neutralized, language, is_tsx)) {
             Ok(Ok((_, has_error, _, _, _))) => !has_error,
             _ => false,
         }
@@ -552,10 +562,12 @@ pub(crate) fn is_expected_angular_template_control_flow_limitation(
 
         // Defensive: only meaningful for files that genuinely failed to parse. If the
         // original parses clean there is no limitation to excuse.
-        let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
-            Ok(Ok((_, has_error, _, _, _))) => has_error,
-            _ => return false,
-        };
+        // HTML is never TSX; the flavor flag is irrelevant for this grammar.
+        let original_has_error =
+            match panic::catch_unwind(|| parse_source(&source, language, false)) {
+                Ok(Ok((_, has_error, _, _, _))) => has_error,
+                _ => return false,
+            };
         if !original_has_error {
             return false;
         }
@@ -576,7 +588,7 @@ pub(crate) fn is_expected_angular_template_control_flow_limitation(
                     &caps[4],
                 )
             });
-        match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+        match panic::catch_unwind(|| parse_source(&neutralized, language, false)) {
             Ok(Ok((_, has_error, _, _, _))) => !has_error,
             _ => false,
         }
@@ -594,7 +606,8 @@ pub fn extract_symbols_for_diff(source: &str, path: &str) -> Option<Vec<(String,
     if config_extractors::is_config_language(&language) {
         return None; // Config files don't go through tree-sitter.
     }
-    let result = panic::catch_unwind(|| parse_source(source, &language));
+    let is_tsx = LanguageId::is_tsx_path(path);
+    let result = panic::catch_unwind(|| parse_source(source, &language, is_tsx));
     let (symbols, ..) = match result {
         Ok(Ok(output)) => output,
         _ => return None,
@@ -702,7 +715,11 @@ mod tests {
         );
         // ...but the SF-003 detector recognizes it as the known grammar limitation.
         assert!(
-            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "class-field import-type-array must be recognized as an expected grammar limitation"
         );
         // Symbols are still extracted (the class `C` is present).
@@ -723,7 +740,11 @@ mod tests {
             "type-alias import-type-array still reports a partial parse"
         );
         assert!(
-            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "type-alias import-type-array must be recognized as an expected grammar limitation"
         );
     }
@@ -732,7 +753,11 @@ mod tests {
     fn test_sf003_multidim_import_type_array_is_expected_limitation() {
         let source = b"type S = import('rxjs').Subscription[][];";
         assert!(
-            is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "multi-dimensional import-type-array must be recognized as an expected limitation"
         );
     }
@@ -786,7 +811,11 @@ mod tests {
             "the genuinely broken file is a partial parse"
         );
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "a genuinely broken file sharing the import-type-array prefix MUST stay partial"
         );
     }
@@ -806,7 +835,11 @@ mod tests {
             "the genuinely broken identifier-glue file is a partial parse"
         );
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "deleting `[]` would glue `Sub[]scription` into a valid identifier; the \
              token-preserving neutralization must keep this broken file partial"
         );
@@ -823,7 +856,11 @@ mod tests {
             "the genuinely broken class-field identifier-glue file is a partial parse"
         );
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "a class-field import-type member glued to a trailing identifier fragment \
              must stay partial under the token-preserving neutralization"
         );
@@ -834,7 +871,11 @@ mod tests {
         // A plain malformed class with no import-type-array at all stays partial.
         let source = b"class C { private x: = ; }";
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "an unrelated syntax error must not be excused as an import-type-array limitation"
         );
     }
@@ -846,7 +887,11 @@ mod tests {
         // detector never masks the real defect.
         let source = b"type S = import('rxjs').Subscription[]; class C { private x: = ; }";
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "a real error elsewhere must keep the file partial even when an import-type-array is present"
         );
     }
@@ -856,7 +901,11 @@ mod tests {
         // The detector only applies to TypeScript. Other languages are never excused.
         let source = b"type S = import('rxjs').Subscription[];";
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::JavaScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::JavaScript,
+                source,
+                false
+            ),
             "the import-type-array limitation detector must be TypeScript-gated"
         );
     }
@@ -866,9 +915,114 @@ mod tests {
         // A clean TS file with no import-type-array is never flagged as the limitation.
         let source = b"type S = import('rxjs').Subscription;";
         assert!(
-            !is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
+            !is_expected_typescript_import_type_array_limitation(
+                &LanguageId::TypeScript,
+                source,
+                false
+            ),
             "clean scalar import-type must not be classified as a limitation"
         );
+    }
+
+    // --- TSX grammar selection (.tsx uses LANGUAGE_TSX, .ts stays on TYPESCRIPT) ---
+
+    #[test]
+    fn test_tsx_jsx_component_parses_clean_and_extracts_symbols() {
+        // The real-world repro: a JSX-returning function. The plain TypeScript
+        // grammar cannot parse JSX and reports a partial parse ("syntax missing
+        // >"); the TSX grammar (selected from the `.tsx` extension) parses it
+        // cleanly and the JSX-nested function symbols survive.
+        let source = br#"
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>
+  );
+}
+"#;
+        let result = process_file("src/App.tsx", source, LanguageId::TypeScript);
+        assert_eq!(
+            result.outcome,
+            FileOutcome::Processed,
+            "a `.tsx` JSX component must parse cleanly under the TSX grammar; got {:?} / {:?}",
+            result.outcome,
+            result.parse_diagnostic
+        );
+        assert!(
+            result.parse_diagnostic.is_none(),
+            "clean TSX parse must not attach a diagnostic; got {:?}",
+            result.parse_diagnostic
+        );
+        assert!(
+            result.symbols.iter().any(|s| s.name == "App"),
+            "the JSX component function `App` must be extracted; got {:?}",
+            result.symbols
+        );
+    }
+
+    #[test]
+    fn test_tsx_grammar_selected_by_extension_not_languageid() {
+        // The same JSX source under a `.ts` extension uses the plain TypeScript
+        // grammar, which cannot parse JSX — so it is a partial parse. This pins
+        // the invariant that the grammar is chosen by the file extension, not by
+        // the (shared) LanguageId::TypeScript.
+        let source = br#"
+export function App() {
+  return <div>hi</div>;
+}
+"#;
+        let as_tsx = process_file("src/App.tsx", source, LanguageId::TypeScript);
+        assert_eq!(
+            as_tsx.outcome,
+            FileOutcome::Processed,
+            "JSX under `.tsx` must parse clean"
+        );
+        let as_ts = process_file("src/App.ts", source, LanguageId::TypeScript);
+        assert!(
+            matches!(as_ts.outcome, FileOutcome::PartialParse { .. }),
+            "JSX under `.ts` must remain a partial parse (plain TS grammar has no JSX); got {:?}",
+            as_ts.outcome
+        );
+    }
+
+    #[test]
+    fn test_ts_angle_bracket_type_assertion_still_parses_clean() {
+        // CRITICAL regression: the TSX grammar rejects legacy angle-bracket type
+        // assertions (`<T>expr`), which are valid in plain `.ts`. A `.ts` file
+        // using `<number>y` must keep parsing cleanly on LANGUAGE_TYPESCRIPT and
+        // must NOT be routed to the TSX grammar.
+        let source = b"const y: unknown = 1;\nconst x = <number>y;\n";
+        let result = process_file("src/cast.ts", source, LanguageId::TypeScript);
+        assert_eq!(
+            result.outcome,
+            FileOutcome::Processed,
+            "a `.ts` angle-bracket cast must parse cleanly under the TypeScript grammar; got {:?} / {:?}",
+            result.outcome,
+            result.parse_diagnostic
+        );
+        assert!(
+            result.parse_diagnostic.is_none(),
+            "clean `.ts` cast must not attach a diagnostic; got {:?}",
+            result.parse_diagnostic
+        );
+        assert!(
+            result.symbols.iter().any(|s| s.name == "x"),
+            "the cast binding `x` must be extracted; got {:?}",
+            result.symbols
+        );
+    }
+
+    #[test]
+    fn test_is_tsx_path_classifier() {
+        assert!(LanguageId::is_tsx_path("src/App.tsx"));
+        assert!(LanguageId::is_tsx_path("App.TSX"));
+        assert!(LanguageId::is_tsx_path(r"src\components\App.tsx"));
+        assert!(!LanguageId::is_tsx_path("src/App.ts"));
+        assert!(!LanguageId::is_tsx_path("src/App.jsx"));
+        assert!(!LanguageId::is_tsx_path("tsx"));
+        assert!(!LanguageId::is_tsx_path("dir.tsx/file.ts"));
+        assert!(!LanguageId::is_tsx_path("noext"));
     }
 
     #[test]
@@ -1005,7 +1159,7 @@ mod tests {
         let source =
             "def compute():\n    value = outer(inner(1 + 2, tail)\n    other = {'a': {'b': 1}}\n";
         let (_symbols, has_error, diagnostic, _references, _aliases) =
-            parse_source(source, &LanguageId::Python).expect("python parse should complete");
+            parse_source(source, &LanguageId::Python, false).expect("python parse should complete");
 
         assert!(has_error, "fixture must contain a tree-sitter parse error");
         let diag = diagnostic.expect("partial parse must attach a diagnostic");
@@ -1029,7 +1183,7 @@ mod tests {
     fn test_parse_source_reports_actionable_missing_node_context() {
         let source = "fn compute() {\n    let value = outer(inner(1 + ), tail);\n}\n";
         let (_symbols, has_error, diagnostic, _references, _aliases) =
-            parse_source(source, &LanguageId::Rust).expect("rust parse should complete");
+            parse_source(source, &LanguageId::Rust, false).expect("rust parse should complete");
 
         assert!(has_error, "fixture must contain a tree-sitter parse error");
         let diag = diagnostic.expect("partial parse must attach a diagnostic");
@@ -1188,7 +1342,7 @@ mod tests {
 
     #[test]
     fn test_parse_source_zero_bytes() {
-        let result = parse_source("", &LanguageId::Rust)
+        let result = parse_source("", &LanguageId::Rust, false)
             .expect("parse_source must handle empty input without error");
         let (symbols, _has_error, _diagnostic, references, alias_map) = result;
         assert!(symbols.is_empty(), "empty source has no symbols");
@@ -1202,7 +1356,7 @@ mod tests {
         // Exercises parse_source + collect_first_error_node (if has_error) on a
         // file that tree-sitter must reject-as-syntax-error rather than crash.
         let source: String = "\0".repeat(4096);
-        let result = parse_source(&source, &LanguageId::Rust)
+        let result = parse_source(&source, &LanguageId::Rust, false)
             .expect("parse_source must handle null-byte input without error");
         let (_symbols, _has_error, _diagnostic, _references, _aliases) = result;
     }
@@ -1219,7 +1373,7 @@ mod tests {
         // stream, so tree-sitter must produce one or more ERROR nodes that
         // could span > 40 bytes of multi-byte content.
         let source: String = "€".repeat(100);
-        parse_source(&source, &LanguageId::Rust)
+        parse_source(&source, &LanguageId::Rust, false)
             .expect("parse_source must not panic on wide multi-byte error region");
     }
 
@@ -1234,7 +1388,7 @@ mod tests {
             source.push('€');
         }
         source.push(' ');
-        parse_source(&source, &LanguageId::Rust)
+        parse_source(&source, &LanguageId::Rust, false)
             .expect("parse_source must not panic when error snippet spans multi-byte chars");
     }
 
