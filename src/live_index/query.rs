@@ -557,7 +557,11 @@ pub(crate) fn anchor_path_match_score(query: &str, anchor_path: &str) -> f32 {
         query: &normalized_query,
         tokens: &tokens,
         current_file: None,
-        target_path: None,
+        // The scored path IS the anchor: setting `target_path` to it marks
+        // this as anchor scoring, so the SF-006 stem-equals-basename promotion
+        // applies here (and in the CoChangeSignal floor check, which scores
+        // `target_path` the same way) but NOT to ordinary candidate ranking.
+        target_path: Some(anchor_path),
         co_change_count: None,
         co_change_weighted_score: None,
     };
