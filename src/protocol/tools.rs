@@ -753,6 +753,7 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 "parsed"
             } else {
@@ -2672,7 +2673,16 @@ fn render_search_text_output(
     } else {
         0.95
     };
-    let output = format::search_text_result_view(result, group_by, terms, Some(confidence));
+    let output = format::search_text_result_view(
+        result,
+        group_by,
+        terms,
+        Some(confidence),
+        format::SearchSuggestionContext {
+            regex: is_regex,
+            include_tests: options.noise_policy.include_tests,
+        },
+    );
     let mut rendered = match envelope {
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,
@@ -2734,7 +2744,16 @@ fn sidecar_status_for_server(server: &SymForgeServer) -> crate::sidecar::port_fi
 /// when we win, when there is no shadow, or when `current_exe()` is unresolvable.
 fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     let our_binary = std::env::current_exe().ok()?;
-    crate::path_shadow::detect_shadow(&our_binary)
+    let mut report = crate::path_shadow::detect_shadow(&our_binary)?;
+    // `detect_shadow` probes our_version via a bounded `<binary> --version`
+    // subprocess, which can flake/time out under load — that produced
+    // "(version unknown)" on one health surface while another showed the real
+    // version in the same session. We ARE the running binary, so source our
+    // version from the compile-time package version instead of a subprocess.
+    // (Leave the shadow's version probed, since that is genuinely a foreign
+    // binary we cannot introspect statically.)
+    report.our_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    Some(report)
 }
 
 /// Extract the `version=<token>` value emitted on the runtime-status line of a
@@ -6288,8 +6307,11 @@ impl SymForgeServer {
             loading_guard!(guard);
             guard.capture_find_dependents_view(&input.path)
         };
+        // Default per-file reference detail is capped at 5 lines (not 10) so the
+        // non-compact view stays bounded on hub files with dozens of dependents;
+        // callers can raise it with max_per_file or switch to compact=true.
         let limits =
-            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
+            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(5));
         let fmt = input.format.as_deref().unwrap_or("text");
         let output = match fmt {
             "mermaid" => format::find_dependents_mermaid(&view, &input.path, &limits),
@@ -6902,14 +6924,34 @@ impl SymForgeServer {
         let mut all_text_queries = text_queries.clone();
         all_text_queries.extend(remainder_terms.iter().cloned());
 
+        // Lowercased remainder terms drive "specific term" detection below: a
+        // remainder noun that matches an indexed symbol name (e.g. "admission"
+        // -> AdmissionTier) must never be outranked by the concept bucket's
+        // generic symbol_queries (e.g. "index"), and it should keep the topic
+        // visible in the header instead of collapsing it to the concept label.
+        let remainder_term_keys: HashSet<String> = remainder_terms
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        // Remainder terms that actually resolve to an indexed symbol name via
+        // search_symbols' substring semantics. Populated during the symbol
+        // search loop so we don't pay for a second index pass.
+        let mut specific_terms: HashSet<String> = HashSet::new();
+
         let fallback_mode = concept.is_none();
         for sq in &all_symbol_queries {
             let term_key = sq.to_ascii_lowercase();
             let result = search::search_symbols(&guard, sq, None, limit * 3);
+            let is_remainder_term = remainder_term_keys.contains(&term_key);
             let mut seen_paths = HashSet::new();
             for hit in &result.hits {
                 if fallback_mode && !Self::explore_fallback_symbol_match(&hit.name, &term_key) {
                     continue;
+                }
+                // A remainder noun that lands on a real symbol name is a
+                // load-bearing query term, not generic concept noise.
+                if !fallback_mode && is_remainder_term {
+                    specific_terms.insert(term_key.clone());
                 }
                 let entry = (hit.name.clone(), hit.kind.clone(), hit.path.clone());
                 let score = match_scores.entry(entry).or_default();
@@ -7122,7 +7164,22 @@ impl SymForgeServer {
                 };
                 let classification = guard.get_file(&path).map(|file| &file.classification);
                 let path_penalty = explore_path_penalty(&path, classification);
-                let coverage_bonus: u64 = match score_data.matched_terms.len() as u64 {
+                // Specific remainder terms (query nouns that resolved to a real
+                // indexed symbol name, e.g. "admission" -> AdmissionTier) are
+                // load-bearing, not generic concept noise. Each one counts as
+                // two extra terms toward coverage: enough that a single specific
+                // noun outranks a generic two-term concept-bucket hit (the
+                // failure this fix targets), but a symbol with genuine
+                // three-plus-term co-occurrence still wins. This only affects
+                // concept mode; fallback mode never populates the set.
+                let specific_match_count = score_data
+                    .matched_terms
+                    .iter()
+                    .filter(|term| specific_terms.contains(*term))
+                    .count() as u64;
+                let effective_terms =
+                    score_data.matched_terms.len() as u64 + 2 * specific_match_count;
+                let coverage_bonus: u64 = match effective_terms {
                     0 | 1 => 1,
                     n => n * n,
                 };
@@ -7300,8 +7357,23 @@ impl SymForgeServer {
             }
         }
 
+        // When a concept matched but the query also named specific terms that
+        // resolve to indexed symbols, keep those nouns visible in the header so
+        // the topic isn't silently collapsed to the generic concept label.
+        // Order by query position (remainder_terms preserves it) for stability.
+        let display_label = if !specific_terms.is_empty() {
+            let ordered: Vec<&str> = remainder_terms
+                .iter()
+                .filter(|t| specific_terms.contains(t.as_str()))
+                .map(|t| t.as_str())
+                .collect();
+            format!("{label} + {}", ordered.join(", "))
+        } else {
+            label.clone()
+        };
+
         let mut output = format::explore_result_view(format::ExploreResultViewInput {
-            label: &label,
+            label: &display_label,
             symbol_hits: &symbol_hits,
             text_hits: &text_hits,
             related_files: &related_files,
@@ -9373,6 +9445,54 @@ mod tests {
         assert!(
             result.contains("Scope: repo-wide symbol token `target`"),
             "default symbol context should surface repo-wide scope; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_context_reference_list_uses_actual_enclosing_kind() {
+        // Regression: reference entries used to render every enclosing symbol as
+        // "in fn <name>" regardless of kind, yielding nonsense like
+        // "in fn impl BucketManager". The enclosing kind must be honored, and an
+        // impl/struct whose stored name already carries the kind prefix must not
+        // double it.
+        let impl_sym = make_symbol("impl BucketManager", SymbolKind::Impl, 1, 5);
+        let caller_file = make_file_with_refs(
+            "src/bucket.rs",
+            b"impl BucketManager {\n    fn f(&self) { target(); }\n}\n",
+            vec![impl_sym],
+            vec![ReferenceRecord {
+                name: "target".to_string(),
+                qualified_name: None,
+                kind: ReferenceKind::Call,
+                byte_range: (38, 44),
+                line_range: (1, 1),
+                enclosing_symbol_index: Some(0),
+            }],
+        );
+        let server = make_server(make_live_index_ready(vec![caller_file]));
+
+        let result = server
+            .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                name: "target".to_string(),
+                file: None,
+                path: None,
+                symbol_kind: None,
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("in impl BucketManager"),
+            "reference list should render the actual enclosing kind; got: {result}"
+        );
+        assert!(
+            !result.contains("in fn impl BucketManager"),
+            "reference list must not hardcode 'fn' nor double the kind; got: {result}"
         );
     }
 
@@ -12782,6 +12902,22 @@ mod tests {
             !result.contains("Snapshot:"),
             "fresh compact health should omit snapshot verification lines"
         );
+    }
+
+    #[test]
+    fn test_current_exe_shadow_report_sources_our_version_from_package() {
+        // Item 6c: our version must come from the compile-time package version,
+        // not a flaky `<binary> --version` subprocess probe. This keeps the
+        // full and compact health surfaces consistent (no "(version unknown)"
+        // on one and the real version on the other). When no shadow exists the
+        // report is None and the invariant holds vacuously.
+        if let Some(report) = super::current_exe_shadow_report() {
+            assert_eq!(
+                report.our_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "our_version must be the compile-time package version, never an unknown probe result"
+            );
+        }
     }
 
     #[tokio::test]
@@ -16510,6 +16646,112 @@ mod tests {
             result.contains("handle_watcher_error") || result.contains("watcher"),
             "concept+remainder should surface watcher results: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explore_concept_remainder_matching_symbol_outranks_generic_bucket() {
+        // Regression: query "admission tiering decide which files get indexed"
+        // matches the "Indexing" concept (via "indexed" -> "index" stemming),
+        // which previously collapsed the topic and buried the real admission
+        // symbols under generic Indexing/LiveIndex hits. The remainder noun
+        // "admission" resolves to indexed symbol names and must win.
+        let admission_content =
+            b"pub enum AdmissionTier { Indexed, MetadataOnly, HardSkip }\npub struct AdmissionDecision { pub tier: AdmissionTier }\n";
+        let admission_symbols = vec![
+            SymbolRecord {
+                name: "AdmissionTier".to_string(),
+                kind: SymbolKind::Enum,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, 58),
+                line_range: (0, 0),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+            SymbolRecord {
+                name: "AdmissionDecision".to_string(),
+                kind: SymbolKind::Struct,
+                depth: 0,
+                sort_order: 1,
+                byte_range: (58, admission_content.len() as u32),
+                line_range: (1, 1),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+        ];
+
+        // Generic indexing symbols the "Indexing" concept bucket targets
+        // directly ("index"/"reindex"). These previously dominated the output.
+        let index_content = b"pub struct LiveIndex {}\npub fn reindex_all() {}\n";
+        let index_symbols = vec![
+            SymbolRecord {
+                name: "LiveIndex".to_string(),
+                kind: SymbolKind::Struct,
+                depth: 0,
+                sort_order: 0,
+                byte_range: (0, 23),
+                line_range: (0, 0),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+            SymbolRecord {
+                name: "reindex_all".to_string(),
+                kind: SymbolKind::Function,
+                depth: 0,
+                sort_order: 1,
+                byte_range: (24, index_content.len() as u32),
+                line_range: (1, 1),
+                doc_byte_range: None,
+                item_byte_range: None,
+            },
+        ];
+
+        let server = make_server(make_live_index_ready(vec![
+            make_file("src/domain/index.rs", admission_content, admission_symbols),
+            make_file("src/live_index/store.rs", index_content, index_symbols),
+        ]));
+
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "admission tiering decide which files get indexed".to_string(),
+                limit: Some(10),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+
+        // The load-bearing query noun must surface its symbols.
+        assert!(
+            result.contains("AdmissionTier"),
+            "explore must surface AdmissionTier for an 'admission' query: {result}"
+        );
+
+        // The header must not silently collapse the topic to "Indexing": the
+        // specific matching noun stays visible.
+        assert!(
+            result.contains("Exploring: Indexing + admission"),
+            "header should keep the specific query noun, not collapse to the concept: {result}"
+        );
+
+        // The specific admission match must rank above the generic concept
+        // bucket symbols (LiveIndex, reindex_all), not be buried beneath them.
+        let admission_pos = result
+            .find("AdmissionTier")
+            .expect("AdmissionTier must be present");
+        for generic in ["LiveIndex", "reindex_all"] {
+            if let Some(generic_pos) = result.find(generic) {
+                assert!(
+                    admission_pos < generic_pos,
+                    "AdmissionTier should rank above the generic '{generic}' bucket hit: {result}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

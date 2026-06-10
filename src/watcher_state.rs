@@ -7,8 +7,13 @@ use std::time::SystemTime;
 /// Watcher operational state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatcherState {
-    /// File watcher is running and receiving events.
+    /// File watcher is registered and looping (receiving/ready for events).
     Active,
+    /// Watcher (re)start has been initiated but the recursive filesystem watch
+    /// has not finished registering yet. On large trees, registering the
+    /// `notify` recursive watch can take seconds; this state distinguishes
+    /// in-progress startup from a watcher that is genuinely not running (`Off`).
+    Starting,
     /// File watcher encountered errors but partial operation continues.
     Degraded,
     /// File watcher is not running.

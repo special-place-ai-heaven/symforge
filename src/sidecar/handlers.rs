@@ -148,6 +148,7 @@ fn parse_state_label(file: &crate::live_index::store::IndexedFile) -> &'static s
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 "parsed"
             } else {
@@ -402,6 +403,7 @@ fn append_parse_status_lines(
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 lines.push(
                     "Parse status: ok (parser limitation: tree-sitter-typescript 0.23.2 \
@@ -1263,11 +1265,17 @@ fn symbol_context_text(
             continue; // count beyond 10 but don't include
         }
 
+        // Capture the enclosing symbol as a kind-aware display label
+        // (e.g. "impl BucketManager", "struct BucketManager", "fn delta")
+        // instead of bare name, so the reference list does not mislabel every
+        // enclosing symbol as a function.
         let enclosing = reference.enclosing_symbol_index.and_then(|idx| {
             guard
                 .get_file(file_path)
                 .and_then(|f| f.symbols.get(idx as usize))
-                .map(|s| s.name.clone())
+                .map(|s| {
+                    crate::protocol::format::symbol_kind_name_label(&s.kind.to_string(), &s.name)
+                })
         });
 
         map.entry(file_path.to_string()).or_default().push((
@@ -1336,8 +1344,8 @@ fn symbol_context_text(
         let mut sorted_refs = refs.clone();
         sorted_refs.sort_by_key(|(line, _, _)| *line);
         for (line, _kind, enclosing) in &sorted_refs {
-            if let Some(sym_name) = enclosing {
-                body_lines.push(format!("  line {}  in fn {}", line, sym_name));
+            if let Some(sym_label) = enclosing {
+                body_lines.push(format!("  line {}  in {}", line, sym_label));
             } else {
                 body_lines.push(format!("  line {}  (module level)", line));
             }

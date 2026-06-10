@@ -536,7 +536,7 @@ mod tests {
         // the SF-004 root cause: has_error=true AND the symbol survives.
         let source = "<div>\n  @if (items.length > 0) {\n    <span>{{ items.length }}</span>\n  }\n</div>";
         let (symbols, has_error, _diagnostic, _refs, _aliases) =
-            crate::parsing::parse_source(source, &LanguageId::Html)
+            crate::parsing::parse_source(source, &LanguageId::Html, false)
                 .expect("HTML parse should not hard-fail");
 
         assert!(

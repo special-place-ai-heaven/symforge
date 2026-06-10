@@ -20,6 +20,13 @@ pub struct HealthStats {
     /// tree-sitter grammar cannot model (SF-004: Angular `@if`/`@for`/... in
     /// `.html`, which tree-sitter-html 0.23.2 has no rules for).
     pub expected_framework_partial_parse_count: usize,
+    /// Expected partial parses from a known host-language grammar limitation
+    /// (SF-003: `import('mod').Member[]` import-type arrays that
+    /// tree-sitter-typescript 0.23.2 mis-parses). These are valid source, not
+    /// repo-owned defects, so they are bucketed separately from unexpected
+    /// partials — but they MUST still be accounted for so the quarantine
+    /// registry total matches the header partial count.
+    pub expected_language_partial_parse_count: usize,
     pub failed_count: usize,
     pub load_duration: Duration,
     /// Current state of the file watcher.
@@ -46,6 +53,9 @@ pub struct HealthStats {
     pub expected_vendor_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of expected framework template partial-parse files.
     pub expected_framework_partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of expected host-language-limitation partial-parse
+    /// files (SF-003 TypeScript import-type arrays).
+    pub expected_language_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of files with failed parse status and their error messages.
     pub failed_files: Vec<(String, String)>,
     /// Admission tier counts: (Tier1 indexed, Tier2 metadata-only, Tier3 hard-skipped).
@@ -68,6 +78,9 @@ pub const EXPECTED_VENDOR_PARTIAL_PARSE_REASON: &str =
 
 pub const EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON: &str = "expected framework: Angular template control-flow not supported by tree-sitter-html; \
 symbols extracted best-effort";
+
+pub const EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON: &str = "expected language: TypeScript import-type array (import('mod').Member[]) not supported by \
+tree-sitter-typescript 0.23.2; symbols extracted best-effort";
 
 /// Angular control-flow block keywords (`@if`/`@for`/`@switch`/`@defer`).
 ///
@@ -240,11 +253,12 @@ impl LiveIndex {
     /// `ignore` crate — the `ignore` crate models gitignore rules but has no concept
     /// of which files are tracked.
     ///
-    /// Covers BOTH discovery paths uniformly: it reads `self.files` (the Tier-1
-    /// population) regardless of whether the index was built by `LiveIndex::load`
-    /// (`discover_all_files`) or the watcher's `build_reload_data`
-    /// (`discover_files`). The two paths admit different Tier-2 populations, but the
-    /// Tier-1 set this count inspects lives in `self.files` either way.
+    /// Covers BOTH index-build paths uniformly: it reads `self.files` (the
+    /// Tier-1 population) regardless of whether the index was built by
+    /// `LiveIndex::load` or `build_reload_data` (the reload / `index_folder`
+    /// path). Both now run the same admission pipeline over `discover_all_files`,
+    /// so they admit the same Tier-2 population; the Tier-1 set this count
+    /// inspects lives in `self.files` either way.
     fn count_untracked_indexed(&self) -> usize {
         // Fail open: no recorded root means we cannot anchor a git lookup.
         let Some(root) = self.indexed_root.as_ref() else {
@@ -298,6 +312,7 @@ impl LiveIndex {
         let mut unexpected_partial_parse_files = Vec::new();
         let mut expected_vendor_partial_parse_files = Vec::new();
         let mut expected_framework_partial_parse_files = Vec::new();
+        let mut expected_language_partial_parse_files = Vec::new();
         for (path, file) in &self.files {
             if matches!(file.parse_status, ParseStatus::PartialParse { .. }) {
                 partial_parse_files.push(path.clone());
@@ -314,12 +329,16 @@ impl LiveIndex {
                 } else if crate::parsing::is_expected_typescript_import_type_array_limitation(
                     &file.language,
                     &file.content,
+                    crate::domain::LanguageId::is_tsx_path(path),
                 ) {
                     // SF-003: a partial parse caused only by the known
                     // tree-sitter-typescript 0.23.2 import-type-array grammar
-                    // limitation is valid TypeScript. It stays in the
-                    // `partial_parse_files` superset but is never counted as an
-                    // unexpected repo-owned partial (it is not a real defect).
+                    // limitation is valid TypeScript. It is never counted as an
+                    // unexpected repo-owned partial (it is not a real defect), but
+                    // it IS bucketed as an expected language-grammar partial so the
+                    // quarantine registry accounts for every partial parse — the
+                    // header partial count and the registry total stay in sync.
+                    expected_language_partial_parse_files.push(path.clone());
                 } else {
                     unexpected_partial_parse_files.push(path.clone());
                 }
@@ -333,6 +352,8 @@ impl LiveIndex {
         expected_vendor_partial_parse_files.dedup();
         expected_framework_partial_parse_files.sort();
         expected_framework_partial_parse_files.dedup();
+        expected_language_partial_parse_files.sort();
+        expected_language_partial_parse_files.dedup();
 
         let mut failed_files: Vec<(String, String)> = self
             .files
@@ -355,6 +376,7 @@ impl LiveIndex {
             unexpected_partial_parse_count: unexpected_partial_parse_files.len(),
             expected_vendor_partial_parse_count: expected_vendor_partial_parse_files.len(),
             expected_framework_partial_parse_count: expected_framework_partial_parse_files.len(),
+            expected_language_partial_parse_count: expected_language_partial_parse_files.len(),
             failed_count,
             load_duration: self.load_duration,
             watcher_state: WatcherState::Off,
@@ -369,6 +391,7 @@ impl LiveIndex {
             unexpected_partial_parse_files,
             expected_vendor_partial_parse_files,
             expected_framework_partial_parse_files,
+            expected_language_partial_parse_files,
             failed_files,
             tier_counts: self.tier_counts(),
             local_empty_reason: self.local_empty_reason(),
@@ -391,5 +414,112 @@ impl LiveIndex {
         stats.stale_files_found = watcher.stale_files_found;
         stats.last_reconcile_at = watcher.last_reconcile_at;
         stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::FileClassification;
+    use crate::live_index::store::{IndexedFile, ParseStatus};
+    use std::sync::Arc;
+
+    fn partial_ts_file(path: &str, content: &str) -> IndexedFile {
+        IndexedFile {
+            relative_path: path.to_string(),
+            language: LanguageId::TypeScript,
+            classification: FileClassification::for_code_path(path),
+            content: content.as_bytes().to_vec(),
+            symbols: Vec::new(),
+            parse_status: ParseStatus::PartialParse {
+                warning: "syntax error".to_string(),
+            },
+            parse_diagnostic: None,
+            byte_len: content.len() as u64,
+            content_hash: "test-hash".to_string(),
+            references: Vec::new(),
+            alias_map: std::collections::HashMap::new(),
+            mtime_secs: 0,
+        }
+    }
+
+    fn index_with_files(files: Vec<IndexedFile>) -> LiveIndex {
+        let mut index = LiveIndex::empty_live_index();
+        index.is_empty = false;
+        for file in files {
+            index
+                .files
+                .insert(file.relative_path.clone(), Arc::new(file));
+        }
+        index
+    }
+
+    /// Regression for the health accounting mismatch: a TypeScript file whose
+    /// partial parse is excused as the known SF-003 import-type-array grammar
+    /// limitation MUST still be accounted for in the quarantine registry.
+    ///
+    /// Before the fix it was counted in `partial_parse_count` (the header) but
+    /// landed in NO category vector, so the registry `total` (which sums the
+    /// named buckets) was less than the header partial count — the excused file
+    /// was invisible to every diagnostic list.
+    #[test]
+    fn sf003_excused_partial_is_accounted_in_quarantine_registry() {
+        // The exact reported SF-003 repro shape (tree-sitter-typescript 0.23.2
+        // mis-parses the `[]` suffix on an import-type member). This genuinely
+        // produces a partial parse but is a known grammar limitation, not a
+        // repo-owned defect.
+        let excused = partial_ts_file("src/app.ts", "type S = import('rxjs').Subscription[];");
+        // A genuinely broken TypeScript file — a real repo-owned partial.
+        let broken = partial_ts_file("src/broken.ts", "function f( { return ;");
+
+        let stats = index_with_files(vec![excused, broken]).health_stats();
+
+        // Header counts both as partial.
+        assert_eq!(
+            stats.partial_parse_count, 2,
+            "both files are ParseStatus::PartialParse"
+        );
+
+        // The registry total must equal partial + failed: every partial file is
+        // accounted for in exactly one named category.
+        let registry_total = stats.unexpected_partial_parse_count
+            + stats.expected_vendor_partial_parse_count
+            + stats.expected_framework_partial_parse_count
+            + stats.expected_language_partial_parse_count
+            + stats.failed_count;
+        assert_eq!(
+            registry_total,
+            stats.partial_parse_count + stats.failed_count,
+            "registry total must account for every partial parse (header={}, \
+             unexpected={}, vendor={}, framework={}, language={}, failed={})",
+            stats.partial_parse_count,
+            stats.unexpected_partial_parse_count,
+            stats.expected_vendor_partial_parse_count,
+            stats.expected_framework_partial_parse_count,
+            stats.expected_language_partial_parse_count,
+            stats.failed_count,
+        );
+
+        // The SF-003 file is bucketed as an expected language-grammar partial,
+        // NOT as an unexpected repo-owned defect.
+        assert_eq!(
+            stats.expected_language_partial_parse_count, 1,
+            "the SF-003 import-type-array file is an expected language partial"
+        );
+        assert!(
+            stats
+                .expected_language_partial_parse_files
+                .contains(&"src/app.ts".to_string()),
+            "the SF-003 file must appear in the expected-language partial list"
+        );
+
+        // The genuinely broken file remains an unexpected repo-owned partial.
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert!(
+            stats
+                .unexpected_partial_parse_files
+                .contains(&"src/broken.ts".to_string()),
+            "the genuinely broken file stays an unexpected partial"
+        );
     }
 }

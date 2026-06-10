@@ -545,12 +545,19 @@ pub struct PublishedIndexState {
     /// limitation (Angular `@if`/`@for`/... in `.html`). Carried across the
     /// daemon-proxy boundary so proxied health reports the same third bucket.
     pub expected_framework_partial_parse_count: usize,
+    /// SF-003: count of partial parses excused as a host-language grammar
+    /// limitation (TypeScript `import('mod').Member[]` import-type arrays).
+    /// Carried across the daemon-proxy boundary so proxied health reports the
+    /// same bucket and the registry total stays in sync with the header.
+    pub expected_language_partial_parse_count: usize,
     pub failed_count: usize,
     pub partial_parse_files: Vec<String>,
     pub unexpected_partial_parse_files: Vec<String>,
     pub expected_vendor_partial_parse_files: Vec<String>,
     /// SF-004: bounded list of framework-template partial-parse files.
     pub expected_framework_partial_parse_files: Vec<String>,
+    /// SF-003: bounded list of host-language-limitation partial-parse files.
+    pub expected_language_partial_parse_files: Vec<String>,
     pub failed_files: Vec<(String, String)>,
     pub symbol_count: usize,
     pub loaded_at_system: SystemTime,
@@ -1044,6 +1051,95 @@ impl SharedIndexHandle {
         true
     }
 
+    /// Generation-checked demotion of a single file to Tier 2/3.
+    ///
+    /// Atomically removes the path from the fully-indexed `files` map (if it was
+    /// Tier 1 before) and upserts its `SkippedFile` record. Used by the
+    /// single-file (re)index choke point to enforce admission tiering: a file
+    /// that classifies as metadata-only/hard-skip must never be parsed into the
+    /// index by the watcher event path or the freshen-on-read path.
+    ///
+    /// Returns `false` (without mutating) when `expected_gen` no longer matches
+    /// the live project generation, matching the stale-mutation fence used by
+    /// `update_file_at_generation` / `remove_file_at_generation`.
+    pub fn demote_to_skipped_at_generation(
+        &self,
+        path: &str,
+        sf: SkippedFile,
+        expected_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale file demotion"
+            );
+            return false;
+        }
+
+        let mut live = (*self.live.load_full()).clone();
+        let path_owned = path.to_string();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            live.demote_to_skipped(&path_owned, sf);
+        }));
+        match result {
+            Ok(()) => self.swap_and_publish(live),
+            Err(panic_info) => {
+                // Clone-mutate-swap means the original index is untouched on
+                // panic — no repair needed, just log and discard the clone.
+                let msg = panic_info
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown");
+                tracing::error!(
+                    "index demotion panicked for '{}': {} — original index preserved",
+                    path,
+                    msg
+                );
+            }
+        }
+        true
+    }
+
+    /// Generation-checked removal of any Tier-2/3 skip record for `path`.
+    ///
+    /// Called on the single-file reindex path when a file is admitted as Tier 1
+    /// again, so a previously-skipped path stops being counted in the Tier-2/3
+    /// totals. Only swaps a new index in when a record was actually removed, so
+    /// the common (no stale skip record) case is allocation-free after the
+    /// clone check. Returns `false` when the generation fence rejects the call.
+    pub fn clear_skipped_at_generation(&self, path: &str, expected_gen: u64) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale skip-record clear"
+            );
+            return false;
+        }
+
+        // Fast path: only clone + swap when a skip record actually exists.
+        let current = self.live.load_full();
+        if !current.skipped_files.iter().any(|sf| sf.path == path) {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.clear_skipped(path);
+        self.swap_and_publish(live);
+        true
+    }
+
     pub fn mark_snapshot_verify_running(&self) {
         let _wg = self.write_mutex.lock();
         let mut live = (*self.live.load_full()).clone();
@@ -1171,6 +1267,7 @@ impl PublishedIndexState {
             unexpected_partial_parse_count: stats.unexpected_partial_parse_count,
             expected_vendor_partial_parse_count: stats.expected_vendor_partial_parse_count,
             expected_framework_partial_parse_count: stats.expected_framework_partial_parse_count,
+            expected_language_partial_parse_count: stats.expected_language_partial_parse_count,
             failed_count: stats.failed_count,
             partial_parse_files: stats.partial_parse_files.into_iter().take(10).collect(),
             unexpected_partial_parse_files: stats
@@ -1185,6 +1282,11 @@ impl PublishedIndexState {
                 .collect(),
             expected_framework_partial_parse_files: stats
                 .expected_framework_partial_parse_files
+                .into_iter()
+                .take(10)
+                .collect(),
+            expected_language_partial_parse_files: stats
+                .expected_language_partial_parse_files
                 .into_iter()
                 .take(10)
                 .collect(),
@@ -1296,6 +1398,329 @@ pub(crate) fn build_path_indices_from_files(
     (by_basename, by_dir_component)
 }
 
+/// An admitted file plus everything needed to parse it. Defined as a named
+/// struct (rather than a wide tuple) to keep the `to_parse` collection type
+/// simple and self-documenting. Shared by the `load` and reload pipelines via
+/// [`admit_and_parse_entries`].
+struct ParseCandidate {
+    relative_path: String,
+    language: crate::domain::LanguageId,
+    classification: crate::domain::FileClassification,
+    bytes: Vec<u8>,
+    mtime_secs: u64,
+    /// Original on-disk size, used in the parse stage to re-acquire an in-flight
+    /// permit for large files (bounding concurrent parse memory). Permits are NOT
+    /// carried across the read→parse stage boundary: doing so would deadlock the
+    /// admission `par_iter`, whose permits would only free in the later parse
+    /// stage. Each stage acquires and releases within its own closure instead.
+    file_size: u64,
+}
+
+/// Outcome of running the admission gate against one discovered file: either it
+/// is admitted for parsing or it is recorded as skipped (Tier 2/3).
+enum AdmissionOutcome {
+    Parse(ParseCandidate),
+    Skip(SkippedFile),
+}
+
+/// Parsed file map plus the skip records and circuit-breaker state produced by a
+/// single admission + parse pass. Returned by [`admit_and_parse_entries`] so the
+/// `load` and reload callers share one pipeline and differ only in how they wrap
+/// the result.
+pub(crate) struct AdmitParseResult {
+    pub files: HashMap<String, Arc<IndexedFile>>,
+    pub skipped_files: Vec<SkippedFile>,
+    pub cb_state: CircuitBreakerState,
+}
+
+/// Run the shared admission gate and parser over a set of discovered entries.
+///
+/// This is the SINGLE pipeline used by both [`LiveIndex::load`] (initial load)
+/// and [`LiveIndex::build_reload_data`] (full reindex / `index_folder`), so both
+/// paths classify every discovered file into Tier 1/2/3, record Tier-2/3 files in
+/// `skipped_files`, and respect the in-flight byte governor identically.
+///
+/// Pipeline shape (same as the original `load`):
+///   * Phase 1 — size + basename classification (no I/O beyond the walk).
+///   * Phase 2 — unknown-language files are read (binary-sniffed) and recorded as
+///     metadata-only skips; they are never parsed.
+///   * Phase 3 — recognized-language files are read (binary-sniffed); a content
+///     sniff can still reclassify to Tier 2. SF-009 untracked demotion applies
+///     here when `exclude_untracked_set` is `Some`.
+///   * Parse — admitted candidates are parsed in parallel.
+///   * Circuit breaker — files are folded into a map sequentially under a fresh
+///     `CircuitBreakerState`, aborting if the failure ratio trips.
+///
+/// `exclude_untracked_set` carries the SF-009 opt-in semantics: `None` (the
+/// default and the fail-open result for non-git trees) demotes nothing; `Some`
+/// demotes recognized-extension files that are not git-tracked to Tier 2.
+pub(crate) fn admit_and_parse_entries(
+    entries: &[crate::discovery::DiscoveredEntry],
+    exclude_untracked_set: &Option<std::collections::HashSet<String>>,
+) -> AdmitParseResult {
+    use crate::discovery::classify_admission;
+    // `AdmissionTier` and `SkippedFile` are already imported at module scope.
+
+    // Peak-memory governor: bounds the bytes resident across all concurrent
+    // full-file reads/parses so a tree of many large recognized-source files
+    // (each under the per-file hard-skip, cumulatively under the cap) cannot
+    // drive peak RSS to `num_threads * file_size`. Coverage is unchanged — every
+    // file is still read and classified; only concurrency of the large reads is
+    // bounded. `read_under_budget` returns the same bytes a bare `std::fs::read`
+    // would, just admission-throttled for big files.
+    let inflight_budget = Arc::new(InflightByteBudget::from_env());
+    // Read a file, acquiring an in-flight permit FIRST for files above the
+    // governor threshold. The returned permit (if any) must be held for as long
+    // as the returned bytes are alive, so peak resident bytes across all workers
+    // stay within the budget. Returns `(bytes, permit)`.
+    let read_under_budget =
+        |path: &Path, size: u64| -> std::io::Result<(Vec<u8>, Option<InflightPermit>)> {
+            if size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES {
+                // Acquire BEFORE reading so the large allocation never races ahead
+                // of the budget.
+                let permit = inflight_budget.acquire(size);
+                let bytes = std::fs::read(path)?;
+                Ok((bytes, Some(permit)))
+            } else {
+                let bytes = std::fs::read(path)?;
+                Ok((bytes, None))
+            }
+        };
+
+    let outcomes: Vec<AdmissionOutcome> = indexing_thread_pool().install(|| {
+        entries
+            .par_iter()
+            .filter_map(|entry| {
+                // Phase 1: size + extension check (no I/O beyond what the walk gave us).
+                let decision_pre = classify_admission(
+                    &entry.absolute_path,
+                    entry.file_size,
+                    None, // no content yet
+                );
+
+                match decision_pre.tier {
+                    AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
+                        // No need to read content — already decided.
+                        let sf = SkippedFile {
+                            path: entry.relative_path.clone(),
+                            size: entry.file_size,
+                            extension: entry
+                                .absolute_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|s| s.to_string()),
+                            decision: decision_pre,
+                        };
+                        return Some(AdmissionOutcome::Skip(sf));
+                    }
+                    AdmissionTier::Normal => {}
+                }
+
+                // Phase 2: we tentatively have Tier-1. If the file has no recognized
+                // language, we cannot parse it — skip it as metadata-only.
+                let language = match &entry.language {
+                    Some(lang) => lang.clone(),
+                    None => {
+                        // Unknown extension, not on denylist, under size limit.
+                        // Read content to do binary sniff, then store as skipped.
+                        // `_permit` stays alive until the end of this block so the
+                        // read bytes are accounted against the in-flight budget.
+                        let (bytes, _permit) =
+                            match read_under_budget(&entry.absolute_path, entry.file_size) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("failed to read {:?}: {}", entry.absolute_path, e);
+                                    return None;
+                                }
+                            };
+                        let decision_post =
+                            classify_admission(&entry.absolute_path, entry.file_size, Some(&bytes));
+                        let sf = SkippedFile {
+                            path: entry.relative_path.clone(),
+                            size: entry.file_size,
+                            extension: entry
+                                .absolute_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|s| s.to_string()),
+                            decision: decision_post,
+                        };
+                        return Some(AdmissionOutcome::Skip(sf));
+                    }
+                };
+
+                // Phase 3: read content and do binary sniff before passing to parser.
+                // `_permit` bounds the concurrent READ footprint and is released at
+                // the end of this closure — it deliberately does NOT cross into the
+                // parse stage (that would deadlock this `par_iter`). The parse stage
+                // re-acquires its own permit from `file_size`.
+                let (bytes, _permit) =
+                    match read_under_budget(&entry.absolute_path, entry.file_size) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("failed to read {:?}: {}", entry.absolute_path, e);
+                            return None;
+                        }
+                    };
+                let mtime_secs = std::fs::metadata(&entry.absolute_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let decision_post =
+                    classify_admission(&entry.absolute_path, entry.file_size, Some(&bytes));
+
+                match decision_post.tier {
+                    AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
+                        // Binary sniff reclassified this file — do NOT parse.
+                        // Drop the bytes now; `_permit` releases at closure end.
+                        drop(bytes);
+                        let sf = SkippedFile {
+                            path: entry.relative_path.clone(),
+                            size: entry.file_size,
+                            extension: entry
+                                .absolute_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .map(|s| s.to_string()),
+                            decision: decision_post,
+                        };
+                        Some(AdmissionOutcome::Skip(sf))
+                    }
+                    AdmissionTier::Normal => {
+                        // SF-009 opt-in demotion: if the exclude-untracked policy is
+                        // active and this recognized-extension file is NOT git-tracked,
+                        // demote it to Tier-2 instead of parsing it. Default (`None`)
+                        // skips this entirely.
+                        if let Some(tracked) = exclude_untracked_set.as_ref()
+                            && !tracked.contains(&entry.relative_path)
+                        {
+                            drop(bytes);
+                            let sf = SkippedFile {
+                                path: entry.relative_path.clone(),
+                                size: entry.file_size,
+                                extension: entry
+                                    .absolute_path
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|s| s.to_string()),
+                                decision: crate::domain::index::AdmissionDecision::skip(
+                                    AdmissionTier::MetadataOnly,
+                                    crate::domain::index::SkipReason::Untracked,
+                                ),
+                            };
+                            return Some(AdmissionOutcome::Skip(sf));
+                        }
+                        Some(AdmissionOutcome::Parse(ParseCandidate {
+                            relative_path: entry.relative_path.clone(),
+                            language,
+                            classification: entry.classification,
+                            bytes,
+                            mtime_secs,
+                            file_size: entry.file_size,
+                        }))
+                    }
+                }
+            })
+            .collect()
+    });
+
+    // Split outcomes into parse candidates and skipped files. Each candidate
+    // carries its on-disk `file_size` so the parse stage can re-acquire an
+    // in-flight permit for large files.
+    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    let mut to_parse: Vec<ParseCandidate> = Vec::new();
+
+    for outcome in outcomes {
+        match outcome {
+            AdmissionOutcome::Skip(sf) => skipped_files.push(sf),
+            AdmissionOutcome::Parse(candidate) => to_parse.push(candidate),
+        }
+    }
+
+    info!(
+        "admission gate: {} to parse, {} skipped",
+        to_parse.len(),
+        skipped_files.len()
+    );
+
+    // Parse all admitted files in parallel via Rayon. Large files re-acquire an
+    // in-flight permit (scoped to THIS closure, so it can never deadlock the
+    // stage) for the duration of the parse, bounding the concurrent parse memory
+    // the same way the read stage bounds the concurrent read memory. Small files
+    // parse with full parallelism.
+    let mut parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
+        to_parse
+            .into_par_iter()
+            .map(|candidate| {
+                let ParseCandidate {
+                    relative_path,
+                    language,
+                    classification,
+                    bytes,
+                    mtime_secs,
+                    file_size,
+                } = candidate;
+                // Permit held for read+parse residency of this large file; released
+                // when this closure returns. `_permit` is None for small files
+                // (unbounded parallelism).
+                let _permit = (file_size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES)
+                    .then(|| inflight_budget.acquire(file_size));
+                let result = parsing::process_file_with_classification(
+                    &relative_path,
+                    &bytes,
+                    language,
+                    classification,
+                );
+                let indexed = IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
+                (relative_path, indexed)
+            })
+            .collect()
+    });
+
+    // Sort by path for deterministic circuit-breaker evaluation order.
+    parse_results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Build the file map sequentially, running circuit breaker checks.
+    let cb_state = CircuitBreakerState::from_env();
+    let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::with_capacity(parse_results.len());
+
+    let mut cb_tripped = false;
+    for (path, indexed_file) in parse_results {
+        match &indexed_file.parse_status {
+            ParseStatus::Failed { error } => {
+                cb_state.record_failure(&path, error);
+            }
+            _ => {
+                cb_state.record_success();
+            }
+        }
+
+        if cb_state.should_abort() {
+            let summary = cb_state.summary();
+            error!("{}", summary);
+            cb_tripped = true;
+            // Still insert the file before breaking.
+            files.insert(path, Arc::new(indexed_file));
+            break;
+        }
+
+        files.insert(path, Arc::new(indexed_file));
+    }
+
+    if cb_tripped {
+        cb_state.tripped.store(true, Ordering::Relaxed);
+    }
+
+    AdmitParseResult {
+        files,
+        skipped_files,
+        cb_state,
+    }
+}
+
 impl LiveIndex {
     /// Load all source files under `root` into memory in parallel (Rayon), parse them,
     /// and return a `SharedIndex`.
@@ -1325,293 +1750,17 @@ impl LiveIndex {
         // alone is sufficient here.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
-        // 2. Run admission gate in parallel.
-        //    For files that pass Tier-1 initially (size/extension checks), we read content
-        //    and re-run the binary sniff before committing to parse.
-        //    Files that are non-Normal skip reading entirely.
-        use crate::discovery::classify_admission;
-        use crate::domain::index::{AdmissionTier, SkippedFile};
-
-        // An admitted file plus everything needed to parse it. Defined as a named
-        // struct (rather than a wide tuple) to keep the `to_parse` collection
-        // type simple and self-documenting.
-        struct ParseCandidate {
-            relative_path: String,
-            language: crate::domain::LanguageId,
-            classification: crate::domain::FileClassification,
-            bytes: Vec<u8>,
-            mtime_secs: u64,
-            /// Original on-disk size, used in the parse stage to re-acquire an
-            /// in-flight permit for large files (bounding concurrent parse
-            /// memory). Permits are NOT carried across the read→parse stage
-            /// boundary: doing so would deadlock the admission `par_iter`, whose
-            /// permits would only free in the later parse stage. Each stage
-            /// acquires and releases within its own closure instead.
-            file_size: u64,
-        }
-
-        enum AdmissionOutcome {
-            Parse(ParseCandidate),
-            Skip(SkippedFile),
-        }
-
-        // Peak-memory governor: bounds the bytes resident across all concurrent
-        // full-file reads/parses so a tree of many large recognized-source files
-        // (each under the per-file hard-skip, cumulatively under the cap) cannot
-        // drive peak RSS to `num_threads * file_size`. Coverage is unchanged —
-        // every file is still read and classified; only concurrency of the large
-        // reads is bounded. `read_under_budget` returns the same bytes a bare
-        // `std::fs::read` would, just admission-throttled for big files.
-        let inflight_budget = Arc::new(InflightByteBudget::from_env());
-        // Read a file, acquiring an in-flight permit FIRST for files above the
-        // governor threshold. The returned permit (if any) must be held for as
-        // long as the returned bytes are alive, so peak resident bytes across all
-        // workers stay within the budget. Returns `(bytes, permit)`.
-        let read_under_budget =
-            |path: &Path, size: u64| -> std::io::Result<(Vec<u8>, Option<InflightPermit>)> {
-                if size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES {
-                    // Acquire BEFORE reading so the large allocation never races
-                    // ahead of the budget.
-                    let permit = inflight_budget.acquire(size);
-                    let bytes = std::fs::read(path)?;
-                    Ok((bytes, Some(permit)))
-                } else {
-                    let bytes = std::fs::read(path)?;
-                    Ok((bytes, None))
-                }
-            };
-
-        let outcomes: Vec<AdmissionOutcome> = indexing_thread_pool().install(|| {
-            all_entries
-                .par_iter()
-                .filter_map(|entry| {
-                    // Phase 1: size + extension check (no I/O beyond what the walk gave us).
-                    let decision_pre = classify_admission(
-                        &entry.absolute_path,
-                        entry.file_size,
-                        None, // no content yet
-                    );
-
-                    match decision_pre.tier {
-                        AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
-                            // No need to read content — already decided.
-                            let sf = SkippedFile {
-                                path: entry.relative_path.clone(),
-                                size: entry.file_size,
-                                extension: entry
-                                    .absolute_path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.to_string()),
-                                decision: decision_pre,
-                            };
-                            return Some(AdmissionOutcome::Skip(sf));
-                        }
-                        AdmissionTier::Normal => {}
-                    }
-
-                    // Phase 2: we tentatively have Tier-1. If the file has no recognized
-                    // language, we cannot parse it — skip it as metadata-only.
-                    let language = match &entry.language {
-                        Some(lang) => lang.clone(),
-                        None => {
-                            // Unknown extension, not on denylist, under size limit.
-                            // Read content to do binary sniff, then store as skipped.
-                            // `_permit` stays alive until the end of this block so the
-                            // read bytes are accounted against the in-flight budget.
-                            let (bytes, _permit) =
-                                match read_under_budget(&entry.absolute_path, entry.file_size) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                                        return None;
-                                    }
-                                };
-                            let decision_post = classify_admission(
-                                &entry.absolute_path,
-                                entry.file_size,
-                                Some(&bytes),
-                            );
-                            let sf = SkippedFile {
-                                path: entry.relative_path.clone(),
-                                size: entry.file_size,
-                                extension: entry
-                                    .absolute_path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.to_string()),
-                                decision: decision_post,
-                            };
-                            return Some(AdmissionOutcome::Skip(sf));
-                        }
-                    };
-
-                    // Phase 3: read content and do binary sniff before passing to parser.
-                    // `_permit` bounds the concurrent READ footprint and is released
-                    // at the end of this closure — it deliberately does NOT cross into
-                    // the parse stage (that would deadlock this `par_iter`). The parse
-                    // stage re-acquires its own permit from `file_size`.
-                    let (bytes, _permit) =
-                        match read_under_budget(&entry.absolute_path, entry.file_size) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                                return None;
-                            }
-                        };
-                    let mtime_secs = std::fs::metadata(&entry.absolute_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-
-                    let decision_post =
-                        classify_admission(&entry.absolute_path, entry.file_size, Some(&bytes));
-
-                    match decision_post.tier {
-                        AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
-                            // Binary sniff reclassified this file — do NOT parse.
-                            // Drop the bytes now; `_permit` releases at closure end.
-                            drop(bytes);
-                            let sf = SkippedFile {
-                                path: entry.relative_path.clone(),
-                                size: entry.file_size,
-                                extension: entry
-                                    .absolute_path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.to_string()),
-                                decision: decision_post,
-                            };
-                            Some(AdmissionOutcome::Skip(sf))
-                        }
-                        AdmissionTier::Normal => {
-                            // SF-009 opt-in demotion: if the exclude-untracked
-                            // policy is active and this recognized-extension file
-                            // is NOT git-tracked, demote it to Tier-2 instead of
-                            // parsing it. Default (`None`) skips this entirely.
-                            if let Some(tracked) = exclude_untracked_set.as_ref()
-                                && !tracked.contains(&entry.relative_path)
-                            {
-                                drop(bytes);
-                                let sf = SkippedFile {
-                                    path: entry.relative_path.clone(),
-                                    size: entry.file_size,
-                                    extension: entry
-                                        .absolute_path
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .map(|s| s.to_string()),
-                                    decision: crate::domain::index::AdmissionDecision::skip(
-                                        AdmissionTier::MetadataOnly,
-                                        crate::domain::index::SkipReason::Untracked,
-                                    ),
-                                };
-                                return Some(AdmissionOutcome::Skip(sf));
-                            }
-                            Some(AdmissionOutcome::Parse(ParseCandidate {
-                                relative_path: entry.relative_path.clone(),
-                                language,
-                                classification: entry.classification,
-                                bytes,
-                                mtime_secs,
-                                file_size: entry.file_size,
-                            }))
-                        }
-                    }
-                })
-                .collect()
-        });
-
-        // 3. Split outcomes into parse candidates and skipped files. Each
-        //    candidate carries its on-disk `file_size` so the parse stage can
-        //    re-acquire an in-flight permit for large files.
-        let mut skipped_files: Vec<SkippedFile> = Vec::new();
-        let mut to_parse: Vec<ParseCandidate> = Vec::new();
-
-        for outcome in outcomes {
-            match outcome {
-                AdmissionOutcome::Skip(sf) => skipped_files.push(sf),
-                AdmissionOutcome::Parse(candidate) => to_parse.push(candidate),
-            }
-        }
-
-        info!(
-            "admission gate: {} to parse, {} skipped",
-            to_parse.len(),
-            skipped_files.len()
-        );
-
-        // 4. Parse all admitted files in parallel via Rayon. Large files
-        //    re-acquire an in-flight permit (scoped to THIS closure, so it can
-        //    never deadlock the stage) for the duration of the parse, bounding
-        //    the concurrent parse memory the same way the read stage bounds the
-        //    concurrent read memory. Small files parse with full parallelism.
-        let mut parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
-            to_parse
-                .into_par_iter()
-                .map(|candidate| {
-                    let ParseCandidate {
-                        relative_path,
-                        language,
-                        classification,
-                        bytes,
-                        mtime_secs,
-                        file_size,
-                    } = candidate;
-                    // Permit held for read+parse residency of this large file;
-                    // released when this closure returns. `_permit` is None for
-                    // small files (unbounded parallelism).
-                    let _permit = (file_size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES)
-                        .then(|| inflight_budget.acquire(file_size));
-                    let result = parsing::process_file_with_classification(
-                        &relative_path,
-                        &bytes,
-                        language,
-                        classification,
-                    );
-                    let indexed =
-                        IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
-                    (relative_path, indexed)
-                })
-                .collect()
-        });
-
-        // 5. Sort by path for deterministic circuit-breaker evaluation order.
-        parse_results.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // 6. Build HashMap sequentially, running circuit breaker checks.
-        let cb_state = CircuitBreakerState::from_env();
-        let mut files: HashMap<String, Arc<IndexedFile>> =
-            HashMap::with_capacity(parse_results.len());
-
-        let mut cb_tripped = false;
-        for (path, indexed_file) in parse_results {
-            match &indexed_file.parse_status {
-                ParseStatus::Failed { error } => {
-                    cb_state.record_failure(&path, error);
-                }
-                _ => {
-                    cb_state.record_success();
-                }
-            }
-
-            if cb_state.should_abort() {
-                let summary = cb_state.summary();
-                error!("{}", summary);
-                cb_tripped = true;
-                // Still insert the file before breaking
-                files.insert(path, Arc::new(indexed_file));
-                break;
-            }
-
-            files.insert(path, Arc::new(indexed_file));
-        }
-
-        if cb_tripped {
-            cb_state.tripped.store(true, Ordering::Relaxed);
-        }
+        // 2. Run the shared admission + parse pipeline. This classifies every
+        //    discovered file into Tier 1/2/3, records Tier-2/3 files in
+        //    `skipped_files`, reads admitted files under the in-flight byte
+        //    governor, parses them in parallel, and applies the circuit breaker.
+        //    The exact same pipeline backs `build_reload_data` (the reload /
+        //    `index_folder` path), so both surfaces report identical tiering.
+        let AdmitParseResult {
+            files,
+            skipped_files,
+            cb_state,
+        } = admit_and_parse_entries(&all_entries, &exclude_untracked_set);
 
         let load_duration = start.elapsed();
         info!(
@@ -1717,6 +1866,44 @@ impl LiveIndex {
         self.skipped_files.push(sf);
     }
 
+    /// Demote a single file to Tier 2/3 (metadata-only or hard-skip).
+    ///
+    /// Used by the single-file (re)index choke point when admission classifies a
+    /// file as non-Tier-1. Performs the full transition atomically on this
+    /// `LiveIndex` clone:
+    /// 1. If the path is currently a fully-indexed Tier-1 file, remove it from
+    ///    `files` (and its derived indices). This handles a Tier 1 -> Tier 2
+    ///    transition, e.g. a source file that grew past the 1MB threshold.
+    /// 2. Upsert the `SkippedFile` record, replacing any stale record for the
+    ///    same path so `skipped_files` never accumulates duplicates or a stale
+    ///    tier/reason for one path.
+    ///
+    /// Mirrors the dedup invariant the bulk `load` path establishes (one record
+    /// per skipped path).
+    pub fn demote_to_skipped(&mut self, path: &str, sf: SkippedFile) {
+        // Drop the file from the fully-indexed store if it was Tier 1 before.
+        // `remove_file` is a no-op when the path is absent.
+        self.remove_file(path);
+        // Replace any existing skip record for this path, then insert the fresh
+        // one. Keeps exactly one record per path with the current tier/reason.
+        self.skipped_files.retain(|existing| existing.path != path);
+        self.skipped_files.push(sf);
+        self.is_empty = self.files.is_empty();
+        self.loaded_at_system = SystemTime::now();
+    }
+
+    /// Remove any Tier-2/3 skip record for `path`.
+    ///
+    /// Called when a previously-skipped file is admitted as Tier 1 again
+    /// (e.g. an oversized file shrank back under the threshold), so the file is
+    /// no longer double-counted as both indexed and skipped. No-op when no skip
+    /// record exists. Returns `true` when a record was removed.
+    pub fn clear_skipped(&mut self, path: &str) -> bool {
+        let before = self.skipped_files.len();
+        self.skipped_files.retain(|existing| existing.path != path);
+        self.skipped_files.len() != before
+    }
+
     pub fn skipped_files(&self) -> &[SkippedFile] {
         &self.skipped_files
     }
@@ -1754,98 +1941,45 @@ impl LiveIndex {
             );
         }
 
-        // 1. Discover all source files
-        let discovered = discovery::discover_files(root)?;
-        info!("discovered {} source files", discovered.len());
+        // 1. Discover ALL files (not just known-language ones), exactly as
+        //    `LiveIndex::load` does, so the admission gate can classify every
+        //    file — including denylisted/binary/oversized ones — and record them
+        //    as Tier-2/3 skips instead of invisibly dropping them. This also
+        //    enables the cumulative-byte discovery ceiling that `discover_files`
+        //    does not enforce. (Previously reload used `discover_files`, which
+        //    hard-filters on extension and therefore never saw Tier-2/3 files,
+        //    leaving health tier counts structurally N/0/0 after any reload.)
+        let all_entries = discovery::discover_all_files(root)?;
+        info!(
+            "discovered {} total files (pre-admission)",
+            all_entries.len()
+        );
 
         // SF-009 opt-in: compute the git-tracked set so untracked
         // recognized-extension files can be demoted out of Tier-1 below.
         // `None` (default + fail-open for non-git trees) means "keep
-        // everything", so admission defaults are unchanged. This is the watcher
-        // incremental path (`discover_files`, which hard-filters on extension
-        // before tiering); it records no Tier-2 metadata, so a demoted file is
-        // simply not parsed here. The `untracked_indexed` health count derives
-        // from `self.files`, so excluded files correctly drop out of the count
-        // on both discovery paths.
+        // everything", so admission defaults are unchanged. With the unified
+        // pipeline a demoted file is now recorded as a Tier-2 skip (it was
+        // silently dropped before), so the `untracked_indexed` health count and
+        // the `skipped_files` registry agree across both discovery paths.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
-        // 2. Parse all files in parallel via Rayon
-        let parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
-            discovered
-                .par_iter()
-                .filter_map(|df| {
-                    // SF-009 opt-in: skip parsing untracked recognized-extension
-                    // files when the exclude-untracked policy is active. `None`
-                    // (default) keeps every file.
-                    if let Some(tracked) = exclude_untracked_set.as_ref()
-                        && !tracked.contains(&df.relative_path)
-                    {
-                        return None;
-                    }
-                    let bytes = match std::fs::read(&df.absolute_path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!("failed to read {:?}: {}", df.absolute_path, e);
-                            return None;
-                        }
-                    };
-
-                    let mtime_secs = std::fs::metadata(&df.absolute_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-
-                    let result = parsing::process_file_with_classification(
-                        &df.relative_path,
-                        &bytes,
-                        df.language.clone(),
-                        df.classification,
-                    );
-                    let indexed =
-                        IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
-                    Some((df.relative_path.clone(), indexed))
-                })
-                .collect()
-        });
-
-        // 3. Build new file map with fresh circuit breaker
-        let new_cb = CircuitBreakerState::from_env();
-        let mut new_files: HashMap<String, Arc<IndexedFile>> =
-            HashMap::with_capacity(parse_results.len());
-
-        let mut cb_tripped = false;
-        for (path, indexed_file) in parse_results {
-            match &indexed_file.parse_status {
-                ParseStatus::Failed { error } => {
-                    new_cb.record_failure(&path, error);
-                }
-                _ => {
-                    new_cb.record_success();
-                }
-            }
-
-            if new_cb.should_abort() {
-                let summary = new_cb.summary();
-                error!("{}", summary);
-                cb_tripped = true;
-                new_files.insert(path, Arc::new(indexed_file));
-                break;
-            }
-
-            new_files.insert(path, Arc::new(indexed_file));
-        }
-
-        if cb_tripped {
-            new_cb.tripped.store(true, Ordering::Relaxed);
-        }
+        // 2. Run the shared admission + parse pipeline (identical to the one
+        //    `LiveIndex::load` uses). This reads admitted files under the
+        //    in-flight byte governor, parses in parallel, applies the circuit
+        //    breaker, and records every Tier-2/3 file in `skipped_files`.
+        let AdmitParseResult {
+            files: new_files,
+            skipped_files,
+            cb_state: new_cb,
+        } = admit_and_parse_entries(&all_entries, &exclude_untracked_set);
 
         let load_duration = start.elapsed();
         info!(
-            "LiveIndex::build_reload_data done: {} files, {} symbols, {:?}",
+            "LiveIndex::build_reload_data done: {} files, {} symbols, {} skipped, {:?}",
             new_files.len(),
             new_files.values().map(|f| f.symbols.len()).sum::<usize>(),
+            skipped_files.len(),
             load_duration
         );
 
@@ -1858,9 +1992,11 @@ impl LiveIndex {
             load_duration,
             gitignore: discovery::load_gitignore(root),
             derived,
-            // NOTE: reload does not track skipped files; health tier counts
-            // will show 0 for Tier 2/3 after reload.
-            skipped_files: Vec::new(),
+            // Reload now records Tier-2/3 files just like `LiveIndex::load`, so
+            // health tier counts are correct after a reload / `index_folder`.
+            // `apply_reload_data` REPLACES `self.skipped_files` (not append), so
+            // stale skips from a prior generation never accumulate.
+            skipped_files,
             coupling_store: super::coupling::init_coupling_store(root),
             // Record the normalized root so the reloaded index advertises which
             // project it now serves (root-mismatch invalidation).
@@ -2348,6 +2484,120 @@ mod tests {
             fs::create_dir_all(p).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    // ── Reload path admission tiering (index_folder) ──────────────────────
+    //
+    // Regression tests for the unified admission pipeline: `build_reload_data`
+    // (the reload / `index_folder` path) must run the SAME admission gate as
+    // `LiveIndex::load`, so Tier-2/3 files are recorded in `skipped_files` and
+    // `tier_counts()` is correct after a reload — not the old structural
+    // `N/0/0`.
+    mod reload_admission_tiering {
+        use super::*;
+        use crate::domain::index::SkipReason;
+
+        /// Build a fresh in-memory index by running the reload pipeline over
+        /// `root`, mirroring exactly what `SharedIndexHandle::reload` does
+        /// (`build_reload_data` then `apply_reload_data`).
+        fn reload_index(root: &Path) -> LiveIndex {
+            let data = LiveIndex::build_reload_data(root).expect("reload should succeed");
+            let mut index = LiveIndex::empty_live_index();
+            index.apply_reload_data(data);
+            index
+        }
+
+        #[test]
+        fn reload_demotes_lockfile_to_tier2_with_dependency_lockfile_reason() {
+            let tmp = TempDir::new().unwrap();
+            // One normal source file (Tier 1) and one dependency lockfile that
+            // must be demoted to Tier 2 metadata-only.
+            write_file(tmp.path(), "src/main.rs", "fn main() {}\n");
+            write_file(
+                tmp.path(),
+                "package-lock.json",
+                "{ \"name\": \"x\", \"lockfileVersion\": 3, \"packages\": {} }\n",
+            );
+
+            let index = reload_index(tmp.path());
+
+            // The lockfile must NOT be a Tier-1 indexed file.
+            assert!(
+                !index.files.contains_key("package-lock.json"),
+                "lockfile must not be parsed/indexed on reload; files = {:?}",
+                index.files.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                index.files.contains_key("src/main.rs"),
+                "normal source must still be indexed on reload"
+            );
+
+            // It MUST appear in skipped_files with the lockfile skip reason.
+            let lockfile_skip = index
+                .skipped_files()
+                .iter()
+                .find(|sf| sf.path.replace('\\', "/") == "package-lock.json")
+                .expect("lockfile must be recorded in skipped_files on reload");
+            assert_eq!(
+                lockfile_skip.tier(),
+                AdmissionTier::MetadataOnly,
+                "lockfile must be Tier-2 metadata-only"
+            );
+            assert_eq!(
+                lockfile_skip.reason(),
+                Some(SkipReason::DependencyLockfile),
+                "lockfile skip reason must be DependencyLockfile"
+            );
+
+            // tier_counts() must report (1 indexed, 1 metadata-only, 0 hard-skip).
+            assert_eq!(
+                index.tier_counts(),
+                (1, 1, 0),
+                "reload tier counts must be (tier1=1, tier2=1, tier3=0)"
+            );
+        }
+
+        #[test]
+        fn reload_demotes_oversized_text_file_to_tier2_size_threshold() {
+            let tmp = TempDir::new().unwrap();
+            // A normal source file (Tier 1) plus a >1MB text file. The big file
+            // has a recognized extension (.json), so this proves general
+            // size-based admission — not just the lockfile special case — now
+            // works on the reload path.
+            write_file(tmp.path(), "src/lib.rs", "pub fn helper() -> i32 { 42 }\n");
+            // METADATA_ONLY_BYTES is 1 MiB; 1.5 MiB clears it comfortably.
+            let big = "x".repeat(1_500_000);
+            write_file(tmp.path(), "data/big.json", &big);
+
+            let index = reload_index(tmp.path());
+
+            assert!(
+                !index.files.contains_key("data/big.json"),
+                "oversized file must not be parsed/indexed on reload"
+            );
+            assert!(
+                index.files.contains_key("src/lib.rs"),
+                "normal source must still be indexed on reload"
+            );
+
+            let big_skip = index
+                .skipped_files()
+                .iter()
+                .find(|sf| sf.path.replace('\\', "/") == "data/big.json")
+                .expect("oversized file must be recorded in skipped_files on reload");
+            assert_eq!(big_skip.tier(), AdmissionTier::MetadataOnly);
+            assert_eq!(
+                big_skip.reason(),
+                Some(SkipReason::SizeThreshold),
+                "oversized file skip reason must be SizeThreshold"
+            );
+
+            assert_eq!(
+                index.tier_counts(),
+                (1, 1, 0),
+                "reload tier counts must be (tier1=1, tier2=1, tier3=0)"
+            );
+        }
     }
 
     #[test]

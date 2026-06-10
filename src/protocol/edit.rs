@@ -2092,6 +2092,9 @@ pub(crate) fn execute_batch_rename(
 
     // Dry run: return preview without writing, with separate confident/uncertain sections.
     if input.dry_run.unwrap_or(false) {
+        // Cap per-site preview lines per file to keep output bounded on hub
+        // files renamed across many sites.
+        const MAX_PREVIEW_SITES_PER_FILE: usize = 10;
         let total_confident: usize = by_file.values().map(|r| r.len()).sum();
         let mut lines = vec![format!("Dry run: `{}` → `{}`", input.name, input.new_name,)];
         lines.push(format!(
@@ -2103,6 +2106,32 @@ pub(crate) fn execute_batch_rename(
         sorted_files.sort_by_key(|(p, _)| (*p).clone());
         for (path, ranges) in sorted_files {
             lines.push(format!("  {} ({} site(s))", path, ranges.len()));
+            // Per-site detail: render `L<line>: <trimmed source line>` for each
+            // confident site, ascending by byte offset (ranges are stored
+            // descending). Best-effort: skip detail if the file content is
+            // unavailable in the index.
+            let file = {
+                let guard = index.read();
+                guard.capture_shared_file(path)
+            };
+            if let Some(file) = file {
+                let content = String::from_utf8_lossy(&file.content);
+                let mut ascending: Vec<(u32, u32)> = ranges.clone();
+                ascending.sort_by_key(|(start, _)| *start);
+                for (start, _end) in ascending.iter().take(MAX_PREVIEW_SITES_PER_FILE) {
+                    let line_no = content[..(*start as usize).min(content.len())]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count()
+                        + 1;
+                    let src_line = content.lines().nth(line_no - 1).unwrap_or("").trim();
+                    lines.push(format!("    L{line_no}: {src_line}"));
+                }
+                let overflow = ranges.len().saturating_sub(MAX_PREVIEW_SITES_PER_FILE);
+                if overflow > 0 {
+                    lines.push(format!("    … and {overflow} more"));
+                }
+            }
         }
         if !uncertain_lines.is_empty() {
             lines.push(format!(
@@ -4315,6 +4344,61 @@ mod tests {
                 .unwrap()
                 .contains("old"),
             "index should remain original for c.rs"
+        );
+    }
+
+    #[test]
+    fn test_batch_rename_dry_run_shows_per_site_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Definition plus a same-file use site so the preview shows two lines.
+        let content = b"struct OldName;\nfn use_it(x: OldName) {}\n";
+        std::fs::write(src.join("a.rs"), content).unwrap();
+
+        let handle = crate::live_index::LiveIndex::empty();
+        let result = crate::parsing::process_file("src/a.rs", content, LanguageId::Rust);
+        let indexed = IndexedFile::from_parse_result(result, content.to_vec());
+        handle.update_file("src/a.rs".to_string(), indexed);
+
+        let input = crate::protocol::edit::BatchRenameInput {
+            path: "src/a.rs".to_string(),
+            name: "OldName".to_string(),
+            new_name: "NewName".to_string(),
+            kind: None,
+            symbol_line: None,
+            dry_run: Some(true),
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+
+        let out = execute_batch_rename(&handle, dir.path(), &input).unwrap();
+
+        assert!(
+            out.contains("Confident matches (will be applied)"),
+            "dry run should keep the confident-matches header; got: {out}"
+        );
+        assert!(
+            out.contains("src/a.rs ("),
+            "dry run should list the file; got: {out}"
+        );
+        // Per-site detail lines, ascending by line number.
+        assert!(
+            out.contains("    L1: struct OldName;"),
+            "dry run should show the definition site with its source line; got: {out}"
+        );
+        assert!(
+            out.contains("    L2: fn use_it(x: OldName) {}"),
+            "dry run should show the use site with its source line; got: {out}"
+        );
+
+        // Nothing was written.
+        let on_disk = std::fs::read_to_string(src.join("a.rs")).unwrap();
+        assert!(
+            !on_disk.contains("NewName"),
+            "dry run must not write to disk; got: {on_disk}"
         );
     }
 

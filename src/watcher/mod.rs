@@ -11,6 +11,8 @@ use notify_debouncer_full::{
 };
 use tracing::{debug, error, trace, warn};
 
+use crate::discovery::classify_admission;
+use crate::domain::index::{AdmissionTier, SkippedFile};
 use crate::domain::{FileClassification, LanguageId};
 use crate::live_index::store::{IndexedFile, SharedIndex};
 use crate::{hash, parsing};
@@ -107,6 +109,10 @@ pub(crate) enum ReindexResult {
     HashSkip,
     /// File was re-parsed and the index was updated.
     Reindexed,
+    /// File classified as Tier 2/3 by the admission gate — NOT parsed/inserted.
+    /// Any prior Tier-1 entry was removed and a skip record recorded. The index
+    /// remains free of this path's symbols.
+    Skipped,
     /// ENOENT observed by `read_and_index`; caller decides whether to retry or treat as confirmed-absent.
     NotFound,
     /// File was not found (ENOENT) — it has been removed from the index.
@@ -237,16 +243,21 @@ fn read_and_index(
     //    content we actually parsed, so a future watcher event will correctly
     //    detect staleness. The reverse order (read then stat) can record a
     //    newer mtime paired with older content, permanently hiding the change.
-    let mtime_secs = match std::fs::metadata(abs_path) {
-        Ok(metadata) => metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+    let metadata = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReindexResult::NotFound,
-        Err(_) => 0,
+        Err(e) => {
+            warn!("watcher: failed to stat {relative_path}: {e}");
+            return ReindexResult::ReadError(e.to_string());
+        }
     };
+    let file_size = metadata.len();
+    let mtime_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let bytes = match std::fs::read(abs_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReindexResult::NotFound,
@@ -278,7 +289,40 @@ fn read_and_index(
         // read lock dropped here
     }
 
-    // 3. Parse outside the lock
+    // 3. Admission gate — the single choke point for ALL single-file (re)index
+    //    paths (watcher FS events and freshen-on-read both reach here). A file
+    //    that classifies as Tier 2/3 must NOT be parsed or inserted, even if it
+    //    was previously Tier 1 (e.g. a source file that grew past 1MB). We
+    //    already have the on-disk size and content in hand, so run the full
+    //    Phase-1 + content-sniff classification in one call.
+    let decision = classify_admission(abs_path, file_size, Some(&bytes));
+    match decision.tier {
+        AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
+            // Do NOT parse or insert. Demote atomically: drop any prior Tier-1
+            // entry and upsert the skip record (dedup by path). Drop the bytes
+            // now — they are never parsed.
+            let extension = abs_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_string());
+            drop(bytes);
+            let sf = SkippedFile {
+                path: relative_path.to_string(),
+                size: file_size,
+                extension,
+                decision,
+            };
+            if shared.demote_to_skipped_at_generation(relative_path, sf, expected_gen) {
+                debug!("watcher: admission-skip {relative_path} (Tier 2/3)");
+            } else {
+                trace!("watcher: admission-skip stale generation rejected: {relative_path}");
+            }
+            return ReindexResult::Skipped;
+        }
+        AdmissionTier::Normal => {}
+    }
+
+    // 4. Parse outside the lock (Tier-1 only).
     let result = parsing::process_file_with_classification(
         relative_path,
         &bytes,
@@ -287,8 +331,14 @@ fn read_and_index(
     );
     let indexed = IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
 
-    // 4. Acquire write lock and update
+    // 5. Acquire write lock and update.
     shared.update_file_at_generation(relative_path, indexed, expected_gen);
+
+    // 6. Clear any stale Tier-2/3 skip record for this path: a file that was
+    //    previously demoted (e.g. oversized) can shrink back under the threshold
+    //    and become Tier 1 again. Without this, it would be double-counted as
+    //    both indexed and skipped. No-op (single cheap scan) in the common case.
+    shared.clear_skipped_at_generation(relative_path, expected_gen);
 
     debug!("watcher: re-indexed {relative_path}");
     ReindexResult::Reindexed
@@ -354,6 +404,11 @@ pub(crate) fn freshen_file_if_stale(
         ReindexResult::HashSkip | ReindexResult::Reindexed | ReindexResult::ReadError(_) => {
             FreshenResult::StaleReindexed
         }
+        // Admission demoted the file to Tier 2/3: the index WAS reconciled
+        // (any prior Tier-1 entry removed, skip record recorded), so the file is
+        // no longer parsed/indexed. Report it as a refresh — the caller's stale
+        // state has been resolved — without claiming the file is still indexed.
+        ReindexResult::Skipped => FreshenResult::StaleReindexed,
         ReindexResult::NotFound | ReindexResult::Removed => FreshenResult::StaleRemoved,
     }
 }
@@ -565,8 +620,9 @@ pub(crate) fn process_events(
 /// Main watcher supervision loop. Spawned as a background tokio task by `main.rs`.
 ///
 /// Lifecycle:
-/// 1. Set state to Active
-/// 2. Loop: start_watcher → process events → restart on error with 1s backoff
+/// 1. Set state to Starting (watch not yet registered)
+/// 2. Loop: start_watcher → on Ok set Active → process events → restart on error
+///    with 1s backoff (state stays Starting while retrying)
 /// 3. After 3 consecutive failures: set state to Degraded and stop
 pub async fn run_watcher_with_stop(
     repo_root: PathBuf,
@@ -582,8 +638,12 @@ pub async fn run_watcher_with_stop(
     }
 
     {
+        // Mark Starting until the recursive filesystem watch is actually
+        // registered. The transition to Active happens only when start_watcher
+        // returns Ok (below) — registering the watch is the slow step on large
+        // trees, and reporting Active before it succeeds is misleading.
         let mut info = watcher_info.lock();
-        info.state = WatcherState::Active;
+        info.state = WatcherState::Starting;
     }
 
     let mut consecutive_failures: u32 = 0;
@@ -820,8 +880,13 @@ pub fn restart_watcher(
     prev: Option<WatcherTaskHandle>,
 ) -> WatcherTaskHandle {
     {
+        // A (re)start has been initiated: mark Starting (not Off) so health can
+        // distinguish "watcher is coming up" from "watcher is not running". The
+        // spawned task may wait up to 2s for the previous watcher to stop and
+        // then register a recursive filesystem watch, which is the slow part on
+        // large trees — health reads during that window should not report Off.
         let mut info = watcher_info.lock();
-        info.state = WatcherState::Off;
+        info.state = WatcherState::Starting;
     }
     let stop_token = Arc::new(AtomicBool::new(false));
     let stop_for_task = Arc::clone(&stop_token);
@@ -856,13 +921,62 @@ mod tests {
 
     #[test]
     fn test_watcher_state_variants() {
-        // All three variants exist and are distinct
+        // All four variants exist and are distinct.
         let active = WatcherState::Active;
+        let starting = WatcherState::Starting;
         let degraded = WatcherState::Degraded;
         let off = WatcherState::Off;
         assert_ne!(active, degraded);
         assert_ne!(active, off);
         assert_ne!(degraded, off);
+        assert_ne!(starting, active);
+        assert_ne!(starting, degraded);
+        assert_ne!(starting, off);
+    }
+
+    #[test]
+    fn test_restart_watcher_sets_starting_state() {
+        // restart_watcher must publish Starting synchronously when a (re)start
+        // is initiated — not Off — so a health probe during startup does not
+        // mistake "watcher coming up" for "watcher not running". We drive this
+        // on a current-thread runtime so the spawned supervision task cannot be
+        // polled before we read the state: the synchronous lock write in
+        // restart_watcher is the contract under test.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let shared = crate::live_index::store::LiveIndex::empty();
+        let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+        assert_eq!(
+            watcher_info.lock().state,
+            WatcherState::Off,
+            "precondition: default watcher state is Off"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let handle = restart_watcher(
+            tmp.path().to_path_buf(),
+            shared,
+            Arc::clone(&watcher_info),
+            None,
+        );
+
+        // The current-thread runtime has not been driven, so the spawned task
+        // is still pending: the only state write that has executed is the
+        // synchronous Starting transition inside restart_watcher.
+        assert_eq!(
+            watcher_info.lock().state,
+            WatcherState::Starting,
+            "restart_watcher should publish Starting synchronously, not Off"
+        );
+
+        // Tear down: signal stop and abort the pending task without driving the
+        // runtime to completion.
+        handle.stop_token.store(true, Ordering::Release);
+        handle.task.abort();
     }
 
     #[test]
@@ -1369,6 +1483,206 @@ mod tests {
         assert!(
             index.get_file("src/b.rs").is_some(),
             "B file should survive stale-generation reconcile"
+        );
+    }
+
+    // --- Admission tiering on single-file (re)index paths (SF: admission bypass) ---
+
+    /// The single-file reindex choke point must NOT re-admit a Tier-2 lockfile.
+    ///
+    /// Reproduces the bypass: after a bulk load demotes `package-lock.json` to
+    /// Tier 2, a watcher modify event (or freshen-on-read) used to call
+    /// `maybe_reindex` -> `read_and_index`, which re-parsed the lockfile and
+    /// inserted it as Tier 1 with full symbols. The admission gate now returns
+    /// `Skipped`: the file stays OUT of `files`, its skip record stays intact
+    /// (no duplicate), and tier counts are unchanged.
+    #[test]
+    fn test_maybe_reindex_admission_skips_lockfile() {
+        let tmp = TempDir::new().unwrap();
+        // A real source file (Tier 1) plus a dependency lockfile (Tier 2).
+        std::fs::write(tmp.path().join("main.rs"), b"fn main() {}").unwrap();
+        let lock_rel = "package-lock.json";
+        let lock_abs = tmp.path().join(lock_rel);
+        std::fs::write(&lock_abs, br#"{"name":"x","lockfileVersion":3}"#).unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+
+        // Baseline: lockfile demoted to Tier 2 by the bulk admission gate.
+        let (t1_before, t2_before, t3_before) = {
+            let idx = shared.read();
+            assert!(
+                idx.get_file(lock_rel).is_none(),
+                "lockfile must not be a Tier-1 file after bulk load"
+            );
+            assert_eq!(
+                idx.skipped_files()
+                    .iter()
+                    .filter(|sf| sf.path == lock_rel)
+                    .count(),
+                1,
+                "lockfile must have exactly one skip record after bulk load"
+            );
+            idx.tier_counts()
+        };
+        assert_eq!((t1_before, t2_before, t3_before), (1, 1, 0));
+
+        // Simulate the single-file freshen/watcher path: re-touch and reindex.
+        // `LanguageId::Json` is what the watcher resolves for `.json`, so this is
+        // exactly the call the real event/freshen path makes.
+        std::fs::write(&lock_abs, br#"{"name":"x","lockfileVersion":3,"extra":1}"#).unwrap();
+        let result = maybe_reindex(lock_rel, &lock_abs, &shared, LanguageId::Json, expected_gen);
+        assert_eq!(
+            result,
+            ReindexResult::Skipped,
+            "lockfile must be admission-skipped, not re-parsed into the index"
+        );
+
+        let idx = shared.read();
+        assert!(
+            idx.get_file(lock_rel).is_none(),
+            "lockfile must STILL be absent from Tier-1 files after the reindex attempt"
+        );
+        assert_eq!(
+            idx.skipped_files()
+                .iter()
+                .filter(|sf| sf.path == lock_rel)
+                .count(),
+            1,
+            "skip record must remain de-duplicated (exactly one) after re-skip"
+        );
+        let sf = idx
+            .skipped_files()
+            .iter()
+            .find(|sf| sf.path == lock_rel)
+            .expect("skip record must survive");
+        assert_eq!(sf.decision.tier, AdmissionTier::MetadataOnly);
+        assert_eq!(
+            sf.decision.reason,
+            Some(crate::domain::index::SkipReason::DependencyLockfile),
+            "lockfile skip reason must be preserved"
+        );
+        assert_eq!(
+            idx.tier_counts(),
+            (t1_before, t2_before, t3_before),
+            "tier counts must be unchanged by the admission-skipped reindex"
+        );
+    }
+
+    /// A file that was Tier 1 but grew past the 1MB threshold must be DEMOTED
+    /// (removed from `files`, recorded as Tier-2 SizeThreshold) by the freshen
+    /// path — not re-parsed and re-inserted.
+    #[test]
+    fn test_freshen_admission_demotes_grown_file() {
+        use crate::domain::index::{AdmissionTier, SkipReason};
+
+        let tmp = TempDir::new().unwrap();
+        let rel = "big.rs";
+        let abs = tmp.path().join(rel);
+        // Small valid Rust source -> Tier 1.
+        std::fs::write(&abs, b"fn small() {}\n").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        {
+            let idx = shared.read();
+            assert!(
+                idx.get_file(rel).is_some(),
+                "small source file must be Tier 1 after load"
+            );
+            assert_eq!(idx.tier_counts(), (1, 0, 0));
+        }
+
+        // Grow the file past the 1MB metadata-only threshold (still valid Rust),
+        // then bump mtime so the freshen path detects staleness.
+        let mut grown = b"fn big() {}\n".to_vec();
+        grown.resize(1_200_000, b' ');
+        std::fs::write(&abs, &grown).unwrap();
+        // Ensure the on-disk mtime differs from the indexed one so the freshen
+        // mtime comparison fires (writes within the same second can otherwise
+        // share an mtime). Backdate via std's `FileTimes` — no extra dep.
+        {
+            let f = std::fs::File::options().write(true).open(&abs).unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+            f.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+
+        let outcome = freshen_file_if_stale(rel, &abs, &shared, expected_gen);
+        assert!(
+            matches!(outcome, FreshenResult::StaleReindexed),
+            "freshen should report the stale file was reconciled"
+        );
+
+        let idx = shared.read();
+        assert!(
+            idx.get_file(rel).is_none(),
+            "grown file must be REMOVED from Tier-1 files (Tier 1 -> Tier 2 transition)"
+        );
+        let sf = idx
+            .skipped_files()
+            .iter()
+            .find(|sf| sf.path == rel)
+            .expect("grown file must have a Tier-2 skip record");
+        assert_eq!(sf.decision.tier, AdmissionTier::MetadataOnly);
+        assert_eq!(sf.decision.reason, Some(SkipReason::SizeThreshold));
+        assert_eq!(
+            idx.tier_counts(),
+            (0, 1, 0),
+            "tier counts must reflect the demotion: 0 Tier-1, 1 Tier-2"
+        );
+    }
+
+    /// A previously-skipped file (Tier 2 oversized) that shrinks back under the
+    /// threshold must be re-admitted as Tier 1 AND have its stale skip record
+    /// cleared, so it is never double-counted as both indexed and skipped.
+    #[test]
+    fn test_maybe_reindex_clears_stale_skip_on_shrink() {
+        let tmp = TempDir::new().unwrap();
+        let rel = "shrink.rs";
+        let abs = tmp.path().join(rel);
+        // Start oversized -> Tier 2 (SizeThreshold).
+        let mut big = b"fn shrink() {}\n".to_vec();
+        big.resize(1_200_000, b' ');
+        std::fs::write(&abs, &big).unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        {
+            let idx = shared.read();
+            assert!(
+                idx.get_file(rel).is_none(),
+                "oversized file must start Tier 2"
+            );
+            assert_eq!(idx.tier_counts(), (0, 1, 0));
+        }
+
+        // Shrink it back under the threshold.
+        std::fs::write(&abs, b"fn shrink() {}\n").unwrap();
+        let result = maybe_reindex(rel, &abs, &shared, LanguageId::Rust, expected_gen);
+        assert_eq!(
+            result,
+            ReindexResult::Reindexed,
+            "shrunk file must be re-admitted as Tier 1"
+        );
+
+        let idx = shared.read();
+        assert!(
+            idx.get_file(rel).is_some(),
+            "shrunk file must now be a Tier-1 indexed file"
+        );
+        assert_eq!(
+            idx.skipped_files()
+                .iter()
+                .filter(|sf| sf.path == rel)
+                .count(),
+            0,
+            "stale Tier-2 skip record must be cleared on Tier-1 re-admission"
+        );
+        assert_eq!(
+            idx.tier_counts(),
+            (1, 0, 0),
+            "no double-counting: 1 Tier-1, 0 Tier-2"
         );
     }
 }

@@ -408,7 +408,7 @@ fn test_search_text_no_match() {
     let result = search_text_result(&index, "xyz_totally_absent");
     assert_eq!(
         result,
-        "No matches for 'xyz_totally_absent'. Suggestions: try search_symbols(query=...) for symbol names, or use regex=true for pattern matching, or broaden with include_tests=true / include_generated=true."
+        "No matches for 'xyz_totally_absent'. Suggestions: try search_symbols(query=...) for symbol names, use regex=true for pattern matching, broaden with include_tests=true / include_generated=true."
     );
 }
 
@@ -423,6 +423,7 @@ fn test_search_text_result_view_matches_live_index_output() {
         None,
         None,
         None,
+        SearchSuggestionContext::default(),
     );
 
     assert_eq!(captured_result, live_result);
@@ -506,7 +507,8 @@ fn test_search_text_result_view_renders_context_windows_with_separators() {
         },
     );
 
-    let rendered = search_text_result_view(result, None, None, None);
+    let rendered =
+        search_text_result_view(result, None, None, None, SearchSuggestionContext::default());
 
     assert!(
         rendered.contains("src/lib.rs"),
@@ -567,6 +569,7 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
         Some("symbol"),
         None,
         None,
+        SearchSuggestionContext::default(),
     );
 
     assert!(
@@ -576,6 +579,83 @@ fn test_search_text_result_view_group_by_symbol_keeps_duplicate_names_separate()
     assert!(
         rendered.contains("fn connect (lines 4-5): 1 match"),
         "missing second symbol bucket: {rendered}"
+    );
+}
+
+// --- Item 5: context-aware zero-hit suggestions ---
+
+fn empty_text_search_result(
+    label: &str,
+) -> Result<search::TextSearchResult, search::TextSearchError> {
+    Ok(search::TextSearchResult {
+        label: label.to_string(),
+        total_matches: 0,
+        files: vec![],
+        suppressed_by_noise: 0,
+        overflow_count: 0,
+    })
+}
+
+#[test]
+fn test_search_text_zero_hit_drops_regex_suggestion_when_regex_already_set() {
+    let rendered = search_text_result_view(
+        empty_text_search_result("regex '.*foo'"),
+        None,
+        None,
+        None,
+        SearchSuggestionContext {
+            regex: true,
+            include_tests: false,
+        },
+    );
+    assert!(
+        !rendered.contains("use regex=true"),
+        "must not suggest regex=true when regex is already on; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("simplify the regex or use literal terms"),
+        "should suggest relaxing the regex instead; got: {rendered}"
+    );
+    // include_tests was off, so suggesting it is still valid.
+    assert!(
+        rendered.contains("include_tests=true"),
+        "should still suggest include_tests=true when tests are excluded; got: {rendered}"
+    );
+}
+
+#[test]
+fn test_search_text_zero_hit_keeps_regex_suggestion_when_not_regex() {
+    let rendered = search_text_result_view(
+        empty_text_search_result("'foo'"),
+        None,
+        None,
+        None,
+        SearchSuggestionContext {
+            regex: false,
+            include_tests: false,
+        },
+    );
+    assert!(
+        rendered.contains("use regex=true"),
+        "should suggest regex=true for a literal search; got: {rendered}"
+    );
+}
+
+#[test]
+fn test_search_text_zero_hit_drops_include_tests_when_already_included() {
+    let rendered = search_text_result_view(
+        empty_text_search_result("'foo'"),
+        None,
+        None,
+        None,
+        SearchSuggestionContext {
+            regex: false,
+            include_tests: true,
+        },
+    );
+    assert!(
+        !rendered.contains("include_tests=true"),
+        "must not suggest include_tests=true when tests already included; got: {rendered}"
     );
 }
 
@@ -723,6 +803,28 @@ fn test_health_report_shows_watcher_active() {
 }
 
 #[test]
+fn test_health_report_shows_watcher_starting() {
+    // A watcher mid-startup (recursive watch not yet registered) must render a
+    // distinct "starting" line, never "off", so an agent does not conclude the
+    // index will go stale while the watch is still registering.
+    use crate::watcher::{WatcherInfo, WatcherState};
+    let index = make_index(vec![]);
+    let watcher = WatcherInfo {
+        state: WatcherState::Starting,
+        ..WatcherInfo::default()
+    };
+    let result = health_report_with_watcher(&index, &watcher);
+    assert!(
+        result.contains("Watcher: starting (registering filesystem watch"),
+        "got: {result}"
+    );
+    assert!(
+        !result.contains("Watcher: off"),
+        "starting watcher must not render as off: {result}"
+    );
+}
+
+#[test]
 fn test_health_report_active_watcher_shows_last_change_when_events_exist() {
     use crate::watcher::{WatcherInfo, WatcherState};
 
@@ -804,6 +906,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 2,
         symbol_count: 12,
         loaded_at_system: SystemTime::now(),
@@ -815,6 +918,7 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![
             ("src/bad.rs".to_string(), "syntax error".to_string()),
             ("src/worse.rs".to_string(), "lexer panic".to_string()),
@@ -830,17 +934,19 @@ fn test_health_report_from_published_state_shows_failed_file_details() {
     };
 
     let report = health_report_from_published_state(&published, &watcher, 0);
+    // Both failed files fit in the quarantine registry, so the per-category
+    // "Failed files" section is deduped; the registry carries the detail.
     assert!(
-        report.contains("Failed files (2):"),
-        "published-state health should preserve failed file detail: {report}"
+        !report.contains("Failed files (not shown above)"),
+        "per-category failed section should be deduped when registry shows all: {report}"
     );
     assert!(
-        report.contains("src/bad.rs"),
-        "published-state health should list failed file paths: {report}"
+        report.contains("src/bad.rs [failed] - syntax error"),
+        "registry should list failed file path with reason: {report}"
     );
     assert!(
-        report.contains("syntax error"),
-        "published-state health should list failure reasons: {report}"
+        report.contains("src/worse.rs"),
+        "registry should list all failed file paths: {report}"
     );
 }
 
@@ -862,6 +968,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         unexpected_partial_parse_count: 2,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
@@ -879,6 +986,7 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
         ],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
@@ -891,9 +999,15 @@ fn test_health_report_from_published_state_shows_partial_parse_files() {
     };
 
     let report = health_report_from_published_state(&published, &watcher, 0);
+    // Both partials fit in the quarantine registry, so the per-category section
+    // is deduped away and the registry carries the detail.
     assert!(
-        report.contains("Unexpected repo-owned partial parse files (2):"),
-        "published-state health should preserve partial file detail: {report}"
+        report.contains("Parse/span quarantine registry:"),
+        "published-state health should render the quarantine registry: {report}"
+    );
+    assert!(
+        !report.contains("Unexpected repo-owned partial parse files"),
+        "the per-category section must be deduped when the registry shows all paths: {report}"
     );
     assert!(
         report.contains("src/partial_a.rs"),
@@ -918,6 +1032,7 @@ fn test_health_report_lists_partial_parse_files() {
         unexpected_partial_parse_count: 3,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -940,19 +1055,22 @@ fn test_health_report_lists_partial_parse_files() {
         ],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (3, 0, 0),
         local_empty_reason: None,
         untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
+    // All three partials fit in the registry; the per-category section is
+    // deduped away and the registry lists them.
     assert!(
-        report.contains("Unexpected repo-owned partial parse files (3):"),
-        "should contain header"
+        !report.contains("Unexpected repo-owned partial parse files"),
+        "per-category section should be deduped when registry shows all: {report}"
     );
-    assert!(report.contains("  1. src/a.rs"), "should list first file");
-    assert!(report.contains("  2. src/b.rs"), "should list second file");
-    assert!(report.contains("  3. src/c.rs"), "should list third file");
+    assert!(report.contains("1. src/a.rs"), "should list first file");
+    assert!(report.contains("2. src/b.rs"), "should list second file");
+    assert!(report.contains("3. src/c.rs"), "should list third file");
     assert!(
         !report.contains("... and"),
         "should not show overflow hint for 3 files"
@@ -976,6 +1094,7 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 2,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -996,6 +1115,7 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
             "vendor/tree-sitter-scss/src/tree_sitter/parser.h".to_string(),
         ],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
@@ -1007,15 +1127,17 @@ fn test_health_report_labels_expected_vendor_partial_parse_noise() {
         report.contains("Partial parse summary: 0 unexpected, 2 expected vendor"),
         "health should separate expected vendor noise from unexpected partials: {report}"
     );
+    // Both vendor partials fit in the registry, so the per-category vendor
+    // section is deduped away; the registry carries the vendor paths + reason.
     assert!(
-        report.contains("Expected vendor partial parse noise (2):"),
-        "health should label expected vendor partials: {report}"
+        !report.contains("Expected vendor partial parse noise"),
+        "per-category vendor section should be deduped when registry shows all: {report}"
     );
     assert!(
         report.contains(
-            "vendor/tree-sitter-scss/src/parser.c [expected vendor: tree-sitter-scss C/header parser limitation]"
+            "vendor/tree-sitter-scss/src/parser.c [expected_vendor_partial] - expected vendor: tree-sitter-scss C/header parser limitation"
         ),
-        "vendor parser.c should carry the expected/vendor reason: {report}"
+        "registry should carry vendor parser.c with its expected/vendor reason: {report}"
     );
     assert!(
         !report.contains("Unexpected repo-owned partial parse files"),
@@ -1036,6 +1158,7 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
         unexpected_partial_parse_count: 1,
         expected_vendor_partial_parse_count: 1,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -1055,6 +1178,7 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
             "vendor/tree-sitter-scss/src/tree_sitter/array.h".to_string(),
         ],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (2, 0, 0),
         local_empty_reason: None,
@@ -1066,17 +1190,24 @@ fn test_health_report_keeps_project_owned_partials_unexpected() {
         report.contains("Partial parse summary: 1 unexpected, 1 expected vendor"),
         "health should summarize mixed partial categories: {report}"
     );
+    // Both partials fit in the registry, so the per-category sections are
+    // deduped; the registry carries each path with its category label.
     assert!(
-        report.contains("Unexpected repo-owned partial parse files (1):"),
-        "project-owned partials should remain a visible failure signal: {report}"
+        !report.contains("Unexpected repo-owned partial parse files"),
+        "per-category unexpected section should be deduped when registry shows all: {report}"
     );
     assert!(
-        report.contains("  1. src/broken.rs"),
-        "project-owned partial path should be listed as unexpected: {report}"
+        !report.contains("Expected vendor partial parse noise"),
+        "per-category vendor section should be deduped when registry shows all: {report}"
     );
     assert!(
-        report.contains("Expected vendor partial parse noise (1):"),
-        "expected vendor partial should be listed separately: {report}"
+        report.contains("src/broken.rs [unexpected_partial]"),
+        "registry should list the project-owned partial as unexpected: {report}"
+    );
+    assert!(
+        report
+            .contains("vendor/tree-sitter-scss/src/tree_sitter/array.h [expected_vendor_partial]"),
+        "registry should list the expected vendor partial with its category: {report}"
     );
 }
 
@@ -1095,6 +1226,7 @@ fn test_health_report_caps_partial_list_at_10() {
         unexpected_partial_parse_count: 50,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(0),
         watcher_state: WatcherState::Off,
@@ -1109,21 +1241,99 @@ fn test_health_report_caps_partial_list_at_10() {
         unexpected_partial_parse_files: partial_parse_files,
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (50, 0, 0),
         local_empty_reason: None,
         untracked_indexed: 0,
     };
     let report = health_report_from_stats("Ready", &stats, 0);
+    // The registry shows the first 10 quarantined paths; the per-category
+    // overflow section lists only the 40 the registry omitted (deduped).
     assert!(
-        report.contains("Unexpected repo-owned partial parse files (50):"),
-        "should show count of 50"
+        report.contains("Parse/span quarantine registry:"),
+        "should render the registry: {report}"
     );
-    assert!(report.contains("  10."), "should list up to entry 10");
-    assert!(!report.contains("  11."), "should not list entry 11");
     assert!(
-        report.contains("... and 40 more unexpected partial files"),
-        "should show overflow hint for 40 remaining"
+        report.contains("Unexpected repo-owned partial parse files (not shown above) (40):"),
+        "overflow section should report the 40 paths not in the registry: {report}"
+    );
+    // The first 10 files appear in the registry but must NOT be repeated in the
+    // overflow section.
+    assert!(
+        report.contains("src/file11.rs"),
+        "overflow section should include the 11th file: {report}"
+    );
+    assert!(
+        report.contains("... and 30 more unexpected partial files"),
+        "overflow section shows its own first 10, then 30 more: {report}"
+    );
+}
+
+#[test]
+fn test_health_report_does_not_duplicate_quarantined_paths() {
+    // Item 6a: a path that fits in the quarantine registry must appear exactly
+    // once across the whole report (registry only), never re-listed by a
+    // per-category section.
+    use crate::watcher::WatcherState;
+    use std::time::Duration;
+
+    let stats = HealthStats {
+        file_count: 3,
+        symbol_count: 0,
+        parsed_count: 0,
+        partial_parse_count: 2,
+        unexpected_partial_parse_count: 1,
+        expected_vendor_partial_parse_count: 1,
+        expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
+        failed_count: 1,
+        load_duration: Duration::from_millis(0),
+        watcher_state: WatcherState::Off,
+        events_processed: 0,
+        last_event_at: None,
+        debounce_window_ms: 200,
+        overflow_count: 0,
+        last_overflow_at: None,
+        stale_files_found: 0,
+        last_reconcile_at: None,
+        partial_parse_files: vec![
+            "src/broken.rs".to_string(),
+            "vendor/scss/array.h".to_string(),
+        ],
+        unexpected_partial_parse_files: vec!["src/broken.rs".to_string()],
+        expected_vendor_partial_parse_files: vec!["vendor/scss/array.h".to_string()],
+        expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
+        failed_files: vec![("src/bad.rs".to_string(), "syntax error".to_string())],
+        tier_counts: (3, 0, 0),
+        local_empty_reason: None,
+        untracked_indexed: 0,
+    };
+    let report = health_report_from_stats("Ready", &stats, 0);
+
+    // Each quarantined path appears exactly once (registry only).
+    assert_eq!(
+        report.matches("src/broken.rs").count(),
+        1,
+        "unexpected partial path must not be duplicated: {report}"
+    );
+    assert_eq!(
+        report.matches("vendor/scss/array.h").count(),
+        1,
+        "vendor partial path must not be duplicated: {report}"
+    );
+    assert_eq!(
+        report.matches("src/bad.rs").count(),
+        1,
+        "failed file path must not be duplicated: {report}"
+    );
+    // No per-category sections at all (registry holds everything).
+    assert!(
+        !report.contains("Unexpected repo-owned partial parse files")
+            && !report.contains("Expected vendor partial parse noise")
+            && !report.contains("Failed files (not shown above)"),
+        "per-category sections must be suppressed when registry shows all: {report}"
     );
 }
 
@@ -1140,6 +1350,7 @@ fn test_health_report_shows_tier_breakdown() {
         unexpected_partial_parse_count: 15,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 5,
         load_duration: Duration::from_millis(120),
         watcher_state: WatcherState::Off,
@@ -1154,6 +1365,7 @@ fn test_health_report_shows_tier_breakdown() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (8200, 1280, 20),
         local_empty_reason: None,
@@ -1161,8 +1373,8 @@ fn test_health_report_shows_tier_breakdown() {
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
-        report.contains("Admission: 9500 files discovered"),
-        "should show total discovered count; got:\n{report}"
+        report.contains("Admission: 9500 files discovered (after gitignore/global excludes)"),
+        "should show total discovered count clarified as post-gitignore; got:\n{report}"
     );
     assert!(
         report.contains("Tier 1 (indexed): 8200"),
@@ -1191,6 +1403,7 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: Duration::from_millis(10),
         watcher_state: WatcherState::Active,
@@ -1205,6 +1418,7 @@ fn test_health_report_shows_reconciliation_and_overflow_stats() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (1, 0, 0),
         local_empty_reason: None,
@@ -1228,6 +1442,7 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::ZERO,
         watcher_state: crate::watcher::WatcherState::Off,
@@ -1242,6 +1457,7 @@ fn test_health_report_shows_empty_index_banner_with_reason() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (0, 0, 0),
         local_empty_reason: Some(
@@ -1287,6 +1503,7 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         load_duration: std::time::Duration::from_millis(500),
         watcher_state: crate::watcher::WatcherState::Active,
@@ -1301,6 +1518,7 @@ fn test_health_report_idle_watcher_shows_reconcile_repairs() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
@@ -1339,6 +1557,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         symbol_count: 1000,
         loaded_at_system: SystemTime::now(),
@@ -1350,6 +1569,7 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         tier_counts: (100, 0, 0),
         local_empty_reason: None,
@@ -1373,6 +1593,60 @@ fn test_health_compact_idle_watcher_shows_reconcile_repairs() {
     );
 }
 
+#[test]
+fn test_health_compact_watcher_starting() {
+    // The compact health line must also distinguish a starting watcher from an
+    // off one, mirroring the full health report.
+    use crate::live_index::store::{
+        IndexLoadSource, PublishedIndexState, PublishedIndexStatus, SnapshotVerifyState,
+    };
+    use crate::watcher::{WatcherInfo, WatcherState};
+    use std::time::{Duration, SystemTime};
+
+    let published = PublishedIndexState {
+        generation: 1,
+        status: PublishedIndexStatus::Ready,
+        degraded_summary: None,
+        file_count: 100,
+        parsed_count: 100,
+        partial_parse_count: 0,
+        unexpected_partial_parse_count: 0,
+        expected_vendor_partial_parse_count: 0,
+        expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
+        failed_count: 0,
+        symbol_count: 1000,
+        loaded_at_system: SystemTime::now(),
+        load_duration: Duration::from_millis(500),
+        load_source: IndexLoadSource::FreshLoad,
+        snapshot_verify_state: SnapshotVerifyState::NotNeeded,
+        is_empty: false,
+        partial_parse_files: vec![],
+        unexpected_partial_parse_files: vec![],
+        expected_vendor_partial_parse_files: vec![],
+        expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
+        failed_files: vec![],
+        tier_counts: (100, 0, 0),
+        local_empty_reason: None,
+        untracked_indexed: 0,
+        indexed_root: None,
+    };
+    let watcher = WatcherInfo {
+        state: WatcherState::Starting,
+        ..WatcherInfo::default()
+    };
+    let report = health_report_compact_from_published_state(&published, &watcher, 0);
+    assert!(
+        report.contains("Watcher: starting (registering filesystem watch)"),
+        "compact health must render starting watcher distinctly; got:\n{report}"
+    );
+    assert!(
+        !report.contains("Watcher: off"),
+        "compact starting watcher must not render as off; got:\n{report}"
+    );
+}
+
 mod health_report_consistency {
     use super::*;
     use crate::live_index::HealthStats;
@@ -1393,11 +1667,13 @@ mod health_report_consistency {
             unexpected_partial_parse_count: 0,
             expected_vendor_partial_parse_count: 0,
             expected_framework_partial_parse_count: 0,
+            expected_language_partial_parse_count: 0,
             failed_count: 0,
             partial_parse_files: vec![],
             unexpected_partial_parse_files: vec![],
             expected_vendor_partial_parse_files: vec![],
             expected_framework_partial_parse_files: vec![],
+            expected_language_partial_parse_files: vec![],
             failed_files: vec![],
             symbol_count: 1000,
             loaded_at_system: SystemTime::now(),
@@ -1422,6 +1698,7 @@ mod health_report_consistency {
             expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
             expected_framework_partial_parse_count: published
                 .expected_framework_partial_parse_count,
+            expected_language_partial_parse_count: published.expected_language_partial_parse_count,
             failed_count: published.failed_count,
             load_duration: published.load_duration,
             watcher_state: watcher.state.clone(),
@@ -1439,6 +1716,9 @@ mod health_report_consistency {
                 .clone(),
             expected_framework_partial_parse_files: published
                 .expected_framework_partial_parse_files
+                .clone(),
+            expected_language_partial_parse_files: published
+                .expected_language_partial_parse_files
                 .clone(),
             failed_files: published.failed_files.clone(),
             tier_counts: published.tier_counts,
@@ -1458,6 +1738,8 @@ mod health_report_consistency {
         let line = watcher_line(report);
         if line.contains("local-fallback") {
             "local-fallback"
+        } else if line.contains("starting") {
+            "starting"
         } else if line.contains("degraded") {
             "degraded"
         } else if line.contains("active/idle") || line.contains("active (idle; event-driven") {
@@ -1548,6 +1830,15 @@ mod health_report_consistency {
                 "degraded",
             ),
             (
+                "starting",
+                WatcherInfo {
+                    state: WatcherState::Starting,
+                    debounce_window_ms: 200,
+                    ..WatcherInfo::default()
+                },
+                "starting",
+            ),
+            (
                 "off",
                 WatcherInfo {
                     state: WatcherState::Off,
@@ -1610,11 +1901,13 @@ fn health_renders_rejected_stale_mutations_counter() {
         unexpected_partial_parse_count: 0,
         expected_vendor_partial_parse_count: 0,
         expected_framework_partial_parse_count: 0,
+        expected_language_partial_parse_count: 0,
         failed_count: 0,
         partial_parse_files: vec![],
         unexpected_partial_parse_files: vec![],
         expected_vendor_partial_parse_files: vec![],
         expected_framework_partial_parse_files: vec![],
+        expected_language_partial_parse_files: vec![],
         failed_files: vec![],
         symbol_count: 9,
         loaded_at_system: SystemTime::now(),
@@ -2692,6 +2985,69 @@ fn test_find_dependents_dot_shows_true_ref_count_not_capped() {
     assert!(
         result.contains("db"),
         "dot label should include symbol name 'db'. Got: {result}"
+    );
+}
+
+// ─── Item 1: compact dependents + bounded default detail ──────────────
+
+#[test]
+fn test_find_dependents_compact_view_shows_per_kind_counts() {
+    use crate::live_index::query::{DependentFileView, DependentLineView, FindDependentsView};
+    let mk = |kind: &str, line: u32| DependentLineView {
+        line_number: line,
+        line_content: format!("ref at {line}"),
+        kind: kind.to_string(),
+        name: "db".to_string(),
+    };
+    let view = FindDependentsView {
+        files: vec![DependentFileView {
+            file_path: "src/handler.rs".to_string(),
+            lines: vec![
+                mk("call", 1),
+                mk("call", 2),
+                mk("type_usage", 3),
+                mk("import", 4),
+            ],
+        }],
+    };
+    // max_per_file is intentionally small to prove the kind counts span ALL
+    // lines, not just the first max_per_file.
+    let limits = OutputLimits::new(20, 2);
+    let result = find_dependents_compact_view(&view, "src/db.rs", &limits);
+    assert!(
+        result.contains("src/handler.rs  (4 refs: 2 call, 1 import, 1 type_usage)"),
+        "compact view should render per-kind counts over all lines; got: {result}"
+    );
+}
+
+#[test]
+fn test_find_dependents_result_view_default_caps_detail_at_5() {
+    use crate::live_index::query::{DependentFileView, DependentLineView, FindDependentsView};
+    let lines: Vec<DependentLineView> = (1..=12)
+        .map(|i| DependentLineView {
+            line_number: i,
+            line_content: format!("use crate::db; // ref {i}"),
+            kind: "import".to_string(),
+            name: "db".to_string(),
+        })
+        .collect();
+    let view = FindDependentsView {
+        files: vec![DependentFileView {
+            file_path: "src/handler.rs".to_string(),
+            lines,
+        }],
+    };
+    // OutputLimits with max_per_file=5 mirrors the handler's new default.
+    let limits = OutputLimits::new(20, 5);
+    let result = find_dependents_result_view(&view, "src/db.rs", &limits);
+    let rendered_ref_lines = result.matches("[import]").count();
+    assert_eq!(
+        rendered_ref_lines, 5,
+        "default detail should cap rendered reference lines at 5; got: {result}"
+    );
+    assert!(
+        result.contains("... and 7 more references"),
+        "should show the remaining-reference tail; got: {result}"
     );
 }
 
@@ -4173,5 +4529,79 @@ fn test_sf003_health_excludes_import_type_array_from_unexpected_partials() {
             .any(|p| p == "broken.ts"),
         "a genuinely broken file must remain an unexpected partial, got: {:?}",
         stats.unexpected_partial_parse_files
+    );
+}
+
+// --- Item 4: inspect_match must not double the kind word ---
+
+#[test]
+fn test_symbol_kind_name_label_avoids_doubling_for_prefixed_names() {
+    // impl/trait symbols store a name that already carries the kind prefix.
+    assert_eq!(
+        symbol_kind_name_label("impl", "impl LanguageId"),
+        "impl LanguageId"
+    );
+    assert_eq!(
+        symbol_kind_name_label("struct", "struct BucketManager"),
+        "struct BucketManager"
+    );
+    // Plain function/struct names do NOT carry the prefix, so it is prepended.
+    assert_eq!(
+        symbol_kind_name_label("fn", "from_extension"),
+        "fn from_extension"
+    );
+    assert_eq!(
+        symbol_kind_name_label("struct", "BucketManager"),
+        "struct BucketManager"
+    );
+    // A name that merely starts with the kind token as a substring (no space
+    // boundary) is NOT treated as already-prefixed.
+    assert_eq!(symbol_kind_name_label("fn", "fnord"), "fn fnord");
+    // Empty kind label yields the bare name.
+    assert_eq!(symbol_kind_name_label("", "anything"), "anything");
+}
+
+#[test]
+fn test_inspect_match_scope_and_enclosing_do_not_double_kind() {
+    use crate::live_index::query::{EnclosingSymbolView, InspectMatchFoundView, InspectMatchView};
+
+    let view = InspectMatchView::Found(InspectMatchFoundView {
+        path: "src/domain/index.rs".to_string(),
+        line: 400,
+        excerpt: "400: let prefix = match self {".to_string(),
+        enclosing: Some(EnclosingSymbolView {
+            name: "from_extension".to_string(),
+            kind_label: "fn".to_string(),
+            line_range: (395, 410),
+        }),
+        // Outer impl block whose stored name already carries the "impl" prefix.
+        parent_chain: vec![
+            EnclosingSymbolView {
+                name: "impl LanguageId".to_string(),
+                kind_label: "impl".to_string(),
+                line_range: (390, 420),
+            },
+            EnclosingSymbolView {
+                name: "from_extension".to_string(),
+                kind_label: "fn".to_string(),
+                line_range: (395, 410),
+            },
+        ],
+        siblings: vec![],
+        siblings_overflow: 0,
+    });
+
+    let result = inspect_match_result_view(&view);
+    assert!(
+        result.contains("Scope: impl LanguageId → fn from_extension"),
+        "scope chain must not double the kind word; got: {result}"
+    );
+    assert!(
+        !result.contains("impl impl LanguageId"),
+        "kind word must not be doubled; got: {result}"
+    );
+    assert!(
+        result.contains("Enclosing symbol: fn from_extension"),
+        "enclosing line should carry the kind exactly once; got: {result}"
     );
 }

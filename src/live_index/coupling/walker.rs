@@ -305,7 +305,8 @@ fn compute_window(
                 let Ok(content) = std::str::from_utf8(blob.content()) else {
                     continue;
                 };
-                for (name, kind) in resolve_symbol_names(content, &lang, &fh.hunks) {
+                let is_tsx = crate::domain::LanguageId::is_tsx_path(&fh.path);
+                for (name, kind) in resolve_symbol_names(content, &lang, is_tsx, &fh.hunks) {
                     symbol_anchors.push(
                         AnchorKey::symbol(&fh.path, &name, kind)
                             .as_str()
@@ -478,10 +479,11 @@ fn language_supports_parsing(lang: &crate::domain::LanguageId) -> bool {
 fn resolve_symbol_names(
     source: &str,
     language: &crate::domain::LanguageId,
+    is_tsx: bool,
     hunks: &[(u32, u32, u32, u32)],
 ) -> Vec<(String, &'static str)> {
     let (symbols, _has_error, _diag, _refs, _alias) =
-        match crate::parsing::parse_source(source, language) {
+        match crate::parsing::parse_source(source, language, is_tsx) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
