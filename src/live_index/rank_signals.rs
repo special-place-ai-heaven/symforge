@@ -115,6 +115,17 @@ pub trait RankSignal: Send + Sync {
 /// mirrors the bucket logic previously inlined in `capture_search_files_view`.
 pub struct PathMatchSignal;
 
+/// Repo-relative path equality tolerant of presentation differences between a
+/// raw caller-supplied anchor and normalized index keys: `\` vs `/` separators
+/// and a leading `./`. Case is preserved — index keys are exact.
+fn is_same_repo_relative_path(a: &str, b: &str) -> bool {
+    fn normalize(s: &str) -> String {
+        let forward = s.replace('\\', "/");
+        forward.trim_start_matches("./").to_string()
+    }
+    normalize(a) == normalize(b)
+}
+
 impl RankSignal for PathMatchSignal {
     fn name(&self) -> &'static str {
         "path_match"
@@ -168,7 +179,15 @@ impl RankSignal for PathMatchSignal {
         // stems (`a`, `io`) stay prefix-tier and do not jump to basename tier;
         // genuine prefixes (`work` vs `work_item`) also stay prefix-tier
         // because neither basename nor stem equals them.
-        let scoring_the_anchor = ctx.target_path.map(Path::new) == Some(path);
+        //
+        // The comparison is normalization-tolerant (Bugbot, PR #270): indexed
+        // candidate keys are forward-slash, `./`-free repo-relative paths, but
+        // the anchor string can arrive raw from the caller (`./`-prefixed or
+        // backslashed). A raw-vs-normalized mismatch would silently strip the
+        // anchor file's own basename tier when it appears among candidates.
+        let scoring_the_anchor = ctx
+            .target_path
+            .is_some_and(|target| is_same_repo_relative_path(target, &path_str));
         let has_basename_match = !basename_token.is_empty()
             && (file_basename == basename_token
                 || (scoring_the_anchor
@@ -504,6 +523,21 @@ mod tests {
             BASENAME_SCORE,
             "an exact basename match keeps basename tier without anchor status"
         );
+
+        // Normalization tolerance (Bugbot, PR #270): a raw caller-supplied
+        // anchor (`./`-prefixed or backslashed) must still be recognized as
+        // the anchor when the scored candidate uses the normalized index key.
+        for raw_anchor in ["./src/stores/work_item.rs", r"src\stores\work_item.rs"] {
+            let raw_ctx = RankCtx {
+                target_path: Some(raw_anchor),
+                ..ctx_with("work_item", &tokens)
+            };
+            assert_eq!(
+                PathMatchSignal.score(Path::new("src/stores/work_item.rs"), &raw_ctx),
+                BASENAME_SCORE,
+                "raw anchor `{raw_anchor}` must match the normalized candidate key"
+            );
+        }
     }
 
     #[test]

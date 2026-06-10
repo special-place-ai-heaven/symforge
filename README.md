@@ -1,4 +1,4 @@
-![SymForge](./symforge-banner_02.png)
+![SymForge](./symforge-banner.png)
 
 SymForge is a local-first MCP server for AI coding agents. It gives an agent a
 fast, symbol-aware view of a repository so it can ask precise questions instead
