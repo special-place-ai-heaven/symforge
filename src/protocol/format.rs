@@ -1798,7 +1798,7 @@ pub fn health_report_from_stats(
     let (tier1, tier2, tier3) = stats.tier_counts;
     let total_discovered = tier1 + tier2 + tier3;
     let mut admission_section = format!(
-        "\nAdmission: {} files discovered\n  Tier 1 (indexed): {}\n  Tier 2 (metadata only): {}\n  Tier 3 (hard-skipped): {}",
+        "\nAdmission: {} files discovered (after gitignore/global excludes)\n  Tier 1 (indexed): {}\n  Tier 2 (metadata only): {}\n  Tier 3 (hard-skipped): {}",
         total_discovered, tier1, tier2, tier3
     );
     // SF-009: surface how many Tier-1 files are not under version control.

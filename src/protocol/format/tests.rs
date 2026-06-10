@@ -1161,8 +1161,8 @@ fn test_health_report_shows_tier_breakdown() {
     };
     let report = health_report_from_stats("Ready", &stats, 0);
     assert!(
-        report.contains("Admission: 9500 files discovered"),
-        "should show total discovered count; got:\n{report}"
+        report.contains("Admission: 9500 files discovered (after gitignore/global excludes)"),
+        "should show total discovered count clarified as post-gitignore; got:\n{report}"
     );
     assert!(
         report.contains("Tier 1 (indexed): 8200"),
