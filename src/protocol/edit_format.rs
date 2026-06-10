@@ -8,6 +8,11 @@ pub(crate) enum EditSafetyMode {
 pub(crate) enum EditSourceAuthority {
     DiskRefreshed,
     CurrentIndex,
+    /// The edit base was re-read and re-parsed from the rerouted worktree
+    /// TARGET because it had diverged from the indexed copy (a prior routed
+    /// edit). Splicing into index content here would silently discard those
+    /// earlier routed edits (review finding 5, post-v7.19.0).
+    WorktreeTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +39,7 @@ fn source_authority_label(authority: EditSourceAuthority) -> &'static str {
     match authority {
         EditSourceAuthority::DiskRefreshed => "disk-refreshed",
         EditSourceAuthority::CurrentIndex => "current index",
+        EditSourceAuthority::WorktreeTarget => "worktree target (rebased)",
     }
 }
 

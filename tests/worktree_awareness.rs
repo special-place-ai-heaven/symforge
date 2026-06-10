@@ -1151,3 +1151,264 @@ async fn conventions_surfaces_worktree_awareness_guidance() {
     assert_not_contains(&output, "Feature-gated on `SYMFORGE_WORKTREE_AWARE=1`");
     assert_contains(&output, "README");
 }
+
+// ─── Review finding 5 (post-v7.19.0): routed edits must compound ────────────
+//
+// Sequential routed edits to the SAME file clobbered each other: each edit
+// spliced into the index's content (mirroring the indexed copy, which routed
+// writes never touch) and overwrote the worktree target wholesale, so only
+// the LAST edit survived while every call reported success. The fix rebases
+// the edit base from the rerouted target when it has diverged, and stops
+// poisoning the index entry with worktree bytes after a routed write.
+
+/// Two sequential routed edits to the same file must BOTH persist in the
+/// worktree target. This is the exact data-loss shape observed live during
+/// the post-v7.19.0 review (only the last of N edits survived).
+#[tokio::test]
+async fn sequential_routed_edits_to_same_file_all_persist() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    // Edit 1: replace `hello`.
+    let first = call(
+        &fx.server,
+        "replace_symbol_body",
+        json!({
+            "path": "src/lib.rs",
+            "name": "hello",
+            "new_body": "fn hello() {\n    println!(\"EDIT_ONE\");\n}",
+            "working_directory": wt_arg.clone(),
+        }),
+    )
+    .await;
+    assert_contains(&first, "rerouted: true");
+
+    // Edit 2: a different symbol in the SAME file, also routed.
+    let second = call(
+        &fx.server,
+        "replace_symbol_body",
+        json!({
+            "path": "src/lib.rs",
+            "name": "world",
+            "new_body": "fn world() {\n    println!(\"EDIT_TWO\");\n}",
+            "working_directory": wt_arg,
+        }),
+    )
+    .await;
+    assert_contains(&second, "rerouted: true");
+    // The second edit's base came from the diverged worktree target, and the
+    // envelope must say so.
+    assert_contains(&second, "worktree target (rebased)");
+
+    let wt_after = fx.read_worktree("src/lib.rs");
+    assert!(
+        wt_after.contains("EDIT_ONE"),
+        "edit 1 must survive edit 2 (review finding 5 regression): {wt_after}"
+    );
+    assert!(
+        wt_after.contains("EDIT_TWO"),
+        "edit 2 must be applied: {wt_after}"
+    );
+
+    // The indexed copy stays untouched by both routed edits.
+    let indexed_after = fx.read_indexed("src/lib.rs");
+    assert!(
+        !indexed_after.contains("EDIT_ONE") && !indexed_after.contains("EDIT_TWO"),
+        "indexed copy must not receive routed writes: {indexed_after}"
+    );
+}
+
+/// Three sequential routed edits across three DIFFERENT single-symbol tools
+/// (replace, edit_within, insert) must all persist — the rebase has to work
+/// for every tool, not just `replace_symbol_body`.
+#[tokio::test]
+async fn sequential_routed_edits_across_tools_all_persist() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    let r1 = call(
+        &fx.server,
+        "replace_symbol_body",
+        json!({
+            "path": "src/lib.rs",
+            "name": "hello",
+            "new_body": "fn hello() {\n    println!(\"TOOL_ONE\");\n}",
+            "working_directory": wt_arg.clone(),
+        }),
+    )
+    .await;
+    assert_contains(&r1, "rerouted: true");
+
+    let r2 = call(
+        &fx.server,
+        "edit_within_symbol",
+        json!({
+            "path": "src/lib.rs",
+            "name": "world",
+            "old_text": "println!(\"world\");",
+            "new_text": "println!(\"TOOL_TWO\");",
+            "working_directory": wt_arg.clone(),
+        }),
+    )
+    .await;
+    assert_contains(&r2, "rerouted: true");
+    assert_contains(&r2, "worktree target (rebased)");
+
+    let r3 = call(
+        &fx.server,
+        "insert_symbol",
+        json!({
+            "path": "src/lib.rs",
+            "name": "world",
+            "position": "after",
+            "content": "fn tool_three() {}",
+            "working_directory": wt_arg,
+        }),
+    )
+    .await;
+    assert_contains(&r3, "rerouted: true");
+    assert_contains(&r3, "worktree target (rebased)");
+
+    let wt_after = fx.read_worktree("src/lib.rs");
+    for needle in ["TOOL_ONE", "TOOL_TWO", "fn tool_three()"] {
+        assert!(
+            wt_after.contains(needle),
+            "all three routed edits must persist; missing `{needle}`: {wt_after}"
+        );
+    }
+}
+
+/// A routed edit must NOT replace the index entry with worktree bytes: the
+/// index mirrors the indexed copy, which a routed write deliberately leaves
+/// untouched. (This was the second half of finding 5 — the poisoned entry was
+/// then "corrected" back from disk by the next edit's freshness check,
+/// erasing the routed state from the edit base.)
+#[tokio::test]
+async fn routed_edit_does_not_poison_index_entry() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    let result = call(
+        &fx.server,
+        "replace_symbol_body",
+        json!({
+            "path": "src/lib.rs",
+            "name": "hello",
+            "new_body": "fn hello() {\n    println!(\"WT_ONLY\");\n}",
+            "working_directory": wt_arg,
+        }),
+    )
+    .await;
+    assert_contains(&result, "rerouted: true");
+
+    // The index serves the INDEXED copy; the routed write must not leak in.
+    let index_view = call(
+        &fx.server,
+        "get_file_content",
+        json!({ "path": "src/lib.rs" }),
+    )
+    .await;
+    assert_not_contains(&index_view, "WT_ONLY");
+    assert_contains(&index_view, "println!(\"hello\");");
+}
+
+/// Batch executors splice index-resolved byte ranges, so a rerouted batch
+/// onto a DIVERGED target must fail closed with an actionable error instead
+/// of silently clobbering earlier routed edits. (Full batch rebase is a
+/// follow-up; refusing loudly is the contract until then.)
+#[tokio::test]
+async fn routed_batch_edit_fails_closed_on_diverged_target() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    // Diverge the worktree target with a routed single-symbol edit.
+    let first = call(
+        &fx.server,
+        "replace_symbol_body",
+        json!({
+            "path": "src/lib.rs",
+            "name": "hello",
+            "new_body": "fn hello() {\n    println!(\"DIVERGED\");\n}",
+            "working_directory": wt_arg.clone(),
+        }),
+    )
+    .await;
+    assert_contains(&first, "rerouted: true");
+    let wt_before = fx.read_worktree("src/lib.rs");
+
+    // A routed batch edit onto the diverged target must refuse to write.
+    let batch = call(
+        &fx.server,
+        "batch_edit",
+        json!({
+            "edits": [{
+                "path": "src/lib.rs",
+                "name": "world",
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "println!(\"world\");",
+                    "new_text": "println!(\"BATCH_CLOBBER\");"
+                }
+            }],
+            "working_directory": wt_arg,
+        }),
+    )
+    .await;
+    assert_contains(&batch, "diverged");
+    assert_contains(&batch, "single-symbol");
+
+    // Nothing was written: the earlier routed edit survives, the batch text
+    // never landed.
+    let wt_after = fx.read_worktree("src/lib.rs");
+    assert_eq!(
+        wt_before, wt_after,
+        "failed-closed batch must not modify the worktree target"
+    );
+    assert!(
+        wt_after.contains("DIVERGED") && !wt_after.contains("BATCH_CLOBBER"),
+        "earlier routed edit must survive the refused batch: {wt_after}"
+    );
+}
+
+/// A rerouted batch onto a target that is still byte-identical to the indexed
+/// copy stays allowed — the guard only fires on divergence.
+#[tokio::test]
+async fn routed_batch_edit_on_identical_target_still_allowed() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    let batch = call(
+        &fx.server,
+        "batch_edit",
+        json!({
+            "edits": [{
+                "path": "src/lib.rs",
+                "name": "hello",
+                "operation": {
+                    "type": "edit_within",
+                    "old_text": "println!(\"hello\");",
+                    "new_text": "println!(\"BATCH_FRESH\");"
+                }
+            }],
+            "working_directory": wt_arg,
+        }),
+    )
+    .await;
+    assert_not_contains(&batch, "diverged");
+
+    let wt_after = fx.read_worktree("src/lib.rs");
+    assert!(
+        wt_after.contains("BATCH_FRESH"),
+        "fresh-target routed batch must still write: {wt_after}"
+    );
+    let indexed_after = fx.read_indexed("src/lib.rs");
+    assert!(
+        !indexed_after.contains("BATCH_FRESH"),
+        "indexed copy must stay untouched: {indexed_after}"
+    );
+}
