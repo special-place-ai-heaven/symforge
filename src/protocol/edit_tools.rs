@@ -560,6 +560,20 @@ impl SymForgeServer {
                 );
             }
         };
+        // Review finding 5 (post-v7.19.0): a rerouted edit must splice into
+        // the worktree TARGET's current bytes. The index mirrors the indexed
+        // copy (routed writes never touch it), so using index content as the
+        // base would silently discard every earlier routed edit to this file.
+        let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
+            Ok(base) => base,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+        };
+        let source_authority = if edit_base.rebased {
+            edit_format::EditSourceAuthority::WorktreeTarget
+        } else {
+            source_authority
+        };
+        let file = edit_base.file;
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
@@ -651,13 +665,21 @@ impl SymForgeServer {
         // Detect parent impl type for type-aware reference filtering.
         // Methods inside `impl Foo` only warn about refs in files that also mention `Foo`.
         let parent_type = edit::find_parent_impl_type(&file, &sym);
-        edit::reindex_after_write(
-            &self.index,
-            &resolved_path,
-            &params.0.path,
-            &new_content,
-            file.language.clone(),
-        );
+        // Review finding 5 (post-v7.19.0): only a pass-through write updates
+        // the index. A routed write leaves the indexed copy untouched, so
+        // replacing the index entry with worktree bytes would make the index
+        // lie about the indexed root — and the next edit's freshness check
+        // would "correct" it back from disk, erasing the routed state it was
+        // spliced from.
+        if !resolved_target.rerouted {
+            edit::reindex_after_write(
+                &self.index,
+                &resolved_path,
+                &params.0.path,
+                &new_content,
+                file.language.clone(),
+            );
+        }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let warnings = edit::detect_stale_references(
             &self.index,
@@ -782,6 +804,20 @@ impl SymForgeServer {
                 );
             }
         };
+        // Review finding 5 (post-v7.19.0): a rerouted edit must splice into
+        // the worktree TARGET's current bytes. The index mirrors the indexed
+        // copy (routed writes never touch it), so using index content as the
+        // base would silently discard every earlier routed edit to this file.
+        let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
+            Ok(base) => base,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+        };
+        let source_authority = if edit_base.rebased {
+            edit_format::EditSourceAuthority::WorktreeTarget
+        } else {
+            source_authority
+        };
+        let file = edit_base.file;
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
@@ -834,13 +870,21 @@ impl SymForgeServer {
                 return output;
             }
         };
-        edit::reindex_after_write(
-            &self.index,
-            &resolved_path,
-            &params.0.path,
-            &new_content,
-            file.language.clone(),
-        );
+        // Review finding 5 (post-v7.19.0): only a pass-through write updates
+        // the index. A routed write leaves the indexed copy untouched, so
+        // replacing the index entry with worktree bytes would make the index
+        // lie about the indexed root — and the next edit's freshness check
+        // would "correct" it back from disk, erasing the routed state it was
+        // spliced from.
+        if !resolved_target.rerouted {
+            edit::reindex_after_write(
+                &self.index,
+                &resolved_path,
+                &params.0.path,
+                &new_content,
+                file.language.clone(),
+            );
+        }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let mut out = format!(
             "{}\n{}",
@@ -945,6 +989,20 @@ impl SymForgeServer {
                 );
             }
         };
+        // Review finding 5 (post-v7.19.0): a rerouted edit must splice into
+        // the worktree TARGET's current bytes. The index mirrors the indexed
+        // copy (routed writes never touch it), so using index content as the
+        // base would silently discard every earlier routed edit to this file.
+        let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
+            Ok(base) => base,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+        };
+        let source_authority = if edit_base.rebased {
+            edit_format::EditSourceAuthority::WorktreeTarget
+        } else {
+            source_authority
+        };
+        let file = edit_base.file;
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::StructuralEditSafe,
@@ -992,13 +1050,21 @@ impl SymForgeServer {
                 return output;
             }
         };
-        edit::reindex_after_write(
-            &self.index,
-            &resolved_path,
-            &params.0.path,
-            &new_content,
-            file.language.clone(),
-        );
+        // Review finding 5 (post-v7.19.0): only a pass-through write updates
+        // the index. A routed write leaves the indexed copy untouched, so
+        // replacing the index entry with worktree bytes would make the index
+        // lie about the indexed root — and the next edit's freshness check
+        // would "correct" it back from disk, erasing the routed state it was
+        // spliced from.
+        if !resolved_target.rerouted {
+            edit::reindex_after_write(
+                &self.index,
+                &resolved_path,
+                &params.0.path,
+                &new_content,
+                file.language.clone(),
+            );
+        }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let mut out = format!(
             "{}\n{}",
@@ -1105,6 +1171,20 @@ impl SymForgeServer {
                 );
             }
         };
+        // Review finding 5 (post-v7.19.0): a rerouted edit must splice into
+        // the worktree TARGET's current bytes. The index mirrors the indexed
+        // copy (routed writes never touch it), so using index content as the
+        // base would silently discard every earlier routed edit to this file.
+        let edit_base = match edit::rebase_edit_base_for_reroute(file, &resolved_target) {
+            Ok(base) => base,
+            Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
+        };
+        let source_authority = if edit_base.rebased {
+            edit_format::EditSourceAuthority::WorktreeTarget
+        } else {
+            source_authority
+        };
+        let file = edit_base.file;
         if let Some(warning) = Self::check_edit_capability(
             &file.language,
             crate::parsing::config_extractors::EditCapability::TextEditSafe,
@@ -1267,13 +1347,21 @@ impl SymForgeServer {
                 return output;
             }
         };
-        edit::reindex_after_write(
-            &self.index,
-            &resolved_path,
-            &params.0.path,
-            &new_content,
-            file.language.clone(),
-        );
+        // Review finding 5 (post-v7.19.0): only a pass-through write updates
+        // the index. A routed write leaves the indexed copy untouched, so
+        // replacing the index entry with worktree bytes would make the index
+        // lie about the indexed root — and the next edit's freshness check
+        // would "correct" it back from disk, erasing the routed state it was
+        // spliced from.
+        if !resolved_target.rerouted {
+            edit::reindex_after_write(
+                &self.index,
+                &resolved_path,
+                &params.0.path,
+                &new_content,
+                file.language.clone(),
+            );
+        }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let mut out = format!(
             "{}\n{}",

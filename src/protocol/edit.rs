@@ -247,6 +247,139 @@ pub(crate) fn reindex_after_write(
 }
 
 // ---------------------------------------------------------------------------
+// Rerouted edit base (review finding 5, post-v7.19.0)
+// ---------------------------------------------------------------------------
+
+/// The effective base record an edit splices into, plus whether it had to be
+/// rebased from the rerouted worktree target.
+pub(crate) struct EditBase {
+    pub file: std::sync::Arc<IndexedFile>,
+    /// `true` when the base was re-read and re-parsed from the rerouted
+    /// target because it diverged from the indexed copy. Callers use this to
+    /// label source authority honestly (`worktree target (rebased)`).
+    pub rebased: bool,
+}
+
+/// Resolve the edit BASE for a possibly rerouted edit.
+///
+/// A rerouted edit must splice into the resolved worktree TARGET's current
+/// bytes — never the index's content. The index mirrors the indexed copy,
+/// which routed writes deliberately do not touch, so using index content as
+/// the base silently discards every earlier routed edit to the same file
+/// while each call still reports success (review finding 5: sequential
+/// routed edits clobbered each other; only the last survived).
+///
+/// Behavior:
+///   - pass-through edit (`rerouted == false`): indexed record, unchanged;
+///   - rerouted, target byte-identical to the index: indexed record (exact
+///     symbol ranges preserved);
+///   - rerouted, target diverged: the target's bytes are re-read and
+///     re-parsed so symbol resolution and splicing run against worktree
+///     truth. Symbols that no longer parse in the worktree file surface as
+///     ordinary resolution errors — honest failure beats silent data loss.
+pub(crate) fn rebase_edit_base_for_reroute(
+    file: std::sync::Arc<IndexedFile>,
+    resolved: &crate::worktree::ResolvedTarget,
+) -> Result<EditBase, String> {
+    if !resolved.rerouted {
+        return Ok(EditBase {
+            file,
+            rebased: false,
+        });
+    }
+    let target_bytes = std::fs::read(&resolved.target_path).map_err(|e| {
+        format!(
+            "Error: cannot read rerouted edit target {}: {e}",
+            resolved.target_path.display()
+        )
+    })?;
+    if target_bytes == file.content {
+        return Ok(EditBase {
+            file,
+            rebased: false,
+        });
+    }
+    let result =
+        crate::parsing::process_file(&file.relative_path, &target_bytes, file.language.clone());
+    Ok(EditBase {
+        file: std::sync::Arc::new(IndexedFile::from_parse_result(result, target_bytes)),
+        rebased: true,
+    })
+}
+
+/// Line-ending-insensitive content equality: treats `\r\n` and `\n` as the
+/// same terminator. A fresh `git worktree add` checkout can materialize CRLF
+/// on Windows (core.autocrlf) while the index holds the indexed root's LF
+/// bytes — that is not a real divergence and must not trip the batch guard.
+fn line_ending_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut ai = a.iter().peekable();
+    let mut bi = b.iter().peekable();
+    loop {
+        // Skip a `\r` only when it is part of a `\r\n` pair.
+        while ai.peek() == Some(&&b'\r') {
+            let mut look = ai.clone();
+            look.next();
+            if look.peek() == Some(&&b'\n') {
+                ai.next();
+            } else {
+                break;
+            }
+        }
+        while bi.peek() == Some(&&b'\r') {
+            let mut look = bi.clone();
+            look.next();
+            if look.peek() == Some(&&b'\n') {
+                bi.next();
+            } else {
+                break;
+            }
+        }
+        match (ai.next(), bi.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Fail-closed divergence guard for the BATCH executors (review finding 5).
+///
+/// The batch pipelines resolve symbol byte ranges against the index snapshot
+/// before path routing happens, so they cannot (yet) rebase onto a diverged
+/// worktree target the way the single-symbol tools do. Until that refactor
+/// lands, a rerouted batch write onto a target that differs from the indexed
+/// content would silently destroy earlier routed edits — so refuse it loudly
+/// instead. A rerouted batch onto a byte-identical target stays allowed.
+pub(crate) fn guard_batch_reroute_divergence(
+    resolved: &crate::worktree::ResolvedTarget,
+    indexed_content: &[u8],
+    relative_path: &str,
+) -> Result<(), String> {
+    if !resolved.rerouted {
+        return Ok(());
+    }
+    let target_bytes = std::fs::read(&resolved.target_path).map_err(|e| {
+        format!(
+            "Error: cannot read rerouted batch target {}: {e}",
+            resolved.target_path.display()
+        )
+    })?;
+    if target_bytes == indexed_content || line_ending_insensitive_eq(&target_bytes, indexed_content)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Error: rerouted batch edit refused for '{relative_path}': the worktree target {} has \
+         diverged from the indexed copy (likely an earlier routed edit). Batch tools splice \
+         index-resolved byte ranges and would overwrite those changes. Use the single-symbol \
+         edit tools (replace_symbol_body / edit_within_symbol / insert_symbol / delete_symbol) \
+         with the same working_directory — they rebase onto the worktree target — or commit the \
+         worktree changes and reindex.",
+        resolved.target_path.display()
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Symbol resolution wrapper
 // ---------------------------------------------------------------------------
 
@@ -1624,6 +1757,10 @@ pub(crate) fn execute_batch_edit(
             Ok(r) => r,
             Err(e) => return Err(format!("Path resolution error for '{path}': {e}")),
         };
+        // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
+        // a diverged rerouted target — this batch's splices were resolved
+        // against the index snapshot, not the worktree file.
+        guard_batch_reroute_divergence(&resolved_target, &file.content, path)?;
         let abs_path = resolved_target.target_path.clone();
         staged.push(StagedFile {
             path: path.clone(),
@@ -2036,6 +2173,10 @@ pub(crate) fn execute_batch_rename(
             Ok(r) => r,
             Err(e) => return Err(format!("Path resolution error for '{path}': {e}")),
         };
+        // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
+        // a diverged rerouted target — rename ranges were validated against
+        // the index snapshot, not the worktree file.
+        guard_batch_reroute_divergence(&resolved_target, &original, path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
@@ -2426,6 +2567,10 @@ pub(crate) fn execute_batch_insert(
             Ok(r) => r,
             Err(e) => return Err(format!("Target {path}: path resolution error: {e}")),
         };
+        // Review finding 5 (post-v7.19.0): fail closed instead of clobbering
+        // a diverged rerouted target — these insert anchors were resolved
+        // against the index snapshot, not the worktree file.
+        guard_batch_reroute_divergence(&resolved_target, &file.content, &path)?;
         staged.push(StagedFile {
             path: path.clone(),
             abs_path: resolved_target.target_path.clone(),
