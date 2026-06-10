@@ -753,6 +753,7 @@ fn parse_state_for_file(file: &IndexedFile) -> &'static str {
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 "parsed"
             } else {

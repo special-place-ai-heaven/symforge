@@ -380,6 +380,11 @@ static RUST_VALUE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
 static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
 static JS_QUERY: OnceLock<Query> = OnceLock::new();
 static TS_QUERY: OnceLock<Query> = OnceLock::new();
+// A tree-sitter Query binds to a specific Language's node-kind IDs. The TSX
+// grammar (`LANGUAGE_TSX`) is a distinct Language from `LANGUAGE_TYPESCRIPT`,
+// so the same xref query source must be compiled and cached separately for it;
+// reusing the TS-compiled query against a TSX tree yields wrong/empty matches.
+static TSX_QUERY: OnceLock<Query> = OnceLock::new();
 static GO_QUERY: OnceLock<Query> = OnceLock::new();
 static JAVA_QUERY: OnceLock<Query> = OnceLock::new();
 static C_QUERY: OnceLock<Query> = OnceLock::new();
@@ -419,6 +424,12 @@ fn js_query(lang: &Language) -> &'static Query {
 
 fn ts_query(lang: &Language) -> &'static Query {
     TS_QUERY.get_or_init(|| Query::new(lang, TS_XREF_QUERY).expect("valid ts xref query"))
+}
+
+/// The TSX-grammar counterpart of [`ts_query`]. Compiled against `LANGUAGE_TSX`
+/// and cached independently of the plain TypeScript query.
+fn tsx_query(lang: &Language) -> &'static Query {
+    TSX_QUERY.get_or_init(|| Query::new(lang, TS_XREF_QUERY).expect("valid tsx xref query"))
 }
 
 fn go_query(lang: &Language) -> &'static Query {
@@ -719,6 +730,7 @@ pub fn extract_references(
     root: &Node,
     source: &str,
     language: &LanguageId,
+    is_tsx: bool,
 ) -> (Vec<ReferenceRecord>, HashMap<String, String>) {
     let source_bytes = source.as_bytes();
 
@@ -736,8 +748,17 @@ pub fn extract_references(
             (js_query(&lang), lang)
         }
         LanguageId::TypeScript => {
-            let lang: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-            (ts_query(&lang), lang)
+            // `.tsx` uses the TSX grammar; the xref query MUST be compiled
+            // against whichever grammar parsed the tree so node-kind IDs line up
+            // (TS and TSX are distinct tree-sitter Languages with separate query
+            // caches — see `tsx_query`).
+            if is_tsx {
+                let lang: Language = tree_sitter_typescript::LANGUAGE_TSX.into();
+                (tsx_query(&lang), lang)
+            } else {
+                let lang: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+                (ts_query(&lang), lang)
+            }
         }
         LanguageId::Go => {
             let lang: Language = tree_sitter_go::LANGUAGE.into();
@@ -1138,11 +1159,21 @@ mod tests {
         source: &str,
         language: LanguageId,
     ) -> (Vec<ReferenceRecord>, HashMap<String, String>) {
+        parse_and_extract_flavored(source, language, false)
+    }
+
+    /// Like [`parse_and_extract`] but selects the TSX grammar when `is_tsx`.
+    fn parse_and_extract_flavored(
+        source: &str,
+        language: LanguageId,
+        is_tsx: bool,
+    ) -> (Vec<ReferenceRecord>, HashMap<String, String>) {
         let mut parser = Parser::new();
         let ts_language: Language = match &language {
             LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),
             LanguageId::Python => tree_sitter_python::LANGUAGE.into(),
             LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            LanguageId::TypeScript if is_tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             LanguageId::Go => tree_sitter_go::LANGUAGE.into(),
             LanguageId::Java => tree_sitter_java::LANGUAGE.into(),
@@ -1170,7 +1201,7 @@ mod tests {
         parser.set_language(&ts_language).expect("set language");
         let tree = parser.parse(source, None).expect("parse");
         let root = tree.root_node();
-        extract_references(&root, source, &language)
+        extract_references(&root, source, &language, is_tsx)
     }
 
     fn find_ref<'a>(refs: &'a [ReferenceRecord], name: &str) -> Option<&'a ReferenceRecord> {
@@ -1700,6 +1731,20 @@ fn helper(n: usize) {
         assert!(
             refs.iter().any(|r| r.kind == ReferenceKind::TypeUsage),
             "should have TypeUsage ref, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_tsx_references_extracted_under_tsx_grammar() {
+        // JSX only parses under the TSX grammar. With the plain TypeScript
+        // grammar this source is a partial parse and the import reference is
+        // lost; the TSX-flavored extraction recovers it.
+        let source = "import { App } from './App';\nexport const root = () => <App />;\n";
+        let (refs, _) = parse_and_extract_flavored(source, LanguageId::TypeScript, true);
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::Import),
+            "TSX import must be captured under the TSX grammar; refs: {:?}",
             refs
         );
     }

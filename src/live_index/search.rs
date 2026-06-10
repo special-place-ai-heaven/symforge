@@ -1199,6 +1199,7 @@ fn search_structural_with_compiler(
     mut compile_pattern: impl FnMut(
         &str,
         &LanguageId,
+        bool,
     ) -> Result<
         crate::parsing::ast_grep::CompiledStructuralPattern,
         String,
@@ -1209,8 +1210,10 @@ fn search_structural_with_compiler(
     let mut files: Vec<TextFileMatches> = Vec::new();
     let mut total_matches = 0usize;
     let mut suppressed_by_noise = 0usize;
+    // Cache key includes the TSX flavor because `.tsx` and `.ts` share the
+    // TypeScript LanguageId but compile against different tree-sitter grammars.
     let mut compiled_patterns: HashMap<
-        (LanguageId, String),
+        (LanguageId, bool, String),
         Result<crate::parsing::ast_grep::CompiledStructuralPattern, String>,
     > = HashMap::new();
     // Track whether at least one candidate successfully compiled the
@@ -1244,9 +1247,10 @@ fn search_structural_with_compiler(
 
         let content_str = String::from_utf8_lossy(&file.content);
 
+        let is_tsx = LanguageId::is_tsx_path(path);
         let compiled = compiled_patterns
-            .entry((lang.clone(), pattern.to_string()))
-            .or_insert_with(|| compile_pattern(pattern, lang));
+            .entry((lang.clone(), is_tsx, pattern.to_string()))
+            .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
         let structural_matches = match compiled {
             Ok(compiled_pattern) => {
                 any_parse_succeeded = true;
@@ -3282,9 +3286,9 @@ mod tests {
             &index,
             pattern,
             &TextSearchOptions::default(),
-            |pattern, lang| {
+            |pattern, lang, is_tsx| {
                 *compile_calls_by_language.entry(lang.clone()).or_default() += 1;
-                crate::parsing::ast_grep::compile_structural_pattern(pattern, lang)
+                crate::parsing::ast_grep::compile_structural_pattern(pattern, lang, is_tsx)
             },
         )
         .expect("valid structural pattern should search all candidate files");

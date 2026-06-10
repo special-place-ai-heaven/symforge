@@ -314,6 +314,7 @@ impl LiveIndex {
                 } else if crate::parsing::is_expected_typescript_import_type_array_limitation(
                     &file.language,
                     &file.content,
+                    crate::domain::LanguageId::is_tsx_path(path),
                 ) {
                     // SF-003: a partial parse caused only by the known
                     // tree-sitter-typescript 0.23.2 import-type-array grammar

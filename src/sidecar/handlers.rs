@@ -148,6 +148,7 @@ fn parse_state_label(file: &crate::live_index::store::IndexedFile) -> &'static s
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 "parsed"
             } else {
@@ -402,6 +403,7 @@ fn append_parse_status_lines(
             if crate::parsing::is_expected_typescript_import_type_array_limitation(
                 &file.language,
                 &file.content,
+                crate::domain::LanguageId::is_tsx_path(&file.relative_path),
             ) {
                 lines.push(
                     "Parse status: ok (parser limitation: tree-sitter-typescript 0.23.2 \
