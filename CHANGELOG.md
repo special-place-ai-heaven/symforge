@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.19.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.2...v7.19.3) (2026-06-10)
+
+
+### Bug Fixes
+
+* **discovery:** admit dependency lockfiles as Tier 2 metadata-only ([170bfbc](https://github.com/special-place-ai-heaven/symforge/commit/170bfbc4aeaa04fb50e012212df0bfcf1a43cbf5))
+* dogfood campaign — TSX grammar, admission tiering, watcher state, explore ranking, health accounting, output UX ([176dd33](https://github.com/special-place-ai-heaven/symforge/commit/176dd33554f887c45c8a88e1742682ff1731366d))
+* **explore:** never drop query terms that match indexed symbols ([068d6e7](https://github.com/special-place-ai-heaven/symforge/commit/068d6e78f8662e987cc7f6c54d22138fd7b0fb5b))
+* **health:** account every partial parse in the quarantine registry ([69630ba](https://github.com/special-place-ai-heaven/symforge/commit/69630ba85d476208518ed554412528807711d110))
+* **index:** apply admission tiering on reload path (index_folder) ([98b328e](https://github.com/special-place-ai-heaven/symforge/commit/98b328e63dee1e903bb8a9490214659667b438e6))
+* **index:** enforce admission tiering on single-file reindex paths ([ce32e21](https://github.com/special-place-ai-heaven/symforge/commit/ce32e21c446d76b645ba8ee6f956db4d6de05d41))
+* **parsing:** parse .tsx with tree-sitter TSX grammar ([0a67523](https://github.com/special-place-ai-heaven/symforge/commit/0a67523f084c145ac825bfd036dd15f3e2996d20))
+* **protocol:** output quality cluster — compact dependents, rename preview, kind labels, context-aware tips, health dedup ([5fa3bd1](https://github.com/special-place-ai-heaven/symforge/commit/5fa3bd1c0653a6101928429cc0b38511776fb687))
+* **watcher:** add Starting state so health distinguishes startup from off ([b8bae3d](https://github.com/special-place-ai-heaven/symforge/commit/b8bae3d55738a5b69871aa5e8bfe1710c66aee13))
+
 ## [7.19.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.1...v7.19.2) (2026-06-10)
 
 
