@@ -87,9 +87,20 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
     // `.js`/`.ts` frontend does not split its own vote.
     let mut lang_votes: std::collections::HashMap<&'static str, u32> =
         std::collections::HashMap::new();
+    // Per-member counts inside the folded JS/TS bucket, used ONLY to pick the
+    // reported label (review finding 4, post-v7.19.0): the fold keeps a mixed
+    // frontend from splitting its own vote, but a pure-JavaScript project must
+    // not be LABELED "TypeScript".
+    let mut js_file_votes = 0u32;
+    let mut ts_file_votes = 0u32;
     for (_path, file) in index.all_files() {
         if let Some(bucket) = code_language_bucket(&file.language) {
             *lang_votes.entry(bucket).or_insert(0) += 1;
+        }
+        match file.language {
+            LanguageId::JavaScript => js_file_votes += 1,
+            LanguageId::TypeScript => ts_file_votes += 1,
+            _ => {}
         }
     }
     let total_code_votes: u32 = lang_votes.values().copied().sum();
@@ -97,6 +108,19 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
     // Deterministic ordering: by count desc, then name asc for tie-breaking.
     vote_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     let primary_lang: &'static str = vote_vec.first().map(|(name, _)| *name).unwrap_or("Unknown");
+    // Review finding 4 (post-v7.19.0): the folded JS/TS bucket keeps a mixed
+    // frontend from splitting its own vote, but a pure-JavaScript project must
+    // not be reported as "TypeScript". When the folded bucket wins with a
+    // JavaScript-majority membership, relabel the primary to "JavaScript" —
+    // every language-branched summary below matches "TypeScript" | "JavaScript",
+    // so the summary framing is unchanged. Ties keep "TypeScript" (the
+    // superset syntax).
+    let primary_lang: &'static str =
+        if primary_lang == "TypeScript" && js_file_votes > ts_file_votes {
+            "JavaScript"
+        } else {
+            primary_lang
+        };
     // Open decision (recorded): a mixed repo reports a SINGLE primary language
     // plus a one-line note when a SECOND language holds a >25% share.
     let secondary_note: Option<String> = vote_vec.get(1).and_then(|(name, count)| {
@@ -800,6 +824,64 @@ mod tests {
             conv.test_patterns.contains("describe/it/test"),
             "TS test patterns should mention describe/it/test scan, got: {}",
             conv.test_patterns
+        );
+    }
+
+    /// Review finding 4 (post-v7.19.0): a pure-JavaScript project folds into
+    /// the JS/TS vote bucket (so the vote is not split) but must be REPORTED
+    /// as "JavaScript", not "TypeScript" — while keeping the TS/JS-framed
+    /// summaries (exception-based error handling, camelCase), never Rust
+    /// wording.
+    #[test]
+    fn javascript_majority_project_is_labeled_javascript() {
+        let service = make_file(
+            "src/service.js",
+            LanguageId::JavaScript,
+            "function handleRequest(req) {\n  try { run(req); } catch (err) { throw new Error('boom'); }\n}\n",
+            vec![sym("handleRequest", SymbolKind::Function)],
+            vec![],
+        );
+        let util = make_file(
+            "src/util.js",
+            LanguageId::JavaScript,
+            "function buildPayload() { return {}; }\n",
+            vec![sym("buildPayload", SymbolKind::Function)],
+            vec![],
+        );
+        // One stray .ts file: JS still holds the bucket majority (2 > 1).
+        let typed = make_file(
+            "src/types.ts",
+            LanguageId::TypeScript,
+            "export interface Payload { ok: boolean }\n",
+            vec![sym("Payload", SymbolKind::Interface)],
+            vec![],
+        );
+
+        let conv = conventions_for(vec![
+            ("src/service.js", service),
+            ("src/util.js", util),
+            ("src/types.ts", typed),
+        ]);
+
+        assert!(
+            conv.language.starts_with("JavaScript"),
+            "JS-majority project must be labeled JavaScript, got: {}",
+            conv.language
+        );
+        assert!(
+            conv.error_handling.contains("try/catch") || conv.error_handling.contains("throw new"),
+            "JS project keeps the exception-based summary framing, got: {}",
+            conv.error_handling
+        );
+        assert!(
+            !conv.error_handling.contains("unwrap"),
+            "JS project must not get Rust error-handling wording, got: {}",
+            conv.error_handling
+        );
+        assert!(
+            conv.naming.contains("camelCase"),
+            "JS naming keeps the camelCase framing, got: {}",
+            conv.naming
         );
     }
 

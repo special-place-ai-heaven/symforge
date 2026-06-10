@@ -5281,6 +5281,7 @@ impl SymForgeServer {
         // is real) so the checkpoint runs against the populated index. On
         // local-fallback the proxy returns None and the in-process logic below
         // checkpoints the locally reloaded index.
+        let daemon_configured = self.daemon_client.is_some();
         if let Some(result) = self.proxy_tool_call("checkpoint_now", &params.0).await {
             return result;
         }
@@ -5305,12 +5306,29 @@ impl SymForgeServer {
         })
         .await
         {
-            Ok(Ok(report)) => format!(
-                "Checkpoint complete: wrote {} bytes for {} file(s) to {}",
-                report.bytes,
-                report.files,
-                report.path.display()
-            ),
+            Ok(Ok(report)) => {
+                let mut message = format!(
+                    "Checkpoint complete: wrote {} bytes for {} file(s) to {}",
+                    report.bytes,
+                    report.files,
+                    report.path.display()
+                );
+                // Honest receipt (review finding 2, post-v7.19.0): reaching this
+                // point with a daemon CONFIGURED means the proxy failed and we
+                // fell back to checkpointing the locally reloaded index, which
+                // may lag the daemon's authoritative live index. Say so, instead
+                // of an output indistinguishable from the daemon path — the
+                // snapshot written here can be staler than one the daemon would
+                // have written.
+                if daemon_configured {
+                    message.push_str(
+                        "\nnote: daemon unreachable; this checkpoint wrote the locally reloaded \
+                         index, which may lag the daemon's live index. Re-run checkpoint_now once \
+                         the daemon is reachable to persist its authoritative state.",
+                    );
+                }
+                message
+            }
             Ok(Err(error)) => format!("Checkpoint failed: {error}"),
             Err(join_error) => format!("Checkpoint failed: checkpoint task panicked: {join_error}"),
         }
@@ -8699,6 +8717,45 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
+    }
+
+    /// Review finding 2 (post-v7.19.0): when a daemon is CONFIGURED but
+    /// unreachable, `checkpoint_now` falls back to checkpointing the locally
+    /// reloaded index — and its receipt must say so, because the snapshot it
+    /// writes can lag the daemon's authoritative live index. A client pointed
+    /// at a dead port (with no stored project root, so `reconnect` cannot
+    /// rediscover a real daemon) forces exactly that fallback path.
+    #[tokio::test]
+    async fn test_checkpoint_now_degraded_fallback_receipt_names_local_index() {
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            // Port 1 is never serving; connection fails fast.
+            "http://127.0.0.1:1".to_string(),
+            "project-id".to_string(),
+            "session-id".to_string(),
+            "project-name".to_string(),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client);
+        let dir = tempfile::tempdir().expect("create temp repo root");
+        server.set_repo_root(Some(dir.path().to_path_buf()));
+
+        let output = server
+            .checkpoint_now(Parameters(super::CheckpointNowInput {
+                verify_after_write: Some(true),
+            }))
+            .await;
+
+        assert!(
+            output.contains("Checkpoint complete"),
+            "local fallback should still checkpoint successfully, got: {output}"
+        );
+        assert!(
+            output.contains("daemon unreachable"),
+            "degraded-fallback receipt must disclose the daemon was unreachable, got: {output}"
+        );
+        assert!(
+            output.contains("locally reloaded index"),
+            "degraded-fallback receipt must name WHAT was checkpointed, got: {output}"
+        );
     }
 
     #[tokio::test]
@@ -12611,6 +12668,12 @@ mod tests {
         assert!(
             result.contains("Checkpoint complete"),
             "checkpoint should report success: {result}"
+        );
+        // Guard (review finding 2): the degraded-fallback disclosure is ONLY
+        // for daemon-proxy fallback; a plain local checkpoint must not carry it.
+        assert!(
+            !result.contains("daemon unreachable"),
+            "local-mode checkpoint must not claim a daemon fallback: {result}"
         );
         assert!(
             temp.path().join(".symforge").join("index.bin").exists(),

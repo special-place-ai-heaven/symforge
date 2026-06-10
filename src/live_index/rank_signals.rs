@@ -156,16 +156,24 @@ impl RankSignal for PathMatchSignal {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        // A stem-only query that names the anchor (e.g. `work_item` for
+        // A stem-only query that names the ANCHOR (e.g. `work_item` for
         // `work_item.rs`) promotes to BASENAME tier so co-change fusion clears
-        // the anchor-confidence floor. The `file_stem == basename_token` arm is
-        // gated behind the same `>= 3` length guard the prefix path uses below
-        // (query.rs:~1236) so 1-2 char stems (`a`, `io`) stay prefix-tier and do
-        // not jump to basename tier; genuine prefixes (`work` vs `work_item`)
-        // also stay prefix-tier because neither basename nor stem equals them.
+        // the anchor-confidence floor (SF-006). The promotion applies ONLY when
+        // the path being scored IS the co-change anchor (`ctx.target_path`) —
+        // the CoChangeSignal floor check and `anchor_path_match_score` both
+        // score the anchor itself — so an anchor-gate fix does not globally
+        // reshape candidate path tiers (review finding 3, post-v7.19.0).
+        // The `file_stem == basename_token` arm is gated behind the same `>= 3`
+        // length guard the prefix path uses below (query.rs:~1236) so 1-2 char
+        // stems (`a`, `io`) stay prefix-tier and do not jump to basename tier;
+        // genuine prefixes (`work` vs `work_item`) also stay prefix-tier
+        // because neither basename nor stem equals them.
+        let scoring_the_anchor = ctx.target_path.map(Path::new) == Some(path);
         let has_basename_match = !basename_token.is_empty()
             && (file_basename == basename_token
-                || (basename_token.len() >= 3 && file_stem == basename_token));
+                || (scoring_the_anchor
+                    && basename_token.len() >= 3
+                    && file_stem == basename_token));
         let has_all_components = !component_tokens.is_empty()
             && component_tokens
                 .iter()
@@ -441,6 +449,61 @@ mod tests {
             co_change_count: None,
             co_change_weighted_score: None,
         }
+    }
+
+    /// Review finding 3 (post-v7.19.0): the SF-006 stem-equals-basename
+    /// promotion is ANCHOR-ONLY. Scoring the co-change anchor itself (path ==
+    /// ctx.target_path) promotes a ≥3-char stem query to basename tier so the
+    /// anchor-confidence floor clears; scoring an ordinary CANDIDATE with the
+    /// same stem keeps the pre-SF-006 prefix tier, so the anchor-gate fix does
+    /// not globally reshape candidate path scoring.
+    #[test]
+    fn stem_promotion_applies_to_anchor_only() {
+        let tokens = vec!["work_item".to_string()];
+
+        // Anchor scoring: target_path IS the scored path -> basename tier.
+        let anchor_ctx = RankCtx {
+            target_path: Some("src/stores/work_item.rs"),
+            ..ctx_with("work_item", &tokens)
+        };
+        assert_eq!(
+            PathMatchSignal.score(Path::new("src/stores/work_item.rs"), &anchor_ctx),
+            BASENAME_SCORE,
+            "a stem query naming the anchor must promote to basename tier"
+        );
+
+        // Candidate scoring: same stem match, but the scored path is NOT the
+        // anchor -> stays prefix tier (pre-SF-006 behavior).
+        let candidate_ctx = RankCtx {
+            target_path: Some("src/stores/other_anchor.rs"),
+            ..ctx_with("work_item", &tokens)
+        };
+        assert_eq!(
+            PathMatchSignal.score(Path::new("src/stores/work_item.rs"), &candidate_ctx),
+            PREFIX_SCORE,
+            "a non-anchor candidate must not receive the stem promotion"
+        );
+
+        // No anchor at all (plain path search): also prefix tier.
+        assert_eq!(
+            PathMatchSignal.score(
+                Path::new("src/stores/work_item.rs"),
+                &ctx_with("work_item", &tokens)
+            ),
+            PREFIX_SCORE,
+            "anchorless scoring must not receive the stem promotion"
+        );
+
+        // Exact basename queries are unaffected by the gate in all roles.
+        let basename_tokens = vec!["work_item.rs".to_string()];
+        assert_eq!(
+            PathMatchSignal.score(
+                Path::new("src/stores/work_item.rs"),
+                &ctx_with("work_item.rs", &basename_tokens)
+            ),
+            BASENAME_SCORE,
+            "an exact basename match keeps basename tier without anchor status"
+        );
     }
 
     #[test]

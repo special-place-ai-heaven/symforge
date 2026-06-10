@@ -292,6 +292,78 @@ pub(crate) fn parse_source(
     Ok((symbols, has_error, diagnostic, references, alias_map))
 }
 
+/// Cache-key discriminant for [`expected_partial_memo`]: which known grammar
+/// limitation a cached verdict belongs to.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ExpectedPartialCheck {
+    /// SF-003: TS import-type immediately followed by `[]`.
+    TsImportTypeArray,
+    /// SF-004: Angular control-flow relational operators in `.html`.
+    AngularControlFlow,
+}
+
+/// Upper bound on memo entries; at the cap the map is cleared wholesale.
+/// Entries are a few machine words each, so the bound is generous; clearing
+/// (vs an LRU) keeps the code trivial, and a refill costs one
+/// re-classification per still-live file.
+const EXPECTED_PARTIAL_MEMO_CAP: usize = 4096;
+
+/// Process-wide memo for the SF-003/SF-004 neutralize-and-reparse verdicts,
+/// keyed by (check, content length, content hash).
+///
+/// The classifiers cost up to two FULL tree-sitter parses per call and sit on
+/// render paths invoked repeatedly with identical content: `health_stats`
+/// iterates every partial-parse file per `health` call, and the
+/// `get_file_context` / `validate_file_syntax` / sidecar envelopes re-classify
+/// per render. A file's content is immutable for a given index generation, so
+/// a (length, 64-bit content hash) key dedups those re-parses. A wrong-verdict
+/// collision requires both equal 64-bit hashes AND equal lengths on different
+/// content that is also classified differently — astronomically unlikely for
+/// the worst case of a mislabeled health bucket. Stale entries from edited
+/// files age out via the wholesale clear at [`EXPECTED_PARTIAL_MEMO_CAP`].
+static EXPECTED_PARTIAL_MEMO: std::sync::LazyLock<std::sync::Mutex<ExpectedPartialMemoMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ExpectedPartialMemoMap::new()));
+
+/// Memo key: (which check, content length, 64-bit content hash).
+type ExpectedPartialMemoKey = (ExpectedPartialCheck, u64, u64);
+/// Verdict map behind [`EXPECTED_PARTIAL_MEMO`].
+type ExpectedPartialMemoMap = std::collections::HashMap<ExpectedPartialMemoKey, bool>;
+
+/// Memoize one expected-partial classification: return the cached (check,
+/// content) verdict, computing and inserting it on a miss.
+///
+/// `compute` runs WITHOUT the lock held, so two threads may race to compute
+/// the same verdict — harmless (the verdict is deterministic) and preferable
+/// to holding a global lock across a tree-sitter parse. A poisoned lock falls
+/// back to the inner map: the map holds only derived verdicts, so there is no
+/// invariant a panicking writer could have broken.
+fn expected_partial_memo(
+    check: ExpectedPartialCheck,
+    content: &[u8],
+    compute: impl FnOnce() -> bool,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let key = (check, content.len() as u64, hasher.finish());
+    if let Some(&verdict) = EXPECTED_PARTIAL_MEMO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return verdict;
+    }
+    let verdict = compute();
+    let mut memo = EXPECTED_PARTIAL_MEMO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if memo.len() >= EXPECTED_PARTIAL_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(key, verdict);
+    verdict
+}
+
 /// Matches a TypeScript import-type member (`import('mod').Member`) immediately
 /// followed by one or more postfix array suffixes (`[]`), allowing interior
 /// whitespace. Capture group 1 is the scalar import-type member alone; the
@@ -349,41 +421,46 @@ pub(crate) fn is_expected_typescript_import_type_array_limitation(
         return false;
     }
 
-    let source = String::from_utf8_lossy(content);
+    // Memoized: the regex pre-gate plus up to two full re-parses below run at
+    // most once per distinct content (see `expected_partial_memo`); render
+    // paths calling this repeatedly with unchanged content hit the cache.
+    expected_partial_memo(ExpectedPartialCheck::TsImportTypeArray, content, || {
+        let source = String::from_utf8_lossy(content);
 
-    // The construct must actually be present; otherwise this limitation is not
-    // what we are looking at.
-    if !IMPORT_TYPE_ARRAY_SUFFIX_RE.is_match(&source) {
-        return false;
-    }
+        // The construct must actually be present; otherwise this limitation is not
+        // what we are looking at.
+        if !IMPORT_TYPE_ARRAY_SUFFIX_RE.is_match(&source) {
+            return false;
+        }
 
-    // Defensive: only meaningful for files that genuinely failed to parse. If
-    // the original parses clean there is no limitation to excuse.
-    let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
-        Ok(Ok((_, has_error, _, _, _))) => has_error,
-        _ => return false,
-    };
-    if !original_has_error {
-        return false;
-    }
+        // Defensive: only meaningful for files that genuinely failed to parse. If
+        // the original parses clean there is no limitation to excuse.
+        let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
+            Ok(Ok((_, has_error, _, _, _))) => has_error,
+            _ => return false,
+        };
+        if !original_has_error {
+            return false;
+        }
 
-    // Neutralize ONLY the array suffix on import-type members, then re-parse the
-    // whole file. A clean re-parse proves the array suffix was the sole cause.
-    //
-    // The `[]` run is replaced with a SINGLE SPACE (not deleted) so the
-    // neutralization is token-preserving. Deleting an empty `[]` between an
-    // import-type member and a trailing identifier fragment would GLUE them into
-    // a single valid identifier (e.g. `import('x').Sub[]scription` ->
-    // `import('x').Subscription`), making a genuinely broken file re-parse clean
-    // and be falsely excused. A space keeps `Sub[]scription` as two tokens
-    // (`Sub scription`, still broken) while the legitimate `Subscription[]`
-    // becomes `Subscription ` (a scalar import-type with trailing whitespace,
-    // still clean). Multi-dim `[][]` is one match, replaced by one space.
-    let neutralized = IMPORT_TYPE_ARRAY_SUFFIX_RE.replace_all(&source, "${1} ");
-    match panic::catch_unwind(|| parse_source(&neutralized, language)) {
-        Ok(Ok((_, has_error, _, _, _))) => !has_error,
-        _ => false,
-    }
+        // Neutralize ONLY the array suffix on import-type members, then re-parse the
+        // whole file. A clean re-parse proves the array suffix was the sole cause.
+        //
+        // The `[]` run is replaced with a SINGLE SPACE (not deleted) so the
+        // neutralization is token-preserving. Deleting an empty `[]` between an
+        // import-type member and a trailing identifier fragment would GLUE them into
+        // a single valid identifier (e.g. `import('x').Sub[]scription` ->
+        // `import('x').Subscription`), making a genuinely broken file re-parse clean
+        // and be falsely excused. A space keeps `Sub[]scription` as two tokens
+        // (`Sub scription`, still broken) while the legitimate `Subscription[]`
+        // becomes `Subscription ` (a scalar import-type with trailing whitespace,
+        // still clean). Multi-dim `[][]` is one match, replaced by one space.
+        let neutralized = IMPORT_TYPE_ARRAY_SUFFIX_RE.replace_all(&source, "${1} ");
+        match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+            Ok(Ok((_, has_error, _, _, _))) => !has_error,
+            _ => false,
+        }
+    })
 }
 
 /// Matches an Angular control-flow opener (`@if`/`@for`/`@switch`/`@defer`/
@@ -461,44 +538,49 @@ pub(crate) fn is_expected_angular_template_control_flow_limitation(
         return false;
     }
 
-    let source = String::from_utf8_lossy(content);
+    // Memoized: the regex pre-gate plus up to two full re-parses below run at
+    // most once per distinct content (see `expected_partial_memo`); render
+    // paths calling this repeatedly with unchanged content hit the cache.
+    expected_partial_memo(ExpectedPartialCheck::AngularControlFlow, content, || {
+        let source = String::from_utf8_lossy(content);
 
-    // The construct must actually be present; otherwise this limitation is not
-    // what we are looking at.
-    if !ANGULAR_CONTROL_FLOW_OPENER_RE.is_match(&source) {
-        return false;
-    }
+        // The construct must actually be present; otherwise this limitation is not
+        // what we are looking at.
+        if !ANGULAR_CONTROL_FLOW_OPENER_RE.is_match(&source) {
+            return false;
+        }
 
-    // Defensive: only meaningful for files that genuinely failed to parse. If the
-    // original parses clean there is no limitation to excuse.
-    let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
-        Ok(Ok((_, has_error, _, _, _))) => has_error,
-        _ => return false,
-    };
-    if !original_has_error {
-        return false;
-    }
+        // Defensive: only meaningful for files that genuinely failed to parse. If the
+        // original parses clean there is no limitation to excuse.
+        let original_has_error = match panic::catch_unwind(|| parse_source(&source, language)) {
+            Ok(Ok((_, has_error, _, _, _))) => has_error,
+            _ => return false,
+        };
+        if !original_has_error {
+            return false;
+        }
 
-    // Neutralize ONLY the relational operators inside each Angular control-flow
-    // opener's `(...)` expression, then re-parse the whole file. Each `<`/`>` in
-    // capture group 3 becomes a single space; the opener keyword, the parens, and
-    // every byte outside the matched openers (including ordinary HTML tag `<`/`>`)
-    // are preserved verbatim. A clean re-parse proves the relational operators were
-    // the sole cause.
-    let neutralized =
-        ANGULAR_CONTROL_FLOW_OPENER_RE.replace_all(&source, |caps: &regex::Captures| {
-            format!(
-                "{}{}{}{}",
-                &caps[1],
-                &caps[2],
-                caps[3].replace(['<', '>'], " "),
-                &caps[4],
-            )
-        });
-    match panic::catch_unwind(|| parse_source(&neutralized, language)) {
-        Ok(Ok((_, has_error, _, _, _))) => !has_error,
-        _ => false,
-    }
+        // Neutralize ONLY the relational operators inside each Angular control-flow
+        // opener's `(...)` expression, then re-parse the whole file. Each `<`/`>` in
+        // capture group 3 becomes a single space; the opener keyword, the parens, and
+        // every byte outside the matched openers (including ordinary HTML tag `<`/`>`)
+        // are preserved verbatim. A clean re-parse proves the relational operators were
+        // the sole cause.
+        let neutralized =
+            ANGULAR_CONTROL_FLOW_OPENER_RE.replace_all(&source, |caps: &regex::Captures| {
+                format!(
+                    "{}{}{}{}",
+                    &caps[1],
+                    &caps[2],
+                    caps[3].replace(['<', '>'], " "),
+                    &caps[4],
+                )
+            });
+        match panic::catch_unwind(|| parse_source(&neutralized, language)) {
+            Ok(Ok((_, has_error, _, _, _))) => !has_error,
+            _ => false,
+        }
+    })
 }
 
 /// Extract symbol name → body-hash pairs from source code using tree-sitter.
@@ -653,6 +735,42 @@ mod tests {
             is_expected_typescript_import_type_array_limitation(&LanguageId::TypeScript, source),
             "multi-dimensional import-type-array must be recognized as an expected limitation"
         );
+    }
+
+    /// Perf regression (review finding 1, post-v7.19.0): the expensive
+    /// neutralize-and-reparse classification must be computed at most once per
+    /// distinct content. The second lookup's compute closure panics, so this
+    /// fails loudly if the memo stops short-circuiting; distinct check kinds
+    /// and distinct content must not share verdicts.
+    #[test]
+    fn test_expected_partial_memo_hit_skips_recompute() {
+        // Unique content so parallel/preceding tests cannot pre-seed the key.
+        let content = b"memo-probe :: post-v7.19.0 review fix 1 :: unique";
+        assert!(expected_partial_memo(
+            ExpectedPartialCheck::TsImportTypeArray,
+            content,
+            || true
+        ));
+        // Memo hit: the closure must NOT run again for the same (check, content).
+        assert!(expected_partial_memo(
+            ExpectedPartialCheck::TsImportTypeArray,
+            content,
+            || panic!("verdict must come from the memo, not a recompute"),
+        ));
+        // The OTHER check kind on the same content is a distinct key.
+        assert!(!expected_partial_memo(
+            ExpectedPartialCheck::AngularControlFlow,
+            content,
+            || false
+        ));
+        // Different content (same length as `content`) is a distinct key.
+        let other = b"memo-probe :: post-v7.19.0 review fix 1 :: uniquf";
+        assert_eq!(content.len(), other.len());
+        assert!(!expected_partial_memo(
+            ExpectedPartialCheck::TsImportTypeArray,
+            other,
+            || false
+        ));
     }
 
     #[test]
