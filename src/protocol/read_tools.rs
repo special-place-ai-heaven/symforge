@@ -391,12 +391,14 @@ pub struct FindDependentsInput {
     /// Maximum number of dependent files to show (default 20, capped at 100).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub limit: Option<u32>,
-    /// Maximum number of reference lines per file (default 10, capped at 50).
+    /// Maximum number of reference lines per file (default 5, capped at 50).
     #[serde(default, deserialize_with = "lenient_u32")]
     pub max_per_file: Option<u32>,
     /// Output format: "text" (default), "mermaid", or "dot".
     pub format: Option<String>,
-    /// When true, show compact output: file:line [kind] without source text (60-75% smaller).
+    /// When true, show compact output: one line per dependent file as
+    /// `path (N refs: M call, K type_usage, J import)` with no source text
+    /// (60-75% smaller). Best for hub files with many dependents.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub compact: Option<bool>,
     /// When true, return an approximate token cost estimate instead of actual content.

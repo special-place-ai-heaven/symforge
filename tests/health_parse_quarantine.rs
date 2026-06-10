@@ -191,9 +191,18 @@ fn health_labels_angular_template_partial_as_expected_framework() {
         !full.contains("src/app/app.component.html [unexpected_partial]"),
         "Angular template partial must NOT be reported as a repo-owned unexpected partial: {full}"
     );
+    // The single framework partial fits in the quarantine registry, so the
+    // per-category section is deduped away; the registry carries it with its
+    // framework reason (asserted above). The framework path must appear exactly
+    // once across the whole report.
     assert!(
-        full.contains("Expected framework partial parse noise (1):"),
-        "framework partials should get their own labeled detail section: {full}"
+        !full.contains("Expected framework partial parse noise"),
+        "per-category framework section should be deduped when registry shows all: {full}"
+    );
+    assert_eq!(
+        full.matches("src/app/app.component.html").count(),
+        1,
+        "framework partial path must appear exactly once (registry only): {full}"
     );
 
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
