@@ -2540,6 +2540,43 @@ fn test_not_found_file_format() {
 }
 
 #[test]
+fn test_not_indexed_skipped_file_tier2_message() {
+    let result = not_indexed_skipped_file(
+        "package-lock.json",
+        AdmissionTier::MetadataOnly,
+        Some(SkipReason::DependencyLockfile),
+        Some(406 * 1024),
+    );
+    assert_eq!(
+        result,
+        "Not indexed: package-lock.json is Tier 2 (metadata only) — reason: lockfile, size 406 KB. \
+         Use get_file_content for raw reads if you need the contents."
+    );
+}
+
+#[test]
+fn test_not_indexed_skipped_file_tier3_message() {
+    let result = not_indexed_skipped_file(
+        "big.bin",
+        AdmissionTier::HardSkip,
+        Some(SkipReason::SizeCeiling),
+        Some(200 * 1024 * 1024),
+    );
+    assert!(
+        result.starts_with("Not indexed: big.bin is Tier 3 (hard-skipped) — reason: >100MB"),
+        "Tier-3 message should name tier and reason; got: {result}"
+    );
+}
+
+#[test]
+fn test_not_indexed_skipped_file_handles_missing_metadata() {
+    // Defensive: unknown reason/size must not panic and must render placeholders.
+    let result = not_indexed_skipped_file("vendor/x.lock", AdmissionTier::MetadataOnly, None, None);
+    assert!(result.contains("reason: skipped"), "got: {result}");
+    assert!(result.contains("size unknown"), "got: {result}");
+}
+
+#[test]
 fn test_not_found_symbol_lists_available() {
     let sym = make_symbol("existing_fn", SymbolKind::Function, 0, 1, 5);
     let (key, file) = make_file("src/lib.rs", b"fn existing_fn() {}", vec![sym]);
