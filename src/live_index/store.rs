@@ -1051,6 +1051,95 @@ impl SharedIndexHandle {
         true
     }
 
+    /// Generation-checked demotion of a single file to Tier 2/3.
+    ///
+    /// Atomically removes the path from the fully-indexed `files` map (if it was
+    /// Tier 1 before) and upserts its `SkippedFile` record. Used by the
+    /// single-file (re)index choke point to enforce admission tiering: a file
+    /// that classifies as metadata-only/hard-skip must never be parsed into the
+    /// index by the watcher event path or the freshen-on-read path.
+    ///
+    /// Returns `false` (without mutating) when `expected_gen` no longer matches
+    /// the live project generation, matching the stale-mutation fence used by
+    /// `update_file_at_generation` / `remove_file_at_generation`.
+    pub fn demote_to_skipped_at_generation(
+        &self,
+        path: &str,
+        sf: SkippedFile,
+        expected_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale file demotion"
+            );
+            return false;
+        }
+
+        let mut live = (*self.live.load_full()).clone();
+        let path_owned = path.to_string();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            live.demote_to_skipped(&path_owned, sf);
+        }));
+        match result {
+            Ok(()) => self.swap_and_publish(live),
+            Err(panic_info) => {
+                // Clone-mutate-swap means the original index is untouched on
+                // panic — no repair needed, just log and discard the clone.
+                let msg = panic_info
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown");
+                tracing::error!(
+                    "index demotion panicked for '{}': {} — original index preserved",
+                    path,
+                    msg
+                );
+            }
+        }
+        true
+    }
+
+    /// Generation-checked removal of any Tier-2/3 skip record for `path`.
+    ///
+    /// Called on the single-file reindex path when a file is admitted as Tier 1
+    /// again, so a previously-skipped path stops being counted in the Tier-2/3
+    /// totals. Only swaps a new index in when a record was actually removed, so
+    /// the common (no stale skip record) case is allocation-free after the
+    /// clone check. Returns `false` when the generation fence rejects the call.
+    pub fn clear_skipped_at_generation(&self, path: &str, expected_gen: u64) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale skip-record clear"
+            );
+            return false;
+        }
+
+        // Fast path: only clone + swap when a skip record actually exists.
+        let current = self.live.load_full();
+        if !current.skipped_files.iter().any(|sf| sf.path == path) {
+            return true;
+        }
+        let mut live = (*current).clone();
+        live.clear_skipped(path);
+        self.swap_and_publish(live);
+        true
+    }
+
     pub fn mark_snapshot_verify_running(&self) {
         let _wg = self.write_mutex.lock();
         let mut live = (*self.live.load_full()).clone();
@@ -1775,6 +1864,44 @@ impl LiveIndex {
 
     pub fn add_skipped_file(&mut self, sf: SkippedFile) {
         self.skipped_files.push(sf);
+    }
+
+    /// Demote a single file to Tier 2/3 (metadata-only or hard-skip).
+    ///
+    /// Used by the single-file (re)index choke point when admission classifies a
+    /// file as non-Tier-1. Performs the full transition atomically on this
+    /// `LiveIndex` clone:
+    /// 1. If the path is currently a fully-indexed Tier-1 file, remove it from
+    ///    `files` (and its derived indices). This handles a Tier 1 -> Tier 2
+    ///    transition, e.g. a source file that grew past the 1MB threshold.
+    /// 2. Upsert the `SkippedFile` record, replacing any stale record for the
+    ///    same path so `skipped_files` never accumulates duplicates or a stale
+    ///    tier/reason for one path.
+    ///
+    /// Mirrors the dedup invariant the bulk `load` path establishes (one record
+    /// per skipped path).
+    pub fn demote_to_skipped(&mut self, path: &str, sf: SkippedFile) {
+        // Drop the file from the fully-indexed store if it was Tier 1 before.
+        // `remove_file` is a no-op when the path is absent.
+        self.remove_file(path);
+        // Replace any existing skip record for this path, then insert the fresh
+        // one. Keeps exactly one record per path with the current tier/reason.
+        self.skipped_files.retain(|existing| existing.path != path);
+        self.skipped_files.push(sf);
+        self.is_empty = self.files.is_empty();
+        self.loaded_at_system = SystemTime::now();
+    }
+
+    /// Remove any Tier-2/3 skip record for `path`.
+    ///
+    /// Called when a previously-skipped file is admitted as Tier 1 again
+    /// (e.g. an oversized file shrank back under the threshold), so the file is
+    /// no longer double-counted as both indexed and skipped. No-op when no skip
+    /// record exists. Returns `true` when a record was removed.
+    pub fn clear_skipped(&mut self, path: &str) -> bool {
+        let before = self.skipped_files.len();
+        self.skipped_files.retain(|existing| existing.path != path);
+        self.skipped_files.len() != before
     }
 
     pub fn skipped_files(&self) -> &[SkippedFile] {
