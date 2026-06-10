@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.19.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.0...v7.19.1) (2026-06-10)
+
+
+### Bug Fixes
+
+* **conventions:** label a JS-majority folded bucket as JavaScript ([a3ca20a](https://github.com/special-place-ai-heaven/symforge/commit/a3ca20a293cb1c44ee827911188a67e3ba2d677c))
+* post-v7.19.0 code-review findings 1-4 (classifier memo, checkpoint receipt, anchor-only stem promotion, JS label) ([5b99c2d](https://github.com/special-place-ai-heaven/symforge/commit/5b99c2d95f58681deacc300f62a08dfe74c9f3ef))
+* **protocol:** disclose local-fallback in the checkpoint_now receipt ([1585469](https://github.com/special-place-ai-heaven/symforge/commit/1585469cc9d73353ce3d8fdaed9f3a0f9327cb21))
+* **rank:** restrict the SF-006 stem promotion to anchor scoring ([096391a](https://github.com/special-place-ai-heaven/symforge/commit/096391a60f475d498c2069d06536d756cac4edf7))
+
+
+### Performance Improvements
+
+* **parsing:** memoize SF-003/SF-004 expected-partial classification ([1eee2ac](https://github.com/special-place-ai-heaven/symforge/commit/1eee2ac8f3ab3ff7bafb09b021f473ce59008a00))
+
 ## [7.19.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.18.1...v7.19.0) (2026-06-09)
 
 
