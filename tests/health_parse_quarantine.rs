@@ -213,9 +213,18 @@ fn health_labels_angular_template_partial_as_expected_framework() {
         !full.contains("src/app/app.component.html [unexpected_partial]"),
         "Angular template partial must NOT be reported as a repo-owned unexpected partial: {full}"
     );
+    // The single framework partial fits in the quarantine registry, so the
+    // per-category section is deduped away; the registry carries it with its
+    // framework reason (asserted above). The framework path must appear exactly
+    // once across the whole report.
     assert!(
-        full.contains("Expected framework partial parse noise (1):"),
-        "framework partials should get their own labeled detail section: {full}"
+        !full.contains("Expected framework partial parse noise"),
+        "per-category framework section should be deduped when registry shows all: {full}"
+    );
+    assert_eq!(
+        full.matches("src/app/app.component.html").count(),
+        1,
+        "framework partial path must appear exactly once (registry only): {full}"
     );
 
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
@@ -257,9 +266,18 @@ fn health_labels_typescript_import_type_array_partial_as_expected_language() {
         !full.contains("src/app/types.ts [unexpected_partial]"),
         "language partial must NOT be reported as a repo-owned unexpected partial: {full}"
     );
+    // Item 6a (quarantine dedup): when the language partial already fits in the
+    // registry, the per-category "Expected language partial parse noise" section
+    // is suppressed so the path is listed exactly once (registry only) — never
+    // duplicated by a redundant detail section.
+    assert_eq!(
+        full.matches("src/app/types.ts").count(),
+        1,
+        "language partial path must appear exactly once (registry only), not duplicated by a per-category section: {full}"
+    );
     assert!(
-        full.contains("Expected language partial parse noise (1):"),
-        "language partials should get their own labeled detail section: {full}"
+        !full.contains("Expected language partial parse noise (not shown above)"),
+        "no overflow section should render when the registry already shows every language partial: {full}"
     );
 
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);

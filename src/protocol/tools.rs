@@ -2673,7 +2673,16 @@ fn render_search_text_output(
     } else {
         0.95
     };
-    let output = format::search_text_result_view(result, group_by, terms, Some(confidence));
+    let output = format::search_text_result_view(
+        result,
+        group_by,
+        terms,
+        Some(confidence),
+        format::SearchSuggestionContext {
+            regex: is_regex,
+            include_tests: options.noise_policy.include_tests,
+        },
+    );
     let mut rendered = match envelope {
         Some(envelope) => format!("{envelope}\n\n{output}"),
         None => output,
@@ -2735,7 +2744,16 @@ fn sidecar_status_for_server(server: &SymForgeServer) -> crate::sidecar::port_fi
 /// when we win, when there is no shadow, or when `current_exe()` is unresolvable.
 fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     let our_binary = std::env::current_exe().ok()?;
-    crate::path_shadow::detect_shadow(&our_binary)
+    let mut report = crate::path_shadow::detect_shadow(&our_binary)?;
+    // `detect_shadow` probes our_version via a bounded `<binary> --version`
+    // subprocess, which can flake/time out under load — that produced
+    // "(version unknown)" on one health surface while another showed the real
+    // version in the same session. We ARE the running binary, so source our
+    // version from the compile-time package version instead of a subprocess.
+    // (Leave the shadow's version probed, since that is genuinely a foreign
+    // binary we cannot introspect statically.)
+    report.our_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    Some(report)
 }
 
 /// Extract the `version=<token>` value emitted on the runtime-status line of a
@@ -6289,8 +6307,11 @@ impl SymForgeServer {
             loading_guard!(guard);
             guard.capture_find_dependents_view(&input.path)
         };
+        // Default per-file reference detail is capped at 5 lines (not 10) so the
+        // non-compact view stays bounded on hub files with dozens of dependents;
+        // callers can raise it with max_per_file or switch to compact=true.
         let limits =
-            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(10));
+            format::OutputLimits::new(input.limit.unwrap_or(20), input.max_per_file.unwrap_or(5));
         let fmt = input.format.as_deref().unwrap_or("text");
         let output = match fmt {
             "mermaid" => format::find_dependents_mermaid(&view, &input.path, &limits),
@@ -9424,6 +9445,54 @@ mod tests {
         assert!(
             result.contains("Scope: repo-wide symbol token `target`"),
             "default symbol context should surface repo-wide scope; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_context_reference_list_uses_actual_enclosing_kind() {
+        // Regression: reference entries used to render every enclosing symbol as
+        // "in fn <name>" regardless of kind, yielding nonsense like
+        // "in fn impl BucketManager". The enclosing kind must be honored, and an
+        // impl/struct whose stored name already carries the kind prefix must not
+        // double it.
+        let impl_sym = make_symbol("impl BucketManager", SymbolKind::Impl, 1, 5);
+        let caller_file = make_file_with_refs(
+            "src/bucket.rs",
+            b"impl BucketManager {\n    fn f(&self) { target(); }\n}\n",
+            vec![impl_sym],
+            vec![ReferenceRecord {
+                name: "target".to_string(),
+                qualified_name: None,
+                kind: ReferenceKind::Call,
+                byte_range: (38, 44),
+                line_range: (1, 1),
+                enclosing_symbol_index: Some(0),
+            }],
+        );
+        let server = make_server(make_live_index_ready(vec![caller_file]));
+
+        let result = server
+            .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                name: "target".to_string(),
+                file: None,
+                path: None,
+                symbol_kind: None,
+                symbol_line: None,
+                verbosity: None,
+                bundle: None,
+                sections: None,
+                max_tokens: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("in impl BucketManager"),
+            "reference list should render the actual enclosing kind; got: {result}"
+        );
+        assert!(
+            !result.contains("in fn impl BucketManager"),
+            "reference list must not hardcode 'fn' nor double the kind; got: {result}"
         );
     }
 
@@ -12833,6 +12902,22 @@ mod tests {
             !result.contains("Snapshot:"),
             "fresh compact health should omit snapshot verification lines"
         );
+    }
+
+    #[test]
+    fn test_current_exe_shadow_report_sources_our_version_from_package() {
+        // Item 6c: our version must come from the compile-time package version,
+        // not a flaky `<binary> --version` subprocess probe. This keeps the
+        // full and compact health surfaces consistent (no "(version unknown)"
+        // on one and the real version on the other). When no shadow exists the
+        // report is None and the invariant holds vacuously.
+        if let Some(report) = super::current_exe_shadow_report() {
+            assert_eq!(
+                report.our_version.as_deref(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "our_version must be the compile-time package version, never an unknown probe result"
+            );
+        }
     }
 
     #[tokio::test]

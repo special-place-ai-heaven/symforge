@@ -215,6 +215,13 @@ impl ParseQuarantineSummary {
         self.total_count.saturating_sub(self.entries.len())
     }
 
+    /// Paths already shown in the quarantine registry's numbered list. Used by
+    /// the per-category health sections to avoid re-listing entries the registry
+    /// already displays (they only render genuinely-omitted overflow paths).
+    fn shown_paths(&self) -> std::collections::HashSet<&str> {
+        self.entries.iter().map(|e| e.path.as_str()).collect()
+    }
+
     fn full_section(&self) -> Option<String> {
         if self.is_empty() {
             return None;
@@ -851,7 +858,16 @@ pub fn search_text_result_with_options(
     regex: bool,
 ) -> String {
     let result = search::search_text(index, query, terms, regex);
-    search_text_result_view(result, None, None, None)
+    search_text_result_view(
+        result,
+        None,
+        None,
+        None,
+        SearchSuggestionContext {
+            regex,
+            include_tests: false,
+        },
+    )
 }
 
 /// Returns true if the line looks like an import statement or a non-doc comment.
@@ -883,11 +899,41 @@ pub fn is_noise_line(line: &str) -> bool {
         || (trimmed.starts_with("var ") && trimmed.contains("require("))
 }
 
+/// Context for building context-aware suggestions on a zero-hit search.
+///
+/// Lets the empty-result message avoid self-referential advice — e.g. it must
+/// not suggest `regex=true` when the search already set it, nor
+/// `include_tests=true` when tests are already included.
+#[derive(Clone, Copy, Default)]
+pub struct SearchSuggestionContext {
+    pub regex: bool,
+    pub include_tests: bool,
+}
+
+/// Build the suggestion list for a zero-hit (non-structural) literal/regex
+/// search, dropping any suggestion that the caller already enabled.
+fn no_match_suggestions(ctx: SearchSuggestionContext) -> String {
+    let mut suggestions: Vec<&str> = vec!["try search_symbols(query=...) for symbol names"];
+    if ctx.regex {
+        // regex already on — suggest relaxing the pattern instead of enabling it.
+        suggestions.push("simplify the regex or use literal terms=[...] instead");
+    } else {
+        suggestions.push("use regex=true for pattern matching");
+    }
+    if !ctx.include_tests {
+        suggestions.push("broaden with include_tests=true / include_generated=true");
+    } else {
+        suggestions.push("broaden with include_generated=true or a wider path_prefix");
+    }
+    suggestions.join(", ")
+}
+
 pub fn search_text_result_view(
     result: Result<search::TextSearchResult, search::TextSearchError>,
     group_by: Option<&str>,
     terms: Option<&[String]>,
     match_confidence: Option<f32>,
+    suggestion_ctx: SearchSuggestionContext,
 ) -> String {
     let result = match result {
         Ok(result) => result,
@@ -966,19 +1012,21 @@ pub fn search_text_result_view(
         // counter, so avoid the earlier "Pattern parsed OK" overclaim and
         // just point at the levers that widen the search.
         if result.label.starts_with("structural ") {
+            let widen = if suggestion_ctx.include_tests {
+                "include_generated=true / broader path_prefix"
+            } else {
+                "include_tests=true / include_generated=true / broader path_prefix"
+            };
             return format!(
                 "No AST matches for {}. Consider widening the search \
-                 (include_tests=true / include_generated=true / broader path_prefix) \
-                 or simplifying the pattern.",
+                 ({widen}) or simplifying the pattern.",
                 result.label
             );
         }
         return format!(
-            "No matches for {}. Suggestions: \
-             try search_symbols(query=...) for symbol names, \
-             or use regex=true for pattern matching, \
-             or broaden with include_tests=true / include_generated=true.",
-            result.label
+            "No matches for {}. Suggestions: {}.",
+            result.label,
+            no_match_suggestions(suggestion_ctx)
         );
     }
 
@@ -1896,136 +1944,105 @@ pub fn health_report_from_stats(
         );
     }
 
-    if let Some(section) = ParseQuarantineSummary::from_stats(stats).full_section() {
+    // The Parse/span quarantine registry below already lists the first
+    // PARSE_QUARANTINE_ENTRY_LIMIT quarantined paths across ALL categories with
+    // category labels. The per-category sections that follow used to re-list the
+    // SAME paths, doubling every quarantined path in the output. To dedup, the
+    // per-category sections now render only paths NOT already shown in the
+    // registry (i.e. the genuinely-omitted overflow), and are skipped entirely
+    // when the registry already shows everything.
+    let quarantine = ParseQuarantineSummary::from_stats(stats);
+    let shown_in_registry = quarantine.shown_paths();
+    if let Some(section) = quarantine.full_section() {
         output.push('\n');
         output.push_str(&section);
     }
 
-    if stats.unexpected_partial_parse_count > 0 {
-        output.push_str(&format!(
-            "\nUnexpected repo-owned partial parse files ({}):\n",
-            stats.unexpected_partial_parse_count
-        ));
-        for (i, path) in stats
-            .unexpected_partial_parse_files
+    // Helper: render a per-category overflow section listing only the paths that
+    // the registry omitted. `decorate` formats each path line body (without the
+    // leading "  N. " counter).
+    let render_overflow = |output: &mut String,
+                           header: &str,
+                           overflow_noun: &str,
+                           paths: &[String],
+                           decorate: &dyn Fn(&str) -> String| {
+        let remaining: Vec<&String> = paths
             .iter()
-            .take(10)
-            .enumerate()
-        {
-            output.push_str(&format!("  {}. {}\n", i + 1, path));
+            .filter(|p| !shown_in_registry.contains(p.as_str()))
+            .collect();
+        if remaining.is_empty() {
+            return;
         }
-        let rendered = stats.unexpected_partial_parse_files.len().min(10);
-        let omitted = stats
-            .unexpected_partial_parse_count
-            .saturating_sub(rendered);
+        output.push_str(&format!("\n{} ({}):\n", header, remaining.len()));
+        for (i, path) in remaining.iter().take(10).enumerate() {
+            output.push_str(&format!("  {}. {}\n", i + 1, decorate(path)));
+        }
+        let omitted = remaining.len().saturating_sub(10);
         if omitted > 0 {
-            output.push_str(&format!(
-                "  ... and {} more unexpected partial files\n",
-                omitted
-            ));
+            output.push_str(&format!("  ... and {} more {}\n", omitted, overflow_noun));
         }
+    };
+
+    if stats.unexpected_partial_parse_count > 0 {
+        render_overflow(
+            &mut output,
+            "Unexpected repo-owned partial parse files (not shown above)",
+            "unexpected partial files",
+            &stats.unexpected_partial_parse_files,
+            &|path| path.to_string(),
+        );
     }
 
     if stats.expected_vendor_partial_parse_count > 0 {
-        output.push_str(&format!(
-            "\nExpected vendor partial parse noise ({}):\n",
-            stats.expected_vendor_partial_parse_count
-        ));
-        for (i, path) in stats
-            .expected_vendor_partial_parse_files
-            .iter()
-            .take(10)
-            .enumerate()
-        {
-            output.push_str(&format!(
-                "  {}. {} [{}]\n",
-                i + 1,
-                path,
-                EXPECTED_VENDOR_PARTIAL_PARSE_REASON
-            ));
-        }
-        let rendered = stats.expected_vendor_partial_parse_files.len().min(10);
-        let omitted = stats
-            .expected_vendor_partial_parse_count
-            .saturating_sub(rendered);
-        if omitted > 0 {
-            output.push_str(&format!(
-                "  ... and {} more expected vendor partial files\n",
-                omitted
-            ));
-        }
+        render_overflow(
+            &mut output,
+            "Expected vendor partial parse noise (not shown above)",
+            "expected vendor partial files",
+            &stats.expected_vendor_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_VENDOR_PARTIAL_PARSE_REASON),
+        );
     }
 
     if stats.expected_framework_partial_parse_count > 0 {
-        output.push_str(&format!(
-            "\nExpected framework partial parse noise ({}):\n",
-            stats.expected_framework_partial_parse_count
-        ));
-        for (i, path) in stats
-            .expected_framework_partial_parse_files
-            .iter()
-            .take(10)
-            .enumerate()
-        {
-            output.push_str(&format!(
-                "  {}. {} [{}]\n",
-                i + 1,
-                path,
-                EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON
-            ));
-        }
-        let rendered = stats.expected_framework_partial_parse_files.len().min(10);
-        let omitted = stats
-            .expected_framework_partial_parse_count
-            .saturating_sub(rendered);
-        if omitted > 0 {
-            output.push_str(&format!(
-                "  ... and {} more expected framework partial files\n",
-                omitted
-            ));
-        }
+        render_overflow(
+            &mut output,
+            "Expected framework partial parse noise (not shown above)",
+            "expected framework partial files",
+            &stats.expected_framework_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON),
+        );
     }
 
     if stats.expected_language_partial_parse_count > 0 {
-        output.push_str(&format!(
-            "\nExpected language partial parse noise ({}):\n",
-            stats.expected_language_partial_parse_count
-        ));
-        for (i, path) in stats
-            .expected_language_partial_parse_files
-            .iter()
-            .take(10)
-            .enumerate()
-        {
-            output.push_str(&format!(
-                "  {}. {} [{}]\n",
-                i + 1,
-                path,
-                EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON
-            ));
-        }
-        let rendered = stats.expected_language_partial_parse_files.len().min(10);
-        let omitted = stats
-            .expected_language_partial_parse_count
-            .saturating_sub(rendered);
-        if omitted > 0 {
-            output.push_str(&format!(
-                "  ... and {} more expected language partial files\n",
-                omitted
-            ));
-        }
+        render_overflow(
+            &mut output,
+            "Expected language partial parse noise (not shown above)",
+            "expected language partial files",
+            &stats.expected_language_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON),
+        );
     }
 
     if !stats.failed_files.is_empty() {
-        output.push_str(&format!("\nFailed files ({}):\n", stats.failed_files.len()));
-        for (i, (path, error)) in stats.failed_files.iter().take(10).enumerate() {
-            output.push_str(&format!("  {}. {} — {}\n", i + 1, path, error));
-        }
-        if stats.failed_files.len() > 10 {
+        let remaining: Vec<&(String, String)> = stats
+            .failed_files
+            .iter()
+            .filter(|(path, _)| !shown_in_registry.contains(path.as_str()))
+            .collect();
+        if !remaining.is_empty() {
             output.push_str(&format!(
-                "  ... and {} more failed files\n",
-                stats.failed_files.len() - 10
+                "\nFailed files (not shown above) ({}):\n",
+                remaining.len()
             ));
+            for (i, (path, error)) in remaining.iter().take(10).enumerate() {
+                output.push_str(&format!("  {}. {} — {}\n", i + 1, path, error));
+            }
+            if remaining.len() > 10 {
+                output.push_str(&format!(
+                    "  ... and {} more failed files\n",
+                    remaining.len() - 10
+                ));
+            }
         }
     }
 
@@ -3149,34 +3166,28 @@ pub fn find_dependents_compact_view(
 
     for file in view.files.iter().take(limits.max_files) {
         let total_refs = file.lines.len();
-        let shown_refs = total_refs.min(limits.max_per_file);
-        let kinds: Vec<&str> = file
-            .lines
-            .iter()
-            .take(limits.max_per_file)
-            .map(|l| l.kind.as_str())
-            .collect();
-        let summary = if kinds.is_empty() {
-            file.file_path.clone()
+        // Count references by kind across ALL lines for this file (not just the
+        // first max_per_file), so the per-file summary reflects the true totals.
+        let mut kind_counts: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for line in &file.lines {
+            *kind_counts.entry(line.kind.as_str()).or_insert(0) += 1;
+        }
+        let summary = if kind_counts.is_empty() {
+            format!("  {}  ({total_refs} refs)", file.file_path)
         } else {
-            let unique_kinds: Vec<&str> = {
-                let mut k = kinds.clone();
-                k.sort_unstable();
-                k.dedup();
-                k
-            };
+            let breakdown: Vec<String> = kind_counts
+                .iter()
+                .map(|(kind, count)| format!("{count} {kind}"))
+                .collect();
             format!(
                 "  {}  ({} refs: {})",
                 file.file_path,
                 total_refs,
-                unique_kinds.join(", ")
+                breakdown.join(", ")
             )
         };
         lines.push(summary);
-        let remaining = total_refs.saturating_sub(shown_refs);
-        if remaining > 0 {
-            // still count but don't show individual lines
-        }
     }
 
     let remaining_files = total_files.saturating_sub(shown_files);
@@ -3654,7 +3665,7 @@ pub fn inspect_match_result_view(view: &InspectMatchView) -> String {
                 let chain: Vec<String> = found
                     .parent_chain
                     .iter()
-                    .map(|p| format!("{} {}", p.kind_label, p.name))
+                    .map(|p| symbol_kind_name_label(&p.kind_label, &p.name))
                     .collect();
                 output.push_str(&chain.join(" → "));
             }
@@ -3676,10 +3687,35 @@ pub fn inspect_match_result_view(view: &InspectMatchView) -> String {
     }
 }
 
+/// Join a symbol kind label and name without doubling the kind token when the
+/// name already begins with it. Some symbols (notably `impl`/`trait` blocks)
+/// store a display name that already carries the kind prefix, e.g. the `impl`
+/// block for `LanguageId` is stored as name "impl LanguageId" with kind "impl".
+/// Naively prepending the kind label then yields "impl impl LanguageId". When
+/// the name already starts with the kind token followed by whitespace (or equals
+/// it exactly), this returns the name unchanged; otherwise it prepends the kind.
+pub(crate) fn symbol_kind_name_label(kind_label: &str, name: &str) -> String {
+    if kind_label.is_empty() {
+        return name.to_string();
+    }
+    let trimmed = name.trim_start();
+    let already_prefixed = trimmed == kind_label
+        || trimmed
+            .strip_prefix(kind_label)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if already_prefixed {
+        name.to_string()
+    } else {
+        format!("{kind_label} {name}")
+    }
+}
+
 fn format_enclosing(enclosing: &crate::live_index::EnclosingSymbolView) -> String {
     format!(
-        "\nEnclosing symbol: {} {} (lines {}-{})",
-        enclosing.kind_label, enclosing.name, enclosing.line_range.0, enclosing.line_range.1
+        "\nEnclosing symbol: {} (lines {}-{})",
+        symbol_kind_name_label(&enclosing.kind_label, &enclosing.name),
+        enclosing.line_range.0,
+        enclosing.line_range.1
     )
 }
 
