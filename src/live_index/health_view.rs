@@ -253,11 +253,12 @@ impl LiveIndex {
     /// `ignore` crate — the `ignore` crate models gitignore rules but has no concept
     /// of which files are tracked.
     ///
-    /// Covers BOTH discovery paths uniformly: it reads `self.files` (the Tier-1
-    /// population) regardless of whether the index was built by `LiveIndex::load`
-    /// (`discover_all_files`) or the watcher's `build_reload_data`
-    /// (`discover_files`). The two paths admit different Tier-2 populations, but the
-    /// Tier-1 set this count inspects lives in `self.files` either way.
+    /// Covers BOTH index-build paths uniformly: it reads `self.files` (the
+    /// Tier-1 population) regardless of whether the index was built by
+    /// `LiveIndex::load` or `build_reload_data` (the reload / `index_folder`
+    /// path). Both now run the same admission pipeline over `discover_all_files`,
+    /// so they admit the same Tier-2 population; the Tier-1 set this count
+    /// inspects lives in `self.files` either way.
     fn count_untracked_indexed(&self) -> usize {
         // Fail open: no recorded root means we cannot anchor a git lookup.
         let Some(root) = self.indexed_root.as_ref() else {

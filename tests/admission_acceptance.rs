@@ -165,12 +165,14 @@ fn test_admission_tier_acceptance() {
 // Test 1b: admission-tier assignment is stable across a reindex
 //
 // The live index does NOT persist admission tier: `IndexSnapshot` only carries
-// Tier-1 indexed files, and `snapshot_to_live_index` / `build_reload_data`
-// both reset `skipped_files` to empty. Tier assignment is therefore recomputed
-// on every fresh `LiveIndex::load`. This test asserts that the recomputation
-// is deterministic — two back-to-back loads of the same directory tree must
-// produce byte-identical tier assignments and skip reasons for every file, so
-// `health` output stays honest after a cold start or a manual reindex.
+// Tier-1 indexed files, and `snapshot_to_live_index` resets `skipped_files` to
+// empty (a snapshot restore re-derives tiers on the next reconcile). Tier
+// assignment is therefore recomputed by the admission gate on every fresh
+// `LiveIndex::load` AND on every `build_reload_data` (the reload / `index_folder`
+// path now runs the same admission pipeline). This test asserts that the
+// recomputation is deterministic — two back-to-back loads of the same directory
+// tree must produce byte-identical tier assignments and skip reasons for every
+// file, so `health` output stays honest after a cold start or a manual reindex.
 // ---------------------------------------------------------------------------
 
 /// Flat, comparable snapshot of the admission-gate output for one load.
