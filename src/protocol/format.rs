@@ -35,7 +35,8 @@ impl Default for OutputLimits {
 
 use crate::domain::index::{AdmissionTier, SkippedFile};
 use crate::live_index::query::{
-    EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
+    EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
+    EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
 };
 use crate::live_index::{
     ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
@@ -54,6 +55,7 @@ enum ParseQuarantineKind {
     UnexpectedPartial,
     ExpectedVendorPartial,
     ExpectedFrameworkPartial,
+    ExpectedLanguagePartial,
     Failed,
 }
 
@@ -63,6 +65,7 @@ impl ParseQuarantineKind {
             Self::UnexpectedPartial => "unexpected_partial",
             Self::ExpectedVendorPartial => "expected_vendor_partial",
             Self::ExpectedFrameworkPartial => "expected_framework_partial",
+            Self::ExpectedLanguagePartial => "expected_language_partial",
             Self::Failed => "failed",
         }
     }
@@ -81,6 +84,7 @@ struct ParseQuarantineSummary {
     unexpected_partial_count: usize,
     expected_vendor_partial_count: usize,
     expected_framework_partial_count: usize,
+    expected_language_partial_count: usize,
     failed_count: usize,
     entries: Vec<ParseQuarantineEntry>,
 }
@@ -91,6 +95,7 @@ impl ParseQuarantineSummary {
             stats.unexpected_partial_parse_count,
             stats.expected_vendor_partial_parse_count,
             stats.expected_framework_partial_parse_count,
+            stats.expected_language_partial_parse_count,
             stats.failed_count,
         );
         for path in &stats.unexpected_partial_parse_files {
@@ -114,6 +119,13 @@ impl ParseQuarantineSummary {
                 EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
             );
         }
+        for path in &stats.expected_language_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedLanguagePartial,
+                EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
+            );
+        }
         for (path, error) in &stats.failed_files {
             summary.push(path, ParseQuarantineKind::Failed, error);
         }
@@ -125,6 +137,7 @@ impl ParseQuarantineSummary {
             published.unexpected_partial_parse_count,
             published.expected_vendor_partial_parse_count,
             published.expected_framework_partial_parse_count,
+            published.expected_language_partial_parse_count,
             published.failed_count,
         );
         for path in &published.unexpected_partial_parse_files {
@@ -148,6 +161,13 @@ impl ParseQuarantineSummary {
                 EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
             );
         }
+        for path in &published.expected_language_partial_parse_files {
+            summary.push(
+                path,
+                ParseQuarantineKind::ExpectedLanguagePartial,
+                EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
+            );
+        }
         for (path, error) in &published.failed_files {
             summary.push(path, ParseQuarantineKind::Failed, error);
         }
@@ -158,16 +178,19 @@ impl ParseQuarantineSummary {
         unexpected_partial_count: usize,
         expected_vendor_partial_count: usize,
         expected_framework_partial_count: usize,
+        expected_language_partial_count: usize,
         failed_count: usize,
     ) -> Self {
         Self {
             total_count: unexpected_partial_count
                 + expected_vendor_partial_count
                 + expected_framework_partial_count
+                + expected_language_partial_count
                 + failed_count,
             unexpected_partial_count,
             expected_vendor_partial_count,
             expected_framework_partial_count,
+            expected_language_partial_count,
             failed_count,
             entries: Vec::new(),
         }
@@ -198,11 +221,12 @@ impl ParseQuarantineSummary {
         }
 
         let mut section = format!(
-            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} failed={} showing={} omitted={}",
+            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} omitted={}",
             self.total_count,
             self.unexpected_partial_count,
             self.expected_vendor_partial_count,
             self.expected_framework_partial_count,
+            self.expected_language_partial_count,
             self.failed_count,
             self.entries.len(),
             self.omitted_count()
@@ -225,11 +249,12 @@ impl ParseQuarantineSummary {
         }
 
         Some(format!(
-            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} failed={} showing={} omitted={}",
+            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} omitted={}",
             self.total_count,
             self.unexpected_partial_count,
             self.expected_vendor_partial_count,
             self.expected_framework_partial_count,
+            self.expected_language_partial_count,
             self.failed_count,
             self.entries.len(),
             self.omitted_count()
@@ -1583,6 +1608,7 @@ pub fn health_report_from_published_state(
         unexpected_partial_parse_count: published.unexpected_partial_parse_count,
         expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
         expected_framework_partial_parse_count: published.expected_framework_partial_parse_count,
+        expected_language_partial_parse_count: published.expected_language_partial_parse_count,
         failed_count: published.failed_count,
         load_duration: published.load_duration,
         watcher_state: watcher.state.clone(),
@@ -1598,6 +1624,9 @@ pub fn health_report_from_published_state(
         expected_vendor_partial_parse_files: published.expected_vendor_partial_parse_files.clone(),
         expected_framework_partial_parse_files: published
             .expected_framework_partial_parse_files
+            .clone(),
+        expected_language_partial_parse_files: published
+            .expected_language_partial_parse_files
             .clone(),
         failed_files: published.failed_files.clone(),
         tier_counts: published.tier_counts,
@@ -1861,6 +1890,10 @@ pub fn health_report_from_stats(
         output.push_str(
             "\nParse resilience: expected framework partial files kept best-effort symbols; they are labeled as framework template parser noise below.",
         );
+    } else if stats.expected_language_partial_parse_count > 0 {
+        output.push_str(
+            "\nParse resilience: expected language partial files kept best-effort symbols; they are labeled as host-language grammar parser noise below.",
+        );
     }
 
     if let Some(section) = ParseQuarantineSummary::from_stats(stats).full_section() {
@@ -1948,6 +1981,36 @@ pub fn health_report_from_stats(
         if omitted > 0 {
             output.push_str(&format!(
                 "  ... and {} more expected framework partial files\n",
+                omitted
+            ));
+        }
+    }
+
+    if stats.expected_language_partial_parse_count > 0 {
+        output.push_str(&format!(
+            "\nExpected language partial parse noise ({}):\n",
+            stats.expected_language_partial_parse_count
+        ));
+        for (i, path) in stats
+            .expected_language_partial_parse_files
+            .iter()
+            .take(10)
+            .enumerate()
+        {
+            output.push_str(&format!(
+                "  {}. {} [{}]\n",
+                i + 1,
+                path,
+                EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON
+            ));
+        }
+        let rendered = stats.expected_language_partial_parse_files.len().min(10);
+        let omitted = stats
+            .expected_language_partial_parse_count
+            .saturating_sub(rendered);
+        if omitted > 0 {
+            output.push_str(&format!(
+                "  ... and {} more expected language partial files\n",
                 omitted
             ));
         }
