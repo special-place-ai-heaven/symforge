@@ -160,6 +160,35 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
     let mut dto_validator_files = 0u32;
     let mut signal_files = 0u32;
 
+    // Python counters.
+    let mut py_try_except_count = 0u32;
+    let mut py_raise_count = 0u32;
+    let mut py_suppress_count = 0u32;
+
+    // Go counters.
+    let mut go_err_check_count = 0u32;
+    let mut go_err_construct_count = 0u32;
+    let mut go_panic_count = 0u32;
+
+    // Kotlin counters.
+    let mut kt_try_catch_count = 0u32;
+    let mut kt_runcatching_count = 0u32;
+    let mut kt_throws_count = 0u32;
+
+    // Elixir counters.
+    let mut ex_ok_error_tuple_count = 0u32;
+    let mut ex_with_else_count = 0u32;
+    let mut ex_raise_rescue_count = 0u32;
+
+    // Language-agnostic naming tally, computed over files whose language matches
+    // the dominant bucket. Powers a non-empty Naming line for EVERY language
+    // (snake_case vs camelCase functions, PascalCase types) — see SF-STRESS-021.
+    let mut primary_snake_fns = 0u32;
+    let mut primary_camel_fns = 0u32;
+    let mut primary_total_fns = 0u32;
+    let mut primary_pascal_types = 0u32;
+    let mut primary_total_types = 0u32;
+
     // Language-agnostic counters.
     let mut test_file_count = 0u32;
 
@@ -206,6 +235,17 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
             file.language,
             LanguageId::TypeScript | LanguageId::JavaScript
         );
+        let is_python = file.language == LanguageId::Python;
+        let is_go = file.language == LanguageId::Go;
+        let is_kotlin = file.language == LanguageId::Kotlin;
+        let is_elixir = file.language == LanguageId::Elixir;
+        // A file counts toward the language-agnostic naming tally when its
+        // language matches the reported dominant bucket (JS/TS folded).
+        let is_primary_lang_file = code_language_bucket(&file.language)
+            .map(|bucket| {
+                bucket == primary_lang || (primary_lang == "JavaScript" && bucket == "TypeScript")
+            })
+            .unwrap_or(false);
 
         // Error-handling patterns — gated by the FILE's language, not just the
         // summary branch, so non-Rust files never pollute the `Result`/`anyhow`
@@ -276,6 +316,86 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
             }
             if content_str.contains("signal(") || content_str.contains("inject(") {
                 signal_files += 1;
+            }
+        } else if is_python {
+            // Python: try/except, raise X, contextlib.suppress.
+            if content_str.contains("try:")
+                && (content_str.contains("except ") || content_str.contains("except:"))
+            {
+                py_try_except_count += 1;
+            }
+            if content_str.contains("raise ") {
+                py_raise_count += 1;
+            }
+            if content_str.contains("suppress(") || content_str.contains("contextlib.suppress") {
+                py_suppress_count += 1;
+            }
+        } else if is_go {
+            // Go: `if err != nil` checks, error constructors, panic.
+            go_err_check_count += content_str.matches("if err != nil").count() as u32;
+            if content_str.contains("errors.New")
+                || content_str.contains("fmt.Errorf")
+                || content_str.contains("errors.Wrap")
+            {
+                go_err_construct_count += 1;
+            }
+            go_panic_count += content_str.matches("panic(").count() as u32;
+        } else if is_kotlin {
+            // Kotlin: try/catch, Result/runCatching, @Throws.
+            if content_str.contains("try {") || content_str.contains("} catch") {
+                kt_try_catch_count += 1;
+            }
+            if content_str.contains("runCatching") || content_str.contains("Result<") {
+                kt_runcatching_count += 1;
+            }
+            if content_str.contains("@Throws") {
+                kt_throws_count += 1;
+            }
+        } else if is_elixir {
+            // Elixir: {:ok, _}/{:error, _} tuple returns, with/else, raise/rescue.
+            if content_str.contains("{:ok,") || content_str.contains("{:error,") {
+                ex_ok_error_tuple_count += 1;
+            }
+            if content_str.contains("with ") && content_str.contains("else") {
+                ex_with_else_count += 1;
+            }
+            if content_str.contains("raise ") || content_str.contains("rescue") {
+                ex_raise_rescue_count += 1;
+            }
+        }
+
+        // Language-agnostic naming tally over dominant-language files: powers a
+        // non-empty Naming line for EVERY language (not just Rust / TS-JS).
+        if is_primary_lang_file {
+            for sym in &file.symbols {
+                match sym.kind {
+                    crate::domain::index::SymbolKind::Function
+                    | crate::domain::index::SymbolKind::Method => {
+                        primary_total_fns += 1;
+                        let name = &sym.name;
+                        // snake_case wins when it contains `_` and is all-lower;
+                        // otherwise a lowercase-initial name with no `_` is camelCase.
+                        if name.contains('_') && *name == name.to_ascii_lowercase() {
+                            primary_snake_fns += 1;
+                        } else if name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                            && !name.contains('_')
+                        {
+                            primary_camel_fns += 1;
+                        }
+                    }
+                    crate::domain::index::SymbolKind::Struct
+                    | crate::domain::index::SymbolKind::Class
+                    | crate::domain::index::SymbolKind::Enum
+                    | crate::domain::index::SymbolKind::Trait
+                    | crate::domain::index::SymbolKind::Interface
+                    | crate::domain::index::SymbolKind::Type => {
+                        primary_total_types += 1;
+                        if sym.name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                            primary_pascal_types += 1;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -372,7 +492,8 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
                 && http_exception_count == 0
                 && catch_error_count == 0
             {
-                "Minimal explicit error handling detected (no try/catch or throw found).".to_string()
+                "Minimal explicit error handling detected (no try/catch or throw found)."
+                    .to_string()
             } else {
                 let mut parts: Vec<String> = Vec::new();
                 if try_catch_count > 0 {
@@ -392,7 +513,79 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
                 format!("Exception-based: {}", parts.join(", "))
             }
         }
-        _ => "Error handling: language-specific heuristics unavailable for this project's dominant language.".to_string(),
+        "Python" => {
+            if py_try_except_count == 0 && py_raise_count == 0 && py_suppress_count == 0 {
+                "Minimal explicit error handling detected (no try/except or raise found)."
+                    .to_string()
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                if py_try_except_count > 0 {
+                    parts.push(format!("try/except in {py_try_except_count} files"));
+                }
+                if py_raise_count > 0 {
+                    parts.push(format!("`raise` in {py_raise_count} files"));
+                }
+                if py_suppress_count > 0 {
+                    parts.push(format!("contextlib.suppress in {py_suppress_count} files"));
+                }
+                format!("Exception-based: {}", parts.join(", "))
+            }
+        }
+        "Go" => {
+            if go_err_check_count == 0 && go_err_construct_count == 0 && go_panic_count == 0 {
+                "Minimal explicit error handling detected (no `if err != nil` found).".to_string()
+            } else {
+                format!(
+                    "Value-based: {go_err_check_count} `if err != nil` checks, errors.New/fmt.Errorf in {go_err_construct_count} files, {go_panic_count} panic()s"
+                )
+            }
+        }
+        "Kotlin" => {
+            if kt_try_catch_count == 0 && kt_runcatching_count == 0 && kt_throws_count == 0 {
+                "Minimal explicit error handling detected (no try/catch or runCatching found)."
+                    .to_string()
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                if kt_try_catch_count > 0 {
+                    parts.push(format!("try/catch in {kt_try_catch_count} files"));
+                }
+                if kt_runcatching_count > 0 {
+                    parts.push(format!(
+                        "Result/runCatching in {kt_runcatching_count} files"
+                    ));
+                }
+                if kt_throws_count > 0 {
+                    parts.push(format!("@Throws in {kt_throws_count} files"));
+                }
+                format!("Exception-based: {}", parts.join(", "))
+            }
+        }
+        "Elixir" => {
+            if ex_ok_error_tuple_count == 0 && ex_with_else_count == 0 && ex_raise_rescue_count == 0
+            {
+                "Minimal explicit error handling detected (no {:ok,_}/{:error,_} tuples found)."
+                    .to_string()
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                if ex_ok_error_tuple_count > 0 {
+                    parts.push(format!(
+                        "{{:ok,_}}/{{:error,_}} tuples in {ex_ok_error_tuple_count} files"
+                    ));
+                }
+                if ex_with_else_count > 0 {
+                    parts.push(format!("with/else in {ex_with_else_count} files"));
+                }
+                if ex_raise_rescue_count > 0 {
+                    parts.push(format!("raise/rescue in {ex_raise_rescue_count} files"));
+                }
+                format!("Tuple-based: {}", parts.join(", "))
+            }
+        }
+        // No language-specific heuristics yet for this dominant language. The
+        // label is prepended by `format_conventions`, so do NOT embed it here
+        // (that produced doubled "Error handling: Error handling:" output).
+        _ => "language-specific heuristics not yet implemented for this dominant language."
+            .to_string(),
     };
 
     // ── Naming summary (language-branched) ───────────────────────────────────
@@ -419,9 +612,27 @@ pub fn detect_conventions(index: &LiveIndex) -> ProjectConventions {
                 "Functions: {fn_pct}% camelCase ({camel_case_fns}/{ts_total_fns}). Types: {type_pct}% PascalCase ({pascal_case_types}/{ts_total_types})."
             )
         }
+        // Language-agnostic fallback for every other dominant language: report
+        // the observed snake_case/camelCase function ratio and PascalCase type
+        // ratio from the index instead of an empty "unavailable" line. The label
+        // is prepended by `format_conventions`, so it is NOT embedded here.
         _ => {
-            "Naming: language-specific heuristics unavailable for this project's dominant language."
-                .to_string()
+            if primary_total_fns == 0 && primary_total_types == 0 {
+                "no functions or types indexed for the dominant language.".to_string()
+            } else {
+                let snake_pct = (primary_snake_fns * 100)
+                    .checked_div(primary_total_fns)
+                    .unwrap_or(0);
+                let camel_pct = (primary_camel_fns * 100)
+                    .checked_div(primary_total_fns)
+                    .unwrap_or(0);
+                let type_pct = (primary_pascal_types * 100)
+                    .checked_div(primary_total_types)
+                    .unwrap_or(0);
+                format!(
+                    "Functions: {snake_pct}% snake_case, {camel_pct}% camelCase ({primary_total_fns} total). Types: {type_pct}% PascalCase ({primary_pascal_types}/{primary_total_types})."
+                )
+            }
         }
     };
 
@@ -1030,6 +1241,92 @@ mod tests {
         assert!(
             out.contains("Language: TypeScript"),
             "format output should include a Language header, got:\n{out}"
+        );
+    }
+
+    /// SF-STRESS-021 regression: a Python-dominant repo must produce a non-empty
+    /// error-handling AND naming headline (previously both fell to the empty
+    /// "heuristics unavailable" fallback), and the rendered output must not
+    /// double the field labels.
+    #[test]
+    fn python_majority_project_has_nonempty_headlines_and_no_doubled_labels() {
+        let app = make_file(
+            "app.py",
+            LanguageId::Python,
+            "import os\n\n\ndef do_thing():\n    try:\n        risky()\n    except ValueError:\n        raise RuntimeError('boom')\n",
+            vec![
+                sym("do_thing", SymbolKind::Function),
+                sym("MyModel", SymbolKind::Class),
+            ],
+            vec![],
+        );
+        let util = make_file(
+            "util.py",
+            LanguageId::Python,
+            "def load_config():\n    raise NotImplementedError\n",
+            vec![sym("load_config", SymbolKind::Function)],
+            vec![],
+        );
+
+        let conv = conventions_for(vec![("app.py", app), ("util.py", util)]);
+
+        assert_eq!(conv.language, "Python", "Python must win the dominant vote");
+        assert!(
+            conv.error_handling.contains("try/except") || conv.error_handling.contains("raise"),
+            "Python error handling must be populated, got: {}",
+            conv.error_handling
+        );
+        assert!(
+            !conv.error_handling.contains("heuristics unavailable"),
+            "Python must not fall to the empty fallback, got: {}",
+            conv.error_handling
+        );
+        assert!(
+            conv.naming.contains("snake_case") || conv.naming.contains("PascalCase"),
+            "Python naming must be populated from the language-agnostic tally, got: {}",
+            conv.naming
+        );
+
+        // No doubled labels in the rendered output (the fallback strings must not
+        // embed the label that `format_conventions` already prepends).
+        let out = format_conventions(&conv);
+        assert!(
+            !out.contains("Error handling: Error handling:"),
+            "error-handling label must not be doubled, got:\n{out}"
+        );
+        assert!(
+            !out.contains("Naming: Naming:"),
+            "naming label must not be doubled, got:\n{out}"
+        );
+    }
+
+    /// A Go-dominant repo reports value-based error handling (the highest-corpus
+    /// presence language), proving the new per-language heuristic fires.
+    #[test]
+    fn go_majority_project_reports_value_based_error_handling() {
+        let main = make_file(
+            "main.go",
+            LanguageId::Go,
+            "package main\n\nfunc run() error {\n    if err != nil {\n        return fmt.Errorf(\"wrap: %w\", err)\n    }\n    return nil\n}\n",
+            vec![
+                sym("run", SymbolKind::Function),
+                sym("Server", SymbolKind::Struct),
+            ],
+            vec![],
+        );
+
+        let conv = conventions_for(vec![("main.go", main)]);
+        assert_eq!(conv.language, "Go");
+        assert!(
+            conv.error_handling.contains("if err != nil")
+                || conv.error_handling.contains("Value-based"),
+            "Go error handling must mention value-based err checks, got: {}",
+            conv.error_handling
+        );
+        assert!(
+            !conv.naming.contains("heuristics unavailable"),
+            "Go naming must be populated, got: {}",
+            conv.naming
         );
     }
 }
