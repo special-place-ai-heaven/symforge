@@ -2451,6 +2451,61 @@ fn explore_should_skip_path_boost(
     false
 }
 
+/// Whether a concept `text_query` legitimately matches `line` at a word
+/// boundary, rather than as a coincidental substring inside a larger
+/// identifier.
+///
+/// SF-STRESS-013: concept text queries are matched by plain case-insensitive
+/// substring, so `"try {"` substring-matches `public string Country { ... }`
+/// (`coun-TRY-{`) and floods DTO-property results into "Error Handling". When a
+/// query begins with an identifier token, we require the character immediately
+/// before the match to be a non-word character (or the line start), so the
+/// token sits on a real word boundary. Queries that begin with punctuation
+/// (e.g. `.expect(`, `#[derive(Serialize`) are already specific and pass
+/// through unchanged. This only *rejects* false positives in explore; it never
+/// invents new matches.
+fn concept_text_query_matches_on_boundary(line: &str, query: &str) -> bool {
+    let line_lower = line.to_ascii_lowercase();
+    let query_lower = query.to_ascii_lowercase();
+
+    // Anchor token = the leading run of word characters in the query.
+    let anchor: String = query_lower
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if anchor.is_empty() {
+        // Punctuation-led query (e.g. `.expect(`); substring containment is the
+        // intended semantics and already specific.
+        return line_lower.contains(&query_lower);
+    }
+
+    // Require at least one occurrence of the full query whose anchor token sits
+    // on a left word boundary.
+    let anchor_bytes = anchor.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = line_lower[start..].find(&query_lower) {
+        let pos = start + rel;
+        let left_ok = pos == 0
+            || !line_lower.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && line_lower.as_bytes()[pos - 1] != b'_';
+        if left_ok {
+            // Anchor is a prefix of the query, so the right boundary of the
+            // anchor is the char at pos + anchor.len(); for code idioms the
+            // query already includes the trailing delimiter (e.g. `unwrap()`),
+            // so a left boundary is sufficient to reject identifier-internal
+            // hits like `coun|try {`.
+            debug_assert!(query_lower.as_bytes().starts_with(anchor_bytes));
+            return true;
+        }
+        // Advance past this occurrence to keep scanning.
+        start = pos + 1;
+        if start >= line_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn explore_path_penalty(
     path: &str,
     classification: Option<&crate::domain::index::FileClassification>,
@@ -2461,7 +2516,10 @@ fn explore_path_penalty(
     }
     if classification.is_some_and(|c| c.is_config)
         || path_lower.ends_with(".md")
+        || path_lower.ends_with(".html")
+        || path_lower.ends_with(".htm")
         || path_lower.contains("/docs/")
+        || path_lower.contains("/doc/")
         || path_lower.contains("/plans/")
         || path_lower.contains("/manual/")
         || path_lower.contains("changelog")
@@ -7179,15 +7237,20 @@ impl SymForgeServer {
             if let Ok(r) = result {
                 let term_key = tq.to_ascii_lowercase();
                 for file in &r.files {
-                    if !file.matches.is_empty() {
-                        Self::record_explore_file_signal(
-                            &mut file_signals,
-                            &file.path,
-                            &term_key,
-                            3,
-                        );
+                    // SF-STRESS-013: require a word-boundary match so a concept
+                    // idiom like `try {` does not score off `Country {`. Filter
+                    // before recording the file signal so coincidental files do
+                    // not register at all.
+                    let boundary_matches: Vec<&search::TextLineMatch> = file
+                        .matches
+                        .iter()
+                        .filter(|m| concept_text_query_matches_on_boundary(&m.line, tq))
+                        .collect();
+                    if boundary_matches.is_empty() {
+                        continue;
                     }
-                    for m in &file.matches {
+                    Self::record_explore_file_signal(&mut file_signals, &file.path, &term_key, 3);
+                    for m in boundary_matches {
                         if text_hits.len() < limit && !format::is_noise_line(&m.line) {
                             text_hits.push((file.path.clone(), m.line.clone(), m.line_number));
                         }
@@ -7340,25 +7403,6 @@ impl SymForgeServer {
             })
             .collect();
 
-        let mut ranked = scored;
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
-        // Filter out weak matches (score < 8 means single text-only hit in a doc file).
-        ranked.retain(|(_, score)| *score >= 8);
-        ranked.truncate(limit);
-        let max_score = ranked.first().map(|(_, s)| *s as f32).unwrap_or(1.0);
-        let symbol_scores: Vec<f32> = ranked
-            .iter()
-            .map(|(_, s)| {
-                if max_score > 0.0 {
-                    (*s as f32 / max_score).min(1.0)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let symbol_hits: Vec<(String, String, String)> =
-            ranked.into_iter().map(|(k, _)| k).collect();
-
         // Noise filtering: hide vendor / generated / gitignored / personal-tooling
         // by default. include_noise is the umbrella; include_vendor and
         // include_personal_tooling are additive finer-grained overrides per B1.
@@ -7380,18 +7424,43 @@ impl SymForgeServer {
                 search::NoiseClass::None => false,
             }
         };
-        let (symbol_hits, text_hits) = if any_suppression {
-            let filtered_symbols: Vec<(String, String, String)> = symbol_hits
-                .into_iter()
-                .filter(|(_, _, path)| {
-                    let hide = should_hide_path(path);
-                    if hide {
-                        noise_hidden += 1;
-                    }
-                    !hide
-                })
-                .collect();
-            let filtered_text: Vec<(String, String, usize)> = text_hits
+
+        let mut ranked = scored;
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+        // Filter out weak matches (score < 8 means single text-only hit in a doc file).
+        ranked.retain(|(_, score)| *score >= 8);
+        // SF-STRESS-013: drop hidden vendor/generated/test symbols BEFORE the
+        // limit truncation so they no longer consume the result budget. Running
+        // the noise filter after truncate starved real results (e.g. 1 visible
+        // symbol while 19 hidden vendor symbols had already eaten the limit).
+        if any_suppression {
+            ranked.retain(|(key, _)| {
+                let hide = should_hide_path(&key.2);
+                if hide {
+                    noise_hidden += 1;
+                }
+                !hide
+            });
+        }
+        ranked.truncate(limit);
+        let max_score = ranked.first().map(|(_, s)| *s as f32).unwrap_or(1.0);
+        let symbol_scores: Vec<f32> = ranked
+            .iter()
+            .map(|(_, s)| {
+                if max_score > 0.0 {
+                    (*s as f32 / max_score).min(1.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let symbol_hits: Vec<(String, String, String)> =
+            ranked.into_iter().map(|(k, _)| k).collect();
+
+        // Text hits still pass through the same noise filter so hidden files
+        // never leak into the rendered pattern list.
+        let text_hits = if any_suppression {
+            text_hits
                 .into_iter()
                 .filter(|(path, _, _)| {
                     let hide = should_hide_path(path);
@@ -7400,10 +7469,9 @@ impl SymForgeServer {
                     }
                     !hide
                 })
-                .collect();
-            (filtered_symbols, filtered_text)
+                .collect::<Vec<_>>()
         } else {
-            (symbol_hits, text_hits)
+            text_hits
         };
 
         // Count files by symbol/text presence
@@ -7553,9 +7621,11 @@ impl SymForgeServer {
         }
 
         if !output.is_empty() {
-            output.push_str(
-                "\n\nranked by: concept match + symbol-token alignment + path proximity + caller density"
-            );
+            // SF-STRESS-013: the explore scorer computes match count, kind
+            // weight, term-coverage and path proximity — it does NOT compute
+            // caller density. Drop the inaccurate claim so the footer is honest.
+            output
+                .push_str("\n\nranked by: concept match + symbol-token alignment + path proximity");
         }
 
         self.record_tool_savings_named(
@@ -16554,10 +16624,14 @@ mod tests {
             "explore output must include rank-signal footer; got:\n{result}"
         );
         assert!(
-            result.contains(
-                "concept match + symbol-token alignment + path proximity + caller density"
-            ),
-            "footer must enumerate the four ranking signals verbatim; got:\n{result}"
+            result.contains("concept match + symbol-token alignment + path proximity"),
+            "footer must enumerate the ranking signals the scorer computes verbatim; got:\n{result}"
+        );
+        // SF-STRESS-013: the scorer never computes caller density, so the footer
+        // must not advertise it.
+        assert!(
+            !result.contains("caller density"),
+            "footer must not claim 'caller density' the scorer does not compute; got:\n{result}"
         );
     }
 
@@ -17406,6 +17480,173 @@ mod tests {
             result.contains("vendor/generated files hidden")
                 && result.contains("include_noise=true"),
             "should show noise hint when results are hidden: {result}"
+        );
+    }
+
+    // --- SF-STRESS-013 ranking-calibration regressions -------------------
+
+    #[test]
+    fn test_concept_text_query_boundary_rejects_identifier_internal_substring() {
+        // The corpus howler: concept idiom `try {` substring-matched
+        // `public string Country { get; set; }` (coun-TRY-{), flooding DTO
+        // properties into "Error Handling".
+        assert!(
+            !super::concept_text_query_matches_on_boundary(
+                "public string Country { get; set; }",
+                "try {"
+            ),
+            "`try {{` must not match inside `Country {{`"
+        );
+        // A genuine `try {` at a word boundary still matches.
+        assert!(
+            super::concept_text_query_matches_on_boundary("        try {", "try {"),
+            "a real `try {{` must still match"
+        );
+        assert!(
+            super::concept_text_query_matches_on_boundary("} else { try { foo()", "try {"),
+            "`try {{` after a non-word char must still match"
+        );
+        // `unwrap()` as the suffix of a larger identifier (`my_unwrap()`) is an
+        // identifier-internal collision and must be rejected; a standalone
+        // `x.unwrap()` (preceded by `.`) is a real boundary hit.
+        assert!(
+            !super::concept_text_query_matches_on_boundary("    let v = my_unwrap();", "unwrap()"),
+            "`unwrap()` must not match inside `my_unwrap()`"
+        );
+        assert!(
+            super::concept_text_query_matches_on_boundary("    let v = x.unwrap();", "unwrap()"),
+            "a real `.unwrap()` call must still match"
+        );
+        // Punctuation-led queries fall through to plain containment.
+        assert!(
+            super::concept_text_query_matches_on_boundary("    .expect(\"boom\")", ".expect("),
+            "punctuation-led queries keep substring semantics"
+        );
+    }
+
+    #[test]
+    fn test_explore_path_penalty_demotes_doc_singular_and_html() {
+        // SF-STRESS-013: redis's deps/lua/doc/manual.html (8800-line single
+        // 'other html' symbol) topped ranking at 1.00. Both the `/doc/`
+        // (singular) segment and the `.html` extension must hit the doc bucket
+        // so it is down-weighted to the doc penalty (2) rather than full (8).
+        assert_eq!(
+            super::explore_path_penalty("deps/lua/doc/manual.html", None),
+            2,
+            "/doc/ + .html must be penalized as documentation"
+        );
+        assert_eq!(
+            super::explore_path_penalty("docs/Enums/Result.html", None),
+            2,
+            ".html docs must be penalized"
+        );
+        assert_eq!(
+            super::explore_path_penalty("site/index.htm", None),
+            2,
+            ".htm must be penalized like .html"
+        );
+        // Ordinary source keeps full weight.
+        assert_eq!(
+            super::explore_path_penalty("src/error.rs", None),
+            8,
+            "ordinary source must keep full weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explore_noise_filtered_before_truncate_keeps_real_symbol() {
+        // SF-STRESS-013 django starvation: noise filtering ran AFTER
+        // truncate(limit), so hidden vendor symbols consumed the budget and a
+        // real source symbol never surfaced. With limit=1 and a vendor symbol
+        // that sorts ahead alphabetically, the real symbol must still win.
+        let vendor_content = b"pub struct AAA_Error {}\n";
+        let vendor_sym = SymbolRecord {
+            name: "AAA_Error".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, vendor_content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let src_content = b"pub struct ResultError {}\n";
+        let src_sym = SymbolRecord {
+            name: "ResultError".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, src_content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (vkey, vfile) = make_file("vendor/lib/lib.rs", vendor_content, vec![vendor_sym]);
+        let (skey, sfile) = make_file("src/error.rs", src_content, vec![src_sym]);
+        let server = make_server(make_live_index_ready(vec![(vkey, vfile), (skey, sfile)]));
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "error handling".to_string(),
+                limit: Some(1),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("ResultError"),
+            "real source symbol must survive a tight limit even though a vendor \
+             symbol sorts ahead; the noise filter must run before truncate: {result}"
+        );
+        assert!(
+            !result.contains("AAA_Error"),
+            "vendor symbol must remain hidden: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explore_footer_drops_unbacked_caller_density_claim() {
+        // SF-STRESS-013: the scorer never computes caller density; the footer
+        // must not advertise a signal it does not use.
+        let content = b"pub enum AppError {}\n";
+        let sym = SymbolRecord {
+            name: "AppError".to_string(),
+            kind: SymbolKind::Enum,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/error.rs", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "error handling".to_string(),
+                limit: Some(5),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("ranked by:"),
+            "footer must be present: {result}"
+        );
+        assert!(
+            !result.contains("caller density"),
+            "footer must not claim caller density: {result}"
         );
     }
 
