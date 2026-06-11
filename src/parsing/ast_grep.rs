@@ -81,7 +81,7 @@ impl SgLang {
             LanguageId::TypeScript if is_tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), '$'),
             LanguageId::TypeScript => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), '$'),
             LanguageId::Java => (tree_sitter_java::LANGUAGE.into(), '$'),
-            LanguageId::Dart => (tree_sitter_dart::language(), '$'),
+            LanguageId::Dart => (tree_sitter_dart::LANGUAGE.into(), '$'),
             LanguageId::Perl => (tree_sitter_perl::LANGUAGE.into(), '$'),
             LanguageId::Html => (tree_sitter_html::LANGUAGE.into(), '$'),
             // Config-only languages — no structural patterns

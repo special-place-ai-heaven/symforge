@@ -289,9 +289,18 @@ const KOTLIN_XREF_QUERY: &str = r#"
 "#;
 
 const DART_XREF_QUERY: &str = r#"
-; Function/method calls: print('x') or obj.method()
-; In dart grammar, calls are member_access with selector
-(member_access (identifier) @ref.call)
+; nielsenko tree-sitter-dart (0.2.0) call shapes, mirroring upstream
+; tags.scm reference queries.
+
+; Plain function calls: print(x), Circle(2.0)
+(call_expression
+  function: (identifier) @ref.call)
+
+; Method calls through a receiver: c.area(), obj?.method()
+(call_expression
+  function: (member_expression property: (identifier) @ref.method_call))
+(call_expression
+  function: (null_aware_member_expression property: (identifier) @ref.method_call))
 
 ; Import directives: import 'dart:core'
 ; import_specification -> configurable_uri -> uri -> string_literal
@@ -789,7 +798,7 @@ pub fn extract_references(
             (kotlin_query(&lang), lang)
         }
         LanguageId::Dart => {
-            let lang: Language = tree_sitter_dart::language();
+            let lang: Language = tree_sitter_dart::LANGUAGE.into();
             (dart_query(&lang), lang)
         }
         LanguageId::Elixir => {
@@ -1182,7 +1191,7 @@ mod tests {
             LanguageId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             LanguageId::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             LanguageId::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
-            LanguageId::Dart => tree_sitter_dart::language(),
+            LanguageId::Dart => tree_sitter_dart::LANGUAGE.into(),
             LanguageId::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             LanguageId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             LanguageId::Swift => tree_sitter_swift::LANGUAGE.into(),
@@ -2168,6 +2177,30 @@ public class PacketsController
     }
 
     // --- Dart ---
+
+    /// Plain calls and receiver method calls must both produce Call refs
+    /// with the callee name, mirroring the nielsenko grammar's
+    /// `call_expression(function:)` / `member_expression(property:)` shapes.
+    #[test]
+    fn test_dart_call_refs() {
+        let source = "void main() { print('x'); var s = 'y'.toUpperCase(); }";
+        let (refs, _) = parse_and_extract(source, LanguageId::Dart);
+        let calls: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            calls.contains(&"print"),
+            "plain function call must yield a Call ref named print, refs: {:?}",
+            refs
+        );
+        assert!(
+            calls.contains(&"toUpperCase"),
+            "receiver method call must yield a Call ref named toUpperCase, refs: {:?}",
+            refs
+        );
+    }
 
     #[test]
     fn test_dart_import_ref() {
