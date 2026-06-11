@@ -2071,18 +2071,21 @@ fn test_search_files_result_view_groups_ranked_paths() {
                 path: "src/protocol/tools.rs".to_string(),
                 coupling_score: None,
                 shared_commits: None,
+                metadata_reason: None,
             },
             crate::live_index::SearchFilesHit {
                 tier: SearchFilesTier::Basename,
                 path: "src/sidecar/tools.rs".to_string(),
                 coupling_score: None,
                 shared_commits: None,
+                metadata_reason: None,
             },
             crate::live_index::SearchFilesHit {
                 tier: SearchFilesTier::LoosePath,
                 path: "src/protocol/tools_helper.rs".to_string(),
                 coupling_score: None,
                 shared_commits: None,
+                metadata_reason: None,
             },
         ],
     };
@@ -2108,6 +2111,61 @@ fn test_search_files_result_view_not_found() {
     assert_eq!(
         search_files_result_view(&view),
         "No indexed source files matching 'README.md'"
+    );
+}
+
+#[test]
+fn test_search_files_result_view_renders_metadata_only_section() {
+    let view = SearchFilesView::Found {
+        query: "package-lock".to_string(),
+        total_matches: 2,
+        overflow_count: 0,
+        hits: vec![
+            crate::live_index::SearchFilesHit {
+                tier: SearchFilesTier::StrongPath,
+                path: "src/loader.rs".to_string(),
+                coupling_score: None,
+                shared_commits: None,
+                metadata_reason: None,
+            },
+            crate::live_index::SearchFilesHit {
+                tier: SearchFilesTier::MetadataOnly,
+                path: "backend/package-lock.json".to_string(),
+                coupling_score: None,
+                shared_commits: None,
+                metadata_reason: Some("lockfile".to_string()),
+            },
+        ],
+    };
+
+    let result = search_files_result_view(&view);
+
+    assert!(result.contains("── Metadata-only paths (Tier-2: not parsed) ──"));
+    assert!(
+        result.contains("  backend/package-lock.json  [metadata-only: lockfile]"),
+        "metadata-only hit must carry its reason label: {result}"
+    );
+    // The metadata section must come AFTER the strong-path section.
+    let strong_idx = result.find("── Strong path matches ──").unwrap();
+    let metadata_idx = result
+        .find("── Metadata-only paths (Tier-2: not parsed) ──")
+        .unwrap();
+    assert!(
+        strong_idx < metadata_idx,
+        "metadata-only section must render below source sections: {result}"
+    );
+}
+
+#[test]
+fn test_search_files_resolve_result_view_metadata_only() {
+    let view = SearchFilesResolveView::ResolvedMetadataOnly {
+        path: "backend/package-lock.json".to_string(),
+        reason: "lockfile".to_string(),
+    };
+
+    assert_eq!(
+        search_files_resolve_result_view(&view),
+        "backend/package-lock.json  [metadata-only: lockfile]"
     );
 }
 
