@@ -290,8 +290,11 @@ const KOTLIN_XREF_QUERY: &str = r#"
 
 const DART_XREF_QUERY: &str = r#"
 ; Function/method calls: print('x') or obj.method()
-; In dart grammar, calls are member_access with selector
-(member_access (identifier) @ref.call)
+; In the orchard dart grammar a call is an identifier immediately
+; followed by a selector carrying an argument_part; method names appear
+; inside unconditional_assignable_selector.
+((identifier) @ref.call . (selector (argument_part)))
+(unconditional_assignable_selector (identifier) @ref.method_call)
 
 ; Import directives: import 'dart:core'
 ; import_specification -> configurable_uri -> uri -> string_literal
@@ -789,7 +792,7 @@ pub fn extract_references(
             (kotlin_query(&lang), lang)
         }
         LanguageId::Dart => {
-            let lang: Language = tree_sitter_dart::language();
+            let lang: Language = tree_sitter_dart_orchard::LANGUAGE.into();
             (dart_query(&lang), lang)
         }
         LanguageId::Elixir => {
@@ -1182,7 +1185,7 @@ mod tests {
             LanguageId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             LanguageId::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             LanguageId::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
-            LanguageId::Dart => tree_sitter_dart::language(),
+            LanguageId::Dart => tree_sitter_dart_orchard::LANGUAGE.into(),
             LanguageId::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             LanguageId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             LanguageId::Swift => tree_sitter_swift::LANGUAGE.into(),
@@ -2187,6 +2190,27 @@ public class PacketsController
         assert!(
             refs.iter().any(|r| r.kind == ReferenceKind::TypeUsage),
             "should have TypeUsage ref, refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_dart_call_refs() {
+        // Plain function call and a method call through a receiver — both
+        // must surface as Call refs under the orchard grammar's
+        // identifier+selector call shape.
+        let source = "void main() {\n  print('hi');\n  var s = 'x';\n  s.toUpperCase();\n}";
+        let (refs, _) = parse_and_extract(source, LanguageId::Dart);
+        assert!(
+            refs.iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "print"),
+            "should have Call ref for print, refs: {:?}",
+            refs
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.kind == ReferenceKind::Call && r.name == "toUpperCase"),
+            "should have Call ref for toUpperCase method call, refs: {:?}",
             refs
         );
     }

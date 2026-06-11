@@ -55,7 +55,7 @@ mod tests {
 
     fn parse_dart(source: &str) -> Vec<SymbolRecord> {
         let mut parser = Parser::new();
-        let lang: tree_sitter::Language = tree_sitter_dart::language();
+        let lang: tree_sitter::Language = tree_sitter_dart_orchard::LANGUAGE.into();
         parser.set_language(&lang).expect("set Dart language");
         let tree = parser.parse(source, None).expect("parse Dart source");
         extract_symbols(&tree.root_node(), source)
@@ -159,6 +159,57 @@ class Calculator {
             member.is_some(),
             "should extract at least one in-class member symbol, got: {:?}",
             symbols
+        );
+    }
+
+    /// Dart 3 syntax must parse cleanly: sealed classes, records, and switch
+    /// expressions (all GA since Dart 3.0, May 2023). The previous grammar
+    /// (tree-sitter-dart 0.0.4) returned parse errors on every one of these,
+    /// silently degrading symbols for any modern Dart/Flutter file — the
+    /// reason for the switch to tree-sitter-dart-orchard.
+    #[test]
+    fn test_dart3_sealed_class_record_switch_expression_parse_clean() {
+        let source = "\
+sealed class Shape {}
+
+class Circle extends Shape {
+  final double radius;
+  Circle(this.radius);
+}
+
+(double, double) center(Shape s) {
+  return (0.0, 0.0);
+}
+
+double area(Shape shape) {
+  return switch (shape) {
+    Circle(radius: var r) => 3.14 * r * r,
+    _ => 0.0,
+  };
+}
+";
+        let result = process_file("shapes.dart", source.as_bytes(), LanguageId::Dart);
+        assert_eq!(
+            result.outcome,
+            FileOutcome::Processed,
+            "Dart 3 sealed class + record + switch expression must parse cleanly, got: {:?}",
+            result.outcome
+        );
+        assert!(
+            result.parse_diagnostic.is_none(),
+            "Dart 3 syntax must not produce a partial-parse diagnostic, got: {:?}",
+            result.parse_diagnostic
+        );
+
+        let symbols = parse_dart(source);
+        let classes: Vec<&str> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            classes.contains(&"Shape") && classes.contains(&"Circle"),
+            "sealed class Shape and class Circle must be extracted, got: {classes:?}"
         );
     }
 }
