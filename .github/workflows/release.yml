@@ -97,7 +97,7 @@ jobs:
 
       - id: release
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           include-component-in-tag: false
