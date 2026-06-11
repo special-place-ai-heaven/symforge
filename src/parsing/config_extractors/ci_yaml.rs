@@ -353,14 +353,20 @@ fn is_github_actions_workflow(map: &serde_yml::Mapping) -> bool {
 }
 
 fn mapping_get<'a>(map: &'a serde_yml::Mapping, key: &str) -> Option<&'a serde_yml::Value> {
-    // serde_yml 0.0.13 (noyalib backend) keys mappings by `String`, so the
-    // native string-keyed `get` replaces the old Value-key scan.
+    // serde_yaml_ng's `Mapping::get` accepts a `&str` index and matches scalar
+    // string keys, so the native string-keyed lookup is exactly what we want.
     map.get(key)
 }
 
 fn string_entries(map: &serde_yml::Mapping) -> Vec<(String, &serde_yml::Value)> {
-    // Keys are already `String` in serde_yml 0.0.13; clone directly.
-    map.iter().map(|(key, value)| (key.clone(), value)).collect()
+    // serde_yaml_ng keys mappings by `Value`; keep only scalar string keys,
+    // which is what every CI-fact lookup here expects.
+    map.iter()
+        .filter_map(|(key, value)| match key {
+            serde_yml::Value::String(key) => Some((key.clone(), value)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn value_as_string(value: &serde_yml::Value) -> Option<String> {

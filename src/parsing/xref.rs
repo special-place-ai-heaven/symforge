@@ -529,6 +529,34 @@ fn rust_grouped_import_parts(input: &str) -> Option<(&str, &str)> {
     Some((prefix, inner))
 }
 
+/// Whether an Elixir `@ref.import` alias node belongs to a genuine module
+/// directive (`alias`/`import`/`use`/`require`) rather than an arbitrary call
+/// that happens to take a module alias as its first argument (e.g.
+/// `raise ArgumentError`, `socket "...", UserSocket`).
+///
+/// The import query captures the `(alias)` inside `(call target: (identifier)
+/// (arguments (alias)))`. We walk up to the enclosing `call` node, read its
+/// `target` field text, and accept only the directive keywords. Returns `false`
+/// when the enclosing call or its target cannot be resolved, so a non-directive
+/// call never produces a spurious `Import` reference.
+fn elixir_import_target_is_directive(alias_node: Node, source_bytes: &[u8]) -> bool {
+    const DIRECTIVES: [&str; 4] = ["alias", "import", "use", "require"];
+
+    // Walk up to the nearest `call` ancestor (alias -> arguments -> call).
+    let mut node = alias_node;
+    while node.kind() != "call" {
+        match node.parent() {
+            Some(parent) => node = parent,
+            None => return false,
+        }
+    }
+
+    node.child_by_field_name("target")
+        .and_then(|target| target.utf8_text(source_bytes).ok())
+        .map(|text| DIRECTIVES.contains(&text.trim()))
+        .unwrap_or(false)
+}
+
 fn expand_rust_import_paths(input: &str) -> Vec<String> {
     let trimmed = input.trim();
     let alias_free = trimmed
@@ -960,6 +988,15 @@ pub fn extract_references(
         // Import
         if let Some(import_node) = ref_import
             && let Ok(name_text) = import_node.utf8_text(source_bytes)
+            // Elixir guard: the import query `(call target: (identifier)
+            // (arguments (alias) @ref.import))` cannot distinguish a real
+            // directive (`alias`/`import`/`use`/`require`) from any other call
+            // that takes a module as its first argument (`raise ArgumentError`,
+            // `socket "...", UserSocket`). Tree-sitter text predicates are NOT
+            // applied by `QueryCursor::matches`, so constrain it here: only keep
+            // the import when the enclosing call's target is a directive keyword.
+            && (*language != LanguageId::Elixir
+                || elixir_import_target_is_directive(import_node, source_bytes))
         {
             let import_texts = match language {
                 LanguageId::Rust => expand_rust_import_paths(name_text),
@@ -2244,6 +2281,39 @@ public class PacketsController
         assert!(
             refs.iter().any(|r| r.kind == ReferenceKind::Import),
             "should have Import ref for alias, refs: {:?}",
+            refs
+        );
+    }
+
+    /// SF-STRESS-021 regression: `raise ArgumentError` parses as the same
+    /// `(call target: (identifier) (arguments (alias)))` shape as `alias Foo`,
+    /// so the import query matched it and mislabeled `ArgumentError` as an
+    /// Import (polluting conventions common-imports and find_references). The
+    /// extraction-site directive guard must reject non-directive call targets.
+    #[test]
+    fn test_elixir_raise_is_not_an_import() {
+        let source = "defmodule App do\n  def run do\n    raise ArgumentError\n  end\nend";
+        let (refs, _) = parse_and_extract(source, LanguageId::Elixir);
+        assert!(
+            !refs.iter().any(|r| r.kind == ReferenceKind::Import),
+            "`raise ArgumentError` must NOT produce an Import ref, refs: {:?}",
+            refs
+        );
+    }
+
+    /// The directive guard keeps `import`/`use`/`require` (not just `alias`)
+    /// classified as imports.
+    #[test]
+    fn test_elixir_use_and_import_are_imports() {
+        let source = "defmodule App do\n  use GenServer\n  import Enum\n  require Logger\nend";
+        let (refs, _) = parse_and_extract(source, LanguageId::Elixir);
+        let import_count = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .count();
+        assert!(
+            import_count >= 3,
+            "use/import/require are all directives -> Import refs, refs: {:?}",
             refs
         );
     }

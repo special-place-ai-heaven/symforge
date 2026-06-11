@@ -8,6 +8,69 @@ use super::{optional_u32, parse_diagnostic};
 
 pub struct JsonExtractor;
 
+/// Normalize JSONC (the tsconfig dialect) into strict JSON that `serde_json`
+/// accepts, WITHOUT changing any byte offsets or line numbers: comments and
+/// trailing commas are blanked to offset-preserving spaces (newlines kept).
+///
+/// `tsc --init` emits trailing commas by default and both `tsc` and VS Code
+/// accept them, so every default-initialized `tsconfig.json` would otherwise
+/// land in a Failed/0-symbol state. We blank a trailing comma — a `,` whose
+/// next significant byte (skipping whitespace; comments are already blanked in
+/// pass 1) is `}` or `]` — exactly the way comments are blanked. This token
+/// sequence never occurs in strict JSON outside string literals, so it is safe
+/// globally; string contents are respected in both passes.
+fn normalize_jsonc(input: &[u8]) -> Vec<u8> {
+    let stripped = strip_json_comments(input);
+    blank_trailing_commas(&stripped)
+}
+
+/// Blank any trailing comma (a `,` followed only by whitespace before `}` or
+/// `]`) with an offset-preserving space. Operates on comment-stripped bytes, so
+/// the only non-whitespace bytes between a trailing comma and its closer are the
+/// closer itself. String literals are respected: a `,`/`}`/`]` inside `"…"` is
+/// never treated as structural.
+fn blank_trailing_commas(input: &[u8]) -> Vec<u8> {
+    let mut out = input.to_vec();
+    let len = out.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = out[i];
+
+        // Skip string literals verbatim (handle escapes) so a comma inside a
+        // string is never mistaken for a structural trailing comma.
+        if b == b'"' {
+            i += 1;
+            while i < len {
+                let c = out[i];
+                i += 1;
+                if c == b'"' {
+                    break;
+                }
+                if c == b'\\' && i < len {
+                    i += 1; // skip the escaped byte
+                }
+            }
+            continue;
+        }
+
+        if b == b',' {
+            // Look ahead past whitespace to the next significant byte.
+            let mut j = i + 1;
+            while j < len && matches!(out[j], b' ' | b'\t' | b'\r' | b'\n') {
+                j += 1;
+            }
+            if j < len && (out[j] == b'}' || out[j] == b']') {
+                out[i] = b' ';
+            }
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
 /// Strip `//` line comments and `/* … */` block comments from JSON bytes,
 /// producing valid JSON that `serde_json` can parse. String literals are
 /// respected — comments inside `"…"` are left untouched. Newlines inside
@@ -89,7 +152,7 @@ fn strip_json_comments(input: &[u8]) -> Vec<u8> {
 
 impl ConfigExtractor for JsonExtractor {
     fn extract(&self, content: &[u8]) -> ExtractionResult {
-        let stripped = strip_json_comments(content);
+        let stripped = normalize_jsonc(content);
         let value: serde_json::Value = match serde_json::from_slice(&stripped) {
             Ok(v) => v,
             Err(e) => {
@@ -595,12 +658,82 @@ mod tests {
     }
 
     #[test]
-    fn test_jsonc_trailing_commas_still_fail() {
+    fn test_jsonc_trailing_commas_now_parse() {
+        // SF-STRESS-016: `tsc --init` emits trailing commas by default, so the
+        // JSONC normalizer must blank them and parse the keys out.
         let content = br#"{"a": 1,}"#;
         let result = JsonExtractor.extract(content);
         assert!(
+            matches!(result.outcome, ExtractionOutcome::Ok),
+            "Trailing commas should now parse (JSONC tolerance)"
+        );
+        assert!(result.symbols.iter().any(|s| s.name == "a"));
+    }
+
+    #[test]
+    fn test_jsonc_trailing_comma_in_array() {
+        let content = br#"{"items": [1, 2, 3,]}"#;
+        let result = JsonExtractor.extract(content);
+        assert!(
+            matches!(result.outcome, ExtractionOutcome::Ok),
+            "Trailing comma in an array should parse"
+        );
+        assert!(result.symbols.iter().any(|s| s.name == "items[2]"));
+    }
+
+    #[test]
+    fn test_jsonc_trailing_comma_inside_string_preserved() {
+        // A comma before a `}`/`]` that lives INSIDE a string is NOT a trailing
+        // comma and must be left untouched (the value stays intact).
+        let content = br#"{"pattern": "a,}", "next": 1}"#;
+        let result = JsonExtractor.extract(content);
+        assert!(
+            matches!(result.outcome, ExtractionOutcome::Ok),
+            "string content with a comma-before-brace must parse"
+        );
+        assert!(result.symbols.iter().any(|s| s.name == "pattern"));
+        assert!(result.symbols.iter().any(|s| s.name == "next"));
+    }
+
+    #[test]
+    fn test_tsconfig_jsonc_with_comments_and_trailing_commas() {
+        // A representative `tsc --init`-style tsconfig.json: line comments,
+        // block comment, AND trailing commas in both an object and an array.
+        let content = br#"{
+  // Visit https://aka.ms/tsconfig to read more about this file
+  "compilerOptions": {
+    "target": "es2016", /* the output target */
+    "module": "commonjs",
+    "strict": true,
+  },
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+  ],
+}"#;
+        let result = JsonExtractor.extract(content);
+        assert!(
+            matches!(result.outcome, ExtractionOutcome::Ok),
+            "a default-initialized tsconfig.json must parse"
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|s| s.name == "compilerOptions.target"),
+            "nested keys are extracted from JSONC tsconfig"
+        );
+        assert!(result.symbols.iter().any(|s| s.name == "include[1]"));
+    }
+
+    #[test]
+    fn test_malformed_json_still_fails_after_jsonc_normalize() {
+        // The JSONC tolerance must NOT mask genuinely malformed JSON — an honest
+        // degraded state is still required for non-dialect breakage.
+        let result = JsonExtractor.extract(b"{\"a\": }");
+        assert!(
             matches!(result.outcome, ExtractionOutcome::Failed(_)),
-            "Trailing commas should still fail"
+            "a missing value is genuine malformation and must still Fail"
         );
     }
 
