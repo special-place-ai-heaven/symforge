@@ -68,8 +68,12 @@ const DAEMON_FALLBACK_DEADLINE: Duration = Duration::from_millis(500);
 // ---------------------------------------------------------------------------
 
 /// Deserialized representation of a Claude Code PostToolUse stdin payload.
+///
+/// The type is `pub` so integration tests can construct an empty payload via
+/// `HookInput::default()` for [`run_hook_with_input`]; the fields stay
+/// crate-private.
 #[derive(serde::Deserialize, Default)]
-pub(crate) struct HookInput {
+pub struct HookInput {
     pub(crate) tool_name: Option<String>,
     pub(crate) tool_input: Option<HookToolInput>,
     pub(crate) cwd: Option<String>,
@@ -236,11 +240,23 @@ impl HookAdoptionSnapshot {
 ///
 /// Never returns an error — failures produce the fail-open empty JSON.
 pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
-    let verbose = is_hook_verbose();
-
     // Always read stdin so we have context for path/query extraction.
     // For explicit subcommands the payload may be empty or absent — that's fine.
-    let input = parse_stdin_input();
+    run_hook_with_input(parse_stdin_input(), subcommand)
+}
+
+/// `run_hook` with the stdin payload supplied by the caller instead of read
+/// from the process's stdin.
+///
+/// This is the seam in-process callers (integration tests) must use: reading
+/// the real stdin from inside a test binary blocks until the harness's stdin
+/// reaches EOF, which never happens when the launching environment holds the
+/// pipe open.
+pub fn run_hook_with_input(
+    input: HookInput,
+    subcommand: Option<&HookSubcommand>,
+) -> anyhow::Result<()> {
+    let verbose = is_hook_verbose();
 
     // PreTool is a special case: no sidecar call needed, just output a
     // tool-preference suggestion based on the tool_name from stdin.
@@ -485,19 +501,42 @@ pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
 /// PostToolUse JSON payload.
 ///
 /// Returns `HookInput::default()` on any parse failure (fail-open).
+/// Upper bound on waiting for the hook payload on stdin.
+///
+/// Claude Code writes the payload and closes the pipe at spawn, so the read
+/// normally completes in well under a millisecond. The bound only matters when
+/// stdin is held open with no writer (e.g. the hook is invoked interactively,
+/// or from an environment that never closes the inherited pipe) — without it
+/// the read blocks forever and the hook hangs the session instead of failing
+/// open.
+const STDIN_READ_TIMEOUT_MS: u64 = 250;
+
 pub(crate) fn parse_stdin_input() -> HookInput {
-    let stdin = std::io::stdin();
-    let mut stdin_json = String::new();
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(l) => {
-                stdin_json.push_str(&l);
-                stdin_json.push('\n');
+    // The blocking read happens on a helper thread so the hook can enforce a
+    // deadline. On timeout the thread is leaked — it stays parked on the stdin
+    // read — which is acceptable because the hook is a one-shot process and
+    // exits immediately after responding. In-process callers (tests) must use
+    // `run_hook_with_input` and never reach this function.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin_json = String::new();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    stdin_json.push_str(&l);
+                    stdin_json.push('\n');
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
+        let _ = tx.send(stdin_json);
+    });
+    match rx.recv_timeout(Duration::from_millis(STDIN_READ_TIMEOUT_MS)) {
+        Ok(stdin_json) => serde_json::from_str(&stdin_json).unwrap_or_default(),
+        // Timeout or disconnected sender: fail open with an empty payload.
+        Err(_) => HookInput::default(),
     }
-    serde_json::from_str(&stdin_json).unwrap_or_default()
 }
 
 /// Converts an absolute path to a relative path by stripping the `cwd` prefix.
