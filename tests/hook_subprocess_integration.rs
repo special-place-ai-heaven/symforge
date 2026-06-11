@@ -282,6 +282,43 @@ fn run_hook_stale_sidecar_and_dead_daemon_degrades_to_pass_through() {
     );
 }
 
+/// Regression guard: a hook whose stdin is held open without data must exit
+/// fail-open instead of hanging.
+///
+/// `parse_stdin_input` reads stdin on a bounded helper thread and gives up
+/// after `STDIN_READ_TIMEOUT_MS`, treating the payload as empty. Before that
+/// bound existed, the read blocked until EOF — forever, when the spawning
+/// environment kept the inherited pipe open with no writer. The same unbounded
+/// read also wedged `sidecar_integration` whenever its harness was launched
+/// with an open stdin (the recurring 0-CPU test stall).
+#[test]
+fn run_hook_stdin_held_open_exits_fail_open_within_deadline() {
+    let tmp = TempDir::new().expect("tempdir creation");
+    let bin = env!("CARGO_BIN_EXE_symforge");
+    let mut child = Command::new(bin)
+        .arg("hook")
+        .current_dir(tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("symforge binary should spawn");
+
+    // Deliberately neither write to nor close the child's stdin: the pipe
+    // stays open with no writer for the child's whole lifetime. The 5s
+    // deadline is generous headroom over the 250ms stdin bound; the kill
+    // inside wait_with_timeout keeps a regression from leaking the child.
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+        .expect("wait on hook subprocess")
+        .expect("hook must exit fail-open despite stdin held open, not hang");
+    assert!(
+        status.success(),
+        "hook with held-open stdin must exit zero (fail-open): {status:?}"
+    );
+
+    drop(child.stdin.take());
+}
+
 /// Marker body returned by the mock daemon's enrichment endpoint. Distinct
 /// from any fail-open output so the test can prove enrichment was served.
 const ENRICHED_MARKER: &str = "MOCK_DAEMON_ENRICHED_OUTLINE";

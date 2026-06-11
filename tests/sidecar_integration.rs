@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use symforge::{
     cli::HookSubcommand,
-    cli::hook::{event_name_for, fail_open_json, run_hook, success_json},
+    cli::hook::{HookInput, event_name_for, fail_open_json, run_hook_with_input, success_json},
     domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord},
     live_index::{IndexedFile, LiveIndex, ParseStatus, SharedIndex},
     sidecar::spawn_sidecar,
@@ -362,8 +362,12 @@ async fn test_hook_binary_latency() {
     // Port file already written by spawn_sidecar.
     // SessionStart calls /repo-map — no file path env var needed.
     let start = Instant::now();
-    // run_hook writes JSON to stdout — acceptable in test context.
-    run_hook(Some(&HookSubcommand::SessionStart)).expect("run_hook must succeed");
+    // run_hook_with_input writes JSON to stdout — acceptable in test context.
+    // The input is injected (empty payload) instead of read from stdin: the
+    // test binary's stdin belongs to the harness's launcher and may never
+    // reach EOF, which would block this test forever.
+    run_hook_with_input(HookInput::default(), Some(&HookSubcommand::SessionStart))
+        .expect("run_hook_with_input must succeed");
     let elapsed = start.elapsed();
 
     assert!(
