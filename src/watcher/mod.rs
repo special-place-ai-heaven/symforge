@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use notify::{EventKind, RecommendedWatcher as NotifyRecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
-    DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer,
+    DebounceEventResult, DebouncedEvent, Debouncer, NoCache, new_debouncer_opt,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -500,7 +500,16 @@ pub(crate) fn reconcile_stale_files(repo_root: &Path, shared: &SharedIndex) -> u
 /// Dropping this struct stops the OS-level file watcher.
 pub struct WatcherHandle {
     /// The debouncer owns the OS watcher thread; dropping it stops watching.
-    _debouncer: Debouncer<NotifyRecommendedWatcher, RecommendedCache>,
+    ///
+    /// `NoCache` (not the platform-default `FileIdMap` on Windows) disables the
+    /// file-ID tracking cache. `FileIdMap` exists only to stitch rename events
+    /// into paired Modify(Name) events, which `process_events` never consumes —
+    /// it treats Create==Modify as reindex and Remove as drop, so a rename that
+    /// arrives as Remove+Create behaves identically. Crucially, `FileIdMap`
+    /// would otherwise run a full `WalkDir` (one open-handle syscall per entry,
+    /// including 100k+ gitignored `target/`/`node_modules/` entries) at
+    /// `watch()`, per Create during build floods, and again on overflow rescan.
+    _debouncer: Debouncer<NotifyRecommendedWatcher, NoCache>,
     /// Receive end of the synchronous channel from the notify callback.
     pub event_rx: std::sync::mpsc::Receiver<DebounceEventResult>,
 }
@@ -522,12 +531,20 @@ pub(crate) fn start_watcher(
 ) -> Result<WatcherHandle, notify::Error> {
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
 
-    let mut debouncer = new_debouncer(
+    // Use `NoCache` instead of the platform-default cache. On Windows the
+    // default `RecommendedCache` is `FileIdMap`, which walks the entire tree
+    // with one open-handle syscall per entry at `watch()` time (and again on
+    // every Create / overflow rescan) to maintain rename-stitching state that
+    // `process_events` never uses. On large trees with many gitignored entries
+    // (`target/`, `node_modules/`) that walk dominates watcher startup latency.
+    let mut debouncer = new_debouncer_opt::<_, NotifyRecommendedWatcher, NoCache>(
         Duration::from_millis(debounce_ms),
         None,
         move |result: DebounceEventResult| {
             let _ = tx.send(result);
         },
+        NoCache::new(),
+        notify::Config::default(),
     )?;
 
     debouncer.watch(repo_root, RecursiveMode::Recursive)?;
@@ -640,8 +657,12 @@ pub async fn run_watcher_with_stop(
     {
         // Mark Starting until the recursive filesystem watch is actually
         // registered. The transition to Active happens only when start_watcher
-        // returns Ok (below) — registering the watch is the slow step on large
-        // trees, and reporting Active before it succeeds is misleading.
+        // returns Ok (below). Historically the slow step on large trees was not
+        // the OS-level watch registration but the debouncer's `FileIdMap` cache,
+        // which walked the whole tree (one open-handle syscall per entry) at
+        // `watch()` time; `start_watcher` now uses `NoCache` to skip that walk.
+        // We still report Active only after Ok so a registration failure is not
+        // misreported as a healthy watcher.
         let mut info = watcher_info.lock();
         info.state = WatcherState::Starting;
     }
