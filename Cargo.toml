@@ -92,7 +92,7 @@ regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 globset = "0.4"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 libc = "0.2.183"
 dunce = "1"
