@@ -26,6 +26,16 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.19.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.3...v7.19.4) (2026-06-11)
+
+
+### Bug Fixes
+
+* **content:** detect and report NUL bytes in source instead of silent space rendering ([95d5385](https://github.com/special-place-ai-heaven/symforge/commit/95d5385dcc6598b54ee3ac8c13c9c5c8cf1a04f5))
+* dogfood open items — .symforge growth bounds, Tier-2 UX, NUL-byte honesty ([2a43ab1](https://github.com/special-place-ai-heaven/symforge/commit/2a43ab1675c5c306e613f848cf4462e8b1854cba))
+* **protocol:** honest Tier-2 metadata-only response instead of file-not-found ([3ad06f2](https://github.com/special-place-ai-heaven/symforge/commit/3ad06f2f7d72e72271d1df48d3c437c73d4e73b2))
+* **state:** bound .symforge growth — tee snapshot retention + coupling.db compaction ([1cb1ec0](https://github.com/special-place-ai-heaven/symforge/commit/1cb1ec0235392193d205e685e720a07eddeafd81))
+
 ## [7.19.3](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.2...v7.19.3) (2026-06-10)
 
 
