@@ -6,6 +6,36 @@ use std::collections::HashMap;
 
 use super::parse_diagnostic;
 
+/// Detects a CommonMark fenced-code-block delimiter line.
+///
+/// Returns `Some((fence_char, run_length, info_empty))` when `line`, after up to
+/// three leading spaces, begins with a run of at least three identical backticks
+/// (`` ` ``) or tildes (`~`). `info_empty` is true when only whitespace follows
+/// the run — a closing fence carries no info string, so this distinguishes a
+/// valid closer from an opener like ```` ```ruby ````. Returns `None` otherwise.
+fn parse_code_fence(line: &str) -> Option<(u8, usize, bool)> {
+    // Up to three leading spaces are allowed before a fence; four or more make
+    // the line an indented code block, which is never a fence delimiter.
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let trimmed = &line[leading_spaces..];
+
+    let fence_char = match trimmed.bytes().next()? {
+        b'`' => b'`',
+        b'~' => b'~',
+        _ => return None,
+    };
+    let run_length = trimmed.bytes().take_while(|&b| b == fence_char).count();
+    if run_length < 3 {
+        return None;
+    }
+    let info = &trimmed[run_length..];
+    let info_empty = info.trim().is_empty();
+    Some((fence_char, run_length, info_empty))
+}
+
 pub struct MarkdownExtractor;
 
 impl ConfigExtractor for MarkdownExtractor {
@@ -86,7 +116,35 @@ impl ConfigExtractor for MarkdownExtractor {
         }
 
         let mut headers: Vec<HeaderInfo> = Vec::new();
+        // Track fenced code blocks so that '#' comment lines inside ``` or ~~~
+        // fences (e.g. shell/ruby comments) are not mistaken for ATX headings,
+        // per CommonMark. Holds (fence_char, opener_run_length) while open.
+        let mut in_fence: Option<(u8, usize)> = None;
         for (li, &(byte_off, line)) in lines.iter().enumerate() {
+            if let Some(fence) = parse_code_fence(line) {
+                let (fence_char, fence_len, info_empty) = fence;
+                match in_fence {
+                    // Opening fence: remember its char and run length. An info
+                    // string (e.g. ```ruby) is allowed on the opener.
+                    None => in_fence = Some((fence_char, fence_len)),
+                    // Closing fence: same char, run >= opener, and nothing but
+                    // whitespace after the run (a closing fence has no info).
+                    Some((open_char, open_len))
+                        if fence_char == open_char && fence_len >= open_len && info_empty =>
+                    {
+                        in_fence = None;
+                    }
+                    // Otherwise the line stays inside the current fence as code.
+                    Some(_) => {}
+                }
+                continue;
+            }
+
+            // Lines inside a fence are code, never headings.
+            if in_fence.is_some() {
+                continue;
+            }
+
             if !line.starts_with('#') {
                 continue;
             }
@@ -254,5 +312,78 @@ mod tests {
             MarkdownExtractor.edit_capability(),
             EditCapability::TextEditSafe
         );
+    }
+
+    // ---- SF-STRESS-019: fenced code blocks must not produce phantom headings ----
+
+    #[test]
+    fn test_hash_inside_backtick_fence_not_heading() {
+        let syms = extract(b"# Real\n\n```ruby\n# config/ci.rb\n# not a heading\n```\n");
+        assert_eq!(syms.len(), 1, "only the real heading is a section");
+        assert_eq!(syms[0].name, "Real");
+    }
+
+    #[test]
+    fn test_hash_inside_tilde_fence_not_heading() {
+        let syms = extract(b"# Real\n\n~~~python\n# also a comment\n~~~\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Real");
+    }
+
+    #[test]
+    fn test_fence_with_info_string_opens_and_closes() {
+        // The rails ```ruby#6-7 case: info strings on the opener must be ignored
+        // and must not be treated as a closer.
+        let syms = extract(b"# Real\n\n```ruby#6-7\n# TODO: phantom\n```\n## Sub\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Real");
+        assert_eq!(syms[1].name, "Real.Sub", "real sub parents to the real heading");
+    }
+
+    #[test]
+    fn test_unclosed_fence_at_eof_swallows_rest() {
+        // An unclosed fence keeps the remainder of the file as code (CommonMark).
+        let syms = extract(b"# Real\n\n```\n# inside unclosed fence\n## also inside\n");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Real");
+    }
+
+    #[test]
+    fn test_closing_run_longer_than_opener_closes() {
+        // Closer run length >= opener run length closes the fence.
+        let syms = extract(b"# Real\n\n```\n# inside\n`````\n## After\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Real");
+        assert_eq!(syms[1].name, "Real.After");
+    }
+
+    #[test]
+    fn test_shorter_closing_run_does_not_close() {
+        // A run shorter than the opener does not close the fence, so the '#'
+        // line after it stays code.
+        let syms = extract(b"# Real\n\n````\n# inside\n```\n# still inside\n````\n## After\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Real");
+        assert_eq!(syms[1].name, "Real.After");
+    }
+
+    #[test]
+    fn test_real_heading_after_closed_fence_keeps_parent_path() {
+        // Hierarchy repair: a real '## Sub' after a phantom-producing fence must
+        // parent under the preceding real heading, not a phantom level-1.
+        let syms =
+            extract(b"# Top\n\n```ruby\n# config/ci.rb\nclass Foo\nend\n```\n\n## Real Sub\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Top");
+        assert_eq!(syms[1].name, "Top.Real Sub");
+        assert_eq!(syms[1].depth, 1);
+    }
+
+    #[test]
+    fn test_indented_fence_within_three_spaces_tracked() {
+        // Up to three leading spaces still opens a fence.
+        let syms = extract(b"# Real\n\n   ```\n# inside indented fence\n   ```\n## After\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[1].name, "Real.After");
     }
 }
