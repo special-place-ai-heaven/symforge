@@ -868,6 +868,7 @@ fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
                 "constrained (tiered path relevance)"
             }
             Some(SearchFilesTier::LoosePath) => "heuristic (loose path relevance)",
+            Some(SearchFilesTier::MetadataOnly) => "heuristic (Tier-2 metadata-only path)",
             None => "constrained",
         },
         _ => "constrained",
@@ -1295,12 +1296,14 @@ fn search_files_tier_summary(view: &SearchFilesView) -> String {
     let mut strong = 0usize;
     let mut basename = 0usize;
     let mut loose = 0usize;
+    let mut metadata = 0usize;
     for hit in hits {
         match hit.tier {
             SearchFilesTier::CoChange => cochange += 1,
             SearchFilesTier::StrongPath => strong += 1,
             SearchFilesTier::Basename => basename += 1,
             SearchFilesTier::LoosePath => loose += 1,
+            SearchFilesTier::MetadataOnly => metadata += 1,
         }
     }
     let mut parts = Vec::new();
@@ -1315,6 +1318,9 @@ fn search_files_tier_summary(view: &SearchFilesView) -> String {
     }
     if loose > 0 {
         parts.push(format!("loose path={loose}"));
+    }
+    if metadata > 0 {
+        parts.push(format!("metadata-only={metadata}"));
     }
     if parts.is_empty() {
         "no returned files".to_string()
@@ -1578,7 +1584,8 @@ fn hidden_search_symbols_noise_count(
 
 fn search_files_resolve_candidate_count(view: &SearchFilesResolveView) -> usize {
     match view {
-        SearchFilesResolveView::Resolved { .. } => 1,
+        SearchFilesResolveView::Resolved { .. }
+        | SearchFilesResolveView::ResolvedMetadataOnly { .. } => 1,
         SearchFilesResolveView::Ambiguous {
             matches,
             overflow_count,
@@ -1657,6 +1664,9 @@ fn append_search_files_filter_summary(
 fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'static str {
     match view {
         SearchFilesResolveView::Resolved { .. } => "exact (resolve)",
+        SearchFilesResolveView::ResolvedMetadataOnly { .. } => {
+            "exact (resolve, Tier-2 metadata-only)"
+        }
         SearchFilesResolveView::Ambiguous { .. } => "constrained (resolve candidates)",
         _ => "constrained",
     }
@@ -4532,6 +4542,22 @@ impl SymForgeServer {
                         &search_paths_evidence(std::iter::once(path.as_str())),
                     ))
                 }
+                SearchFilesResolveView::ResolvedMetadataOnly { path, reason } => {
+                    // Tier-2 path: never parsed, so report the metadata-only
+                    // parse state honestly instead of the misleading "parsed".
+                    Some(search_format::format_search_envelope(
+                        search_files_resolve_match_type_label(&view),
+                        "current index",
+                        "metadata-only (not parsed)",
+                        &search_completeness_label(0, hidden_noise_count),
+                        &search_files_scope_summary(
+                            "resolve=true against indexed file paths",
+                            include_vendor,
+                            include_personal_tooling,
+                        ),
+                        &format!("Tier-2 metadata-only path `{path}` ({reason}); never parsed"),
+                    ))
+                }
                 SearchFilesResolveView::Ambiguous {
                     matches,
                     overflow_count,
@@ -4623,6 +4649,7 @@ impl SymForgeServer {
                         path: entry.path.clone(),
                         coupling_score: Some(entry.coupling_score),
                         shared_commits: Some(entry.shared_commits),
+                        metadata_reason: None,
                     })
                     .collect();
                 let weak_hits: Vec<SearchFilesHit> = history
@@ -4633,6 +4660,7 @@ impl SymForgeServer {
                         path: entry.path.clone(),
                         coupling_score: Some(entry.coupling_score),
                         shared_commits: Some(entry.shared_commits),
+                        metadata_reason: None,
                     })
                     .collect();
                 if hits.is_empty() {

@@ -2098,6 +2098,9 @@ pub fn search_files_resolve_result_view(view: &SearchFilesResolveView) -> String
     match view {
         SearchFilesResolveView::EmptyHint => "Path hint must not be empty.".to_string(),
         SearchFilesResolveView::Resolved { path } => path.clone(),
+        SearchFilesResolveView::ResolvedMetadataOnly { path, reason } => {
+            format!("{path}  [metadata-only: {reason}]")
+        }
         SearchFilesResolveView::NotFound { hint } => {
             format!(
                 "No indexed source path matched '{hint}'. \
@@ -2155,6 +2158,9 @@ pub fn search_files_result_view(view: &SearchFilesView) -> String {
                         SearchFilesTier::StrongPath => "── Strong path matches ──",
                         SearchFilesTier::Basename => "── Basename matches ──",
                         SearchFilesTier::LoosePath => "── Loose path matches ──",
+                        SearchFilesTier::MetadataOnly => {
+                            "── Metadata-only paths (Tier-2: not parsed) ──"
+                        }
                     };
                     if lines.len() > 1 {
                         lines.push(String::new());
@@ -2166,8 +2172,16 @@ pub fn search_files_result_view(view: &SearchFilesView) -> String {
                     SearchFilesTier::StrongPath => 0.80,
                     SearchFilesTier::Basename => 0.90,
                     SearchFilesTier::LoosePath => 0.40,
+                    SearchFilesTier::MetadataOnly => 0.30,
                 };
-                if let (Some(score), Some(shared)) = (hit.coupling_score, hit.shared_commits) {
+                if hit.tier == SearchFilesTier::MetadataOnly {
+                    let reason = hit.metadata_reason.as_deref().unwrap_or("metadata only");
+                    lines.push(format!(
+                        "  {}  [metadata-only: {}]  [{:.2}]",
+                        hit.path, reason, confidence
+                    ));
+                } else if let (Some(score), Some(shared)) = (hit.coupling_score, hit.shared_commits)
+                {
                     lines.push(format!(
                         "  {}  ({:.0}% coupled, {} shared commits)  [{:.2}]",
                         hit.path,
