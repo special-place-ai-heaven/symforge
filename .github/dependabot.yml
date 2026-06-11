@@ -1,0 +1,34 @@
+# Automated dependency freshness. Policy: never sit on old versions —
+# upgrade by default; a stale component must justify its survival.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      tree-sitter-grammars:
+        patterns:
+          - "tree-sitter*"
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          - "tree-sitter*"
+
+  - package-ecosystem: npm
+    directory: /npm
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
