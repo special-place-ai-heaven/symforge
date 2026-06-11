@@ -209,6 +209,35 @@ fn collect_deepest_error_node(root: &Node, source: &str) -> Option<(String, u32,
     })
 }
 
+/// Append a NUL-byte hint to a tree-sitter diagnostic message when `source`
+/// contains literal `0x00` bytes. tree-sitter cannot parse NUL in source (the
+/// lexer treats it as input end / blank), so the deepest-error snippet looks
+/// like `syntax error near ` ` — meaningless on its own. The hint names the real
+/// cause and the offending offsets so health/quarantine output is actionable.
+fn augment_message_with_nul_hint(message: String, source: &[u8]) -> String {
+    let scan = crate::domain::index::scan_nul_bytes(source);
+    if !scan.has_nul() {
+        return message;
+    }
+    let offsets = scan
+        .first_offsets
+        .iter()
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let offset_suffix = if scan.count > scan.first_offsets.len() {
+        format!("{offsets}, ...")
+    } else {
+        offsets
+    };
+    let plural = if scan.count == 1 { "" } else { "s" };
+    format!(
+        "{message} (file contains {} NUL byte{plural} at offset(s) {offset_suffix}; \
+         tree-sitter cannot parse NUL in source)",
+        scan.count
+    )
+}
+
 fn error_candidate_is_better(
     candidate: Node,
     candidate_depth: usize,
@@ -286,7 +315,12 @@ pub(crate) fn parse_source(
         collect_deepest_error_node(&root, source).map(|(message, line, column, span)| {
             ParseDiagnostic {
                 parser: "tree-sitter".to_string(),
-                message,
+                // NUL bytes (0x00) are valid UTF-8 but tree-sitter cannot parse
+                // them in source — they truncate the lexer's view and render as a
+                // blank in the error snippet (`syntax error near ` `), hiding the
+                // real cause. When the source carries NUL bytes, append a hint so
+                // health/quarantine output explains the actual problem.
+                message: augment_message_with_nul_hint(message, source.as_bytes()),
                 line: Some(line),
                 column: Some(column),
                 byte_span: Some(span),
@@ -1359,6 +1393,54 @@ export function App() {
         let result = parse_source(&source, &LanguageId::Rust, false)
             .expect("parse_source must handle null-byte input without error");
         let (_symbols, _has_error, _diagnostic, _references, _aliases) = result;
+    }
+
+    #[test]
+    fn test_augment_message_with_nul_hint_appends_for_nul_source() {
+        // Pure-logic coverage: the hint is grammar-independent, so test it
+        // directly rather than depending on a specific tree-sitter error shape.
+        let augmented = augment_message_with_nul_hint(
+            "syntax error near ` `".to_string(),
+            b"const a = `x\0y`;\n",
+        );
+        assert!(
+            augmented.contains("file contains 1 NUL byte at offset(s) 12"),
+            "hint must name count and offset; got: {augmented}"
+        );
+        assert!(
+            augmented.contains("tree-sitter cannot parse NUL in source"),
+            "hint must explain the real cause; got: {augmented}"
+        );
+        // Original message is preserved.
+        assert!(augmented.starts_with("syntax error near ` `"));
+    }
+
+    #[test]
+    fn test_augment_message_with_nul_hint_noop_for_clean_source() {
+        let original = "syntax error near `oops`".to_string();
+        let augmented = augment_message_with_nul_hint(original.clone(), b"fn main() {}\n");
+        assert_eq!(augmented, original, "clean source must not gain a NUL hint");
+    }
+
+    #[test]
+    fn test_parse_source_diagnostic_carries_nul_hint_when_present() {
+        // A NUL smuggled into a JS template literal is valid for Node but makes
+        // tree-sitter-javascript produce a partial parse. When that happens the
+        // diagnostic must explain the NUL rather than the bare `near ` `` snippet.
+        // Robust against grammar behavior: if no diagnostic is produced we skip
+        // (the augment helper is covered directly above).
+        let source = "function mint() {\n  const token = `prefix\0suffix`;\n  return token;\n}\n";
+        let (_symbols, has_error, diagnostic, _refs, _aliases) =
+            parse_source(source, &LanguageId::JavaScript, false)
+                .expect("parse_source must not crash on a NUL-bearing template literal");
+        if has_error && let Some(diag) = diagnostic {
+            assert!(
+                diag.message
+                    .contains("tree-sitter cannot parse NUL in source"),
+                "diagnostic must carry the NUL hint; got: {}",
+                diag.message
+            );
+        }
     }
 
     #[test]

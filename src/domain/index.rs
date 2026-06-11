@@ -672,6 +672,82 @@ pub fn is_dependency_lockfile(path: &std::path::Path) -> bool {
         .is_some_and(|name| LOCKFILE_BASENAMES.contains(&name))
 }
 
+/// Maximum number of NUL byte offsets [`scan_nul_bytes`] enumerates explicitly.
+/// Beyond this we report only the count plus the first few offsets — the warning
+/// exists to alert, not to exhaustively map every NUL.
+pub const NUL_OFFSET_SAMPLE_LIMIT: usize = 5;
+
+/// Result of scanning a byte slice for literal NUL (`0x00`) bytes.
+///
+/// A NUL is valid UTF-8, so it survives `String::from_utf8_lossy` intact and is
+/// then rendered invisibly (most terminals show nothing or a space). Source code
+/// that smuggles a NUL into a string/template literal (legal for Node, Python,
+/// etc.) therefore reads back as text that does NOT byte-match the file — an
+/// agent copying that rendered text for an edit produces a mismatch. This scan
+/// powers an honest warning at the content-rendering boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NulScan {
+    /// Total count of NUL bytes in the scanned slice.
+    pub count: usize,
+    /// Byte offsets (relative to the scanned slice) of the first
+    /// [`NUL_OFFSET_SAMPLE_LIMIT`] NUL bytes, in ascending order.
+    pub first_offsets: Vec<usize>,
+}
+
+impl NulScan {
+    /// `true` when the scanned slice contained at least one NUL byte.
+    pub fn has_nul(&self) -> bool {
+        self.count > 0
+    }
+}
+
+/// Scan `content` for literal NUL (`0x00`) bytes, returning a count and the
+/// first [`NUL_OFFSET_SAMPLE_LIMIT`] offsets. Pure; scans the WHOLE slice it is
+/// given (callers pass the exact bytes whose rendering they are warning about).
+pub fn scan_nul_bytes(content: &[u8]) -> NulScan {
+    let mut count = 0usize;
+    let mut first_offsets = Vec::new();
+    for (offset, &byte) in content.iter().enumerate() {
+        if byte == 0 {
+            count += 1;
+            if first_offsets.len() < NUL_OFFSET_SAMPLE_LIMIT {
+                first_offsets.push(offset);
+            }
+        }
+    }
+    NulScan {
+        count,
+        first_offsets,
+    }
+}
+
+/// Render a single-line warning describing NUL bytes found by [`scan_nul_bytes`],
+/// or `None` when the slice is clean. The message is deliberately blunt: copied
+/// rendered text will not byte-match the file, so edits must use byte-exact tools.
+pub fn nul_byte_warning_line(scan: &NulScan) -> Option<String> {
+    if !scan.has_nul() {
+        return None;
+    }
+    let offsets = scan
+        .first_offsets
+        .iter()
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plural = if scan.count == 1 { "" } else { "s" };
+    let offset_suffix = if scan.count > scan.first_offsets.len() {
+        format!("{offsets}, ...")
+    } else {
+        offsets
+    };
+    Some(format!(
+        "WARNING: this file contains {} NUL byte{plural} (0x00) at byte offset(s) {offset_suffix}. \
+         They are rendered invisibly above; copied text will NOT byte-match the file. \
+         Edit this file with byte-exact tools, not rendered text.",
+        scan.count
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,5 +1068,63 @@ mod tests {
         };
         assert_eq!(sf.tier(), AdmissionTier::MetadataOnly);
         assert_eq!(sf.reason(), Some(SkipReason::DenylistedExtension));
+    }
+
+    #[test]
+    fn test_scan_nul_bytes_clean_slice_reports_none() {
+        let scan = scan_nul_bytes(b"fn main() {}\n");
+        assert!(!scan.has_nul());
+        assert_eq!(scan.count, 0);
+        assert!(scan.first_offsets.is_empty());
+        assert_eq!(nul_byte_warning_line(&scan), None);
+    }
+
+    #[test]
+    fn test_scan_nul_bytes_empty_slice_reports_none() {
+        let scan = scan_nul_bytes(b"");
+        assert!(!scan.has_nul());
+        assert_eq!(nul_byte_warning_line(&scan), None);
+    }
+
+    #[test]
+    fn test_scan_nul_bytes_single_offset_and_singular_warning() {
+        let scan = scan_nul_bytes(b"ab\0cd");
+        assert_eq!(scan.count, 1);
+        assert_eq!(scan.first_offsets, vec![2]);
+        let warning = nul_byte_warning_line(&scan).expect("NUL present");
+        assert!(warning.contains("1 NUL byte (0x00)"), "warning: {warning}");
+        assert!(
+            warning.contains("byte offset(s) 2."),
+            "single offset, no ellipsis: {warning}"
+        );
+        assert!(warning.contains("byte-exact tools"));
+    }
+
+    #[test]
+    fn test_scan_nul_bytes_plural_warning() {
+        let scan = scan_nul_bytes(b"\0a\0b");
+        assert_eq!(scan.count, 2);
+        assert_eq!(scan.first_offsets, vec![0, 2]);
+        let warning = nul_byte_warning_line(&scan).expect("NUL present");
+        assert!(warning.contains("2 NUL bytes (0x00)"), "warning: {warning}");
+        assert!(
+            warning.contains("byte offset(s) 0, 2."),
+            "warning: {warning}"
+        );
+    }
+
+    #[test]
+    fn test_scan_nul_bytes_caps_offsets_and_adds_ellipsis() {
+        // 7 NUL bytes; only the first NUL_OFFSET_SAMPLE_LIMIT (5) are enumerated.
+        let scan = scan_nul_bytes(b"\0\0\0\0\0\0\0");
+        assert_eq!(scan.count, 7);
+        assert_eq!(scan.first_offsets.len(), NUL_OFFSET_SAMPLE_LIMIT);
+        assert_eq!(scan.first_offsets, vec![0, 1, 2, 3, 4]);
+        let warning = nul_byte_warning_line(&scan).expect("NUL present");
+        assert!(warning.contains("7 NUL bytes"), "warning: {warning}");
+        assert!(
+            warning.contains("0, 1, 2, 3, 4, ..."),
+            "more NULs than sampled => ellipsis: {warning}"
+        );
     }
 }

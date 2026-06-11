@@ -2148,6 +2148,34 @@ fn admission_tier_degradation_for_path(
     }
 }
 
+/// File-level (non-symbol) variant of admission-tier degradation. Returns an
+/// honest "not indexed" message for a path that EXISTS but was admitted as
+/// Tier-2 metadata-only or Tier-3 hard-skipped, instead of a misleading
+/// "File not found". Resolution reuses the same index-lookup + disk-fallback
+/// path as `admission_tier_degradation_for_path`, so the containment guard in
+/// `admission_degradation_view_from_disk` (path must stay within the repo root)
+/// is preserved. `None` means the path is either Tier-1 (indexed) or genuinely
+/// absent — the caller should fall through to its normal not-found handling.
+fn admission_tier_file_degradation_for_path(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    path: &str,
+) -> Option<String> {
+    let view = index
+        .capture_admission_tier_lookup_view(path)
+        .map(admission_degradation_view_from_lookup)
+        .or_else(|| repo_root.and_then(|root| admission_degradation_view_from_disk(root, path)))?;
+    if view.tier == AdmissionTier::Normal {
+        return None;
+    }
+    Some(format::not_indexed_skipped_file(
+        &view.path,
+        view.tier,
+        view.reason,
+        view.size,
+    ))
+}
+
 fn find_references_match_type_label(input: &FindReferencesInput, mode: &str) -> &'static str {
     if mode == "implementations" {
         return "constrained (implementations mode)";
@@ -3079,6 +3107,27 @@ impl SymForgeServer {
             guard.capture_shared_file(&params.0.path)
         };
 
+        // Honest Tier-2/Tier-3 response before any miss handling: a path like
+        // package-lock.json EXISTS but is admitted metadata-only, so it has no
+        // symbols to return. Name the tier and point at get_file_content for raw
+        // reads instead of "File not found". Only runs when the file is not in
+        // the index (Tier-1 files resolve above).
+        if file.is_none() {
+            let repo_root = self.capture_repo_root();
+            let degraded = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                admission_tier_file_degradation_for_path(
+                    &guard,
+                    repo_root.as_deref(),
+                    &params.0.path,
+                )
+            };
+            if let Some(result) = degraded {
+                return result;
+            }
+        }
+
         // Estimate mode: return token cost without full content
         if params.0.estimate == Some(true) {
             if let Some(ref file) = file {
@@ -3325,6 +3374,27 @@ impl SymForgeServer {
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
+        }
+        // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
+        // deliberately admitted as metadata-only (e.g. package-lock.json) or
+        // hard-skipped. Return an actionable "not indexed" message pointing at
+        // get_file_content for raw reads, instead of a misleading
+        // "File not found". Resolution reuses the index lookup + repo-root-bound
+        // disk fallback shared with the symbol-level degradation path.
+        {
+            let repo_root = self.capture_repo_root();
+            let degraded = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                admission_tier_file_degradation_for_path(
+                    &guard,
+                    repo_root.as_deref(),
+                    &params.0.path,
+                )
+            };
+            if let Some(result) = degraded {
+                return result;
+            }
         }
         if params.0.estimate == Some(true) {
             let guard = self.index.read();
@@ -5848,18 +5918,41 @@ impl SymForgeServer {
         }
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            if let Some(file) = guard.capture_shared_file(&input.path) {
+            let indexed = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                guard.capture_shared_file(&input.path)
+            };
+            if let Some(file) = indexed {
                 let file_tokens = file.content.len() / 4;
                 let line_count = file.content.iter().filter(|&&b| b == b'\n').count();
                 return format!(
                     "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (~{} lines)",
                     input.path, file_tokens, line_count
                 );
-            } else {
-                return format::not_found_file(&input.path);
             }
+            // Not indexed: get_file_content still serves Tier-2 (and other
+            // non-source) files via a raw disk read, so the estimate should
+            // reflect the disk file rather than reporting "File not found".
+            // Reuse the same repo-root containment guard as the main read path.
+            if let Some(root) = self.capture_repo_root() {
+                match edit::safe_repo_path(&root, &input.path) {
+                    Ok(canon_path) if canon_path.is_file() => {
+                        if let Ok(metadata) = std::fs::metadata(&canon_path) {
+                            let file_tokens = metadata.len() as usize / 4;
+                            return format!(
+                                "Estimate for get_file_content(path=\"{}\"):\n  ~{} tokens (raw disk read; not indexed)",
+                                input.path, file_tokens
+                            );
+                        }
+                    }
+                    Err(message) if message.contains("outside the repository") => {
+                        return format::path_outside_repo(&input.path);
+                    }
+                    _ => {}
+                }
+            }
+            return format::not_found_file(&input.path);
         }
 
         let options = match file_content_options_from_input(&input) {
@@ -5897,10 +5990,14 @@ impl SymForgeServer {
                 // collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                format::enforce_token_budget(
-                    format::cap_file_content_output(format!("{}{}", mode_annotation, output)),
-                    max_tokens,
-                )
+                // NUL-byte guard: append an honest warning (after the byte cap so
+                // truncation can never drop it) when the file content contains
+                // literal 0x00 bytes that render invisibly. See
+                // `format::append_nul_byte_warning`.
+                let capped =
+                    format::cap_file_content_output(format!("{}{}", mode_annotation, output));
+                let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
+                format::enforce_token_budget(with_warning, max_tokens)
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -5930,13 +6027,15 @@ impl SymForgeServer {
                                 // fallback branch (non-indexed source files);
                                 // collection policy is resolved inside bump_frecency.
                                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                                return format::enforce_token_budget(
-                                    format::cap_file_content_output(format!(
-                                        "{}{}",
-                                        mode_annotation, body
-                                    )),
-                                    max_tokens,
-                                );
+                                // NUL-byte guard (raw-disk fallback branch):
+                                // mirror the indexed branch — warn after the cap.
+                                let capped = format::cap_file_content_output(format!(
+                                    "{}{}",
+                                    mode_annotation, body
+                                ));
+                                let with_warning =
+                                    format::append_nul_byte_warning(capped, &content);
+                                return format::enforce_token_budget(with_warning, max_tokens);
                             }
                             Err(e) => {
                                 return format!("{} [error: could not read file: {e}]", input.path);
@@ -8196,6 +8295,39 @@ mod tests {
         index
     }
 
+    /// Build a ready index that knows `path` only as a Tier-2 metadata-only skip
+    /// record (e.g. a dependency lockfile) — the path is NOT in `files`,
+    /// mirroring the post-admission state where lockfiles are demoted instead of
+    /// parsed. One real Tier-1 source file is also seeded so the index reports
+    /// `Ready` (an index with zero Tier-1 files reports `Empty`, matching a real
+    /// repo where source coexists with the lockfile). Used to exercise the honest
+    /// "not indexed" degradation responses in
+    /// get_file_context / get_symbol / get_file_content.
+    fn make_live_index_with_tier2_skip(
+        path: &str,
+        size: u64,
+        reason: crate::domain::index::SkipReason,
+    ) -> LiveIndex {
+        use crate::domain::index::{AdmissionDecision, AdmissionTier, SkippedFile};
+        let (anchor_key, anchor_file) = make_file(
+            "src/anchor.rs",
+            b"fn anchor() {}\n",
+            vec![make_symbol("anchor", SymbolKind::Function, 0, 0)],
+        );
+        let mut index = make_live_index_ready(vec![(anchor_key, anchor_file)]);
+        let extension = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_string);
+        index.skipped_files = vec![SkippedFile {
+            path: path.to_string(),
+            size,
+            extension,
+            decision: AdmissionDecision::skip(AdmissionTier::MetadataOnly, reason),
+        }];
+        index
+    }
+
     fn make_live_index_ready_with_coupling_store(
         files: Vec<(String, IndexedFile)>,
         store: crate::live_index::coupling::CouplingStore,
@@ -9102,6 +9234,318 @@ mod tests {
         assert!(
             !missing.contains("outside the repository root"),
             "an in-repo missing file must not be misreported as outside-root; got: {missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_context_tier2_lockfile_returns_metadata_only_message() {
+        // A Tier-2 metadata-only path (e.g. package-lock.json) EXISTS but is
+        // deliberately not parsed. get_file_context must say so honestly and
+        // point at get_file_content, NOT report a misleading "File not found".
+        let index = make_live_index_with_tier2_skip(
+            "package-lock.json",
+            406 * 1024,
+            crate::domain::index::SkipReason::DependencyLockfile,
+        );
+        let server = make_server(index);
+
+        let result = server
+            .get_file_context(Parameters(super::GetFileContextInput {
+                path: "package-lock.json".to_string(),
+                max_tokens: None,
+                sections: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("Not indexed: package-lock.json is Tier 2 (metadata only)"),
+            "Tier-2 path must report metadata-only status; got: {result}"
+        );
+        assert!(
+            result.contains("reason: lockfile"),
+            "message must name the skip reason; got: {result}"
+        );
+        assert!(
+            result.contains("get_file_content"),
+            "message must point at the raw-read escape hatch; got: {result}"
+        );
+        assert!(
+            !result.starts_with("File not found"),
+            "Tier-2 path must NOT be reported as a generic miss; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_indexed_nul_byte_appends_warning() {
+        // A source file with a NUL (0x00) mid-content (mirrors the mint.js case:
+        // valid for Node, smuggled into a template literal). It passes the
+        // first-8KB binary sniff and gets indexed, so get_file_content renders it.
+        // The NUL renders invisibly; the warning must make that explicit.
+        let content = b"const a = `x\0y`;\nfn anchor() {}\n";
+        let nul_offset = content.iter().position(|&b| b == 0).unwrap();
+        let sym = SymbolRecord {
+            name: "anchor".to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (16, content.len() as u32),
+            line_range: (1, 1),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/mint.js", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("src/mint.js")))
+            .await;
+
+        assert!(
+            out.contains("WARNING: this file contains 1 NUL byte (0x00)"),
+            "NUL warning must be present; got: {out}"
+        );
+        assert!(
+            out.contains(&format!("byte offset(s) {nul_offset}")),
+            "warning must report the NUL byte offset {nul_offset}; got: {out}"
+        );
+        assert!(
+            out.contains("byte-exact tools"),
+            "warning must steer agents to byte-exact edits; got: {out}"
+        );
+        // Symbols are still extracted best-effort: get_file_content renders fine.
+        assert!(
+            out.contains("anchor"),
+            "content must still render; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_tier2_lockfile_returns_metadata_only_message() {
+        // get_symbol on a Tier-2 metadata-only path has no symbols to return;
+        // it must degrade to the honest "not indexed" message rather than a
+        // bare "File not found" (which would imply the file is absent).
+        let index = make_live_index_with_tier2_skip(
+            "package-lock.json",
+            406 * 1024,
+            crate::domain::index::SkipReason::DependencyLockfile,
+        );
+        let server = make_server(index);
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input(
+                "package-lock.json",
+                "anything",
+            )))
+            .await;
+
+        assert!(
+            result.contains("Not indexed: package-lock.json is Tier 2 (metadata only)"),
+            "Tier-2 path must report metadata-only status; got: {result}"
+        );
+        assert!(
+            !result.starts_with("File not found"),
+            "Tier-2 path must NOT be reported as a generic miss; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_no_nul_has_no_warning() {
+        // No false positives: a clean source file must not gain a NUL warning.
+        let content = b"const a = `xy`;\nfn anchor() {}\n";
+        let sym = SymbolRecord {
+            name: "anchor".to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (15, content.len() as u32),
+            line_range: (1, 1),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/clean.js", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("src/clean.js")))
+            .await;
+
+        assert!(
+            !out.contains("NUL byte"),
+            "clean file must not gain a NUL warning; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_tier2_lockfile_returns_raw_disk_content() {
+        // Chosen semantics: get_file_content is the documented escape hatch for
+        // Tier-2 files. Even though package-lock.json is metadata-only (not in
+        // the index), get_file_content must still serve its raw bytes from disk.
+        let repo = TempDir::new().expect("temp repo");
+        let lockfile_body = b"{\n  \"name\": \"demo\",\n  \"lockfileVersion\": 3\n}\n";
+        fs::write(repo.path().join("package-lock.json"), lockfile_body)
+            .expect("write lockfile to disk");
+        let index = make_live_index_with_tier2_skip(
+            "package-lock.json",
+            lockfile_body.len() as u64,
+            crate::domain::index::SkipReason::DependencyLockfile,
+        );
+        let server = make_server_with_root(index, Some(repo.path().to_path_buf()));
+
+        let result = server
+            .get_file_content(Parameters(get_file_content_input("package-lock.json")))
+            .await;
+
+        assert!(
+            result.contains("\"lockfileVersion\": 3"),
+            "get_file_content must serve Tier-2 file raw from disk; got: {result}"
+        );
+        assert!(
+            !result.starts_with("File not found"),
+            "Tier-2 escape hatch must not report a miss; got: {result}"
+        );
+        assert!(
+            !result.contains("Not indexed:"),
+            "get_file_content must read the file, not degrade to the Tier-2 notice; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_raw_disk_fallback_nul_warning() {
+        // Raw-disk fallback branch (file not in index): the warning must also fire
+        // there, using the bytes read from disk.
+        let repo = TempDir::new().expect("temp repo");
+        let content = b"plain text\0with a nul\n";
+        let nul_offset = content.iter().position(|&b| b == 0).unwrap();
+        fs::write(repo.path().join("notes.txt"), content).expect("write nul file");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("notes.txt")))
+            .await;
+        assert!(
+            out.contains("WARNING: this file contains 1 NUL byte (0x00)"),
+            "raw-disk fallback must also warn on NUL; got: {out}"
+        );
+        assert!(
+            out.contains(&format!("byte offset(s) {nul_offset}")),
+            "raw-disk warning must report the NUL offset {nul_offset}; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_context_genuinely_missing_path_still_not_found() {
+        // A path that is neither indexed nor a known skip nor present on disk
+        // must still report a plain "File not found", preserving the existing
+        // close-match suggestion behavior where applicable.
+        let server = make_server(make_live_index_ready(vec![]));
+
+        let result = server
+            .get_file_context(Parameters(super::GetFileContextInput {
+                path: "totally/absent/file.rs".to_string(),
+                max_tokens: None,
+                sections: None,
+                estimate: None,
+            }))
+            .await;
+
+        assert!(
+            result.starts_with("File not found"),
+            "genuinely missing path must report a plain not-found; got: {result}"
+        );
+        assert!(
+            !result.contains("Not indexed:"),
+            "absent path must not be misreported as a Tier-2 skip; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_symbol_body_preserves_nul_after_edited_symbol() {
+        // Byte-exactness guarantee: editing a symbol that sits BEFORE a NUL byte
+        // must leave the NUL intact on disk. The splice (apply_splice) copies the
+        // SUFFIX bytes (everything after the symbol, including the NUL) verbatim —
+        // it never re-renders the untouched file region. `target` is parsed from
+        // the clean prefix; the NUL lives in a later raw-string literal.
+        let original =
+            b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
+        assert!(original.contains(&0u8), "fixture must contain a NUL");
+        let (_dir, server, file_path) = setup_edit_test(original);
+
+        let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            path: "src/lib.rs".to_string(),
+            name: "target".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "fn target() {\n    let x = 42;\n}".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            working_directory: None,
+        };
+        let result = server.replace_symbol_body(Parameters(input)).await;
+        assert!(result.contains("replaced"), "result was: {result}");
+
+        // Read back RAW bytes: the NUL must still be present, embedded in the
+        // untouched suffix literal that apply_splice copied verbatim.
+        let on_disk = std::fs::read(&file_path).unwrap();
+        let on_disk_nul = on_disk
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL byte must survive an edit to an earlier symbol");
+        assert_eq!(
+            &on_disk[on_disk_nul - 4..on_disk_nul],
+            b"lead",
+            "NUL must remain embedded in the untouched suffix literal"
+        );
+        assert!(
+            on_disk.windows(b"x = 42".len()).any(|w| w == b"x = 42"),
+            "new body must be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_preserves_nul_after_edited_symbol() {
+        // Same byte-exactness guarantee for edit_within_symbol.
+        let original =
+            b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(original);
+
+        let result = server
+            .edit_within_symbol(Parameters(crate::protocol::edit::EditWithinSymbolInput {
+                path: "src/lib.rs".to_string(),
+                name: "target".to_string(),
+                kind: None,
+                symbol_line: None,
+                old_text: "let x = 1;".to_string(),
+                new_text: "let x = 7;".to_string(),
+                replace_all: false,
+                dry_run: None,
+                idempotency_key: None,
+                working_directory: None,
+            }))
+            .await;
+        assert!(
+            result.contains("edited within `target`"),
+            "result was: {result}"
+        );
+
+        let on_disk = std::fs::read(&file_path).unwrap();
+        let on_disk_nul = on_disk
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL must survive edit_within_symbol on an earlier symbol");
+        assert_eq!(
+            &on_disk[on_disk_nul - 4..on_disk_nul],
+            b"lead",
+            "NUL must remain embedded in the untouched suffix literal"
+        );
+        assert!(
+            on_disk
+                .windows(b"let x = 7;".len())
+                .any(|w| w == b"let x = 7;"),
+            "new text must be written"
         );
     }
 

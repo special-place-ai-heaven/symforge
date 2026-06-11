@@ -6,6 +6,10 @@ pub const META_SCHEMA_VERSION: &str = "schema_version";
 pub const META_LAST_HEAD: &str = "last_indexed_head_oid";
 pub const META_COLD_BUILT_AT: &str = "cold_build_completed_at";
 pub const META_LAST_REFERENCE_TS: &str = "last_reference_ts";
+/// Number of `commit_delta` applications since the last VACUUM. Persisted so
+/// the compaction cadence survives process restarts. Cold builds reset it to 0
+/// because they VACUUM unconditionally.
+pub const META_DELTA_SINCE_VACUUM: &str = "delta_since_vacuum";
 
 pub const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS coupling_meta (

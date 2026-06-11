@@ -14,7 +14,36 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::AnchorKey;
 use super::decay_factor;
-use super::schema::{CURRENT_SCHEMA_VERSION, META_LAST_HEAD, META_SCHEMA_VERSION, SCHEMA_V1};
+use super::schema::{
+    CURRENT_SCHEMA_VERSION, META_DELTA_SINCE_VACUUM, META_LAST_HEAD, META_SCHEMA_VERSION, SCHEMA_V1,
+};
+
+/// Run `VACUUM` after this many `commit_delta` applications to reclaim the
+/// free pages that incremental updates leave behind. Cold builds VACUUM
+/// unconditionally (they `DELETE` every row first), so this only governs the
+/// incremental path. Override with `SYMFORGE_COUPLING_VACUUM_EVERY`; `0`
+/// disables periodic delta-driven compaction entirely.
+pub const DEFAULT_DELTA_VACUUM_INTERVAL: u64 = 50;
+
+/// Env override for the delta-driven VACUUM cadence (`0` disables it).
+pub const COUPLING_VACUUM_EVERY_ENV: &str = "SYMFORGE_COUPLING_VACUUM_EVERY";
+
+/// Resolve the delta-driven VACUUM interval from the environment, falling back
+/// to [`DEFAULT_DELTA_VACUUM_INTERVAL`]. `0` disables periodic compaction.
+/// Unparseable values fall back to the default. Mirrors the testable
+/// `*_from_value` pattern used elsewhere in the codebase.
+pub fn delta_vacuum_interval_from_value(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim) {
+        Some(value) if !value.is_empty() => value
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_DELTA_VACUUM_INTERVAL),
+        _ => DEFAULT_DELTA_VACUUM_INTERVAL,
+    }
+}
+
+fn delta_vacuum_interval_from_env() -> u64 {
+    delta_vacuum_interval_from_value(std::env::var(COUPLING_VACUUM_EVERY_ENV).ok().as_deref())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CouplingRow {
@@ -340,6 +369,72 @@ impl CouplingStore {
         Ok(())
     }
 
+    /// Reclaim free pages by rewriting the database file. SQLite never returns
+    /// pages freed by `DELETE` to the OS on its own (auto_vacuum is off), so
+    /// the file grows monotonically with churn until a `VACUUM` repacks it.
+    /// Must run outside any transaction.
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("coupling mutex poisoned");
+        conn.execute_batch("VACUUM")
+            .context("vacuuming coupling db")?;
+        Ok(())
+    }
+
+    /// Number of `commit_delta` applications recorded since the last VACUUM.
+    /// Reset to 0 by cold builds (which VACUUM unconditionally).
+    pub fn delta_since_vacuum(&self) -> Result<u64> {
+        let conn = self.conn.lock().expect("coupling mutex poisoned");
+        let s: Option<String> = conn
+            .query_row(
+                "SELECT value FROM coupling_meta WHERE key = ?1",
+                params![META_DELTA_SINCE_VACUUM],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(s.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Increment the persisted delta-since-vacuum counter and, when the
+    /// configured interval is reached, VACUUM and reset the counter. The
+    /// counter is bumped inside the delta transaction (see `commit_delta`);
+    /// this method is the post-commit "maybe compact" step, so it reads the
+    /// freshly-committed counter and acts on it. A `0` interval disables
+    /// delta-driven compaction. VACUUM failures are non-fatal.
+    fn maybe_vacuum_after_delta(&self) {
+        let interval = delta_vacuum_interval_from_env();
+        if interval == 0 {
+            return;
+        }
+        let count = match self.delta_since_vacuum() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("coupling: reading delta-vacuum counter failed: {e}");
+                return;
+            }
+        };
+        if count < interval {
+            return;
+        }
+        if let Err(e) = self.vacuum() {
+            tracing::warn!("coupling: periodic delta VACUUM failed: {e}");
+            return;
+        }
+        if let Err(e) = self.reset_delta_since_vacuum() {
+            tracing::warn!("coupling: resetting delta-vacuum counter failed: {e}");
+        }
+    }
+
+    /// Reset the persisted delta-since-vacuum counter to 0.
+    fn reset_delta_since_vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("coupling mutex poisoned");
+        conn.execute(
+            "INSERT INTO coupling_meta (key, value) VALUES (?1, '0')
+             ON CONFLICT(key) DO UPDATE SET value = '0'",
+            params![META_DELTA_SINCE_VACUUM],
+        )?;
+        Ok(())
+    }
+
     /// Snapshot of the commit OIDs currently inside the bounded window,
     /// keyed to their commit timestamp. Used by delta to diff against a
     /// freshly-computed window.
@@ -442,7 +537,24 @@ impl CouplingStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![super::schema::META_COLD_BUILT_AT, reference_ts.to_string()],
         )?;
+        // A cold build always VACUUMs (below), so the delta-since-vacuum
+        // counter starts fresh from here.
+        tx.execute(
+            "INSERT INTO coupling_meta (key, value) VALUES (?1, '0')
+             ON CONFLICT(key) DO UPDATE SET value = '0'",
+            params![META_DELTA_SINCE_VACUUM],
+        )?;
         tx.commit()?;
+        drop(conn);
+
+        // Cold build `DELETE`s every row before reinserting, orphaning a large
+        // number of pages. VACUUM unconditionally to return them to the OS;
+        // cold builds are rare (first session / wipe / schema reset), so the
+        // cost is acceptable and this is the single highest-leverage bound on
+        // coupling.db growth. Non-fatal on failure.
+        if let Err(e) = self.vacuum() {
+            tracing::warn!("coupling: post-cold-build VACUUM failed: {e}");
+        }
         Ok(())
     }
 
@@ -627,7 +739,24 @@ impl CouplingStore {
             ],
         )?;
 
+        // Bump the delta-since-vacuum counter inside the same transaction so it
+        // advances exactly once per committed delta and survives restarts.
+        // Stored as TEXT to match the other meta values; COALESCE handles the
+        // first delta after a cold build / fresh store.
+        tx.execute(
+            "INSERT INTO coupling_meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET
+                 value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            params![META_DELTA_SINCE_VACUUM],
+        )?;
+
         tx.commit()?;
+        drop(conn);
+
+        // After committing, compact if the configured interval is reached.
+        // Deltas churn pages via the global rescale UPDATE; periodic VACUUM
+        // bounds the slow growth the incremental path leaves behind.
+        self.maybe_vacuum_after_delta();
         Ok(())
     }
 }
@@ -1047,5 +1176,229 @@ mod tests {
             row.shared_commits, 1,
             "pair_row returns row regardless of strength; floor is caller-applied"
         );
+    }
+
+    // ─── Compaction / VACUUM bounding ───────────────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+
+    // Serialises COUPLING_VACUUM_EVERY_ENV mutation across tests. Project test
+    // policy already enforces --test-threads=1, but the lock makes the env
+    // contract explicit and robust to future parallelism.
+    static VACUUM_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[allow(unsafe_code)] // test-only env helper runs under VACUUM_ENV_LOCK.
+    fn set_vacuum_env(value: &str) {
+        // SAFETY: callers hold VACUUM_ENV_LOCK; tests run single-threaded.
+        unsafe { std::env::set_var(COUPLING_VACUUM_EVERY_ENV, value) };
+    }
+
+    #[allow(unsafe_code)] // test-only env helper runs under VACUUM_ENV_LOCK.
+    fn clear_vacuum_env() {
+        // SAFETY: callers hold VACUUM_ENV_LOCK; tests run single-threaded.
+        unsafe { std::env::remove_var(COUPLING_VACUUM_EVERY_ENV) };
+    }
+
+    fn ledger(oid: &str, anchor: &str, partner: &str, ts: i64) -> LedgerEdgeRow {
+        LedgerEdgeRow {
+            commit_oid: oid.to_string(),
+            anchor_key: AnchorKey::file(anchor).as_str().to_string(),
+            partner_key: AnchorKey::file(partner).as_str().to_string(),
+            shared_inc: 1,
+            base_weight: 1.0,
+            commit_ts: ts,
+        }
+    }
+
+    #[test]
+    fn delta_vacuum_interval_parses_and_defaults() {
+        assert_eq!(
+            delta_vacuum_interval_from_value(None),
+            DEFAULT_DELTA_VACUUM_INTERVAL
+        );
+        assert_eq!(
+            delta_vacuum_interval_from_value(Some("")),
+            DEFAULT_DELTA_VACUUM_INTERVAL
+        );
+        assert_eq!(delta_vacuum_interval_from_value(Some("10")), 10);
+        assert_eq!(delta_vacuum_interval_from_value(Some(" 10 ")), 10);
+        // 0 disables periodic compaction (honored, not defaulted).
+        assert_eq!(delta_vacuum_interval_from_value(Some("0")), 0);
+        // Garbage falls back to the default.
+        assert_eq!(
+            delta_vacuum_interval_from_value(Some("nope")),
+            DEFAULT_DELTA_VACUUM_INTERVAL
+        );
+    }
+
+    #[test]
+    fn cold_build_resets_delta_counter_to_zero() {
+        let store = CouplingStore::open_in_memory().unwrap();
+        // Simulate prior deltas having advanced the counter.
+        store.reset_delta_since_vacuum().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO coupling_meta (key, value) VALUES (?1, '42')
+                 ON CONFLICT(key) DO UPDATE SET value = '42'",
+                params![META_DELTA_SINCE_VACUUM],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.delta_since_vacuum().unwrap(), 42);
+
+        store
+            .commit_cold_build(
+                &[sample_row("a.rs", "b.rs", 1, 1.0, 100)],
+                &[("oid1".to_string(), 100)],
+                &[ledger("oid1", "a.rs", "b.rs", 100)],
+                Some("head1"),
+                100,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.delta_since_vacuum().unwrap(),
+            0,
+            "cold build must reset the delta-since-vacuum counter"
+        );
+    }
+
+    #[test]
+    fn commit_delta_increments_counter_without_vacuum_below_interval() {
+        let _lock = VACUUM_ENV_LOCK.lock().unwrap();
+        set_vacuum_env("100"); // high interval — no VACUUM during this test
+        let store = CouplingStore::open_in_memory().unwrap();
+
+        store
+            .commit_cold_build(&[], &[], &[], Some("head0"), 100)
+            .unwrap();
+        assert_eq!(store.delta_since_vacuum().unwrap(), 0);
+
+        for i in 1..=3 {
+            store
+                .commit_delta(
+                    &[(format!("oid{i}"), 100 + i)],
+                    &[ledger(&format!("oid{i}"), "a.rs", "b.rs", 100 + i)],
+                    &[],
+                    Some(&format!("head{i}")),
+                    Some(100),
+                    100 + i,
+                    1_000_000,
+                )
+                .unwrap();
+            assert_eq!(
+                store.delta_since_vacuum().unwrap(),
+                i as u64,
+                "counter advances once per delta"
+            );
+        }
+        clear_vacuum_env();
+    }
+
+    #[test]
+    fn periodic_vacuum_resets_counter_and_shrinks_file() {
+        let _lock = VACUUM_ENV_LOCK.lock().unwrap();
+        set_vacuum_env("2"); // VACUUM when counter reaches 2
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("coupling.db");
+        let store = CouplingStore::open(&db_path).unwrap();
+
+        // Seed a large aggregate, then churn it to create free pages so the
+        // VACUUM has something measurable to reclaim. Cold build VACUUMs, so
+        // start the counter clean afterwards.
+        let mut rows = Vec::new();
+        for i in 0..4000 {
+            rows.push(sample_row(
+                &format!("file_{i}.rs"),
+                &format!("file_{}.rs", i + 1),
+                1,
+                1.0,
+                100,
+            ));
+        }
+        store
+            .commit_cold_build(&rows, &[("oid0".to_string(), 100)], &[], Some("head0"), 100)
+            .unwrap();
+        assert_eq!(store.delta_since_vacuum().unwrap(), 0);
+
+        // First delta: counter -> 1, below interval, no VACUUM yet.
+        store
+            .commit_delta(
+                &[("oid1".to_string(), 101)],
+                &[ledger("oid1", "a.rs", "b.rs", 101)],
+                &[],
+                Some("head1"),
+                Some(100),
+                101,
+                1_000_000,
+            )
+            .unwrap();
+        assert_eq!(store.delta_since_vacuum().unwrap(), 1);
+
+        // Manually bloat the file: delete the bulk rows (frees pages) just
+        // before the delta that crosses the interval, so VACUUM reclaims them.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM coupling", []).unwrap();
+        }
+        let size_before = std::fs::metadata(&db_path).unwrap().len();
+
+        // Second delta: counter -> 2, reaches interval, triggers VACUUM+reset.
+        store
+            .commit_delta(
+                &[("oid2".to_string(), 102)],
+                &[ledger("oid2", "a.rs", "b.rs", 102)],
+                &[],
+                Some("head2"),
+                Some(100),
+                102,
+                1_000_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.delta_since_vacuum().unwrap(),
+            0,
+            "reaching the interval must VACUUM and reset the counter"
+        );
+        let size_after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "VACUUM should shrink the file: before={size_before}, after={size_after}"
+        );
+        clear_vacuum_env();
+    }
+
+    #[test]
+    fn periodic_vacuum_disabled_when_interval_zero() {
+        let _lock = VACUUM_ENV_LOCK.lock().unwrap();
+        set_vacuum_env("0"); // disabled
+        let store = CouplingStore::open_in_memory().unwrap();
+        store
+            .commit_cold_build(&[], &[], &[], Some("head0"), 100)
+            .unwrap();
+
+        for i in 1..=5 {
+            store
+                .commit_delta(
+                    &[(format!("oid{i}"), 100 + i)],
+                    &[ledger(&format!("oid{i}"), "a.rs", "b.rs", 100 + i)],
+                    &[],
+                    Some(&format!("head{i}")),
+                    Some(100),
+                    100 + i,
+                    1_000_000,
+                )
+                .unwrap();
+        }
+        // Counter keeps climbing because compaction is disabled; it is never
+        // reset by a VACUUM.
+        assert_eq!(
+            store.delta_since_vacuum().unwrap(),
+            5,
+            "interval=0 disables periodic VACUUM, so the counter is never reset"
+        );
+        clear_vacuum_env();
     }
 }
