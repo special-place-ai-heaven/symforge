@@ -5897,10 +5897,14 @@ impl SymForgeServer {
                 // collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                format::enforce_token_budget(
-                    format::cap_file_content_output(format!("{}{}", mode_annotation, output)),
-                    max_tokens,
-                )
+                // NUL-byte guard: append an honest warning (after the byte cap so
+                // truncation can never drop it) when the file content contains
+                // literal 0x00 bytes that render invisibly. See
+                // `format::append_nul_byte_warning`.
+                let capped =
+                    format::cap_file_content_output(format!("{}{}", mode_annotation, output));
+                let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
+                format::enforce_token_budget(with_warning, max_tokens)
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -5930,13 +5934,15 @@ impl SymForgeServer {
                                 // fallback branch (non-indexed source files);
                                 // collection policy is resolved inside bump_frecency.
                                 self.bump_frecency(&[PathBuf::from(&input.path)]);
-                                return format::enforce_token_budget(
-                                    format::cap_file_content_output(format!(
-                                        "{}{}",
-                                        mode_annotation, body
-                                    )),
-                                    max_tokens,
-                                );
+                                // NUL-byte guard (raw-disk fallback branch):
+                                // mirror the indexed branch — warn after the cap.
+                                let capped = format::cap_file_content_output(format!(
+                                    "{}{}",
+                                    mode_annotation, body
+                                ));
+                                let with_warning =
+                                    format::append_nul_byte_warning(capped, &content);
+                                return format::enforce_token_budget(with_warning, max_tokens);
                             }
                             Err(e) => {
                                 return format!("{} [error: could not read file: {e}]", input.path);
@@ -9102,6 +9108,190 @@ mod tests {
         assert!(
             !missing.contains("outside the repository root"),
             "an in-repo missing file must not be misreported as outside-root; got: {missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_indexed_nul_byte_appends_warning() {
+        // A source file with a NUL (0x00) mid-content (mirrors the mint.js case:
+        // valid for Node, smuggled into a template literal). It passes the
+        // first-8KB binary sniff and gets indexed, so get_file_content renders it.
+        // The NUL renders invisibly; the warning must make that explicit.
+        let content = b"const a = `x\0y`;\nfn anchor() {}\n";
+        let nul_offset = content.iter().position(|&b| b == 0).unwrap();
+        let sym = SymbolRecord {
+            name: "anchor".to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (16, content.len() as u32),
+            line_range: (1, 1),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/mint.js", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("src/mint.js")))
+            .await;
+
+        assert!(
+            out.contains("WARNING: this file contains 1 NUL byte (0x00)"),
+            "NUL warning must be present; got: {out}"
+        );
+        assert!(
+            out.contains(&format!("byte offset(s) {nul_offset}")),
+            "warning must report the NUL byte offset {nul_offset}; got: {out}"
+        );
+        assert!(
+            out.contains("byte-exact tools"),
+            "warning must steer agents to byte-exact edits; got: {out}"
+        );
+        // Symbols are still extracted best-effort: get_file_content renders fine.
+        assert!(
+            out.contains("anchor"),
+            "content must still render; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_no_nul_has_no_warning() {
+        // No false positives: a clean source file must not gain a NUL warning.
+        let content = b"const a = `xy`;\nfn anchor() {}\n";
+        let sym = SymbolRecord {
+            name: "anchor".to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (15, content.len() as u32),
+            line_range: (1, 1),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/clean.js", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("src/clean.js")))
+            .await;
+
+        assert!(
+            !out.contains("NUL byte"),
+            "clean file must not gain a NUL warning; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_raw_disk_fallback_nul_warning() {
+        // Raw-disk fallback branch (file not in index): the warning must also fire
+        // there, using the bytes read from disk.
+        let repo = TempDir::new().expect("temp repo");
+        let content = b"plain text\0with a nul\n";
+        let nul_offset = content.iter().position(|&b| b == 0).unwrap();
+        fs::write(repo.path().join("notes.txt"), content).expect("write nul file");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("notes.txt")))
+            .await;
+        assert!(
+            out.contains("WARNING: this file contains 1 NUL byte (0x00)"),
+            "raw-disk fallback must also warn on NUL; got: {out}"
+        );
+        assert!(
+            out.contains(&format!("byte offset(s) {nul_offset}")),
+            "raw-disk warning must report the NUL offset {nul_offset}; got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_symbol_body_preserves_nul_after_edited_symbol() {
+        // Byte-exactness guarantee: editing a symbol that sits BEFORE a NUL byte
+        // must leave the NUL intact on disk. The splice (apply_splice) copies the
+        // SUFFIX bytes (everything after the symbol, including the NUL) verbatim —
+        // it never re-renders the untouched file region. `target` is parsed from
+        // the clean prefix; the NUL lives in a later raw-string literal.
+        let original =
+            b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
+        assert!(original.contains(&0u8), "fixture must contain a NUL");
+        let (_dir, server, file_path) = setup_edit_test(original);
+
+        let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            path: "src/lib.rs".to_string(),
+            name: "target".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "fn target() {\n    let x = 42;\n}".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            working_directory: None,
+        };
+        let result = server.replace_symbol_body(Parameters(input)).await;
+        assert!(result.contains("replaced"), "result was: {result}");
+
+        // Read back RAW bytes: the NUL must still be present, embedded in the
+        // untouched suffix literal that apply_splice copied verbatim.
+        let on_disk = std::fs::read(&file_path).unwrap();
+        let on_disk_nul = on_disk
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL byte must survive an edit to an earlier symbol");
+        assert_eq!(
+            &on_disk[on_disk_nul - 4..on_disk_nul],
+            b"lead",
+            "NUL must remain embedded in the untouched suffix literal"
+        );
+        assert!(
+            on_disk.windows(b"x = 42".len()).any(|w| w == b"x = 42"),
+            "new body must be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_preserves_nul_after_edited_symbol() {
+        // Same byte-exactness guarantee for edit_within_symbol.
+        let original =
+            b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
+        let (_dir, server, file_path) = setup_edit_test(original);
+
+        let result = server
+            .edit_within_symbol(Parameters(crate::protocol::edit::EditWithinSymbolInput {
+                path: "src/lib.rs".to_string(),
+                name: "target".to_string(),
+                kind: None,
+                symbol_line: None,
+                old_text: "let x = 1;".to_string(),
+                new_text: "let x = 7;".to_string(),
+                replace_all: false,
+                dry_run: None,
+                idempotency_key: None,
+                working_directory: None,
+            }))
+            .await;
+        assert!(
+            result.contains("edited within `target`"),
+            "result was: {result}"
+        );
+
+        let on_disk = std::fs::read(&file_path).unwrap();
+        let on_disk_nul = on_disk
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL must survive edit_within_symbol on an earlier symbol");
+        assert_eq!(
+            &on_disk[on_disk_nul - 4..on_disk_nul],
+            b"lead",
+            "NUL must remain embedded in the untouched suffix literal"
+        );
+        assert!(
+            on_disk
+                .windows(b"let x = 7;".len())
+                .any(|w| w == b"let x = 7;"),
+            "new text must be written"
         );
     }
 

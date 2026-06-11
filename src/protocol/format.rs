@@ -2732,6 +2732,25 @@ pub const GET_FILE_CONTENT_MAX_BYTES: usize = 60_000;
 /// Returns `output` unchanged when `output.len() <= GET_FILE_CONTENT_MAX_BYTES`.
 /// Otherwise truncates at the last `\n` boundary under the cap and appends a
 /// footer suggesting narrower read modes. Idempotent.
+/// Append an honest NUL-byte warning to already-rendered `get_file_content`
+/// output when `content` contains literal NUL (`0x00`) bytes.
+///
+/// Central rendering-boundary guard. NUL is valid UTF-8, so it passes
+/// `String::from_utf8_lossy` untouched and then renders invisibly (terminals
+/// show nothing or a space). An agent that copies the rendered text for an edit
+/// gets bytes that do NOT match the file. The warning is appended AFTER the byte
+/// cap so truncation can never drop it. `content` is the exact byte slice whose
+/// rendering `output` represents (the full file for whole-file reads), so the
+/// reported count/offsets describe what was actually scanned.
+pub fn append_nul_byte_warning(output: String, content: &[u8]) -> String {
+    let scan = crate::domain::index::scan_nul_bytes(content);
+    match crate::domain::index::nul_byte_warning_line(&scan) {
+        Some(warning) if output.is_empty() => warning,
+        Some(warning) => format!("{output}\n{warning}"),
+        None => output,
+    }
+}
+
 pub fn cap_file_content_output(output: String) -> String {
     if output.len() <= GET_FILE_CONTENT_MAX_BYTES {
         return output;
