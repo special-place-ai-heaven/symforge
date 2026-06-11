@@ -80,16 +80,6 @@ impl ConfigExtractor for YamlExtractor {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract a plain string from a YAML Value if it is a string/number/bool scalar.
-fn value_as_key_str(v: &serde_yml::Value) -> Option<String> {
-    match v {
-        serde_yml::Value::String(s) => Some(s.clone()),
-        serde_yml::Value::Number(n) => Some(n.to_string()),
-        serde_yml::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
 /// Find the byte range in `content` for the YAML mapping key `key`.
 ///
 /// Searches for `key:` pattern inside `search_end` starting from `search_from`,
@@ -266,10 +256,9 @@ impl YamlWalker<'_> {
         let search_end = parent_byte_range.1 as usize;
 
         for (k, v) in map.iter() {
-            let key_str = match value_as_key_str(k) {
-                Some(s) => s,
-                None => continue,
-            };
+            // serde_yml 0.0.13's `Mapping` keys are `String` (noyalib backend),
+            // so the key is already a plain string and needs no scalar coercion.
+            let key_str = k.clone();
 
             let key_path = join_key_path(parent_path, &key_str);
             let (byte_start, byte_end) =

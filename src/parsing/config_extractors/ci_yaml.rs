@@ -353,14 +353,14 @@ fn is_github_actions_workflow(map: &serde_yml::Mapping) -> bool {
 }
 
 fn mapping_get<'a>(map: &'a serde_yml::Mapping, key: &str) -> Option<&'a serde_yml::Value> {
-    map.iter()
-        .find_map(|(candidate, value)| (value_as_string(candidate).as_deref() == Some(key)).then_some(value))
+    // serde_yml 0.0.13 (noyalib backend) keys mappings by `String`, so the
+    // native string-keyed `get` replaces the old Value-key scan.
+    map.get(key)
 }
 
 fn string_entries(map: &serde_yml::Mapping) -> Vec<(String, &serde_yml::Value)> {
-    map.iter()
-        .filter_map(|(key, value)| value_as_string(key).map(|key| (key, value)))
-        .collect()
+    // Keys are already `String` in serde_yml 0.0.13; clone directly.
+    map.iter().map(|(key, value)| (key.clone(), value)).collect()
 }
 
 fn value_as_string(value: &serde_yml::Value) -> Option<String> {
