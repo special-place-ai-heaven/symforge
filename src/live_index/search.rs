@@ -683,6 +683,48 @@ pub struct TextSearchResult {
 
 pub const SUPPRESSED_TEXT_MATCH_DISPLAY_CAP: usize = 100;
 
+/// Hard per-line character cap applied at capture time to every source line
+/// stored for text-search output. A single committed minified line can be
+/// hundreds of kilobytes; emitting it verbatim detonates the tool result and
+/// can blow an agent's entire context budget (SF-STRESS-008). Capping at
+/// capture time means every downstream renderer (default/symbol/usage modes,
+/// context windows) inherits the bound for free.
+pub const MAX_DISPLAY_LINE_CHARS: usize = 2000;
+
+/// Truncate a source line to a bounded, char-boundary-safe head excerpt with an
+/// honest marker when it exceeds [`MAX_DISPLAY_LINE_CHARS`].
+///
+/// Slicing is done over `char_indices` so multibyte UTF-8 (e.g. U+2028 in
+/// minified bundles) never causes a byte-boundary panic. Lines at or under the
+/// cap are returned unchanged. The marker reports the number of characters
+/// omitted so the result stays honest about what was elided.
+fn truncate_display_line(line: &str) -> String {
+    // Fast path: most lines are short. `len()` (bytes) is a cheap upper bound on
+    // char count, so a line whose byte length fits the cap cannot exceed it in
+    // chars and needs no scan.
+    if line.len() <= MAX_DISPLAY_LINE_CHARS {
+        return line.to_string();
+    }
+
+    let total_chars = line.chars().count();
+    if total_chars <= MAX_DISPLAY_LINE_CHARS {
+        return line.to_string();
+    }
+
+    // Take a char-boundary-safe head excerpt of the first MAX_DISPLAY_LINE_CHARS
+    // characters. nth(n) yields the byte offset of the (n+1)-th char start.
+    let cut_byte = line
+        .char_indices()
+        .nth(MAX_DISPLAY_LINE_CHARS)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(line.len());
+    let omitted = total_chars - MAX_DISPLAY_LINE_CHARS;
+    format!(
+        "{}... [line truncated, {omitted} chars omitted]",
+        &line[..cut_byte]
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextSearchError {
     EmptyRegexQuery,
@@ -1572,7 +1614,7 @@ where
             if matches.len() < options.max_per_file {
                 matches.push(TextLineMatch {
                     line_number: line_idx + 1,
-                    line: line.to_string(),
+                    line: truncate_display_line(line),
                     enclosing_symbol: file
                         .symbols
                         .iter()
@@ -1743,7 +1785,7 @@ fn build_context_rendered_lines(
         for line_number in start..=end {
             rendered.push(TextDisplayLine::Line(TextRenderedLine {
                 line_number,
-                line: lines[line_number - 1].to_string(),
+                line: truncate_display_line(lines[line_number - 1]),
                 is_match: match_lines.contains(&line_number),
             }));
         }
@@ -2080,6 +2122,146 @@ mod tests {
 
         assert_eq!(result.total_matches, 2);
         assert_eq!(result.overflow_count, 1);
+    }
+
+    // ── SF-STRESS-008: per-line truncation guards ──────────────────────────
+    //
+    // A single committed minified line (hundreds of KB) must never be emitted
+    // verbatim; the snippet renderer would otherwise detonate the tool result
+    // (~123k tokens for one 490KB line) and consume an agent's whole context.
+
+    #[test]
+    fn test_truncate_display_line_caps_overlong_line_with_honest_marker() {
+        let long = "a".repeat(500_000);
+        let out = truncate_display_line(&long);
+        // Head excerpt is exactly the cap; marker accounts for the rest.
+        assert!(
+            out.starts_with(&"a".repeat(MAX_DISPLAY_LINE_CHARS)),
+            "excerpt must retain the first MAX_DISPLAY_LINE_CHARS chars"
+        );
+        assert!(
+            out.contains("[line truncated,"),
+            "must carry an honest truncation marker, got len {}",
+            out.len()
+        );
+        let expected_omitted = 500_000 - MAX_DISPLAY_LINE_CHARS;
+        assert!(
+            out.contains(&format!("{expected_omitted} chars omitted")),
+            "marker must report the exact omitted-char count"
+        );
+        // Output is the excerpt plus a short fixed marker, nowhere near 500KB.
+        assert!(
+            out.len() < MAX_DISPLAY_LINE_CHARS + 64,
+            "truncated line must stay close to the cap, got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn test_truncate_display_line_is_char_boundary_safe_on_multibyte() {
+        // Mix of multibyte chars (U+2028 line separator, emoji, CJK) repeated
+        // past the cap. Byte slicing here would panic; char_indices must not.
+        let unit = "a\u{2028}\u{1F600}\u{4E2D}"; // 1 + 3 + 4 + 3 = 11 bytes, 4 chars
+        let long = unit.repeat(MAX_DISPLAY_LINE_CHARS); // 4 * cap chars >> cap
+        let out = truncate_display_line(&long); // must not panic
+        assert!(out.contains("[line truncated,"));
+        // The excerpt prefix must itself be valid UTF-8 (guaranteed by &str),
+        // and contain exactly MAX_DISPLAY_LINE_CHARS chars before the marker.
+        let head = out.split("... [line truncated,").next().unwrap();
+        assert_eq!(
+            head.chars().count(),
+            MAX_DISPLAY_LINE_CHARS,
+            "excerpt must hold exactly the cap in chars"
+        );
+    }
+
+    #[test]
+    fn test_truncate_display_line_passes_short_lines_through_unchanged() {
+        let short = "let x = 42; // needle here";
+        assert_eq!(truncate_display_line(short), short);
+        // A line exactly at the cap is untouched.
+        let at_cap = "x".repeat(MAX_DISPLAY_LINE_CHARS);
+        assert_eq!(truncate_display_line(&at_cap), at_cap);
+    }
+
+    #[test]
+    fn test_search_text_bounds_a_500kb_single_line_file() {
+        // Reproduce the corpus detonation: one ~500KB minified line holding the
+        // needle. Pre-fix this emits the line verbatim (~490KB / ~123k tokens);
+        // post-fix the stored match line is bounded and carries the marker.
+        let mut line = "x".repeat(250_000);
+        line.push_str("needle");
+        line.push_str(&"y".repeat(250_000));
+        let content = format!("{line}\n");
+        let index = make_index(vec![make_file("dist/scripts.js", &content, Vec::new())]);
+
+        let result = search_text_with_options(
+            &index,
+            Some("needle"),
+            None,
+            false,
+            &TextSearchOptions::default(),
+        )
+        .expect("search should work");
+
+        assert_eq!(result.total_matches, 1, "the needle line must still match");
+        let stored = &result.files[0].matches[0].line;
+        assert!(
+            stored.chars().count() <= MAX_DISPLAY_LINE_CHARS + 64,
+            "stored match line must be bounded, got {} chars",
+            stored.chars().count()
+        );
+        assert!(
+            stored.contains("[line truncated,"),
+            "bounded match line must carry the truncation marker"
+        );
+
+        // The renderer emits the stored `line` verbatim, so bounding total
+        // stored-line bytes bounds the whole tool result. Pre-fix this sum was
+        // ~500KB for this single match; post-fix it is a few KB. With a default
+        // max_tokens budget of, say, 2000 tokens (~8KB), the result can no
+        // longer be blown by one line.
+        let total_line_bytes: usize = result
+            .files
+            .iter()
+            .flat_map(|f| f.matches.iter())
+            .map(|m| m.line.len())
+            .sum();
+        assert!(
+            total_line_bytes < 8_000,
+            "total stored match-line bytes must stay well under an 8KB (~2k token) budget, got {total_line_bytes}"
+        );
+    }
+
+    #[test]
+    fn test_search_text_context_window_truncates_overlong_neighbor_lines() {
+        // Neighbors of a minified line are themselves minified; the context
+        // renderer must cap them too, not just the match line.
+        let huge_neighbor = "z".repeat(400_000);
+        let content = format!("{huge_neighbor}\nneedle here\n{huge_neighbor}\n");
+        let index = make_index(vec![make_file("dist/bundle.js", &content, Vec::new())]);
+        let options = TextSearchOptions {
+            context: Some(1),
+            ..TextSearchOptions::default()
+        };
+
+        let result = search_text_with_options(&index, Some("needle"), None, false, &options)
+            .expect("search should work");
+
+        let rendered = result.files[0]
+            .rendered_lines
+            .as_ref()
+            .expect("context mode materializes rendered lines");
+        for display in rendered {
+            if let TextDisplayLine::Line(rl) = display {
+                assert!(
+                    rl.line.chars().count() <= MAX_DISPLAY_LINE_CHARS + 64,
+                    "every context line (match or neighbor) must be bounded, got {} chars on line {}",
+                    rl.line.chars().count(),
+                    rl.line_number
+                );
+            }
+        }
     }
 
     #[test]
