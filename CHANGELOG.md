@@ -26,6 +26,20 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.21.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.20.0...v7.21.0) (2026-06-11)
+
+
+### Features
+
+* **parsing:** adopt nielsenko tree-sitter-dart 0.2.0 with field-based extraction ([f277510](https://github.com/special-place-ai-heaven/symforge/commit/f27751023c4195226446e43fa03b5cefee92a1a2))
+* **parsing:** adopt nielsenko tree-sitter-dart 0.2.0 with field-based extraction ([1c49685](https://github.com/special-place-ai-heaven/symforge/commit/1c49685333e12161453f9cb381ea6e92c9d81564))
+
+
+### Bug Fixes
+
+* **hook:** bounded stdin read so the hook can never hang waiting for EOF ([45db7cc](https://github.com/special-place-ai-heaven/symforge/commit/45db7ccff05b23c63700e8ba74e62d4cdbb5d5e5))
+* **hook:** bounded stdin read so the hook can never hang waiting for EOF ([5848933](https://github.com/special-place-ai-heaven/symforge/commit/5848933823d7c260a10e306ab11441c2ca6d3b9e))
+
 ## [7.20.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.4...v7.20.0) (2026-06-11)
 
 
