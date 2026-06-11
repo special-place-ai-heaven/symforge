@@ -89,7 +89,7 @@ ignore = "0.4"
 notify = { version = "8", optional = true }
 notify-debouncer-full = { version = "0.7", optional = true }
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
 globset = "0.4"
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
