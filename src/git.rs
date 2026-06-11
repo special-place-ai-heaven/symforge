@@ -77,7 +77,10 @@ impl GitRepo {
         let paths: Vec<String> = statuses
             .iter()
             .filter(|entry| !entry.status().is_ignored())
-            .filter_map(|entry| entry.path().map(|p| p.replace('\\', "/")))
+            // git2 0.21 changed StatusEntry::path() from Option<&str> to
+            // Result<&str, Error> (UTF-8 validation); `.ok()` preserves the
+            // prior "skip non-UTF-8 paths" behavior the Option-returning API gave.
+            .filter_map(|entry| entry.path().ok().map(|p| p.replace('\\', "/")))
             .collect();
 
         Ok(paths)
@@ -101,7 +104,10 @@ impl GitRepo {
                 let status = entry.status();
                 status.is_wt_new() && !status.is_index_new() && !status.is_ignored()
             })
-            .filter_map(|entry| entry.path().map(|p| p.replace('\\', "/")))
+            // git2 0.21 changed StatusEntry::path() from Option<&str> to
+            // Result<&str, Error> (UTF-8 validation); `.ok()` preserves the
+            // prior "skip non-UTF-8 paths" behavior the Option-returning API gave.
+            .filter_map(|entry| entry.path().ok().map(|p| p.replace('\\', "/")))
             .collect();
         paths.sort();
         paths.dedup();
