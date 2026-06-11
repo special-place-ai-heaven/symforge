@@ -53,7 +53,12 @@ schemars = "1"
 rmcp = { version = "1.1.0", features = ["transport-io"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yml = "0.0.13"
+# Maintained libyaml-lineage YAML backend. The previous `serde_yml 0.0.13` fork
+# enforced a spec-strict flow-indent rule that mainstream parsers (PyYAML/libyaml,
+# dtolnay serde-yaml) relax, hard-failing real production CI configs (SF-STRESS-016).
+# `serde_yaml_ng` is the maintained continuation of dtolnay's serde-yaml and exposes
+# the same `Value`/`Mapping`/`Sequence` API; aliased to `serde_yml` to keep call sites stable.
+serde_yml = { package = "serde_yaml_ng", version = "0.10" }
 toml_edit = "0.25"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal"] }
