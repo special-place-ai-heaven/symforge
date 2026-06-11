@@ -33,7 +33,7 @@ impl Default for OutputLimits {
     }
 }
 
-use crate::domain::index::{AdmissionTier, SkippedFile};
+use crate::domain::index::{AdmissionTier, SkipReason, SkippedFile};
 use crate::live_index::query::{
     EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
     EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
@@ -2782,6 +2782,47 @@ pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> St
     } else {
         let top: Vec<&str> = suggestions.iter().take(5).map(|s| s.as_str()).collect();
         format!("File not found: {path}. Did you mean: {}?", top.join(", "))
+    }
+}
+
+/// Honest "not indexed" response for a path that EXISTS but was deliberately
+/// admitted as Tier-2 (metadata-only) or Tier-3 (hard-skipped) rather than
+/// parsed. Distinct from `not_found_file`: the file is present on disk, so a
+/// bare "File not found" is wrong and confusing. This message names the tier,
+/// the skip reason, and the size, and points the caller at the documented
+/// escape hatch (`get_file_content` reads Tier-2 files raw from disk).
+///
+/// Example (Tier 2):
+///   `Not indexed: package-lock.json is Tier 2 (metadata only) — reason:
+///    lockfile, size 406 KB. Use get_file_content for raw reads if you need
+///    the contents.`
+pub fn not_indexed_skipped_file(
+    path: &str,
+    tier: AdmissionTier,
+    reason: Option<SkipReason>,
+    size: Option<u64>,
+) -> String {
+    let reason_str = reason
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "skipped".to_string());
+    let size_str = size
+        .map(human_size)
+        .unwrap_or_else(|| "unknown".to_string());
+    match tier {
+        AdmissionTier::Normal => {
+            // Not a skip; callers should never reach here with a Normal tier,
+            // but degrade gracefully rather than assert.
+            not_found_file(path)
+        }
+        AdmissionTier::MetadataOnly => format!(
+            "Not indexed: {path} is Tier 2 (metadata only) — reason: {reason_str}, size {size_str}. \
+             Use get_file_content for raw reads if you need the contents."
+        ),
+        AdmissionTier::HardSkip => format!(
+            "Not indexed: {path} is Tier 3 (hard-skipped) — reason: {reason_str}, size {size_str}. \
+             This file is not parsed or read; get_file_content may still read it raw if it is a \
+             text file within the repository."
+        ),
     }
 }
 
