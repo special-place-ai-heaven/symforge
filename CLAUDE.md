@@ -15,6 +15,20 @@
 - Full real-repo coupling calibration is operator-triggered with
   `SYMFORGE_CALIBRATION_REPOS`; standard CI must not depend on local paths.
 
+## Merging PRs (release-please double-count guard)
+
+GitHub's default merge commit puts the PR title in the commit BODY;
+release-please parses merge-commit bodies for conventional messages, so a
+plain `gh pr merge --merge` lands every PR in the changelog TWICE (merge
+commit + inner commit). Always override the body with non-conventional text:
+
+```
+gh pr merge <N> --merge --delete-branch --body "PR #<N>"
+```
+
+Subject stays GitHub's default (`Merge pull request #N ...`, ignored by
+release-please); inner commits are counted exactly once.
+
 ## Architecture
 
 Rust MCP server providing symbol-aware code navigation and editing tools. Current MCP `tools/list` exposes 32 canonical tools, including `health_compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
