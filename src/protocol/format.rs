@@ -35,8 +35,9 @@ impl Default for OutputLimits {
 
 use crate::domain::index::{AdmissionTier, SkipReason, SkippedFile};
 use crate::live_index::query::{
-    EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
-    EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
+    EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON, EXPECTED_GENERATED_PARTIAL_PARSE_REASON,
+    EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON, EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON,
+    EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
 };
 use crate::live_index::{
     ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
@@ -50,10 +51,50 @@ use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
 const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
 
+/// Upper bound on the quarantine display window the `health` `quarantine_limit`
+/// parameter may request (SF-STRESS-010). Caps token cost while still letting an
+/// agent page the full list in a few calls rather than thousands of per-file
+/// `get_file_context` calls.
+pub const PARSE_QUARANTINE_MAX_LIMIT: usize = 1000;
+
+/// Display window into the ranked quarantine registry (SF-STRESS-010).
+/// `None` everywhere preserves the historical default (offset 0, limit 10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuarantineWindow {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for QuarantineWindow {
+    /// The historical default registry window: offset 0, the legacy 10-entry cap.
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: PARSE_QUARANTINE_ENTRY_LIMIT,
+        }
+    }
+}
+
+impl QuarantineWindow {
+    /// Build a window from optional caller-supplied paging args, clamping the
+    /// limit to [`PARSE_QUARANTINE_MAX_LIMIT`]. `None` limit means the default.
+    pub fn from_args(offset: Option<usize>, limit: Option<usize>) -> Self {
+        Self {
+            offset: offset.unwrap_or(0),
+            limit: limit
+                .unwrap_or(PARSE_QUARANTINE_ENTRY_LIMIT)
+                .clamp(1, PARSE_QUARANTINE_MAX_LIMIT),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParseQuarantineKind {
     UnexpectedPartial,
     ExpectedVendorPartial,
+    ExpectedGeneratedPartial,
+    ExpectedTestFixturePartial,
+    ExpectedTemplateDslPartial,
     ExpectedFrameworkPartial,
     ExpectedLanguagePartial,
     Failed,
@@ -64,9 +105,31 @@ impl ParseQuarantineKind {
         match self {
             Self::UnexpectedPartial => "unexpected_partial",
             Self::ExpectedVendorPartial => "expected_vendor_partial",
+            Self::ExpectedGeneratedPartial => "expected_generated_partial",
+            Self::ExpectedTestFixturePartial => "expected_test_fixture_partial",
+            Self::ExpectedTemplateDslPartial => "expected_template_dsl_partial",
             Self::ExpectedFrameworkPartial => "expected_framework_partial",
             Self::ExpectedLanguagePartial => "expected_language_partial",
             Self::Failed => "failed",
+        }
+    }
+
+    /// Real-source-first ranking key (SF-STRESS-010): unexpected repo-owned
+    /// partials and hard failures rank BEFORE heuristic-noise buckets, so a
+    /// `deps/`-flood cannot fill the default registry slots and hide genuine
+    /// `src/` losses. Lower sorts first.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Failed => 0,
+            Self::UnexpectedPartial => 1,
+            // Sound (proven) limitation buckets — still repo-relevant.
+            Self::ExpectedFrameworkPartial => 2,
+            Self::ExpectedLanguagePartial => 3,
+            // Heuristic noise buckets — least likely to need attention.
+            Self::ExpectedTemplateDslPartial => 4,
+            Self::ExpectedTestFixturePartial => 5,
+            Self::ExpectedGeneratedPartial => 6,
+            Self::ExpectedVendorPartial => 7,
         }
     }
 }
@@ -83,10 +146,24 @@ struct ParseQuarantineSummary {
     total_count: usize,
     unexpected_partial_count: usize,
     expected_vendor_partial_count: usize,
+    expected_generated_partial_count: usize,
+    expected_test_fixture_partial_count: usize,
+    expected_template_dsl_partial_count: usize,
     expected_framework_partial_count: usize,
     expected_language_partial_count: usize,
     failed_count: usize,
+    /// Every collected entry, ranked real-source-first (see
+    /// [`ParseQuarantineKind::rank`]). The display layer windows this with
+    /// [`Self::display_limit`]; the full vector is what makes the list
+    /// retrievable (SF-STRESS-010) once the data layer stops truncating at
+    /// capture time.
     entries: Vec<ParseQuarantineEntry>,
+    /// How many ranked entries the registry renders. Defaults to
+    /// [`PARSE_QUARANTINE_ENTRY_LIMIT`]; the `health` `quarantine_limit`
+    /// parameter raises it so the full list is retrievable (SF-STRESS-010).
+    display_limit: usize,
+    /// Offset into the ranked entries for the rendered window (paging).
+    display_offset: usize,
 }
 
 impl ParseQuarantineSummary {
@@ -94,41 +171,23 @@ impl ParseQuarantineSummary {
         let mut summary = Self::new(
             stats.unexpected_partial_parse_count,
             stats.expected_vendor_partial_parse_count,
+            stats.expected_generated_partial_parse_count,
+            stats.expected_test_fixture_partial_parse_count,
+            stats.expected_template_dsl_partial_parse_count,
             stats.expected_framework_partial_parse_count,
             stats.expected_language_partial_parse_count,
             stats.failed_count,
         );
-        for path in &stats.unexpected_partial_parse_files {
-            summary.push(
-                path,
-                ParseQuarantineKind::UnexpectedPartial,
-                "repo-owned partial parse; best-effort symbols may be incomplete",
-            );
-        }
-        for path in &stats.expected_vendor_partial_parse_files {
-            summary.push(
-                path,
-                ParseQuarantineKind::ExpectedVendorPartial,
-                EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
-            );
-        }
-        for path in &stats.expected_framework_partial_parse_files {
-            summary.push(
-                path,
-                ParseQuarantineKind::ExpectedFrameworkPartial,
-                EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
-            );
-        }
-        for path in &stats.expected_language_partial_parse_files {
-            summary.push(
-                path,
-                ParseQuarantineKind::ExpectedLanguagePartial,
-                EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
-            );
-        }
-        for (path, error) in &stats.failed_files {
-            summary.push(path, ParseQuarantineKind::Failed, error);
-        }
+        summary.push_partials(
+            &stats.unexpected_partial_parse_files,
+            &stats.expected_vendor_partial_parse_files,
+            &stats.expected_generated_partial_parse_files,
+            &stats.expected_test_fixture_partial_parse_files,
+            &stats.expected_template_dsl_partial_parse_files,
+            &stats.expected_framework_partial_parse_files,
+            &stats.expected_language_partial_parse_files,
+            &stats.failed_files,
+        );
         summary
     }
 
@@ -136,47 +195,109 @@ impl ParseQuarantineSummary {
         let mut summary = Self::new(
             published.unexpected_partial_parse_count,
             published.expected_vendor_partial_parse_count,
+            published.expected_generated_partial_parse_count,
+            published.expected_test_fixture_partial_parse_count,
+            published.expected_template_dsl_partial_parse_count,
             published.expected_framework_partial_parse_count,
             published.expected_language_partial_parse_count,
             published.failed_count,
         );
-        for path in &published.unexpected_partial_parse_files {
-            summary.push(
+        summary.push_partials(
+            &published.unexpected_partial_parse_files,
+            &published.expected_vendor_partial_parse_files,
+            &published.expected_generated_partial_parse_files,
+            &published.expected_test_fixture_partial_parse_files,
+            &published.expected_template_dsl_partial_parse_files,
+            &published.expected_framework_partial_parse_files,
+            &published.expected_language_partial_parse_files,
+            &published.failed_files,
+        );
+        summary
+    }
+
+    /// Collect every available path into ranked entries. The data layer may have
+    /// already bounded each list, but this consumes whatever is present in full
+    /// (no per-call `.take()`), so the display window — not collection — controls
+    /// truncation (SF-STRESS-010).
+    #[allow(clippy::too_many_arguments)]
+    fn push_partials(
+        &mut self,
+        unexpected: &[String],
+        vendor: &[String],
+        generated: &[String],
+        test_fixture: &[String],
+        template_dsl: &[String],
+        framework: &[String],
+        language: &[String],
+        failed: &[(String, String)],
+    ) {
+        for path in unexpected {
+            self.push(
                 path,
                 ParseQuarantineKind::UnexpectedPartial,
                 "repo-owned partial parse; best-effort symbols may be incomplete",
             );
         }
-        for path in &published.expected_vendor_partial_parse_files {
-            summary.push(
+        for path in vendor {
+            self.push(
                 path,
                 ParseQuarantineKind::ExpectedVendorPartial,
                 EXPECTED_VENDOR_PARTIAL_PARSE_REASON,
             );
         }
-        for path in &published.expected_framework_partial_parse_files {
-            summary.push(
+        for path in generated {
+            self.push(
+                path,
+                ParseQuarantineKind::ExpectedGeneratedPartial,
+                EXPECTED_GENERATED_PARTIAL_PARSE_REASON,
+            );
+        }
+        for path in test_fixture {
+            self.push(
+                path,
+                ParseQuarantineKind::ExpectedTestFixturePartial,
+                EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON,
+            );
+        }
+        for path in template_dsl {
+            self.push(
+                path,
+                ParseQuarantineKind::ExpectedTemplateDslPartial,
+                EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON,
+            );
+        }
+        for path in framework {
+            self.push(
                 path,
                 ParseQuarantineKind::ExpectedFrameworkPartial,
                 EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
             );
         }
-        for path in &published.expected_language_partial_parse_files {
-            summary.push(
+        for path in language {
+            self.push(
                 path,
                 ParseQuarantineKind::ExpectedLanguagePartial,
                 EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
             );
         }
-        for (path, error) in &published.failed_files {
-            summary.push(path, ParseQuarantineKind::Failed, error);
+        for (path, error) in failed {
+            self.push(path, ParseQuarantineKind::Failed, error);
         }
-        summary
+        // Real-source-first ordering so a vendored/fixture flood cannot evict
+        // genuine repo-owned losses from the default display window
+        // (SF-STRESS-010). Stable by (rank, original insertion order within the
+        // already-sorted category lists), preserving alphabetical paths per kind.
+        self.entries
+            .sort_by_key(|entry| (entry.kind.rank(), entry.path.clone()));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         unexpected_partial_count: usize,
         expected_vendor_partial_count: usize,
+        expected_generated_partial_count: usize,
+        expected_test_fixture_partial_count: usize,
+        expected_template_dsl_partial_count: usize,
         expected_framework_partial_count: usize,
         expected_language_partial_count: usize,
         failed_count: usize,
@@ -184,22 +305,46 @@ impl ParseQuarantineSummary {
         Self {
             total_count: unexpected_partial_count
                 + expected_vendor_partial_count
+                + expected_generated_partial_count
+                + expected_test_fixture_partial_count
+                + expected_template_dsl_partial_count
                 + expected_framework_partial_count
                 + expected_language_partial_count
                 + failed_count,
             unexpected_partial_count,
             expected_vendor_partial_count,
+            expected_generated_partial_count,
+            expected_test_fixture_partial_count,
+            expected_template_dsl_partial_count,
             expected_framework_partial_count,
             expected_language_partial_count,
             failed_count,
             entries: Vec::new(),
+            display_limit: PARSE_QUARANTINE_ENTRY_LIMIT,
+            display_offset: 0,
         }
     }
 
+    /// Override the display window (SF-STRESS-010 retrieval surface). `limit` is
+    /// clamped to at least 1; `offset` pages into the ranked entries.
+    fn with_window(mut self, offset: usize, limit: usize) -> Self {
+        self.display_offset = offset;
+        self.display_limit = limit.max(1);
+        self
+    }
+
+    /// The ranked entries actually rendered in the current display window.
+    fn windowed_entries(&self) -> &[ParseQuarantineEntry] {
+        let start = self.display_offset.min(self.entries.len());
+        let end = start
+            .saturating_add(self.display_limit)
+            .min(self.entries.len());
+        &self.entries[start..end]
+    }
+
+    /// Collect ALL entries (no display cap). The display window is applied
+    /// separately via [`Self::windowed_entries`].
     fn push(&mut self, path: &str, kind: ParseQuarantineKind, reason: &str) {
-        if self.entries.len() >= PARSE_QUARANTINE_ENTRY_LIMIT {
-            return;
-        }
         self.entries.push(ParseQuarantineEntry {
             path: path.to_string(),
             kind,
@@ -211,15 +356,42 @@ impl ParseQuarantineSummary {
         self.total_count == 0
     }
 
-    fn omitted_count(&self) -> usize {
-        self.total_count.saturating_sub(self.entries.len())
+    /// Count metadata fields shared by the full and compact headers. Always
+    /// reports the TRUE category totals (`total_count` etc. come from the
+    /// uncapped health counts), while `showing`/`omitted` reflect the current
+    /// display window so the header never overstates what is on screen.
+    fn header_counts(&self) -> String {
+        let shown = self.windowed_entries().len();
+        // Entries beyond the current window, relative to the true total — covers
+        // BOTH display windowing and any data-layer bound on `entries`.
+        let omitted = self
+            .total_count
+            .saturating_sub(self.display_offset.saturating_add(shown));
+        format!(
+            "total={} unexpected_partial={} expected_vendor_partial={} expected_generated_partial={} expected_test_fixture_partial={} expected_template_dsl_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} offset={} omitted={}",
+            self.total_count,
+            self.unexpected_partial_count,
+            self.expected_vendor_partial_count,
+            self.expected_generated_partial_count,
+            self.expected_test_fixture_partial_count,
+            self.expected_template_dsl_partial_count,
+            self.expected_framework_partial_count,
+            self.expected_language_partial_count,
+            self.failed_count,
+            shown,
+            self.display_offset,
+            omitted,
+        )
     }
 
-    /// Paths already shown in the quarantine registry's numbered list. Used by
-    /// the per-category health sections to avoid re-listing entries the registry
-    /// already displays (they only render genuinely-omitted overflow paths).
+    /// Paths in the CURRENT display window. Used by the per-category health
+    /// sections to avoid re-listing entries the registry already displays (they
+    /// only render genuinely-omitted overflow paths).
     fn shown_paths(&self) -> std::collections::HashSet<&str> {
-        self.entries.iter().map(|e| e.path.as_str()).collect()
+        self.windowed_entries()
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect()
     }
 
     fn full_section(&self) -> Option<String> {
@@ -227,25 +399,27 @@ impl ParseQuarantineSummary {
             return None;
         }
 
-        let mut section = format!(
-            "Parse/span quarantine registry: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} omitted={}",
-            self.total_count,
-            self.unexpected_partial_count,
-            self.expected_vendor_partial_count,
-            self.expected_framework_partial_count,
-            self.expected_language_partial_count,
-            self.failed_count,
-            self.entries.len(),
-            self.omitted_count()
-        );
-        for (index, entry) in self.entries.iter().enumerate() {
+        let mut section = format!("Parse/span quarantine registry: {}", self.header_counts());
+        for (index, entry) in self.windowed_entries().iter().enumerate() {
             section.push_str(&format!(
                 "\n  {}. {} [{}] - {}",
-                index + 1,
+                self.display_offset + index + 1,
                 entry.path,
                 entry.kind.label(),
                 entry.reason
             ));
+        }
+        // SF-STRESS-010: when the registry does not show the full list, point the
+        // caller at the retrieval surface instead of leaving them to thousands of
+        // per-file calls.
+        if self.total_count.saturating_sub(
+            self.display_offset
+                .saturating_add(self.windowed_entries().len()),
+        ) > 0
+        {
+            section.push_str(
+                "\n  (use health with quarantine_limit/quarantine_offset to page the full list)",
+            );
         }
         Some(section)
     }
@@ -255,17 +429,7 @@ impl ParseQuarantineSummary {
             return None;
         }
 
-        Some(format!(
-            "Parse/span quarantine: total={} unexpected_partial={} expected_vendor_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} omitted={}",
-            self.total_count,
-            self.unexpected_partial_count,
-            self.expected_vendor_partial_count,
-            self.expected_framework_partial_count,
-            self.expected_language_partial_count,
-            self.failed_count,
-            self.entries.len(),
-            self.omitted_count()
-        ))
+        Some(format!("Parse/span quarantine: {}", self.header_counts()))
     }
 }
 
@@ -1648,6 +1812,22 @@ pub fn health_report_from_published_state(
     watcher: &crate::watcher::WatcherInfo,
     rejected_stale_mutations: u64,
 ) -> String {
+    health_report_from_published_state_windowed(
+        published,
+        watcher,
+        rejected_stale_mutations,
+        QuarantineWindow::from_args(None, None),
+    )
+}
+
+/// Like [`health_report_from_published_state`] but renders the quarantine
+/// registry through the given display window (SF-STRESS-010 retrieval surface).
+pub fn health_report_from_published_state_windowed(
+    published: &PublishedIndexState,
+    watcher: &crate::watcher::WatcherInfo,
+    rejected_stale_mutations: u64,
+    quarantine_window: QuarantineWindow,
+) -> String {
     let mut stats = HealthStats {
         file_count: published.file_count,
         symbol_count: published.symbol_count,
@@ -1655,6 +1835,11 @@ pub fn health_report_from_published_state(
         partial_parse_count: published.partial_parse_count,
         unexpected_partial_parse_count: published.unexpected_partial_parse_count,
         expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
+        expected_generated_partial_parse_count: published.expected_generated_partial_parse_count,
+        expected_test_fixture_partial_parse_count: published
+            .expected_test_fixture_partial_parse_count,
+        expected_template_dsl_partial_parse_count: published
+            .expected_template_dsl_partial_parse_count,
         expected_framework_partial_parse_count: published.expected_framework_partial_parse_count,
         expected_language_partial_parse_count: published.expected_language_partial_parse_count,
         failed_count: published.failed_count,
@@ -1670,6 +1855,15 @@ pub fn health_report_from_published_state(
         partial_parse_files: published.partial_parse_files.clone(),
         unexpected_partial_parse_files: published.unexpected_partial_parse_files.clone(),
         expected_vendor_partial_parse_files: published.expected_vendor_partial_parse_files.clone(),
+        expected_generated_partial_parse_files: published
+            .expected_generated_partial_parse_files
+            .clone(),
+        expected_test_fixture_partial_parse_files: published
+            .expected_test_fixture_partial_parse_files
+            .clone(),
+        expected_template_dsl_partial_parse_files: published
+            .expected_template_dsl_partial_parse_files
+            .clone(),
         expected_framework_partial_parse_files: published
             .expected_framework_partial_parse_files
             .clone(),
@@ -1686,8 +1880,12 @@ pub fn health_report_from_published_state(
         stats.events_processed = 0;
         stats.last_event_at = None;
     }
-    let mut report =
-        health_report_from_stats(published.status_label(), &stats, rejected_stale_mutations);
+    let mut report = health_report_from_stats_windowed(
+        published.status_label(),
+        &stats,
+        rejected_stale_mutations,
+        quarantine_window,
+    );
     if let Some(line) = snapshot_verify_health_line(published) {
         report.push('\n');
         report.push_str(&line);
@@ -1816,6 +2014,22 @@ pub fn health_report_from_stats(
     stats: &HealthStats,
     rejected_stale_mutations: u64,
 ) -> String {
+    health_report_from_stats_windowed(
+        status,
+        stats,
+        rejected_stale_mutations,
+        QuarantineWindow::from_args(None, None),
+    )
+}
+
+/// Like [`health_report_from_stats`] but renders the quarantine registry through
+/// the given display window (SF-STRESS-010 retrieval surface).
+pub fn health_report_from_stats_windowed(
+    status: &str,
+    stats: &HealthStats,
+    rejected_stale_mutations: u64,
+    quarantine_window: QuarantineWindow,
+) -> String {
     use crate::watcher::WatcherState;
 
     let relative_age = |time: Option<std::time::SystemTime>| -> String {
@@ -1917,8 +2131,14 @@ pub fn health_report_from_stats(
 
     if stats.partial_parse_count > 0 {
         output.push_str(&format!(
-            "\nPartial parse summary: {} unexpected, {} expected vendor",
-            stats.unexpected_partial_parse_count, stats.expected_vendor_partial_parse_count
+            "\nPartial parse summary: {} unexpected, {} expected vendor, {} expected generated, {} expected test-fixture, {} expected template-DSL, {} expected framework, {} expected language (expected_* vendor/generated/test-fixture/template-DSL are heuristic path-based labels)",
+            stats.unexpected_partial_parse_count,
+            stats.expected_vendor_partial_parse_count,
+            stats.expected_generated_partial_parse_count,
+            stats.expected_test_fixture_partial_parse_count,
+            stats.expected_template_dsl_partial_parse_count,
+            stats.expected_framework_partial_parse_count,
+            stats.expected_language_partial_parse_count,
         ));
     }
 
@@ -1944,14 +2164,15 @@ pub fn health_report_from_stats(
         );
     }
 
-    // The Parse/span quarantine registry below already lists the first
-    // PARSE_QUARANTINE_ENTRY_LIMIT quarantined paths across ALL categories with
-    // category labels. The per-category sections that follow used to re-list the
-    // SAME paths, doubling every quarantined path in the output. To dedup, the
-    // per-category sections now render only paths NOT already shown in the
-    // registry (i.e. the genuinely-omitted overflow), and are skipped entirely
-    // when the registry already shows everything.
-    let quarantine = ParseQuarantineSummary::from_stats(stats);
+    // The Parse/span quarantine registry below lists ranked quarantined paths
+    // across ALL categories with category labels, windowed by `quarantine_window`
+    // (default offset 0, limit PARSE_QUARANTINE_ENTRY_LIMIT; raised by the
+    // `health` quarantine_limit/quarantine_offset params — SF-STRESS-010). The
+    // per-category sections that follow render only paths NOT already shown in
+    // the current window (the genuinely-omitted overflow), deduping against the
+    // registry and skipping entirely when the registry already shows everything.
+    let quarantine = ParseQuarantineSummary::from_stats(stats)
+        .with_window(quarantine_window.offset, quarantine_window.limit);
     let shown_in_registry = quarantine.shown_paths();
     if let Some(section) = quarantine.full_section() {
         output.push('\n');
@@ -1996,10 +2217,40 @@ pub fn health_report_from_stats(
     if stats.expected_vendor_partial_parse_count > 0 {
         render_overflow(
             &mut output,
-            "Expected vendor partial parse noise (not shown above)",
+            "Expected vendor partial parse noise (heuristic, not shown above)",
             "expected vendor partial files",
             &stats.expected_vendor_partial_parse_files,
             &|path| format!("{} [{}]", path, EXPECTED_VENDOR_PARTIAL_PARSE_REASON),
+        );
+    }
+
+    if stats.expected_generated_partial_parse_count > 0 {
+        render_overflow(
+            &mut output,
+            "Expected generated partial parse noise (heuristic, not shown above)",
+            "expected generated partial files",
+            &stats.expected_generated_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_GENERATED_PARTIAL_PARSE_REASON),
+        );
+    }
+
+    if stats.expected_test_fixture_partial_parse_count > 0 {
+        render_overflow(
+            &mut output,
+            "Expected test-fixture partial parse noise (heuristic, not shown above)",
+            "expected test-fixture partial files",
+            &stats.expected_test_fixture_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON),
+        );
+    }
+
+    if stats.expected_template_dsl_partial_parse_count > 0 {
+        render_overflow(
+            &mut output,
+            "Expected template-DSL partial parse noise (heuristic, not shown above)",
+            "expected template-DSL partial files",
+            &stats.expected_template_dsl_partial_parse_files,
+            &|path| format!("{} [{}]", path, EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON),
         );
     }
 

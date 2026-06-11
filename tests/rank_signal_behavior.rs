@@ -212,7 +212,7 @@ async fn search_files_rankings_match_golden() {
 
 const GOLDEN_EXACT_PATH_HIT: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/tools.rs`
 
 1 matching file
@@ -221,7 +221,7 @@ Evidence: paths `src/protocol/tools.rs`
 
 const GOLDEN_BASENAME_TOOLS_RS: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/tools.rs`
 
 1 matching file
@@ -230,7 +230,7 @@ Evidence: paths `src/protocol/tools.rs`
 
 const GOLDEN_LOOSE_PROTOCOL: &str = "\
 Trust: heuristic (loose path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/mod.rs`, `src/protocol/tools.rs`, `src/protocol/format.rs`
 
 3 matching files
@@ -241,7 +241,7 @@ Evidence: paths `src/protocol/mod.rs`, `src/protocol/tools.rs`, `src/protocol/fo
 
 const GOLDEN_MULTI_COMPONENT_LIVE_SEARCH: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/live_index/search.rs`
 
 1 matching file
@@ -250,7 +250,7 @@ Evidence: paths `src/live_index/search.rs`
 
 const GOLDEN_CURRENT_FILE_BOOST: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; current file boost `src/protocol/tools.rs`; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; current file boost `src/protocol/tools.rs`; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/mod.rs`, `src/live_index/mod.rs`
 
 2 matching files
@@ -260,7 +260,7 @@ Evidence: paths `src/protocol/mod.rs`, `src/live_index/mod.rs`
 
 const GOLDEN_GLOB: &str = "\
 Trust: constrained (tiered path relevance) | current index | parsed | full for current scope
-Scope: ranked indexed file paths; filters: vendor filtered; personal tooling filtered
+Scope: ranked indexed file paths; filters: vendor filter active (heuristic); personal tooling filtered
 Evidence: paths `src/protocol/format.rs`, `src/protocol/mod.rs`, `src/protocol/tools.rs`
 
 3 matching files
@@ -272,4 +272,4 @@ Evidence: paths `src/protocol/format.rs`, `src/protocol/mod.rs`, `src/protocol/t
 const GOLDEN_NOT_FOUND: &str = "\
 No indexed source files matching 'definitely_not_in_fixture_xyzzy'
 
-filters: vendor filtered; personal tooling filtered";
+filters: vendor filter active (heuristic); personal tooling filtered";

@@ -14,8 +14,23 @@ pub struct HealthStats {
     pub partial_parse_count: usize,
     /// Partial parses that are not explicitly classified as expected vendor noise.
     pub unexpected_partial_parse_count: usize,
-    /// Expected partial parses from the vendored tree-sitter-scss C/header parser source.
+    /// Expected partial parses heuristically classified as vendored / third-party
+    /// dependency source (path-based: `vendor/`, `node_modules/`, `deps/`, ...).
+    /// SF-STRESS-009: this is a heuristic path label, not a soundness proof.
     pub expected_vendor_partial_parse_count: usize,
+    /// Expected partial parses heuristically classified as machine-generated /
+    /// build output (path-based: `dist/`, `.min.css`, `.map`, generated dirs).
+    /// SF-STRESS-009.
+    pub expected_generated_partial_parse_count: usize,
+    /// Expected partial parses heuristically classified as test fixtures /
+    /// snapshots (path-based: `test_data/`, `fixtures/`, `__snapshots__/`, ...).
+    /// These are intentionally-malformed inputs, not repo-owned defects.
+    /// SF-STRESS-009.
+    pub expected_test_fixture_partial_parse_count: usize,
+    /// Expected partial parses heuristically classified as server/build template
+    /// DSL embedded in a host-grammar file (`{% %}`, `{{ }}`, `<% %>`,
+    /// `.mstemplate`). SF-STRESS-009.
+    pub expected_template_dsl_partial_parse_count: usize,
     /// Expected partial parses from framework template syntax that the host
     /// tree-sitter grammar cannot model (SF-004: Angular `@if`/`@for`/... in
     /// `.html`, which tree-sitter-html 0.23.2 has no rules for).
@@ -51,6 +66,12 @@ pub struct HealthStats {
     pub unexpected_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of expected vendored partial-parse files.
     pub expected_vendor_partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of expected machine-generated partial-parse files.
+    pub expected_generated_partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of expected test-fixture partial-parse files.
+    pub expected_test_fixture_partial_parse_files: Vec<String>,
+    /// Sorted, deduplicated list of expected template-DSL partial-parse files.
+    pub expected_template_dsl_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of expected framework template partial-parse files.
     pub expected_framework_partial_parse_files: Vec<String>,
     /// Sorted, deduplicated list of expected host-language-limitation partial-parse
@@ -73,8 +94,17 @@ pub struct HealthStats {
     pub untracked_indexed: usize,
 }
 
-pub const EXPECTED_VENDOR_PARTIAL_PARSE_REASON: &str =
-    "expected vendor: tree-sitter-scss C/header parser limitation";
+pub const EXPECTED_VENDOR_PARTIAL_PARSE_REASON: &str = "expected vendor (heuristic path-based): vendored/third-party dependency source; \
+not repo-owned, parse loss is upstream";
+
+pub const EXPECTED_GENERATED_PARTIAL_PARSE_REASON: &str = "expected generated (heuristic path-based): machine-generated/build output; \
+not hand-authored, parse loss does not indicate a repo defect";
+
+pub const EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON: &str = "expected test fixture (heuristic path-based): test fixture/snapshot; \
+often intentionally malformed input, not a repo-owned defect";
+
+pub const EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON: &str = "expected template DSL (heuristic path/content-based): server/build template \
+markers ({% %}/{{ }}/<% %>) the host grammar cannot model; symbols extracted best-effort";
 
 pub const EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON: &str = "expected framework: Angular template control-flow not supported by tree-sitter-html; \
 symbols extracted best-effort";
@@ -139,22 +169,94 @@ pub(crate) fn is_expected_framework_partial_parse(file: &IndexedFile) -> bool {
     )
 }
 
-fn is_expected_vendor_partial_parse_noise(
+/// Heuristic (path-based) classification of a partial parse into an "expected"
+/// noise bucket, or `Unexpected` when no heuristic matches.
+///
+/// SF-STRESS-009: the previous classifier only recognized symforge's own
+/// `vendor/tree-sitter-scss/src/` headers, so `expected_vendor_partial` was
+/// structurally 0 on every other repo and the headline "unexpected repo-owned
+/// partial" metric was dominated by vendored / generated / fixture / template
+/// noise. This reuses the SAME path heuristics the search filters use
+/// ([`FileClassification`] + [`NoisePolicy::classify_path`]) plus a content
+/// signal for template DSLs, so the buckets actually fire.
+///
+/// These buckets are HEURISTIC and PATH-BASED — they are an honest best-effort
+/// label, NOT a neutralize-and-reparse soundness proof (unlike the SF-003 /
+/// SF-004 framework/language buckets). The rendered reason strings say so. A
+/// genuine repo-owned `src/` partial matches none of these heuristics and stays
+/// `Unexpected` (loud).
+///
+/// Precedence: vendor > generated > test-fixture > template-DSL. Vendor wins so
+/// a vendored `dist/` bundle reads as vendor, not generated; test-fixture is
+/// checked before template-DSL so a fixture HTML template reads as a fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeuristicPartialBucket {
+    Vendor,
+    Generated,
+    TestFixture,
+    TemplateDsl,
+    Unexpected,
+}
+
+/// Build-template / server-template DSL markers embedded in an otherwise
+/// host-grammar file (DTL/Jinja `{% %}`, Go/Handlebars `{{ }}`, EJS/ERB
+/// `<% %>`). The host tree-sitter grammar (HTML, CSS, JS) has no rules for these
+/// constructs, so they produce ERROR nodes that are a template-engine artifact,
+/// not a repo-owned defect. `.mstemplate` filenames (jellyfin) are also covered.
+fn has_template_dsl_marker(file: &IndexedFile, path: &str) -> bool {
+    let lower_path = path.replace('\\', "/").to_ascii_lowercase();
+    if lower_path.contains(".mstemplate.") || lower_path.ends_with(".mstemplate") {
+        return true;
+    }
+    // Only inspect text content for host grammars that can legitimately host a
+    // template DSL; skip binary-ish or non-markup languages to keep this cheap
+    // and avoid false positives (e.g. `{{` in a Rust macro).
+    if !matches!(
+        file.language,
+        LanguageId::Html | LanguageId::Css | LanguageId::Scss | LanguageId::JavaScript
+    ) {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&file.content) else {
+        return false;
+    };
+    text.contains("{%") || text.contains("<%") || text.contains("{{")
+}
+
+/// Heuristically bucket a partial parse. See [`HeuristicPartialBucket`].
+pub(crate) fn classify_heuristic_partial_bucket(
     path: &str,
     file: &IndexedFile,
     gitignore: Option<&ignore::gitignore::Gitignore>,
-) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let is_tree_sitter_scss_c_or_header = normalized.starts_with("vendor/tree-sitter-scss/src/")
-        && (normalized.ends_with(".c") || normalized.ends_with(".h"));
+) -> HeuristicPartialBucket {
+    let noise_class = NoisePolicy::classify_path(path, gitignore);
 
-    is_tree_sitter_scss_c_or_header
-        && file.classification.is_vendor
-        && matches!(file.language, LanguageId::C | LanguageId::Cpp)
-        && matches!(
-            NoisePolicy::classify_path(path, gitignore),
-            NoiseClass::Vendor
-        )
+    // 1. Vendored / third-party dependency source. Either the per-file
+    //    classification or the search-side path heuristic flags it.
+    if file.classification.is_vendor || matches!(noise_class, NoiseClass::Vendor) {
+        return HeuristicPartialBucket::Vendor;
+    }
+
+    // 2. Machine-generated / build output (dist/, .min.css, .map, baselines via
+    //    the generated path heuristic).
+    if file.classification.is_generated || matches!(noise_class, NoiseClass::Generated) {
+        return HeuristicPartialBucket::Generated;
+    }
+
+    // 3. Test fixtures / snapshots (test_data, fixtures, __snapshots__, ...).
+    //    Keyed on the shared test-segment heuristic so rust-analyzer err
+    //    fixtures and HTML snapshots, laravel bad-syntax fixtures, and
+    //    TypeScript baselines stop counting as repo-owned defects.
+    if file.classification.is_test {
+        return HeuristicPartialBucket::TestFixture;
+    }
+
+    // 4. Server/build template DSL embedded in a host-grammar file.
+    if has_template_dsl_marker(file, path) {
+        return HeuristicPartialBucket::TemplateDsl;
+    }
+
+    HeuristicPartialBucket::Unexpected
 }
 
 /// Owned per-path admission-tier lookup result for protocol handlers.
@@ -311,14 +413,20 @@ impl LiveIndex {
         let mut partial_parse_files = Vec::new();
         let mut unexpected_partial_parse_files = Vec::new();
         let mut expected_vendor_partial_parse_files = Vec::new();
+        let mut expected_generated_partial_parse_files = Vec::new();
+        let mut expected_test_fixture_partial_parse_files = Vec::new();
+        let mut expected_template_dsl_partial_parse_files = Vec::new();
         let mut expected_framework_partial_parse_files = Vec::new();
         let mut expected_language_partial_parse_files = Vec::new();
         for (path, file) in &self.files {
             if matches!(file.parse_status, ParseStatus::PartialParse { .. }) {
                 partial_parse_files.push(path.clone());
-                if is_expected_vendor_partial_parse_noise(path, file, self.gitignore.as_ref()) {
-                    expected_vendor_partial_parse_files.push(path.clone());
-                } else if is_expected_framework_partial_parse(file) {
+                // Precedence: the two SOUND (neutralize-and-reparse) buckets are
+                // tried first so a proven framework/language limitation keeps its
+                // precise label even when it sits under a heuristic path; the
+                // heuristic path/content buckets then absorb the broad
+                // vendored/generated/fixture/template noise (SF-STRESS-009).
+                if is_expected_framework_partial_parse(file) {
                     // SF-004: a partial parse caused only by Angular template
                     // control-flow (`@if`/`@for`/... in `.html`) that
                     // tree-sitter-html cannot model. Symbols are still extracted
@@ -340,7 +448,27 @@ impl LiveIndex {
                     // header partial count and the registry total stay in sync.
                     expected_language_partial_parse_files.push(path.clone());
                 } else {
-                    unexpected_partial_parse_files.push(path.clone());
+                    // SF-STRESS-009: heuristic path/content classification. These
+                    // labels are honest best-effort, NOT soundness proofs — the
+                    // rendered reasons say "heuristic". A genuine repo-owned `src/`
+                    // partial matches none of these and stays Unexpected (loud).
+                    match classify_heuristic_partial_bucket(path, file, self.gitignore.as_ref()) {
+                        HeuristicPartialBucket::Vendor => {
+                            expected_vendor_partial_parse_files.push(path.clone());
+                        }
+                        HeuristicPartialBucket::Generated => {
+                            expected_generated_partial_parse_files.push(path.clone());
+                        }
+                        HeuristicPartialBucket::TestFixture => {
+                            expected_test_fixture_partial_parse_files.push(path.clone());
+                        }
+                        HeuristicPartialBucket::TemplateDsl => {
+                            expected_template_dsl_partial_parse_files.push(path.clone());
+                        }
+                        HeuristicPartialBucket::Unexpected => {
+                            unexpected_partial_parse_files.push(path.clone());
+                        }
+                    }
                 }
             }
         }
@@ -350,6 +478,12 @@ impl LiveIndex {
         unexpected_partial_parse_files.dedup();
         expected_vendor_partial_parse_files.sort();
         expected_vendor_partial_parse_files.dedup();
+        expected_generated_partial_parse_files.sort();
+        expected_generated_partial_parse_files.dedup();
+        expected_test_fixture_partial_parse_files.sort();
+        expected_test_fixture_partial_parse_files.dedup();
+        expected_template_dsl_partial_parse_files.sort();
+        expected_template_dsl_partial_parse_files.dedup();
         expected_framework_partial_parse_files.sort();
         expected_framework_partial_parse_files.dedup();
         expected_language_partial_parse_files.sort();
@@ -375,6 +509,11 @@ impl LiveIndex {
             partial_parse_count,
             unexpected_partial_parse_count: unexpected_partial_parse_files.len(),
             expected_vendor_partial_parse_count: expected_vendor_partial_parse_files.len(),
+            expected_generated_partial_parse_count: expected_generated_partial_parse_files.len(),
+            expected_test_fixture_partial_parse_count: expected_test_fixture_partial_parse_files
+                .len(),
+            expected_template_dsl_partial_parse_count: expected_template_dsl_partial_parse_files
+                .len(),
             expected_framework_partial_parse_count: expected_framework_partial_parse_files.len(),
             expected_language_partial_parse_count: expected_language_partial_parse_files.len(),
             failed_count,
@@ -390,6 +529,9 @@ impl LiveIndex {
             partial_parse_files,
             unexpected_partial_parse_files,
             expected_vendor_partial_parse_files,
+            expected_generated_partial_parse_files,
+            expected_test_fixture_partial_parse_files,
+            expected_template_dsl_partial_parse_files,
             expected_framework_partial_parse_files,
             expected_language_partial_parse_files,
             failed_files,
@@ -428,6 +570,28 @@ mod tests {
         IndexedFile {
             relative_path: path.to_string(),
             language: LanguageId::TypeScript,
+            classification: FileClassification::for_code_path(path),
+            content: content.as_bytes().to_vec(),
+            symbols: Vec::new(),
+            parse_status: ParseStatus::PartialParse {
+                warning: "syntax error".to_string(),
+            },
+            parse_diagnostic: None,
+            byte_len: content.len() as u64,
+            content_hash: "test-hash".to_string(),
+            references: Vec::new(),
+            alias_map: std::collections::HashMap::new(),
+            mtime_secs: 0,
+        }
+    }
+
+    /// Build a partial-parse file with an explicit language and content. Used by
+    /// the SF-STRESS-009 heuristic-bucket tests, which need non-TypeScript host
+    /// grammars (HTML/CSS) and varied vendor/generated/fixture/template paths.
+    fn partial_file(path: &str, language: LanguageId, content: &str) -> IndexedFile {
+        IndexedFile {
+            relative_path: path.to_string(),
+            language,
             classification: FileClassification::for_code_path(path),
             content: content.as_bytes().to_vec(),
             symbols: Vec::new(),
@@ -520,6 +684,153 @@ mod tests {
                 .unexpected_partial_parse_files
                 .contains(&"src/broken.ts".to_string()),
             "the genuinely broken file stays an unexpected partial"
+        );
+    }
+
+    /// SF-STRESS-009: the heuristic classifier must fire on the corpus-proven
+    /// path shapes. A `deps/` vendored partial, a `dist/.min.css` generated
+    /// partial, a `__snapshots__`/`test_data` fixture partial, and a `{% %}`
+    /// template-DSL partial must each land in their own expected bucket, while a
+    /// genuine repo-owned `src/` partial stays UNEXPECTED (loud). Before the fix
+    /// every one of these counted as an unexpected repo-owned partial.
+    #[test]
+    fn sf009_heuristic_buckets_fire_on_corpus_path_shapes() {
+        // redis-shape: a vendored dependency under deps/ (was unexpected).
+        let deps_vendor = partial_file(
+            "deps/hiredis/sds.c",
+            LanguageId::C,
+            "struct sds { int len } badly_formed",
+        );
+        // laravel/bootstrap-shape: minified generated CSS under dist/.
+        let dist_generated = partial_file(
+            "dist/css/bootstrap.min.css",
+            LanguageId::Css,
+            ".a{color:#fff} .b{ broken",
+        );
+        // rust-analyzer/TypeScript-shape: an intentionally-malformed snapshot
+        // fixture under __snapshots__ / test_data.
+        let snapshot_fixture = partial_file(
+            "crates/parser/test_data/parser/err/0000_unclosed.rs",
+            LanguageId::Rust,
+            "fn f( { // deliberately unclosed fixture",
+        );
+        // django/caddy-shape: a server-template DSL embedded in HTML ({% %}).
+        let template_dsl = partial_file(
+            "django/contrib/admin/templates/admin/base.html",
+            LanguageId::Html,
+            "<html>{% load i18n static tz %}<body>{% if user %}</body>",
+        );
+        // A genuine repo-owned source partial — must stay loud.
+        let real_src = partial_file("src/app/widget.ts", LanguageId::TypeScript, "function f( {");
+
+        let stats = index_with_files(vec![
+            deps_vendor,
+            dist_generated,
+            snapshot_fixture,
+            template_dsl,
+            real_src,
+        ])
+        .health_stats();
+
+        // Every partial is accounted for exactly once: the registry total equals
+        // the header partial count (the load-bearing invariant).
+        let registry_total = stats.unexpected_partial_parse_count
+            + stats.expected_vendor_partial_parse_count
+            + stats.expected_generated_partial_parse_count
+            + stats.expected_test_fixture_partial_parse_count
+            + stats.expected_template_dsl_partial_parse_count
+            + stats.expected_framework_partial_parse_count
+            + stats.expected_language_partial_parse_count;
+        assert_eq!(
+            registry_total, stats.partial_parse_count,
+            "every partial must be bucketed exactly once (header={}, sum={})",
+            stats.partial_parse_count, registry_total
+        );
+
+        assert!(
+            stats
+                .expected_vendor_partial_parse_files
+                .contains(&"deps/hiredis/sds.c".to_string()),
+            "a deps/ partial must bucket as expected_vendor: {:?}",
+            stats.expected_vendor_partial_parse_files
+        );
+        assert!(
+            stats
+                .expected_generated_partial_parse_files
+                .contains(&"dist/css/bootstrap.min.css".to_string()),
+            "a dist/.min.css partial must bucket as expected_generated: {:?}",
+            stats.expected_generated_partial_parse_files
+        );
+        assert!(
+            stats
+                .expected_test_fixture_partial_parse_files
+                .contains(&"crates/parser/test_data/parser/err/0000_unclosed.rs".to_string()),
+            "a test_data fixture partial must bucket as expected_test_fixture: {:?}",
+            stats.expected_test_fixture_partial_parse_files
+        );
+        assert!(
+            stats
+                .expected_template_dsl_partial_parse_files
+                .contains(&"django/contrib/admin/templates/admin/base.html".to_string()),
+            "a {{% %}} template partial must bucket as expected_template_dsl: {:?}",
+            stats.expected_template_dsl_partial_parse_files
+        );
+
+        // The genuine repo-owned source partial stays UNEXPECTED — heuristics
+        // must never silence a real loss.
+        assert_eq!(
+            stats.unexpected_partial_parse_count, 1,
+            "exactly one genuine repo-owned partial remains unexpected"
+        );
+        assert!(
+            stats
+                .unexpected_partial_parse_files
+                .contains(&"src/app/widget.ts".to_string()),
+            "the real src/ partial must stay unexpected (loud): {:?}",
+            stats.unexpected_partial_parse_files
+        );
+    }
+
+    /// SF-STRESS-009: vendor wins over generated. A vendored file that also looks
+    /// generated (`node_modules/.../bundle.min.js`) buckets as vendor, not
+    /// generated — the more accurate root cause.
+    #[test]
+    fn sf009_vendor_precedence_over_generated() {
+        let vendored_bundle = partial_file(
+            "node_modules/some-pkg/dist/bundle.min.js",
+            LanguageId::JavaScript,
+            "var a = { broken",
+        );
+        let stats = index_with_files(vec![vendored_bundle]).health_stats();
+
+        assert_eq!(stats.expected_vendor_partial_parse_count, 1);
+        assert_eq!(stats.expected_generated_partial_parse_count, 0);
+        assert!(
+            stats
+                .expected_vendor_partial_parse_files
+                .contains(&"node_modules/some-pkg/dist/bundle.min.js".to_string()),
+            "vendored path must win the vendor bucket over the generated heuristic"
+        );
+    }
+
+    /// SF-STRESS-009: the template-DSL content signal must not fire on a plain
+    /// host-grammar file with no template markers — those stay unexpected.
+    #[test]
+    fn sf009_template_dsl_requires_markers() {
+        let plain_html = partial_file(
+            "src/views/page.html",
+            LanguageId::Html,
+            "<html><body><div></body></html>",
+        );
+        let stats = index_with_files(vec![plain_html]).health_stats();
+
+        assert_eq!(
+            stats.expected_template_dsl_partial_parse_count, 0,
+            "a marker-free HTML partial must NOT bucket as template-DSL"
+        );
+        assert_eq!(
+            stats.unexpected_partial_parse_count, 1,
+            "a marker-free repo-owned HTML partial stays unexpected"
         );
     }
 }

@@ -355,35 +355,28 @@ impl NoisePolicy {
         let segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
         let basename = segments.last().copied().unwrap_or("");
 
-        // 1. Vendor heuristic
-        let is_vendor = segments.iter().any(|s| {
-            matches!(
-                *s,
-                "vendor"
-                    | "node_modules"
-                    | "third_party"
-                    | "third-party"
-                    | ".venv"
-                    | "venv"
-                    | "site-packages"
-                    | "pods"
-                    | "bower_components"
-            )
-        });
+        // 1. Vendor heuristic. Shares VENDOR_PATH_SEGMENTS with
+        // FileClassification::for_code_path so search_symbols/search_text agree
+        // with explore/repo_map/search_files on what counts as vendored
+        // (SF-STRESS-011).
+        let is_vendor = segments
+            .iter()
+            .any(|s| crate::domain::index::VENDOR_PATH_SEGMENTS.contains(s));
         if is_vendor {
             return NoiseClass::Vendor;
         }
 
-        // 2. Generated heuristic
-        let is_generated = segments.iter().any(|s| {
-            matches!(
-                *s,
-                "dist" | "generated" | "__generated__" | "generated-sources"
-            )
-        }) || basename.ends_with(".lock")
+        // 2. Generated heuristic. Directory roots share GENERATED_PATH_SEGMENTS
+        // with FileClassification; the basename suffixes below additionally cover
+        // lockfiles and source maps that are not directory-keyed.
+        let is_generated = segments
+            .iter()
+            .any(|s| crate::domain::index::GENERATED_PATH_SEGMENTS.contains(s))
+            || basename.ends_with(".lock")
             || basename.contains("-lock.")
             || basename.ends_with(".min.js")
             || basename.ends_with(".min.css")
+            || basename.ends_with(".map")
             || basename.contains(".generated.")
             || basename.contains(".gen.")
             || basename.ends_with(".g.dart")
@@ -2767,6 +2760,45 @@ mod tests {
         assert_eq!(
             NoisePolicy::classify_path("Forms/Form1.Designer.cs", None),
             NoiseClass::Generated
+        );
+    }
+
+    /// SF-STRESS-011: the broadened vendor/generated/test segment sets must be
+    /// recognized, and `NoiseClass::classify_path` must AGREE with
+    /// `FileClassification::for_code_path` on the same paths (they share the
+    /// segment-set source of truth) so search and explore no longer disagree.
+    #[test]
+    fn test_noise_classifiers_agree_on_corpus_paths() {
+        use crate::domain::FileClassification;
+
+        // deps/ vendored dependency (redis, node) — previously an undocumented gap.
+        assert_eq!(
+            NoisePolicy::classify_path("deps/hiredis/sds.c", None),
+            NoiseClass::Vendor
+        );
+        assert!(FileClassification::for_code_path("deps/hiredis/sds.c").is_vendor);
+
+        // dist/ build output (laravel) — now shared by both classifiers.
+        assert_eq!(
+            NoisePolicy::classify_path("dist/css/app.css", None),
+            NoiseClass::Generated
+        );
+        assert!(FileClassification::for_code_path("dist/css/app.css").is_generated);
+
+        // .min.css / .map generated assets (mojo bootstrap.css, source maps).
+        assert_eq!(
+            NoisePolicy::classify_path("public/bootstrap.min.css", None),
+            NoiseClass::Generated
+        );
+        assert!(FileClassification::for_code_path("public/bootstrap.min.css").is_generated);
+        assert!(FileClassification::for_code_path("dist/app.js.map").is_generated);
+
+        // test_data / __snapshots__ fixtures (rust-analyzer) — FileClassification
+        // is the test-aware classifier; classify_path does not model tests, so we
+        // only assert FileClassification here.
+        assert!(FileClassification::for_code_path("crates/parser/test_data/err/0001.rs").is_test);
+        assert!(
+            FileClassification::for_code_path("src/__snapshots__/Button.test.tsx.snap").is_test
         );
     }
 

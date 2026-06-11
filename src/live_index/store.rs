@@ -541,6 +541,12 @@ pub struct PublishedIndexState {
     pub partial_parse_count: usize,
     pub unexpected_partial_parse_count: usize,
     pub expected_vendor_partial_parse_count: usize,
+    /// SF-STRESS-009: counts of partial parses heuristically (path-based) bucketed
+    /// as machine-generated, test-fixture, or template-DSL noise. Carried across
+    /// the daemon-proxy boundary so proxied health reports the same buckets.
+    pub expected_generated_partial_parse_count: usize,
+    pub expected_test_fixture_partial_parse_count: usize,
+    pub expected_template_dsl_partial_parse_count: usize,
     /// SF-004: count of partial parses excused as a framework template grammar
     /// limitation (Angular `@if`/`@for`/... in `.html`). Carried across the
     /// daemon-proxy boundary so proxied health reports the same third bucket.
@@ -554,6 +560,11 @@ pub struct PublishedIndexState {
     pub partial_parse_files: Vec<String>,
     pub unexpected_partial_parse_files: Vec<String>,
     pub expected_vendor_partial_parse_files: Vec<String>,
+    /// SF-STRESS-009: bounded lists of the heuristic generated/test-fixture/
+    /// template-DSL partial-parse buckets.
+    pub expected_generated_partial_parse_files: Vec<String>,
+    pub expected_test_fixture_partial_parse_files: Vec<String>,
+    pub expected_template_dsl_partial_parse_files: Vec<String>,
     /// SF-004: bounded list of framework-template partial-parse files.
     pub expected_framework_partial_parse_files: Vec<String>,
     /// SF-003: bounded list of host-language-limitation partial-parse files.
@@ -1246,6 +1257,14 @@ impl Drop for SharedIndexWriteGuard<'_> {
 /// Thread-safe shared handle to the index.
 pub type SharedIndex = Arc<SharedIndexHandle>;
 
+/// SF-STRESS-010: per-category cap on the quarantine path lists published across
+/// the daemon-proxy boundary. Raised from the previous hard `10` so the full
+/// list is retrievable via the `health` `quarantine_limit` paging parameter in
+/// daemon mode (production default). The `*_count` fields stay uncapped, so the
+/// rendered `total`/`omitted` remain truthful even if a list reaches this cap.
+/// Kept in sync with [`crate::protocol::format::PARSE_QUARANTINE_MAX_LIMIT`].
+const PUBLISHED_QUARANTINE_LIST_CAP: usize = 1000;
+
 impl PublishedIndexState {
     fn capture(generation: u64, index: &LiveIndex) -> Self {
         let (status, degraded_summary) = match index.index_state() {
@@ -1266,31 +1285,64 @@ impl PublishedIndexState {
             partial_parse_count: stats.partial_parse_count,
             unexpected_partial_parse_count: stats.unexpected_partial_parse_count,
             expected_vendor_partial_parse_count: stats.expected_vendor_partial_parse_count,
+            expected_generated_partial_parse_count: stats.expected_generated_partial_parse_count,
+            expected_test_fixture_partial_parse_count: stats
+                .expected_test_fixture_partial_parse_count,
+            expected_template_dsl_partial_parse_count: stats
+                .expected_template_dsl_partial_parse_count,
             expected_framework_partial_parse_count: stats.expected_framework_partial_parse_count,
             expected_language_partial_parse_count: stats.expected_language_partial_parse_count,
             failed_count: stats.failed_count,
-            partial_parse_files: stats.partial_parse_files.into_iter().take(10).collect(),
+            // SF-STRESS-010: publish up to PUBLISHED_QUARANTINE_LIST_CAP entries
+            // per category (was 10) so the daemon-proxy boundary no longer
+            // destroys the lists before the formatter can page them. The `*_count`
+            // fields above stay UNCAPPED (true totals), so showing/omitted stay
+            // honest even when a list hits the publish cap.
+            partial_parse_files: stats
+                .partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
             unexpected_partial_parse_files: stats
                 .unexpected_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_vendor_partial_parse_files: stats
                 .expected_vendor_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_generated_partial_parse_files: stats
+                .expected_generated_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_test_fixture_partial_parse_files: stats
+                .expected_test_fixture_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_template_dsl_partial_parse_files: stats
+                .expected_template_dsl_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_framework_partial_parse_files: stats
                 .expected_framework_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_language_partial_parse_files: stats
                 .expected_language_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
-            failed_files: stats.failed_files.into_iter().take(10).collect(),
+            failed_files: stats
+                .failed_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
             symbol_count: stats.symbol_count,
             loaded_at_system: index.loaded_at_system,
             load_duration: stats.load_duration,
