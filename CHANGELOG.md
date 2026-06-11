@@ -26,6 +26,25 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.20.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.4...v7.20.0) (2026-06-11)
+
+
+### Features
+
+* **search:** rank Tier-2 metadata-only paths in search_files; fix get_symbol_context default budget ([c7498c7](https://github.com/special-place-ai-heaven/symforge/commit/c7498c753aadeb70fe7a2c7b2438a9e4553fb9eb))
+
+
+### Bug Fixes
+
+* **parsing,explore:** balanced-paren Angular excuser, .jsx regression fixture, honest stem-match header ([8534ce2](https://github.com/special-place-ai-heaven/symforge/commit/8534ce2ff500f9328856265d7b0ed09b4448efee))
+* wave 3 — tree-sitter 0.26.9, watcher NoCache, Tier-2 search, coupling eviction, Angular excuser ([d747441](https://github.com/special-place-ai-heaven/symforge/commit/d7474417f4e38a190095951df0a5b5878321bf58))
+
+
+### Performance Improvements
+
+* **coupling:** evict dead-path pairs at cold build — 82% db shrink ([e145a21](https://github.com/special-place-ai-heaven/symforge/commit/e145a21731598eda836955824c3b585d38dc6805))
+* **watcher:** use NoCache debouncer — kill FileIdMap full-tree walk on Windows ([1b791f0](https://github.com/special-place-ai-heaven/symforge/commit/1b791f0c3525434da770681682e34788d4d1ebee))
+
 ## [7.19.4](https://github.com/special-place-ai-heaven/symforge/compare/v7.19.3...v7.19.4) (2026-06-11)
 
 
