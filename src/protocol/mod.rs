@@ -619,6 +619,10 @@ impl SymForgeServer {
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for SymForgeServer {
     fn get_info(&self) -> ServerInfo {
+        // Override rmcp's `from_build_env` default, which expands
+        // `CARGO_CRATE_NAME`/`CARGO_PKG_VERSION` inside the rmcp crate and would
+        // otherwise identify this server as "rmcp"/<rmcp version>. `env!` here
+        // expands in the symforge crate, staying in sync with Cargo.toml.
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -626,6 +630,10 @@ impl ServerHandler for SymForgeServer {
                 .enable_resources()
                 .build(),
         )
+        .with_server_info(rmcp::model::Implementation::new(
+            "symforge",
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 
     fn list_resources(
@@ -852,6 +860,24 @@ mod tests {
             server.index.published_state().indexed_root,
             root_after_first,
             "repeated same-root calls must leave the recorded root unchanged"
+        );
+    }
+
+    /// SF-STRESS-022: `initialize` serverInfo must identify symforge, not the
+    /// rmcp framework default. Without `with_server_info`, rmcp's
+    /// `Implementation::from_build_env` reports "rmcp"/<rmcp version>.
+    #[test]
+    fn get_info_reports_symforge_name_and_crate_version() {
+        let server = make_local_server(None);
+        let info = ServerHandler::get_info(&server);
+        assert_eq!(
+            info.server_info.name, "symforge",
+            "serverInfo.name must identify symforge, not the rmcp framework"
+        );
+        assert_eq!(
+            info.server_info.version,
+            env!("CARGO_PKG_VERSION"),
+            "serverInfo.version must track the symforge crate version"
         );
     }
 }
