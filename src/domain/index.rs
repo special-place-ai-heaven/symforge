@@ -548,6 +548,14 @@ pub enum SkipReason {
     /// that env gate is explicitly enabled; the default admission path never
     /// produces this reason, so admission defaults are unchanged.
     Untracked,
+    /// SF-004 / SF-012: file exists on disk and is small/non-binary, but its
+    /// extension maps to no supported tree-sitter grammar (e.g. `.tcl`, `.sh`,
+    /// `.m`, `.eex`, extensionless `LICENSE`/`Makefile`). It cannot be parsed, so
+    /// it is admitted Tier-2 metadata-only instead of being stored with a
+    /// contradictory Tier-1/Normal decision (which made it vanish from tier
+    /// accounting and minted a false "File not found"). The path stays searchable
+    /// as metadata; only symbol extraction is skipped.
+    UnsupportedLanguage,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -559,6 +567,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::BinaryContent => write!(f, "binary"),
             SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),
+            SkipReason::UnsupportedLanguage => write!(f, "unsupported language"),
         }
     }
 }
