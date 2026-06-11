@@ -24,11 +24,11 @@ jobs:
   verify-main-push:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -43,10 +43,10 @@ jobs:
       - name: Run version sync tests
         run: python -m unittest discover -s execution -p 'test_*.py'
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Run cargo check
         run: cargo check
@@ -67,7 +67,7 @@ jobs:
       - name: Run embed-feature lib tests
         run: cargo test --no-default-features --features embed --lib -- --test-threads=1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
 
@@ -84,11 +84,11 @@ jobs:
       version: ${{ steps.context.outputs.version }}
       release_ref: ${{ steps.context.outputs.release_ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -213,22 +213,22 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare-release.outputs.release_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Verify release versions
         run: python execution/version_sync.py check --tag "${{ needs.prepare-release.outputs.tag_name }}"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-          targets: ${{ matrix.target }}
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup toolchain install && rustup target add ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -238,7 +238,7 @@ jobs:
         run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -251,18 +251,18 @@ jobs:
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare-release.outputs.release_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Verify release versions
         run: python execution/version_sync.py check --tag "${{ needs.prepare-release.outputs.tag_name }}"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
 
@@ -344,7 +344,7 @@ jobs:
           ls -l dist-npm
 
       - name: Upload npm package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: npm-package
           path: dist-npm/*.tgz
@@ -379,18 +379,18 @@ jobs:
     if: needs.prepare-release.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare-release.outputs.release_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Publish to crates.io
         run: >
@@ -409,15 +409,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-publish
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare-release.outputs.release_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
