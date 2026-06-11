@@ -36,6 +36,10 @@ pub mod observability;
 // cli::update, and protocol health — all server-only.
 #[cfg(feature = "server")]
 pub mod path_shadow;
+// Console-flash-free child spawning (CREATE_NO_WINDOW on Windows); used by the
+// daemon's helper spawns, worktree listing, PATH-shadow probes, and the updater.
+#[cfg(feature = "server")]
+pub(crate) mod process_util;
 #[cfg(feature = "server")]
 pub mod protocol;
 #[cfg(feature = "server")]

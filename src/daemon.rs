@@ -1465,7 +1465,9 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         // `tasklist` lists the pid only when it exists; "No tasks" otherwise.
-        std::process::Command::new("tasklist")
+        // hidden_command: the daemon has no console, so a plain spawn would
+        // flash a new conhost window on every periodic liveness check.
+        crate::process_util::hidden_command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -2564,7 +2566,7 @@ fn cleanup_daemon_runtime_files() {
 pub(crate) fn terminate_process(pid: u32) -> io::Result<()> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        let status = crate::process_util::hidden_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

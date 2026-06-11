@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -270,7 +269,7 @@ pub fn resolve_target_path(
 /// is stable, handles every edge case (bare, detached, locked, prunable)
 /// uniformly, and the call only happens on cache miss.
 fn list_worktrees(indexed_root: &Path) -> Result<Vec<PathBuf>, WorktreeError> {
-    let output = Command::new("git")
+    let output = crate::process_util::hidden_command("git")
         .arg("-C")
         .arg(indexed_root)
         .arg("worktree")
