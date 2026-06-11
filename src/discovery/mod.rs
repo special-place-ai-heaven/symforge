@@ -189,6 +189,27 @@ fn is_under_repo_root_build_dir(relative_path: &str, target_dir_child: Option<&s
     matches!(target_dir_child, Some(child) if child == first)
 }
 
+/// SF-025: returns `true` when any component of `relative_path` (forward-slash
+/// normalized, relative to the repo root) is a "hidden" dotfile/dotdir — a
+/// segment beginning with `.` other than the `.`/`..` traversal segments.
+///
+/// The bulk discovery walk (`discover_all_files`) uses `ignore::WalkBuilder`
+/// with its default `.hidden(true)`, which skips any entry whose name — or an
+/// ancestor directory's name — starts with `.` (e.g. `.github/workflows/ci.yml`,
+/// `.travis.yml`). The single-file (re)index choke point in the watcher did NOT
+/// apply that rule, so a freshen-on-read of a tracked hidden file would parse
+/// and INSERT it even though a fresh bulk load never discovered it. That made
+/// index membership query-history-dependent: a file was invisible to
+/// `search_files` until someone happened to `get_file_context` it, and identical
+/// health calls disagreed across processes. This predicate lets the single-file
+/// path apply the SAME hidden-path exclusion as the walk, keeping admission
+/// symmetric and the index deterministic from scan policy alone.
+pub fn path_has_hidden_component(relative_path: &str) -> bool {
+    relative_path
+        .split('/')
+        .any(|component| component.starts_with('.') && component != "." && component != "..")
+}
+
 /// Build the graceful, explicit over-cap error. Surfaced to the caller (and
 /// thus the MCP client) instead of an OOM/panic, and it names the override knob
 /// so an operator with a genuinely huge repo can raise the ceiling.
@@ -306,6 +327,16 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     let target_dir_child = cargo_target_dir_root_child(&root);
     let mut total_bytes: u64 = 0;
     let mut entries: Vec<DiscoveredEntry> = Vec::new();
+    // SF-012(B): the repo-root build-dir heuristic (`is_under_repo_root_build_dir`)
+    // matches `target-<alnum>` by design (e.g. `target-wsl`, a `CARGO_TARGET_DIR`
+    // variant), but false-positives on legitimately tracked source dirs whose name
+    // happens to match — tokio's `target-specs/` (tracked `.md`/`.json`, not
+    // gitignored). Build output is NEVER git-tracked, so git-tracked status is a
+    // decisive counter-signal: if a path the heuristic would skip is tracked, keep
+    // it. The tracked set is computed LAZILY (only on the first build-dir hit) so
+    // the common case — no root-level `target-*` dir — pays nothing. `None` means
+    // "no git / unreadable index" (fail open: heuristic decides alone, as before).
+    let mut tracked_for_build_dirs: Option<Option<std::collections::HashSet<String>>> = None;
     for entry_result in WalkBuilder::new(&root).build() {
         let Ok(entry) = entry_result else { continue };
         let path =
@@ -335,7 +366,20 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
         // build output from counting against the discovery ceilings. Nested
         // source dirs like `src/target/` are unaffected (first component only).
         if is_under_repo_root_build_dir(&relative_path, target_dir_child.as_deref()) {
-            continue;
+            // SF-012(B): rescue genuine source. Only build output reaches the size
+            // ceilings, so the heuristic's intent is to drop build artifacts — but
+            // a tracked `target-*` source dir (tokio `target-specs/`) is not build
+            // output. Consult the git-tracked set (computed once, lazily); a
+            // tracked path overrides the heuristic and is admitted normally. When
+            // git is unavailable the set is `None` and the heuristic decides alone.
+            let tracked = tracked_for_build_dirs
+                .get_or_insert_with(|| tracked_path_set_for_build_dir_rescue(&root));
+            let rescued = tracked
+                .as_ref()
+                .is_some_and(|set| set.contains(relative_path.as_str()));
+            if !rescued {
+                continue;
+            }
         }
 
         // Attempt language detection; None for unknown/denylisted extensions.
@@ -787,6 +831,32 @@ pub fn classify_admission(
     AdmissionDecision::normal()
 }
 
+/// SF-004 / SF-012: reconcile a `classify_admission` result for a file whose
+/// extension maps to no supported tree-sitter grammar.
+///
+/// `classify_admission` only inspects size / denylist / binary content — it has
+/// no concept of language recognition, so a small, non-binary, non-denylisted
+/// file with an unknown extension (`.tcl`, `.sh`, `.m`, `.eex`, extensionless
+/// `LICENSE`/`Makefile`, …) comes back `AdmissionTier::Normal`. But the parser
+/// cannot extract symbols from it, so storing a `Normal` decision is
+/// self-contradictory: such records were silently dropped by `tier_counts`
+/// (the `Normal => {}` arm) and minted a false "File not found" in
+/// `get_file_context`.
+///
+/// This helper is the single place that maps that "Normal but unparseable"
+/// state onto an honest `Tier-2 metadata-only / UnsupportedLanguage` decision.
+/// A non-`Normal` decision (real size/denylist/binary skip) is returned
+/// unchanged, so this never overrides a more specific reason. Callers invoke it
+/// ONLY on the no-recognized-language branch, so a `Normal` input here always
+/// means "unparseable language", never "Tier-1 source".
+pub fn unsupported_language_decision(decision: AdmissionDecision) -> AdmissionDecision {
+    if decision.tier == AdmissionTier::Normal {
+        AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::UnsupportedLanguage)
+    } else {
+        decision
+    }
+}
+
 /// Env var gating the SF-009 opt-in "exclude untracked" admission policy.
 /// Default OFF — when unset (or set to anything other than a truthy value) the
 /// index admits files exactly as before, so admission defaults are unchanged.
@@ -824,6 +894,24 @@ pub fn tracked_path_set_for_exclusion(root: &Path) -> Option<std::collections::H
     if !exclude_untracked_enabled() {
         return None;
     }
+    let git_repo = crate::git::GitRepo::open(root).ok()?;
+    let tracked = git_repo.tracked_paths().ok()?;
+    if tracked.is_empty() {
+        return None;
+    }
+    Some(tracked.into_iter().collect())
+}
+
+/// SF-012(B): git-tracked path set used to RESCUE source files the repo-root
+/// build-dir heuristic (`is_under_repo_root_build_dir`) would otherwise skip.
+///
+/// Unlike [`tracked_path_set_for_exclusion`] this is NOT env-gated: build output
+/// is never git-tracked, so a tracked path matching `target-<alnum>` (e.g.
+/// tokio's `target-specs/`) is real source, not a build artifact, and must be
+/// admitted. **Fails open to `None`** (heuristic decides alone) when no git repo
+/// is discoverable, the index cannot be read, or the tracked set is empty — so a
+/// non-git tree keeps the conservative build-dir skip exactly as before.
+fn tracked_path_set_for_build_dir_rescue(root: &Path) -> Option<std::collections::HashSet<String>> {
     let git_repo = crate::git::GitRepo::open(root).ok()?;
     let tracked = git_repo.tracked_paths().ok()?;
     if tracked.is_empty() {
@@ -1083,6 +1171,186 @@ mod tests {
             assert!(
                 paths.contains(&"targets/x.rs"),
                 "non-build dir `targets/` must not be over-skipped: {paths:?}"
+            );
+        }
+    }
+
+    // ── SF-004 / SF-012(A): unsupported-language admission demotion ──
+    //
+    // A small, non-binary file with an extension that maps to no supported
+    // grammar must be admitted Tier-2 (metadata-only / unsupported-language),
+    // NOT stored with a contradictory Tier-1/Normal decision that vanishes from
+    // tier accounting and mints a false "File not found".
+    mod unsupported_language {
+        use super::*;
+
+        #[test]
+        fn unsupported_language_decision_demotes_normal_to_metadata_only() {
+            // classify_admission returns Normal for a small non-binary file (it
+            // never inspects language); the helper must demote it honestly.
+            let normal = AdmissionDecision::normal();
+            let demoted = unsupported_language_decision(normal);
+            assert_eq!(demoted.tier, AdmissionTier::MetadataOnly);
+            assert_eq!(demoted.reason, Some(SkipReason::UnsupportedLanguage));
+        }
+
+        #[test]
+        fn unsupported_language_decision_preserves_specific_skip_reasons() {
+            // A real size/denylist/binary skip must pass through unchanged — the
+            // helper only rewrites the contradictory Normal-but-unparseable state.
+            for original in [
+                AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
+                AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::SizeThreshold),
+                AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::BinaryContent),
+                AdmissionDecision::skip(
+                    AdmissionTier::MetadataOnly,
+                    SkipReason::DependencyLockfile,
+                ),
+            ] {
+                assert_eq!(
+                    unsupported_language_decision(original),
+                    original,
+                    "non-Normal decision must be returned unchanged"
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_language_reason_renders_honestly() {
+            assert_eq!(
+                SkipReason::UnsupportedLanguage.to_string(),
+                "unsupported language"
+            );
+        }
+    }
+
+    // ── SF-025: hidden-path scan-policy predicate ──
+    //
+    // The bulk walk skips hidden dotfiles/dotdirs; the single-file (re)index path
+    // must mirror that so index membership is deterministic from scan policy.
+    mod hidden_path {
+        use super::*;
+
+        #[test]
+        fn detects_hidden_directory_component() {
+            assert!(path_has_hidden_component(".github/workflows/ci.yml"));
+            assert!(path_has_hidden_component(
+                "deps/hiredis/.github/release.yml"
+            ));
+            assert!(path_has_hidden_component(".travis.yml"));
+            assert!(path_has_hidden_component("a/b/.hidden"));
+        }
+
+        #[test]
+        fn allows_visible_paths_and_traversal_segments() {
+            assert!(!path_has_hidden_component("src/main.rs"));
+            assert!(!path_has_hidden_component("README.md"));
+            // `.`/`..` traversal segments are not "hidden" file names.
+            assert!(!path_has_hidden_component("./src/main.rs"));
+            assert!(!path_has_hidden_component("../sibling/main.rs"));
+            // A dot inside a name (not a leading-dot component) is visible.
+            assert!(!path_has_hidden_component("src/a.b.c/main.rs"));
+        }
+
+        #[test]
+        fn discover_all_files_skips_hidden_supported_extension_files() {
+            let tmp = TempDir::new().unwrap();
+            // A hidden dir with a SUPPORTED extension inside — the exact SF-025
+            // shape (e.g. `.github/workflows/ci.yml`).
+            create_file(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
+            create_file(tmp.path(), ".travis.yml", "language: rust\n");
+            // Visible source must still be discovered.
+            create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+            let entries = discover_all_files(tmp.path()).unwrap();
+            let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+            assert!(
+                !paths.contains(&".github/workflows/ci.yml"),
+                "hidden-dir file must not be discovered by the bulk walk: {paths:?}"
+            );
+            assert!(
+                !paths.contains(&".travis.yml"),
+                "hidden dotfile must not be discovered by the bulk walk: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/main.rs"),
+                "visible source must be discovered: {paths:?}"
+            );
+        }
+    }
+
+    // ── SF-012(B): build-dir heuristic rescues tracked source dirs ──
+    mod build_dir_tracked_rescue {
+        use super::*;
+        use std::process::Command;
+
+        #[test]
+        fn discover_all_files_rescues_tracked_target_specs_dir() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let run = |args: &[&str]| {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .expect("git command");
+            };
+            run(&["init"]);
+            run(&["config", "user.email", "test@test.com"]);
+            run(&["config", "user.name", "Test"]);
+
+            // tokio's real shape: a tracked `target-specs/` source dir whose name
+            // matches the build-dir heuristic, plus a genuine `target/` build dir.
+            create_file(root, "target-specs/i686.json", "{}\n");
+            create_file(root, "target-specs/README.md", "# specs\n");
+            create_file(root, "src/main.rs", "fn main() {}");
+            // Stage+commit ONLY the source and the target-specs dir — the build
+            // dir below is left untracked, exactly like real build output.
+            run(&["add", "target-specs", "src"]);
+            run(&["commit", "-m", "initial"]);
+            // A genuine (untracked) build dir matching the heuristic.
+            create_file(root, "target/debug/artifact.rs", "fn a() {}");
+
+            let entries = discover_all_files(root).unwrap();
+            let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+            assert!(
+                paths.contains(&"target-specs/i686.json"),
+                "tracked target-specs/ source must be rescued: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"target-specs/README.md"),
+                "tracked target-specs/ source must be rescued: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/main.rs"),
+                "normal source must be discovered: {paths:?}"
+            );
+            assert!(
+                !paths.contains(&"target/debug/artifact.rs"),
+                "untracked build output must still be skipped: {paths:?}"
+            );
+        }
+
+        #[test]
+        fn discover_all_files_without_git_keeps_conservative_build_dir_skip() {
+            // No git repo: the rescue helper fails open to None, so the heuristic
+            // decides alone and a `target-*` dir is skipped exactly as before.
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "target-wsl/debug/artifact.rs", "fn a() {}");
+            create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+            let entries = discover_all_files(tmp.path()).unwrap();
+            let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+            assert!(
+                !paths.contains(&"target-wsl/debug/artifact.rs"),
+                "non-git tree must still skip target-* build dirs: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"src/main.rs"),
+                "normal source must be discovered: {paths:?}"
             );
         }
     }

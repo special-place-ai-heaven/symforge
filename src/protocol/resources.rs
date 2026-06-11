@@ -141,7 +141,10 @@ impl SymForgeServer {
 
     async fn render_resource_text(&self, request: ResourceRequest) -> Result<String, String> {
         let text = match request {
-            ResourceRequest::RepoHealth => self.health().await,
+            ResourceRequest::RepoHealth => {
+                self.health(Parameters(crate::protocol::tools::HealthInput::default()))
+                    .await
+            }
             ResourceRequest::RepoOutline => {
                 self.get_repo_map(Parameters(GetRepoMapInput {
                     detail: Some("full".to_string()),

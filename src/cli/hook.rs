@@ -1107,6 +1107,13 @@ const HOOK_HINT_MARKER: &str = ".symforge/hook-hint-shown";
 /// Freshness window for the sidecar hint marker file (30 minutes).
 const HOOK_HINT_FRESHNESS: Duration = Duration::from_secs(30 * 60);
 
+/// CLI invocation advertised by the sidecar hint to set up MCP integration.
+///
+/// Must remain a valid `symforge` subcommand (asserted in tests). The earlier
+/// `symforge --stdio` form was never a valid flag — clap rejected it with
+/// exit 2 — so first-run users following the hint hit an immediate error.
+const SIDECAR_HINT_COMMAND: &str = "symforge init";
+
 /// Emit a one-time hint to stderr when the sidecar is not running (HOOK-03).
 ///
 /// Uses a marker file (`.symforge/hook-hint-shown`) to avoid repeating the hint
@@ -1132,7 +1139,7 @@ fn maybe_emit_sidecar_hint(repo_root: &Path) {
     eprintln!(
         "[symforge-hook]   \u{2022} Configure SymForge as an MCP server in your editor settings"
     );
-    eprintln!("[symforge-hook]   \u{2022} Or run: symforge --stdio");
+    eprintln!("[symforge-hook]   \u{2022} Or run: {SIDECAR_HINT_COMMAND}");
     eprintln!("[symforge-hook] (This hint appears once per session)");
 
     // Touch / create the marker file so we don't repeat within 30 minutes.
@@ -2246,6 +2253,23 @@ mod tests {
             mtime_before, mtime_after,
             "marker mtime should not change when fresh"
         );
+    }
+
+    /// SF-STRESS-020: the sidecar hint must advertise a command the binary
+    /// actually accepts. The previous `symforge --stdio` form was rejected by
+    /// clap with exit 2, so first-run users following the hint hit an error.
+    #[test]
+    fn sidecar_hint_command_parses_as_valid_cli_invocation() {
+        use clap::Parser;
+        let args: Vec<&str> = SIDECAR_HINT_COMMAND.split_whitespace().collect();
+        assert_eq!(
+            args.first().copied(),
+            Some("symforge"),
+            "hint command must invoke the symforge binary"
+        );
+        crate::cli::Cli::try_parse_from(args).unwrap_or_else(|e| {
+            panic!("sidecar hint command `{SIDECAR_HINT_COMMAND}` must parse as a valid CLI invocation, got: {e}")
+        });
     }
 
     // --- helpers ---

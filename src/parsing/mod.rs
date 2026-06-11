@@ -92,7 +92,20 @@ pub fn process_file_with_classification(
     // distinction is carried by the file extension, not the LanguageId.
     let is_tsx = LanguageId::is_tsx_path(relative_path);
 
-    let parse_result = panic::catch_unwind(|| parse_source(&source, &language, is_tsx));
+    // SF-STRESS-005: `.h` maps to C by extension, but cross-platform repos fill
+    // `.h` with C++ (`class`/`namespace`/`::`). The C grammar extracts ZERO
+    // symbols from a C++ class header, so disambiguate the grammar from content
+    // here and adopt the C++ verdict (grammar AND reported language) when it
+    // parses the header better than C. A plain C header parses clean as C and is
+    // never touched. Objective-C headers (`@interface`) have no shipped grammar
+    // and stay C — reported honestly as a partial, not silently mislabeled.
+    let (language, parse_result) =
+        if matches!(language, LanguageId::C) && LanguageId::is_c_header_path(relative_path) {
+            resolve_c_header_parse(&source)
+        } else {
+            let parse_result = panic::catch_unwind(|| parse_source(&source, &language, is_tsx));
+            (language, parse_result)
+        };
 
     match parse_result {
         Ok(Ok((symbols, has_error, diagnostic, references, alias_map))) => {
@@ -308,6 +321,30 @@ pub(crate) fn parse_source(
 
     let root = tree.root_node();
     let has_error = root.has_error();
+
+    // SF-STRESS-007: on Windows checkouts (core.autocrlf=true) a backslash line
+    // continuation inside a C/C++ string literal ends with `\` + CR + LF.
+    // tree-sitter-cpp/-c lex `\`+CR as an escape_sequence, leaving a raw LF that
+    // `string_content` cannot match -> parse error. Error recovery then re-enters
+    // mid-literal and harvests embedded-DSL text (HLSL shader `struct`/`main`) as
+    // PHANTOM C++ symbols that are well-formed siblings OUTSIDE the ERROR nodes,
+    // so they cannot be filtered by skipping ERROR subtrees and they pollute
+    // exact-match search at full confidence. Recover by reparsing a copy with the
+    // line splice rewritten `\`+CR+LF -> `\`+LF+CR (CR is valid string_content and
+    // whitespace): this is BYTE-LENGTH PRESERVING, so every real symbol's byte
+    // span is identical between the on-disk source and the reparsed buffer — no
+    // offset map is needed. We adopt the reparse ONLY if it is fully clean (no
+    // ERROR/MISSING anywhere), which proves the splice was the sole defect; any
+    // unrelated error keeps the original (dirty) parse, so a genuinely broken
+    // file is never silently "fixed".
+    if has_error
+        && matches!(language, LanguageId::C | LanguageId::Cpp)
+        && source_has_backslash_crlf(source)
+        && let Some(recovered) = recover_c_family_backslash_crlf(source, language)
+    {
+        return Ok(recovered);
+    }
+
     let symbols = languages::extract_symbols(&root, source, language);
     let (references, alias_map) = xref::extract_references(&root, source, language, is_tsx);
 
@@ -332,6 +369,350 @@ pub(crate) fn parse_source(
     };
 
     Ok((symbols, has_error, diagnostic, references, alias_map))
+}
+
+/// Returns `true` when `source` contains a backslash immediately followed by a
+/// CRLF (`\` `\r` `\n`) — the Windows line-continuation byte pattern that
+/// tree-sitter-c/-cpp mis-lex inside string literals (SF-STRESS-007). Cheap
+/// pre-gate so the recovery reparse runs only on files that actually carry the
+/// pattern.
+fn source_has_backslash_crlf(source: &str) -> bool {
+    let b = source.as_bytes();
+    b.windows(3).any(|w| w == [b'\\', b'\r', b'\n'])
+}
+
+/// SF-STRESS-007 recovery: reparse `source` with every `\`+CR+LF line splice
+/// rewritten to `\`+LF+CR and return the reparse output IFF it is fully clean.
+///
+/// The rewrite is byte-length preserving (3 bytes -> 3 bytes, a pure transpose
+/// of CR and LF after the backslash), so byte offsets — and therefore every
+/// extracted symbol's `byte_range` and every reference span — are IDENTICAL
+/// between the on-disk source and the reparsed buffer. CR is valid
+/// `string_content` and ordinary whitespace, so moving it after the LF lets the
+/// `\`+LF escape/line-continuation lex correctly while keeping the line count
+/// and all spans intact.
+///
+/// Returns `None` (caller keeps the original dirty parse) when the rewritten
+/// buffer STILL has any ERROR/MISSING node: a residual error proves the splice
+/// was not the sole defect, so we must not silently substitute a different parse.
+fn recover_c_family_backslash_crlf(
+    source: &str,
+    language: &LanguageId,
+) -> Option<ParseSourceOutput> {
+    // Transpose `\`+CR+LF -> `\`+LF+CR. Byte-length preserving, so spans hold.
+    let bytes = source.as_bytes();
+    let mut buf = bytes.to_vec();
+    let mut i = 0usize;
+    while i + 2 < buf.len() {
+        if buf[i] == b'\\' && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+            buf[i + 1] = b'\n';
+            buf[i + 2] = b'\r';
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    // The transpose only moves existing valid-UTF-8 bytes, so the buffer stays
+    // valid UTF-8; the lossy fallback never allocates for well-formed input.
+    let rewritten = String::from_utf8_lossy(&buf);
+
+    // `.h`/.c/.cpp are never `.tsx`; the flavor flag is irrelevant here. Reparse
+    // under the SAME grammar — this fixes lexing, not language routing.
+    let output = panic::catch_unwind(|| parse_source(&rewritten, language, false))
+        .ok()?
+        .ok()?;
+    // Adopt ONLY a fully clean reparse; `has_error` is the second tuple element.
+    if output.1 {
+        return None;
+    }
+    Some(output)
+}
+
+/// Count ERROR and MISSING nodes in a tree-sitter tree.
+///
+/// `root.has_error()` is a boolean; for picking the *better* of two candidate
+/// grammars on the same `.h` header (SF-STRESS-005) we need a magnitude — a C++
+/// class header parsed as C explodes into hundreds of ERROR nodes, while the
+/// same bytes parsed as C++ have zero. The count is the comparison key in
+/// [`resolve_c_header_parse`].
+fn count_error_nodes(root: &Node) -> usize {
+    let mut cursor = root.walk();
+    let mut stack = vec![*root];
+    let mut count = 0usize;
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            count += 1;
+        }
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            stack.push(cursor.node());
+            while cursor.goto_next_sibling() {
+                stack.push(cursor.node());
+            }
+        }
+    }
+    count
+}
+
+/// Parse `source` under `language` and return the symbol output alongside the
+/// ERROR/MISSING node count, so [`resolve_c_header_parse`] can pick the grammar
+/// that parses a `.h` header with fewer errors. Returns `None` on a parse
+/// failure or parser panic (treated as "infinitely bad" by the caller).
+fn parse_source_scored(source: &str, language: &LanguageId) -> Option<(ParseSourceOutput, usize)> {
+    let mut parser = Parser::new();
+    let ts_language = match language {
+        LanguageId::C => tree_sitter_c::LANGUAGE.into(),
+        LanguageId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        // Only C/C++ grammars are scored for header disambiguation.
+        _ => return None,
+    };
+    parser.set_language(&ts_language).ok()?;
+    let tree = parser.parse(source, None)?;
+    let error_nodes = count_error_nodes(&tree.root_node());
+    // `.h` headers are never `.tsx`; the flavor flag is irrelevant here.
+    let output = parse_source(source, language, false).ok()?;
+    Some((output, error_nodes))
+}
+
+/// SF-STRESS-005: choose the grammar for a `.h` header from its CONTENT and
+/// return the chosen parse plus the [`LanguageId`] to report.
+///
+/// `.h` maps to [`LanguageId::C`] by extension, but cross-platform repos fill
+/// `.h` with C++ (`class`/`namespace`/`::`/`template`). The C grammar has no
+/// `class_specifier`/`template`/`namespace` rule, so a C++ class header parses
+/// into hundreds of ERROR nodes and the symbol extractor recovers NOTHING —
+/// total symbol loss. The fix disambiguates in two complementary layers:
+///
+///   (a) Cheap content heuristic: if the header carries C++-only markers and no
+///       blocking Objective-C marker, parse with the C++ grammar directly,
+///       skipping a C parse that is known to fail. The header IS C++, so it is
+///       reported as [`LanguageId::Cpp`].
+///   (b) Error-count fallback for headers the heuristic does not flag: parse as
+///       C; if that is clean, keep it (a plain C header stays C — the common
+///       case, no extra work). Only when the C parse ERRORS do we make a
+///       one-shot C++ attempt and adopt C++ iff it parses with STRICTLY fewer
+///       ERROR/MISSING nodes. A tie keeps C (the extension default), so a header
+///       that is genuinely C is never relabeled on a wash.
+///
+/// Objective-C honesty: `@interface`/`@property`/`@import` parse cleanly under
+/// NEITHER grammar (no tree-sitter-objc is shipped). When an ObjC marker is
+/// present without a C++ marker, the header stays C and surfaces as an honest
+/// partial parse — never silently mislabeled as C++ to fake success. If the C++
+/// grammar happened to recover fewer errors on such a file the error-count
+/// fallback could still pick it, but the heuristic short-circuits the obvious
+/// ObjC case to C first, and either way the result is reported with the grammar
+/// that actually parsed it.
+///
+/// The return shape mirrors the inline `parse_source` call it replaces: the
+/// `Result<Result<...>, _>` outer layer is the `catch_unwind` envelope the
+/// caller already matches on.
+fn resolve_c_header_parse(
+    source: &str,
+) -> (
+    LanguageId,
+    std::thread::Result<Result<ParseSourceOutput, String>>,
+) {
+    // Layer (a): content heuristic. C++ markers route straight to the C++
+    // grammar (and C++ reporting); an ObjC-only header is left to the C grammar.
+    let header_kind = classify_c_header_content(source);
+    if matches!(header_kind, CHeaderContent::Cpp) {
+        let output = panic::catch_unwind(|| parse_source(source, &LanguageId::Cpp, false));
+        return (LanguageId::Cpp, output);
+    }
+
+    // Layer (b): parse as C first. A clean C parse (the overwhelmingly common
+    // case for real C headers, and for ObjC headers there is nothing better to
+    // offer) is kept as-is with no second parse.
+    let c_scored = panic::catch_unwind(|| parse_source_scored(source, &LanguageId::C));
+    let c_errors = match &c_scored {
+        Ok(Some((_, errors))) => *errors,
+        // C parse failed/panicked: fall back to the plain C parse path so the
+        // caller reports the failure exactly as it would have without this hook.
+        _ => {
+            let output = panic::catch_unwind(|| parse_source(source, &LanguageId::C, false));
+            return (LanguageId::C, output);
+        }
+    };
+    if c_errors == 0 {
+        // Clean C parse — a real C header. Keep C, no C++ attempt.
+        return (
+            LanguageId::C,
+            c_scored.map(|opt| Ok(opt.expect("checked Some above").0)),
+        );
+    }
+
+    // C parse has errors. Objective-C content has no better grammar to offer, so
+    // do not burn a second parse chasing it — keep the honest C partial.
+    if matches!(header_kind, CHeaderContent::ObjectiveC) {
+        return (
+            LanguageId::C,
+            c_scored.map(|opt| Ok(opt.expect("checked Some above").0)),
+        );
+    }
+
+    // Layer (b) C++ attempt: adopt C++ only if it parses with STRICTLY fewer
+    // errors than C. A tie or a worse C++ parse keeps C (the extension default).
+    let cpp_scored = panic::catch_unwind(|| parse_source_scored(source, &LanguageId::Cpp));
+    match cpp_scored {
+        Ok(Some((cpp_output, cpp_errors))) if cpp_errors < c_errors => {
+            (LanguageId::Cpp, Ok(Ok(cpp_output)))
+        }
+        _ => (
+            LanguageId::C,
+            c_scored.map(|opt| Ok(opt.expect("checked Some above").0)),
+        ),
+    }
+}
+
+/// Coarse content classification of a `.h` header for grammar routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CHeaderContent {
+    /// Carries a C++-only construct (`class`/`namespace`/`template`/`::`/…).
+    Cpp,
+    /// Carries an Objective-C construct (`@interface`/`@property`/`@import`/…)
+    /// and no C++ marker. No tree-sitter-objc grammar is shipped.
+    ObjectiveC,
+    /// No C++ or Objective-C marker found — treat as plain C.
+    C,
+}
+
+/// Scan a `.h` header for C++-only and Objective-C markers, ignoring matches
+/// inside line/block comments and string/char literals so a comment mentioning
+/// `class` or a `"a::b"` string cannot misroute a plain C header.
+///
+/// C++ markers (none are legal in C89..C23): the `class`/`namespace`/`template`
+/// keywords, the `::` scope-resolution operator, access labels `public:`/
+/// `private:`/`protected:`, and `extern "C++"`. Objective-C markers: the `@`
+/// directives `@interface`/`@implementation`/`@protocol`/`@property`/`@end` and
+/// `#import`. A C++ marker wins over an ObjC marker (a `.h` with both is C++
+/// with embedded ObjC-C++, routed to the C++ grammar).
+fn classify_c_header_content(source: &str) -> CHeaderContent {
+    let bytes = source.as_bytes();
+    let mut found_cpp = false;
+    let mut found_objc = false;
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    // Word-boundary helper: a keyword marker must not be glued to an
+    // identifier character on either side (so `subclass`/`classify` do not match
+    // `class`). Operates on byte offsets into `bytes`.
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let word_at = |start: usize, kw: &[u8]| -> bool {
+        let end = start + kw.len();
+        if end > n || &bytes[start..end] != kw {
+            return false;
+        }
+        let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+        let after_ok = end == n || !is_ident(bytes[end]);
+        before_ok && after_ok
+    };
+
+    while i < n {
+        let b = bytes[i];
+        // Skip line comments.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip block comments.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // Skip string / char literals (handle escapes so `"\""` stays inside).
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // C++ scope operator `::` — the single strongest C++ signal in headers
+        // (`std::`, `flutter::DartProject`). Not valid anywhere in C.
+        if b == b':' && i + 1 < n && bytes[i + 1] == b':' {
+            found_cpp = true;
+            i += 2;
+            continue;
+        }
+
+        // Objective-C `@` directives.
+        if b == b'@' {
+            for kw in [
+                b"interface".as_slice(),
+                b"implementation",
+                b"protocol",
+                b"property",
+                b"end",
+            ] {
+                if word_at(i + 1, kw) {
+                    found_objc = true;
+                    break;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // `#import` is an Objective-C preprocessor directive (C/C++ use
+        // `#include`). Allow whitespace between `#` and `import`.
+        if b == b'#' {
+            let mut j = i + 1;
+            while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if word_at(j, b"import") {
+                found_objc = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        // C++ keyword markers at a word boundary.
+        if is_ident(b) && (i == 0 || !is_ident(bytes[i - 1])) {
+            if word_at(i, b"class")
+                || word_at(i, b"namespace")
+                || word_at(i, b"template")
+                || word_at(i, b"public") && bytes.get(i + 6).is_some_and(|&c| c == b':')
+                || word_at(i, b"private") && bytes.get(i + 7).is_some_and(|&c| c == b':')
+                || word_at(i, b"protected") && bytes.get(i + 9).is_some_and(|&c| c == b':')
+            {
+                found_cpp = true;
+            }
+            // Advance to the end of this identifier run to avoid re-scanning.
+            i += 1;
+            while i < n && is_ident(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if found_cpp {
+        CHeaderContent::Cpp
+    } else if found_objc {
+        CHeaderContent::ObjectiveC
+    } else {
+        CHeaderContent::C
+    }
 }
 
 /// Cache-key discriminant for [`expected_partial_memo`]: which known grammar
@@ -723,6 +1104,94 @@ pub fn extract_symbols_for_diff(source: &str, path: &str) -> Option<Vec<(String,
 mod tests {
     use super::*;
     use crate::domain::{FileOutcome, LanguageId, SymbolKind};
+
+    // SF-STRESS-005: content classification of a `.h` header for grammar routing.
+    #[test]
+    fn test_classify_c_header_content_cpp_markers() {
+        // Each C++-only construct must classify as Cpp.
+        for src in [
+            "class FlutterWindow {};",
+            "namespace ns { }",
+            "template <typename T> struct S {};",
+            "flutter::DartProject project_;",
+            "class A : public B {\n public:\n};",
+        ] {
+            assert_eq!(
+                classify_c_header_content(src),
+                CHeaderContent::Cpp,
+                "expected Cpp for: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_c_header_content_plain_c() {
+        // Plain C constructs carry no C++/ObjC marker.
+        for src in [
+            "struct point { int x; int y; };",
+            "int add(int a, int b);",
+            "#define MAX 10\nvoid f(void);",
+            "typedef struct node node_t;",
+        ] {
+            assert_eq!(
+                classify_c_header_content(src),
+                CHeaderContent::C,
+                "expected C for: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_c_header_content_objc_markers() {
+        for src in [
+            "@interface Foo : NSObject\n@end",
+            "#import <Foundation/Foundation.h>",
+            "@protocol Bar\n@end",
+            "@property(nonatomic) int x;",
+        ] {
+            assert_eq!(
+                classify_c_header_content(src),
+                CHeaderContent::ObjectiveC,
+                "expected ObjectiveC for: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_c_header_content_ignores_comments_and_strings() {
+        // A C++ marker inside a comment or string must NOT misroute plain C.
+        assert_eq!(
+            classify_c_header_content("// this header defines a class\nint f(void);"),
+            CHeaderContent::C,
+            "`class` in a line comment must not trigger Cpp"
+        );
+        assert_eq!(
+            classify_c_header_content("/* namespace std */\nint f(void);"),
+            CHeaderContent::C,
+            "`namespace` in a block comment must not trigger Cpp"
+        );
+        assert_eq!(
+            classify_c_header_content("const char* s = \"a::b\";\nint f(void);"),
+            CHeaderContent::C,
+            "`::` inside a string literal must not trigger Cpp"
+        );
+        // `subclass`/`classify` must not match the `class` keyword.
+        assert_eq!(
+            classify_c_header_content("int subclass; void classify(void);"),
+            CHeaderContent::C,
+            "`class` as a substring of an identifier must not trigger Cpp"
+        );
+    }
+
+    #[test]
+    fn test_classify_c_header_content_cpp_wins_over_objc() {
+        // A header with BOTH ObjC and C++ markers (Objective-C++) is routed to
+        // the C++ grammar, which can parse the C++ portions.
+        assert_eq!(
+            classify_c_header_content("#import <F/F.h>\nclass Foo {};"),
+            CHeaderContent::Cpp
+        );
+    }
 
     #[test]
     fn test_process_file_rust_extracts_function() {

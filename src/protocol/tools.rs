@@ -258,6 +258,35 @@ pub struct CheckpointNowInput {
     pub verify_after_write: Option<bool>,
 }
 
+/// Input for `health`.
+///
+/// SF-STRESS-010: the parse/span quarantine registry was hard-capped at 10
+/// entries with no retrieval surface, so the full list of partial/failed files
+/// was unreachable without thousands of per-file calls. These optional paging
+/// parameters page the ranked registry; entries are ranked real-source-first so
+/// genuine repo-owned losses surface before vendored/fixture noise. Omitting
+/// both preserves the historical default (offset 0, limit 10).
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
+pub struct HealthInput {
+    /// Maximum quarantine registry entries to render (default 10, capped at
+    /// 1000). Raise to retrieve more of the full partial/failed file list.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub quarantine_limit: Option<u32>,
+    /// Offset into the ranked quarantine registry for paging (default 0).
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub quarantine_offset: Option<u32>,
+}
+
+impl HealthInput {
+    fn quarantine_limit(&self) -> Option<usize> {
+        self.quarantine_limit.map(|n| n as usize)
+    }
+
+    fn quarantine_offset(&self) -> Option<usize> {
+        self.quarantine_offset.map(|n| n as usize)
+    }
+}
+
 /// Input for `what_changed`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct WhatChangedInput {
@@ -696,20 +725,26 @@ fn search_scope_summary(
     if let Some(language) = language_filter {
         parts.push(format!("language `{language}`"));
     }
+    // SF-STRESS-011 honesty fix: these are HEURISTIC path-based filters, not a
+    // guaranteed outcome. Detection keys on path segments (vendor/, deps/,
+    // dist/, test_data/, ...) and basename patterns, so a vendored/generated
+    // file with an unconventional path can still appear in results. The header
+    // says "filter active (heuristic)" rather than asserting the file class was
+    // actually removed, which the previous "vendor filtered" wording overstated.
     parts.push(if noise_policy.include_tests {
         "tests included".to_string()
     } else {
-        "tests filtered".to_string()
+        "tests filter active (heuristic)".to_string()
     });
     parts.push(if noise_policy.include_generated {
         "generated included".to_string()
     } else {
-        "generated filtered".to_string()
+        "generated filter active (heuristic)".to_string()
     });
     parts.push(if noise_policy.include_vendor {
         "vendor included".to_string()
     } else {
-        "vendor filtered".to_string()
+        "vendor filter active (heuristic)".to_string()
     });
     parts.push(if include_personal_tooling {
         "personal tooling included".to_string()
@@ -1624,10 +1659,14 @@ fn search_files_hidden_noise_note(
 }
 
 fn search_files_filter_summary(include_vendor: bool, include_personal_tooling: bool) -> String {
+    // SF-STRESS-011 honesty fix: vendor detection is a heuristic path filter, so
+    // the header says "filter active (heuristic)" rather than asserting the file
+    // class was actually removed. Personal-tooling paths are an exact prefix
+    // match, so that claim stays definite.
     let vendor = if include_vendor {
         "vendor included"
     } else {
-        "vendor filtered"
+        "vendor filter active (heuristic)"
     };
     let personal = if include_personal_tooling {
         "personal tooling included"
@@ -2070,6 +2109,26 @@ fn admission_degradation_view_from_disk(
         initial_decision
     };
 
+    let extension = canonical_candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_string);
+    let language = extension.as_deref().and_then(LanguageId::from_extension);
+
+    // SF-004: a small, non-binary, non-denylisted file whose extension maps to
+    // no supported grammar comes back `Normal` from `classify_admission` (which
+    // never inspects language). On disk it EXISTS but cannot be parsed, so it
+    // must report the honest Tier-2/UnsupportedLanguage degradation rather than
+    // falling through to a false "File not found". Mirror the bulk-walk demotion
+    // (store.rs Phase-2) via the same shared predicate. A recognized-language
+    // file that is genuinely Tier-1 keeps its `Normal` decision and returns
+    // `None` below so the caller's normal handling proceeds.
+    let decision = if decision.tier == AdmissionTier::Normal && language.is_none() {
+        crate::discovery::unsupported_language_decision(decision)
+    } else {
+        decision
+    };
+
     if decision.tier == AdmissionTier::Normal {
         return None;
     }
@@ -2080,11 +2139,6 @@ fn admission_degradation_view_from_disk(
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         .filter(|relative| !relative.is_empty())
         .unwrap_or_else(|| normalize_admission_degradation_path(path));
-    let extension = canonical_candidate
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_string);
-    let language = extension.as_deref().and_then(LanguageId::from_extension);
 
     Some(AdmissionDegradationView {
         tier: decision.tier,
@@ -2451,6 +2505,61 @@ fn explore_should_skip_path_boost(
     false
 }
 
+/// Whether a concept `text_query` legitimately matches `line` at a word
+/// boundary, rather than as a coincidental substring inside a larger
+/// identifier.
+///
+/// SF-STRESS-013: concept text queries are matched by plain case-insensitive
+/// substring, so `"try {"` substring-matches `public string Country { ... }`
+/// (`coun-TRY-{`) and floods DTO-property results into "Error Handling". When a
+/// query begins with an identifier token, we require the character immediately
+/// before the match to be a non-word character (or the line start), so the
+/// token sits on a real word boundary. Queries that begin with punctuation
+/// (e.g. `.expect(`, `#[derive(Serialize`) are already specific and pass
+/// through unchanged. This only *rejects* false positives in explore; it never
+/// invents new matches.
+fn concept_text_query_matches_on_boundary(line: &str, query: &str) -> bool {
+    let line_lower = line.to_ascii_lowercase();
+    let query_lower = query.to_ascii_lowercase();
+
+    // Anchor token = the leading run of word characters in the query.
+    let anchor: String = query_lower
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if anchor.is_empty() {
+        // Punctuation-led query (e.g. `.expect(`); substring containment is the
+        // intended semantics and already specific.
+        return line_lower.contains(&query_lower);
+    }
+
+    // Require at least one occurrence of the full query whose anchor token sits
+    // on a left word boundary.
+    let anchor_bytes = anchor.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = line_lower[start..].find(&query_lower) {
+        let pos = start + rel;
+        let left_ok = pos == 0
+            || !line_lower.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && line_lower.as_bytes()[pos - 1] != b'_';
+        if left_ok {
+            // Anchor is a prefix of the query, so the right boundary of the
+            // anchor is the char at pos + anchor.len(); for code idioms the
+            // query already includes the trailing delimiter (e.g. `unwrap()`),
+            // so a left boundary is sufficient to reject identifier-internal
+            // hits like `coun|try {`.
+            debug_assert!(query_lower.as_bytes().starts_with(anchor_bytes));
+            return true;
+        }
+        // Advance past this occurrence to keep scanning.
+        start = pos + 1;
+        if start >= line_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn explore_path_penalty(
     path: &str,
     classification: Option<&crate::domain::index::FileClassification>,
@@ -2461,7 +2570,10 @@ fn explore_path_penalty(
     }
     if classification.is_some_and(|c| c.is_config)
         || path_lower.ends_with(".md")
+        || path_lower.ends_with(".html")
+        || path_lower.ends_with(".htm")
         || path_lower.contains("/docs/")
+        || path_lower.contains("/doc/")
         || path_lower.contains("/plans/")
         || path_lower.contains("/manual/")
         || path_lower.contains("changelog")
@@ -5113,16 +5225,18 @@ impl SymForgeServer {
         project_id: Option<String>,
         session_id: Option<String>,
         project_root: Option<PathBuf>,
+        quarantine_window: format::QuarantineWindow,
     ) -> String {
         let published = self.index.published_state();
         let runtime_status =
             self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
-        let mut result = format::health_report_from_published_state(
+        let mut result = format::health_report_from_published_state_windowed(
             &published,
             &watcher_guard,
             rejected_stale_mutations,
+            quarantine_window,
         );
         result.push('\n');
         result.push_str(&format::format_runtime_status(&runtime_status));
@@ -5318,12 +5432,14 @@ impl SymForgeServer {
         project_id: String,
         session_id: String,
         project_root: PathBuf,
+        quarantine_window: format::QuarantineWindow,
     ) -> String {
         self.health_for_runtime(
             format::RuntimeMode::DaemonReusedSession,
             Some(project_id),
             Some(session_id),
             Some(project_root),
+            quarantine_window,
         )
     }
 
@@ -5345,16 +5461,21 @@ impl SymForgeServer {
     /// project/session identity, hook adoption metrics, git temporal status. Always responds
     /// even during loading. Use to verify SymForge is working.
     #[tool(
-        description = "Diagnostic: index status, file/symbol counts, project/session identity, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
+        description = "Diagnostic: index status, file/symbol counts, project/session identity, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. Optional quarantine_limit/quarantine_offset page the parse/span quarantine registry (default 10) so the full list of partial/failed files is retrievable. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    pub(crate) async fn health(&self) -> String {
-        if let Some(result) = self.proxy_tool_call_without_params("health").await {
+    pub(crate) async fn health(&self, params: Parameters<HealthInput>) -> String {
+        let input = params.0;
+        if let Some(result) = self.proxy_tool_call("health", &input).await {
             // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
             // we proxied to is serving an OLDER binary than this front-end.
             return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
-        let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None);
+        let window = format::QuarantineWindow::from_args(
+            input.quarantine_offset(),
+            input.quarantine_limit(),
+        );
+        let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None, window);
         self.session_context
             .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
         result
@@ -7179,15 +7300,20 @@ impl SymForgeServer {
             if let Ok(r) = result {
                 let term_key = tq.to_ascii_lowercase();
                 for file in &r.files {
-                    if !file.matches.is_empty() {
-                        Self::record_explore_file_signal(
-                            &mut file_signals,
-                            &file.path,
-                            &term_key,
-                            3,
-                        );
+                    // SF-STRESS-013: require a word-boundary match so a concept
+                    // idiom like `try {` does not score off `Country {`. Filter
+                    // before recording the file signal so coincidental files do
+                    // not register at all.
+                    let boundary_matches: Vec<&search::TextLineMatch> = file
+                        .matches
+                        .iter()
+                        .filter(|m| concept_text_query_matches_on_boundary(&m.line, tq))
+                        .collect();
+                    if boundary_matches.is_empty() {
+                        continue;
                     }
-                    for m in &file.matches {
+                    Self::record_explore_file_signal(&mut file_signals, &file.path, &term_key, 3);
+                    for m in boundary_matches {
                         if text_hits.len() < limit && !format::is_noise_line(&m.line) {
                             text_hits.push((file.path.clone(), m.line.clone(), m.line_number));
                         }
@@ -7340,25 +7466,6 @@ impl SymForgeServer {
             })
             .collect();
 
-        let mut ranked = scored;
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
-        // Filter out weak matches (score < 8 means single text-only hit in a doc file).
-        ranked.retain(|(_, score)| *score >= 8);
-        ranked.truncate(limit);
-        let max_score = ranked.first().map(|(_, s)| *s as f32).unwrap_or(1.0);
-        let symbol_scores: Vec<f32> = ranked
-            .iter()
-            .map(|(_, s)| {
-                if max_score > 0.0 {
-                    (*s as f32 / max_score).min(1.0)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let symbol_hits: Vec<(String, String, String)> =
-            ranked.into_iter().map(|(k, _)| k).collect();
-
         // Noise filtering: hide vendor / generated / gitignored / personal-tooling
         // by default. include_noise is the umbrella; include_vendor and
         // include_personal_tooling are additive finer-grained overrides per B1.
@@ -7380,18 +7487,43 @@ impl SymForgeServer {
                 search::NoiseClass::None => false,
             }
         };
-        let (symbol_hits, text_hits) = if any_suppression {
-            let filtered_symbols: Vec<(String, String, String)> = symbol_hits
-                .into_iter()
-                .filter(|(_, _, path)| {
-                    let hide = should_hide_path(path);
-                    if hide {
-                        noise_hidden += 1;
-                    }
-                    !hide
-                })
-                .collect();
-            let filtered_text: Vec<(String, String, usize)> = text_hits
+
+        let mut ranked = scored;
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+        // Filter out weak matches (score < 8 means single text-only hit in a doc file).
+        ranked.retain(|(_, score)| *score >= 8);
+        // SF-STRESS-013: drop hidden vendor/generated/test symbols BEFORE the
+        // limit truncation so they no longer consume the result budget. Running
+        // the noise filter after truncate starved real results (e.g. 1 visible
+        // symbol while 19 hidden vendor symbols had already eaten the limit).
+        if any_suppression {
+            ranked.retain(|(key, _)| {
+                let hide = should_hide_path(&key.2);
+                if hide {
+                    noise_hidden += 1;
+                }
+                !hide
+            });
+        }
+        ranked.truncate(limit);
+        let max_score = ranked.first().map(|(_, s)| *s as f32).unwrap_or(1.0);
+        let symbol_scores: Vec<f32> = ranked
+            .iter()
+            .map(|(_, s)| {
+                if max_score > 0.0 {
+                    (*s as f32 / max_score).min(1.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let symbol_hits: Vec<(String, String, String)> =
+            ranked.into_iter().map(|(k, _)| k).collect();
+
+        // Text hits still pass through the same noise filter so hidden files
+        // never leak into the rendered pattern list.
+        let text_hits = if any_suppression {
+            text_hits
                 .into_iter()
                 .filter(|(path, _, _)| {
                     let hide = should_hide_path(path);
@@ -7400,10 +7532,9 @@ impl SymForgeServer {
                     }
                     !hide
                 })
-                .collect();
-            (filtered_symbols, filtered_text)
+                .collect::<Vec<_>>()
         } else {
-            (symbol_hits, text_hits)
+            text_hits
         };
 
         // Count files by symbol/text presence
@@ -7553,9 +7684,11 @@ impl SymForgeServer {
         }
 
         if !output.is_empty() {
-            output.push_str(
-                "\n\nranked by: concept match + symbol-token alignment + path proximity + caller density"
-            );
+            // SF-STRESS-013: the explore scorer computes match count, kind
+            // weight, term-coverage and path proximity — it does NOT compute
+            // caller density. Drop the inaccurate claim so the footer is honest.
+            output
+                .push_str("\n\nranked by: concept match + symbol-token alignment + path proximity");
         }
 
         self.record_tool_savings_named(
@@ -8819,7 +8952,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_always_responds_on_empty_index() {
         let server = make_server(make_live_index_empty());
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         // Health should NOT return the guard message; it should return actual health info
         assert!(
             !result.starts_with("Index not loaded"),
@@ -9323,6 +9458,78 @@ mod tests {
         assert!(
             !result.starts_with("File not found"),
             "Tier-2 path must NOT be reported as a generic miss; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_context_unsupported_language_on_disk_is_honest_not_found() {
+        // SF-004: a file that EXISTS on disk but maps to no supported grammar
+        // (e.g. `.sh`, `.tcl`, extensionless `LICENSE`) is NOT in the index's
+        // skipped_files (it was admission-excluded at the unsupported-language
+        // branch / a stale index never saw it). get_file_context must resolve it
+        // via the repo-root-bound disk fallback and report the honest Tier-2
+        // "not indexed: unsupported language" message — NEVER a false
+        // "File not found", which an agent would read as "the file is absent".
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("scripts")).unwrap();
+        std::fs::write(repo.path().join("scripts/setup.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(repo.path().join("LICENSE"), "MIT License\n").unwrap();
+
+        // Ready (non-empty) index whose `skipped_files` does NOT record the target
+        // paths: the files are on disk but absent from the index, so resolution
+        // MUST fall through to the repo-root-bound disk-fallback leg (this mirrors
+        // a stale/admission-excluded index — the SF-004 production scenario).
+        let (anchor_key, anchor_file) = make_file(
+            "src/anchor.rs",
+            b"fn anchor() {}\n",
+            vec![make_symbol("anchor", SymbolKind::Function, 0, 0)],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(anchor_key, anchor_file)]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        for path in ["scripts/setup.sh", "LICENSE"] {
+            let result = server
+                .get_file_context(Parameters(super::GetFileContextInput {
+                    path: path.to_string(),
+                    max_tokens: None,
+                    sections: None,
+                    estimate: None,
+                }))
+                .await;
+            assert!(
+                !result.starts_with("File not found"),
+                "on-disk unsupported-language file `{path}` must NOT report a false \
+                 not-found; got: {result}"
+            );
+            assert!(
+                result.contains("Not indexed:") && result.contains("Tier 2 (metadata only)"),
+                "`{path}` must report honest Tier-2 metadata-only status; got: {result}"
+            );
+            assert!(
+                result.contains("reason: unsupported language"),
+                "`{path}` must name the unsupported-language reason; got: {result}"
+            );
+            assert!(
+                result.contains("get_file_content"),
+                "`{path}` must point at the raw-read escape hatch; got: {result}"
+            );
+        }
+
+        // Control: a genuinely-absent path still reports the plain "File not
+        // found" — real and absent files remain distinguishable to an agent.
+        let absent = server
+            .get_file_context(Parameters(super::GetFileContextInput {
+                path: "does/not/exist.tcl".to_string(),
+                max_tokens: None,
+                sections: None,
+                estimate: None,
+            }))
+            .await;
+        assert!(
+            absent.starts_with("File not found"),
+            "a genuinely-absent path must still report File not found; got: {absent}"
         );
     }
 
@@ -10755,7 +10962,9 @@ mod tests {
             "reset must never delete source files"
         );
 
-        let health = server.health().await;
+        let health = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             health.contains("load_source=fresh_load")
                 && health.contains("reset_state=current_project:p")
@@ -10960,7 +11169,7 @@ mod tests {
             "test symbol noise should be hidden by default: {result}"
         );
         assert!(
-            result.contains("vendor filtered"),
+            result.contains("vendor filter active (heuristic)"),
             "scope should report vendor filtering status: {result}"
         );
     }
@@ -11005,7 +11214,7 @@ mod tests {
             "vendor symbol should be hidden by default: {result}"
         );
         assert!(
-            result.contains("vendor filtered")
+            result.contains("vendor filter active (heuristic)")
                 && result.contains("1 noise-filtered match(es) suppressed"),
             "vendor filtering should be explicit in envelope: {result}"
         );
@@ -11489,7 +11698,9 @@ mod tests {
             "search_text should expose trust envelope, got: {result}"
         );
         assert!(
-            result.contains("Scope: repo-wide; tests filtered; generated filtered"),
+            result.contains(
+                "Scope: repo-wide; tests filter active (heuristic); generated filter active (heuristic)"
+            ),
             "search_text should expose applied scope, got: {result}"
         );
         assert!(
@@ -12276,7 +12487,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "not-found search_files output should disclose active filters: {result}"
         );
     }
@@ -12915,7 +13126,7 @@ mod tests {
             "suppressed-noise note should be visible: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "active search_files filters should be disclosed even on no-result output: {result}"
         );
     }
@@ -12983,7 +13194,7 @@ mod tests {
             "resolve=true should explain suppressed vendor candidate: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "resolve=true output should disclose active search_files filters: {result}"
         );
     }
@@ -13051,7 +13262,7 @@ mod tests {
             "glob search should report suppressed vendor candidate: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "glob search output should disclose active filters: {result}"
         );
     }
@@ -13081,7 +13292,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "resolve=true envelope should disclose active filters: {result}"
         );
         assert!(result.contains("src/protocol/tools.rs"), "got: {result}");
@@ -13120,7 +13331,7 @@ mod tests {
         assert!(result.contains("src/lib.rs"), "got: {result}");
         assert!(result.contains("tests/lib.rs"), "got: {result}");
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "ambiguous resolve output should disclose active filters: {result}"
         );
     }
@@ -13129,7 +13340,9 @@ mod tests {
     async fn test_health_returns_status_fields() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server(make_live_index_ready(vec![(key, file)]));
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(result.contains("Status:"), "should have Status field");
         assert!(result.contains("Files:"), "should have Files field");
         assert!(result.contains("Symbols:"), "should have Symbols field");
@@ -13144,7 +13357,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Runtime: mode=local_process"),
             "health should identify local runtime mode: {result}"
@@ -13196,6 +13411,7 @@ mod tests {
             project_id.clone(),
             session_id.clone(),
             temp.path().to_path_buf(),
+            crate::protocol::format::QuarantineWindow::default(),
         );
         assert!(
             full.contains("Runtime: mode=daemon_reused_session")
@@ -13245,7 +13461,9 @@ mod tests {
         index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
         let server = make_server_with_root(index, Some(temp.path().to_path_buf()));
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains("load_source=snapshot_restore")
                 && full.contains("reset_state=none")
@@ -13343,7 +13561,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains(&format!("Sidecar: pid=4242 port={port} state=alive")),
             "full health should surface alive sidecar state: {result}"
@@ -13359,7 +13579,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Sidecar: none"),
             "full health should distinguish no sidecar state: {result}"
@@ -13422,7 +13644,9 @@ mod tests {
         index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Running;
         let server = make_server(index);
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains("Snapshot verify: load_source=snapshot_restore state=running"),
             "full health should expose background snapshot verification progress: {full}"
@@ -13449,7 +13673,9 @@ mod tests {
             );
         let server = make_server(index);
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains(
                 "Snapshot verify: load_source=snapshot_restore state=completed mismatches=12 showing=10 omitted=2",
@@ -13512,7 +13738,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Sidecar: pid=4242 port=unknown state=unknown"),
             "full health should surface unknown sidecar state: {result}"
@@ -16554,10 +16782,14 @@ mod tests {
             "explore output must include rank-signal footer; got:\n{result}"
         );
         assert!(
-            result.contains(
-                "concept match + symbol-token alignment + path proximity + caller density"
-            ),
-            "footer must enumerate the four ranking signals verbatim; got:\n{result}"
+            result.contains("concept match + symbol-token alignment + path proximity"),
+            "footer must enumerate the ranking signals the scorer computes verbatim; got:\n{result}"
+        );
+        // SF-STRESS-013: the scorer never computes caller density, so the footer
+        // must not advertise it.
+        assert!(
+            !result.contains("caller density"),
+            "footer must not claim 'caller density' the scorer does not compute; got:\n{result}"
         );
     }
 
@@ -17406,6 +17638,173 @@ mod tests {
             result.contains("vendor/generated files hidden")
                 && result.contains("include_noise=true"),
             "should show noise hint when results are hidden: {result}"
+        );
+    }
+
+    // --- SF-STRESS-013 ranking-calibration regressions -------------------
+
+    #[test]
+    fn test_concept_text_query_boundary_rejects_identifier_internal_substring() {
+        // The corpus howler: concept idiom `try {` substring-matched
+        // `public string Country { get; set; }` (coun-TRY-{), flooding DTO
+        // properties into "Error Handling".
+        assert!(
+            !super::concept_text_query_matches_on_boundary(
+                "public string Country { get; set; }",
+                "try {"
+            ),
+            "`try {{` must not match inside `Country {{`"
+        );
+        // A genuine `try {` at a word boundary still matches.
+        assert!(
+            super::concept_text_query_matches_on_boundary("        try {", "try {"),
+            "a real `try {{` must still match"
+        );
+        assert!(
+            super::concept_text_query_matches_on_boundary("} else { try { foo()", "try {"),
+            "`try {{` after a non-word char must still match"
+        );
+        // `unwrap()` as the suffix of a larger identifier (`my_unwrap()`) is an
+        // identifier-internal collision and must be rejected; a standalone
+        // `x.unwrap()` (preceded by `.`) is a real boundary hit.
+        assert!(
+            !super::concept_text_query_matches_on_boundary("    let v = my_unwrap();", "unwrap()"),
+            "`unwrap()` must not match inside `my_unwrap()`"
+        );
+        assert!(
+            super::concept_text_query_matches_on_boundary("    let v = x.unwrap();", "unwrap()"),
+            "a real `.unwrap()` call must still match"
+        );
+        // Punctuation-led queries fall through to plain containment.
+        assert!(
+            super::concept_text_query_matches_on_boundary("    .expect(\"boom\")", ".expect("),
+            "punctuation-led queries keep substring semantics"
+        );
+    }
+
+    #[test]
+    fn test_explore_path_penalty_demotes_doc_singular_and_html() {
+        // SF-STRESS-013: redis's deps/lua/doc/manual.html (8800-line single
+        // 'other html' symbol) topped ranking at 1.00. Both the `/doc/`
+        // (singular) segment and the `.html` extension must hit the doc bucket
+        // so it is down-weighted to the doc penalty (2) rather than full (8).
+        assert_eq!(
+            super::explore_path_penalty("deps/lua/doc/manual.html", None),
+            2,
+            "/doc/ + .html must be penalized as documentation"
+        );
+        assert_eq!(
+            super::explore_path_penalty("docs/Enums/Result.html", None),
+            2,
+            ".html docs must be penalized"
+        );
+        assert_eq!(
+            super::explore_path_penalty("site/index.htm", None),
+            2,
+            ".htm must be penalized like .html"
+        );
+        // Ordinary source keeps full weight.
+        assert_eq!(
+            super::explore_path_penalty("src/error.rs", None),
+            8,
+            "ordinary source must keep full weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explore_noise_filtered_before_truncate_keeps_real_symbol() {
+        // SF-STRESS-013 django starvation: noise filtering ran AFTER
+        // truncate(limit), so hidden vendor symbols consumed the budget and a
+        // real source symbol never surfaced. With limit=1 and a vendor symbol
+        // that sorts ahead alphabetically, the real symbol must still win.
+        let vendor_content = b"pub struct AAA_Error {}\n";
+        let vendor_sym = SymbolRecord {
+            name: "AAA_Error".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, vendor_content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let src_content = b"pub struct ResultError {}\n";
+        let src_sym = SymbolRecord {
+            name: "ResultError".to_string(),
+            kind: SymbolKind::Struct,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, src_content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (vkey, vfile) = make_file("vendor/lib/lib.rs", vendor_content, vec![vendor_sym]);
+        let (skey, sfile) = make_file("src/error.rs", src_content, vec![src_sym]);
+        let server = make_server(make_live_index_ready(vec![(vkey, vfile), (skey, sfile)]));
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "error handling".to_string(),
+                limit: Some(1),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("ResultError"),
+            "real source symbol must survive a tight limit even though a vendor \
+             symbol sorts ahead; the noise filter must run before truncate: {result}"
+        );
+        assert!(
+            !result.contains("AAA_Error"),
+            "vendor symbol must remain hidden: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explore_footer_drops_unbacked_caller_density_claim() {
+        // SF-STRESS-013: the scorer never computes caller density; the footer
+        // must not advertise a signal it does not use.
+        let content = b"pub enum AppError {}\n";
+        let sym = SymbolRecord {
+            name: "AppError".to_string(),
+            kind: SymbolKind::Enum,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, content.len() as u32),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        let (key, file) = make_file("src/error.rs", content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .explore(Parameters(super::ExploreInput {
+                query: "error handling".to_string(),
+                limit: Some(5),
+                depth: None,
+                include_noise: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                language: None,
+                path_prefix: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("ranked by:"),
+            "footer must be present: {result}"
+        );
+        assert!(
+            !result.contains("caller density"),
+            "footer must not claim caller density: {result}"
         );
     }
 

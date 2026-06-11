@@ -541,6 +541,12 @@ pub struct PublishedIndexState {
     pub partial_parse_count: usize,
     pub unexpected_partial_parse_count: usize,
     pub expected_vendor_partial_parse_count: usize,
+    /// SF-STRESS-009: counts of partial parses heuristically (path-based) bucketed
+    /// as machine-generated, test-fixture, or template-DSL noise. Carried across
+    /// the daemon-proxy boundary so proxied health reports the same buckets.
+    pub expected_generated_partial_parse_count: usize,
+    pub expected_test_fixture_partial_parse_count: usize,
+    pub expected_template_dsl_partial_parse_count: usize,
     /// SF-004: count of partial parses excused as a framework template grammar
     /// limitation (Angular `@if`/`@for`/... in `.html`). Carried across the
     /// daemon-proxy boundary so proxied health reports the same third bucket.
@@ -554,6 +560,11 @@ pub struct PublishedIndexState {
     pub partial_parse_files: Vec<String>,
     pub unexpected_partial_parse_files: Vec<String>,
     pub expected_vendor_partial_parse_files: Vec<String>,
+    /// SF-STRESS-009: bounded lists of the heuristic generated/test-fixture/
+    /// template-DSL partial-parse buckets.
+    pub expected_generated_partial_parse_files: Vec<String>,
+    pub expected_test_fixture_partial_parse_files: Vec<String>,
+    pub expected_template_dsl_partial_parse_files: Vec<String>,
     /// SF-004: bounded list of framework-template partial-parse files.
     pub expected_framework_partial_parse_files: Vec<String>,
     /// SF-003: bounded list of host-language-limitation partial-parse files.
@@ -1246,6 +1257,14 @@ impl Drop for SharedIndexWriteGuard<'_> {
 /// Thread-safe shared handle to the index.
 pub type SharedIndex = Arc<SharedIndexHandle>;
 
+/// SF-STRESS-010: per-category cap on the quarantine path lists published across
+/// the daemon-proxy boundary. Raised from the previous hard `10` so the full
+/// list is retrievable via the `health` `quarantine_limit` paging parameter in
+/// daemon mode (production default). The `*_count` fields stay uncapped, so the
+/// rendered `total`/`omitted` remain truthful even if a list reaches this cap.
+/// Kept in sync with [`crate::protocol::format::PARSE_QUARANTINE_MAX_LIMIT`].
+const PUBLISHED_QUARANTINE_LIST_CAP: usize = 1000;
+
 impl PublishedIndexState {
     fn capture(generation: u64, index: &LiveIndex) -> Self {
         let (status, degraded_summary) = match index.index_state() {
@@ -1266,31 +1285,64 @@ impl PublishedIndexState {
             partial_parse_count: stats.partial_parse_count,
             unexpected_partial_parse_count: stats.unexpected_partial_parse_count,
             expected_vendor_partial_parse_count: stats.expected_vendor_partial_parse_count,
+            expected_generated_partial_parse_count: stats.expected_generated_partial_parse_count,
+            expected_test_fixture_partial_parse_count: stats
+                .expected_test_fixture_partial_parse_count,
+            expected_template_dsl_partial_parse_count: stats
+                .expected_template_dsl_partial_parse_count,
             expected_framework_partial_parse_count: stats.expected_framework_partial_parse_count,
             expected_language_partial_parse_count: stats.expected_language_partial_parse_count,
             failed_count: stats.failed_count,
-            partial_parse_files: stats.partial_parse_files.into_iter().take(10).collect(),
+            // SF-STRESS-010: publish up to PUBLISHED_QUARANTINE_LIST_CAP entries
+            // per category (was 10) so the daemon-proxy boundary no longer
+            // destroys the lists before the formatter can page them. The `*_count`
+            // fields above stay UNCAPPED (true totals), so showing/omitted stay
+            // honest even when a list hits the publish cap.
+            partial_parse_files: stats
+                .partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
             unexpected_partial_parse_files: stats
                 .unexpected_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_vendor_partial_parse_files: stats
                 .expected_vendor_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_generated_partial_parse_files: stats
+                .expected_generated_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_test_fixture_partial_parse_files: stats
+                .expected_test_fixture_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
+            expected_template_dsl_partial_parse_files: stats
+                .expected_template_dsl_partial_parse_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_framework_partial_parse_files: stats
                 .expected_framework_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
             expected_language_partial_parse_files: stats
                 .expected_language_partial_parse_files
                 .into_iter()
-                .take(10)
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
                 .collect(),
-            failed_files: stats.failed_files.into_iter().take(10).collect(),
+            failed_files: stats
+                .failed_files
+                .into_iter()
+                .take(PUBLISHED_QUARANTINE_LIST_CAP)
+                .collect(),
             symbol_count: stats.symbol_count,
             loaded_at_system: index.loaded_at_system,
             load_duration: stats.load_duration,
@@ -1458,7 +1510,7 @@ pub(crate) fn admit_and_parse_entries(
     entries: &[crate::discovery::DiscoveredEntry],
     exclude_untracked_set: &Option<std::collections::HashSet<String>>,
 ) -> AdmitParseResult {
-    use crate::discovery::classify_admission;
+    use crate::discovery::{classify_admission, unsupported_language_decision};
     // `AdmissionTier` and `SkippedFile` are already imported at module scope.
 
     // Peak-memory governor: bounds the bytes resident across all concurrent
@@ -1533,8 +1585,11 @@ pub(crate) fn admit_and_parse_entries(
                                     return None;
                                 }
                             };
-                        let decision_post =
-                            classify_admission(&entry.absolute_path, entry.file_size, Some(&bytes));
+                        let decision_post = unsupported_language_decision(classify_admission(
+                            &entry.absolute_path,
+                            entry.file_size,
+                            Some(&bytes),
+                        ));
                         let sf = SkippedFile {
                             path: entry.relative_path.clone(),
                             size: entry.file_size,
@@ -1919,7 +1974,31 @@ impl LiveIndex {
             match sf.tier() {
                 AdmissionTier::MetadataOnly => tier2 += 1,
                 AdmissionTier::HardSkip => tier3 += 1,
-                AdmissionTier::Normal => {} // shouldn't happen
+                AdmissionTier::Normal => {
+                    // INVARIANT VIOLATION: a skipped file must never carry a
+                    // Tier-1/Normal decision — a Normal file is parsed and lives
+                    // in `self.files`, not `skipped_files`. Before SF-004/SF-012
+                    // the unsupported-language branch minted exactly such records
+                    // and they vanished here, taking the file out of every tier
+                    // count (so "discovered" undercounted and "Tier 3: 0" read as
+                    // complete accounting). The admission gate now demotes those
+                    // to Tier-2/UnsupportedLanguage, so reaching this arm means a
+                    // new code path regressed the invariant. Surface it loudly
+                    // (and count it as Tier-2 so the file is at least not lost)
+                    // instead of silently dropping the record.
+                    warn!(
+                        "tier_counts invariant violation: skipped file {:?} has \
+                         Tier-1/Normal decision (reason {:?}); counting as Tier-2",
+                        sf.path,
+                        sf.reason()
+                    );
+                    debug_assert!(
+                        false,
+                        "skipped file {:?} must not carry a Normal admission tier",
+                        sf.path
+                    );
+                    tier2 += 1;
+                }
             }
         }
         (tier1, tier2, tier3)
@@ -4181,5 +4260,153 @@ mod tests {
         });
 
         assert_eq!(index.tier_counts(), (0, 1, 1));
+    }
+
+    /// SF-012(A): a small, non-binary file whose extension maps to no supported
+    /// grammar must be admitted Tier-2 (metadata-only / unsupported-language) by
+    /// the real `LiveIndex::load` admission pipeline — not dropped into a
+    /// contradictory Tier-1/Normal `SkippedFile` that vanishes from tier counts.
+    /// This is the corpus case (redis `.tcl`/`.sh`, phoenix `.eex`, extensionless
+    /// `LICENSE`/`Makefile`).
+    #[test]
+    fn load_admits_unsupported_language_files_as_tier2() {
+        use crate::domain::index::{AdmissionTier, SkipReason};
+
+        let tmp = TempDir::new().unwrap();
+        // Visible Tier-1 source.
+        write_file(tmp.path(), "src/main.rs", "fn main() {}");
+        // Unsupported-language files that EXIST on disk and are small/non-binary.
+        write_file(
+            tmp.path(),
+            "tests/unit/foo.tcl",
+            "proc foo {} { return 1 }\n",
+        );
+        write_file(tmp.path(), "scripts/setup.sh", "#!/bin/sh\necho hi\n");
+        write_file(tmp.path(), "LICENSE", "MIT License\n");
+
+        let shared = LiveIndex::load(tmp.path()).unwrap();
+        let index = shared.read();
+
+        // The supported file is Tier-1; the three unsupported-language files are
+        // Tier-2 (not lost). Tier-3 stays 0.
+        let (tier1, tier2, tier3) = index.tier_counts();
+        assert_eq!(tier1, 1, "only src/main.rs is parsed Tier-1");
+        assert_eq!(
+            tier2, 3,
+            "the 3 unsupported-language files must land in Tier-2"
+        );
+        assert_eq!(tier3, 0);
+
+        // Every unsupported-language skip record carries the honest reason and is
+        // NEVER stored with a contradictory Tier-1/Normal decision.
+        for sf in index.skipped_files() {
+            assert_eq!(
+                sf.tier(),
+                AdmissionTier::MetadataOnly,
+                "skipped file {:?} must be Tier-2, never Normal",
+                sf.path
+            );
+            assert_eq!(
+                sf.reason(),
+                Some(SkipReason::UnsupportedLanguage),
+                "skipped file {:?} must report unsupported-language",
+                sf.path
+            );
+        }
+
+        // SF-012 auditability: the demoted files are surfaced as metadata-only
+        // paths (so search_files / repo-map can find them), not invisible.
+        let surfaced: Vec<&str> = index
+            .metadata_only_skipped_paths()
+            .map(|(path, _)| path)
+            .collect();
+        assert!(surfaced.contains(&"tests/unit/foo.tcl"), "{surfaced:?}");
+        assert!(surfaced.contains(&"scripts/setup.sh"), "{surfaced:?}");
+        assert!(surfaced.contains(&"LICENSE"), "{surfaced:?}");
+    }
+
+    /// SF-025 / SF-012: the health/admission counters must RECONCILE on any
+    /// index instant. Two invariants, asserted on a synthetic index built from
+    /// the public accessors:
+    ///   1. tier1 + tier2 + tier3 == files.len() + skipped_files.len()
+    ///      (every record lands in exactly one tier — no silent drops).
+    ///   2. parsed + partial + failed == file_count
+    ///      (every indexed file is in exactly one parse state).
+    #[test]
+    fn tier_and_parse_counters_reconcile_on_synthetic_index() {
+        use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
+
+        let mut index = make_empty_live_index();
+
+        // Three Tier-1 files in distinct parse states.
+        let mut parsed = make_indexed_file_for_mutation("src/parsed.rs");
+        parsed.parse_status = ParseStatus::Parsed;
+        index.update_file("src/parsed.rs".into(), parsed);
+
+        let mut partial = make_indexed_file_for_mutation("src/partial.rs");
+        partial.parse_status = ParseStatus::PartialParse {
+            warning: "partial".into(),
+        };
+        index.update_file("src/partial.rs".into(), partial);
+
+        let mut failed = make_indexed_file_for_mutation("src/failed.rs");
+        failed.parse_status = ParseStatus::Failed {
+            error: "boom".into(),
+        };
+        index.update_file("src/failed.rs".into(), failed);
+
+        // A spread of Tier-2/3 skip records, including the new
+        // unsupported-language reason.
+        index.add_skipped_file(SkippedFile {
+            path: "vendor.lock".into(),
+            size: 100,
+            extension: Some("lock".into()),
+            decision: AdmissionDecision::skip(
+                AdmissionTier::MetadataOnly,
+                SkipReason::DependencyLockfile,
+            ),
+        });
+        index.add_skipped_file(SkippedFile {
+            path: "tests/foo.tcl".into(),
+            size: 50,
+            extension: Some("tcl".into()),
+            decision: AdmissionDecision::skip(
+                AdmissionTier::MetadataOnly,
+                SkipReason::UnsupportedLanguage,
+            ),
+        });
+        index.add_skipped_file(SkippedFile {
+            path: "huge.bin".into(),
+            size: 200_000_000,
+            extension: Some("bin".into()),
+            decision: AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
+        });
+
+        // Invariant 1: tier sum == total records (indexed + skipped).
+        let (tier1, tier2, tier3) = index.tier_counts();
+        let discovered = index.file_count() + index.skipped_files().len();
+        assert_eq!(
+            tier1 + tier2 + tier3,
+            discovered,
+            "tier sum ({}+{}+{}) must equal discovered records ({})",
+            tier1,
+            tier2,
+            tier3,
+            discovered
+        );
+        assert_eq!(tier1, index.file_count(), "Tier-1 must equal indexed files");
+        assert_eq!((tier1, tier2, tier3), (3, 2, 1));
+
+        // Invariant 2: parse states partition the indexed files exactly.
+        let stats = index.health_stats();
+        assert_eq!(
+            stats.parsed_count + stats.partial_parse_count + stats.failed_count,
+            stats.file_count,
+            "parsed+partial+failed must equal indexed file count"
+        );
+        assert_eq!(stats.file_count, 3);
+        assert_eq!(stats.parsed_count, 1);
+        assert_eq!(stats.partial_parse_count, 1);
+        assert_eq!(stats.failed_count, 1);
     }
 }

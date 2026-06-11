@@ -78,6 +78,26 @@ impl LanguageId {
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tsx"))
     }
 
+    /// Returns `true` when `relative_path` is a `.h` header file.
+    ///
+    /// `.h` maps to [`LanguageId::C`] by extension, but in cross-platform repos
+    /// it routinely holds C++ (`class`/`namespace`/`::`) or Objective-C
+    /// (`@interface`/`@property`) — none of which the C grammar can parse,
+    /// causing total symbol loss (SF-STRESS-005). The grammar for a `.h` file is
+    /// therefore disambiguated from CONTENT at parse time (see
+    /// [`crate::parsing`]), not from the extension alone; this helper flags the
+    /// `.h` extension so the parse site knows to apply that disambiguation.
+    ///
+    /// Unambiguous C++ header extensions (`.hpp`/`.hxx`/`.hh`) already map to
+    /// [`LanguageId::Cpp`] and are NOT `.h`, so they are not flagged here.
+    pub fn is_c_header_path(relative_path: &str) -> bool {
+        relative_path
+            .rsplit(['/', '\\'])
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("h"))
+    }
+
     pub fn extensions(&self) -> &[&str] {
         match self {
             Self::Rust => &["rs"],
@@ -181,6 +201,50 @@ pub enum FileClass {
     Binary,
 }
 
+/// Canonical path-segment source of truth for noise classification, shared by
+/// [`FileClassification::for_code_path`] (gates search_symbols/search_text) and
+/// `NoiseClass::classify_path` (gates explore/repo_map/search_files) so the two
+/// classifiers cannot diverge (SF-STRESS-011). A segment is a single
+/// `/`-delimited path component, already lowercased.
+///
+/// Vendored / third-party dependency roots. `deps` and `extern`/`externals`
+/// added per SF-STRESS-011 corpus evidence (redis `deps/`, node `deps/`).
+pub const VENDOR_PATH_SEGMENTS: &[&str] = &[
+    "vendor",
+    "third_party",
+    "third-party",
+    "node_modules",
+    ".venv",
+    "venv",
+    "site-packages",
+    "pods",
+    "bower_components",
+    "deps",
+    "extern",
+    "externals",
+];
+
+/// Build-output / machine-generated directory roots. `dist` is shared here so
+/// `FileClassification` agrees with `NoiseClass` (previously `dist` lived only
+/// in `NoiseClass`, causing the laravel `dist/` divergence in SF-STRESS-011).
+pub const GENERATED_PATH_SEGMENTS: &[&str] =
+    &["dist", "generated", "__generated__", "generated-sources"];
+
+/// Test-directory roots. `test_data`/`testdata`/`fixtures`/`__fixtures__`/
+/// `__snapshots__` added per SF-STRESS-011 (rust-analyzer `test_data` fixtures,
+/// snapshot trees) and SF-STRESS-009 (test-fixture bucket).
+pub const TEST_PATH_SEGMENTS: &[&str] = &[
+    "tests",
+    "test",
+    "__tests__",
+    "spec",
+    "test_data",
+    "testdata",
+    "fixtures",
+    "__fixtures__",
+    "__snapshots__",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileClassification {
     pub class: FileClass,
@@ -206,38 +270,28 @@ impl FileClassification {
 
         let is_test = segments
             .iter()
-            .any(|segment| matches!(*segment, "tests" | "test" | "__tests__" | "spec"))
+            .any(|segment| TEST_PATH_SEGMENTS.contains(segment))
             || stem.starts_with("test_")
             || stem.ends_with("_test")
             || stem.ends_with(".test")
             || stem.ends_with("_spec")
             || stem.ends_with(".spec");
 
-        let is_vendor = segments.iter().any(|segment| {
-            matches!(
-                *segment,
-                "vendor"
-                    | "third_party"
-                    | "third-party"
-                    | "node_modules"
-                    | ".venv"
-                    | "venv"
-                    | "site-packages"
-                    | "pods"
-            )
-        });
+        let is_vendor = segments
+            .iter()
+            .any(|segment| VENDOR_PATH_SEGMENTS.contains(segment));
 
-        let is_generated = segments.iter().any(|segment| {
-            matches!(
-                *segment,
-                "generated" | "__generated__" | "generated-sources"
-            )
-        }) || basename.contains(".generated.")
+        let is_generated = segments
+            .iter()
+            .any(|segment| GENERATED_PATH_SEGMENTS.contains(segment))
+            || basename.contains(".generated.")
             || basename.contains(".gen.")
             || basename.ends_with(".g.dart")
             || basename.ends_with(".pb.go")
             || basename.ends_with(".designer.cs")
-            || basename.ends_with(".min.js");
+            || basename.ends_with(".min.js")
+            || basename.ends_with(".min.css")
+            || basename.ends_with(".map");
 
         let ext = basename.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
         let is_config = matches!(ext, "json" | "toml" | "yaml" | "yml" | "md" | "env");
@@ -514,6 +568,14 @@ pub enum SkipReason {
     /// that env gate is explicitly enabled; the default admission path never
     /// produces this reason, so admission defaults are unchanged.
     Untracked,
+    /// SF-004 / SF-012: file exists on disk and is small/non-binary, but its
+    /// extension maps to no supported tree-sitter grammar (e.g. `.tcl`, `.sh`,
+    /// `.m`, `.eex`, extensionless `LICENSE`/`Makefile`). It cannot be parsed, so
+    /// it is admitted Tier-2 metadata-only instead of being stored with a
+    /// contradictory Tier-1/Normal decision (which made it vanish from tier
+    /// accounting and minted a false "File not found"). The path stays searchable
+    /// as metadata; only symbol extraction is skipped.
+    UnsupportedLanguage,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -525,6 +587,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::BinaryContent => write!(f, "binary"),
             SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),
+            SkipReason::UnsupportedLanguage => write!(f, "unsupported language"),
         }
     }
 }
@@ -755,6 +818,25 @@ mod tests {
     #[test]
     fn test_symbol_kind_display_function() {
         assert_eq!(SymbolKind::Function.to_string(), "fn");
+    }
+
+    #[test]
+    fn test_is_c_header_path() {
+        // `.h` headers (any case, any directory separator) are flagged.
+        assert!(LanguageId::is_c_header_path("foo.h"));
+        assert!(LanguageId::is_c_header_path("src/runner/flutter_window.h"));
+        assert!(LanguageId::is_c_header_path("windows\\runner\\utils.h"));
+        assert!(LanguageId::is_c_header_path("API.H"));
+        // C++ header extensions map to Cpp directly and are NOT `.h`.
+        assert!(!LanguageId::is_c_header_path("foo.hpp"));
+        assert!(!LanguageId::is_c_header_path("foo.hxx"));
+        assert!(!LanguageId::is_c_header_path("foo.hh"));
+        // Non-headers.
+        assert!(!LanguageId::is_c_header_path("foo.c"));
+        assert!(!LanguageId::is_c_header_path("foo.cpp"));
+        assert!(!LanguageId::is_c_header_path("README"));
+        // A `.h` in the directory name, not the file, must not match.
+        assert!(!LanguageId::is_c_header_path("foo.h/bar.c"));
     }
 
     #[test]

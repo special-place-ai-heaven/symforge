@@ -23,7 +23,9 @@ use super::disambiguation::{
 pub(crate) use super::health_view::is_expected_framework_partial_parse;
 pub use super::health_view::{
     AdmissionTierLookupView, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
-    EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
+    EXPECTED_GENERATED_PARTIAL_PARSE_REASON, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
+    EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON, EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON,
+    EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
 };
 use super::search::{NoiseClass, NoisePolicy, PathScope};
 use super::store::{IndexedFile, LiveIndex};
@@ -4875,8 +4877,15 @@ impl Actor for MyActor {
         assert!(stats.expected_framework_partial_parse_files.is_empty());
     }
 
+    /// Policy changed by the stress-sweep honesty fix (SF-STRESS-009): a
+    /// partial under a vendor/ root is bucketed `expected_vendor` via the
+    /// generic heuristic classifier (previously only symforge's own
+    /// `vendor/tree-sitter-scss/src/` was excused, so every other repo's
+    /// vendored partials screamed "unexpected repo-owned" — corpus-proven
+    /// noise on 20/20 stress repos). Real repo-owned source partials staying
+    /// UNEXPECTED is pinned separately in health_view tests.
     #[test]
-    fn test_health_stats_does_not_mark_all_vendor_partials_expected() {
+    fn test_health_stats_buckets_generic_vendor_partials_as_expected_vendor() {
         let vendor_c = make_indexed_file_with_language(
             "vendor/other-parser/src/parser.c",
             LanguageId::C,
@@ -4890,13 +4899,19 @@ impl Actor for MyActor {
         let stats = index.health_stats();
 
         assert_eq!(stats.partial_parse_count, 1);
-        assert_eq!(stats.unexpected_partial_parse_count, 1);
-        assert_eq!(stats.expected_vendor_partial_parse_count, 0);
         assert_eq!(
-            stats.unexpected_partial_parse_files,
+            stats.expected_vendor_partial_parse_count, 1,
+            "vendor/ partial must land in the heuristic expected_vendor bucket"
+        );
+        assert_eq!(
+            stats.unexpected_partial_parse_count, 0,
+            "vendor/ partial must not be reported as repo-owned unexpected"
+        );
+        assert_eq!(
+            stats.expected_vendor_partial_parse_files,
             vec!["vendor/other-parser/src/parser.c".to_string()]
         );
-        assert!(stats.expected_vendor_partial_parse_files.is_empty());
+        assert!(stats.unexpected_partial_parse_files.is_empty());
     }
 
     #[test]

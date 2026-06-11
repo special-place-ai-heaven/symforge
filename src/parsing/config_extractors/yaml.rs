@@ -80,6 +80,22 @@ impl ConfigExtractor for YamlExtractor {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Coerce a YAML mapping KEY `Value` to its string form for path building.
+///
+/// `serde_yaml_ng` represents mapping keys as `Value` (unlike the previous
+/// fork's plain-`String` keys). YAML keys are almost always scalar strings;
+/// numeric and boolean scalar keys are rendered to their text form. Non-scalar
+/// keys (sequences/mappings, which are exotic and not path-addressable here)
+/// yield `None` so the caller skips them.
+fn yaml_key_to_string(key: &serde_yml::Value) -> Option<String> {
+    match key {
+        serde_yml::Value::String(s) => Some(s.clone()),
+        serde_yml::Value::Number(n) => Some(n.to_string()),
+        serde_yml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Find the byte range in `content` for the YAML mapping key `key`.
 ///
 /// Searches for `key:` pattern inside `search_end` starting from `search_from`,
@@ -256,9 +272,12 @@ impl YamlWalker<'_> {
         let search_end = parent_byte_range.1 as usize;
 
         for (k, v) in map.iter() {
-            // serde_yml 0.0.13's `Mapping` keys are `String` (noyalib backend),
-            // so the key is already a plain string and needs no scalar coercion.
-            let key_str = k.clone();
+            // serde_yaml_ng's `Mapping` keys are `Value`. The overwhelmingly
+            // common case is a scalar string key; coerce non-string scalar keys
+            // (numbers/bools) to their text form and skip non-scalar keys.
+            let Some(key_str) = yaml_key_to_string(k) else {
+                continue;
+            };
 
             let key_path = join_key_path(parent_path, &key_str);
             let (byte_start, byte_end) =
@@ -414,6 +433,26 @@ mod tests {
         let result = YamlExtractor.extract(b":\n  :\n  - [invalid");
         assert!(result.symbols.is_empty());
         assert!(matches!(result.outcome, ExtractionOutcome::Failed(_)));
+    }
+
+    /// SF-STRESS-016 regression: a flow sequence whose contents and closing `]`
+    /// sit at the SAME indentation as the surrounding block mapping. The old
+    /// `serde_yml 0.0.13` fork rejected this with "flow content must be indented
+    /// more than the surrounding block", while PyYAML/libyaml accept it — and so
+    /// must the maintained `serde_yaml_ng` backend. Shape mirrors the live
+    /// flutter-packages `.ci/targets/*.yaml` production CI configs.
+    #[test]
+    fn test_flow_sequence_indented_like_block_parses() {
+        let content = b"tasks:\n  - name: Dart unit tests - web\n    script: .ci/scripts/tool_runner.sh\n    args: [\n      \"dart-test\",\n      \"--platform=chrome\"\n    ]\n";
+        let result = YamlExtractor.extract(content);
+        assert!(
+            matches!(result.outcome, ExtractionOutcome::Ok),
+            "flow content at block indentation must parse (libyaml-lineage tolerance)"
+        );
+        assert!(
+            result.symbols.iter().any(|s| s.name == "tasks"),
+            "the top-level key is extracted"
+        );
     }
 
     #[test]

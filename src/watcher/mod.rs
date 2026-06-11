@@ -289,6 +289,32 @@ fn read_and_index(
         // read lock dropped here
     }
 
+    // SF-025: scan-policy gate — keep the single-file (re)index path symmetric
+    // with the bulk discovery walk. `discover_all_files` uses `ignore::WalkBuilder`
+    // with its default `.hidden(true)`, so a hidden dotfile/dotdir such as
+    // `.github/workflows/ci.yml` or `.travis.yml` is NEVER discovered, admitted,
+    // counted, or recorded on a fresh load — it simply does not exist as far as
+    // the index is concerned. The watcher (FS events + freshen-on-read) had no
+    // such rule, so a single `get_file_context` on a tracked hidden file would
+    // parse and INSERT it, making index membership query-history-dependent: the
+    // file was invisible to `search_files` until someone happened to read it, and
+    // identical health calls disagreed across processes. Apply the SAME exclusion
+    // here, BEFORE the admission gate. Mirror "the walk never saw it" exactly: do
+    // not parse, do not insert, and do not mint a skip record (the walk mints
+    // none either) — but DO drop any stale Tier-1/skip record a prior build may
+    // have left for this path, so the index converges to the bulk-load shape.
+    if crate::discovery::path_has_hidden_component(relative_path) {
+        drop(bytes);
+        let removed = shared.remove_file_at_generation(relative_path, expected_gen);
+        let cleared = shared.clear_skipped_at_generation(relative_path, expected_gen);
+        if removed || cleared {
+            debug!("watcher: scan-policy hidden-path eviction {relative_path}");
+        } else {
+            trace!("watcher: scan-policy hidden-path skip (no prior record) {relative_path}");
+        }
+        return ReindexResult::Skipped;
+    }
+
     // 3. Admission gate — the single choke point for ALL single-file (re)index
     //    paths (watcher FS events and freshen-on-read both reach here). A file
     //    that classifies as Tier 2/3 must NOT be parsed or inserted, even if it
@@ -1268,6 +1294,123 @@ mod tests {
             assert!(file.classification.is_test);
             assert!(file.classification.is_generated);
         }
+    }
+
+    #[test]
+    fn reindex_refuses_hidden_path_to_match_bulk_walk() {
+        // SF-025: the bulk discovery walk skips hidden dotfiles/dotdirs, so a
+        // tracked hidden file like `.github/workflows/ci.yml` is never indexed on
+        // a fresh load. The single-file (re)index choke point must apply the SAME
+        // scan-policy exclusion — otherwise a freshen-on-read (or watcher event)
+        // would parse and INSERT it, making index membership query-history-
+        // dependent. Here `.github/workflows/ci.yml` is a SUPPORTED-language
+        // (Yaml) file with content; the choke point must still refuse it and the
+        // index must stay empty, so health counts are invariant.
+        use crate::domain::LanguageId;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let rel_path = ".github/workflows/ci.yml";
+        let abs_path = tmp.path().join(".github").join("workflows").join("ci.yml");
+        std::fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+        std::fs::write(&abs_path, "name: ci\non: [push]\n").unwrap();
+
+        let shared: crate::live_index::store::SharedIndex = {
+            let index = crate::live_index::store::LiveIndex {
+                files: std::collections::HashMap::new(),
+                loaded_at: std::time::Instant::now(),
+                loaded_at_system: std::time::SystemTime::now(),
+                load_duration: std::time::Duration::ZERO,
+                cb_state: crate::live_index::store::CircuitBreakerState::new(0.20),
+                is_empty: false,
+                load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
+                snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+                reverse_index: std::collections::HashMap::new(),
+                files_by_basename: std::collections::HashMap::new(),
+                files_by_dir_component: std::collections::HashMap::new(),
+                trigram_index: crate::live_index::trigram::TrigramIndex::new(),
+                gitignore: None,
+                skipped_files: Vec::new(),
+                coupling_store: None,
+                local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+                indexed_root: None,
+            };
+            crate::live_index::SharedIndexHandle::shared(index)
+        };
+
+        let expected_gen = shared.current_project_generation();
+        let result = maybe_reindex(rel_path, &abs_path, &shared, LanguageId::Yaml, expected_gen);
+        assert_eq!(
+            result,
+            ReindexResult::Skipped,
+            "hidden-path file must be scan-policy skipped, not parsed/inserted"
+        );
+
+        let idx = shared.read();
+        assert!(
+            idx.get_file(rel_path).is_none(),
+            "hidden-path file must NOT be inserted into the parsed index"
+        );
+        // It must also not leave a skip record — the bulk walk records none
+        // either (it simply never discovers hidden paths), so the index converges
+        // to the exact same shape regardless of read history.
+        assert_eq!(
+            idx.tier_counts(),
+            (0, 0, 0),
+            "hidden-path skip must not mint a tier record; index stays empty"
+        );
+    }
+
+    #[test]
+    fn reindex_still_admits_visible_supported_file() {
+        // Control for the hidden-path gate: a VISIBLE supported file at the same
+        // choke point is still parsed and inserted normally — the SF-025 fix only
+        // excludes hidden paths, never visible source.
+        use crate::domain::LanguageId;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let rel_path = "config/ci.yml";
+        let abs_path = tmp.path().join("config").join("ci.yml");
+        std::fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+        std::fs::write(&abs_path, "name: ci\non: [push]\n").unwrap();
+
+        let shared: crate::live_index::store::SharedIndex = {
+            let index = crate::live_index::store::LiveIndex {
+                files: std::collections::HashMap::new(),
+                loaded_at: std::time::Instant::now(),
+                loaded_at_system: std::time::SystemTime::now(),
+                load_duration: std::time::Duration::ZERO,
+                cb_state: crate::live_index::store::CircuitBreakerState::new(0.20),
+                is_empty: false,
+                load_source: crate::live_index::store::IndexLoadSource::FreshLoad,
+                snapshot_verify_state: crate::live_index::store::SnapshotVerifyState::NotNeeded,
+                reverse_index: std::collections::HashMap::new(),
+                files_by_basename: std::collections::HashMap::new(),
+                files_by_dir_component: std::collections::HashMap::new(),
+                trigram_index: crate::live_index::trigram::TrigramIndex::new(),
+                gitignore: None,
+                skipped_files: Vec::new(),
+                coupling_store: None,
+                local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+                indexed_root: None,
+            };
+            crate::live_index::SharedIndexHandle::shared(index)
+        };
+
+        let expected_gen = shared.current_project_generation();
+        let result = maybe_reindex(rel_path, &abs_path, &shared, LanguageId::Yaml, expected_gen);
+        assert_eq!(
+            result,
+            ReindexResult::Reindexed,
+            "visible supported file must be parsed and inserted"
+        );
+
+        let idx = shared.read();
+        assert!(
+            idx.get_file(rel_path).is_some(),
+            "visible supported file must be present in the parsed index"
+        );
     }
 
     #[test]
