@@ -6,11 +6,12 @@
 //! HEAD-oid tracking. Cold-build walker and symbol-identity resolution
 //! are separate steps.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::AnchorKey;
 use super::decay_factor;
@@ -67,6 +68,19 @@ pub struct LedgerEdgeRow {
     pub shared_inc: u32,
     pub base_weight: f64,
     pub commit_ts: i64,
+}
+
+/// Counts reported by [`CouplingStore::prune_dead_paths`]. Every figure is the
+/// number of rows physically deleted from the named table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Rows removed from `coupling` (anchor or partner path no longer live).
+    pub coupling_removed: usize,
+    /// Rows removed from `coupling_commit_edges` (same liveness rule).
+    pub edges_removed: usize,
+    /// Rows removed from `coupling_active_commits` (commit left with no
+    /// surviving ledger edge after the edge prune).
+    pub commits_removed: usize,
 }
 
 #[derive(Clone)]
@@ -449,9 +463,59 @@ impl CouplingStore {
         Ok(rows.into_iter().collect())
     }
 
+    /// Evict coupling pairs and ledger edges that reference a path no longer
+    /// present in `live_paths`, then drop any active commit left with no
+    /// surviving ledger edge. Runs in one transaction; reports the deleted
+    /// row counts.
+    ///
+    /// ## Liveness rule
+    /// A pair survives only when BOTH its anchor and partner resolve to a live
+    /// path. The path is the component of the anchor key after the `prefix:`
+    /// and before the first `#` (if any), so both `file:<path>` and
+    /// `symbol:<path>#<name>#<kind>` keys are handled by the same rule — a
+    /// symbol pair dies exactly when its file dies. Relative normalized paths
+    /// never contain `:` (no Windows drive letters; the walker normalizes to
+    /// forward slashes via `AnchorKey::file`), so the first `:` is always the
+    /// prefix delimiter.
+    ///
+    /// ## Read-path honesty
+    /// The read path gates every anchor on `index.files` (`tools.rs`) and draws
+    /// candidates only from `all_files()` (`query.rs`), so a dead pair is inert
+    /// — it can never surface a phantom file or shift ranking. The caller in
+    /// the cold-build path supplies the git-tracked set (`git ls-files`
+    /// semantics), a SUPERSET of the indexed set: this is conservative
+    /// (a live-but-unindexed path is kept, never wrongly evicted) and still
+    /// evicts the dead deleted-file pairs, which are absent from both sets.
+    ///
+    /// ## Fail-open
+    /// An empty `live_paths` is treated as "liveness unknown" and is a no-op:
+    /// it must never wipe the whole store (e.g. a fresh `git init` whose index
+    /// has no tracked files yet). Callers that genuinely want an empty store
+    /// use the cold-build purge, not this method.
+    pub fn prune_dead_paths(&self, live_paths: &HashSet<String>) -> Result<PruneStats> {
+        if live_paths.is_empty() {
+            // Fail open: an unknown/empty live set must not erase the store.
+            return Ok(PruneStats::default());
+        }
+        let mut conn = self.conn.lock().expect("coupling mutex poisoned");
+        let tx = conn.transaction()?;
+        let stats = prune_dead_paths_in_tx(&tx, live_paths)?;
+        tx.commit()?;
+        Ok(stats)
+    }
+
     /// Atomic cold build: purges `coupling`, `coupling_active_commits`, and
     /// `coupling_commit_edges`, writes the supplied state, and updates meta
     /// (last_head, last_reference_ts, cold_built_at) in a single transaction.
+    ///
+    /// When `live_paths` is `Some` and non-empty, dead-path pairs are evicted
+    /// in the same transaction (right before the post-build VACUUM) via
+    /// [`prune_dead_paths_in_tx`], so the VACUUM reclaims the freed pages in one
+    /// pass. `None` (and an empty set) skips eviction — fail-open, identical to
+    /// the pre-eviction behaviour. The freshly-built rows reference only paths
+    /// the walker just saw in git history, so eviction here removes stale pairs
+    /// left over from a *previous* cold build on the same DB file (the read
+    /// path is gated on the live index regardless — see `prune_dead_paths`).
     pub fn commit_cold_build(
         &self,
         new_rows: &[CouplingRow],
@@ -459,6 +523,7 @@ impl CouplingStore {
         new_ledger: &[LedgerEdgeRow],
         new_head: Option<&str>,
         reference_ts: i64,
+        live_paths: Option<&HashSet<String>>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().expect("coupling mutex poisoned");
         let tx = conn.transaction()?;
@@ -544,6 +609,25 @@ impl CouplingStore {
              ON CONFLICT(key) DO UPDATE SET value = '0'",
             params![META_DELTA_SINCE_VACUUM],
         )?;
+
+        // Evict dead-path pairs in the same transaction so the post-build
+        // VACUUM reclaims their pages in a single pass. Skipped when no live
+        // set is supplied or it is empty (fail-open).
+        if let Some(live) = live_paths
+            && !live.is_empty()
+        {
+            let pruned = prune_dead_paths_in_tx(&tx, live)?;
+            if pruned.coupling_removed > 0 || pruned.edges_removed > 0 || pruned.commits_removed > 0
+            {
+                tracing::debug!(
+                    "coupling: cold-build pruned {} pairs, {} ledger edges, {} commits",
+                    pruned.coupling_removed,
+                    pruned.edges_removed,
+                    pruned.commits_removed,
+                );
+            }
+        }
+
         tx.commit()?;
         drop(conn);
 
@@ -759,6 +843,100 @@ impl CouplingStore {
         self.maybe_vacuum_after_delta();
         Ok(())
     }
+}
+
+/// Shared dead-path eviction body. Runs inside the caller's transaction so the
+/// cold-build path can prune in the same atomic unit that writes fresh state
+/// (one transaction, one VACUUM afterward), while the public
+/// [`CouplingStore::prune_dead_paths`] wraps it in its own transaction.
+///
+/// Precondition: `live_paths` is non-empty (the empty/unknown case is a
+/// fail-open no-op handled by callers). See
+/// [`CouplingStore::prune_dead_paths`] for the liveness rule and the
+/// read-path-honesty rationale.
+fn prune_dead_paths_in_tx(tx: &Transaction, live_paths: &HashSet<String>) -> Result<PruneStats> {
+    debug_assert!(
+        !live_paths.is_empty(),
+        "prune_dead_paths_in_tx must not be called with an empty live set"
+    );
+
+    // Temp table of live paths. A temp table + JOIN sidesteps the SQL
+    // parameter / statement-length limits a giant `IN (...)` list would hit on
+    // large repos (100k+ tracked files). Created fresh and dropped each call so
+    // repeated invocations within one connection do not leak stale rows.
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS coupling_live_paths (path TEXT PRIMARY KEY);
+         DELETE FROM coupling_live_paths;",
+    )?;
+    {
+        let mut insert =
+            tx.prepare("INSERT OR IGNORE INTO coupling_live_paths (path) VALUES (?1)")?;
+        for path in live_paths {
+            insert.execute(params![path])?;
+        }
+    }
+
+    // SQL extracting the path component of an anchor key: drop everything up to
+    // and including the first ':' (the `prefix:` delimiter), then keep
+    // everything before the first '#' (symbol keys carry `#name#kind`), else
+    // the whole remainder (file keys). `col` is a fixed column name chosen
+    // here, never user input.
+    let path_expr = |col: &str| -> String {
+        format!(
+            "CASE \
+               WHEN instr(substr({col}, instr({col}, ':') + 1), '#') > 0 \
+               THEN substr( \
+                      substr({col}, instr({col}, ':') + 1), \
+                      1, \
+                      instr(substr({col}, instr({col}, ':') + 1), '#') - 1) \
+               ELSE substr({col}, instr({col}, ':') + 1) \
+             END"
+        )
+    };
+    let dead_clause = |col: &str| -> String {
+        format!(
+            "({expr}) NOT IN (SELECT path FROM coupling_live_paths)",
+            expr = path_expr(col),
+        )
+    };
+
+    let coupling_removed = tx.execute(
+        &format!(
+            "DELETE FROM coupling WHERE {anchor} OR {partner}",
+            anchor = dead_clause("anchor_key"),
+            partner = dead_clause("partner_key"),
+        ),
+        [],
+    )?;
+
+    let edges_removed = tx.execute(
+        &format!(
+            "DELETE FROM coupling_commit_edges WHERE {anchor} OR {partner}",
+            anchor = dead_clause("anchor_key"),
+            partner = dead_clause("partner_key"),
+        ),
+        [],
+    )?;
+
+    // Drop active commits left with no surviving ledger edge. Required for
+    // delta consistency: a later delta subtracting an aged-out commit whose
+    // edges were all evicted must be a no-op, and cold-build counters must
+    // agree with the surviving ledger.
+    let commits_removed = tx.execute(
+        "DELETE FROM coupling_active_commits
+         WHERE commit_oid NOT IN (
+             SELECT DISTINCT commit_oid FROM coupling_commit_edges
+         )",
+        [],
+    )?;
+
+    tx.execute("DROP TABLE IF EXISTS coupling_live_paths", [])?;
+
+    Ok(PruneStats {
+        coupling_removed,
+        edges_removed,
+        commits_removed,
+    })
 }
 
 #[cfg(test)]
@@ -1254,6 +1432,7 @@ mod tests {
                 &[ledger("oid1", "a.rs", "b.rs", 100)],
                 Some("head1"),
                 100,
+                None,
             )
             .unwrap();
 
@@ -1271,7 +1450,7 @@ mod tests {
         let store = CouplingStore::open_in_memory().unwrap();
 
         store
-            .commit_cold_build(&[], &[], &[], Some("head0"), 100)
+            .commit_cold_build(&[], &[], &[], Some("head0"), 100, None)
             .unwrap();
         assert_eq!(store.delta_since_vacuum().unwrap(), 0);
 
@@ -1318,7 +1497,14 @@ mod tests {
             ));
         }
         store
-            .commit_cold_build(&rows, &[("oid0".to_string(), 100)], &[], Some("head0"), 100)
+            .commit_cold_build(
+                &rows,
+                &[("oid0".to_string(), 100)],
+                &[],
+                Some("head0"),
+                100,
+                None,
+            )
             .unwrap();
         assert_eq!(store.delta_since_vacuum().unwrap(), 0);
 
@@ -1376,7 +1562,7 @@ mod tests {
         set_vacuum_env("0"); // disabled
         let store = CouplingStore::open_in_memory().unwrap();
         store
-            .commit_cold_build(&[], &[], &[], Some("head0"), 100)
+            .commit_cold_build(&[], &[], &[], Some("head0"), 100, None)
             .unwrap();
 
         for i in 1..=5 {
@@ -1400,5 +1586,169 @@ mod tests {
             "interval=0 disables periodic VACUUM, so the counter is never reset"
         );
         clear_vacuum_env();
+    }
+
+    // ---------- prune_dead_paths ----------
+
+    /// Seed a store with two live-live pairs (a<->b, b<->a) and two dead pairs
+    /// referencing `dead.rs`, plus a ledger and active commits so we can assert
+    /// orphaned-commit cleanup. `oid_live` touches a/b, `oid_dead` touches only
+    /// the dead pair, so after eviction `oid_dead` must be removed.
+    fn seed_prune_fixture() -> CouplingStore {
+        let store = CouplingStore::open_in_memory().unwrap();
+        let rows = vec![
+            sample_row("a.rs", "b.rs", 2, 5.0, 200),
+            sample_row("b.rs", "a.rs", 2, 5.0, 200),
+            sample_row("a.rs", "dead.rs", 1, 3.0, 150),
+            sample_row("dead.rs", "a.rs", 1, 3.0, 150),
+        ];
+        let commits = vec![("oid_live".to_string(), 200), ("oid_dead".to_string(), 150)];
+        let ledger_rows = vec![
+            ledger("oid_live", "a.rs", "b.rs", 200),
+            ledger("oid_live", "b.rs", "a.rs", 200),
+            ledger("oid_dead", "a.rs", "dead.rs", 150),
+            ledger("oid_dead", "dead.rs", "a.rs", 150),
+        ];
+        store
+            .commit_cold_build(&rows, &commits, &ledger_rows, Some("head"), 200, None)
+            .unwrap();
+        store
+    }
+
+    fn live_set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn prune_dead_paths_empty_live_set_is_noop() {
+        let store = seed_prune_fixture();
+        let stats = store.prune_dead_paths(&HashSet::new()).unwrap();
+        assert_eq!(stats, PruneStats::default());
+        // Nothing removed: all four pairs still present.
+        assert_eq!(store.query(&AnchorKey::file("a.rs"), 10).unwrap().len(), 2);
+        assert_eq!(store.active_commit_oids().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_dead_paths_all_live_removes_nothing() {
+        let store = seed_prune_fixture();
+        let stats = store
+            .prune_dead_paths(&live_set(&["a.rs", "b.rs", "dead.rs"]))
+            .unwrap();
+        assert_eq!(stats, PruneStats::default());
+        assert_eq!(store.query(&AnchorKey::file("a.rs"), 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_dead_paths_evicts_dead_pairs_from_both_tables() {
+        let store = seed_prune_fixture();
+        let stats = store
+            .prune_dead_paths(&live_set(&["a.rs", "b.rs"]))
+            .unwrap();
+
+        // Two coupling rows reference dead.rs (a->dead, dead->a).
+        assert_eq!(stats.coupling_removed, 2);
+        // Two ledger edges reference dead.rs.
+        assert_eq!(stats.edges_removed, 2);
+        // oid_dead loses all its edges -> orphaned -> removed.
+        assert_eq!(stats.commits_removed, 1);
+
+        // dead.rs has no surviving partners.
+        assert!(
+            store
+                .query(&AnchorKey::file("dead.rs"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        // a.rs keeps only b.rs.
+        let a = store.query(&AnchorKey::file("a.rs"), 10).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].partner.as_str(), AnchorKey::file("b.rs").as_str());
+
+        // oid_live survives (still has live edges); oid_dead is gone.
+        let active = store.active_commit_oids().unwrap();
+        assert!(active.contains_key("oid_live"));
+        assert!(!active.contains_key("oid_dead"));
+    }
+
+    #[test]
+    fn prune_dead_paths_leaves_surviving_pairs_byte_identical() {
+        // A control store that was never seeded with the dead pairs must be
+        // byte-identical (for the live pairs) to the pruned store.
+        let pruned = seed_prune_fixture();
+        pruned
+            .prune_dead_paths(&live_set(&["a.rs", "b.rs"]))
+            .unwrap();
+
+        let control = CouplingStore::open_in_memory().unwrap();
+        control
+            .commit_cold_build(
+                &[
+                    sample_row("a.rs", "b.rs", 2, 5.0, 200),
+                    sample_row("b.rs", "a.rs", 2, 5.0, 200),
+                ],
+                &[("oid_live".to_string(), 200)],
+                &[
+                    ledger("oid_live", "a.rs", "b.rs", 200),
+                    ledger("oid_live", "b.rs", "a.rs", 200),
+                ],
+                Some("head"),
+                200,
+                None,
+            )
+            .unwrap();
+
+        let p = pruned
+            .pair_row(&AnchorKey::file("a.rs"), &AnchorKey::file("b.rs"))
+            .unwrap()
+            .unwrap();
+        let c = control
+            .pair_row(&AnchorKey::file("a.rs"), &AnchorKey::file("b.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.shared_commits, c.shared_commits);
+        assert_eq!(p.last_commit_ts, c.last_commit_ts);
+        assert!((p.weighted_score - c.weighted_score).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prune_dead_paths_handles_symbol_keys_by_file_component() {
+        // Symbol keys (`symbol:<path>#<name>#<kind>`) die exactly when their
+        // file component is not live; live symbol pairs survive.
+        let store = CouplingStore::open_in_memory().unwrap();
+        let live_sym = CouplingRow {
+            anchor: AnchorKey::symbol("a.rs", "alpha", "fn"),
+            partner: AnchorKey::symbol("b.rs", "beta", "fn"),
+            shared_commits: 1,
+            weighted_score: 2.0,
+            last_commit_ts: 100,
+        };
+        let dead_sym = CouplingRow {
+            anchor: AnchorKey::symbol("a.rs", "alpha", "fn"),
+            partner: AnchorKey::symbol("gone.rs", "ghost", "fn"),
+            shared_commits: 1,
+            weighted_score: 2.0,
+            last_commit_ts: 100,
+        };
+        store
+            .commit_cold_build(&[live_sym, dead_sym], &[], &[], Some("head"), 100, None)
+            .unwrap();
+
+        let stats = store
+            .prune_dead_paths(&live_set(&["a.rs", "b.rs"]))
+            .unwrap();
+        assert_eq!(
+            stats.coupling_removed, 1,
+            "only the gone.rs symbol pair dies"
+        );
+
+        let survivors = store
+            .query(&AnchorKey::symbol("a.rs", "alpha", "fn"), 10)
+            .unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(
+            survivors[0].partner.as_str(),
+            AnchorKey::symbol("b.rs", "beta", "fn").as_str()
+        );
     }
 }

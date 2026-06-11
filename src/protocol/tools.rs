@@ -868,6 +868,7 @@ fn search_files_match_type_label(view: &SearchFilesView) -> &'static str {
                 "constrained (tiered path relevance)"
             }
             Some(SearchFilesTier::LoosePath) => "heuristic (loose path relevance)",
+            Some(SearchFilesTier::MetadataOnly) => "heuristic (Tier-2 metadata-only path)",
             None => "constrained",
         },
         _ => "constrained",
@@ -1295,12 +1296,14 @@ fn search_files_tier_summary(view: &SearchFilesView) -> String {
     let mut strong = 0usize;
     let mut basename = 0usize;
     let mut loose = 0usize;
+    let mut metadata = 0usize;
     for hit in hits {
         match hit.tier {
             SearchFilesTier::CoChange => cochange += 1,
             SearchFilesTier::StrongPath => strong += 1,
             SearchFilesTier::Basename => basename += 1,
             SearchFilesTier::LoosePath => loose += 1,
+            SearchFilesTier::MetadataOnly => metadata += 1,
         }
     }
     let mut parts = Vec::new();
@@ -1315,6 +1318,9 @@ fn search_files_tier_summary(view: &SearchFilesView) -> String {
     }
     if loose > 0 {
         parts.push(format!("loose path={loose}"));
+    }
+    if metadata > 0 {
+        parts.push(format!("metadata-only={metadata}"));
     }
     if parts.is_empty() {
         "no returned files".to_string()
@@ -1578,7 +1584,8 @@ fn hidden_search_symbols_noise_count(
 
 fn search_files_resolve_candidate_count(view: &SearchFilesResolveView) -> usize {
     match view {
-        SearchFilesResolveView::Resolved { .. } => 1,
+        SearchFilesResolveView::Resolved { .. }
+        | SearchFilesResolveView::ResolvedMetadataOnly { .. } => 1,
         SearchFilesResolveView::Ambiguous {
             matches,
             overflow_count,
@@ -1657,6 +1664,9 @@ fn append_search_files_filter_summary(
 fn search_files_resolve_match_type_label(view: &SearchFilesResolveView) -> &'static str {
     match view {
         SearchFilesResolveView::Resolved { .. } => "exact (resolve)",
+        SearchFilesResolveView::ResolvedMetadataOnly { .. } => {
+            "exact (resolve, Tier-2 metadata-only)"
+        }
         SearchFilesResolveView::Ambiguous { .. } => "constrained (resolve candidates)",
         _ => "constrained",
     }
@@ -4532,6 +4542,22 @@ impl SymForgeServer {
                         &search_paths_evidence(std::iter::once(path.as_str())),
                     ))
                 }
+                SearchFilesResolveView::ResolvedMetadataOnly { path, reason } => {
+                    // Tier-2 path: never parsed, so report the metadata-only
+                    // parse state honestly instead of the misleading "parsed".
+                    Some(search_format::format_search_envelope(
+                        search_files_resolve_match_type_label(&view),
+                        "current index",
+                        "metadata-only (not parsed)",
+                        &search_completeness_label(0, hidden_noise_count),
+                        &search_files_scope_summary(
+                            "resolve=true against indexed file paths",
+                            include_vendor,
+                            include_personal_tooling,
+                        ),
+                        &format!("Tier-2 metadata-only path `{path}` ({reason}); never parsed"),
+                    ))
+                }
                 SearchFilesResolveView::Ambiguous {
                     matches,
                     overflow_count,
@@ -4623,6 +4649,7 @@ impl SymForgeServer {
                         path: entry.path.clone(),
                         coupling_score: Some(entry.coupling_score),
                         shared_commits: Some(entry.shared_commits),
+                        metadata_reason: None,
                     })
                     .collect();
                 let weak_hits: Vec<SearchFilesHit> = history
@@ -4633,6 +4660,7 @@ impl SymForgeServer {
                         path: entry.path.clone(),
                         coupling_score: Some(entry.coupling_score),
                         shared_commits: Some(entry.shared_commits),
+                        metadata_reason: None,
                     })
                     .collect();
                 if hits.is_empty() {
@@ -6910,8 +6938,21 @@ impl SymForgeServer {
 
         let concept = super::explore::match_concept(&params.0.query);
 
+        // A single-word concept that matched ONLY via the stemmed fallback is a
+        // weak signal: the query never named the concept verbatim. When the query
+        // also carries specific terms (computed below) the header should let those
+        // terms lead and demote such a concept to a parenthetical hint, rather than
+        // collapsing the topic to a label the user did not type. Exact matches and
+        // multi-word concept keys keep leading the header.
+        let demote_stem_only_concept = matches!(
+            concept,
+            Some((key, _, super::explore::ConceptMatchKind::Stemmed))
+                if key.split_whitespace().count() == 1
+        );
+
         let mut enriched_imports: Vec<String> = Vec::new();
-        let (label, symbol_queries, text_queries, remainder_terms) = if let Some((key, c)) = concept
+        let (label, symbol_queries, text_queries, remainder_terms) = if let Some((key, c, _)) =
+            concept
         {
             let remainder = Self::compute_remainder_terms(&params.0.query, key);
             let mut sym_q: Vec<String> = c.symbol_queries.iter().map(|s| s.to_string()).collect();
@@ -7466,7 +7507,16 @@ impl SymForgeServer {
                 .filter(|t| specific_terms.contains(t.as_str()))
                 .map(|t| t.as_str())
                 .collect();
-            format!("{label} + {}", ordered.join(", "))
+            if demote_stem_only_concept {
+                // The concept matched only via a single-word stem misfire (e.g.
+                // "indexed" -> "Indexing") while the query named real terms. Lead
+                // with those specific terms and demote the concept to an honest
+                // parenthetical hint, instead of letting a label the user never
+                // typed front the header.
+                format!("{} (+ {label} signals)", ordered.join(", "))
+            } else {
+                format!("{label} + {}", ordered.join(", "))
+            }
         } else {
             label.clone()
         };
@@ -17176,11 +17226,14 @@ mod tests {
             "explore must surface AdmissionTier for an 'admission' query: {result}"
         );
 
-        // The header must not silently collapse the topic to "Indexing": the
-        // specific matching noun stays visible.
+        // The "Indexing" concept matched ONLY via a single-word stem misfire
+        // ("indexed" -> "indexing") while the query named the real noun
+        // "admission". The header must lead with that specific term and demote
+        // the stem-only concept to a parenthetical signal hint, not front a label
+        // the user never typed.
         assert!(
-            result.contains("Exploring: Indexing + admission"),
-            "header should keep the specific query noun, not collapse to the concept: {result}"
+            result.contains("Exploring: admission (+ Indexing signals)"),
+            "stem-only single-word concept must be demoted behind the specific query noun: {result}"
         );
 
         // The specific admission match must rank above the generic concept

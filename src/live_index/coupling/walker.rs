@@ -83,8 +83,32 @@ pub enum DeltaOutcome {
     },
 }
 
+/// Set of currently git-tracked paths (`git ls-files` semantics), normalized
+/// to forward slashes — the liveness source fed to the cold-build dead-path
+/// eviction. This is a SUPERSET of the live INDEX file set the read path
+/// actually gates on (`index.files`), so pruning against it is conservative:
+/// a tracked-but-unindexed file is kept, never wrongly evicted, while pairs
+/// referencing files deleted from HEAD (the actual bloat) are removed.
+///
+/// The walker's entry points (`run_init`, `start_lazy_prepare`) only carry
+/// `repo_root`, not the live `SharedIndex`, so the index file set is not in
+/// scope here; `git ls-files` is the closest read-path-honest approximation
+/// reachable from this layer. Returns `None` on any failure (no repo, fresh
+/// `git init` with no index, empty tracked set), which the caller treats as
+/// fail-open: no eviction rather than a wrongly-emptied store.
+fn live_tracked_paths(repo_root: &Path) -> Option<HashSet<String>> {
+    let repo = crate::git::GitRepo::open(repo_root).ok()?;
+    let paths = repo.tracked_paths().ok()?;
+    if paths.is_empty() {
+        return None;
+    }
+    Some(paths.into_iter().collect())
+}
+
 /// Cold-build the coupling store from a bounded slice of git history.
-/// Atomic rebuild — purges existing rows and ledger, writes fresh state.
+/// Atomic rebuild — purges existing rows and ledger, writes fresh state, then
+/// evicts dead-path pairs in the same transaction before the post-build VACUUM
+/// (see [`CouplingStore::commit_cold_build`]).
 pub fn cold_build(
     store: &CouplingStore,
     repo_root: &Path,
@@ -105,6 +129,8 @@ pub fn cold_build(
         rows_written: rows.len(),
     };
 
+    let live_paths = live_tracked_paths(repo_root);
+
     store
         .commit_cold_build(
             &rows,
@@ -112,6 +138,7 @@ pub fn cold_build(
             &ledger,
             head_oid.as_deref(),
             cfg.reference_ts,
+            live_paths.as_ref(),
         )
         .context("committing cold build")?;
     Ok(stats)
@@ -601,6 +628,52 @@ mod tests {
                 &parent_refs,
             )
         }
+
+        /// Commit that removes `removals` from the git index (and worktree),
+        /// optionally also writing `add` files. Used to exercise dead-path
+        /// eviction: after this commit the removed paths are no longer tracked.
+        fn commit_removing(
+            &self,
+            add: &[(&str, &str)],
+            removals: &[&str],
+            ts: i64,
+            msg: &str,
+        ) -> git2::Oid {
+            for (rel, content) in add {
+                let full = self.tmp.path().join(rel);
+                if let Some(parent) = full.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(&full, content).unwrap();
+            }
+            let mut index = self.repo.index().unwrap();
+            for (rel, _) in add {
+                index.add_path(Path::new(rel)).unwrap();
+            }
+            for rel in removals {
+                index.remove_path(Path::new(rel)).unwrap();
+                let _ = fs::remove_file(self.tmp.path().join(rel));
+            }
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = self.repo.find_tree(tree_oid).unwrap();
+            let sig =
+                git2::Signature::new("Test", "t@example.com", &git2::Time::new(ts, 0)).unwrap();
+            let parent_oid = self.repo.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit> = parent_oid
+                .and_then(|oid| self.repo.find_commit(oid).ok())
+                .into_iter()
+                .collect();
+            let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+            git_test_helpers::commit_head_with_retry(
+                &self.repo,
+                &sig,
+                &sig,
+                msg,
+                &tree,
+                &parent_refs,
+            )
+        }
     }
 
     fn now_sec() -> i64 {
@@ -929,6 +1002,102 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ---------- dead-path eviction at cold build ----------
+
+    /// Build a coupling store via the full `cold_build` path against a repo
+    /// where one file was deleted, and assert that every pair / ledger edge /
+    /// orphaned commit referencing the deleted path is gone, while the live
+    /// pair is byte-identical to an unpruned control filtered to live pairs.
+    #[test]
+    fn cold_build_evicts_pairs_for_deleted_paths() {
+        let repo = TestRepo::init();
+        let now_ts = 2_000_000_000i64;
+        let mut cfg = test_cfg(now_ts);
+        cfg.window_days = 365_000;
+
+        // c1: a, b, dead all change together -> 3 files -> all three pairs.
+        repo.commit(
+            &[("a.rs", "1"), ("b.rs", "1"), ("dead.rs", "1")],
+            now_ts - 86400 * 10,
+            "c1",
+        );
+        // c2: a, b change again AND dead.rs is removed from the index.
+        repo.commit_removing(
+            &[("a.rs", "2"), ("b.rs", "2")],
+            &["dead.rs"],
+            now_ts - 86400,
+            "c2",
+        );
+
+        // Pruned store via the production cold_build path (reads git ls-files).
+        let pruned = CouplingStore::open_in_memory().unwrap();
+        cold_build(&pruned, &repo.path(), &cfg).unwrap();
+
+        // Unpruned control: same window inputs, committed with live_paths=None.
+        let control = CouplingStore::open_in_memory().unwrap();
+        let (entries, head_oid) = compute_window(&repo.path(), &cfg).unwrap();
+        let (rows, ledger, active) = build_cold_inputs(&entries, &cfg);
+        control
+            .commit_cold_build(
+                &rows,
+                &active,
+                &ledger,
+                head_oid.as_deref(),
+                cfg.reference_ts,
+                None,
+            )
+            .unwrap();
+
+        // dead.rs must have no surviving pairs in the pruned store.
+        assert!(
+            pruned
+                .query(&AnchorKey::file("dead.rs"), 100)
+                .unwrap()
+                .is_empty(),
+            "deleted path must have no surviving partners"
+        );
+        // ...but the control (unpruned) must still carry them.
+        assert!(
+            !control
+                .query(&AnchorKey::file("dead.rs"), 100)
+                .unwrap()
+                .is_empty(),
+            "control must retain the dead pairs (proving the prune did work)"
+        );
+
+        // a.rs must no longer list dead.rs as a partner in the pruned store.
+        let a_partners = pruned.query(&AnchorKey::file("a.rs"), 100).unwrap();
+        assert!(
+            a_partners
+                .iter()
+                .all(|r| r.partner.as_str() != AnchorKey::file("dead.rs").as_str()),
+            "a.rs must not retain dead.rs as a partner"
+        );
+
+        // The live a.rs<->b.rs pair must be byte-identical to the control's.
+        let a_to_b_pruned = pruned
+            .pair_row(&AnchorKey::file("a.rs"), &AnchorKey::file("b.rs"))
+            .unwrap()
+            .expect("live a<->b pair must survive pruning");
+        let a_to_b_control = control
+            .pair_row(&AnchorKey::file("a.rs"), &AnchorKey::file("b.rs"))
+            .unwrap()
+            .expect("control must have a<->b pair");
+        assert_eq!(a_to_b_pruned.shared_commits, a_to_b_control.shared_commits);
+        assert_eq!(a_to_b_pruned.last_commit_ts, a_to_b_control.last_commit_ts);
+        assert!(
+            (a_to_b_pruned.weighted_score - a_to_b_control.weighted_score).abs() < 1e-12,
+            "surviving live pair weighted_score must be byte-identical to control"
+        );
+
+        // Every active commit that survives must still have a ledger edge:
+        // c1 only touched a/b/dead pairs; after eviction its a<->b edge keeps
+        // it alive. (No orphan-commit assertion possible here since c1 retains
+        // a live edge; the orphan path is covered by the store-level test.)
+        let active_oids = pruned.active_commit_oids().unwrap();
+        assert!(!active_oids.is_empty());
     }
 
     // ---------- delta equivalence ----------

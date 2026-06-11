@@ -577,6 +577,86 @@ pub(super) fn path_has_component(path: &str, component: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case(component))
 }
 
+/// Precomputed query parts shared by the non-glob `search_files` passes.
+///
+/// Built once from the normalized query so the same exact/suffix, basename,
+/// prefix, and loose predicates apply identically to Tier-1 indexed paths and
+/// Tier-2 skipped paths — no five-filter duplication across candidate sources.
+pub(super) struct SearchFilesQueryPredicate<'a> {
+    normalized_query_lower: String,
+    tokens: &'a [String],
+    basename_token: &'a str,
+    component_tokens: &'a [String],
+    has_path_context: bool,
+}
+
+impl<'a> SearchFilesQueryPredicate<'a> {
+    fn new(normalized_query: &str, tokens: &'a [String]) -> Self {
+        let basename_token = tokens.last().map(String::as_str).unwrap_or("");
+        let component_tokens = if tokens.len() > 1 {
+            &tokens[..tokens.len() - 1]
+        } else {
+            &[][..]
+        };
+        Self {
+            normalized_query_lower: normalized_query.to_ascii_lowercase(),
+            tokens,
+            basename_token,
+            component_tokens,
+            has_path_context: normalized_query.contains('/'),
+        }
+    }
+
+    /// True when `path` matches the query under ANY of the non-glob passes
+    /// (exact, suffix, basename+components, prefix, loose). The five Tier-1
+    /// passes split these into separate buckets for per-tier labeling; the
+    /// Tier-2 metadata-only pass only needs the union, since all metadata
+    /// hits collapse into the single `MetadataOnly` tier.
+    fn matches(&self, path: &str) -> bool {
+        let path_lower = path.to_ascii_lowercase();
+
+        // Exact / suffix (strong).
+        if path_lower == self.normalized_query_lower
+            || (self.has_path_context && path_lower.ends_with(&self.normalized_query_lower))
+        {
+            return true;
+        }
+
+        // Basename exact + required directory components.
+        if !self.basename_token.is_empty() {
+            let file_basename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if file_basename.eq_ignore_ascii_case(self.basename_token)
+                && self
+                    .component_tokens
+                    .iter()
+                    .all(|component| path_has_component(path, component))
+            {
+                return true;
+            }
+        }
+
+        // Prefix on the file stem (matches the >=3-char Tier-1 prefix pass).
+        if self.basename_token.len() >= 3 {
+            let file_stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            if file_stem
+                .to_ascii_lowercase()
+                .starts_with(&self.basename_token.to_ascii_lowercase())
+            {
+                return true;
+            }
+        }
+
+        // Loose: every token appears somewhere in the path.
+        !self.tokens.is_empty() && self.tokens.iter().all(|token| path_lower.contains(token))
+    }
+}
+
 fn shared_directory_prefix_len(path_a: &str, path_b: &str) -> usize {
     let parts_a: Vec<&str> = path_a.split('/').collect();
     let parts_b: Vec<&str> = path_b.split('/').collect();
@@ -651,6 +731,13 @@ pub enum SearchFilesResolveView {
     Resolved {
         path: String,
     },
+    /// Resolved to a Tier-2 metadata-only path (lockfile, oversized, etc.).
+    /// The path is real and addressable, but it was never parsed, so it is
+    /// surfaced with the metadata label instead of as a plain `Resolved`.
+    ResolvedMetadataOnly {
+        path: String,
+        reason: String,
+    },
     NotFound {
         hint: String,
     },
@@ -667,6 +754,21 @@ pub enum SearchFilesTier {
     StrongPath,
     Basename,
     LoosePath,
+    /// Tier-2 admission-demoted file (lockfile, oversized, denylisted, etc.).
+    /// Stored in `LiveIndex::skipped_files()` as metadata only — never parsed.
+    /// Findable by path so it is not a silent black hole, but ranked strictly
+    /// below every Tier-1 hit via the rank floor in
+    /// `capture_search_files_view_with_noise`.
+    MetadataOnly,
+}
+
+impl SearchFilesTier {
+    /// True for the Tier-2 metadata-only floor. Used as the primary sort key
+    /// so a metadata-only hit can never outrank a real (Tier-1) source file,
+    /// regardless of path-relevance score or frecency fusion.
+    pub fn is_metadata_only(self) -> bool {
+        matches!(self, SearchFilesTier::MetadataOnly)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -683,6 +785,11 @@ pub struct SearchFilesHit {
     pub path: String,
     pub coupling_score: Option<f32>,
     pub shared_commits: Option<u32>,
+    /// Short human-readable reason a Tier-2 metadata-only path was demoted
+    /// (e.g. "lockfile", "artifact", ">1MB"). `None` for every Tier-1 hit.
+    /// Carried on the hit so the formatter can render
+    /// `[metadata-only: <reason>]` without re-deriving from the index.
+    pub metadata_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -932,6 +1039,26 @@ impl LiveIndex {
         self.files.iter().map(|(path, file)| (path, file.as_ref()))
     }
 
+    /// Iterate Tier-2 metadata-only skipped paths as `(path, reason_label)`.
+    ///
+    /// Tier-3 hard-skipped files (and any future tiers) are excluded — only
+    /// metadata-only files are surfaced as findable `search_files` hits. The
+    /// reason label is the `SkipReason` display string (e.g. "lockfile",
+    /// "artifact", ">1MB") used by the formatter's `[metadata-only: …]` suffix.
+    pub fn metadata_only_skipped_paths(&self) -> impl Iterator<Item = (&str, String)> {
+        self.skipped_files().iter().filter_map(|sf| {
+            if sf.tier() == crate::domain::index::AdmissionTier::MetadataOnly {
+                let reason = sf
+                    .reason()
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "metadata only".to_string());
+                Some((sf.path.as_str(), reason))
+            } else {
+                None
+            }
+        })
+    }
+
     /// Capture a shared immutable file entry under the read lock.
     pub fn capture_shared_file(&self, relative_path: &str) -> Option<Arc<IndexedFile>> {
         self.files.get(relative_path).cloned()
@@ -1037,7 +1164,21 @@ impl LiveIndex {
             };
         }
 
+        // Tier-2 exact match: a metadata-only skipped path (lockfile, oversized,
+        // etc.) is a real, addressable path. Resolve it WITH the metadata label
+        // instead of falling through to NotFound. Matched case-insensitively on
+        // the full relative path so `resolve=true` mirrors the Tier-1 exact rule.
         let normalized_hint_lower = normalized_hint.to_ascii_lowercase();
+        if let Some((path, reason)) = self
+            .metadata_only_skipped_paths()
+            .filter(|(path, _)| path_allowed(path))
+            .find(|(path, _)| path.to_ascii_lowercase() == normalized_hint_lower)
+        {
+            return SearchFilesResolveView::ResolvedMetadataOnly {
+                path: path.to_string(),
+                reason,
+            };
+        }
         let parts: Vec<&str> = normalized_hint
             .split('/')
             .filter(|part| !part.is_empty())
@@ -1172,23 +1313,53 @@ impl LiveIndex {
                 .map(|path| path.to_string())
                 .collect();
             glob_hits.sort();
-            let total_matches = glob_hits.len();
+            let tier1_total = glob_hits.len();
+
+            // Tier-2 metadata-only paths also participate in glob matching, but
+            // are appended after every Tier-1 hit and carry the metadata label.
+            let strong_set: HashSet<&str> = glob_hits.iter().map(String::as_str).collect();
+            let mut metadata_hits: Vec<(String, String)> = self
+                .metadata_only_skipped_paths()
+                .filter(|(path, _)| path_allowed(path))
+                .filter(|(path, _)| !strong_set.contains(*path))
+                .filter(|(path, _)| matcher.is_match(path))
+                .map(|(path, reason)| (path.to_string(), reason))
+                .collect();
+            metadata_hits.sort_by(|(lp, _), (rp, _)| lp.cmp(rp));
+
+            let total_matches = tier1_total + metadata_hits.len();
             if total_matches == 0 {
                 return SearchFilesView::NotFound {
                     query: normalized_query,
                 };
             }
             let overflow_count = total_matches.saturating_sub(limit);
-            glob_hits.truncate(limit);
-            let hits: Vec<SearchFilesHit> = glob_hits
+            // Tier-1 hits fill the limit first; metadata-only hits take any
+            // remaining slots, preserving the rank-floor invariant.
+            let mut hits: Vec<SearchFilesHit> = glob_hits
                 .into_iter()
+                .take(limit)
                 .map(|path| SearchFilesHit {
                     tier: SearchFilesTier::StrongPath,
                     path,
                     coupling_score: None,
                     shared_commits: None,
+                    metadata_reason: None,
                 })
                 .collect();
+            let remaining = limit.saturating_sub(hits.len());
+            hits.extend(
+                metadata_hits
+                    .into_iter()
+                    .take(remaining)
+                    .map(|(path, reason)| SearchFilesHit {
+                        tier: SearchFilesTier::MetadataOnly,
+                        path,
+                        coupling_score: None,
+                        shared_commits: None,
+                        metadata_reason: Some(reason),
+                    }),
+            );
             return SearchFilesView::Found {
                 query: normalized_query,
                 total_matches,
@@ -1305,8 +1476,32 @@ impl LiveIndex {
             .map(|path| path.to_string())
             .collect();
 
-        let total_matches =
+        let tier1_total =
             strong_hits.len() + basename_only_hits.len() + prefix_hits.len() + loose_hits.len();
+
+        // Tier-2 metadata-only pass: run the SAME query predicates over the
+        // skipped-file paths so demoted lockfiles/oversized files are findable
+        // BY PATH instead of vanishing into a NotFound. Exclude any path already
+        // present as a Tier-1 candidate (a path can be both indexed and skipped
+        // only transiently; dedup keeps the higher tier). These hits are pinned
+        // below every Tier-1 hit by the rank floor in the sort comparator.
+        let tier1_set: HashSet<&str> = strong_hits
+            .iter()
+            .chain(basename_only_hits.iter())
+            .chain(prefix_hits.iter())
+            .chain(loose_hits.iter())
+            .map(String::as_str)
+            .collect();
+        let metadata_predicate = SearchFilesQueryPredicate::new(&normalized_query, &tokens);
+        let metadata_hits: Vec<(String, String)> = self
+            .metadata_only_skipped_paths()
+            .filter(|(path, _)| path_allowed(path))
+            .filter(|(path, _)| !tier1_set.contains(path))
+            .filter(|(path, _)| metadata_predicate.matches(path))
+            .map(|(path, reason)| (path.to_string(), reason))
+            .collect();
+
+        let total_matches = tier1_total + metadata_hits.len();
         if total_matches == 0 {
             return SearchFilesView::NotFound {
                 query: normalized_query,
@@ -1314,30 +1509,36 @@ impl LiveIndex {
         }
 
         // Collect all classified candidates into a single list, preserving
-        // their tier label for the formatter. Ordering across the list is
-        // then driven by `super::rank_signals::combine` as the primary sort key,
-        // with within-tier tiebreakers (exact/suffix, shared dir prefix,
-        // length, lex) matching the previous per-bucket behavior.
-        let mut candidates: Vec<(String, SearchFilesTier)> = Vec::with_capacity(total_matches);
+        // their tier label and (for Tier-2) the metadata reason for the
+        // formatter. Ordering across the list is driven by the sort comparator
+        // below, where the metadata-only rank floor is the PRIMARY key:
+        // a Tier-2 hit can never outrank a Tier-1 hit regardless of path score.
+        let mut candidates: Vec<(String, SearchFilesTier, Option<String>)> =
+            Vec::with_capacity(total_matches);
         candidates.extend(
             strong_hits
                 .into_iter()
-                .map(|path| (path, SearchFilesTier::StrongPath)),
+                .map(|path| (path, SearchFilesTier::StrongPath, None)),
         );
         candidates.extend(
             basename_only_hits
                 .into_iter()
-                .map(|path| (path, SearchFilesTier::Basename)),
+                .map(|path| (path, SearchFilesTier::Basename, None)),
         );
         candidates.extend(
             prefix_hits
                 .into_iter()
-                .map(|path| (path, SearchFilesTier::LoosePath)),
+                .map(|path| (path, SearchFilesTier::LoosePath, None)),
         );
         candidates.extend(
             loose_hits
                 .into_iter()
-                .map(|path| (path, SearchFilesTier::LoosePath)),
+                .map(|path| (path, SearchFilesTier::LoosePath, None)),
+        );
+        candidates.extend(
+            metadata_hits
+                .into_iter()
+                .map(|(path, reason)| (path, SearchFilesTier::MetadataOnly, Some(reason))),
         );
 
         let shared_len = |path: &str| -> usize {
@@ -1358,7 +1559,16 @@ impl LiveIndex {
                     .fold(0.0_f32, f32::max)
             })
             .unwrap_or(0.0);
-        candidates.sort_by(|(lp, _), (rp, _)| {
+        candidates.sort_by(|(lp, l_tier, _), (rp, r_tier, _)| {
+            // Rank floor: Tier-2 metadata-only paths ALWAYS sort below every
+            // Tier-1 hit, regardless of path-relevance score. `false` (Tier-1)
+            // orders before `true` (metadata-only).
+            let l_meta = l_tier.is_metadata_only();
+            let r_meta = r_tier.is_metadata_only();
+            if l_meta != r_meta {
+                return l_meta.cmp(&r_meta);
+            }
+
             let l_score = search_files_rank_score(
                 lp,
                 &normalized_query,
@@ -1394,14 +1604,20 @@ impl LiveIndex {
 
         let hits: Vec<SearchFilesHit> = candidates
             .into_iter()
-            .map(|(path, tier)| {
-                let coupling_evidence = usable_search_files_coupling_evidence(
-                    &path,
-                    &normalized_query,
-                    &tokens,
-                    current_file,
-                    coupling_context,
-                );
+            .map(|(path, tier, metadata_reason)| {
+                // Metadata-only hits never participate in co-change promotion:
+                // they are not real source and must stay on the rank floor.
+                let coupling_evidence = if tier.is_metadata_only() {
+                    None
+                } else {
+                    usable_search_files_coupling_evidence(
+                        &path,
+                        &normalized_query,
+                        &tokens,
+                        current_file,
+                        coupling_context,
+                    )
+                };
                 let coupling_score = coupling_evidence.and_then(|evidence| {
                     if max_coupling_weight > 0.0 {
                         Some((evidence.weighted_score / max_coupling_weight).clamp(0.0, 1.0))
@@ -1418,6 +1634,7 @@ impl LiveIndex {
                     path,
                     coupling_score,
                     shared_commits: coupling_evidence.map(|evidence| evidence.shared_commits),
+                    metadata_reason,
                 }
             })
             .collect();
@@ -3064,6 +3281,191 @@ mod tests {
         );
     }
 
+    fn add_metadata_only_skip(index: &mut LiveIndex, path: &str, reason: SkipReason) {
+        index.add_skipped_file(SkippedFile {
+            path: path.to_string(),
+            size: 4096,
+            extension: std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string),
+            decision: AdmissionDecision::skip(AdmissionTier::MetadataOnly, reason),
+        });
+    }
+
+    // Fix 1(a): a query matching only a Tier-2 lockfile returns it labeled
+    // metadata-only instead of NotFound.
+    #[test]
+    fn test_capture_search_files_view_surfaces_tier2_metadata_only_path() {
+        let mut index = make_index(vec![], false);
+        add_metadata_only_skip(
+            &mut index,
+            "backend/package-lock.json",
+            SkipReason::DependencyLockfile,
+        );
+
+        let view = index.capture_search_files_view("package-lock", 20, None, None);
+
+        match view {
+            SearchFilesView::Found {
+                total_matches,
+                hits,
+                ..
+            } => {
+                assert_eq!(total_matches, 1, "the Tier-2 path counts toward matches");
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].tier, SearchFilesTier::MetadataOnly);
+                assert_eq!(hits[0].path, "backend/package-lock.json");
+                assert_eq!(hits[0].metadata_reason.as_deref(), Some("lockfile"));
+            }
+            other => panic!("expected Found with a metadata-only hit, got {other:?}"),
+        }
+    }
+
+    // Fix 1(b): a query matching both real source AND a Tier-2 path ranks every
+    // source hit above the Tier-2 hit (the rank floor), regardless of path score.
+    #[test]
+    fn test_capture_search_files_view_ranks_all_source_above_tier2() {
+        // The lockfile's path scores higher on the loose-token query "lock"
+        // than the source files, yet the rank floor must still pin it last.
+        let mut index = make_index(
+            vec![
+                (
+                    "src/lock_manager.rs",
+                    make_indexed_file("src/lock_manager.rs", vec![], ParseStatus::Parsed),
+                ),
+                (
+                    "src/util/locking.rs",
+                    make_indexed_file("src/util/locking.rs", vec![], ParseStatus::Parsed),
+                ),
+            ],
+            false,
+        );
+        add_metadata_only_skip(&mut index, "Cargo.lock", SkipReason::DependencyLockfile);
+
+        let view = index.capture_search_files_view("lock", 20, None, None);
+
+        match view {
+            SearchFilesView::Found {
+                total_matches,
+                hits,
+                ..
+            } => {
+                assert_eq!(total_matches, 3);
+                let metadata_pos = hits
+                    .iter()
+                    .position(|h| h.tier == SearchFilesTier::MetadataOnly)
+                    .expect("metadata-only hit present");
+                // Every hit before the metadata hit must be Tier-1 (non-metadata),
+                // and the metadata hit must be the LAST hit.
+                assert_eq!(
+                    metadata_pos,
+                    hits.len() - 1,
+                    "metadata-only hit must sort last: {hits:?}"
+                );
+                assert!(
+                    hits[..metadata_pos]
+                        .iter()
+                        .all(|h| h.tier != SearchFilesTier::MetadataOnly),
+                    "all source hits must precede the metadata hit: {hits:?}"
+                );
+                assert_eq!(hits[metadata_pos].path, "Cargo.lock");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    // Fix 1(c): a vendored Tier-2 path stays suppressed under the default
+    // vendor filter (include_vendor=false), exactly like vendored Tier-1 paths.
+    #[test]
+    fn test_capture_search_files_view_vendor_filter_suppresses_tier2() {
+        let mut index = make_index(vec![], false);
+        add_metadata_only_skip(
+            &mut index,
+            "node_modules/leftpad/package-lock.json",
+            SkipReason::DependencyLockfile,
+        );
+
+        // Default (vendor hidden): the vendored lockfile must NOT surface.
+        let hidden =
+            index.capture_search_files_view_with_noise("package-lock", 20, None, None, false, true);
+        assert!(
+            matches!(hidden, SearchFilesView::NotFound { .. }),
+            "vendored Tier-2 path must be suppressed by default: {hidden:?}"
+        );
+
+        // include_vendor=true: now it surfaces as metadata-only.
+        let shown =
+            index.capture_search_files_view_with_noise("package-lock", 20, None, None, true, true);
+        match shown {
+            SearchFilesView::Found { hits, .. } => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].tier, SearchFilesTier::MetadataOnly);
+                assert_eq!(hits[0].path, "node_modules/leftpad/package-lock.json");
+            }
+            other => panic!("expected Found with vendor included, got {other:?}"),
+        }
+    }
+
+    // Fix 1(d): resolve=true on an exact Tier-2 path resolves with the
+    // metadata-only label instead of returning NotFound.
+    #[test]
+    fn test_capture_search_files_resolve_view_resolves_tier2_with_label() {
+        let mut index = make_index(vec![], false);
+        add_metadata_only_skip(
+            &mut index,
+            "backend/package-lock.json",
+            SkipReason::DependencyLockfile,
+        );
+
+        let view = index.capture_search_files_resolve_view("./backend\\package-lock.json");
+
+        assert_eq!(
+            view,
+            SearchFilesResolveView::ResolvedMetadataOnly {
+                path: "backend/package-lock.json".to_string(),
+                reason: "lockfile".to_string(),
+            }
+        );
+    }
+
+    // Fix 1 (glob): a glob query also matches Tier-2 paths, appended below the
+    // Tier-1 hits and carrying the metadata label.
+    #[test]
+    fn test_capture_search_files_view_glob_includes_tier2_below_source() {
+        let mut index = make_index(
+            vec![(
+                "src/config.json",
+                make_indexed_file("src/config.json", vec![], ParseStatus::Parsed),
+            )],
+            false,
+        );
+        add_metadata_only_skip(
+            &mut index,
+            "package-lock.json",
+            SkipReason::DependencyLockfile,
+        );
+
+        let view = index.capture_search_files_view("*.json", 20, None, None);
+
+        match view {
+            SearchFilesView::Found {
+                total_matches,
+                hits,
+                ..
+            } => {
+                assert_eq!(total_matches, 2);
+                // Tier-1 source first, Tier-2 metadata last.
+                assert_eq!(hits[0].path, "src/config.json");
+                assert_eq!(hits[0].tier, SearchFilesTier::StrongPath);
+                assert_eq!(hits[1].path, "package-lock.json");
+                assert_eq!(hits[1].tier, SearchFilesTier::MetadataOnly);
+                assert_eq!(hits[1].metadata_reason.as_deref(), Some("lockfile"));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_capture_search_files_resolve_view_returns_exact_path_match() {
         let index = make_index(
@@ -3192,12 +3594,14 @@ mod tests {
                         path: "src/protocol/tools.rs".to_string(),
                         coupling_score: None,
                         shared_commits: None,
+                        metadata_reason: None,
                     },
                     SearchFilesHit {
                         tier: SearchFilesTier::Basename,
                         path: "src/sidecar/tools.rs".to_string(),
                         coupling_score: None,
                         shared_commits: None,
+                        metadata_reason: None,
                     },
                 ],
             }
@@ -3234,12 +3638,14 @@ mod tests {
                         path: "src/live_index/query.rs".to_string(),
                         coupling_score: None,
                         shared_commits: None,
+                        metadata_reason: None,
                     },
                     SearchFilesHit {
                         tier: SearchFilesTier::LoosePath,
                         path: "src/live_index/store.rs".to_string(),
                         coupling_score: None,
                         shared_commits: None,
+                        metadata_reason: None,
                     },
                 ],
             }
@@ -3381,6 +3787,7 @@ mod tests {
                     path: "wiki/notes.md".to_string(),
                     coupling_score: Some(1.0),
                     shared_commits: Some(3),
+                    metadata_reason: None,
                 }],
             }
         );
@@ -4350,6 +4757,122 @@ impl Actor for MyActor {
             stats.unexpected_partial_parse_files,
             vec!["src/app/plain_broken.html".to_string()]
         );
+    }
+
+    #[test]
+    fn test_health_stats_angular_nested_paren_openers_are_framework_partial() {
+        // POSITIVE control, real parser end-to-end, mirroring the real-world
+        // testpilot `app.html` shape that the OLD `[^()]*`-bodied opener regex
+        // could never neutralize: the control expressions contain NESTED parens
+        // (`applications()`), so the single relational `>` was never reached and
+        // the file wrongly landed as an unexpected partial. The balanced-paren
+        // forward scan handles these, proving the relational operators are the
+        // sole cause, so the file is bucketed as a framework partial.
+        let content = "<div>\n\
+@if (applications().length > 0) {\n\
+  <ul>\n\
+    @for (a of applications(); track a.id) {\n\
+      <li>{{ a.name }}</li>\n\
+    }\n\
+  </ul>\n\
+}\n\
+</div>";
+        let app_html = make_real_html_indexed_file("src/app/app.html", content);
+
+        // Sanity: real parser produced a partial parse that still carries the
+        // text-scanned control-flow symbols (both halves of the SF-004 root
+        // cause), otherwise the assertion below would be vacuous.
+        assert!(
+            matches!(app_html.parse_status, ParseStatus::PartialParse { .. }),
+            "real parser must report a partial parse for the nested-paren Angular template"
+        );
+        assert!(
+            app_html
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if control-flow symbol must survive the partial parse"
+        );
+
+        let index = make_index(vec![("src/app/app.html", app_html)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(stats.partial_parse_count, 1);
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 1,
+            "nested-paren Angular openers must be excused as a framework partial"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 0);
+        assert_eq!(
+            stats.expected_framework_partial_parse_files,
+            vec!["src/app/app.html".to_string()]
+        );
+        assert!(stats.unexpected_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_nested_paren_opener_plus_broken_html_stays_unexpected() {
+        // NEGATIVE control, real parser end-to-end: a nested-paren `@if
+        // (applications().length > 0)` PLUS a genuine structural defect (an
+        // unclosed `<div` with attribute garbage) elsewhere. Neutralizing only the
+        // opener's relational operators leaves the broken tag, so the whole-file
+        // re-parse stays dirty and the file is NOT excused. Proves the balanced
+        // scan still validates the WHOLE file, never masking an unrelated defect.
+        let content = "<div>\n\
+@if (applications().length > 0) {\n\
+  <span></span>\n\
+}\n\
+<div class=\n\
+<section></section\n\
+</div>";
+        let broken = make_real_html_indexed_file("src/app/broken_nested.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/broken_nested.html", broken)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 0,
+            "broken HTML alongside a nested-paren opener must NOT be excused"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/app/broken_nested.html".to_string()]
+        );
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_unterminated_opener_paren_stays_unexpected() {
+        // NEGATIVE control for the EOF-skip branch of the balanced-paren scan: an
+        // `@if (` whose control expression is never closed (the file ends before
+        // the matching `)`). An unterminated control expression is itself a
+        // genuine defect; the scan must skip that opener (neutralize nothing in
+        // it), so the re-parse stays dirty and the file is NOT excused.
+        let content = "<div>\n@if (applications().length > 0 {\n  <span></span>\n";
+        let broken = make_real_html_indexed_file("src/app/unterminated.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/unterminated.html", broken)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 0,
+            "an unterminated `@if (` must NOT be excused"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
     }
 
     #[test]

@@ -96,16 +96,28 @@ pub struct HealthResponse {
 struct RenderOptions {
     include_savings_footer: bool,
     record_stats: bool,
+    /// Byte budget for the `symbol_context` references section
+    /// (`build_with_budget`). Explicit tool calls deserve a roomy default so a
+    /// symbol with a couple dozen references renders in full; the prompt-context
+    /// hook injection stays lean to avoid flooding auto-injected context.
+    symbol_context_references_budget_bytes: u64,
 }
+
+/// ~100 tokens. Kept small for auto-injected prompt context.
+const HOOK_REFERENCES_BUDGET_BYTES: u64 = 400;
+/// ~1000 tokens. Explicit `get_symbol_context` calls render references in full.
+const TOOL_REFERENCES_BUDGET_BYTES: u64 = 4000;
 
 const HOOK_RENDER_OPTIONS: RenderOptions = RenderOptions {
     include_savings_footer: true,
     record_stats: true,
+    symbol_context_references_budget_bytes: HOOK_REFERENCES_BUDGET_BYTES,
 };
 
 const TOOL_RENDER_OPTIONS: RenderOptions = RenderOptions {
     include_savings_footer: false,
     record_stats: true,
+    symbol_context_references_budget_bytes: TOOL_REFERENCES_BUDGET_BYTES,
 };
 
 fn format_prompt_context_signal(level: &str, evidence: impl Into<String>, body: String) -> String {
@@ -1373,8 +1385,10 @@ fn symbol_context_text(
         }
     }
 
-    // Apply budget (100 tokens = 400 bytes).
-    let (body_text, remaining) = build_with_budget(&body_lines, 400);
+    // Apply the references-section budget. Tool calls get ~1000 tokens
+    // (4000 bytes); the prompt-context hook stays at ~100 tokens (400 bytes).
+    let (body_text, remaining) =
+        build_with_budget(&body_lines, options.symbol_context_references_budget_bytes);
     let completeness = if total < grand_total {
         "truncated"
     } else if remaining > 0 {
@@ -5735,5 +5749,96 @@ mod tests {
         assert_eq!(snap.read_fires, 1);
         assert_eq!(snap.write_fires, 1);
         assert_eq!(snap.read_saved_tokens, 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // symbol_context references-section budget (Fix 2)
+    // -----------------------------------------------------------------------
+
+    /// Build an index where `process_request` is referenced from `ref_files`
+    /// distinct files. The references resolve by name (no `path`/`file` filter),
+    /// so all of them land in the references section. `ref_files <= 9` keeps the
+    /// count under the 10-match display cap, isolating the byte budget as the
+    /// only possible source of truncation. With long file paths the rendered
+    /// body exceeds the old 400-byte (~100 token) budget but fits the new
+    /// 4000-byte (~1000 token) tool budget.
+    fn build_referenced_symbol_index(ref_files: usize) -> SidecarState {
+        let files: Vec<(String, IndexedFile)> = (0..ref_files)
+            .map(|i| {
+                let path = format!("src/handlers/request_handler_module_{i:02}.rs");
+                let file = make_indexed_file(
+                    &path,
+                    vec![],
+                    vec![make_reference(
+                        "process_request",
+                        ReferenceKind::Call,
+                        (i as u32) + 5,
+                    )],
+                    ParseStatus::Parsed,
+                );
+                (path, file)
+            })
+            .collect();
+        let file_refs: Vec<(&str, IndexedFile)> =
+            files.iter().map(|(p, f)| (p.as_str(), f.clone())).collect();
+        make_state(file_refs)
+    }
+
+    #[test]
+    fn test_symbol_context_tool_renders_references_without_default_budget_truncation() {
+        // 9 referencing files fit under the 10-match cap, so truncation here
+        // could only come from the byte budget — which the tool path must not hit.
+        let state = build_referenced_symbol_index(9);
+        let params = SymbolContextParams {
+            name: "process_request".to_string(),
+            file: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+        };
+
+        let tool = symbol_context_tool_text(&state, &params).expect("tool render");
+
+        // Sanity: the body really is larger than the old 400-byte budget, so
+        // this test would have failed before the budget was raised.
+        assert!(
+            tool.len() > 400,
+            "expected a references body larger than the old budget: {} bytes\n{tool}",
+            tool.len()
+        );
+        assert!(
+            !tool.contains("[truncated]"),
+            "tool path must render all references without budget truncation: {tool}"
+        );
+        // All 9 referencing files should appear (none dropped by the 10-match cap).
+        for i in 0..9 {
+            let path = format!("src/handlers/request_handler_module_{i:02}.rs");
+            assert!(
+                tool.contains(&path),
+                "expected reference file {path} in output: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_symbol_context_hook_keeps_lean_references_budget() {
+        // The same body, rendered through the prompt-context hook path, must
+        // still truncate at the lean ~100-token budget so auto-injected context
+        // stays compact. This pins the intentional hook/tool budget split.
+        let state = build_referenced_symbol_index(9);
+        let params = SymbolContextParams {
+            name: "process_request".to_string(),
+            file: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+        };
+
+        let hook = symbol_context_hook_text(&state, &params).expect("hook render");
+
+        assert!(
+            hook.contains("[truncated]"),
+            "hook path should still truncate the references section at the lean budget: {hook}"
+        );
     }
 }

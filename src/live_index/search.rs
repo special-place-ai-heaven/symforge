@@ -1781,6 +1781,9 @@ pub fn tier_path_match_score(tier: SearchFilesTier) -> f64 {
         SearchFilesTier::Basename => 0.6,
         SearchFilesTier::LoosePath => 0.3,
         SearchFilesTier::CoChange => 0.0,
+        // Tier-2 metadata-only paths earn no path-match credit; the hard rank
+        // floor in `reorder_hits_by_frecency_fusion` keeps them below Tier-1.
+        SearchFilesTier::MetadataOnly => 0.0,
     }
 }
 
@@ -1841,6 +1844,13 @@ pub fn reorder_hits_by_frecency_fusion(
     debug_assert_eq!(hits.len(), breakdowns.len());
     let mut indexed: Vec<(usize, SearchFilesHit)> = hits.drain(..).enumerate().collect();
     indexed.sort_by(|a, b| {
+        // Rank floor: Tier-2 metadata-only hits never outrank a Tier-1 hit, even
+        // if frecency would score them higher. `false` (Tier-1) precedes `true`.
+        let a_meta = a.1.tier.is_metadata_only();
+        let b_meta = b.1.tier.is_metadata_only();
+        if a_meta != b_meta {
+            return a_meta.cmp(&b_meta);
+        }
         let sa = breakdowns[a.0].combined;
         let sb = breakdowns[b.0].combined;
         sb.partial_cmp(&sa)
@@ -2980,6 +2990,7 @@ mod tests {
             path: path.to_string(),
             coupling_score: None,
             shared_commits: None,
+            metadata_reason: None,
         }
     }
 
