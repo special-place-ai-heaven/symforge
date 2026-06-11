@@ -182,13 +182,15 @@ impl ConfigExtractor for JsonExtractor {
             sort_order: &mut sort_order,
         };
 
-        // Only walk into the root if it is an object or array.
+        // Only walk into the root if it is an object or array. The root's
+        // parent range is the whole document.
+        let root_range = (0u32, content.len() as u32);
         match &value {
             serde_json::Value::Object(map) => {
-                walker.walk_object(map, "", 0);
+                walker.walk_object(map, "", root_range, 0);
             }
             serde_json::Value::Array(arr) => {
-                walker.walk_array(arr, "", (0, content.len() as u32), 0);
+                walker.walk_array(arr, "", root_range, 0);
             }
             _ => {}
         }
@@ -240,20 +242,44 @@ impl JsonWalker<'_> {
         &mut self,
         map: &serde_json::Map<String, serde_json::Value>,
         parent_path: &str,
+        parent_byte_range: (u32, u32),
         depth: u32,
     ) {
-        let mut search_from: usize = 0;
+        // `serde_json::Map` iterates in BTreeMap (alphabetical) order in this
+        // build — preserve_order is only activated via tree-sitter's
+        // build-dependencies, which resolver v3 does not unify into the runtime
+        // graph (verified: keys come back sorted). The byte-range scanner below
+        // is document-order with a forward cursor, so first recover document
+        // order by locating each key within this object's byte range and sorting
+        // by position. Scoping to the parent range also prevents a key binding to
+        // an identically named key in a sibling object.
+        let parent_start = (parent_byte_range.0 as usize).min(self.content.len());
+        let parent_end = (parent_byte_range.1 as usize).min(self.content.len());
 
+        let mut ordered: Vec<(usize, &String, &serde_json::Value)> = Vec::with_capacity(map.len());
         for (key, value) in map.iter() {
+            let offset = find_key_offset(self.content, key, parent_start, parent_end)
+                .unwrap_or(parent_start);
+            ordered.push((offset, key, value));
+        }
+        ordered.sort_by_key(|&(offset, _, _)| offset);
+
+        // Forward cursor within the parent: each key's value range is found
+        // starting at or after the previous key's value end, never crossing the
+        // parent boundary.
+        let mut cursor = parent_start;
+        for (_, key, value) in ordered {
             let key_path = join_key_path(parent_path, key);
-            let (byte_start, byte_end) = find_key_value_range(self.content, key, &mut search_from);
+            let (byte_start, byte_end) =
+                find_key_value_range(self.content, key, cursor, parent_end);
+            cursor = byte_end.max(cursor);
             let byte_range = (byte_start as u32, byte_end as u32);
             self.push_key_symbol(key_path.clone(), depth, byte_range);
 
             if depth + 1 < MAX_DEPTH {
                 match value {
                     serde_json::Value::Object(child_map) => {
-                        self.walk_object(child_map, &key_path, depth + 1);
+                        self.walk_object(child_map, &key_path, byte_range, depth + 1);
                     }
                     serde_json::Value::Array(child_arr) => {
                         self.walk_array(child_arr, &key_path, byte_range, depth + 1);
@@ -284,7 +310,7 @@ impl JsonWalker<'_> {
             if depth + 1 < MAX_DEPTH {
                 match value {
                     serde_json::Value::Object(child_map) => {
-                        self.walk_object(child_map, &elem_path, depth + 1);
+                        self.walk_object(child_map, &elem_path, byte_range, depth + 1);
                     }
                     serde_json::Value::Array(child_arr) => {
                         self.walk_array(child_arr, &elem_path, byte_range, depth + 1);
@@ -361,47 +387,68 @@ fn find_value_start_in_range(content: &[u8], start: usize, end: usize) -> Option
     Some(skip_whitespace(content, start).min(end))
 }
 
-/// Search the raw bytes for `"key":` starting from `*search_from`, returning
-/// the byte range covering the key and its associated value.
+/// Build the JSON-encoded quoted-key needle for `key`, escaping backslashes and
+/// double quotes so keys like `a"b` / `a\b` match their encoded form.
+fn key_needle(key: &str) -> String {
+    let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped_key)
+}
+
+/// Find the byte offset of the quoted key `"key"` within `[search_from, end)`,
+/// or `None` if it does not occur in that range.
+fn find_key_offset(content: &[u8], key: &str, search_from: usize, end: usize) -> Option<usize> {
+    let start = search_from.min(content.len());
+    let end = end.min(content.len());
+    if start >= end {
+        return None;
+    }
+    let needle = key_needle(key);
+    find_substring(&content[start..end], needle.as_bytes()).map(|rel| start + rel)
+}
+
+/// Search the raw bytes for `"key":` within `[search_from, parent_end)`,
+/// returning the byte range covering the key and its associated value.
 ///
 /// The start is the opening `"` of the key. The end is determined by scanning
-/// past the value (tracking braces, brackets, and strings).
-fn find_key_value_range(content: &[u8], key: &str, search_from: &mut usize) -> (usize, usize) {
-    // Build the needle: `"key"` (we search for the quoted key).
-    // Escape backslashes and double-quotes within the key so that keys like
-    // `a"b` or `a\b` match their JSON-encoded form (`"a\"b"`, `"a\\b"`).
-    let escaped_key = key.replace('\\', "\\\\").replace('"', "\\\"");
-    let needle = format!("\"{}\"", escaped_key);
-    let needle_bytes = needle.as_bytes();
+/// past the value (tracking braces, brackets, and strings). The search is
+/// clamped to the enclosing object's bytes so a key cannot bind to an identically
+/// named key in a sibling object, and so a miss degrades to the parent's range
+/// rather than the whole document.
+fn find_key_value_range(
+    content: &[u8],
+    key: &str,
+    search_from: usize,
+    parent_end: usize,
+) -> (usize, usize) {
+    let search_from = search_from.min(content.len());
+    let parent_end = parent_end.min(content.len());
+    let needle_len = key_needle(key).len();
 
-    // Search forward from the current cursor.
-    let hay = &content[*search_from..];
-    if let Some(rel_pos) = find_substring(hay, needle_bytes) {
-        let abs_key_start = *search_from + rel_pos;
-
-        // Find the colon after the key.
-        let after_key = abs_key_start + needle_bytes.len();
-        let colon_pos = match content[after_key..].iter().position(|&b| b == b':') {
-            Some(p) => after_key + p,
-            None => {
-                // Fallback: return just the key span.
-                let end = abs_key_start + needle_bytes.len();
-                *search_from = end;
-                return (abs_key_start, end);
-            }
+    // Search only within the enclosing object's byte range.
+    if let Some(abs_key_start) = find_key_offset(content, key, search_from, parent_end) {
+        // Find the colon after the key, bounded by the parent range.
+        let after_key = abs_key_start + needle_len;
+        let colon_pos = content[after_key.min(parent_end)..parent_end]
+            .iter()
+            .position(|&b| b == b':')
+            .map(|p| after_key + p);
+        let Some(colon_pos) = colon_pos else {
+            // No colon before the parent end: degrade to the key span.
+            return (abs_key_start, after_key.min(parent_end));
         };
 
         // Skip whitespace after the colon to find the value start.
         let value_start = skip_whitespace(content, colon_pos + 1);
 
-        // Determine the value end.
-        let value_end = scan_value_end(content, value_start);
+        // Determine the value end, clamped to the parent range.
+        let value_end = scan_value_end(content, value_start).min(parent_end);
 
-        *search_from = value_end;
         (abs_key_start, value_end)
     } else {
-        // Key not found (shouldn't happen for valid JSON). Return file bounds.
-        (0, content.len())
+        // Key not found within the parent (e.g. the key name collides with a
+        // nested value scanned past). Degrade to the parent's range — never the
+        // whole document, which would poison enclosing-symbol attribution.
+        (search_from, parent_end)
     }
 }
 
@@ -632,6 +679,106 @@ mod tests {
         assert_eq!(
             JsonExtractor.edit_capability(),
             EditCapability::TextEditSafe
+        );
+    }
+
+    // ---- SF-STRESS-018: no whole-document spans; correct enclosing attribution ----
+
+    fn find_sym<'a>(syms: &'a [SymbolRecord], name: &str) -> &'a SymbolRecord {
+        syms.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol {name} not found"))
+    }
+
+    /// No leaf key may be indexed with a span covering (almost) the whole file.
+    /// A whole-document span on a leaf poisons find_enclosing_symbol so that
+    /// unrelated lines resolve to the alphabetically-first leaf key.
+    #[test]
+    fn test_no_leaf_key_spans_whole_document() {
+        // Keys deliberately NOT in alphabetical order (zebra < ... fails sort),
+        // forcing the BTreeMap iteration order to differ from document order.
+        let content = br#"{
+  "zebra": "z",
+  "mango": "m",
+  "alpha": "a"
+}"#;
+        let result = JsonExtractor.extract(content);
+        let total = content.len() as u32;
+        for sym in &result.symbols {
+            let span = sym.byte_range.1.saturating_sub(sym.byte_range.0);
+            assert!(
+                span < total / 2,
+                "leaf key {} got an oversized span {:?} of {} bytes (file {} bytes)",
+                sym.name,
+                sym.byte_range,
+                span,
+                total
+            );
+        }
+    }
+
+    /// Each leaf string key's byte range must cover its own `"key": "value"`
+    /// regardless of alphabetical-vs-document order mismatch.
+    #[test]
+    fn test_leaf_byte_ranges_match_source_under_non_alpha_order() {
+        let content = br#"{
+  "zebra": "Z value",
+  "mango": "M value",
+  "alpha": "A value"
+}"#;
+        let result = JsonExtractor.extract(content);
+        for (key, needle) in [
+            ("zebra", &b"\"zebra\": \"Z value\""[..]),
+            ("mango", &b"\"mango\": \"M value\""[..]),
+            ("alpha", &b"\"alpha\": \"A value\""[..]),
+        ] {
+            let sym = find_sym(&result.symbols, key);
+            let slice = &content[sym.byte_range.0 as usize..sym.byte_range.1 as usize];
+            assert_eq!(
+                slice, needle,
+                "key {key} byte range should cover its own key/value pair"
+            );
+            // The line range must be a single line, not the whole document.
+            assert_eq!(
+                sym.line_range.0, sym.line_range.1,
+                "leaf key {key} should occupy a single line, got {:?}",
+                sym.line_range
+            );
+        }
+    }
+
+    /// Duplicate key names across sibling objects must bind to their own parent,
+    /// not cross-bind to the first object's occurrence (the alerts.clearReset vs
+    /// buttons.clearReset corpus case).
+    #[test]
+    fn test_duplicate_keys_across_siblings_bind_to_own_parent() {
+        let content = br#"{
+  "alerts": {
+    "clearReset": "alerts reset"
+  },
+  "buttons": {
+    "clearReset": "buttons reset"
+  }
+}"#;
+        let result = JsonExtractor.extract(content);
+
+        let alerts_reset = find_sym(&result.symbols, "alerts.clearReset");
+        let buttons_reset = find_sym(&result.symbols, "buttons.clearReset");
+
+        let alerts_slice =
+            &content[alerts_reset.byte_range.0 as usize..alerts_reset.byte_range.1 as usize];
+        let buttons_slice =
+            &content[buttons_reset.byte_range.0 as usize..buttons_reset.byte_range.1 as usize];
+
+        assert_eq!(alerts_slice, &b"\"clearReset\": \"alerts reset\""[..]);
+        assert_eq!(buttons_slice, &b"\"clearReset\": \"buttons reset\""[..]);
+        assert_ne!(
+            alerts_reset.byte_range, buttons_reset.byte_range,
+            "sibling duplicate keys must not share a byte range"
+        );
+        assert!(
+            buttons_reset.byte_range.0 > alerts_reset.byte_range.0,
+            "buttons.clearReset must bind to the later occurrence, not the first"
         );
     }
 

@@ -356,10 +356,44 @@ fn find_table_header_bytes(bytes: &[u8], key_path: &str) -> (usize, usize) {
     find_header_pattern(bytes, &format!("[{}]", unescaped))
 }
 
-/// Reverse the escaping applied by `join_key_path`: `~1` -> `.`, `~0` -> `~`.
+/// Reverse the escaping applied by `escape_key_segment` / `join_key_path`:
+/// `~0` -> `~`, `~1` -> `.`, `~2` -> `[`, `~3` -> `]`.
+///
+/// A single left-to-right scan handles all four escapes unambiguously; the
+/// previous sequential-`replace` form silently left `~2`/`~3` (escaped brackets)
+/// untouched, producing a wrong header pattern for keys with literal brackets.
 fn unescape_key_path(s: &str) -> String {
-    // Must replace ~1 first, then ~0, to avoid double-unescaping.
-    s.replace("~1", ".").replace("~0", "~")
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '~' {
+            match chars.peek() {
+                Some('0') => {
+                    out.push('~');
+                    chars.next();
+                    continue;
+                }
+                Some('1') => {
+                    out.push('.');
+                    chars.next();
+                    continue;
+                }
+                Some('2') => {
+                    out.push('[');
+                    chars.next();
+                    continue;
+                }
+                Some('3') => {
+                    out.push(']');
+                    chars.next();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn find_array_table_header_bytes(bytes: &[u8], key_path: &str, index: usize) -> (usize, usize) {
@@ -611,5 +645,36 @@ mod tests {
             TomlExtractor.edit_capability(),
             EditCapability::StructuralEditSafe
         );
+    }
+
+    // ---- SF-STRESS-015: unescape must reverse all four escapes ----
+
+    #[test]
+    fn test_unescape_key_path_reverses_all_escapes() {
+        // The previous sequential-replace form left ~2/~3 (brackets) untouched.
+        assert_eq!(unescape_key_path("a~1b"), "a.b");
+        assert_eq!(unescape_key_path("a~0b"), "a~b");
+        assert_eq!(unescape_key_path("items~20~3"), "items[0]");
+        assert_eq!(unescape_key_path("a~1b~2c~3"), "a.b[c]");
+    }
+
+    #[test]
+    fn test_unescape_key_path_roundtrips_escape_key_segment() {
+        for raw in ["plain", "with.dot", "tilde~here", "arr[0]", "mix.[a]~b"] {
+            let escaped = super::super::escape_key_segment(raw);
+            assert_eq!(
+                unescape_key_path(&escaped),
+                raw,
+                "round-trip failed for {raw:?} (escaped {escaped:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unescape_key_path_preserves_non_ascii() {
+        // A byte-wise unescaper would corrupt multi-byte UTF-8; the char-wise
+        // scan must leave non-ASCII keys intact.
+        assert_eq!(unescape_key_path("café~1com"), "café.com");
+        assert_eq!(unescape_key_path("日本~0語"), "日本~語");
     }
 }
