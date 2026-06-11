@@ -534,7 +534,7 @@ impl SymForgeServer {
             "get_file_content" => call!(get_file_content, tools::GetFileContentInput),
             "get_symbol" => call!(get_symbol, tools::GetSymbolInput),
             "get_symbol_context" => call!(get_symbol_context, tools::GetSymbolContextInput),
-            "health" => self.health().await,
+            "health" => call!(health, tools::HealthInput),
             "health_compact" => self.health_compact().await,
             "conventions" => self.conventions().await,
             other => format!("dispatch_tool_for_tests: unknown tool '{other}'"),

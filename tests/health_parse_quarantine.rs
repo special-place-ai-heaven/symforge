@@ -17,6 +17,9 @@ use symforge::watcher::{WatcherInfo, WatcherState};
 struct QuarantineFixture {
     unexpected_partial_files: Vec<String>,
     expected_vendor_partial_files: Vec<String>,
+    expected_generated_partial_files: Vec<String>,
+    expected_test_fixture_partial_files: Vec<String>,
+    expected_template_dsl_partial_files: Vec<String>,
     expected_framework_partial_files: Vec<String>,
     expected_language_partial_files: Vec<String>,
     failed_files: Vec<(String, String)>,
@@ -26,6 +29,9 @@ fn published_state(fixture: QuarantineFixture) -> PublishedIndexState {
     let QuarantineFixture {
         unexpected_partial_files,
         expected_vendor_partial_files,
+        expected_generated_partial_files,
+        expected_test_fixture_partial_files,
+        expected_template_dsl_partial_files,
         expected_framework_partial_files,
         expected_language_partial_files,
         failed_files,
@@ -33,11 +39,17 @@ fn published_state(fixture: QuarantineFixture) -> PublishedIndexState {
 
     let partial_parse_count = unexpected_partial_files.len()
         + expected_vendor_partial_files.len()
+        + expected_generated_partial_files.len()
+        + expected_test_fixture_partial_files.len()
+        + expected_template_dsl_partial_files.len()
         + expected_framework_partial_files.len()
         + expected_language_partial_files.len();
     let failed_count = failed_files.len();
     let mut partial_parse_files = unexpected_partial_files.clone();
     partial_parse_files.extend(expected_vendor_partial_files.iter().cloned());
+    partial_parse_files.extend(expected_generated_partial_files.iter().cloned());
+    partial_parse_files.extend(expected_test_fixture_partial_files.iter().cloned());
+    partial_parse_files.extend(expected_template_dsl_partial_files.iter().cloned());
     partial_parse_files.extend(expected_framework_partial_files.iter().cloned());
     partial_parse_files.extend(expected_language_partial_files.iter().cloned());
     partial_parse_files.sort();
@@ -51,12 +63,18 @@ fn published_state(fixture: QuarantineFixture) -> PublishedIndexState {
         partial_parse_count,
         unexpected_partial_parse_count: unexpected_partial_files.len(),
         expected_vendor_partial_parse_count: expected_vendor_partial_files.len(),
+        expected_generated_partial_parse_count: expected_generated_partial_files.len(),
+        expected_test_fixture_partial_parse_count: expected_test_fixture_partial_files.len(),
+        expected_template_dsl_partial_parse_count: expected_template_dsl_partial_files.len(),
         expected_framework_partial_parse_count: expected_framework_partial_files.len(),
         expected_language_partial_parse_count: expected_language_partial_files.len(),
         failed_count,
         partial_parse_files,
         unexpected_partial_parse_files: unexpected_partial_files,
         expected_vendor_partial_parse_files: expected_vendor_partial_files,
+        expected_generated_partial_parse_files: expected_generated_partial_files,
+        expected_test_fixture_partial_parse_files: expected_test_fixture_partial_files,
+        expected_template_dsl_partial_parse_files: expected_template_dsl_partial_files,
         expected_framework_partial_parse_files: expected_framework_partial_files,
         expected_language_partial_parse_files: expected_language_partial_files,
         failed_files,
@@ -81,6 +99,7 @@ fn health_reports_parse_span_quarantine_registry() {
         expected_framework_partial_files: vec!["src/app/app.html".to_string()],
         expected_language_partial_files: vec!["src/types.ts".to_string()],
         failed_files: vec![("src/unparseable.rs".to_string(), "lexer panic".to_string())],
+        ..QuarantineFixture::default()
     });
     let watcher = WatcherInfo {
         state: WatcherState::Off,
@@ -90,7 +109,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 omitted=0"
+            "Parse/span quarantine registry: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
         ),
         "full health should summarize parse/span quarantine evidence: {full}"
     );
@@ -118,7 +137,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 omitted=0"
+            "Parse/span quarantine: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
         ),
         "compact health should retain bounded quarantine counts: {compact}"
     );
@@ -162,7 +181,7 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 omitted=2"
+            "Parse/span quarantine registry: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 offset=0 omitted=2"
         ),
         "full health should cap quarantine evidence and report omitted entries: {full}"
     );
@@ -174,13 +193,121 @@ fn health_parse_span_quarantine_registry_is_bounded() {
         !full.contains("src/broken_10.rs [unexpected_partial]"),
         "entries beyond the registry limit should be omitted: {full}"
     );
+    // SF-STRESS-010: when the default window omits entries, the registry must
+    // point the caller at the paging parameters instead of leaving them stranded.
+    assert!(
+        full.contains("quarantine_limit/quarantine_offset to page the full list"),
+        "omitted registry should advertise the paging retrieval surface: {full}"
+    );
 
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 omitted=2"
+            "Parse/span quarantine: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 offset=0 omitted=2"
         ),
         "compact health should expose the bounded quarantine count: {compact}"
+    );
+}
+
+#[test]
+fn health_quarantine_registry_is_retrievable_via_paging_window() {
+    // SF-STRESS-010: the full quarantine list must be retrievable. With a raised
+    // limit the registry shows every entry; with an offset it pages.
+    use symforge::live_index::HealthStats;
+    use symforge::protocol::format::{QuarantineWindow, health_report_from_stats_windowed};
+
+    let unexpected_partial_files: Vec<String> = (0..25)
+        .map(|index| format!("src/broken_{index:02}.rs"))
+        .collect();
+    let published = published_state(QuarantineFixture {
+        unexpected_partial_files: unexpected_partial_files.clone(),
+        ..QuarantineFixture::default()
+    });
+    let watcher = WatcherInfo {
+        state: WatcherState::Off,
+        ..WatcherInfo::default()
+    };
+
+    // Rebuild HealthStats from the published state so we can drive the windowed
+    // formatter directly (the published lists carry all 25 entries).
+    let stats = HealthStats {
+        file_count: published.file_count,
+        symbol_count: published.symbol_count,
+        parsed_count: published.parsed_count,
+        partial_parse_count: published.partial_parse_count,
+        unexpected_partial_parse_count: published.unexpected_partial_parse_count,
+        expected_vendor_partial_parse_count: published.expected_vendor_partial_parse_count,
+        expected_generated_partial_parse_count: published.expected_generated_partial_parse_count,
+        expected_test_fixture_partial_parse_count: published
+            .expected_test_fixture_partial_parse_count,
+        expected_template_dsl_partial_parse_count: published
+            .expected_template_dsl_partial_parse_count,
+        expected_framework_partial_parse_count: published.expected_framework_partial_parse_count,
+        expected_language_partial_parse_count: published.expected_language_partial_parse_count,
+        failed_count: published.failed_count,
+        load_duration: published.load_duration,
+        watcher_state: watcher.state.clone(),
+        events_processed: watcher.events_processed,
+        last_event_at: watcher.last_event_at,
+        debounce_window_ms: watcher.debounce_window_ms,
+        overflow_count: watcher.overflow_count,
+        last_overflow_at: watcher.last_overflow_at,
+        stale_files_found: watcher.stale_files_found,
+        last_reconcile_at: watcher.last_reconcile_at,
+        partial_parse_files: published.partial_parse_files.clone(),
+        unexpected_partial_parse_files: published.unexpected_partial_parse_files.clone(),
+        expected_vendor_partial_parse_files: published.expected_vendor_partial_parse_files.clone(),
+        expected_generated_partial_parse_files: published
+            .expected_generated_partial_parse_files
+            .clone(),
+        expected_test_fixture_partial_parse_files: published
+            .expected_test_fixture_partial_parse_files
+            .clone(),
+        expected_template_dsl_partial_parse_files: published
+            .expected_template_dsl_partial_parse_files
+            .clone(),
+        expected_framework_partial_parse_files: published
+            .expected_framework_partial_parse_files
+            .clone(),
+        expected_language_partial_parse_files: published
+            .expected_language_partial_parse_files
+            .clone(),
+        failed_files: published.failed_files.clone(),
+        tier_counts: published.tier_counts,
+        local_empty_reason: published.local_empty_reason.clone(),
+        untracked_indexed: published.untracked_indexed,
+    };
+
+    // Raised limit retrieves the full list (showing=25 omitted=0).
+    let full = health_report_from_stats_windowed(
+        "Ready",
+        &stats,
+        0,
+        QuarantineWindow::from_args(None, Some(50)),
+    );
+    assert!(
+        full.contains("showing=25 offset=0 omitted=0"),
+        "a raised limit must retrieve the entire quarantine list: {full}"
+    );
+    assert!(
+        full.contains("src/broken_24.rs [unexpected_partial]"),
+        "the last entry must be retrievable with a raised limit: {full}"
+    );
+
+    // Offset pages into the list (entry numbering reflects the offset).
+    let paged = health_report_from_stats_windowed(
+        "Ready",
+        &stats,
+        0,
+        QuarantineWindow::from_args(Some(20), Some(10)),
+    );
+    assert!(
+        paged.contains("showing=5 offset=20 omitted=0"),
+        "an offset must page the tail of the list: {paged}"
+    );
+    assert!(
+        paged.contains("21. src/broken_20.rs [unexpected_partial]"),
+        "paged entry numbering must reflect the offset: {paged}"
     );
 }
 
@@ -201,7 +328,7 @@ fn health_labels_angular_template_partial_as_expected_framework() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 omitted=0"
+            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 offset=0 omitted=0"
         ),
         "framework partial should be counted in its own bucket: {full}"
     );
@@ -230,7 +357,7 @@ fn health_labels_angular_template_partial_as_expected_framework() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 omitted=0"
+            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 offset=0 omitted=0"
         ),
         "compact health should carry the framework bucket count: {compact}"
     );
@@ -254,7 +381,7 @@ fn health_labels_typescript_import_type_array_partial_as_expected_language() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 omitted=0"
+            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "language partial should be counted in its own bucket: {full}"
     );
@@ -283,7 +410,7 @@ fn health_labels_typescript_import_type_array_partial_as_expected_language() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 omitted=0"
+            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "compact health should carry the language bucket count: {compact}"
     );
@@ -303,6 +430,9 @@ fn health_registry_total_accounts_for_every_partial_including_excused() {
 
     let registry_total = published.unexpected_partial_parse_count
         + published.expected_vendor_partial_parse_count
+        + published.expected_generated_partial_parse_count
+        + published.expected_test_fixture_partial_parse_count
+        + published.expected_template_dsl_partial_parse_count
         + published.expected_framework_partial_parse_count
         + published.expected_language_partial_parse_count
         + published.failed_count;
@@ -324,7 +454,7 @@ fn health_registry_total_accounts_for_every_partial_including_excused() {
     );
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=2 unexpected_partial=1 expected_vendor_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=2 omitted=0"
+            "Parse/span quarantine registry: total=2 unexpected_partial=1 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=2 offset=0 omitted=0"
         ),
         "registry total must equal the header partial count — no invisible partials: {full}"
     );

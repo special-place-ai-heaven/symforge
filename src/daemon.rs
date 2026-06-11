@@ -29,9 +29,9 @@ use crate::protocol::edit::{
 use crate::protocol::tools::{
     AnalyzeFileImpactInput, CheckpointNowInput, DiffSymbolsInput, EditPlanInput, ExploreInput,
     FindDependentsInput, FindReferencesInput, GetFileContentInput, GetFileContextInput,
-    GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, IndexFolderInput, InspectMatchInput,
-    InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput, SmartQueryInput,
-    TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
+    GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, HealthInput, IndexFolderInput,
+    InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
+    SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
 };
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
@@ -2349,11 +2349,21 @@ async fn execute_tool_call(
         "search_files" => Ok(server
             .search_files(Parameters(decode_params::<SearchFilesInput>(params)?))
             .await),
-        "health" => Ok(server.health_for_daemon_session(
-            runtime.project_id.clone(),
-            runtime.session_id.clone(),
-            runtime.canonical_root.clone(),
-        )),
+        "health" => {
+            // SF-STRESS-010: forward the quarantine paging window so the daemon
+            // (which owns the authoritative index in production) renders the
+            // requested registry slice instead of silently ignoring args.
+            let input: HealthInput = decode_params(params)?;
+            Ok(server.health_for_daemon_session(
+                runtime.project_id.clone(),
+                runtime.session_id.clone(),
+                runtime.canonical_root.clone(),
+                crate::protocol::format::QuarantineWindow::from_args(
+                    input.quarantine_offset.map(|n| n as usize),
+                    input.quarantine_limit.map(|n| n as usize),
+                ),
+            ))
+        }
         "health_compact" => Ok(server.health_compact_for_daemon_session(
             runtime.project_id.clone(),
             runtime.session_id.clone(),

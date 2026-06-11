@@ -23,7 +23,9 @@ use super::disambiguation::{
 pub(crate) use super::health_view::is_expected_framework_partial_parse;
 pub use super::health_view::{
     AdmissionTierLookupView, EXPECTED_FRAMEWORK_PARTIAL_PARSE_REASON,
-    EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON, EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
+    EXPECTED_GENERATED_PARTIAL_PARSE_REASON, EXPECTED_LANGUAGE_PARTIAL_PARSE_REASON,
+    EXPECTED_TEMPLATE_DSL_PARTIAL_PARSE_REASON, EXPECTED_TEST_FIXTURE_PARTIAL_PARSE_REASON,
+    EXPECTED_VENDOR_PARTIAL_PARSE_REASON, HealthStats,
 };
 use super::search::{NoiseClass, NoisePolicy, PathScope};
 use super::store::{IndexedFile, LiveIndex};

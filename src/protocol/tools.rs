@@ -258,6 +258,35 @@ pub struct CheckpointNowInput {
     pub verify_after_write: Option<bool>,
 }
 
+/// Input for `health`.
+///
+/// SF-STRESS-010: the parse/span quarantine registry was hard-capped at 10
+/// entries with no retrieval surface, so the full list of partial/failed files
+/// was unreachable without thousands of per-file calls. These optional paging
+/// parameters page the ranked registry; entries are ranked real-source-first so
+/// genuine repo-owned losses surface before vendored/fixture noise. Omitting
+/// both preserves the historical default (offset 0, limit 10).
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
+pub struct HealthInput {
+    /// Maximum quarantine registry entries to render (default 10, capped at
+    /// 1000). Raise to retrieve more of the full partial/failed file list.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub quarantine_limit: Option<u32>,
+    /// Offset into the ranked quarantine registry for paging (default 0).
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub quarantine_offset: Option<u32>,
+}
+
+impl HealthInput {
+    fn quarantine_limit(&self) -> Option<usize> {
+        self.quarantine_limit.map(|n| n as usize)
+    }
+
+    fn quarantine_offset(&self) -> Option<usize> {
+        self.quarantine_offset.map(|n| n as usize)
+    }
+}
+
 /// Input for `what_changed`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct WhatChangedInput {
@@ -696,20 +725,26 @@ fn search_scope_summary(
     if let Some(language) = language_filter {
         parts.push(format!("language `{language}`"));
     }
+    // SF-STRESS-011 honesty fix: these are HEURISTIC path-based filters, not a
+    // guaranteed outcome. Detection keys on path segments (vendor/, deps/,
+    // dist/, test_data/, ...) and basename patterns, so a vendored/generated
+    // file with an unconventional path can still appear in results. The header
+    // says "filter active (heuristic)" rather than asserting the file class was
+    // actually removed, which the previous "vendor filtered" wording overstated.
     parts.push(if noise_policy.include_tests {
         "tests included".to_string()
     } else {
-        "tests filtered".to_string()
+        "tests filter active (heuristic)".to_string()
     });
     parts.push(if noise_policy.include_generated {
         "generated included".to_string()
     } else {
-        "generated filtered".to_string()
+        "generated filter active (heuristic)".to_string()
     });
     parts.push(if noise_policy.include_vendor {
         "vendor included".to_string()
     } else {
-        "vendor filtered".to_string()
+        "vendor filter active (heuristic)".to_string()
     });
     parts.push(if include_personal_tooling {
         "personal tooling included".to_string()
@@ -1624,10 +1659,14 @@ fn search_files_hidden_noise_note(
 }
 
 fn search_files_filter_summary(include_vendor: bool, include_personal_tooling: bool) -> String {
+    // SF-STRESS-011 honesty fix: vendor detection is a heuristic path filter, so
+    // the header says "filter active (heuristic)" rather than asserting the file
+    // class was actually removed. Personal-tooling paths are an exact prefix
+    // match, so that claim stays definite.
     let vendor = if include_vendor {
         "vendor included"
     } else {
-        "vendor filtered"
+        "vendor filter active (heuristic)"
     };
     let personal = if include_personal_tooling {
         "personal tooling included"
@@ -5113,16 +5152,18 @@ impl SymForgeServer {
         project_id: Option<String>,
         session_id: Option<String>,
         project_root: Option<PathBuf>,
+        quarantine_window: format::QuarantineWindow,
     ) -> String {
         let published = self.index.published_state();
         let runtime_status =
             self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
         let rejected_stale_mutations = self.index.current_rejected_stale_mutations();
-        let mut result = format::health_report_from_published_state(
+        let mut result = format::health_report_from_published_state_windowed(
             &published,
             &watcher_guard,
             rejected_stale_mutations,
+            quarantine_window,
         );
         result.push('\n');
         result.push_str(&format::format_runtime_status(&runtime_status));
@@ -5318,12 +5359,14 @@ impl SymForgeServer {
         project_id: String,
         session_id: String,
         project_root: PathBuf,
+        quarantine_window: format::QuarantineWindow,
     ) -> String {
         self.health_for_runtime(
             format::RuntimeMode::DaemonReusedSession,
             Some(project_id),
             Some(session_id),
             Some(project_root),
+            quarantine_window,
         )
     }
 
@@ -5345,16 +5388,21 @@ impl SymForgeServer {
     /// project/session identity, hook adoption metrics, git temporal status. Always responds
     /// even during loading. Use to verify SymForge is working.
     #[tool(
-        description = "Diagnostic: index status, file/symbol counts, project/session identity, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
+        description = "Diagnostic: index status, file/symbol counts, project/session identity, load time, watcher state, token savings, hook adoption metrics, git temporal status. Always responds even during loading. Use to verify SymForge is working. Optional quarantine_limit/quarantine_offset page the parse/span quarantine registry (default 10) so the full list of partial/failed files is retrievable. NOT for diagnosing a specific file or symbol (use get_file_context or get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    pub(crate) async fn health(&self) -> String {
-        if let Some(result) = self.proxy_tool_call_without_params("health").await {
+    pub(crate) async fn health(&self, params: Parameters<HealthInput>) -> String {
+        let input = params.0;
+        if let Some(result) = self.proxy_tool_call("health", &input).await {
             // Ops guard (SF-001/SF-009 root-cause class): warn loudly if the daemon
             // we proxied to is serving an OLDER binary than this front-end.
             return append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
         }
-        let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None);
+        let window = format::QuarantineWindow::from_args(
+            input.quarantine_offset(),
+            input.quarantine_limit(),
+        );
+        let result = self.health_for_runtime(self.local_runtime_mode(), None, None, None, window);
         self.session_context
             .record_summary_output("health", (result.len() / 4).min(u32::MAX as usize) as u32);
         result
@@ -8819,7 +8867,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_always_responds_on_empty_index() {
         let server = make_server(make_live_index_empty());
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         // Health should NOT return the guard message; it should return actual health info
         assert!(
             !result.starts_with("Index not loaded"),
@@ -10755,7 +10805,9 @@ mod tests {
             "reset must never delete source files"
         );
 
-        let health = server.health().await;
+        let health = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             health.contains("load_source=fresh_load")
                 && health.contains("reset_state=current_project:p")
@@ -10960,7 +11012,7 @@ mod tests {
             "test symbol noise should be hidden by default: {result}"
         );
         assert!(
-            result.contains("vendor filtered"),
+            result.contains("vendor filter active (heuristic)"),
             "scope should report vendor filtering status: {result}"
         );
     }
@@ -11005,7 +11057,7 @@ mod tests {
             "vendor symbol should be hidden by default: {result}"
         );
         assert!(
-            result.contains("vendor filtered")
+            result.contains("vendor filter active (heuristic)")
                 && result.contains("1 noise-filtered match(es) suppressed"),
             "vendor filtering should be explicit in envelope: {result}"
         );
@@ -11489,7 +11541,9 @@ mod tests {
             "search_text should expose trust envelope, got: {result}"
         );
         assert!(
-            result.contains("Scope: repo-wide; tests filtered; generated filtered"),
+            result.contains(
+                "Scope: repo-wide; tests filter active (heuristic); generated filter active (heuristic)"
+            ),
             "search_text should expose applied scope, got: {result}"
         );
         assert!(
@@ -12276,7 +12330,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "not-found search_files output should disclose active filters: {result}"
         );
     }
@@ -12915,7 +12969,7 @@ mod tests {
             "suppressed-noise note should be visible: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "active search_files filters should be disclosed even on no-result output: {result}"
         );
     }
@@ -12983,7 +13037,7 @@ mod tests {
             "resolve=true should explain suppressed vendor candidate: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "resolve=true output should disclose active search_files filters: {result}"
         );
     }
@@ -13051,7 +13105,7 @@ mod tests {
             "glob search should report suppressed vendor candidate: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "glob search output should disclose active filters: {result}"
         );
     }
@@ -13081,7 +13135,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "resolve=true envelope should disclose active filters: {result}"
         );
         assert!(result.contains("src/protocol/tools.rs"), "got: {result}");
@@ -13120,7 +13174,7 @@ mod tests {
         assert!(result.contains("src/lib.rs"), "got: {result}");
         assert!(result.contains("tests/lib.rs"), "got: {result}");
         assert!(
-            result.contains("filters: vendor filtered; personal tooling filtered"),
+            result.contains("filters: vendor filter active (heuristic); personal tooling filtered"),
             "ambiguous resolve output should disclose active filters: {result}"
         );
     }
@@ -13129,7 +13183,9 @@ mod tests {
     async fn test_health_returns_status_fields() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server(make_live_index_ready(vec![(key, file)]));
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(result.contains("Status:"), "should have Status field");
         assert!(result.contains("Files:"), "should have Files field");
         assert!(result.contains("Symbols:"), "should have Symbols field");
@@ -13144,7 +13200,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Runtime: mode=local_process"),
             "health should identify local runtime mode: {result}"
@@ -13196,6 +13254,7 @@ mod tests {
             project_id.clone(),
             session_id.clone(),
             temp.path().to_path_buf(),
+            crate::protocol::format::QuarantineWindow::default(),
         );
         assert!(
             full.contains("Runtime: mode=daemon_reused_session")
@@ -13245,7 +13304,9 @@ mod tests {
         index.load_source = crate::live_index::store::IndexLoadSource::SnapshotRestore;
         let server = make_server_with_root(index, Some(temp.path().to_path_buf()));
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains("load_source=snapshot_restore")
                 && full.contains("reset_state=none")
@@ -13343,7 +13404,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains(&format!("Sidecar: pid=4242 port={port} state=alive")),
             "full health should surface alive sidecar state: {result}"
@@ -13359,7 +13422,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Sidecar: none"),
             "full health should distinguish no sidecar state: {result}"
@@ -13422,7 +13487,9 @@ mod tests {
         index.snapshot_verify_state = crate::live_index::store::SnapshotVerifyState::Running;
         let server = make_server(index);
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains("Snapshot verify: load_source=snapshot_restore state=running"),
             "full health should expose background snapshot verification progress: {full}"
@@ -13449,7 +13516,9 @@ mod tests {
             );
         let server = make_server(index);
 
-        let full = server.health().await;
+        let full = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             full.contains(
                 "Snapshot verify: load_source=snapshot_restore state=completed mismatches=12 showing=10 omitted=2",
@@ -13512,7 +13581,9 @@ mod tests {
             Some(temp.path().to_path_buf()),
         );
 
-        let result = server.health().await;
+        let result = server
+            .health(Parameters(super::HealthInput::default()))
+            .await;
         assert!(
             result.contains("Sidecar: pid=4242 port=unknown state=unknown"),
             "full health should surface unknown sidecar state: {result}"
