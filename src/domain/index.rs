@@ -78,6 +78,26 @@ impl LanguageId {
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tsx"))
     }
 
+    /// Returns `true` when `relative_path` is a `.h` header file.
+    ///
+    /// `.h` maps to [`LanguageId::C`] by extension, but in cross-platform repos
+    /// it routinely holds C++ (`class`/`namespace`/`::`) or Objective-C
+    /// (`@interface`/`@property`) — none of which the C grammar can parse,
+    /// causing total symbol loss (SF-STRESS-005). The grammar for a `.h` file is
+    /// therefore disambiguated from CONTENT at parse time (see
+    /// [`crate::parsing`]), not from the extension alone; this helper flags the
+    /// `.h` extension so the parse site knows to apply that disambiguation.
+    ///
+    /// Unambiguous C++ header extensions (`.hpp`/`.hxx`/`.hh`) already map to
+    /// [`LanguageId::Cpp`] and are NOT `.h`, so they are not flagged here.
+    pub fn is_c_header_path(relative_path: &str) -> bool {
+        relative_path
+            .rsplit(['/', '\\'])
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("h"))
+    }
+
     pub fn extensions(&self) -> &[&str] {
         match self {
             Self::Rust => &["rs"],
@@ -798,6 +818,25 @@ mod tests {
     #[test]
     fn test_symbol_kind_display_function() {
         assert_eq!(SymbolKind::Function.to_string(), "fn");
+    }
+
+    #[test]
+    fn test_is_c_header_path() {
+        // `.h` headers (any case, any directory separator) are flagged.
+        assert!(LanguageId::is_c_header_path("foo.h"));
+        assert!(LanguageId::is_c_header_path("src/runner/flutter_window.h"));
+        assert!(LanguageId::is_c_header_path("windows\\runner\\utils.h"));
+        assert!(LanguageId::is_c_header_path("API.H"));
+        // C++ header extensions map to Cpp directly and are NOT `.h`.
+        assert!(!LanguageId::is_c_header_path("foo.hpp"));
+        assert!(!LanguageId::is_c_header_path("foo.hxx"));
+        assert!(!LanguageId::is_c_header_path("foo.hh"));
+        // Non-headers.
+        assert!(!LanguageId::is_c_header_path("foo.c"));
+        assert!(!LanguageId::is_c_header_path("foo.cpp"));
+        assert!(!LanguageId::is_c_header_path("README"));
+        // A `.h` in the directory name, not the file, must not match.
+        assert!(!LanguageId::is_c_header_path("foo.h/bar.c"));
     }
 
     #[test]
