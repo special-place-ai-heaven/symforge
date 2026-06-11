@@ -9,7 +9,7 @@
 [![npm](https://img.shields.io/npm/v/symforge?label=npm&color=cb3837)](https://www.npmjs.com/package/symforge)
 [![CI](https://github.com/special-place-ai-heaven/symforge/actions/workflows/ci.yml/badge.svg)](https://github.com/special-place-ai-heaven/symforge/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.95-orange?logo=rust)](./rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.96-orange?logo=rust)](./rust-toolchain.toml)
 [![MCP](https://img.shields.io/badge/protocol-MCP-8A2BE2)](https://modelcontextprotocol.io)
 [![Platforms](https://img.shields.io/badge/platforms-win--x64%20%7C%20linux--x64%20%7C%20mac--arm64%20%7C%20mac--x64-555)](#install)
 
@@ -189,6 +189,8 @@ sequenceDiagram
 SymForge parses **19 source languages**:
 
 Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, C#, Ruby, PHP, Swift, Perl, Kotlin, Dart, Elixir, HTML, CSS, and SCSS.
+
+Grammar choices are evidence-driven: Dart, for example, uses the spec-native [nielsenko `tree-sitter-dart`](https://crates.io/crates/tree-sitter-dart) grammar after corpus measurement over 2,800+ real Flutter files — full Dart 3.0–3.12 syntax (records, patterns, sealed classes, dot shorthands, null-aware elements, private named parameters) parses cleanly, with extraction driven by grammar `name` fields. The selection methodology and falsification record live in [docs/dart-parser-investigation.md](./docs/dart-parser-investigation.md).
 
 It also indexes common project formats:
 
@@ -572,7 +574,7 @@ cargo build --no-default-features --features embed
 cargo test --no-default-features --features embed --lib -- --test-threads=1
 ```
 
-The Rust toolchain is pinned by `rust-toolchain.toml` to Rust 1.95.0 with `rustfmt` and `clippy`; the crate uses Rust edition 2024. PR and push CI run version sync, formatting, `cargo check`, clippy with warnings denied, the full Rust test suite, the engine-only embed build (including a musl cross-compile gate), a release build, and npm tests.
+The Rust toolchain is pinned by `rust-toolchain.toml` (currently Rust 1.96.0, with `rustfmt` and `clippy`) — that file is the single source of toolchain truth for local builds, CI, and release workflows alike; the crate uses Rust edition 2024. PR and push CI run version sync, formatting, `cargo check`, clippy with warnings denied, the full Rust test suite, the engine-only embed build (including a musl cross-compile gate), a release build, and npm tests.
 
 Scheduled and manual CI also run bounded ignored performance evidence:
 
@@ -591,7 +593,7 @@ The release workflow is driven by Release Please on `main`. When a release is cr
 
 ## Project Notes
 
-The live implementation backlog is tracked in [docs/live-code-backlog.md](./docs/live-code-backlog.md). Historical plans, reviews, and local agent artifacts were pruned from the repository; the README is the public starting point, the [wiki](https://github.com/special-place-ai-heaven/symforge/wiki) is the long-form reference, and the backlog file is the implementation queue.
+The live implementation backlog is tracked in [docs/live-code-backlog.md](./docs/live-code-backlog.md). The forward architecture direction — tree-sitter as the permanent universal Tier-0 index, with per-language semantic engines (LSP, SCIP) as optional lazily-activated depth backends — is documented in [docs/semantic-tier-roadmap.md](./docs/semantic-tier-roadmap.md). Historical plans, reviews, and local agent artifacts were pruned from the repository; the README is the public starting point, the [wiki](https://github.com/special-place-ai-heaven/symforge/wiki) is the long-form reference, and the backlog file is the implementation queue.
 
 ## License
 
