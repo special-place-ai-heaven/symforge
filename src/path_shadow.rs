@@ -245,7 +245,9 @@ fn probe_version(path: &Path) -> Option<String> {
     // `output()` until the child exits, then sends to a dropped receiver (a
     // harmless no-op). We never join it, so a hung child cannot block us.
     std::thread::spawn(move || {
-        let result = std::process::Command::new(&path)
+        // hidden_command: health/update run these probes from console-less
+        // contexts (the daemon); a plain spawn flashes a conhost window.
+        let result = crate::process_util::hidden_command(&path)
             .arg("--version")
             .stdin(std::process::Stdio::null())
             .output();

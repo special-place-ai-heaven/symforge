@@ -18,7 +18,7 @@
 //!     durable-install leftovers and prunes dead version-registry entries.
 
 use anyhow::{Context, bail};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
@@ -235,7 +235,7 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn npm_install(&mut self, program: &str, args: &[&str]) -> anyhow::Result<bool> {
-        let status = Command::new(program)
+        let status = crate::process_util::hidden_command(program)
             .args(args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -251,7 +251,10 @@ impl UpdateOps for RealUpdateOps {
         // BOTH stdout and the exit status: the npm launcher prints resolve errors
         // to stderr and exits non-zero with empty stdout, which must surface as a
         // loud failure, not a silent "could not probe".
-        let output = match Command::new(symforge_launcher()).arg("--version").output() {
+        let output = match crate::process_util::hidden_command(symforge_launcher())
+            .arg("--version")
+            .output()
+        {
             Ok(output) => output,
             Err(_) => return InstalledProbe::Unprobeable,
         };
@@ -292,7 +295,7 @@ impl UpdateOps for RealUpdateOps {
         // Spawn the NEW launcher's init so clients are registered at the freshly
         // installed binary (this update process is still the OLD binary, so an
         // in-process `run_init` would re-register the OLD path).
-        let status = Command::new(symforge_launcher())
+        let status = crate::process_util::hidden_command(symforge_launcher())
             .args(["init", "--client", "all"])
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -321,7 +324,7 @@ impl UpdateOps for RealUpdateOps {
 /// Returns `None` when `npm` is unavailable or the prefix cannot be parsed.
 fn npm_installed_launcher_path() -> Option<std::path::PathBuf> {
     let program = npm_executable_for_os(std::env::consts::OS);
-    let output = Command::new(program)
+    let output = crate::process_util::hidden_command(program)
         .args(["prefix", "-g"])
         .stdin(Stdio::null())
         .output()
