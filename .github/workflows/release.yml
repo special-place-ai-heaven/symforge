@@ -43,10 +43,10 @@ jobs:
       - name: Run version sync tests
         run: python -m unittest discover -s execution -p 'test_*.py'
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Run cargo check
         run: cargo check
@@ -224,11 +224,11 @@ jobs:
       - name: Verify release versions
         run: python execution/version_sync.py check --tag "${{ needs.prepare-release.outputs.tag_name }}"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-          targets: ${{ matrix.target }}
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup toolchain install && rustup target add ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -387,10 +387,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Publish to crates.io
         run: >

@@ -58,10 +58,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Check Rust formatting
         run: cargo fmt --check
@@ -84,10 +84,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       # Engine-only build for library embedders (e.g. AAP): no daemon / sidecar /
       # protocol-server / CLI surface. Makes "an embedder can build symforge" a
@@ -108,11 +108,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-          targets: x86_64-unknown-linux-musl
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively. A hardcoded `toolchain:` input
+      # here silently loses when rust-toolchain.toml is bumped: cargo follows
+      # the toml and auto-installs that toolchain WITHOUT the musl target,
+      # which broke this job with E0463 "can't find crate for core" after the
+      # 1.95.0 -> 1.96.0 bump.
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl
 
       # Cross-compile the engine-only embed build to musl. AAP compiles the
       # SymForge engine inside musl guest-agent VMs, so a musl regression must
@@ -149,10 +152,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Run ignored 1000-file load performance smoke
         run: cargo test --release --test live_index_integration test_load_perf_1000_files -- --ignored --test-threads=1
