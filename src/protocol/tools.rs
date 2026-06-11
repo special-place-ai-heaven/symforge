@@ -2070,6 +2070,26 @@ fn admission_degradation_view_from_disk(
         initial_decision
     };
 
+    let extension = canonical_candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_string);
+    let language = extension.as_deref().and_then(LanguageId::from_extension);
+
+    // SF-004: a small, non-binary, non-denylisted file whose extension maps to
+    // no supported grammar comes back `Normal` from `classify_admission` (which
+    // never inspects language). On disk it EXISTS but cannot be parsed, so it
+    // must report the honest Tier-2/UnsupportedLanguage degradation rather than
+    // falling through to a false "File not found". Mirror the bulk-walk demotion
+    // (store.rs Phase-2) via the same shared predicate. A recognized-language
+    // file that is genuinely Tier-1 keeps its `Normal` decision and returns
+    // `None` below so the caller's normal handling proceeds.
+    let decision = if decision.tier == AdmissionTier::Normal && language.is_none() {
+        crate::discovery::unsupported_language_decision(decision)
+    } else {
+        decision
+    };
+
     if decision.tier == AdmissionTier::Normal {
         return None;
     }
@@ -2080,11 +2100,6 @@ fn admission_degradation_view_from_disk(
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         .filter(|relative| !relative.is_empty())
         .unwrap_or_else(|| normalize_admission_degradation_path(path));
-    let extension = canonical_candidate
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_string);
-    let language = extension.as_deref().and_then(LanguageId::from_extension);
 
     Some(AdmissionDegradationView {
         tier: decision.tier,
@@ -9323,6 +9338,78 @@ mod tests {
         assert!(
             !result.starts_with("File not found"),
             "Tier-2 path must NOT be reported as a generic miss; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_context_unsupported_language_on_disk_is_honest_not_found() {
+        // SF-004: a file that EXISTS on disk but maps to no supported grammar
+        // (e.g. `.sh`, `.tcl`, extensionless `LICENSE`) is NOT in the index's
+        // skipped_files (it was admission-excluded at the unsupported-language
+        // branch / a stale index never saw it). get_file_context must resolve it
+        // via the repo-root-bound disk fallback and report the honest Tier-2
+        // "not indexed: unsupported language" message — NEVER a false
+        // "File not found", which an agent would read as "the file is absent".
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("scripts")).unwrap();
+        std::fs::write(repo.path().join("scripts/setup.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(repo.path().join("LICENSE"), "MIT License\n").unwrap();
+
+        // Ready (non-empty) index whose `skipped_files` does NOT record the target
+        // paths: the files are on disk but absent from the index, so resolution
+        // MUST fall through to the repo-root-bound disk-fallback leg (this mirrors
+        // a stale/admission-excluded index — the SF-004 production scenario).
+        let (anchor_key, anchor_file) = make_file(
+            "src/anchor.rs",
+            b"fn anchor() {}\n",
+            vec![make_symbol("anchor", SymbolKind::Function, 0, 0)],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(anchor_key, anchor_file)]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        for path in ["scripts/setup.sh", "LICENSE"] {
+            let result = server
+                .get_file_context(Parameters(super::GetFileContextInput {
+                    path: path.to_string(),
+                    max_tokens: None,
+                    sections: None,
+                    estimate: None,
+                }))
+                .await;
+            assert!(
+                !result.starts_with("File not found"),
+                "on-disk unsupported-language file `{path}` must NOT report a false \
+                 not-found; got: {result}"
+            );
+            assert!(
+                result.contains("Not indexed:") && result.contains("Tier 2 (metadata only)"),
+                "`{path}` must report honest Tier-2 metadata-only status; got: {result}"
+            );
+            assert!(
+                result.contains("reason: unsupported language"),
+                "`{path}` must name the unsupported-language reason; got: {result}"
+            );
+            assert!(
+                result.contains("get_file_content"),
+                "`{path}` must point at the raw-read escape hatch; got: {result}"
+            );
+        }
+
+        // Control: a genuinely-absent path still reports the plain "File not
+        // found" — real and absent files remain distinguishable to an agent.
+        let absent = server
+            .get_file_context(Parameters(super::GetFileContextInput {
+                path: "does/not/exist.tcl".to_string(),
+                max_tokens: None,
+                sections: None,
+                estimate: None,
+            }))
+            .await;
+        assert!(
+            absent.starts_with("File not found"),
+            "a genuinely-absent path must still report File not found; got: {absent}"
         );
     }
 
