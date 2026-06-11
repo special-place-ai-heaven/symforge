@@ -286,7 +286,7 @@ pub(crate) fn parse_source(
         LanguageId::Swift => tree_sitter_swift::LANGUAGE.into(),
         LanguageId::Perl => tree_sitter_perl::LANGUAGE.into(),
         LanguageId::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
-        LanguageId::Dart => tree_sitter_dart::language(),
+        LanguageId::Dart => tree_sitter_dart::LANGUAGE.into(),
         LanguageId::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         LanguageId::Json
         | LanguageId::Toml
