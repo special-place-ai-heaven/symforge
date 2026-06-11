@@ -4353,6 +4353,122 @@ impl Actor for MyActor {
     }
 
     #[test]
+    fn test_health_stats_angular_nested_paren_openers_are_framework_partial() {
+        // POSITIVE control, real parser end-to-end, mirroring the real-world
+        // testpilot `app.html` shape that the OLD `[^()]*`-bodied opener regex
+        // could never neutralize: the control expressions contain NESTED parens
+        // (`applications()`), so the single relational `>` was never reached and
+        // the file wrongly landed as an unexpected partial. The balanced-paren
+        // forward scan handles these, proving the relational operators are the
+        // sole cause, so the file is bucketed as a framework partial.
+        let content = "<div>\n\
+@if (applications().length > 0) {\n\
+  <ul>\n\
+    @for (a of applications(); track a.id) {\n\
+      <li>{{ a.name }}</li>\n\
+    }\n\
+  </ul>\n\
+}\n\
+</div>";
+        let app_html = make_real_html_indexed_file("src/app/app.html", content);
+
+        // Sanity: real parser produced a partial parse that still carries the
+        // text-scanned control-flow symbols (both halves of the SF-004 root
+        // cause), otherwise the assertion below would be vacuous.
+        assert!(
+            matches!(app_html.parse_status, ParseStatus::PartialParse { .. }),
+            "real parser must report a partial parse for the nested-paren Angular template"
+        );
+        assert!(
+            app_html
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if control-flow symbol must survive the partial parse"
+        );
+
+        let index = make_index(vec![("src/app/app.html", app_html)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(stats.partial_parse_count, 1);
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 1,
+            "nested-paren Angular openers must be excused as a framework partial"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 0);
+        assert_eq!(
+            stats.expected_framework_partial_parse_files,
+            vec!["src/app/app.html".to_string()]
+        );
+        assert!(stats.unexpected_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_nested_paren_opener_plus_broken_html_stays_unexpected() {
+        // NEGATIVE control, real parser end-to-end: a nested-paren `@if
+        // (applications().length > 0)` PLUS a genuine structural defect (an
+        // unclosed `<div` with attribute garbage) elsewhere. Neutralizing only the
+        // opener's relational operators leaves the broken tag, so the whole-file
+        // re-parse stays dirty and the file is NOT excused. Proves the balanced
+        // scan still validates the WHOLE file, never masking an unrelated defect.
+        let content = "<div>\n\
+@if (applications().length > 0) {\n\
+  <span></span>\n\
+}\n\
+<div class=\n\
+<section></section\n\
+</div>";
+        let broken = make_real_html_indexed_file("src/app/broken_nested.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/broken_nested.html", broken)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 0,
+            "broken HTML alongside a nested-paren opener must NOT be excused"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert_eq!(
+            stats.unexpected_partial_parse_files,
+            vec!["src/app/broken_nested.html".to_string()]
+        );
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
+    }
+
+    #[test]
+    fn test_health_stats_unterminated_opener_paren_stays_unexpected() {
+        // NEGATIVE control for the EOF-skip branch of the balanced-paren scan: an
+        // `@if (` whose control expression is never closed (the file ends before
+        // the matching `)`). An unterminated control expression is itself a
+        // genuine defect; the scan must skip that opener (neutralize nothing in
+        // it), so the re-parse stays dirty and the file is NOT excused.
+        let content = "<div>\n@if (applications().length > 0 {\n  <span></span>\n";
+        let broken = make_real_html_indexed_file("src/app/unterminated.html", content);
+        assert!(
+            broken
+                .symbols
+                .iter()
+                .any(|s| s.name == "@if" && s.kind == SymbolKind::Module),
+            "the @if symbol must be present so the cheap pre-gate fires"
+        );
+        let index = make_index(vec![("src/app/unterminated.html", broken)], false);
+        let stats = index.health_stats();
+
+        assert_eq!(
+            stats.expected_framework_partial_parse_count, 0,
+            "an unterminated `@if (` must NOT be excused"
+        );
+        assert_eq!(stats.unexpected_partial_parse_count, 1);
+        assert!(stats.expected_framework_partial_parse_files.is_empty());
+    }
+
+    #[test]
     fn test_health_stats_does_not_mark_all_vendor_partials_expected() {
         let vendor_c = make_indexed_file_with_language(
             "vendor/other-parser/src/parser.c",

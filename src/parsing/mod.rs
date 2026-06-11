@@ -507,28 +507,28 @@ pub(crate) fn is_expected_typescript_import_type_array_limitation(
     })
 }
 
-/// Matches an Angular control-flow opener (`@if`/`@for`/`@switch`/`@defer`/
-/// `@else if`) together with its parenthesized control expression. Capture
-/// groups:
+/// Matches the START of an Angular control-flow opener (`@if`/`@for`/`@switch`/
+/// `@defer`/`@else if`) up to and including its opening `(`. Capture groups:
 ///   1. the boundary char before `@` (start-of-line or a non-identifier char),
 ///      preserved so we never match a keyword embedded in an identifier (e.g.
 ///      `foo@if`),
-///   2. the opener keyword plus the opening `(`,
-///   3. the control expression body (no nested parens — `[^()]*` keeps the
-///      match scoped to a single, balanced opener expression),
-///   4. the closing `)`.
+///   2. the opener keyword plus the opening `(`.
 ///
-/// Only the relational operators (`<`/`>`, covering `<`, `>`, `<=`, `>=`) inside
-/// group 3 are the `tree-sitter-html 0.23.2` grammar trigger (SF-004): the `>` in
-/// `@if (a > b) {` is lexed as a tag close, producing an ERROR node. Neutralizing
-/// those operators within group 3 only — never elsewhere in the file — lets us
-/// re-parse the whole file and prove whether the operators were the SOLE cause.
+/// This regex deliberately does NOT capture the control-expression body. The
+/// body can contain nested parentheses — real Angular like
+/// `@if (applications().length > 0) {` or `@for (a of items(); track a.id) {` —
+/// which a `[^()]*` body could never span, so the old single-regex form silently
+/// failed to capture the common case. Instead the matcher locates the opener's
+/// `(` here, then scans forward in code (see
+/// [`is_expected_angular_template_control_flow_limitation`]) with a paren-depth
+/// counter to find the matching close `)`, neutralizing the relational operators
+/// (`<`/`>`, covering `<`, `>`, `<=`, `>=`) within that balanced span only —
+/// never elsewhere in the file — so a clean re-parse proves whether those
+/// operators were the SOLE cause of the error.
 static ANGULAR_CONTROL_FLOW_OPENER_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?m)(^|[^A-Za-z0-9_$])(@(?:if|for|switch|defer|else\s+if)\s*\()([^()]*)(\))",
-        )
-        .expect("SF-004 Angular control-flow opener regex is a valid pattern")
+        regex::Regex::new(r"(?m)(^|[^A-Za-z0-9_$])(@(?:if|for|switch|defer|else\s+if)\s*\()")
+            .expect("SF-004 Angular control-flow opener regex is a valid pattern")
     });
 
 /// SF-004: recognize a partial parse whose ONLY cause is the known
@@ -549,11 +549,16 @@ static ANGULAR_CONTROL_FLOW_OPENER_RE: std::sync::LazyLock<regex::Regex> =
 /// fallback was even worse — it excused arbitrary broken HTML.
 ///
 /// Instead we mirror SF-003: neutralize ONLY the suspected limitation and
-/// re-parse the whole file. For every Angular control-flow opener we replace each
-/// `<`/`>` inside its `(...)` control expression with a single space (length- and
-/// token-preserving; a space cannot fuse adjacent tokens), leaving the rest of the
-/// file — including every ordinary HTML tag's `<`/`>` — byte-for-byte unchanged.
-/// We return `true` iff:
+/// re-parse the whole file. For every Angular control-flow opener we locate its
+/// `(...)` control expression by scanning forward from the opening `(` with a
+/// paren-depth counter (so nested calls like `applications().length` and
+/// multi-clause `@for` headers are handled correctly), and replace each `<`/`>`
+/// inside that balanced span with a single space (length- and token-preserving;
+/// a space cannot fuse adjacent tokens), leaving the rest of the file — including
+/// every ordinary HTML tag's `<`/`>` — byte-for-byte unchanged. An opener whose
+/// `(` is never closed before EOF (depth never returns to zero) is skipped, not
+/// neutralized: an unterminated control expression is itself a genuine defect and
+/// must keep the file dirty. We return `true` iff:
 ///   1. the language is HTML, AND
 ///   2. the original source genuinely has a parse error, AND
 ///   3. at least one Angular control-flow opener is present (the regex matched),
@@ -607,26 +612,83 @@ pub(crate) fn is_expected_angular_template_control_flow_limitation(
         }
 
         // Neutralize ONLY the relational operators inside each Angular control-flow
-        // opener's `(...)` expression, then re-parse the whole file. Each `<`/`>` in
-        // capture group 3 becomes a single space; the opener keyword, the parens, and
-        // every byte outside the matched openers (including ordinary HTML tag `<`/`>`)
-        // are preserved verbatim. A clean re-parse proves the relational operators were
-        // the sole cause.
-        let neutralized =
-            ANGULAR_CONTROL_FLOW_OPENER_RE.replace_all(&source, |caps: &regex::Captures| {
-                format!(
-                    "{}{}{}{}",
-                    &caps[1],
-                    &caps[2],
-                    caps[3].replace(['<', '>'], " "),
-                    &caps[4],
-                )
-            });
+        // opener's balanced `(...)` expression, then re-parse the whole file. The
+        // opener keyword, the parens, and every byte outside the matched openers
+        // (including ordinary HTML tag `<`/`>`) are preserved verbatim. A clean
+        // re-parse proves the relational operators were the sole cause.
+        let neutralized = neutralize_angular_control_flow_operators(&source);
         match panic::catch_unwind(|| parse_source(&neutralized, language, false)) {
             Ok(Ok((_, has_error, _, _, _))) => !has_error,
             _ => false,
         }
     })
+}
+
+/// Replace the relational operators (`<`/`>`) inside every Angular control-flow
+/// opener's balanced `(...)` control expression with spaces, byte-length
+/// preserving, and leave the rest of `source` untouched.
+///
+/// For each opener matched by [`ANGULAR_CONTROL_FLOW_OPENER_RE`] we scan forward
+/// from the opening `(` tracking paren depth and replacing `<`/`>` with spaces
+/// until the matching close `)` (depth returns to zero). An opener whose `(` is
+/// never closed before the end of input is skipped entirely — its bytes are
+/// copied verbatim — so an unterminated control expression keeps the re-parse
+/// dirty and is NOT excused. Bytes between openers are copied verbatim.
+///
+/// Soundness: the only bytes ever changed are `<`/`>` that sit at paren depth >= 1
+/// inside a recognized opener span. A `<` or `>` of an ordinary HTML tag lives at
+/// depth 0 (outside any opener's parens) and is never touched. Replacing with a
+/// single ASCII space is length-preserving, so byte offsets — and therefore every
+/// extracted symbol's span — are identical between the original and neutralized
+/// source.
+fn neutralize_angular_control_flow_operators(source: &str) -> String {
+    let original = source.as_bytes();
+    // Work on a byte buffer so we can do constant-byte overwrites without
+    // touching `unsafe`. The only mutation is ASCII `<`/`>` -> ASCII space, so the
+    // buffer stays valid UTF-8 and `String::from_utf8` below cannot fail.
+    let mut buf = original.to_vec();
+
+    for m in ANGULAR_CONTROL_FLOW_OPENER_RE.find_iter(source) {
+        // The match ends exactly at the opener's `(`; scan the expression body
+        // that follows it.
+        let open_paren = m.end();
+        debug_assert_eq!(original.get(open_paren - 1), Some(&b'('));
+
+        let mut depth: usize = 1;
+        let mut i = open_paren;
+        let mut closed = false;
+        let mut neutralized_any = false;
+        while i < original.len() {
+            match original[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                b'<' | b'>' => {
+                    buf[i] = b' ';
+                    neutralized_any = true;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // Unterminated opener (EOF before the close paren): this is a genuine
+        // defect, not the excusable limitation. Roll back any neutralization we
+        // performed inside this opener so the span stays byte-for-byte original
+        // and the re-parse remains dirty.
+        if !closed && neutralized_any {
+            buf[open_paren..i].copy_from_slice(&original[open_paren..i]);
+        }
+    }
+
+    // The transform only ever replaces single-byte ASCII `<`/`>` with a
+    // single-byte ASCII space, so the buffer is still valid UTF-8.
+    String::from_utf8(buf).unwrap_or_else(|_| source.to_string())
 }
 
 /// Extract symbol name → body-hash pairs from source code using tree-sitter.
@@ -714,6 +776,48 @@ mod tests {
         assert!(!result.symbols.is_empty());
         assert_eq!(result.symbols[0].name, "doStuff");
         assert_eq!(result.symbols[0].kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_process_file_jsx_parses_clean_and_extracts_symbols() {
+        // Regression: `.jsx` maps to LanguageId::JavaScript (src/domain/index.rs),
+        // and tree-sitter-javascript 0.25 parses JSX natively — fragments
+        // (`<>...</>`), self-closing components (`<Row .../>`), `prop={expr}`
+        // attributes, and `.map(...)` with JSX children all parse under the plain
+        // JavaScript grammar with NO `.tsx`-style flavor switch (`.jsx` is not a
+        // TSX path). This pins that a realistic JSX component file parses cleanly
+        // (no partial diagnostic) and the component function symbol survives.
+        let source = br#"
+import { Row } from './Row';
+
+export function Table({ rows }) {
+  return (
+    <>
+      {rows.map((r) => (
+        <Row key={r.id} value={r.value} />
+      ))}
+    </>
+  );
+}
+"#;
+        let result = process_file("src/Table.jsx", source, LanguageId::JavaScript);
+        assert_eq!(
+            result.outcome,
+            FileOutcome::Processed,
+            "a `.jsx` file must parse cleanly under the JavaScript grammar; got {:?} / {:?}",
+            result.outcome,
+            result.parse_diagnostic
+        );
+        assert!(
+            result.parse_diagnostic.is_none(),
+            "clean JSX parse must not attach a diagnostic; got {:?}",
+            result.parse_diagnostic
+        );
+        assert!(
+            result.symbols.iter().any(|s| s.name == "Table"),
+            "the JSX component function `Table` must be extracted; got {:?}",
+            result.symbols
+        );
     }
 
     #[test]

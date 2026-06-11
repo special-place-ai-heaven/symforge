@@ -6910,8 +6910,21 @@ impl SymForgeServer {
 
         let concept = super::explore::match_concept(&params.0.query);
 
+        // A single-word concept that matched ONLY via the stemmed fallback is a
+        // weak signal: the query never named the concept verbatim. When the query
+        // also carries specific terms (computed below) the header should let those
+        // terms lead and demote such a concept to a parenthetical hint, rather than
+        // collapsing the topic to a label the user did not type. Exact matches and
+        // multi-word concept keys keep leading the header.
+        let demote_stem_only_concept = matches!(
+            concept,
+            Some((key, _, super::explore::ConceptMatchKind::Stemmed))
+                if key.split_whitespace().count() == 1
+        );
+
         let mut enriched_imports: Vec<String> = Vec::new();
-        let (label, symbol_queries, text_queries, remainder_terms) = if let Some((key, c)) = concept
+        let (label, symbol_queries, text_queries, remainder_terms) = if let Some((key, c, _)) =
+            concept
         {
             let remainder = Self::compute_remainder_terms(&params.0.query, key);
             let mut sym_q: Vec<String> = c.symbol_queries.iter().map(|s| s.to_string()).collect();
@@ -7466,7 +7479,16 @@ impl SymForgeServer {
                 .filter(|t| specific_terms.contains(t.as_str()))
                 .map(|t| t.as_str())
                 .collect();
-            format!("{label} + {}", ordered.join(", "))
+            if demote_stem_only_concept {
+                // The concept matched only via a single-word stem misfire (e.g.
+                // "indexed" -> "Indexing") while the query named real terms. Lead
+                // with those specific terms and demote the concept to an honest
+                // parenthetical hint, instead of letting a label the user never
+                // typed front the header.
+                format!("{} (+ {label} signals)", ordered.join(", "))
+            } else {
+                format!("{label} + {}", ordered.join(", "))
+            }
         } else {
             label.clone()
         };
@@ -17176,11 +17198,14 @@ mod tests {
             "explore must surface AdmissionTier for an 'admission' query: {result}"
         );
 
-        // The header must not silently collapse the topic to "Indexing": the
-        // specific matching noun stays visible.
+        // The "Indexing" concept matched ONLY via a single-word stem misfire
+        // ("indexed" -> "indexing") while the query named the real noun
+        // "admission". The header must lead with that specific term and demote
+        // the stem-only concept to a parenthetical signal hint, not front a label
+        // the user never typed.
         assert!(
-            result.contains("Exploring: Indexing + admission"),
-            "header should keep the specific query noun, not collapse to the concept: {result}"
+            result.contains("Exploring: admission (+ Indexing signals)"),
+            "stem-only single-word concept must be demoted behind the specific query noun: {result}"
         );
 
         // The specific admission match must rank above the generic concept
