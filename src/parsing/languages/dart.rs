@@ -104,4 +104,61 @@ mod tests {
         );
         assert!(!result.symbols.is_empty(), "should have symbols");
     }
+
+    /// Baseline regression fixture for the tree-sitter-dart grammar: a realistic
+    /// file with an import directive, a class, and an in-class method. Guards
+    /// symbol extraction across grammar version bumps.
+    ///
+    /// Invariants asserted are deliberately version-tolerant so they hold on the
+    /// current 0.0.4 grammar and let us detect a *regression* on a bump:
+    ///   1. the leading `import` directive parses cleanly (Processed outcome),
+    ///   2. the `Calculator` class is extracted by name,
+    ///   3. at least one in-class member symbol is extracted.
+    ///
+    /// Note: 0.0.4 parses the concrete method `int add(...)` as a
+    /// `function_signature` and (imperfectly) names it after the return type
+    /// `int` rather than `add`. That is an existing grammar/extractor limitation,
+    /// not something this test should hard-code as correct; it only asserts that
+    /// a member symbol survives so a grammar bump that drops member extraction
+    /// entirely is caught.
+    #[test]
+    fn test_dart_class_with_import_and_method() {
+        let source = "\
+import 'dart:math';
+
+class Calculator {
+  int add(int a, int b) {
+    return a + b;
+  }
+}
+";
+        // Parse must succeed cleanly (process_file reports Processed, not a
+        // parse failure) even with the leading import directive present.
+        let result = process_file("calculator.dart", source.as_bytes(), LanguageId::Dart);
+        assert_eq!(
+            result.outcome,
+            FileOutcome::Processed,
+            "import + class + method must parse cleanly, got: {:?}",
+            result.outcome
+        );
+
+        let symbols = parse_dart(source);
+        let class = symbols.iter().find(|s| s.kind == SymbolKind::Class);
+        assert!(
+            class.is_some(),
+            "should extract the Calculator class, got: {:?}",
+            symbols
+        );
+        assert_eq!(class.unwrap().name, "Calculator");
+
+        // At least one in-class member (the method, however the grammar models
+        // it) must be extracted. A bump that regresses to extracting only the
+        // class shell would fail here.
+        let member = symbols.iter().find(|s| s.depth > class.unwrap().depth);
+        assert!(
+            member.is_some(),
+            "should extract at least one in-class member symbol, got: {:?}",
+            symbols
+        );
+    }
 }
