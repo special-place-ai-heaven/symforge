@@ -495,11 +495,29 @@ fn stems_match(a: &str, b: &str) -> bool {
         && (sa.starts_with(sb.as_str()) || sb.starts_with(sa.as_str()))
 }
 
+/// How a query matched a concept: either an exact word-boundary hit or a looser
+/// stemmed fallback. The header-rendering logic in the explore handler treats a
+/// stem-only match more cautiously than an exact match (a single-word concept
+/// matched only by stemming should not lead the header over the query's own
+/// specific terms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConceptMatchKind {
+    /// At least one window of query words matched the concept key verbatim
+    /// (case-insensitive).
+    Exact,
+    /// No exact match; the concept key words matched query words only after
+    /// stemming (e.g. "indexed" -> "indexing").
+    Stemmed,
+}
+
 /// Find the best matching concept for a query.
-/// Returns the matched key and the corresponding pattern, or `None` if no concept matches.
+/// Returns the matched key, the corresponding pattern, and how it matched
+/// (exact word-boundary vs stemmed fallback), or `None` if no concept matches.
 /// Uses word-boundary matching to avoid substring collisions (e.g. "clinical" should not match "cli").
 /// Falls back to stemmed matching when exact words don't match.
-pub fn match_concept(query: &str) -> Option<(&'static str, &'static ConceptPattern)> {
+pub fn match_concept(
+    query: &str,
+) -> Option<(&'static str, &'static ConceptPattern, ConceptMatchKind)> {
     let query_words: Vec<&str> = query.split_whitespace().collect();
 
     // Exact word-boundary match (original behavior).
@@ -513,7 +531,7 @@ pub fn match_concept(query: &str) -> Option<(&'static str, &'static ConceptPatte
         })
     });
     if let Some((key, pattern)) = exact {
-        return Some((*key, pattern));
+        return Some((*key, pattern, ConceptMatchKind::Exact));
     }
 
     // Stemmed fallback with bag-of-words matching: each key word must match some query
@@ -526,7 +544,7 @@ pub fn match_concept(query: &str) -> Option<(&'static str, &'static ConceptPatte
                 .iter()
                 .all(|kw| query_words.iter().any(|qw| stems_match(qw, kw)))
         })
-        .map(|(key, pattern)| (*key, pattern))
+        .map(|(key, pattern)| (*key, pattern, ConceptMatchKind::Stemmed))
 }
 
 /// Return additional search terms for a concept based on the project's detected import roots.
@@ -683,6 +701,23 @@ mod tests {
         let concept = match_concept("handle errors");
         assert!(concept.is_some());
         assert_eq!(concept.unwrap().1.label, "Error Handling");
+    }
+
+    #[test]
+    fn test_match_concept_reports_match_provenance() {
+        // Exact word-boundary hit reports ConceptMatchKind::Exact.
+        let exact = match_concept("error handling patterns").expect("exact concept must match");
+        assert_eq!(exact.0, "error handling");
+        assert_eq!(exact.2, ConceptMatchKind::Exact);
+
+        // The stem-misfire shape from the explore-header bug: "indexed" matches the
+        // single-word "indexing" concept ONLY via stemming, never verbatim. The
+        // provenance must be Stemmed so the header logic can demote it.
+        let stemmed = match_concept("admission tiering decide which files get indexed")
+            .expect("stemmed concept must match");
+        assert_eq!(stemmed.0, "indexing");
+        assert_eq!(stemmed.1.label, "Indexing");
+        assert_eq!(stemmed.2, ConceptMatchKind::Stemmed);
     }
 
     #[test]

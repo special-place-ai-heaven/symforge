@@ -1722,6 +1722,25 @@ fn helper(n: usize) {
         );
     }
 
+    #[test]
+    fn test_jsx_import_extracted_under_plain_js_grammar() {
+        // Regression: `.jsx` resolves to LanguageId::JavaScript and is NOT a TSX
+        // path, so it runs through the plain (non-flavored) JavaScript grammar.
+        // tree-sitter-javascript 0.25 parses JSX natively — unlike `.ts`, the JSX
+        // here is NOT a partial parse — so the import reference for the component
+        // rendered in the fragment must still be captured.
+        let source = "import { Row } from './Row';\n\
+export const Table = ({ rows }) => (\n\
+  <>{rows.map((r) => <Row key={r.id} value={r.value} />)}</>\n\
+);\n";
+        let (refs, _) = parse_and_extract(source, LanguageId::JavaScript);
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::Import),
+            "JSX under the plain JavaScript grammar must still capture the import; refs: {:?}",
+            refs
+        );
+    }
+
     // --- TypeScript ---
 
     #[test]
