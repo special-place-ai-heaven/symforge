@@ -26,6 +26,26 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.21.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.0...v7.21.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **admission:** honest accounting for excluded files (SF-004/012/025) ([b3d4ed6](https://github.com/special-place-ai-heaven/symforge/commit/b3d4ed60b488064bc0ba9174612f33a6e62e45cb))
+* **config:** tolerate JSONC trailing commas and accept libyaml flow-indentation ([88081cc](https://github.com/special-place-ai-heaven/symforge/commit/88081ccdf8d7e2d4ae349f33e8c5a9a664e1224b))
+* **conventions:** add Python/Go/Kotlin/Elixir heuristics and fix doubled labels ([093f561](https://github.com/special-place-ai-heaven/symforge/commit/093f561bda6d8c4e4d0cf6ab3292911a14d1dacd))
+* **explore:** calibrate concept ranking precision and honesty (bounded subset) ([062516b](https://github.com/special-place-ai-heaven/symforge/commit/062516bb200ce2656f3d1f761286d3ebb662d285))
+* **health:** make quarantine expected_* classifier fire off-repo, page the registry, and tell the truth about noise filters ([49ef4bd](https://github.com/special-place-ai-heaven/symforge/commit/49ef4bdde8b41913e868239f7b08e2c61177bcbb))
+* **hook:** advertise valid 'symforge init' in sidecar fail-open hint ([d96cf7a](https://github.com/special-place-ai-heaven/symforge/commit/d96cf7a6efa0c414d67fc1d4cb976b5757db61df))
+* **parsing:** disambiguate C-family .h headers and drop string-literal phantoms ([49f6b37](https://github.com/special-place-ai-heaven/symforge/commit/49f6b370d3e63b05f346a9438a882754ac88d129))
+* **parsing:** stop JSON keys spanning the whole document ([199b45c](https://github.com/special-place-ai-heaven/symforge/commit/199b45c7ddc682715db996404908c506b661c445))
+* **parsing:** track fenced code blocks in markdown section extractor ([7f1833d](https://github.com/special-place-ai-heaven/symforge/commit/7f1833d15c15689b00640cb8431dcc0416e1cb49))
+* **parsing:** unescape all four key escapes in toml header lookup ([7c606aa](https://github.com/special-place-ai-heaven/symforge/commit/7c606aaf077dd15e0ec066892855681fac00a477))
+* **path-shadow:** resolve install identity so a launcher shim is not a false shadow ([9882b4a](https://github.com/special-place-ai-heaven/symforge/commit/9882b4a339f58c4d3d89b51ff906d628eb55108c))
+* **protocol:** identify as symforge in MCP initialize serverInfo ([25021b8](https://github.com/special-place-ai-heaven/symforge/commit/25021b893b4df931ef6101fc3c9e6761cf533a0c))
+* **search:** cap per-line length in text-search snippet renderer ([ec2f6fc](https://github.com/special-place-ai-heaven/symforge/commit/ec2f6fc0a080740b0adffac9b2bc39f0cf54d556))
+* **windows:** stop console windows flashing from daemon child spawns ([9cd2011](https://github.com/special-place-ai-heaven/symforge/commit/9cd2011abb70b70074310275ee6ca268cb36ba3a))
+
 ## [7.21.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.20.0...v7.21.0) (2026-06-11)
 
 
