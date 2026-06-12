@@ -67,7 +67,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 |----|------------|------------|--------|
 | **A-001** | sf-bench S/M/N token method (`ceil(bytes/4)`) is stable across re-runs on same binary | Re-run battery 2×; compare session_net variance ≤ ±2% | **OPEN** |
 | **A-002** | Competent-manual baseline (grep + ~50-line window) matches sf-bench `M` and is the right product comparator | Spot-check 6 rows: manual harness output vs judge expectations | **OPEN** |
-| **A-003** | Local release binary via `SYMFORGE_BIN` matches what we will ship | Compare npm 7.21.1 vs `target/release` on 3 spot tasks | **PARTIAL** (t1_small/t3 spot-check done; full battery not) |
+| **A-003** | v8 branch release binary runs full harness without error | `results-v8-harness-shakedown.json` on `target/release` | **OPEN** |
 | **A-004** | Equivalence judge correlates with human “good enough” on 10 sampled rows | Manual review sample; document false pos/neg | **OPEN** |
 
 ### Schema & surface
@@ -107,7 +107,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
 | **A-017** | Tool selection accuracy degrades past ~30–50 exposed tools (Anthropic) | A/B compact vs full surface on **same tasks** with LLM in loop OR proxy via path confusion rate | **OPEN** (cited, not reproduced) |
-| **A-019** | Replacing entire 32-tool surface with 1–2 meta-tools beats compact-3 on session_net **and** equivalence | Full battery A/B: meta-tool vs STEL compact vs 7.x full | **OPEN** |
+| **A-019** | Replacing entire 32-tool surface with 1–2 meta-tools beats compact-3 on session_net **and** equivalence | Full battery A/B: meta-tool vs STEL compact (same corpus) | **OPEN** |
 
 ### Server & deploy (Phase 4 — after 8.0.0)
 
@@ -122,7 +122,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
 | **A-023** | BYPASS rows excluded from **H6** numerator and denominator; scored separately in bypass ledger | compare-results.js + RESULTS.md columns | **OPEN** |
-| **A-024** | Baseline re-pinned on **`558cb69+` release binary** before STEL battery diffs (not npm 7.21.1 alone) | `results-*-baseline.json` artifact path + SHA | **OPEN** |
+| **A-024** | **`results-v8-8.0-baseline.json`** pinned at **8.0.0 tag**; all later diffs vs v8 baselines only | artifact path + git tag SHA | **OPEN** |
 | **A-025** | `symforge_edit` JSON Schema ≤ **1,500 B**; else merge into `symforge` with `intent=edit` | Measured `list_tools` bytes | **OPEN** |
 | **A-026** | **H4** uses **`session_net_accepted`** (accepted serve rows only); `session_net_all36` reported separately | RESULTS.md §8.2 + compare-results.js | **OPEN** |
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |

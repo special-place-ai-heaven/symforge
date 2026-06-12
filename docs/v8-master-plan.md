@@ -31,21 +31,11 @@ Never count SYMFORGE-LESS or sGteM as wins; BYPASS excluded from H6 denominator
 
 ---
 
-## Where we are today (pinned baseline)
+## Where 7.x was (informational only)
 
-Source: `E:\project\sf-bench\RESULTS.md`, SymForge **7.21.1**, 2026-06-12.
+sf-bench on **7.21.1** diagnosed the old paradigm: ~62kB schema, low equivalence on trace tasks, SYMFORGE-LESS on many rows. That run **motivated v8** — it does **not** define v8 success.
 
-| Metric | Value | Implication |
-|--------|------:|-------------|
-| Tool schema | **62,397 B** (~312 tok/task amortized ÷50) | Dominates small-file calls |
-| Equivalence | **8 / 36** (22%) | Reference tracing (T2) broken |
-| Honest savings (equiv only) | **55.6%** vs M | Real win on orientation + large reads |
-| SYMFORGE-LESS | **24 / 36** | Under-answer or token loss |
-| sGteM on accepted | **12 / 36** | Schema + routing tax |
-
-**Already landed on branch** (commit `558cb69`): windowed baseline, payload trimming, STEL docs, honest health direction.
-
-**Not yet shipped as 8.0.0:** compact surface, controller bypass, golden trajectories, remote MCP.
+See `E:\project\sf-bench\RESULTS.md` as a **7.x appendix**. v8 gates (H1–H8) are absolute criteria on the corpus, not “≥ 7.21.1.”
 
 ---
 
@@ -95,8 +85,8 @@ Source: `E:\project\sf-bench\RESULTS.md`, SymForge **7.21.1**, 2026-06-12.
 
 | Gate | Pass condition |
 |------|----------------|
-| **H6** | `EQUIVALENT` / eligible rows ≥ **50%**; BYPASS excluded (**A-023**) |
-| **H8** | Per-language on accepted serve rows |
+| **H6** | `EQUIVALENT` / eligible rows ≥ **50%**; BYPASS excluded (**A-023**) — absolute, not vs 7.x |
+| **H8** | Per-language accepted serve: zero accepted losses per language |
 | **Deploy** | `symforge serve` + URL + API key (**A-020..A-022**) |
 
 Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-all-required-for-800).
@@ -113,7 +103,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 |---|--------|-------------|------------|
 | 0.1 | Re-run sf-bench **2×** same binary + SHAs | Two `results.json`; variance report | **A-001** |
 | 0.2 | Spot-check 6 rows: manual harness vs `M` | Notes in assumption register | **A-002** |
-| 0.3 | Full battery on `target/release` via `SYMFORGE_BIN` | `results-7.21.1-baseline.json` | **A-003** |
+| 0.3 | Harness shakedown on v8 branch release binary | `results-v8-harness-shakedown.json` | **A-003** |
 | 0.4 | Human sample 10 equivalence judgments | False pos/neg doc | **A-004** |
 | 0.5 | Build **`routes.golden.jsonl`** (36 rows) | Path corpus | unlocks H2 |
 | 0.6 | Implement **`compare-results.js`** | CI PASS/FAIL per gate | |
@@ -151,7 +141,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 2.2 | `AdmissionController` — serve / bypass / degrade / cache | `StelDecision` | **A-008..A-014** |
 | 2.3 | Bypass: “use Read L1–N” when index says loss | Small-file rows | **H3** |
 | 2.4 | **T2/T3 spike** — ≥2/4 T2 equiv or bypass policy | Research log | **A-029** |
-| 2.5 | Battery diff vs pinned baseline | `results-v8-candidate.json` | **H3, H4** |
+| 2.5 | Battery on **compact STEL** candidate | `results-v8-candidate.json` | **H3, H4** |
 
 **Exit:** H3, H4 PASS on **compact surface** (H1 must land in Phase 1 first).
 
@@ -167,7 +157,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 3.2 | Predictor calibration EMA | Error trend down | **A-016** |
 | 3.3 | Golden corpus full replay | **H2** ≥ 95% | **H2** |
 | 3.4 | Repeatability re-run | **H7** | **H7** |
-| 3.5 | Tag **8.0.0** | Release | **H1–H5, H7** |
+| 3.5 | Tag **8.0.0**; pin **`results-v8-8.0-baseline.json`** | Release + v8 baseline | **H1–H5, H7** |
 
 **Exit:** Economics gates PASS → ship **8.0.0** (stdio MCP + compact STEL).
 
@@ -249,11 +239,11 @@ Index stays on the **server host** (machine with the repo). Remote attach = remo
 
 **Do not skip steps.** Full order: [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §7 Phase 0 + §12 checklist.
 
-1. Implement **`compare-results.js`** + row classification fields in battery output.
-2. Pin **`results-v8-branch-baseline.json`** on release binary (`558cb69+`).
-3. Seed **`routes.golden.jsonl`** (36 rows, `expected_equiv`, P-FF bypass rows).
+1. Implement **`compare-results.js`** + row classification in battery output.
+2. Harness shakedown on v8 branch binary (not a 7.x regression gate).
+3. Seed **`routes.golden.jsonl`** (36 rows).
 4. Run Phase 0.1–0.11; validate assumptions; check §12 boxes.
-5. **Only then** `src/stel/mod.rs`.
+5. **Only then** `src/stel/mod.rs`. Pin **`results-v8-8.0-baseline.json` at 8.0 tag**, not before.
 
 ---
 

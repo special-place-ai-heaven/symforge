@@ -11,7 +11,7 @@ Every struct below is a contract between layers. If a component cannot emit/cons
 superior   → survives (merged, default path)
 inferior   → axed (removed, not deprecated limbo)
 unknown    → no merge until battery + path proof
-forward    → only pinned baseline diff PASS moves the branch
+forward    → only v8 pinned baseline diff PASS moves the branch (from 8.0 tag)
 assumption → VALIDATED before it unlocks the next phase; else research
 ```
 
@@ -436,7 +436,7 @@ Expansion triggered only when trajectory replay proves a core tool beats facade 
 
 **Order rationale (post–adversarial review):** compact **H1 before controller** so Phase 2 battery runs on real economics, not 62 kB schema tax.
 
-**Nothing in S4–S7 merges without battery diff PASS vs pinned baseline.**
+**Nothing in S4–S7 merges without v8 battery diff PASS vs v8 baseline (post-8.0).**
 
 ---
 

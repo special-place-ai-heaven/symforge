@@ -18,9 +18,9 @@ We write ideation down first, validate assumptions, then implement. Details deep
 
 | Artifact | Role |
 |----------|------|
-| `E:\project\sf-bench\` | Independent token-savings battery (not unit tests as proof) |
-| `sf-bench/out/results-7.21.1-baseline.json` | Pinned baseline (Phase 0 deliverable) |
-| `sf-bench/RESULTS.md` | Human-readable battery headline |
+| `E:\project\sf-bench\` | Measurement harness (methodology + corpus) |
+| `results-v8-8.0-baseline.json` | Pinned at **8.0 tag** — v8 regression reference (not 7.x) |
+| `sf-bench/RESULTS.md` | **7.21.1 appendix** — informational only |
 
 ## How docs evolve
 

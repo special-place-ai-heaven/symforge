@@ -20,7 +20,19 @@ only then continue. No “implement anyway and fix later.”
 
 **End state (8.1.0):** stdio + **`symforge serve`** (URL + API key), compact STEL, economics gates on 8.0, quality + deploy on 8.1, sf-bench reproducible on pinned SHAs.
 
----
+### Paradigm shift (7.x bench vs v8)
+
+```text
+sf-bench on SymForge 7.21.1 = informational autopsy of the OLD product only.
+It explains why v8 exists (schema tax, trace gaps). It is NOT the v8 scoreboard.
+
+v8 proof = north star gates (H1–H8) measured on the SAME corpus + methodology,
+but compared to v8's own pinned baselines after the paradigm ships — not
+"beat 7.21.1 on its terms while still carrying 32-tool DNA."
+
+First v8 green battery → pin results-v8-8.0-baseline.json → all regressions
+diff against THAT. Optional appendix: 7.x numbers for historical context only.
+```
 
 ## 1. North star (locked definitions)
 
@@ -59,7 +71,8 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 | **G-001** | Token method unstable | Phase 0.1: battery 2× | `results-run{1,2}.json` | variance ≤±2% on `session_net_accepted` | Fix harness | Stop — fix ruler first |
 | **G-002** | Manual baseline M wrong | Phase 0.2: 6-row spot-check | `docs/research/A-002-manual-spotcheck.md` | 6/6 match | Adjust `lib/manual.js` | Redefine M in spec |
 | **G-003** | Equivalence judge untrusted | Phase 0.4: **20** stratified human samples | `docs/research/A-004-equiv-audit.md` | FP+FN ≤10% | Tune judge | Replace judge |
-| **G-004** | Stale 7.21.1 baseline | Phase 0.9: battery on **`558cb69+` release** | `results-v8-branch-baseline.json` | committed + SHA in JSON | — | — |
+| **G-004** | No v8 baseline yet | **At 8.0 tag:** first green battery → pin `results-v8-8.0-baseline.json` | JSON + SHA | committed | — | — |
+| **G-004b** | 7.x bench (informational) | Keep `E:\project\sf-bench\RESULTS.md` as **7.21.1 context only** — do not gate v8 on beating it | appendix | — | — | — |
 | **G-005** | No gate automation | Phase 0.6: **`compare-results.js`** | script + CI job | all H* computable | — | — |
 | **G-006** | H4 conflated all-36 vs accepted | **DONE** — RESULTS §8.7 + compare-results columns | RESULTS.md | — | — | — |
 | **G-027** | Schema ÷50 may lie vs Cursor | Phase 0.10: host measurement **or** conservative mode | `docs/research/A-006-host-schema.md` | documented divisor | Controller uses `max(amortized, full/ session_calls)` | Battery uses full schema per call in “worst case” mode |
@@ -121,7 +134,7 @@ Run battery ×3 surfaces (full 32, compact-3, meta-1/2)
   → winner = max session_net_accepted s.t. equiv_count ≥ baseline
   → if meta wins: Phase 1 ships meta (update stel-schema L0)
   → if compact wins: ship compact-3
-  → if all lose vs branch baseline: STOP — fix L3 payloads before L0
+  → if all lose vs north star gates: STOP — fix L3 payloads before L0
 ```
 
 ### 4.2 A-029 T2 spike
@@ -284,16 +297,16 @@ Report both raw 36 and eligible counts in RESULTS.md
 |------|-------------|------------|
 | 0.1 | Battery 2× | A-001 |
 | 0.2 | Manual spot-check | A-002 |
-| 0.3 | Branch release battery | A-003, A-024 |
+| 0.3 | Harness shakedown on v8 branch binary | A-003 |
 | 0.4 | Equiv audit n=20 | A-004 |
 | 0.5 | `routes.golden.jsonl` | A-028 |
 | 0.6 | `compare-results.js` | G-005 |
 | 0.7 | Schema stubs + bytes | A-005, A-025 |
 | 0.8 | L0 A/B battery | A-019 |
-| 0.9 | Pin `results-v8-branch-baseline.json` | A-024 |
-| 0.10 | Schema amortization study | A-006, A-027 |
-| 0.11 | Bypass two-hop in harness | A-012 |
-| 0.12 | Document P-FF + eligible H6 rules | G-031 |
+| 0.9 | Schema amortization study | A-006, A-027 |
+| 0.10 | Bypass two-hop in harness | A-012 |
+| 0.11 | Document P-FF + eligible H6 rules | G-031 |
+| 0.12 | rmcp compile spike doc | A-031 |
 
 ### Phase 1 — L0 + H1
 
@@ -340,7 +353,8 @@ symforge serve --listen 127.0.0.1:8787 --api-key sf_… [--tls-cert …]
 ## 9. Assumption dependency DAG (summary)
 
 ```text
-Phase 0: A-001..004 → A-019 → A-005,A-025 → A-006,A-027 → A-012 → A-024 pin
+Phase 0: A-001..004 → A-019 → A-005,A-025 → A-006,A-027 → A-012
+Phase 3 exit: A-024 pin results-v8-8.0-baseline.json at tag
 Phase 1: (all above VALIDATED)
 Phase 2: A-008..014, A-029 spike
 Phase 3: A-015, A-016
@@ -380,12 +394,12 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 - [ ] A-001 VALIDATED (2× battery)
 - [ ] A-002 VALIDATED (manual spot-check)
-- [ ] A-003 VALIDATED (branch release = battery binary)
+- [ ] A-003 VALIDATED (harness runs on v8 branch binary)
 - [ ] A-004 VALIDATED (equiv audit)
-- [ ] A-024 pinned `results-v8-branch-baseline.json`
-- [ ] `compare-results.js` runs on baseline
+- [ ] `compare-results.js` runs on harness shakedown JSON
 - [ ] `routes.golden.jsonl` 36 rows + schema validated
-- [ ] RESULTS.md §8.7 + compare-results columns live
+- [ ] RESULTS.md §8.7 + compare-results columns live *(v8 runs only)*
+- [ ] **No requirement** to beat or pin `results-7.21.1-baseline.json`
 
 **Surface choice**
 

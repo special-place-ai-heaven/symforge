@@ -123,18 +123,11 @@ symforge serve --listen 0.0.0.0:8787 --api-key sf_…
 
 ---
 
-## Current reality (baseline snapshot)
+## Current reality (7.x — informational only)
 
-Pinned: sf-bench, SymForge **7.21.1**, 2026-06-12 — see `E:\project\sf-bench\RESULTS.md`.
+The sf-bench run on **7.21.1** was an **autopsy of the old product**: schema bloat, trace gaps, mixed economics. It informed the v8 paradigm shift. **It is not the v8 scoreboard.**
 
-| Signal | Rough value | Meaning |
-|--------|------------:|---------|
-| Schema | 62kB | Fix in Phase 1 (compact surface) |
-| Equivalence | 8/36 | Fix routing + T2 trace in Phase 2 |
-| Honest win (equiv rows) | ~56% vs M | Real moat on orientation / large reads |
-| SYMFORGE-LESS | 24/36 | Quality + economics debt |
-
-Payload trimming landed on branch; **8.0.0 behavior** (controller, compact list) has not.
+v8 is judged only by **H1–H8** on the measurement harness after STEL ships. Optional read: `E:\project\sf-bench\RESULTS.md`.
 
 ---
 
@@ -236,7 +229,14 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 - [ ] Golden trajectory examples (3–5 rows) inline or in `routes.golden.jsonl`
 - [ ] README alignment — remove claims that contradict pinned battery
 
-### 2026-06-12 — No code until gap closure pre-flight green
+### 2026-06-12 — 7.x bench is informational; v8 defines its own baseline
+
+**Decision:** sf-bench on 7.21.1 explains why we shift paradigm; it does **not** gate v8. First pin `results-v8-8.0-baseline.json` at **8.0 tag**; regressions diff v8 vs v8 only.
+
+**Context:** User: bench results inconsequential for v8 — paradigm shift.  
+**Refs:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) § Paradigm shift
+
+---
 
 **Decision:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) is binding. §12 checklist must be 100% before `src/stel/`. Every gap has pass/pivot/kill; H6 is 8.1 program §6, not a Phase 2 line item.
 

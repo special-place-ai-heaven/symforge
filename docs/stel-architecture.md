@@ -73,7 +73,7 @@ External citations (Anthropic, MCP spec, Atlassian) are **hypotheses** until we 
 | **Performance test** | Tokens spent (S, M, N), session net, schema bytes, latency | `sf-bench/out/results.json`, `RESULTS.md` |
 | **Path test** | Which route ran, equivalence vs manual, bypass vs serve | Per-row `equivalence`, `sGteM`, route envelope in battery |
 | **Trajectory test** | L0 call → internal plan → outcome matches golden | `routes.golden.jsonl` + `must_call` / `must_not_call` |
-| **Regression gate** | Candidate ≥ baseline on pinned metrics | CI diff: `results-v8-candidate.json` vs `results-7.21.1-baseline.json` |
+| **Regression gate** | Candidate ≥ **v8 pinned baseline** (from 8.0 tag onward) | CI diff: `results-v8-candidate.json` vs `results-v8-8.0-baseline.json` |
 
 Every phase ships only when it **moves a number** in a pinned artifact. “Looks correct in code” is not a merge criterion.
 
@@ -113,7 +113,7 @@ Each principle maps to **performance/path gates**, not slogans.
 | Comparator | Win condition |
 |------------|---------------|
 | Competent manual (M) | Session net ≥ 0; per-task S ≤ M on accepted calls |
-| SymForge 7.21.1 | No regression on tasks 7.x already wins; equivalence rate ↑ |
+| SymForge 7.x (informational) | Historical context only — **not** a v8 gate |
 | Naive whole-file (N) | Maintained on large-file tasks (sanity, not headline) |
 | External facades (schema-only) | H1: compact schema ≤ 5kB (beats eager 32-tool catalog) |
 
@@ -177,14 +177,9 @@ v8 changes what hosts and LLMs see at the MCP boundary:
 
 Embed facade (`symforge::embed`) policy unchanged unless explicitly touched.
 
-## Problem (measured)
+## Problem (7.x autopsy — informational)
 
-From sf-bench phase 1 (`E:\project\sf-bench`, SymForge 7.21.1):
-
-- **62,397 B** tool schema (~15.6k tokens); **312 tokens/call** amortized in harness
-- **8 / 36** tasks EQUIVALENT; **55.6%** honest savings vs competent manual on those only
-- LLMs use **≤4 of 32** tools in practice; Anthropic documents selection cliff past **30–50** tools
-- Small-file losses often **schema + routing**, not payload (e.g. tokio t1_small: 69 tok payload, 381 tok total)
+From sf-bench phase 1 on **7.21.1** (`E:\project\sf-bench`): schema tax, low trace equivalence, SYMFORGE-LESS on many rows. **This motivated v8; it does not score v8.** v8 gates are absolute (H1–H8), not “beat 7.21.1.”
 
 ## Architecture
 
@@ -268,9 +263,9 @@ Gates are **performance and path outcomes** on pinned artifacts. CI fails if met
 | **H3** | Small-file economics | sf-bench `*_small`: **0** rows with `sGteM` on **accepted serve** rows (`EQUIVALENT` ∧ S≤M); bypass rows excluded |
 | **H4** | Session net (economics) | **`session_net_accepted`** = Σ(M−S) over **accepted serve** rows only ≥ **0**; also report `session_net_all36` in RESULTS (diagnostic — can be positive while quality fails) |
 | **H5** | Round-trips | Compact profile: MCP `tools/call` count per sf-bench task ≤ **1** where plan is single-chain |
-| **H6** | Equivalence | `EQUIVALENT` / **eligible** rows ≥ **50%**; **BYPASS rows excluded** from numerator and denominator; SYMFORGE-LESS ↓ vs 7.21.1 |
+| **H6** | Equivalence | `EQUIVALENT` / **eligible** rows ≥ **50%**; **BYPASS rows excluded**; no 7.x regression requirement |
 | **H7** | Stability | Same binary + SHAs: battery re-run variance on **`session_net_accepted`** ≤ **±2%** |
-| **H8** | Language agnostic | Per-language on accepted serve rows ≥ 7.21.1 baseline or zero accepted losses in that language |
+| **H8** | Language agnostic | Per-language **accepted serve** rows: zero accepted losses in that language |
 
 ### Release split (post–adversarial review)
 
@@ -292,7 +287,8 @@ Schema and path corpus **before** code (steps S1–S2 in `stel-schema.md`).
 - [x] **`stel-assumptions.md`** — assumption register + phase gates
 - [ ] **Validate A-001..A-004** (harness + comparator trust) — **blocks all `src/stel/`**
 - [ ] Seed **`routes.golden.jsonl`** (36 rows from sf-bench targets)
-- [ ] Run sf-bench battery → pin `results-7.21.1-baseline.json` + `RESULTS.md`
+- [ ] Run sf-bench harness shakedown → optional `results-v8-harness-shakedown.json`
+- [ ] Pin **`results-v8-8.0-baseline.json` at 8.0 tag only** (not Phase 0)
 - [ ] Measure `tools/list` schema bytes → validate or invalidate **A-005**
 - [ ] **`compare-results.js`** — PASS/FAIL per H1–H8
 
