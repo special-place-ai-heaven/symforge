@@ -32,6 +32,7 @@ All must pass on **Win + Linux or macOS** smoke before **8.1.0**:
 | **O6** | **Apply** writes Streamable HTTP + Bearer config with backup; dry-run preview in UI |
 | **O7** | Per-harness API keys optional but supported (create, revoke, scoped) |
 | **O8** | `symforge init --url … --scan` uses same `HarnessRegistry` as admin (no duplicate logic) |
+| **A9** | AAP-specific presets: sibling detect, embed vs serve mode, no stdio overwrite — [`v8-aap-integration.md`](v8-aap-integration.md) |
 
 **8.2+ (polish only):** charts, CSV export, log tail, themes — not required for 8.1 tag.
 

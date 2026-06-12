@@ -179,7 +179,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 4.6 | **`stel_ledger` SQLite** + server key store | rusqlite migrations | **G-038, G-039** |
 | 4.7 | **Admin UI MVP** — `/admin` + `/api/v1/*` | Operator dashboard | **G-037, G-042** |
 | 4.8 | **First-run onboarding** — URL banner, browser open, wizard | Install/update UX | **G-040** |
-| 4.9 | **Harness hub** — scan configs, per-harness keys, apply | `src/harness/` + admin | **G-041** |
+| 4.9 | **Harness hub** — scan configs, per-harness keys, apply + **AAP presets** | `src/harness/` + admin | **G-041, G-044** |
 | 4.10 | Tag **8.1.0** | **O1–O8** + H6/H8 | all gates |
 
 **Exit:** H6/H8 PASS + **O1–O8 PASS** + documented URL+key config on two hosts.
@@ -197,6 +197,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | **Daemon → unified server** | One index, multi-session, governor |
 | **Streamable HTTP + Bearer API key** | Industry MCP remote config |
 | **Admin web UI (local ops)** | Stats, index ops, keys, harness setup — same server as `/mcp` ([`v8-admin-ui.md`](v8-admin-ui.md)) — **8.1 committed** |
+| **AAP embed contract** | AAP sibling build + embed CI (**G-043**) | [`v8-aap-integration.md`](v8-aap-integration.md) |
 | **Golden trajectories** | Path proof separate from unit tests |
 | **Assumption register** | Stops “implement anyway” drift |
 

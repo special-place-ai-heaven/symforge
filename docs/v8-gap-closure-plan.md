@@ -18,7 +18,7 @@ If a spike hits KILL criteria → pivot per §4 decision tree → re-validate �
 only then continue. No “implement anyway and fix later.”
 ```
 
-**End state (8.1.0):** stdio + **`symforge serve`** (URL + API key), compact STEL, economics gates on 8.0, quality + deploy on 8.1, **committed operator stack (O1–O8)**, sf-bench reproducible on pinned SHAs.
+**End state (8.1.0):** stdio + **`symforge serve`** (URL + API key), compact STEL, economics gates on 8.0, quality + deploy on 8.1, **committed operator stack (O1–O8, A9)**, **AAP embed path preserved (G-043..G-045)**, sf-bench reproducible on pinned SHAs.
 
 ### Paradigm shift (7.x bench vs v8)
 
@@ -140,6 +140,16 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 | **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | O4 pass | — | **8.1 blocked** |
 
 Detail: [`v8-admin-ui.md`](v8-admin-ui.md) — **O1–O8 required for 8.1.0 tag**. Depends on **G-020**, **G-034**, **G-033**.
+
+### 3.8 AAP embed integration (Agent Army Professionals)
+
+| ID | Gap | Closure action | Artifact | Pass | Pivot | Kill |
+|----|-----|----------------|----------|------|-------|------|
+| **G-043** | Embed contract not release-gated | E1/E2: embed tests + AAP sibling build in CI/docs | `src/embed.rs` contract + CHANGELOG | green on tag | manual AAP gate doc | **8.0 blocked for embed consumers** |
+| **G-044** | No AAP operator convenience | Admin AAP panel + harness presets (E6–E9) | [`v8-aap-integration.md`](v8-aap-integration.md) | AAP panel smoke | generic MCP scan only | **8.1 convenience** |
+| **G-045** | STEL leaks into embed build | `server` feature audit; embed CI without axum/rmcp | CI job | embed build clean | split crate | **8.0 blocked** |
+
+AAP repo: `E:\project\Agent_Army_Professionals` · Primary integration: **`aap-code-intel`** + `symforge` **`embed`** feature (not MCP config).
 
 ---
 

@@ -3,7 +3,7 @@
 **Status:** living document · branch `v8/stel-architecture`  
 **Purpose:** Capture *why* and *what* before nitty-gritty specs. Elaborate sections over time; link outward instead of duplicating.
 
-**Companion docs:** **[`v8-bootstrap.md`](v8-bootstrap.md)** (external LLM entry) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`v8-master-plan.md`](v8-master-plan.md) · [`stel-architecture.md`](stel-architecture.md) · [`stel-assumptions.md`](stel-assumptions.md) · [`v8-admin-ui.md`](v8-admin-ui.md)
+**Companion docs:** **[`v8-bootstrap.md`](v8-bootstrap.md)** (external LLM entry) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`v8-master-plan.md`](v8-master-plan.md) · [`stel-architecture.md`](stel-architecture.md) · [`stel-assumptions.md`](stel-assumptions.md) · [`v8-admin-ui.md`](v8-admin-ui.md) · [`v8-aap-integration.md`](v8-aap-integration.md)
 
 ---
 
@@ -62,9 +62,12 @@ Use this table at planning time — **8.1 operator rows are committed**, not bac
 | **Admin web UI + `/api/v1`** | Operator | Phase 4.7 → **8.1** ✓ committed | HTTP (same server) |
 | **Harness scan & config apply** | Operator | Phase 4.9 → **8.1** ✓ committed | Admin UI + `symforge init --scan` |
 | **First-run / update onboarding** | Operator | Phase 4.8 → **8.1** ✓ committed | CLI banner + browser wizard |
-| **sf-bench / compare-results** | Proof | Phase 0 → ongoing | CLI/Node |
+| **AAP embed (`symforge::embed`)** | AAP agents / guest VM | **Committed** — parallel to MCP; see [`v8-aap-integration.md`](v8-aap-integration.md) | In-process library |
+| **AAP admin presets** | Operator | Phase 4.7–4.9 → **8.1** ✓ committed | Admin AAP panel + harness presets |
 
 **SQLite (rusqlite):** analytics today; **STEL ledger + server keys** in Phase 3–4 feed both MCP status and admin UI.
+
+**AAP:** [`v8-aap-integration.md`](v8-aap-integration.md) — embed path is **separate from** generic MCP harness scan; both committed.
 
 ---
 
@@ -291,5 +294,14 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 
 **Context:** User commitment — same class of UX as other MCP servers; convenience over hand-editing client configs.  
 **Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); **G-037..G-042**
+
+---
+
+### 2026-06-12 — AAP embed integration retained and improved (**committed**)
+
+**Decision:** Agent Army Professionals keeps **`symforge::embed`** + `aap-code-intel` as the primary integration. v8 STEL/MCP/admin must not break embed builds (`G-043`, `G-045`). Improve convenience via admin **AAP panel** and dedicated harness presets (`G-044`), not by replacing embed with generic MCP config.
+
+**Context:** AAP at `E:\project\Agent_Army_Professionals` — library-link + guest-agent path is tighter than MCP JSON editing.  
+**Refs:** [`v8-aap-integration.md`](v8-aap-integration.md)
 
 *Last updated: 2026-06-12 · amend decision log and open questions as ideation grows.*

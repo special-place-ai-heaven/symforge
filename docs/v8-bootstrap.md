@@ -226,7 +226,7 @@ symforge serve --listen 0.0.0.0:8787 --api-key sf_…
 
 Platforms: Windows, Linux, macOS, WSL (Linux binary). Today: loopback daemon only; Streamable HTTP **not implemented** (`rmcp` has `transport-io` only).
 
-**Full product surface map:** [`ideation.md`](ideation.md) § Product surfaces · admin detail [`v8-admin-ui.md`](v8-admin-ui.md).
+**Full product surface map:** [`ideation.md`](ideation.md) § Product surfaces · admin [`v8-admin-ui.md`](v8-admin-ui.md) · AAP [`v8-aap-integration.md`](v8-aap-integration.md).
 
 ---
 
@@ -282,7 +282,8 @@ Read after this bootstrap when you need depth:
 | 7 | [`stel-assumptions.md`](stel-assumptions.md) | A-001..A-032 assumption register |
 | 8 | [`v8-architecture-diagrams.md`](v8-architecture-diagrams.md) | 13 mermaid diagrams + reviewer prompts |
 | 9 | [`v8-admin-ui.md`](v8-admin-ui.md) | **Committed 8.1** — admin, onboarding, harness hub (**O1–O8**) |
-| 10 | [`README.md`](README.md) | Doc index + phase crosswalk |
+| 10 | [`v8-aap-integration.md`](v8-aap-integration.md) | **Committed** — AAP embed path + admin presets (`E:\project\Agent_Army_Professionals`) |
+| 11 | [`README.md`](README.md) | Doc index + phase crosswalk |
 
 ---
 
