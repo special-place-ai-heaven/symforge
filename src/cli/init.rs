@@ -260,6 +260,22 @@ fn run_init_with_paths(
     Ok(())
 }
 
+/// Read a client config file as UTF-8 text, stripping a leading byte-order mark.
+///
+/// Windows tools (Notepad, PowerShell `Set-Content -Encoding UTF8`) prepend a
+/// UTF-8 BOM; `serde_json` and `toml_edit` reject it with "expected value at
+/// line 1 column 1", which aborts `symforge init --client all` against real
+/// user configs. Stripping at the read boundary keeps every parser working;
+/// the merged file is rewritten without the BOM.
+fn read_config_text(path: &std::path::Path) -> anyhow::Result<String> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(stripped) => stripped.to_owned(),
+        None => text,
+    })
+}
+
 /// Merge symforge hook entries into `settings_path`, creating it if necessary.
 ///
 /// This is the testable core of `run_init`. Integration tests can pass a temp-dir path
@@ -278,8 +294,7 @@ pub fn merge_hooks_into_settings(
 
     // Read existing settings or start with empty object.
     let mut settings: Value = if settings_path.exists() {
-        let settings_json = std::fs::read_to_string(settings_path)
-            .with_context(|| format!("reading {}", settings_path.display()))?;
+        let settings_json = read_config_text(settings_path)?;
         serde_json::from_str(&settings_json)
             .with_context(|| format!("parsing {}", settings_path.display()))?
     } else {
@@ -544,8 +559,7 @@ pub fn register_mcp_server(
     binary_path: &str,
 ) -> anyhow::Result<()> {
     let mut config: Value = if claude_json_path.exists() {
-        let config_json = std::fs::read_to_string(claude_json_path)
-            .with_context(|| format!("reading {}", claude_json_path.display()))?;
+        let config_json = read_config_text(claude_json_path)?;
         serde_json::from_str(&config_json)
             .with_context(|| format!("parsing {}", claude_json_path.display()))?
     } else {
@@ -605,8 +619,7 @@ fn register_claude_desktop_mcp_server_with_home(
     }
 
     let mut config: Value = if desktop_config_path.exists() {
-        let config_json = std::fs::read_to_string(desktop_config_path)
-            .with_context(|| format!("reading {}", desktop_config_path.display()))?;
+        let config_json = read_config_text(desktop_config_path)?;
         serde_json::from_str(&config_json)
             .with_context(|| format!("parsing {}", desktop_config_path.display()))?
     } else {
@@ -731,8 +744,7 @@ pub fn register_codex_mcp_server(
     }
 
     let config_toml = if codex_config_path.exists() {
-        std::fs::read_to_string(codex_config_path)
-            .with_context(|| format!("reading {}", codex_config_path.display()))?
+        read_config_text(codex_config_path)?
     } else {
         String::new()
     };
@@ -861,8 +873,7 @@ pub fn register_gemini_mcp_server(
     }
 
     let mut config: Value = if gemini_settings_path.exists() {
-        let config_json = std::fs::read_to_string(gemini_settings_path)
-            .with_context(|| format!("reading {}", gemini_settings_path.display()))?;
+        let config_json = read_config_text(gemini_settings_path)?;
         serde_json::from_str(&config_json)
             .with_context(|| format!("parsing {}", gemini_settings_path.display()))?
     } else {
@@ -902,8 +913,7 @@ pub fn register_kilo_mcp_server(
     }
 
     let mut config: Value = if kilo_config_path.exists() {
-        let config_json = std::fs::read_to_string(kilo_config_path)
-            .with_context(|| format!("reading {}", kilo_config_path.display()))?;
+        let config_json = read_config_text(kilo_config_path)?;
         serde_json::from_str(&config_json)
             .with_context(|| format!("parsing {}", kilo_config_path.display()))?
     } else {
@@ -979,8 +989,7 @@ fn gemini_folder_trust_enabled(gemini_settings_path: &std::path::Path) -> anyhow
         return Ok(false);
     }
 
-    let config_json = std::fs::read_to_string(gemini_settings_path)
-        .with_context(|| format!("reading {}", gemini_settings_path.display()))?;
+    let config_json = read_config_text(gemini_settings_path)?;
     let config: Value = serde_json::from_str(&config_json)
         .with_context(|| format!("parsing {}", gemini_settings_path.display()))?;
 
@@ -997,8 +1006,7 @@ fn gemini_workspace_is_trusted(
         return Ok(false);
     }
 
-    let trust_rules_json = std::fs::read_to_string(gemini_trusted_folders_path)
-        .with_context(|| format!("reading {}", gemini_trusted_folders_path.display()))?;
+    let trust_rules_json = read_config_text(gemini_trusted_folders_path)?;
     let trust_rules: Value = serde_json::from_str(&trust_rules_json)
         .with_context(|| format!("parsing {}", gemini_trusted_folders_path.display()))?;
     let Some(entries) = trust_rules.as_object() else {
@@ -1405,6 +1413,35 @@ mod tests {
         );
         assert_eq!(session.len(), 1, "SessionStart must have 1 entry");
         assert_eq!(prompt.len(), 1, "UserPromptSubmit must have 1 entry");
+    }
+
+    /// Windows editors and PowerShell write settings.json with a UTF-8 BOM;
+    /// init must parse it instead of dying with "expected value at line 1
+    /// column 1", and the rewrite must not carry the BOM forward.
+    #[test]
+    fn test_init_parses_settings_with_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            "\u{feff}{\r\n    \"cleanupPeriodDays\": 99999\r\n}",
+        )
+        .unwrap();
+
+        merge_hooks_into_settings(&settings_path, std::path::Path::new(FAKE_BINARY))
+            .expect("BOM-prefixed settings.json must parse");
+
+        let written = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            !written.starts_with('\u{feff}'),
+            "BOM must not survive the rewrite"
+        );
+        let settings: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(settings["cleanupPeriodDays"], 99999);
+        assert!(
+            settings["hooks"]["PostToolUse"].is_array(),
+            "hooks must be merged into the BOM'd settings"
+        );
     }
 
     #[test]
