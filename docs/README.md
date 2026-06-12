@@ -8,6 +8,7 @@ We write ideation down first, validate assumptions, then implement. Details deep
 | Doc | Role |
 |-----|------|
 | **[`ideation.md`](ideation.md)** | Vision, principles, non-goals, open questions, decision log — **start here** |
+| **[`v8-architecture-diagrams.md`](v8-architecture-diagrams.md)** | **Visual pack** — mermaid diagrams for external LLM / human review |
 | **[`v8-gap-closure-plan.md`](v8-gap-closure-plan.md)** | **Binding pre-flight** — every gap, spike, pivot, harness spec; blocks `src/stel/` until §12 green |
 | **[`v8-master-plan.md`](v8-master-plan.md)** | Phased roadmap summary |
 | **[`stel-architecture.md`](stel-architecture.md)** | STEL layers, release gates H1–H8, engineering rules |

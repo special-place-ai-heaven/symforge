@@ -211,7 +211,8 @@ Structured reviews of this doc set. **Verdict: proceed with changes** (not stop,
 4. **A-019** — meta-tool vs compact-3 battery **before** locking L0 tools (Phase 0.8).
 5. **A-023..A-029** — bypass/H6 accounting, baseline re-pin, edit schema budget, golden `expected_equiv`, T2 spike.
 
-Full amendment table: [`v8-master-plan.md`](v8-master-plan.md) § Adversarial review.
+Full amendment table: [`v8-master-plan.md`](v8-master-plan.md) § Adversarial review.  
+Architecture diagrams (external LLM pack): [`v8-architecture-diagrams.md`](v8-architecture-diagrams.md).
 
 ---
 
