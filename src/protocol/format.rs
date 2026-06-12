@@ -811,6 +811,13 @@ pub fn symbol_detail_from_indexed_file(
             )
         }
         SymbolSelectorMatch::NotFound => {
+            if let Some(window) = content_anchored_symbol_window(
+                file,
+                name,
+                COMPETENT_READ_WINDOW_LINES / 2,
+            ) {
+                return window;
+            }
             render_not_found_symbol(&file.relative_path, &file.symbols, name)
         }
         SymbolSelectorMatch::Ambiguous(lines) => {
@@ -4910,6 +4917,12 @@ pub fn format_tool_call_counts(counts: &[(String, usize)]) -> String {
 pub const COMPETENT_READ_WINDOW_LINES: u32 = 50;
 const COMPETENT_READ_AVG_LINE_BYTES: usize = 80;
 
+/// Whole-file char count below which a competent agent reads the entire file.
+pub const SMALL_FILE_CHAR_THRESHOLD: usize = 200;
+
+/// Line count at or below which responses should stay minimal (outline-only, no hints).
+pub const SMALL_FILE_LINE_THRESHOLD: usize = 50;
+
 /// Whole-file read baseline (legacy naive comparison — kept for transparency).
 pub fn whole_file_baseline_chars(raw_chars: usize) -> usize {
     raw_chars
@@ -4917,7 +4930,7 @@ pub fn whole_file_baseline_chars(raw_chars: usize) -> usize {
 
 /// Windowed read a disciplined agent would do instead of reading the whole file.
 pub fn competent_manual_baseline_chars(raw_chars: usize) -> usize {
-    if raw_chars < 200 {
+    if raw_chars < SMALL_FILE_CHAR_THRESHOLD {
         return raw_chars;
     }
     let window =
@@ -4925,12 +4938,68 @@ pub fn competent_manual_baseline_chars(raw_chars: usize) -> usize {
     raw_chars.min(window)
 }
 
+pub fn indexed_file_line_count(content: &[u8]) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    content.iter().filter(|&&b| b == b'\n').count() + 1
+}
+
+pub fn is_small_indexed_file(content_len: usize, line_count: usize) -> bool {
+    content_len < SMALL_FILE_CHAR_THRESHOLD || line_count <= SMALL_FILE_LINE_THRESHOLD
+}
+
+/// Default read budget when callers omit `max_tokens` (~50-line competent window).
+pub fn default_read_max_tokens() -> u64 {
+    estimate_tokens_from_chars(competent_manual_baseline_chars(4000))
+}
+
+/// Resolve an explicit or default token budget for read-like tools.
+pub fn resolve_read_max_tokens(explicit: Option<u64>, raw_chars: usize) -> u64 {
+    match explicit {
+        Some(t) if t > 0 => t,
+        _ => {
+            let baseline = competent_manual_baseline_chars(raw_chars);
+            estimate_tokens_from_chars(baseline).max(64)
+        }
+    }
+}
+
+/// Grep-then-window fallback when the symbol name is missing from the index but
+/// appears in source (matches sf-bench manual T1: grep hit + ±25-line window).
+pub fn content_anchored_symbol_window(
+    file: &crate::live_index::store::IndexedFile,
+    needle: &str,
+    radius_lines: u32,
+) -> Option<String> {
+    if needle.trim().is_empty() {
+        return None;
+    }
+    let text = std::str::from_utf8(&file.content).ok()?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let needle_lower = needle.to_lowercase();
+    let hit_line = lines
+        .iter()
+        .position(|line| line.to_lowercase().contains(&needle_lower))
+        .map(|idx| (idx + 1) as u32)?;
+    let excerpt = render_numbered_around_line_excerpt(&lines, hit_line, radius_lines);
+    if excerpt.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{excerpt}\n[content-anchored window around '{needle}' at L{hit_line}; no indexed symbol with that name]"
+    ))
+}
+
 pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
     chars.div_ceil(4) as u64
 }
 
 pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {
-    if raw_chars <= response_chars || raw_chars < 200 {
+    if raw_chars <= response_chars || raw_chars < SMALL_FILE_CHAR_THRESHOLD {
         return 0;
     }
     estimate_tokens_from_chars(raw_chars.saturating_sub(response_chars))
@@ -4955,7 +5024,7 @@ pub fn estimate_listing_baseline_chars(output_chars: usize) -> usize {
 /// Estimate tokens saved by a structured response vs raw file content.
 /// Returns a one-line footer string, or empty string if no meaningful savings.
 pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String {
-    if raw_chars <= response_chars || raw_chars < 200 {
+    if raw_chars <= response_chars || raw_chars < SMALL_FILE_CHAR_THRESHOLD {
         return String::new();
     }
     let whole_saved = saved_tokens_whole_file(response_chars, raw_chars);

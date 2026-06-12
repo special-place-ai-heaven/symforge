@@ -3281,21 +3281,27 @@ impl SymForgeServer {
 
         match file {
             Some(file) => {
+                let raw_chars = file.content.len();
+                let line_count = format::indexed_file_line_count(&file.content);
+                let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
                 let body = format::symbol_detail_from_indexed_file(
                     file.as_ref(),
                     &params.0.name,
                     params.0.kind.as_deref(),
                     params.0.symbol_line,
                 );
-                let output = format!(
-                    "{body}{}",
+                let hint = if is_small_file {
+                    String::new()
+                } else {
                     format::compact_next_step_hint(&[
                         "get_symbol_context (callers/callees/types)",
                         "find_references (usages)",
                         "edit_within_symbol / replace_symbol_body (edits)",
                     ])
-                );
-                let raw_chars = file.content.len();
+                    .to_string()
+                };
+                let output = format!("{body}{hint}");
+                let max_tokens = format::resolve_read_max_tokens(params.0.max_tokens, raw_chars);
                 self.record_tool_savings_named(
                     "get_symbol",
                     format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
@@ -3312,7 +3318,7 @@ impl SymForgeServer {
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                output
+                format::enforce_token_budget(output, Some(max_tokens))
             }
             None => {
                 let suggestions = {
@@ -3551,31 +3557,45 @@ impl SymForgeServer {
                 return format::not_found_file(&params.0.path);
             }
         }
-        const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 2000;
-        let (raw_chars, symbol_count, reference_count) = {
+        const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 1000;
+        let (raw_chars, line_count, symbol_count, reference_count) = {
             let guard = self.index.read();
             loading_guard!(guard);
             let stats = guard
                 .capture_shared_file(&params.0.path)
-                .map(|f| (f.content.len(), f.symbols.len(), f.references.len()))
-                .unwrap_or((0, 0, 0));
+                .map(|f| {
+                    (
+                        f.content.len(),
+                        format::indexed_file_line_count(&f.content),
+                        f.symbols.len(),
+                        f.references.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             drop(guard);
             stats
         };
-        let large_default_summary = params.0.sections.is_none()
+        let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
+        let large_default_summary = !is_small_file
+            && params.0.sections.is_none()
             && (raw_chars > 200_000 || symbol_count > 250 || reference_count > 800);
 
         let state = sidecar_state_for_server(self);
         let include_tests = include_tests_from_sections(params.0.sections.as_ref());
-        let sections = if large_default_summary {
+        let sections = if is_small_file {
+            Some(vec!["outline".to_string()])
+        } else if large_default_summary {
             Some(vec!["outline".to_string(), "imports".to_string()])
         } else {
             visible_sections(&params.0.sections)
         };
-        let context_max_tokens = params
-            .0
-            .max_tokens
-            .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS));
+        let context_max_tokens = Some(format::resolve_read_max_tokens(
+            params
+                .0
+                .max_tokens
+                .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS)),
+            raw_chars,
+        ));
         let outline = OutlineParams {
             path: params.0.path.clone(),
             max_tokens: context_max_tokens,
@@ -3596,12 +3616,16 @@ impl SymForgeServer {
                         format!("{note}\n\n{result}")
                     };
                 }
-                let hint = format::compact_next_step_hint(&[
-                    "get_symbol (body)",
-                    "find_references (callers/imports)",
-                    "search_text (string/pattern usage)",
-                    "get_file_content (exact raw text)",
-                ]);
+                let hint = if is_small_file {
+                    String::new()
+                } else {
+                    format::compact_next_step_hint(&[
+                        "get_symbol (body)",
+                        "find_references (callers/imports)",
+                        "search_text (string/pattern usage)",
+                        "get_file_content (exact raw text)",
+                    ])
+                };
                 let body = format!("{result}{hint}");
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
                 let output =
@@ -4188,6 +4212,59 @@ impl SymForgeServer {
             Some(envelope) => format!("{envelope}\n\n{output}{hint}"),
             None => format!("{output}{hint}"),
         };
+        let output = if !is_browse
+            && query_str.len() >= 2
+            && result.hits.len() < options.result_limit.get() / 2
+        {
+            let text_fallback = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                let mut text_options = search::TextSearchOptions::for_current_code_search();
+                text_options.path_scope = options.path_scope.clone();
+                text_options.noise_policy = options.noise_policy.clone();
+                text_options.include_personal_tooling = options.include_personal_tooling;
+                text_options.language_filter = options.language_filter.clone();
+                text_options.total_limit = 15;
+                text_options.max_per_file = 1;
+                search::search_text_with_options(
+                    &guard,
+                    Some(query_str),
+                    None,
+                    false,
+                    &text_options,
+                )
+                .unwrap_or_else(|_| search::TextSearchResult {
+                    label: String::new(),
+                    total_matches: 0,
+                    files: vec![],
+                    suppressed_by_noise: 0,
+                    overflow_count: 0,
+                })
+            };
+            let symbol_paths: std::collections::HashSet<&str> =
+                result.hits.iter().map(|h| h.path.as_str()).collect();
+            let extra_paths: Vec<String> = text_fallback
+                .files
+                .iter()
+                .filter(|file| !symbol_paths.contains(file.path.as_str()))
+                .filter_map(|file| {
+                    file.matches.first().map(|m| {
+                        format!("{}:{}", file.path, m.line_number)
+                    })
+                })
+                .take(10)
+                .collect();
+            if extra_paths.is_empty() {
+                output
+            } else {
+                format!(
+                    "{output}\n\nText path fallback (sparse symbol hits):\n{}",
+                    extra_paths.join("\n")
+                )
+            }
+        } else {
+            output
+        };
         self.record_tool_savings_named(
             "search_symbols",
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
@@ -4208,10 +4285,11 @@ impl SymForgeServer {
         // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
         // §"Search tools deliberately do NOT bump" for the positive-feedback-
         // loop rationale.
-        format::enforce_token_budget(output, params.0.max_tokens)
+        format::enforce_token_budget(
+            output,
+            Some(format::resolve_read_max_tokens(params.0.max_tokens, 4000)),
+        )
     }
-
-    /// Full-text search across file contents — literal, OR-terms, regex, or structural AST patterns.
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
     /// follow_refs=true to inline callers. Set structural=true to match AST patterns using
     /// ast-grep syntax ($VAR for metavariables, $$$ for multi-node wildcards).
@@ -6068,7 +6146,7 @@ impl SymForgeServer {
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
         let mut input = params.0;
         input.path = normalize_exact_path(&input.path);
-        let max_tokens = input.max_tokens;
+        let explicit_max_tokens = input.max_tokens;
 
         if let Err(e) = normalize_file_content_aliases(&mut input) {
             return e;
@@ -6077,7 +6155,7 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_file_content", &input).await {
             return format::enforce_token_budget(
                 format::cap_file_content_output(result),
-                max_tokens,
+                explicit_max_tokens,
             );
         }
         // Estimate mode: return token cost without reading content
@@ -6139,6 +6217,10 @@ impl SymForgeServer {
         match file {
             Some(file) => {
                 let raw_chars = file.as_ref().content.len();
+                let max_tokens = Some(format::resolve_read_max_tokens(
+                    explicit_max_tokens,
+                    raw_chars,
+                ));
                 let output = format::file_content_from_indexed_file_with_context(
                     file.as_ref(),
                     options.content_context,
@@ -6201,6 +6283,10 @@ impl SymForgeServer {
                                 ));
                                 let with_warning =
                                     format::append_nul_byte_warning(capped, &content);
+                                let max_tokens = Some(format::resolve_read_max_tokens(
+                                    explicit_max_tokens,
+                                    content.len(),
+                                ));
                                 return format::enforce_token_budget(with_warning, max_tokens);
                             }
                             Err(e) => {
@@ -8713,6 +8799,7 @@ mod tests {
             symbol_line: None,
             targets: None,
             estimate: None,
+            max_tokens: None,
         }
     }
 
@@ -8889,6 +8976,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -8967,6 +9055,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -9025,6 +9114,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         // Should return source body or not-found message — not a guard message
@@ -13797,6 +13887,7 @@ mod tests {
                     end_byte: None,
                 }]),
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -13829,6 +13920,7 @@ mod tests {
                     end_byte: Some(8),
                 }]),
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(

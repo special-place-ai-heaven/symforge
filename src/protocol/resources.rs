@@ -232,6 +232,7 @@ impl SymForgeServer {
                     symbol_line: None,
                     targets: None,
                     estimate: None,
+                    max_tokens: None,
                 }))
                 .await
             }
