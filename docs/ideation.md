@@ -276,9 +276,9 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 
 ---
 
-### 2026-06-12 — Admin web UI with `symforge serve` (8.1)
+### 2026-06-12 — Admin web UI with `symforge serve` (**committed 8.1**)
 
-**Decision:** Plan a **local operator web UI** (stats, repo/index ops, API key settings) on the same axum process as Streamable HTTP MCP — rusqlite-backed, single-tenant, loopback-first. **Not** in 8.0; MVP in Phase 4.7 after L4 ledger schema exists.
+**Decision:** Local operator web UI on the same process as MCP — stats, repo ops, API keys, rusqlite-backed. **Required for 8.1.0 (O1–O8).**
 
 **Context:** Capture all product ideas at start; avoid a second dashboard project after serve ships.  
 **Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); gaps **G-037..G-042**
