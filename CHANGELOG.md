@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.21.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.1...v7.21.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* **init:** strip UTF-8 BOM when parsing client config files ([b80aaba](https://github.com/special-place-ai-heaven/symforge/commit/b80aaba378284beda1a8b9d8b88b4513565e8f6e))
+
 ## [7.21.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.0...v7.21.1) (2026-06-11)
 
 
