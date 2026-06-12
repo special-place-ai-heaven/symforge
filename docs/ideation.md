@@ -3,7 +3,7 @@
 **Status:** living document · branch `v8/stel-architecture`  
 **Purpose:** Capture *why* and *what* before nitty-gritty specs. Elaborate sections over time; link outward instead of duplicating.
 
-**Companion docs:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) (binding execution), [`v8-master-plan.md`](v8-master-plan.md), [`stel-architecture.md`](stel-architecture.md), [`stel-assumptions.md`](stel-assumptions.md).
+**Companion docs:** **[`v8-bootstrap.md`](v8-bootstrap.md)** (external LLM entry) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`v8-master-plan.md`](v8-master-plan.md) · [`stel-architecture.md`](stel-architecture.md) · [`stel-assumptions.md`](stel-assumptions.md)
 
 ---
 
