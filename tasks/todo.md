@@ -20,13 +20,42 @@
 - `Cargo.toml` still has `rmcp = { version = "1.1.0", features = ["transport-io"] }`; no Streamable HTTP feature is enabled.
 - `src/main.rs` still chooses daemon-backed stdio first and falls back to local stdio plus a separate HTTP sidecar.
 - `src/protocol/tools.rs` and `src/protocol/edit_tools.rs` still expose the legacy 32-tool router; `src/protocol/smart_query.rs` and `ask` route directly to one core tool, not to a STEL plan/controller.
-- `src/stel/` does not exist, which is correct because `docs/v8-gap-closure-plan.md` §12 is still all unchecked.
+- `src/stel/` does not exist, which is correct because `docs/v8-gap-closure-plan.md` §12A is still not fully green.
 
 ## Review
 
 - Complete: [`docs/reviews/v8-architecture-review-codex-resume.md`](../docs/reviews/v8-architecture-review-codex-resume.md)
-- Verdict: design sound; Phase 0 §12 is the blocker; proceed only through harness/golden file before `src/stel/`.
-- Net-new gaps: G-NEW-1..5 (admission naming, ask vs trust envelope, init allowlists, TokenStats confusion, local-empty merge constraint).
+- Verdict: design sound; Phase 0 §12A is the blocker; proceed only through harness/golden file before `src/stel/`.
+- Net-new gaps: G-032..G-036 in gap-closure plan (from Codex addendum).
+
+---
+
+# Phase 0 pre-flight (§12A)
+
+## Plan
+
+- [x] `compare-results.js` with `--preflight` (sf-bench commit `16acb4b`)
+- [x] `routes.golden.jsonl` 36-row skeleton + `fixtures/preflight-minimal.json`
+- [x] `scripts/measure-schema-bytes.ps1` stub (symforge `f7af058`)
+- [ ] Human review of golden `expected_decision` / `expected_equiv` (≥10 rows)
+- [ ] A-001..A-004 validated on real battery output
+- [ ] `battery.js` emits v8 row fields (`decision`, `acceptedServe`, …)
+- [ ] A-012 two-hop bypass harness
+- [ ] A-005 / A-019 / A-025 validated
+
+## Run
+
+```powershell
+cd E:\project\sf-bench
+node compare-results.js --preflight --release 8.0
+cd E:\project\symforge
+.\scripts\measure-schema-bytes.ps1
+```
+
+## Review
+
+- Preflight gate script verified (synthetic fixture passes H1–H5, H7).
+- Still blocked on real harness trust + golden semantics before `src/stel/`.
 
 ---
 
