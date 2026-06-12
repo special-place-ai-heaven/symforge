@@ -272,7 +272,7 @@ Gates are **performance and path outcomes** on pinned artifacts. CI fails if met
 | Release | Scope | Gates |
 |---------|--------|-------|
 | **8.0.0** | STEL economics + compact surface | **H1–H5, H7**, revised **H4** |
-| **8.1.0** | Reference quality + recommendable deploy | **H6, H8** + `symforge serve` (A-020..A-022) |
+| **8.1.0** | Reference quality + recommendable deploy | **H6, H8** + `symforge serve` + **operator stack O1–O8** |
 
 H6 at 50% from **8/36** today requires T2/T3 index work — scoped as **8.1 program**, not a single Phase 2 line item. See [`v8-master-plan.md`](v8-master-plan.md).
 

@@ -20,7 +20,7 @@ We write ideation down first, validate assumptions, then implement. Details deep
 | [`stel-architecture.md`](stel-architecture.md) | STEL charter, gates H1–H8 |
 | [`stel-schema.md`](stel-schema.md) | Normative types, controller algorithm |
 | [`stel-assumptions.md`](stel-assumptions.md) | Assumption register A-001.. |
-| [`v8-admin-ui.md`](v8-admin-ui.md) | Operator dashboard plan (8.1, rusqlite) |
+| [`v8-admin-ui.md`](v8-admin-ui.md) | **Committed** operator UX — admin, onboarding, harness hub (O1–O8, 8.1) |
 
 ---
 
@@ -42,7 +42,7 @@ We write ideation down first, validate assumptions, then implement. Details deep
 | **1** | Phase 1 | Compact surface **H1** |
 | **2** | Phase 2 | Router + controller **H3, H4, H5** |
 | **3** | Phase 3 | Ledger → **8.0.0** + pin v8 baseline |
-| **4** | Phase 4 | **H6, H8** + `symforge serve` + admin UI → **8.1.0** |
+| **4** | Phase 4 | **H6, H8** + `symforge serve` + **O1–O8 operator stack** → **8.1.0** |
 
 ---
 

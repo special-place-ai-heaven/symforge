@@ -1,16 +1,39 @@
-# SymForge v8 — Admin web UI (planning)
+# SymForge v8 — Admin web UI & operator experience (committed roadmap)
 
-**Status:** PLANNED — not blocking Phase 0 or 8.0  
+**Status:** **COMMITTED for 8.1.0** — ships with `symforge serve`; not optional polish  
 **Branch:** `v8/stel-architecture`  
 **Companion:** [`v8-master-plan.md`](v8-master-plan.md) · [`ideation.md`](ideation.md) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md)
 
+**Does not block:** Phase 0 or **`src/stel/`** (8.0 economics still first).
+
 ---
 
-## Why capture this now
+## Why this is on the roadmap (committed)
 
-v8 is not only an MCP protocol change — it is a **deployable server product**. Operators need to see economics proof, index health, and credentials without reading MCP responses or CLI JSON. Planning the admin UI **up front** keeps one process, one auth story, and one SQLite stack — instead of bolting on a dashboard after `symforge serve` ships.
+v8 is a **deployable server product**, not only an MCP protocol refactor. Industry MCP servers already offer local admin ports, stats, and client setup — **SymForge 8.1 matches that bar**. Operator UX is part of “easy deploy and recommend,” not a follow-up side project.
 
-**Not in scope:** multi-tenant SaaS, OAuth/SSO, billing (see [`ideation.md`](ideation.md) non-goals).
+**Committed for 8.1.0 tag:** admin dashboard, first-run/post-update onboarding, harness scan-and-apply, per-harness API keys, ops telemetry (resources, PIDs, indexes, sessions).
+
+**Still not in scope:** multi-tenant SaaS, OAuth/SSO, billing (see [`ideation.md`](ideation.md) non-goals).
+
+---
+
+## 8.1 operator acceptance (blocks tag)
+
+All must pass on **Win + Linux or macOS** smoke before **8.1.0**:
+
+| ID | Requirement |
+|----|-------------|
+| **O1** | `symforge serve` exposes `/mcp`, `/admin`, `/api/v1/*` on documented bind |
+| **O2** | Post-install/update/`serve` prints admin + MCP URLs; optional browser open (`--no-open` to skip) |
+| **O3** | First-run wizard: create MCP key → land on dashboard |
+| **O4** | Dashboard: economics summary, indexed repos, active sessions, system resources, symforge-related PIDs |
+| **O5** | **Scan harnesses** finds ≥3 client types (Cursor, Claude Code, Codex minimum registry) |
+| **O6** | **Apply** writes Streamable HTTP + Bearer config with backup; dry-run preview in UI |
+| **O7** | Per-harness API keys optional but supported (create, revoke, scoped) |
+| **O8** | `symforge init --url … --scan` uses same `HarnessRegistry` as admin (no duplicate logic) |
+
+**8.2+ (polish only):** charts, CSV export, log tail, themes — not required for 8.1 tag.
 
 ---
 
@@ -19,14 +42,14 @@ v8 is not only an MCP protocol change — it is a **deployable server product**.
 | Release | Admin / ops surface | Notes |
 |---------|---------------------|-------|
 | **7.x (today)** | CLI only (`symforge analytics …`); sidecar `GET /health` JSON; daemon REST | Fragmented; no unified UI |
-| **8.0.0** | **`symforge_status` MCP tool** + CLI | Agent-facing battery headline; **no web UI yet** |
-| **8.1.0** | **`symforge serve`** + **admin UI MVP** on same axum server | MCP `/mcp` + `/admin` + JSON API |
-| **8.2+ (optional)** | Dashboard polish, charts, export UX | After H6/H8 green; not gated |
+| **8.0.0** | **`symforge_status` MCP tool** + CLI | Agent-facing battery headline; **no web UI** |
+| **8.1.0** | **`symforge serve`** + **full operator stack** (admin, onboarding, harness hub) | **O1–O8** + H6/H8 |
+| **8.2+** | Visual polish only (charts, export, themes) | Not gated |
 
 ```text
 Phase 0   → harness + golden file (no UI)
 Phase 1–3 → STEL + L4 ledger schema in SQLite (data layer for future dashboard)
-Phase 4   → symforge serve + admin MVP ships with 8.1.0
+Phase 4   → symforge serve + **committed operator stack** (O1–O8) → tag 8.1.0
 ```
 
 ---
@@ -244,27 +267,27 @@ CLI may call the same endpoints later (`symforge stats --url …`) — API first
 | **2** | Controller emits structured trust envelope (feeds ledger) | No |
 | **3** | **`StelLedgerEvent` → rusqlite** (L4); `symforge_status` = battery headline | **Yes — data model** |
 | **4.1–4.3** | `symforge serve`, ServerRuntime merge, auth model | **Yes — transport + auth** |
-| **4.7** | Admin static + `/api/v1/*` routes | Ships 8.1 MVP |
-| **4.8** | First-run wizard + post-update URL banner + optional browser open | Onboarding UX |
-| **4.9** | Harness scan/apply module (`src/harness/`) shared with CLI | Harness hub |
-| **8.2+** | Charts, export CSV, dark mode, i18n | No |
+| **4.7** | Admin static + `/api/v1/*` + ops telemetry | **O1, O4, G-042** |
+| **4.8** | First-run wizard + post-update URL banner + browser open | **O2, O3** |
+| **4.9** | Harness scan/apply (`src/harness/`) shared with CLI | **O5–O8** |
+| **4.10** | Tag **8.1.0** — all O1–O8 + H6/H8 | Release |
 
 **Rule:** Do not show hook `TokenStats` as v8 economics in the UI (G-NEW-4). Dashboard reads **ledger rows** only.
 
 ---
 
-## Gap register
+## Gap register (committed — 8.1.0)
 
-| ID | Gap | Closure | Phase |
-|----|-----|---------|-------|
-| **G-037** | No operator web UI | Admin MVP on `symforge serve` | 4.7 / 8.1 |
-| **G-038** | No `stel_ledger` SQLite schema | Migration in L4 (Phase 3) | 3 |
-| **G-039** | No product API-key store | Hashed keys in server DB; `init --url` | 4.4 |
-| **G-040** | No first-run / post-update onboarding | CLI banner + browser open + wizard | 4.8 |
-| **G-041** | No harness filesystem scan + config writer | `HarnessRegistry`; admin + CLI share logic | 4.9 |
-| **G-042** | No ops telemetry in UI | System + PID + session panels | 4.7 |
+| ID | Gap | Closure | Phase | Blocks 8.1 |
+|----|-----|---------|-------|------------|
+| **G-037** | No operator web UI | Admin on `symforge serve` | 4.7 | **Yes** |
+| **G-038** | No `stel_ledger` SQLite schema | L4 migration | 3 | Yes |
+| **G-039** | No product API-key store | Hashed keys + rotate | 4.4 | **Yes** |
+| **G-040** | No first-run / post-update onboarding | URL banner + wizard | 4.8 | **Yes** |
+| **G-041** | No harness scan + config apply | `HarnessRegistry` | 4.9 | **Yes** |
+| **G-042** | No ops telemetry in admin UI | System + PID panels | 4.7 | **Yes** |
 
-Depends on: **G-020** (serve), **G-034** (ServerRuntime), **G-033** (sidecar auth), **G-030b** (init templates → evolves into G-041).
+Depends on: **G-020**, **G-034**, **G-033**, **G-030b** (evolves into G-041).
 
 ---
 
@@ -289,6 +312,7 @@ Add to [`stel-assumptions.md`](stel-assumptions.md) when Phase 4 planning starts
 | 2026-06-12 | Admin web UI planned for **8.1** with `symforge serve`; rusqlite-backed; single-tenant local ops; MVP in Phase 4.7 after L4 ledger exists |
 | 2026-06-12 | **First-run onboarding:** post-install/update message with admin URL; optional browser open; wizard for key + harness scan |
 | 2026-06-12 | **Harness hub:** OS scan of MCP configs, per-harness API keys, backup-then-apply — evolves `symforge init` + `InitClient::All` |
+| 2026-06-12 | **COMMITTED:** full operator stack (O1–O8) is **required for 8.1.0 tag** — industry-parity admin, not post-release nice-to-have |
 
 ---
 

@@ -18,7 +18,7 @@ If a spike hits KILL criteria → pivot per §4 decision tree → re-validate �
 only then continue. No “implement anyway and fix later.”
 ```
 
-**End state (8.1.0):** stdio + **`symforge serve`** (URL + API key), compact STEL, economics gates on 8.0, quality + deploy on 8.1, sf-bench reproducible on pinned SHAs.
+**End state (8.1.0):** stdio + **`symforge serve`** (URL + API key), compact STEL, economics gates on 8.0, quality + deploy on 8.1, **committed operator stack (O1–O8)**, sf-bench reproducible on pinned SHAs.
 
 ### Paradigm shift (7.x bench vs v8)
 
@@ -54,7 +54,7 @@ diff against THAT. Optional appendix: 7.x numbers for historical context only.
 | Release | Ships | Gates | Transport |
 |---------|-------|-------|-----------|
 | **8.0.0** | Compact STEL, controller, ledger, stdio MCP | **H1–H5, H7** | stdio (existing) |
-| **8.1.0** | Reference quality + unified server | **H6, H8** + deploy | Streamable HTTP `/mcp` + optional stdio shim |
+| **8.1.0** | Reference quality + unified server + **operator UX** | **H6, H8** + deploy + **O1–O8** | Streamable HTTP `/mcp` + admin `/admin` |
 
 Do **not** tag 8.0 claiming “easy deploy”; do **not** defer H6 fixes silently into 8.0.
 
@@ -132,14 +132,14 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 
 | ID | Gap | Closure action | Artifact | Pass | Pivot | Kill |
 |----|-----|----------------|----------|------|-------|------|
-| **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | loopback smoke on 2 hosts | CLI-only stats | defer to 8.2 |
-| **G-038** | No STEL ledger SQLite | Phase 3 L4: `stel_ledger_events` migration | schema + store | dashboard + H4 query <100ms | export JSON only | — |
-| **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | rotate + MCP auth works | file-based keys only | — |
-| **G-040** | No first-run / post-update onboarding | CLI URL banner + optional browser open + wizard | onboarding flag in server DB | 3-platform smoke | CLI-only instructions | — |
-| **G-041** | No harness scan + config apply | `HarnessRegistry`; scan/apply API + CLI `--scan` | `src/harness/` | Cursor+Codex smoke | manual `init --url` only | — |
-| **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | panels render | CLI `symforge status` only | — |
+| **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | O1,O4 pass | — | **8.1 blocked** |
+| **G-038** | No STEL ledger SQLite | Phase 3 L4: `stel_ledger_events` migration | schema + store | dashboard + H4 query | export JSON only | **8.1 blocked** |
+| **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | O3,O7 pass | — | **8.1 blocked** |
+| **G-040** | No first-run / post-update onboarding | CLI URL banner + browser open + wizard | onboarding in server DB | O2,O3 pass | — | **8.1 blocked** |
+| **G-041** | No harness scan + config apply | `HarnessRegistry`; scan/apply API + CLI `--scan` | `src/harness/` | O5–O8 pass | — | **8.1 blocked** |
+| **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | O4 pass | — | **8.1 blocked** |
 
-Detail: [`v8-admin-ui.md`](v8-admin-ui.md). Depends on **G-020**, **G-034**, **G-033**.
+Detail: [`v8-admin-ui.md`](v8-admin-ui.md) — **O1–O8 required for 8.1.0 tag**. Depends on **G-020**, **G-034**, **G-033**.
 
 ---
 
@@ -458,6 +458,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 - [ ] A-023 reflected in compare-results (BYPASS excluded from H6 denominator)
 - [ ] A-031 rmcp compile spike doc (`docs/research/A-031-rmcp-spike.md`)
 - [ ] A-020..A-022 validated (stdio vs HTTP battery parity + deploy acceptance)
+- [ ] **O1–O8** operator acceptance ([`v8-admin-ui.md`](v8-admin-ui.md)) — admin, onboarding, harness hub on 2 hosts
 
 ---
 
@@ -466,7 +467,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 | Milestone | Objective proof |
 |-----------|-----------------|
 | **8.0.0** | `compare-results.js candidate baseline` → H1–H5,H7 PASS; footer = `session_net_accepted` |
-| **8.1.0** | H6,H8 PASS; `symforge serve` + paste JSON works on 2 hosts; battery stdio vs HTTP ±1% |
+| **8.1.0** | H6,H8 PASS; `symforge serve` + paste JSON on 2 hosts; battery stdio vs HTTP ±1%; **O1–O8 PASS** (admin, onboarding, harness scan/apply) |
 
 ---
 

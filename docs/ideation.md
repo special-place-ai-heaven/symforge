@@ -11,7 +11,7 @@
 
 SymForge is a **code-intelligence MCP server that genuinely reduces token use** for agent workflows — not by gaming metrics, but by beating what a competent developer would do manually (`grep` + a bounded read window) or by **stepping aside honestly** when it cannot win.
 
-We want something people **deploy in one command**, **attach from any MCP harness** (URL + API key), and **recommend to others** because the savings show up in every session footer — and match an independent battery anyone can re-run.
+We want something people **deploy in one command**, **attach from any MCP harness** (URL + API key), **configure clients from a local admin UI** (scan → apply), and **recommend to others** because the savings show up in every session footer — and match an independent battery anyone can re-run.
 
 We are **not** building this to monetize tiers or chase enterprise checkbox features. We are building something **superior on measured economics**, then making it **easy to run everywhere** (Windows, Linux, macOS, WSL).
 
@@ -48,7 +48,7 @@ Full gate math: [`stel-architecture.md`](stel-architecture.md#release-gates-all-
 
 ## Product surfaces map (all ideas — where each lands)
 
-Use this table at planning time so nothing is “surprise scope” later. Detail: [`v8-admin-ui.md`](v8-admin-ui.md).
+Use this table at planning time — **8.1 operator rows are committed**, not backlog. Detail: [`v8-admin-ui.md`](v8-admin-ui.md).
 
 | Surface | Audience | Phase / release | Transport |
 |---------|----------|-----------------|-----------|
@@ -285,13 +285,11 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 
 ---
 
-### 2026-06-12 — Harness hub + first-run onboarding (8.1)
+### 2026-06-12 — Harness hub + first-run onboarding (**committed 8.1**)
 
-**Decision:** After install/update/`serve`, show admin URL and optionally open browser. Dashboard exposes system resources, symforge PIDs, sessions, indexes. **Scan** OS for MCP harness configs, assign per-harness API keys, backup-and-apply — operator does not hand-edit client JSON/TOML. Evolves `symforge init --client all` (`src/cli/init.rs`) into shared `HarnessRegistry`.
+**Decision:** After install/update/`serve`, show admin URL and optionally open browser. Dashboard exposes system resources, symforge PIDs, sessions, indexes. **Scan** OS for MCP harness configs, assign per-harness API keys, backup-and-apply. **Required for 8.1.0 tag (O1–O8)** — industry-parity operator UX, not optional.
 
-**Context:** User idea — convenience over fiddling in each harness; build on existing multi-client init.  
-**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md) § First-run, § Harness hub; **G-040..G-042**
-
----
+**Context:** User commitment — same class of UX as other MCP servers; convenience over hand-editing client configs.  
+**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); **G-037..G-042**
 
 *Last updated: 2026-06-12 · amend decision log and open questions as ideation grows.*

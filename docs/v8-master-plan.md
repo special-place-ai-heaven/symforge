@@ -11,7 +11,7 @@ Status: **PRE-IMPLEMENTATION** — see [`v8-gap-closure-plan.md`](v8-gap-closure
 
 ## What we are building (one paragraph)
 
-**SymForge is a superior code-intelligence MCP server whose only headline is honest net token savings** — every accepted call beats competent manual (`grep` + ~50-line read window) or SymForge **bypasses with a real cheaper alternative**. It runs on Windows, Linux, macOS, and WSL; deploys with one server process; attaches from any MCP harness via **URL + API key**; and proves superiority with **sf-bench**, not marketing.
+**SymForge is a superior code-intelligence MCP server whose only headline is honest net token savings** — every accepted call beats competent manual (`grep` + ~50-line read window) or SymForge **bypasses with a real cheaper alternative**. It runs on Windows, Linux, macOS, and WSL; deploys with **`symforge serve`** (MCP + **admin UI**); attaches from any harness via **URL + API key** with **scan-and-apply config**; and proves superiority with **sf-bench**, not marketing.
 
 We are **not** optimizing for revenue tiers, OAuth complexity, or feature count. We optimize for **measurable economics**, **trust**, and **recommendability**.
 
@@ -89,6 +89,7 @@ See `E:\project\sf-bench\RESULTS.md` as a **7.x appendix**. v8 gates (H1–H8) a
 | **H6** | `EQUIVALENT` / eligible rows ≥ **50%**; BYPASS excluded (**A-023**) — absolute, not vs 7.x |
 | **H8** | Per-language accepted serve: zero accepted losses per language |
 | **Deploy** | `symforge serve` + URL + API key (**A-020..A-022**) |
+| **Operator** | Admin UI + onboarding + harness hub (**O1–O8**) — [`v8-admin-ui.md`](v8-admin-ui.md) |
 
 Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-all-required-for-800).
 
@@ -179,9 +180,9 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 4.7 | **Admin UI MVP** — `/admin` + `/api/v1/*` | Operator dashboard | **G-037, G-042** |
 | 4.8 | **First-run onboarding** — URL banner, browser open, wizard | Install/update UX | **G-040** |
 | 4.9 | **Harness hub** — scan configs, per-harness keys, apply | `src/harness/` + admin | **G-041** |
-| 4.10 | Tag **8.1.0** | Release | |
+| 4.10 | Tag **8.1.0** | **O1–O8** + H6/H8 | all gates |
 
-**Exit:** H6/H8 PASS + documented URL+key config on two hosts.
+**Exit:** H6/H8 PASS + **O1–O8 PASS** + documented URL+key config on two hosts.
 
 ---
 
@@ -195,7 +196,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | **Trust envelope + session ledger** | Recommendability in 30 seconds |
 | **Daemon → unified server** | One index, multi-session, governor |
 | **Streamable HTTP + Bearer API key** | Industry MCP remote config |
-| **Admin web UI (local ops)** | Stats, index ops, keys — same server as `/mcp` ([`v8-admin-ui.md`](v8-admin-ui.md)) |
+| **Admin web UI (local ops)** | Stats, index ops, keys, harness setup — same server as `/mcp` ([`v8-admin-ui.md`](v8-admin-ui.md)) — **8.1 committed** |
 | **Golden trajectories** | Path proof separate from unit tests |
 | **Assumption register** | Stops “implement anyway” drift |
 
@@ -255,7 +256,7 @@ Index stays on the **server host** (machine with the repo). Remote attach = remo
 
 ## Success looks like
 
-A developer runs SymForge (stdio **8.0**, then **`symforge serve` in 8.1**), sees footer **“saved N tokens vs grep+read”** on accepted calls, and sf-bench proves **`session_net_accepted` ≥ 0** with **zero accepted `sGteM`** on small files.
+A developer runs SymForge (stdio **8.0**, then **`symforge serve` in 8.1**), opens **`/admin`** after install, scans harnesses and applies MCP config in clicks, sees footer **“saved N tokens vs grep+read”** on accepted calls, and sf-bench proves **`session_net_accepted` ≥ 0** with **zero accepted `sGteM`** on small files.
 
 That is the product worth recommending.
 
