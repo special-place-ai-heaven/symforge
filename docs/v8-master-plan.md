@@ -1,7 +1,7 @@
 # SymForge v8 — Master plan
 
 Branch: `v8/stel-architecture`  
-Status: **PRE-IMPLEMENTATION** — see [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §12 (blocks `src/stel/`)
+Status: **PRE-IMPLEMENTATION** — see [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §12A (blocks `src/stel/`)
 
 **Binding gap closure:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md)  
 **Ideation:** [`ideation.md`](ideation.md)  
@@ -45,6 +45,7 @@ See `E:\project\sf-bench\RESULTS.md` as a **7.x appendix**. v8 gates (H1–H8) a
 ┌─────────────────────────────────────────────────────────────┐
 │ DEPLOY          symforge serve --listen HOST:PORT --api-key … │
 │ TRANSPORT       MCP Streamable HTTP  /mcp                     │
+│                 Admin UI + /api/v1  (operator — see admin doc)│
 │                 (optional stdio shim for legacy clients)      │
 ├─────────────────────────────────────────────────────────────┤
 │ STEL (intelligence)                                           │
@@ -174,7 +175,9 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 4.3 | Merge sidecar; drop local duplicate stack | Single process | **A-021** |
 | 4.4 | **`symforge init --url … --api-key …`** | Paste-ready JSON | |
 | 4.5 | sf-bench: stdio vs HTTP — no regression | Battery row | **A-022** |
-| 4.6 | Tag **8.1.0** | Release | |
+| 4.6 | **`stel_ledger` SQLite** + server key store | rusqlite migrations | **G-038, G-039** |
+| 4.7 | **Admin UI MVP** — `/admin` + `/api/v1/*` | Operator dashboard | **G-037** |
+| 4.8 | Tag **8.1.0** | Release | |
 
 **Exit:** H6/H8 PASS + documented URL+key config on two hosts.
 
@@ -190,6 +193,7 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | **Trust envelope + session ledger** | Recommendability in 30 seconds |
 | **Daemon → unified server** | One index, multi-session, governor |
 | **Streamable HTTP + Bearer API key** | Industry MCP remote config |
+| **Admin web UI (local ops)** | Stats, index ops, keys — same server as `/mcp` ([`v8-admin-ui.md`](v8-admin-ui.md)) |
 | **Golden trajectories** | Path proof separate from unit tests |
 | **Assumption register** | Stops “implement anyway” drift |
 

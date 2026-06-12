@@ -128,6 +128,16 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 | **G-030c** | Phase doc drift | A-030 on every phase edit | README crosswalk |
 | **G-POLY** | PolyForm NC | ideation Q6 note + README license | not blocking 8.0 |
 
+### 3.7 Admin UI & operator surface (8.1)
+
+| ID | Gap | Closure action | Artifact | Pass | Pivot | Kill |
+|----|-----|----------------|----------|------|-------|------|
+| **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | loopback smoke on 2 hosts | CLI-only stats | defer to 8.2 |
+| **G-038** | No STEL ledger SQLite | Phase 3 L4: `stel_ledger_events` migration | schema + store | dashboard + H4 query <100ms | export JSON only | — |
+| **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | rotate + MCP auth works | file-based keys only | — |
+
+Detail: [`v8-admin-ui.md`](v8-admin-ui.md). Depends on **G-020**, **G-034**, **G-033**.
+
 ---
 
 ## 4. Decision trees (when spikes fail)

@@ -3,7 +3,7 @@
 **Status:** living document · branch `v8/stel-architecture`  
 **Purpose:** Capture *why* and *what* before nitty-gritty specs. Elaborate sections over time; link outward instead of duplicating.
 
-**Companion docs:** **[`v8-bootstrap.md`](v8-bootstrap.md)** (external LLM entry) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`v8-master-plan.md`](v8-master-plan.md) · [`stel-architecture.md`](stel-architecture.md) · [`stel-assumptions.md`](stel-assumptions.md)
+**Companion docs:** **[`v8-bootstrap.md`](v8-bootstrap.md)** (external LLM entry) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`v8-master-plan.md`](v8-master-plan.md) · [`stel-architecture.md`](stel-architecture.md) · [`stel-assumptions.md`](stel-assumptions.md) · [`v8-admin-ui.md`](v8-admin-ui.md)
 
 ---
 
@@ -42,6 +42,27 @@ Full gate math: [`stel-architecture.md`](stel-architecture.md#release-gates-all-
 | 32-tool MCP surface as default | Battery shows schema tax dominates small calls |
 | Remote indexing of repos not on server | Index lives where files live; MCP attaches to that host |
 | Marketing percentages without equiv rate | “55.6%” without “8/36 equivalent” is dishonest |
+| Multi-tenant admin SaaS | Single-user local ops UI in 8.1; not OAuth/hosted dashboard product |
+
+---
+
+## Product surfaces map (all ideas — where each lands)
+
+Use this table at planning time so nothing is “surprise scope” later. Detail: [`v8-admin-ui.md`](v8-admin-ui.md).
+
+| Surface | Audience | Phase / release | Transport |
+|---------|----------|-----------------|-----------|
+| **32 MCP tools** | Agents (legacy) | 7.x; migration mode `SYMFORGE_SURFACE=full` | stdio |
+| **Compact STEL (3 tools)** | Agents | Phase 1 → **8.0** | stdio |
+| **`symforge_status` ledger** | Agents | Phase 3 → **8.0** | MCP |
+| **CLI** (`init`, `analytics`, `daemon`) | Operator | Existing; evolves | subprocess |
+| **Daemon REST** | Internal proxy | 7.x → merged into server Phase 4 | HTTP |
+| **Sidecar hooks HTTP** | Host hooks | 7.x → merged / loopback-only | HTTP |
+| **`symforge serve` `/mcp`** | Agents | Phase 4 → **8.1** | Streamable HTTP |
+| **Admin web UI + `/api/v1`** | Operator | Phase 4.7 → **8.1** | HTTP (same server) |
+| **sf-bench / compare-results** | Proof | Phase 0 → ongoing | CLI/Node |
+
+**SQLite (rusqlite):** analytics today; **STEL ledger + server keys** in Phase 3–4 feed both MCP status and admin UI.
 
 ---
 
@@ -239,7 +260,7 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 
 ---
 
-**Decision:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) is binding. §12 checklist must be 100% before `src/stel/`. Every gap has pass/pivot/kill; H6 is 8.1 program §6, not a Phase 2 line item.
+**Decision:** [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) is binding. §12A checklist must be 100% before `src/stel/`. Every gap has pass/pivot/kill; H6 is 8.1 program §6, not a Phase 2 line item.
 
 **Context:** User requirement — no snags we cannot get around after start.  
 **Refs:** Gap register §3, decision trees §4, harness specs §5
@@ -250,6 +271,15 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 
 **Context:** Adversarial + feasibility reviews; H4 trivially passed on SYMFORGE-LESS rows; H6 needs T2/T3 program not one line item.  
 **Refs:** [`v8-master-plan.md`](v8-master-plan.md) § Adversarial review; **A-023..A-029**
+
+---
+
+### 2026-06-12 — Admin web UI with `symforge serve` (8.1)
+
+**Decision:** Plan a **local operator web UI** (stats, repo/index ops, API key settings) on the same axum process as Streamable HTTP MCP — rusqlite-backed, single-tenant, loopback-first. **Not** in 8.0; MVP in Phase 4.7 after L4 ledger schema exists.
+
+**Context:** Capture all product ideas at start; avoid a second dashboard project after serve ships.  
+**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); gaps **G-037..G-039**
 
 ---
 

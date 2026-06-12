@@ -14,12 +14,13 @@ We write ideation down first, validate assumptions, then implement. Details deep
 |-----|------|
 | **[`v8-bootstrap.md`](v8-bootstrap.md)** | **START HERE** — bootstrap brief for external LLMs (whole v8 session memory) |
 | [`ideation.md`](ideation.md) | Vision, principles, non-goals, decision log |
-| [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) | **Binding** pre-flight — gaps, spikes, harness specs; blocks `src/stel/` until §12 green |
+| [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) | **Binding** pre-flight — gaps, spikes, harness specs; blocks `src/stel/` until §12A green |
 | [`v8-master-plan.md`](v8-master-plan.md) | Phased roadmap summary |
 | [`v8-architecture-diagrams.md`](v8-architecture-diagrams.md) | 13 mermaid diagrams |
 | [`stel-architecture.md`](stel-architecture.md) | STEL charter, gates H1–H8 |
 | [`stel-schema.md`](stel-schema.md) | Normative types, controller algorithm |
 | [`stel-assumptions.md`](stel-assumptions.md) | Assumption register A-001.. |
+| [`v8-admin-ui.md`](v8-admin-ui.md) | Operator dashboard plan (8.1, rusqlite) |
 
 ---
 
@@ -41,7 +42,7 @@ We write ideation down first, validate assumptions, then implement. Details deep
 | **1** | Phase 1 | Compact surface **H1** |
 | **2** | Phase 2 | Router + controller **H3, H4, H5** |
 | **3** | Phase 3 | Ledger → **8.0.0** + pin v8 baseline |
-| **4** | Phase 4 | **H6, H8** + `symforge serve` → **8.1.0** |
+| **4** | Phase 4 | **H6, H8** + `symforge serve` + admin UI → **8.1.0** |
 
 ---
 

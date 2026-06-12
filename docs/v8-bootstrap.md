@@ -208,6 +208,8 @@ flowchart TD
 symforge serve --listen 0.0.0.0:8787 --api-key sf_…
 ```
 
+**Operator (same process):** `http://127.0.0.1:8787/admin` — stats, projects, API keys ([`v8-admin-ui.md`](v8-admin-ui.md)).
+
 **Any MCP harness:**
 
 ```json
@@ -223,6 +225,8 @@ symforge serve --listen 0.0.0.0:8787 --api-key sf_…
 ```
 
 Platforms: Windows, Linux, macOS, WSL (Linux binary). Today: loopback daemon only; Streamable HTTP **not implemented** (`rmcp` has `transport-io` only).
+
+**Full product surface map:** [`ideation.md`](ideation.md) § Product surfaces · admin detail [`v8-admin-ui.md`](v8-admin-ui.md).
 
 ---
 
@@ -277,7 +281,8 @@ Read after this bootstrap when you need depth:
 | 6 | [`stel-schema.md`](stel-schema.md) | **Normative types**, controller algorithm, S1–S7 order |
 | 7 | [`stel-assumptions.md`](stel-assumptions.md) | A-001..A-032 assumption register |
 | 8 | [`v8-architecture-diagrams.md`](v8-architecture-diagrams.md) | 13 mermaid diagrams + reviewer prompts |
-| 9 | [`README.md`](README.md) | Doc index + phase crosswalk |
+| 9 | [`v8-admin-ui.md`](v8-admin-ui.md) | Operator web UI — phase map, rusqlite, API sketch (8.1) |
+| 10 | [`README.md`](README.md) | Doc index + phase crosswalk |
 
 ---
 
