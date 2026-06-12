@@ -1,8 +1,7 @@
 # SymForge v8 — Architecture diagrams (external review pack)
 
 **Purpose:** Self-contained visual reference for humans and external LLMs.  
-**Branch:** `v8/stel-architecture` · **Target:** 8.0.0 (STEL economics) → 8.1.0 (quality + deploy)  
-**Status:** PRE-IMPLEMENTATION — design approved in docs; `src/stel/` not started until pre-flight green.
+**Start here first:** [`v8-bootstrap.md`](v8-bootstrap.md) — full session brief. This file is the **diagram supplement**.
 
 **Related specs:** [`ideation.md`](ideation.md) · [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) · [`stel-schema.md`](stel-schema.md)
 
