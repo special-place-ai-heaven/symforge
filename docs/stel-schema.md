@@ -428,7 +428,7 @@ Expansion triggered only when trajectory replay proves a core tool beats facade 
 |------|-------------|-------|
 | **S1** | This document + `routes.golden.jsonl` seed (36 sf-bench rows; include `expected_equiv`, `expected_decision`) | review |
 | **S2** | Rust types in `src/stel/mod.rs` matching schemas | compile |
-| **S3** | Compact surface (`SYMFORGE_SURFACE=compact`) — 3 tools in `tools/list` | **H1**, **H5** |
+| **S3** | Compact surface (`SYMFORGE_SURFACE=compact`) — 3 tools in `tools/list` | **H1**; external **H5** (one MCP call) once L1–L2 execute inside that call (full H5 proof: Phase 2 exit per gap plan §7) |
 | **S4** | `StelRequest` MCP tool + envelope formatter | path replay 5 rows |
 | **S5** | L1 plan builder (extend smart_query) | H2 partial |
 | **S6** | L2 controller + bypass | **H3/H4** on **compact** surface |

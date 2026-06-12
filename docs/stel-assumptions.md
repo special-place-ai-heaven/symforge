@@ -2,7 +2,7 @@
 
 **RULE (hard gate):** Every assumption MUST be tested and validated before it drives the next phase.  
 If validation **fails** → stop forward work on that path, **research** (more data, revised design), re-register assumption, validate again.  
-**Unvalidated assumptions do not appear in code, schemas, or release gates.**
+**Unvalidated assumptions do not unlock implementation or ship as satisfied gates** (OPEN assumptions may appear in design docs as planned work).
 
 **Performance superiority overrides preservation:** any assumption of the form “we must keep X” is invalid until X beats the alternative on the pinned battery. If X loses → X is research fodder, not a constraint.
 
@@ -46,7 +46,7 @@ Store records in this file (human) and optionally `docs/stel-assumptions.json` (
 
 | Phase | May start only when |
 |-------|---------------------|
-| **0 baseline** | A-001..A-004 validated (measurement harness trustworthy) |
+| **0 baseline** | Phase 0 **exits** when A-001..A-004 validated (measurement harness trustworthy) |
 | **0 L0 choice** | A-019 validated (compact-3 vs meta-tool — **before** locking Phase 1 tools) |
 | **1 types + L0** | A-005, A-025 validated (compact schema ≤5kB including edit) |
 | **2 L1 + L2** | A-008..A-014 validated; A-029 spike started (T2/T3) |
@@ -128,7 +128,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |
 | **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **OPEN** |
 | **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | Spike artifact in research log | **OPEN** |
-| **A-031** | Phase 0.13 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-020-rmcp-spike.md` | **OPEN** |
+| **A-031** | Phase 0.12 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-031-rmcp-spike.md` | **OPEN** |
 | **A-032** | Full-file review tasks use policy **P-FF** (bypass, `eligible_h6=false`) | 4 rows in `routes.golden.jsonl` | **OPEN** |
 
 *(Register new “must keep X” beliefs here — they default OPEN and block nothing until validated.)*

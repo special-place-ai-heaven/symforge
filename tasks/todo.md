@@ -1,3 +1,35 @@
+# SymForge v8 Architecture Review
+
+## Plan
+
+- [x] Checkout and confirm `v8/stel-architecture`.
+- [x] Index the repo with SymForge and check project memory.
+- [x] Read `docs/v8-bootstrap.md` fully.
+- [x] Inspect §10 code paths and verify gap-vs-reality claims.
+- [x] Read binding linked specs needed for §13.
+- [x] Check `src/stel/` pre-flight invariant.
+- [x] Synthesize concrete architecture findings and answer §13.
+- [x] Document review results here.
+
+## Evidence Log
+
+- Branch confirmed as `v8/stel-architecture` after `git fetch origin`, `git checkout v8/stel-architecture`, `git pull`, and `git branch --show-current`.
+- SymForge initially reported an empty index, then indexed `E:\project\symforge`: 250 files, 11750 symbols.
+- Working tree had an existing local modification to `docs/v8-bootstrap.md`; this review treats that working-tree version as the active brief and does not overwrite it.
+- agentmemory recall surfaced one relevant prior lesson: generation fences and cancellation are required when long-lived async state can outlive a project/session identity change.
+- `Cargo.toml` still has `rmcp = { version = "1.1.0", features = ["transport-io"] }`; no Streamable HTTP feature is enabled.
+- `src/main.rs` still chooses daemon-backed stdio first and falls back to local stdio plus a separate HTTP sidecar.
+- `src/protocol/tools.rs` and `src/protocol/edit_tools.rs` still expose the legacy 32-tool router; `src/protocol/smart_query.rs` and `ask` route directly to one core tool, not to a STEL plan/controller.
+- `src/stel/` does not exist, which is correct because `docs/v8-gap-closure-plan.md` §12 is still all unchecked.
+
+## Review
+
+- Complete: [`docs/reviews/v8-architecture-review-codex-resume.md`](../docs/reviews/v8-architecture-review-codex-resume.md)
+- Verdict: design sound; Phase 0 §12 is the blocker; proceed only through harness/golden file before `src/stel/`.
+- Net-new gaps: G-NEW-1..5 (admission naming, ask vs trust envelope, init allowlists, TokenStats confusion, local-empty merge constraint).
+
+---
+
 # Init All-Client Durable Binary Failure
 
 ## Plan

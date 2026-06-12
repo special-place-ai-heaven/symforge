@@ -10,11 +10,12 @@
 
 You are reviewing **SymForge v8**, a major paradigm shift for a Rust code-intelligence MCP server. Your job:
 
-1. **Read this document fully** — it is the session memory for the v8 effort.
-2. **If you have repo access**, inspect the code paths in [§10 Code inspection checklist](#10-code-inspection-checklist) and compare to [§4 Gap: design vs today](#4-gap-design-vs-today).
-3. **Read linked docs in [§11 Document library](#11-document-library)** for depth (schema types, gap closure, diagrams).
-4. **Answer or challenge** the questions in [§13 Reviewer questions](#13-reviewer-questions).
-5. **Do not treat 7.x benchmark scores as v8 success criteria** — see [§2 Paradigm shift](#2-paradigm-shift).
+1. **Use branch `v8/stel-architecture`** — v8 docs and the gap analysis assume this branch. `main` may still be 7.x-only; do not review from default branch without checking.
+2. **Read this document fully** — it is the session memory for the v8 effort.
+3. **If you have repo access**, checkout that branch, then inspect the code paths in [§10 Code inspection checklist](#10-code-inspection-checklist) and compare to [§4 Gap: design vs today](#4-gap-design-vs-today).
+4. **Read linked docs in [§11 Document library](#11-document-library)** for depth (schema types, gap closure, diagrams).
+5. **Answer or challenge** the questions in [§13 Reviewer questions](#13-reviewer-questions).
+6. **Do not treat 7.x benchmark scores as v8 success criteria** — see [§2 Paradigm shift](#2-paradigm-shift).
 
 **What we want from you:** blind spots, contradictions, under-specified flows, feasibility risks, and concrete suggestions — especially where the existing codebase must change to achieve the north star.
 
@@ -101,7 +102,7 @@ Never count SYMFORGE-LESS or sGteM as wins
 | Streamable HTTP `/mcp` | `symforge serve` + rmcp | 8.1 (**A-020**) |
 | `symforge init --url` | `src/cli/init.rs` | 8.1 |
 
-**Blocker:** `src/stel/` must not start until Phase 0 pre-flight is green — see [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §12.
+**Blocker:** `src/stel/` must not start until Phase 0 pre-flight **§12A** is green — see [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §12.
 
 ---
 
@@ -310,15 +311,34 @@ Please address explicitly:
 ## 14. Suggested prompt (copy-paste)
 
 ```text
-You are reviewing SymForge v8 on branch v8/stel-architecture.
+You are reviewing SymForge v8.
 
-Read docs/v8-bootstrap.md in the repo (this is the full session brief).
-Then inspect the code paths in §10 and the linked specs in §11.
+BRANCH (do this first — required):
+  All v8 design docs and the gap register live on branch v8/stel-architecture.
+  main/default may still reflect 7.21.1 without these docs — do not review from the wrong branch.
 
-Challenge the architecture, find gaps between design and implementation,
-and answer §13. Be concrete: file paths, failure modes, and alternatives.
+  If you have the repo:
+    git fetch origin
+    git checkout v8/stel-architecture
+    git pull
+    git branch --show-current   # must print: v8/stel-architecture
 
-Remember: 7.x benchmark scores are informational only; v8 gates are absolute (H1–H8).
+  If you only have pasted files, confirm they came from v8/stel-architecture
+  (especially docs/v8-bootstrap.md and docs/v8-gap-closure-plan.md).
+
+READ (in order):
+  1. docs/v8-bootstrap.md — full session brief (this file)
+  2. Code paths in §10 of that file
+  3. Linked specs in §11 as needed (v8-gap-closure-plan.md, stel-schema.md, …)
+
+TASK:
+  Challenge the architecture, find gaps between design and implementation,
+  and answer §13. Be concrete: file paths, failure modes, and alternatives.
+
+CONSTRAINTS:
+  7.x benchmark scores are informational only; v8 gates are absolute (H1–H8).
+  src/stel/ should not exist yet — if it does, note which pre-flight items in
+  v8-gap-closure-plan.md §12A were skipped.
 ```
 
 ---

@@ -1,6 +1,6 @@
 # SymForge v8 — Gap closure plan (binding)
 
-**Status:** PRE-IMPLEMENTATION — **no `src/stel/` until §12 checklist is 100% green**  
+**Status:** PRE-IMPLEMENTATION — **no `src/stel/` until §12A checklist is 100% green**  
 Branch: `v8/stel-architecture`  
 Supersedes ambiguous items in other docs when they conflict.
 
@@ -12,7 +12,7 @@ Supersedes ambiguous items in other docs when they conflict.
 
 ```text
 We do not start STEL implementation until every gap in §3 has a CLOSED or
-ACCEPTED-RISK verdict with a pinned artifact, and §12 Pre-flight is all [x].
+ACCEPTED-RISK verdict with a pinned artifact, and §12A Pre-flight is all [x].
 
 If a spike hits KILL criteria → pivot per §4 decision tree → re-validate →
 only then continue. No “implement anyway and fix later.”
@@ -38,7 +38,7 @@ diff against THAT. Optional appendix: 7.x numbers for historical context only.
 
 | Term | Definition |
 |------|------------|
-| **Accepted serve row** | Judge = `EQUIVALENT` **and** S ≤ M (tokens include schema amortization per §5.3) |
+| **Accepted serve row** | Controller `decision=SERVE` **and** judge = `EQUIVALENT` (S vs M evaluated separately — a row can be equivalent yet sGteM; that hurts **H4**, blocked by **H3** on small-file serve rows) |
 | **BYPASS row** | Controller returns explicit cheaper path; S = bypass response tokens only; **excluded from H6** numerator/denominator (**A-023**) |
 | **`session_net_accepted`** | Σ(M − S) over **accepted serve** rows — **H4 headline** |
 | **`session_net_all36`** | Σ(M − S) over all 36 rows — diagnostic only |
@@ -114,6 +114,11 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 | **G-021** | sidecar/local sprawl | Phase 4.3: merge routes | single axum router | A-021 no regression | keep sidecar loopback only | — |
 | **G-022** | HTTP proxy hop | In-process dispatch in server | benchmark p99 | A-022 | keep proxy if multi-process required | — |
 | **G-030b** | init templates missing | Phase 4.4: `init --url` | JSON for Cursor + Claude Code | manual smoke | — | — |
+| **G-032** | Governor not universal | Shared `ToolExecutor` used by stdio, daemon proxy, sidecar, HTTP | design + code | same write-gate all paths | loopback-only sidecar interim | — |
+| **G-033** | Sidecar HTTP unauthenticated | Loopback bind default; non-loopback requires Bearer or disabled | code + test | no open bind without auth | retire standalone sidecar in 8.1 | block 0.0.0.0 in prod |
+| **G-034** | No transport-agnostic runtime | `ServerRuntime` owns index + STEL + governor + auth; transports thin | `src/server/` or refactor plan | single tool dispatch table | keep daemon string-map with tests | — |
+| **G-035** | Structured BYPASS missing | Machine-readable bypass body + `do_not_retry_symforge_same_target` | `stel-schema.md` + harness | two-hop A-012 passes | prose-only bypass | — |
+| **G-036** | init 32-tool allowlist undermines compact | Version-aware init: compact hosts get 3 tools only | `init.rs` + docs | post-8.0 smoke | — | — |
 
 ### 3.6 Documentation & product copy
 
@@ -189,7 +194,7 @@ After §6 complete:
 |------|-------------|
 | H1 | `schemaBytes` from candidate setup |
 | H2 | replay `routes.golden.jsonl` → pass rate |
-| H3 | rows matching `*_small` AND `acceptedServe` → count sGteM (must be 0) |
+| H3 | rows matching `*_small` AND `decision=serve` → count sGteM (must be 0) |
 | H4 | `session_net_accepted` ≥ 0 |
 | H5 | per task: `mcpCalls` ≤ 1 where golden `chain=single` |
 | H6 | `equiv / eligible` ≥ 0.50; BYPASS rows excluded |
@@ -211,7 +216,11 @@ After §6 complete:
 
 Exit code: 0 iff all gates for target release pass.
 
+**Preflight mode (`--preflight`):** Before `results-v8-8.0-baseline.json` exists, §12A only requires that the script **runs and computes** gate columns on shakedown JSON. Accept either: (a) `--baseline` and `--candidate` pointing at the same shakedown file, or (b) a synthetic minimal fixture checked into `sf-bench/fixtures/`. Full baseline-vs-candidate regression is required for **8.0 tag**, not for unlocking `src/stel/`.
+
 ### 5.2 `routes.golden.jsonl` (one line per sf-bench task)
+
+**Canonical path:** `sf-bench/routes.golden.jsonl` (repo sibling or submodule). §12A accepts a copy under `symforge/docs/fixtures/` only if kept in sync via CI check.
 
 ```json
 {
@@ -346,7 +355,7 @@ symforge serve --listen 127.0.0.1:8787 --api-key sf_… [--tls-cert …]
 
 **Routes:** `POST /mcp` (Streamable HTTP), `GET /health` (no secret), existing daemon project/session APIs internal or merged.
 
-**Phase 0.13 deliverable:** `docs/research/A-020-rmcp-spike.md` — compile proof + hello InitializeRequest (no full STEL).
+**Phase 0.12 deliverable:** `docs/research/A-031-rmcp-spike.md` — compile proof + hello InitializeRequest (no full STEL). *(A-020 is stdio-vs-HTTP battery parity at 8.1.)*
 
 ---
 
@@ -388,7 +397,11 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 ---
 
-## 12. Pre-flight checklist (binary — all must be `[x]`)
+## 12. Pre-flight checklists (binary — see split below)
+
+**Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
+
+### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
 **Measurement**
 
@@ -396,36 +409,40 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 - [ ] A-002 VALIDATED (manual spot-check)
 - [ ] A-003 VALIDATED (harness runs on v8 branch binary)
 - [ ] A-004 VALIDATED (equiv audit)
-- [ ] `compare-results.js` runs on harness shakedown JSON
-- [ ] `routes.golden.jsonl` 36 rows + schema validated
+- [ ] `compare-results.js` runs on harness shakedown JSON (**`--preflight` mode** — synthetic or self-diff baseline; see §5.2)
+- [ ] `sf-bench/routes.golden.jsonl` 36 rows + schema validated (canonical path; symlink/copy OK in CI)
 - [ ] RESULTS.md §8.7 + compare-results columns live *(v8 runs only)*
 - [ ] **No requirement** to beat or pin `results-7.21.1-baseline.json`
 
 **Surface choice**
 
-- [ ] A-005 VALIDATED (H1 feasible)
-- [ ] A-025 VALIDATED (edit budget or pivot documented)
+- [ ] A-005 VALIDATED (H1 feasible) — measurement via **non-shipping stub** (`scripts/measure-schema-bytes.rs` or fixture JSON); **not** blocked on `src/stel/`
+- [ ] A-025 VALIDATED (edit budget or pivot documented) — same stub policy
 - [ ] A-019 VALIDATED (L0 surface locked)
 - [ ] A-006/A-027 documented (amortization policy)
 
-**Bypass & gates**
+**Bypass harness (serve economics trust)**
 
-- [ ] A-012 harness spec implemented or H3 scoped to serve-only in compare-results
-- [ ] P-FF policy in golden file (4 rows)
-- [ ] H6 eligible set documented
-- [ ] A-023 reflected in compare-results
-
-**Transport spike (before Phase 4, not before Phase 1)**
-
-- [ ] A-020 rmcp compile spike doc (`A-020-rmcp-spike.md`)
+- [ ] A-012 two-hop harness spec implemented **or** H3 scoped to serve-only in compare-results until implemented
 
 **Process**
 
+- [ ] P-FF + eligible H6 rules **documented** in golden-file README (implementation of 4 bypass rows may wait for §12B)
 - [ ] Phase crosswalk reviewed (A-030)
 - [ ] Decision log updated in ideation.md
 - [ ] No OPEN assumption blocks Phase 1 per §9
 
-**Only when every box is checked → first commit in `src/stel/`.**
+**Only when every §12A box is checked → first commit in `src/stel/`.**
+
+### §12B — Before Phase 4 / 8.1.0 (quality + deploy pre-flight)
+
+**Not required before `src/stel/`.**
+
+- [ ] P-FF policy enforced in `routes.golden.jsonl` (4 rows) + battery
+- [ ] H6 eligible set validated in compare-results output
+- [ ] A-023 reflected in compare-results (BYPASS excluded from H6 denominator)
+- [ ] A-031 rmcp compile spike doc (`docs/research/A-031-rmcp-spike.md`)
+- [ ] A-020..A-022 validated (stdio vs HTTP battery parity + deploy acceptance)
 
 ---
 

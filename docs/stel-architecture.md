@@ -306,9 +306,9 @@ Schema and path corpus **before** code (steps S1–S2 in `stel-schema.md`).
 - [ ] **T2/T3 spike** — ≥2/4 T2 equiv on two repos or documented bypass-only policy (A-029)
 - [ ] **Performance test:** battery diff **H3, H4** vs baseline on **compact surface**
 
-### Phase 3 — L2 executor + L4 calibration → **8.0.0**
+### Phase 3 — L4 + calibration → **8.0.0**
 
-- [ ] Internal chain in one MCP call; **H5**
+- [ ] Internal chain in one MCP call (**H5** — executor proof; compact surface enables external single call from Phase 1)
 - [ ] `StelLedgerEvent` → analytics + calibration EMA → L2 fudge
 - [ ] `symforge_status` = **`session_net_accepted`** headline (matches RESULTS)
 - [ ] **H1–H5, H7** PASS → tag **8.0.0**
