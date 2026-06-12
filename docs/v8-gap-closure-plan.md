@@ -401,6 +401,8 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
+**Progress (2026-06-12):** `E:\project\sf-bench\compare-results.js` + `routes.golden.jsonl` skeleton + `fixtures/preflight-minimal.json` landed (sf-bench `16acb4b`). `symforge/scripts/measure-schema-bytes.ps1` stub landed (`f7af058`). Preflight: `node compare-results.js --preflight --release 8.0` exits 0 on synthetic fixture. Golden semantics, A-001..A-004, and battery row fields still OPEN.
+
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
 **Measurement**
