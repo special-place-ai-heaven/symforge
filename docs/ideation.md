@@ -59,9 +59,9 @@ Use this table at planning time — **8.1 operator rows are committed**, not bac
 | **Daemon REST** | Internal proxy | 7.x → merged into server Phase 4 | HTTP |
 | **Sidecar hooks HTTP** | Host hooks | 7.x → merged / loopback-only | HTTP |
 | **`symforge serve` `/mcp`** | Agents | Phase 4 → **8.1** | Streamable HTTP |
-| **Admin web UI + `/api/v1`** | Operator | Phase 4.7 → **8.1** | HTTP (same server) |
-| **Harness scan & config apply** | Operator | Phase 4.9 → **8.1** | Admin UI + `symforge init --scan` |
-| **First-run / update onboarding** | Operator | Phase 4.8 → **8.1** | CLI banner + browser wizard |
+| **Admin web UI + `/api/v1`** | Operator | Phase 4.7 → **8.1** ✓ committed | HTTP (same server) |
+| **Harness scan & config apply** | Operator | Phase 4.9 → **8.1** ✓ committed | Admin UI + `symforge init --scan` |
+| **First-run / update onboarding** | Operator | Phase 4.8 → **8.1** ✓ committed | CLI banner + browser wizard |
 | **sf-bench / compare-results** | Proof | Phase 0 → ongoing | CLI/Node |
 
 **SQLite (rusqlite):** analytics today; **STEL ledger + server keys** in Phase 3–4 feed both MCP status and admin UI.
