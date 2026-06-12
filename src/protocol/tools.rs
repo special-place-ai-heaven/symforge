@@ -3180,6 +3180,16 @@ impl SymForgeServer {
             let has_symbol_lookup = captured
                 .iter()
                 .any(|entry| matches!(entry, CapturedGetSymbolsEntry::SymbolLookup { .. }));
+            let batch_baseline_chars: usize = captured
+                .iter()
+                .filter_map(|entry| match entry {
+                    CapturedGetSymbolsEntry::SymbolLookup { file, .. }
+                    | CapturedGetSymbolsEntry::CodeSlice { file, .. } => Some(
+                        format::competent_manual_baseline_chars(file.as_ref().content.len()),
+                    ),
+                    CapturedGetSymbolsEntry::FileNotFound { .. } => None,
+                })
+                .sum();
             let mut output = captured
                 .into_iter()
                 .map(|entry| match entry {
@@ -3215,7 +3225,7 @@ impl SymForgeServer {
             }
             self.record_tool_savings_named(
                 "get_symbol",
-                (output.len() * 5 / 4) as u64,
+                format::estimate_tokens_from_chars(batch_baseline_chars),
                 (output.len() / 4) as u64,
             );
             self.bump_frecency(&bump_paths);
@@ -3285,9 +3295,12 @@ impl SymForgeServer {
                         "edit_within_symbol / replace_symbol_body (edits)",
                     ])
                 );
+                let raw_chars = file.content.len();
                 self.record_tool_savings_named(
                     "get_symbol",
-                    (output.len() * 5 / 4) as u64,
+                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
+                        raw_chars,
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context.record_symbol(
@@ -3590,9 +3603,7 @@ impl SymForgeServer {
                     "get_file_content (exact raw text)",
                 ]);
                 let body = format!("{result}{hint}");
-                let saved = raw_chars.saturating_sub(body.len());
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                self.record_read_savings((saved / 4) as u64);
                 let output =
                     format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
                 self.session_context
@@ -3751,9 +3762,11 @@ impl SymForgeServer {
             } else {
                 result
             };
-            let saved = raw_chars.saturating_sub(result.len());
             let footer = format::compact_savings_footer(result.len(), raw_chars);
-            self.record_read_savings((saved / 4) as u64);
+            self.record_read_savings(format::saved_tokens_vs_competent_manual(
+                result.len(),
+                raw_chars,
+            ));
             let output = format!("{result}{footer}");
             self.session_context
                 .record_symbol(&path, &params.0.name, (output.len() / 4) as u32);
@@ -3890,9 +3903,7 @@ impl SymForgeServer {
                     "find_references (usages)",
                     "edit_within_symbol / replace_symbol_body (edits)",
                 ]));
-                let saved = raw_chars.saturating_sub(output.len());
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
-                self.record_read_savings((saved / 4) as u64);
                 // Frecency bump — commitment tool, default-mode happy path.
                 // Resolve the bump path the same way the output did:
                 // explicit params first, auto-resolved path as fallback.
@@ -3925,8 +3936,10 @@ impl SymForgeServer {
                         "find_references (usages)",
                     ]));
                     let footer = format::compact_savings_footer(body.len(), raw_chars);
-                    let saved = raw_chars.saturating_sub(body.len());
-                    self.record_read_savings((saved / 4) as u64);
+                    self.record_read_savings(format::saved_tokens_vs_competent_manual(
+                        body.len(),
+                        raw_chars,
+                    ));
                     let output = format!("{body}{footer}");
                     if let Some(ref p) = resolved_path {
                         self.session_context.record_symbol(
@@ -4177,7 +4190,9 @@ impl SymForgeServer {
         };
         self.record_tool_savings_named(
             "search_symbols",
-            (output.len() * 10 / 4) as u64,
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
             (output.len() / 4) as u64,
         );
         self.session_context.record_summary_output(
@@ -6130,7 +6145,9 @@ impl SymForgeServer {
                 );
                 self.record_tool_savings_named(
                     "get_file_content",
-                    (raw_chars / 4) as u64,
+                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
+                        raw_chars,
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context
@@ -6496,7 +6513,9 @@ impl SymForgeServer {
 
                 self.record_tool_savings_named(
                     "find_references",
-                    (output.len() * 8 / 4) as u64,
+                    format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                        output.len(),
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context.record_summary_output(
@@ -7693,7 +7712,9 @@ impl SymForgeServer {
 
         self.record_tool_savings_named(
             "explore",
-            (output.len() * 10 / 4) as u64,
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
             (output.len() / 4) as u64,
         );
         self.session_context
@@ -8167,7 +8188,12 @@ impl SymForgeServer {
             params.0.language.as_deref(),
             code_only,
         );
-        self.record_tool_savings((output.len() * 5 / 4) as u64, (output.len() / 4) as u64);
+        self.record_tool_savings(
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
+            (output.len() / 4) as u64,
+        );
         self.session_context.record_summary_output(
             "diff_symbols",
             (output.len() / 4).min(u32::MAX as usize) as u32,

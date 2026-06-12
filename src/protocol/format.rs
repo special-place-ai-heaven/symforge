@@ -4820,7 +4820,10 @@ pub fn format_token_savings(snap: &StatsSnapshot) -> String {
         ));
     }
 
-    lines.push(format!("Total: ~{} tokens saved", total_saved));
+    lines.push(format!(
+        "Total: ~{} tokens saved (vs competent-manual windowed read)",
+        total_saved
+    ));
 
     lines.join("\n")
 }
@@ -4849,7 +4852,7 @@ pub fn format_tool_token_breakdown(details: &[(String, u64, u64)]) -> String {
     };
 
     let mut lines = vec![format!(
-        "\u{2500}\u{2500} Session Efficiency \u{2500}\u{2500}\nTokens served: {}\nNaive equivalent: {}\nEfficiency: {:.1}x ({reduction_pct}% reduction)",
+        "\u{2500}\u{2500} Session Efficiency (competent-manual baseline) \u{2500}\u{2500}\nTokens served: {}\nCompetent-manual equivalent: {}\nEfficiency: {:.1}x ({reduction_pct}% reduction vs windowed-read baseline)",
         total_served, total_naive, efficiency
     )];
 
@@ -4902,20 +4905,77 @@ pub fn format_tool_call_counts(counts: &[(String, usize)]) -> String {
     lines.join("\n")
 }
 
+/// Competent-manual read baseline: grep-then-~50-line window, calibrated from
+/// sf-bench phase-1 token-savings benchmark (2026-06-12, S-vs-M headline tasks).
+pub const COMPETENT_READ_WINDOW_LINES: u32 = 50;
+const COMPETENT_READ_AVG_LINE_BYTES: usize = 80;
+
+/// Whole-file read baseline (legacy naive comparison — kept for transparency).
+pub fn whole_file_baseline_chars(raw_chars: usize) -> usize {
+    raw_chars
+}
+
+/// Windowed read a disciplined agent would do instead of reading the whole file.
+pub fn competent_manual_baseline_chars(raw_chars: usize) -> usize {
+    if raw_chars < 200 {
+        return raw_chars;
+    }
+    let window =
+        (COMPETENT_READ_WINDOW_LINES as usize).saturating_mul(COMPETENT_READ_AVG_LINE_BYTES);
+    raw_chars.min(window)
+}
+
+pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    chars.div_ceil(4) as u64
+}
+
+pub fn saved_tokens_whole_file(response_chars: usize, raw_chars: usize) -> u64 {
+    if raw_chars <= response_chars || raw_chars < 200 {
+        return 0;
+    }
+    estimate_tokens_from_chars(raw_chars.saturating_sub(response_chars))
+}
+
+pub fn saved_tokens_vs_competent_manual(response_chars: usize, raw_chars: usize) -> u64 {
+    let baseline = competent_manual_baseline_chars(raw_chars);
+    if baseline <= response_chars {
+        return 0;
+    }
+    estimate_tokens_from_chars(baseline.saturating_sub(response_chars))
+}
+
+/// Baseline for search/reference listing tools without a single raw file length.
+pub fn estimate_listing_baseline_chars(output_chars: usize) -> usize {
+    let hits = (output_chars / 80).max(1);
+    let grep = hits.saturating_mul(120);
+    let windows = (hits / 5 + 1).saturating_mul(competent_manual_baseline_chars(4000));
+    grep.saturating_add(windows).max(output_chars)
+}
+
 /// Estimate tokens saved by a structured response vs raw file content.
 /// Returns a one-line footer string, or empty string if no meaningful savings.
 pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String {
     if raw_chars <= response_chars || raw_chars < 200 {
         return String::new();
     }
-    // Rough token estimate: ~4 chars per token for code
-    let response_tokens = response_chars / 4;
-    let raw_tokens = raw_chars / 4;
-    let saved = raw_tokens.saturating_sub(response_tokens);
-    if saved < 50 {
+    let whole_saved = saved_tokens_whole_file(response_chars, raw_chars);
+    let window_saved = saved_tokens_vs_competent_manual(response_chars, raw_chars);
+    if whole_saved < 50 && window_saved < 10 {
         return String::new();
     }
-    format!("\n\n~{saved} tokens saved vs raw file read")
+    let mut parts = Vec::new();
+    if whole_saved >= 50 {
+        parts.push(format!("~{whole_saved} tokens vs whole-file read"));
+    }
+    if window_saved >= 10 {
+        parts.push(format!(
+            "~{window_saved} tokens vs ~{COMPETENT_READ_WINDOW_LINES}-line windowed read (competent-manual baseline)"
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("\n\n{}", parts.join("; "))
 }
 
 /// Format a "Hook Adoption (current session)" section from hook-time workflow counters.

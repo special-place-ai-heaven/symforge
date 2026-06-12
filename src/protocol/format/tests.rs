@@ -3783,9 +3783,24 @@ fn test_format_hook_adoption_marks_no_sidecar_fail_open_as_mostly_benign() {
 // --- compact_savings_footer tests ---
 
 #[test]
+fn test_competent_manual_baseline_caps_large_files() {
+    assert_eq!(competent_manual_baseline_chars(500_000), 4000);
+    assert_eq!(competent_manual_baseline_chars(100), 100);
+}
+
+#[test]
+fn test_saved_tokens_vs_competent_manual_uses_window() {
+    assert_eq!(saved_tokens_vs_competent_manual(200, 500_000), 950);
+}
+
+#[test]
 fn test_compact_savings_footer_shows_savings() {
     let footer = compact_savings_footer(200, 2000);
-    assert!(footer.contains("tokens saved"), "got: {footer}");
+    assert!(footer.contains("whole-file read"), "got: {footer}");
+    assert!(
+        footer.contains("windowed read"),
+        "should show competent-manual baseline: {footer}"
+    );
 }
 
 #[test]
