@@ -60,6 +60,8 @@ Use this table at planning time so nothing is “surprise scope” later. Detail
 | **Sidecar hooks HTTP** | Host hooks | 7.x → merged / loopback-only | HTTP |
 | **`symforge serve` `/mcp`** | Agents | Phase 4 → **8.1** | Streamable HTTP |
 | **Admin web UI + `/api/v1`** | Operator | Phase 4.7 → **8.1** | HTTP (same server) |
+| **Harness scan & config apply** | Operator | Phase 4.9 → **8.1** | Admin UI + `symforge init --scan` |
+| **First-run / update onboarding** | Operator | Phase 4.8 → **8.1** | CLI banner + browser wizard |
 | **sf-bench / compare-results** | Proof | Phase 0 → ongoing | CLI/Node |
 
 **SQLite (rusqlite):** analytics today; **STEL ledger + server keys** in Phase 3–4 feed both MCP status and admin UI.
@@ -279,7 +281,16 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 **Decision:** Plan a **local operator web UI** (stats, repo/index ops, API key settings) on the same axum process as Streamable HTTP MCP — rusqlite-backed, single-tenant, loopback-first. **Not** in 8.0; MVP in Phase 4.7 after L4 ledger schema exists.
 
 **Context:** Capture all product ideas at start; avoid a second dashboard project after serve ships.  
-**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); gaps **G-037..G-039**
+**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md); gaps **G-037..G-042**
+
+---
+
+### 2026-06-12 — Harness hub + first-run onboarding (8.1)
+
+**Decision:** After install/update/`serve`, show admin URL and optionally open browser. Dashboard exposes system resources, symforge PIDs, sessions, indexes. **Scan** OS for MCP harness configs, assign per-harness API keys, backup-and-apply — operator does not hand-edit client JSON/TOML. Evolves `symforge init --client all` (`src/cli/init.rs`) into shared `HarnessRegistry`.
+
+**Context:** User idea — convenience over fiddling in each harness; build on existing multi-client init.  
+**Refs:** [`v8-admin-ui.md`](v8-admin-ui.md) § First-run, § Harness hub; **G-040..G-042**
 
 ---
 

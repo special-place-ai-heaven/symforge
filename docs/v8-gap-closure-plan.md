@@ -135,6 +135,9 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 | **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | loopback smoke on 2 hosts | CLI-only stats | defer to 8.2 |
 | **G-038** | No STEL ledger SQLite | Phase 3 L4: `stel_ledger_events` migration | schema + store | dashboard + H4 query <100ms | export JSON only | — |
 | **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | rotate + MCP auth works | file-based keys only | — |
+| **G-040** | No first-run / post-update onboarding | CLI URL banner + optional browser open + wizard | onboarding flag in server DB | 3-platform smoke | CLI-only instructions | — |
+| **G-041** | No harness scan + config apply | `HarnessRegistry`; scan/apply API + CLI `--scan` | `src/harness/` | Cursor+Codex smoke | manual `init --url` only | — |
+| **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | panels render | CLI `symforge status` only | — |
 
 Detail: [`v8-admin-ui.md`](v8-admin-ui.md). Depends on **G-020**, **G-034**, **G-033**.
 
