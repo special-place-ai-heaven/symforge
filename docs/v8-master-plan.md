@@ -176,8 +176,10 @@ Full definitions: [`stel-architecture.md`](stel-architecture.md#release-gates-al
 | 4.4 | **`symforge init --url … --api-key …`** | Paste-ready JSON | |
 | 4.5 | sf-bench: stdio vs HTTP — no regression | Battery row | **A-022** |
 | 4.6 | **`stel_ledger` SQLite** + server key store | rusqlite migrations | **G-038, G-039** |
-| 4.7 | **Admin UI MVP** — `/admin` + `/api/v1/*` | Operator dashboard | **G-037** |
-| 4.8 | Tag **8.1.0** | Release | |
+| 4.7 | **Admin UI MVP** — `/admin` + `/api/v1/*` | Operator dashboard | **G-037, G-042** |
+| 4.8 | **First-run onboarding** — URL banner, browser open, wizard | Install/update UX | **G-040** |
+| 4.9 | **Harness hub** — scan configs, per-harness keys, apply | `src/harness/` + admin | **G-041** |
+| 4.10 | Tag **8.1.0** | Release | |
 
 **Exit:** H6/H8 PASS + documented URL+key config on two hosts.
 
