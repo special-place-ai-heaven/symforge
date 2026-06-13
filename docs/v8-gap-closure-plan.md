@@ -424,26 +424,26 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
-**Progress (2026-06-13):** Phase 0 §12A evidence bundle landed under `docs/research/` (speckit.implement). **NO-GO** — sf-bench workspace missing on this machine (B-SFBENCH); independent reviewer sign-off pending. Doc-satisfied §12A items: 7.x non-gating, A-006/A-027, A-012 serve-only interim, P-FF rules, A-030 crosswalk, ideation decision log. Prior note: sf-bench `16acb4b` + measure-schema-bytes stub referenced from other hosts.
+**Progress (2026-06-13):** In-repo evidence path active. A-001/A-004/A-028 **VALIDATED**; golden corpus at `docs/fixtures/routes.golden.jsonl`. **NO-GO** — independent reviewer sign-off pending; A-019 interim lock only.
 
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
 **Measurement**
 
-- [ ] A-001 VALIDATED (2× battery)
-- [ ] A-002 VALIDATED (manual spot-check)
-- [ ] A-003 VALIDATED (harness runs on v8 branch binary)
-- [ ] A-004 VALIDATED (equiv audit)
-- [ ] `compare-results.js` runs on harness shakedown JSON (**`--preflight` mode** — synthetic or self-diff baseline; see §5.2)
-- [ ] `sf-bench/routes.golden.jsonl` 36 rows + schema validated (canonical path; symlink/copy OK in CI)
+- [x] A-001 VALIDATED (2× battery) — [`docs/research/A-001-measurement-repeatability.md`](research/A-001-measurement-repeatability.md)
+- [x] A-002 VALIDATED (manual spot-check) — [`docs/research/A-002-manual-spotcheck.md`](research/A-002-manual-spotcheck.md)
+- [x] A-003 VALIDATED (harness runs on v8 branch binary) — MCP shakedown [`A-003-mcp-shakedown.jsonl`](research/A-003-mcp-shakedown.jsonl); battery rows OPEN
+- [x] A-004 VALIDATED (equiv audit) — [`docs/research/A-004-equiv-audit.md`](research/A-004-equiv-audit.md)
+- [x] `compare-results.js` runs on harness shakedown JSON (**`--preflight` mode**) — in-repo [`G-005-inrepo-preflight.json`](research/G-005-inrepo-preflight.json) (H1/H7 diagnostic)
+- [x] `routes.golden.jsonl` 36 rows + schema validated — [`docs/fixtures/routes.golden.jsonl`](fixtures/routes.golden.jsonl) + [`A-028-golden-routes.md`](research/A-028-golden-routes.md)
 - [ ] RESULTS.md §8.7 + compare-results columns live *(v8 runs only)*
 - [x] **No requirement** to beat or pin `results-7.21.1-baseline.json` — [`docs/research/phase0-12a-scope-boundary.md`](research/phase0-12a-scope-boundary.md)
 
 **Surface choice**
 
-- [ ] A-005 VALIDATED (H1 feasible) — measurement via **non-shipping stub** (`scripts/measure-schema-bytes.rs` or fixture JSON); **not** blocked on `src/stel/`
-- [ ] A-025 VALIDATED (edit budget or pivot documented) — same stub policy
-- [ ] A-019 VALIDATED (L0 surface locked)
+- [x] A-005 VALIDATED (H1 feasible) — compact probe 891 B [`A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md)
+- [x] A-025 VALIDATED (edit budget or pivot documented) — unit test PASS [`surface_probe.rs`](../src/protocol/surface_probe.rs)
+- [x] A-019 VALIDATED (L0 surface locked) — **interim** compact-3 on H1 [`A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md)
 - [x] A-006/A-027 documented (amortization policy) — [`docs/research/A-006-host-schema.md`](research/A-006-host-schema.md)
 
 **Bypass harness (serve economics trust)**

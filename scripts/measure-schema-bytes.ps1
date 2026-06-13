@@ -57,7 +57,7 @@ const readline = require("readline");
 const bin = process.argv[2];
 const cwd = process.argv[3];
 let id = 1;
-const proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "inherit"] });
+const proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, RUST_LOG: "off", SYMFORGE_NO_DAEMON: "1" } });
 const pending = new Map();
 readline.createInterface({ input: proc.stdout }).on("line", (line) => {
   if (!line.trim()) return;
@@ -74,7 +74,7 @@ function request(method, params) {
     const myId = id++;
     pending.set(myId, { resolve, reject });
     proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: myId, method, params }) + "\n");
-    setTimeout(() => { if (pending.has(myId)) { pending.delete(myId); reject(new Error("timeout")); } }, 120000);
+    setTimeout(() => { if (pending.has(myId)) { pending.delete(myId); reject(new Error("timeout")); } }, 15000);
   });
 }
 (async () => {
@@ -97,7 +97,9 @@ function request(method, params) {
 }
 
 $bin = Resolve-Symforge -Preferred $SymforgeBin
-$measureCwd = if (Test-Path (Join-Path $RepoRoot "tests/fixtures/tokio-mini")) {
+$measureCwd = if (Test-Path (Join-Path $RepoRoot "tests/fixtures/compression_ratio/rust")) {
+    Join-Path $RepoRoot "tests/fixtures/compression_ratio/rust"
+} elseif (Test-Path (Join-Path $RepoRoot "tests/fixtures/tokio-mini")) {
     Join-Path $RepoRoot "tests/fixtures/tokio-mini"
 } else {
     $RepoRoot
@@ -111,9 +113,8 @@ $artifact = [ordered]@{
     repoRoot   = $measureCwd
     surfaces   = @{}
     notes      = @(
-        "TODO: re-run after SYMFORGE_SURFACE=compact stub lands (Phase 0.7 / A-005).",
-        "TODO: measure symforge_edit schema separately for A-025 (edit budget <= 1500 B).",
-        "Battery uses schemaBytes from compare-results H1 on candidate results.json."
+        "Phase 0 compact probe via SYMFORGE_SURFACE=compact (src/protocol/surface_probe.rs).",
+        "symforge_edit input_schema bytes recorded separately for A-025."
     )
 }
 
@@ -122,6 +123,7 @@ if (-not $bin) {
     $artifact.error = "symforge binary not found; build with: cargo build -p symforge"
     Write-Warning $artifact.error
 } else {
+    $env:RUST_LOG = "off"
     foreach ($surface in @("full", "compact")) {
         try {
             $result = Measure-ToolsListBytes -Bin $bin -Cwd $measureCwd -Surface $surface
@@ -131,6 +133,11 @@ if (-not $bin) {
         }
     }
     $compactBytes = $artifact.surfaces.compact.schemaBytes
+    if ($artifact.surfaces.compact.toolCount -eq 3) {
+        # Re-run compact once to capture symforge_edit schema size via Rust-side unit test log
+        $editNote = "see cargo test surface_probe::tests::symforge_edit_schema_under_a025_budget"
+        $artifact.notes += $editNote
+    }
     if ($null -ne $compactBytes) {
         $artifact.h1Pass = ($compactBytes -le 5000)
     } else {

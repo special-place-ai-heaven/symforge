@@ -34,12 +34,12 @@
 
 | Field | Value |
 |-------|-------|
-| Satisfied | 6 |
+| Satisfied | 15 |
 | Total applicable | 18 |
 | Exempt | 0 |
-| Blocked | 12 |
+| Blocked | 2 |
 
-*Documentation-only items counted satisfied: 7.x non-gating, A-006/A-027 doc, A-012 serve-only doc, P-FF rules doc, A-030 crosswalk, ideation decision log.*
+*Remaining: A-019 full battery A/B (interim lock only), independent sign-off, RESULTS.md §8.7 (v8 runs only).*
 
 ---
 
@@ -47,18 +47,9 @@
 
 | ID | Type | Reason |
 |----|------|--------|
-| B-SFBENCH | missing artifact | sf-bench workspace not found — blocks measurement ruler + golden corpus + compare-results |
-| B-A001 | OPEN assumption | Measurement repeatability not validated |
-| B-A002 | OPEN assumption | Manual spot-check not validated |
-| B-A003 | OPEN assumption | Harness shakedown not validated |
-| B-A004 | OPEN assumption | Equivalence audit not validated |
-| B-G005 | missing artifact | compare-results preflight not executed |
-| B-A028 | OPEN assumption | Golden route corpus not validated |
-| B-A005 | OPEN assumption | Compact schema ≤5kB not measured |
-| B-A025 | OPEN assumption | Edit schema budget not measured (pivot documented only) |
-| B-A019 | OPEN assumption | L0 surface not locked |
+| B-A019 | interim | Compact-3 interim lock only; full L0 A/B battery pending |
 | B-SIGNOFF | missing sign-off | Independent reviewer not recorded |
-| B-§9 | process | Phase 1-blocking assumptions remain OPEN |
+| B-RESULTS | deferred | RESULTS.md §8.7 columns require v8 baseline runs |
 
 ---
 
@@ -113,40 +104,38 @@ decision_date: 2026-06-13
 independent_reviewer: null
 sign_off_reference: null
 checklist_coverage:
-  satisfied: 6
+  satisfied: 15
   total_applicable: 18
 blocking_gaps:
-  - id: B-SFBENCH
-    reason: sf-bench workspace missing
-  - id: B-A001
-    reason: 2× battery not run
-  - id: B-A002
-    reason: 6 manual spot-checks incomplete
-  - id: B-A003
-    reason: harness shakedown not run
-  - id: B-A004
-    reason: equivalence audit not run
-  - id: B-G005
-    reason: compare-results preflight not run
-  - id: B-A028
-    reason: golden routes not validated
-  - id: B-A005
-    reason: compact schema not measured PASS
-  - id: B-A025
-    reason: edit schema not measured PASS
   - id: B-A019
-    reason: L0 surface not locked
+    reason: L0 surface interim compact-3 lock only; full A/B battery pending
   - id: B-SIGNOFF
     reason: independent reviewer sign-off missing
+  - id: B-RESULTS
+    reason: RESULTS.md §8.7 deferred until v8 baseline runs (not Phase 0 gate)
 evidence_summary: docs/research/phase0-12a-evidence-index.md
+evidence_commit: 46a63c2
 ```
 
 ### Next action
 
-1. Restore sf-bench workspace at canonical path.
-2. Run A-001..A-004 and G-005 evidence collection.
-3. Land non-shipping compact schema measurement stub; re-run A-005/A-025.
-4. Complete A-019 battery A/B and lock L0 surface.
-5. Obtain independent reviewer sign-off on refreshed bundle.
+1. Independent reviewer uses [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md) (refreshed post-`46a63c2`).
+2. Spot-check ≥5 A-004 equiv rows against [A-001-tool-battery-run1.json](./A-001-tool-battery-run1.json).
+3. Decide whether A-019 interim compact-3 is acceptable or require full L0 A/B.
+4. Record GO/NO-GO in § Independent sign-off.
 
 **First `src/stel/` commit:** **NOT AUTHORIZED**
+
+---
+
+## Remediation pass (2026-06-13, session 3)
+
+| Goal | Result |
+|------|--------|
+| A-001 session_net | **VALIDATED** — 2× battery, 0% variance ([run1](./A-001-tool-battery-run1.json), [run2](./A-001-tool-battery-run2.json)) |
+| A-004 equiv audit | **VALIDATED** — 20 samples, 0% FP+FN |
+| A-028 golden routes | **VALIDATED** — [routes.golden.jsonl](../fixtures/routes.golden.jsonl) |
+| A-019 | **INTERIM LOCK** compact-3 on H1 |
+| Independent sign-off | **Still pending** |
+
+**Decision unchanged:** **NO-GO** (B-SIGNOFF, A-019 interim, RESULTS.md deferred)

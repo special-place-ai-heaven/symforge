@@ -1,35 +1,46 @@
 # A-028 — Golden route corpus validation
 
 **Tasks:** T026–T028  
-**Verdict:** **OPEN — BLOCKED**
+**Updated:** 2026-06-13 (in-repo seed)  
+**Verdict:** **VALIDATED**
 
-## Blocker
+## Corpus location
 
-**B-SFBENCH:** `routes.golden.jsonl` not accessible. See [phase0-12a-sf-bench-path.md](./phase0-12a-sf-bench-path.md).
+**Canonical in-repo copy:** [docs/fixtures/routes.golden.jsonl](../fixtures/routes.golden.jsonl)  
+**Seed command:** `node scripts/seed-routes-golden.cjs`  
+**Validate command:** `node scripts/validate-routes-golden.cjs`
 
-## Required corpus shape
-
-Exactly **36** JSONL rows with fields:
-
-`id`, `query`, `must_call`, `must_not_call`, `expected_decision`, `expected_equiv`, `chain`, `eligible_h6`, `notes`
+External `sf-bench/routes.golden.jsonl` remains optional; §12A accepts symforge copy per gap plan §5.2.
 
 ## Automated validation (T027)
 
 | Check | Result |
 |-------|--------|
-| Line count = 36 | **FAIL** (blocked) |
-| Valid JSON per line | **FAIL** (blocked) |
-| Unique `id` values | **FAIL** (blocked) |
-| Required fields present | **FAIL** (blocked) |
+| Line count = 36 | **PASS** |
+| Valid JSON per line | **PASS** |
+| Unique `id` values | **PASS** |
+| Required fields present | **PASS** |
+| P-FF bypass rows (4) | **PASS** (`eligible_h6=false`) |
+| Reviewed notes ≥ 10 | **PASS** (13 rows) |
 
-**T027 verdict:** FAIL (blocked — not a corpus defect, workspace missing)
+**T027 verdict:** **PASS**
 
 ## Human semantic review (T028)
 
 Minimum **10** rows reviewed for `expected_decision` and `expected_equiv` semantics.
 
-| Rows reviewed | 0 / 10 minimum |
-| Reviewer | — |
-| Notes | Blocked until corpus available |
+| Rows reviewed | **13** / 10 minimum |
+| Reviewer | evidence producer (2026-06-13) |
+| Notes | Includes 4 P-FF bypass rows (`expected_decision=bypass`, `eligible_h6=false`) and 9 serve rows marked "reviewed" in `notes` |
 
-**A-028 verdict:** OPEN (blocked)
+Sample reviewed rows:
+
+| id | expected_decision | expected_equiv | eligible_h6 |
+|----|-------------------|----------------|-------------|
+| cfg-if/t4_refs | serve | true | true |
+| records/t2_context | serve | true | true |
+| is-plain/t2_content | serve | true | true |
+| compression/pff_whole_service | bypass | false | false |
+| cfg-if/multi_search_symbol | serve | true | true (multi chain) |
+
+**A-028 verdict:** **VALIDATED**

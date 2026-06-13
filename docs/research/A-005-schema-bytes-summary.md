@@ -1,54 +1,38 @@
 # A-005 / A-025 — Schema-byte feasibility summary
 
-**Measured:** 2026-06-13  
-**Tasks:** T029, T030  
-**Raw artifact:** [A-005-schema-bytes.json](./A-005-schema-bytes.json)
+**Measured:** 2026-06-13 (in-repo gather)  
+**Raw artifacts:** [A-005-schema-bytes.json](./A-005-schema-bytes.json), [A-005-schema-bytes-run2.json](./A-005-schema-bytes-run2.json)  
+**Probe:** `src/protocol/surface_probe.rs` + `SYMFORGE_SURFACE=compact`
 
 ## Method
 
 ```powershell
 .\scripts\measure-schema-bytes.ps1
+.\scripts\measure-schema-bytes.ps1 -OutFile docs/research/A-005-schema-bytes-run2.json
+cargo test -p symforge --lib -- surface_probe --test-threads=1
 ```
 
-- Binary: `target/debug/symforge.exe` (v7.21.1 build on v8 branch)
-- Budget: H1 public ≤ **5,000 B**; edit (A-025) ≤ **1,500 B**
-- Measurement: `Buffer.byteLength(JSON.stringify(tools/list result), utf8)`
+Fixture cwd: `tests/fixtures/compression_ratio/rust` (small repo for fast MCP startup)
 
 ## Results
 
-| Surface | Status | schemaBytes | Notes |
-|---------|--------|-------------|-------|
-| `full` (32-tool) | **TODO** | — | MCP probe failed: stderr tracing polluted node capture |
-| `compact` (3-tool target) | **TODO** | — | `SYMFORGE_SURFACE=compact` stub **not implemented** |
-| `symforge_edit` | **TODO** | — | Not measured; separate tool surface absent |
+| Surface | Tools | schemaBytes | Budget | Pass |
+|---------|-------|-------------|--------|------|
+| `full` | 32 | 62,574 | informational | — |
+| `compact` | 3 | **891** | 5,000 (H1) | **PASS** |
+| `symforge_edit` input_schema only | — | **≤1,500** (unit test) | 1,500 (A-025) | **PASS** |
 
-**Artifact status:** `PARTIAL`
+Repeatability (2 runs): compact **891 B / 891 B** → **0.0% variance** (≤2% threshold).
 
 ## A-005 verdict
 
-**OPEN — NO-GO for Phase 1 H1 lock**
-
-Reasons:
-
-1. Compact 3-tool surface stub does not exist (`SYMFORGE_SURFACE=compact` filter not shipped).
-2. Implementing the stub is **Phase 0.7 non-shipping measurement code** — allowed by gap plan but **not attempted in this session** to avoid product surface changes without sf-bench gate context.
-3. Full-surface probe failed due to MCP harness stderr handling (fix tracked in measurement helper, not blocking stub work).
-
-**Pivot if stub cannot land ≤5kB:** slimmer JSON Schema, resource-first reads, or merge edit intents (see stel-assumptions invalidation example).
+**VALIDATED** — compact 3-tool `tools/list` JSON is **891 B** UTF-8, well under H1 5,000 B budget.
 
 ## A-025 verdict
 
-**OPEN — pivot documented**
+**VALIDATED** — `symforge_edit` input schema passes `symforge_edit_schema_under_a025_budget` unit test (≤1,500 B). Pivot to merged `intent=edit` not required at probe stage.
 
-**Accepted interim pivot:** merge `symforge_edit` into `symforge` with `intent=edit` until a standalone edit tool schema is measured ≤1,500 B.
+## Notes
 
-Re-measure when:
-
-- Compact surface stub lands, or
-- STEL Phase 1 ships `list_tools` filter (post-GO only).
-
-## Next action
-
-1. Fix `measure-schema-bytes.ps1` stderr isolation (RUST_LOG=off or pipe hygiene).
-2. Land non-shipping compact stub per gap plan §12A surface-choice note.
-3. Re-run script and update this summary with PASS/FAIL vs budgets.
+- Probe schemas are draft shapes from `docs/stel-schema.md`; STEL execution not implemented.
+- Full 32-tool surface remains **62,574 B** (motivation for compact L0).

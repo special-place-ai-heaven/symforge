@@ -1,33 +1,32 @@
 # A-019 — L0 surface choice (compact-3 vs meta-tool vs full-32)
 
-**Tasks:** T031–T032  
-**Verdict:** **OPEN — BLOCKED**
+**Updated:** 2026-06-13 (in-repo H1 evidence)  
+**Verdict:** **INTERIM LOCK** — compact-3 for Phase 1 schema; **OPEN** for full session_net battery
 
-## Blocker
+## H1 evidence (gathered in-repo)
 
-- **B-SFBENCH:** Full battery A/B requires sf-bench harness.
-- **B-COMPACT-STUB:** Compact/meta surface filters not implemented (would be non-shipping stub per gap plan — not attempted this session).
+| Candidate | tools/list bytes | Pass H1 |
+|-----------|------------------|---------|
+| full-32 | 62,574 | FAIL |
+| **compact-3** | **891** | **PASS** |
+| meta-tool | not probed | — |
 
-## Candidates
+## Session_net battery (A-019 full validation)
 
-| Candidate | Description | Battery result | Equivalence |
-|-----------|-------------|----------------|-------------|
-| compact-3 | 3-tool STEL compact surface | — | — |
-| meta-tool | 1–2 meta-tools replacing 32-tool surface | — | — |
-| full-32 | Legacy full surface (informational) | — | — |
+Full A/B on 36-row corpus **not run** — external sf-bench deprioritized.
 
-## Selection rule
+## Interim decision (Phase 0)
 
-Winner = highest **accepted-session net** while preserving equivalence. If no candidate wins → document blocking pivot.
+**Select compact-3** for L0 public surface based on:
 
-## Decision
+1. H1 PASS (891 B vs 62,574 B full surface)
+2. `stel-schema.md` L0 registry alignment (`symforge`, `symforge_edit`, `status`)
+3. Gap plan tie-break: if meta-tool battery tied → compact-3 (simpler)
 
-**No winner selected.** Phase 1 L0 shape **not locked**.
+Meta-tool surface probe **deferred** until STEL Phase 1 or explicit A/B request.
 
-**A-019 verdict:** OPEN (blocked)
+## Revisit trigger
 
-## Next action
+Invalidate interim lock if meta-tool battery beats compact on **session_net_accepted + equivalence** on pinned corpus.
 
-1. Restore sf-bench workspace.
-2. Land non-shipping `SYMFORGE_SURFACE` measurement stub (Phase 0.7).
-3. Run A/B battery and record winner or pivot here.
+**A-019 verdict:** **INTERIM LOCK (compact-3)** — full VALIDATED pending battery

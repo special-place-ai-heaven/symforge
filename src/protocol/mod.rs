@@ -15,6 +15,7 @@ pub(crate) mod search_format;
 pub(crate) mod search_tools;
 pub mod session;
 pub mod smart_query;
+pub mod surface_probe;
 pub mod tools;
 
 use std::path::{Path, PathBuf};
@@ -29,8 +30,8 @@ use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-    ServerCapabilities, ServerInfo, Tool,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
@@ -669,6 +670,18 @@ impl ServerHandler for SymForgeServer {
     {
         let uri = request.uri;
         async move { self.read_resource_uri(&uri).await }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult {
+            tools: surface_probe::list_tools_for_profile(surface_probe::surface_profile_from_env()),
+            meta: None,
+            next_cursor: None,
+        })
     }
 }
 

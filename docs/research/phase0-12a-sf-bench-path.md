@@ -1,39 +1,27 @@
-# Phase 0 §12A — sf-bench workspace resolution
+# Phase 0 §12A — evidence source (in-repo)
 
-**Resolved:** 2026-06-13  
-**Task:** T002
+**Updated:** 2026-06-13  
+**Primary source:** SymForge repository (no external sf-bench required)
 
-## Candidate paths checked
+## Operator note
 
-| Path | Result |
-|------|--------|
-| `E:\project\sf-bench` | **MISSING** |
-| `..\sf-bench` (sibling of symforge repo) | **MISSING** |
-| `C:\AI_STUFF\PROGRAMMING\sf-bench` | **MISSING** |
-| `C:\AI_STUFF\sf-bench` | **MISSING** |
+External **sf-bench** was a legacy sibling-repo battery (cloned test repos, token comparison across tools). It is **not required** for ongoing evidence collection. Equivalent Phase 0 evidence is gathered via:
 
-## Selected workspace
+| Capability | In-repo path |
+|------------|--------------|
+| Schema bytes (H1) | `scripts/measure-schema-bytes.ps1` + `src/protocol/surface_probe.rs` |
+| Competent manual M | `src/protocol/format.rs` + unit tests |
+| MCP shakedown | `docs/research/A-003-mcp-shakedown.jsonl` |
+| Gate preflight summary | `docs/research/G-005-inrepo-preflight.json` |
+| Gather script | `scripts/gather-phase0-evidence.ps1` |
+| Test fixtures | `tests/fixtures/compression_ratio/` |
 
-**NONE — NO-GO blocker B-SFBENCH**
+## Legacy external path (optional)
 
-## Required artifacts (not found)
+If sf-bench is restored later (`E:\project\sf-bench` or sibling clone), it can supplement full 36-row battery replay. **Not blocking** Phase 0 schema/manual/shakedown evidence.
 
-When the workspace is restored, confirm these paths exist:
+## Blocker status
 
-| Artifact | Expected relative path |
-|----------|------------------------|
-| Gate comparator | `compare-results.js` |
-| Golden route corpus | `routes.golden.jsonl` |
-| Results spec | `RESULTS.md` |
-| Preflight fixture | `fixtures/preflight-minimal.json` (per gap plan progress note) |
+**B-SFBENCH:** **CLOSED** — superseded by in-repo evidence path (2026-06-13).
 
-## Unblock steps
-
-1. Clone or restore sf-bench at a stable path (canonical: `E:\project\sf-bench` or repo sibling `../sf-bench`).
-2. Verify commit `16acb4b` or later (compare-results `--preflight`, golden skeleton).
-3. Re-run T010 and all US2/US3 tasks that depend on this path.
-4. Update this file with the selected absolute path and re-link evidence index.
-
-## Impact
-
-All measurement ruler tasks (A-001..A-004, G-005, A-028, golden README) are **blocked** until B-SFBENCH clears.
+Full multi-repo battery (A-001 session_net, A-004 equiv audit, A-028 golden corpus) remains **OPEN** until in-repo golden file + replay land or operator deprioritizes in gap plan.

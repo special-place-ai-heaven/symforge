@@ -304,4 +304,23 @@ Full reports live in conversation / agent transcripts; promote conclusions into 
 **Context:** AAP at `E:\project\Agent_Army_Professionals` — library-link + guest-agent path is tighter than MCP JSON editing.  
 **Refs:** [`v8-aap-integration.md`](v8-aap-integration.md)
 
-*Last updated: 2026-06-12 · amend decision log and open questions as ideation grows.*
+*Last updated: 2026-06-13 · amend decision log and open questions as ideation grows.*
+
+---
+
+### 2026-06-13 — Phase 0 §12A pre-flight evidence bundle (NO-GO)
+
+**Decision:** Phase 0 §12A evidence workflow executed; **NO-GO** for first `src/stel/` commit. Independent reviewer sign-off not obtained; sf-bench workspace missing on this machine.
+
+**Locked interim policies (documentation-only):**
+
+| Topic | Choice | Evidence |
+|-------|--------|----------|
+| L0 surface | **Not locked** — A-019 OPEN | [`research/A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md) |
+| Schema budget | **OPEN** — compact stub not measured; A-025 pivot = merge edit intent | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) |
+| Bypass policy | **Serve-only H3 interim scope** until two-hop harness | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) |
+| Host amortization | **Conservative worst-case** until A-006 host-validated | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) |
+| GO/NO-GO | **NO-GO** | [`research/phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md) |
+
+**Context:** speckit.implement on `specs/001-v8-phase0-preflight`; pre-implementation boundary preserved (`src/stel/**` untouched).  
+**Refs:** [`research/phase0-12a-evidence-index.md`](research/phase0-12a-evidence-index.md), [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md) §12A

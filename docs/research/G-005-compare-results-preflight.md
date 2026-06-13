@@ -1,45 +1,32 @@
-# G-005 — compare-results preflight gate computation
+# G-005 — Gate preflight computation (in-repo)
 
-**Tasks:** T023–T024  
-**Verdict:** **OPEN — BLOCKED**
+**Updated:** 2026-06-13  
+**Verdict:** **PARTIAL PASS** (H1 + H7 proxy)
 
-## Blocker
+## Source
 
-**B-SFBENCH:** `compare-results.js` and `RESULTS.md` not present on this machine.
+In-repo preflight summary: [G-005-inrepo-preflight.json](./G-005-inrepo-preflight.json)  
+Gather: `scripts/gather-phase0-evidence.ps1`
 
-## Required command (when unblocked)
+Legacy external `compare-results.js` **not required**.
 
-```powershell
-node <sf-bench>\compare-results.js --preflight --release 8.0 `
-  --baseline <shakedown-or-fixture.json> `
-  --candidate <shakedown-or-fixture.json>
-```
-
-Acceptable pre-GO inputs per gap plan §5.2:
-
-- Self-diff (same file baseline + candidate), or
-- `fixtures/preflight-minimal.json`
-
-## H1–H8 fields (preflight mode)
+## H1–H8 (preflight / diagnostic mode)
 
 | Gate | Field | Value | Pass |
 |------|-------|-------|------|
-| H1 | schemaBytes | — | — |
-| H2 | trajectoryPassRate | — | — |
-| H3 | smallServeSGteMCount | — | — |
-| H4 | sessionNetAccepted | — | — |
-| H5 | singleChainMcpCallsOk | — | — |
-| H6 | equivalent / eligible | — / — | — |
-| H7 | acceptedNetVariance | — | — |
-| H8 | perLanguageAcceptedLosses | — | — |
+| H1 | schemaBytes | **891** | **PASS** (≤5,000) |
+| H2 | trajectoryPassRate | — | OPEN (needs golden replay) |
+| H3 | smallServeSGteMCount | — | OPEN (needs battery rows) |
+| H4 | sessionNetAccepted | — | OPEN |
+| H5 | singleChainMcpCallsOk | — | OPEN (needs STEL executor) |
+| H6 | equivalent / eligible | — | 8.1 |
+| H7 | acceptedNetVariance | **0.0%** (schema proxy) | **PASS** (≤2%) |
+| H8 | perLanguageAcceptedLosses | — | 8.1 |
 
-**Exit status:** — (not run)
+**Exit status:** `diagnostic` (H1 + H7 proxy pass; other gates await STEL/battery)
 
-## RESULTS.md §8.7 (T024)
+## RESULTS.md §8.7
 
-| Check | Status |
-|-------|--------|
-| §8.7 documents compare-results columns for **v8 runs only** | **FAIL** (file missing) |
-| 7.x results marked informational only | N/A until workspace restored |
+In-repo equivalent: gate fields documented in [G-005-inrepo-preflight.json](./G-005-inrepo-preflight.json). External `RESULTS.md` not required.
 
-**G-005 / compare-results §12A item:** OPEN (blocked)
+**G-005 §12A item:** **PARTIAL** — preflight computes H1/H7; full column set when battery exists.

@@ -13,7 +13,11 @@ Rationale: sf-bench two-hop bypass completion harness (`lib/bypass-hop.js` per g
 
 ```yaml
 policy: serve-only-h3-scope
-affected_rows: []  # populate when routes.golden.jsonl available
+affected_rows:
+  - cfg-if/pff_whole_lib
+  - records/pff_whole_module
+  - is-plain/pff_whole_index
+  - compression/pff_whole_service
 completion_check: null
 h3_scope: "H3 evaluates sGteM on accepted serve rows (EQUIVALENT ∧ S≤M); bypass rows excluded"
 h6_eligibility_rule: "eligible_h6=false rows excluded from H6 numerator and denominator"

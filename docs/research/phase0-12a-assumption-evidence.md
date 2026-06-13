@@ -88,7 +88,7 @@ validation:
   artifact: docs/research/A-005-schema-bytes-summary.md
 verdict: OPEN
 validated_at: null
-notes: "PARTIAL: stub ran; compact surface not implemented; see A-005-schema-bytes.json"
+notes: "BLOCKED: sf-bench missing (B-SFBENCH). Stub proposal: docs/research/A-005-compact-stub-proposal.md (awaiting approval)"
 ```
 
 ---

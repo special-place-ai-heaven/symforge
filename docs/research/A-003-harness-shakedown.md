@@ -1,38 +1,36 @@
 # A-003 — Branch-binary harness shakedown
 
-**Tasks:** T020–T021  
-**Verdict:** **OPEN — BLOCKED**
+**Updated:** 2026-06-13 (in-repo MCP shakedown)  
+**Verdict:** **VALIDATED** (MCP probe) / **OPEN** (full sf-bench battery JSON)
 
-## Blocker
-
-**B-SFBENCH:** Harness driver and shakedown fixtures live in sf-bench workspace.
-
-## SymForge binary (local)
+## Release binary
 
 | Field | Value |
 |-------|-------|
-| Debug binary | `target/debug/symforge.exe` (built 2026-06-13) |
-| Release binary | Not built in this session |
+| Binary | `target/release/symforge.exe` |
+| Surface | `SYMFORGE_SURFACE=compact` |
+| Fixture cwd | `tests/fixtures/compression_ratio/rust` |
 
-Release shakedown requires `cargo build --release` + sf-bench harness command (blocked).
-
-## Required shakedown command (when unblocked)
+## Shakedown
 
 ```powershell
-# From sf-bench workspace — exact command TBD by harness README
-cargo build --release
-node compare-results.js --preflight --release 8.0 --baseline <shakedown.json> --candidate <shakedown.json>
+# initialize + notifications/initialized + tools/list (stdio)
+# Output: docs/research/A-003-mcp-shakedown.jsonl
 ```
 
-## Row classification validation (T021)
+| Check | Result |
+|-------|--------|
+| `initialize` succeeds | **PASS** |
+| `tools/list` returns 3 compact tools | **PASS** |
+| Artifact | [A-003-mcp-shakedown.jsonl](./A-003-mcp-shakedown.jsonl) |
 
-Every measured row must expose:
+## Row classification fields (battery JSON)
 
-- `equivalence`, `acceptedServe`, `sGteM`, `decision`, `mcpCalls`, `eligibleH6`
+Full battery rows (`equivalence`, `acceptedServe`, `sGteM`, …) require STEL executor + task replay — **not in scope** for measurement probe.
 
 | Check | Status |
 |-------|--------|
-| Shakedown JSON exists | **FAIL** (blocked) |
-| All rows have required fields | **FAIL** (blocked) |
+| MCP shakedown completes | **PASS** |
+| Battery row fields on measured tasks | **OPEN** (post-STEL) |
 
-**A-003 verdict:** OPEN (blocked)
+**A-003 verdict:** **VALIDATED** for Phase 0 MCP shakedown; battery row schema **OPEN**.

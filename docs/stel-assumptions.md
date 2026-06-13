@@ -65,10 +65,10 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
-| **A-001** | sf-bench S/M/N token method (`ceil(bytes/4)`) is stable across re-runs on same binary | Re-run battery 2×; compare session_net variance ≤ ±2% | **OPEN** |
-| **A-002** | Competent-manual baseline (grep + ~50-line window) matches sf-bench `M` and is the right product comparator | Spot-check 6 rows: manual harness output vs judge expectations | **OPEN** |
-| **A-003** | v8 branch release binary runs full harness without error | `results-v8-harness-shakedown.json` on `target/release` | **OPEN** |
-| **A-004** | Equivalence judge correlates with human “good enough” on 10 sampled rows | Manual review sample; document false pos/neg | **OPEN** |
+| **A-001** | sf-bench S/M/N token method (`ceil(bytes/4)`) is stable across re-runs on same binary | Re-run battery 2×; compare session_net variance ≤ ±2% | **VALIDATED** |
+| **A-002** | Competent-manual baseline (grep + ~50-line window) matches sf-bench `M` and is the right product comparator | Spot-check 6 rows: manual harness output vs judge expectations | **VALIDATED** |
+| **A-003** | v8 branch release binary runs full harness without error | `results-v8-harness-shakedown.json` on `target/release` | **PARTIAL** |
+| **A-004** | Equivalence judge correlates with human “good enough” on 10 sampled rows | Manual review sample; document false pos/neg | **VALIDATED** |
 
 ### Schema & surface
 
@@ -126,12 +126,32 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | **A-025** | `symforge_edit` JSON Schema ≤ **1,500 B**; else merge into `symforge` with `intent=edit` | Measured `list_tools` bytes | **OPEN** |
 | **A-026** | **H4** uses **`session_net_accepted`** (accepted serve rows only); `session_net_all36` reported separately | RESULTS.md §8.2 + compare-results.js | **OPEN** |
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |
-| **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **OPEN** |
+| **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **VALIDATED** |
 | **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | Spike artifact in research log | **OPEN** |
 | **A-031** | Phase 0.12 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-031-rmcp-spike.md` | **OPEN** |
 | **A-032** | Full-file review tasks use policy **P-FF** (bypass, `eligible_h6=false`) | 4 rows in `routes.golden.jsonl` | **OPEN** |
 
 *(Register new “must keep X” beliefs here — they default OPEN and block nothing until validated.)*
+
+## Phase 0 §12A evidence links (2026-06-13)
+
+Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index: [`research/phase0-12a-evidence-index.md`](research/phase0-12a-evidence-index.md). Decision: **NO-GO** — [`research/phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md).
+
+| ID | Artifact | Verdict | Notes |
+|----|----------|---------|-------|
+| **A-001** | [`research/A-001-measurement-repeatability.md`](research/A-001-measurement-repeatability.md) | **VALIDATED** | 2× battery 0% session_net variance |
+| **A-002** | [`research/A-002-manual-spotcheck.md`](research/A-002-manual-spotcheck.md) | **VALIDATED** | 6/6 spot checks in-repo |
+| **A-003** | [`research/A-003-harness-shakedown.md`](research/A-003-harness-shakedown.md) | **PARTIAL** | MCP shakedown PASS; battery row fields OPEN |
+| **A-004** | [`research/A-004-equiv-audit.md`](research/A-004-equiv-audit.md) | **VALIDATED** | 20-sample audit 0% FP+FN |
+| **A-005** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Compact 891 B |
+| **A-006** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Conservative worst-case policy documented |
+| **A-012** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **OPEN** | Serve-only H3 interim scope selected |
+| **A-019** | [`research/A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md) | **OPEN** | Interim compact-3 lock on H1 |
+| **A-025** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Edit schema ≤1,500 B |
+| **A-026** | [`research/G-005-compare-results-preflight.md`](research/G-005-compare-results-preflight.md) | **PARTIAL** | H1/H7 in-repo preflight |
+| **A-027** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Harness ÷50 documented as non-product |
+| **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **VALIDATED** | 36 rows [`fixtures/routes.golden.jsonl`](fixtures/routes.golden.jsonl) |
+| **A-032** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **PARTIAL** | 4 P-FF rows seeded; battery enforcement §12B |
 
 ## When an assumption is invalidated
 

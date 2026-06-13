@@ -1,9 +1,9 @@
 ﻿{
-    "measuredAt":  "2026-06-13T14:27:02.9853891Z",
+    "measuredAt":  "2026-06-13T14:36:00.4022802Z",
     "method":  "Buffer.byteLength(JSON.stringify(tools/list result), utf8)",
     "h1BudgetBytes":  5000,
     "symforgeBin":  "C:\\AI_STUFF\\PROGRAMMING\\symforge\\target\\debug\\symforge.exe",
-    "repoRoot":  "C:\\AI_STUFF\\PROGRAMMING\\symforge",
+    "repoRoot":  "C:\\AI_STUFF\\PROGRAMMING\\symforge\\tests\\fixtures\\compression_ratio\\rust",
     "surfaces":  {
                      "full":  {
                                   "toolCount":  32,
