@@ -1,10 +1,10 @@
 # Phase 1 STEL checkpoint (compact-3 surface truthful)
 
 **Branch:** `v8/stel-architecture`  
-**Checkpoint commit:** `cabd978` — *Add Phase 1 preview-only symforge_edit handler*
-**Status:** Phase 1 **L1–L4 on compact `symforge` and preview-only `symforge_edit`**, plus compact `status` and observational calibration. **Compact-3 is now fully truthful at the MCP surface level** — all three advertised tools have real handlers.
+**Checkpoint commit:** `df89308` — *Add Phase 1 guarded symforge_edit apply for single-symbol replace*  
+**Status:** Phase 1 **L1–L4 on compact `symforge` and preview-and-apply `symforge_edit`**, plus compact `status` and observational calibration. **Compact-3 is fully truthful at the MCP surface level** — all three advertised tools have real handlers.
 
-This document captures implementation state after the preview-only `symforge_edit` slice. It does **not** change runtime behavior.
+This document captures implementation state after the guarded `symforge_edit` apply slice (`df89308`). It does **not** change runtime behavior.
 
 ---
 
@@ -15,7 +15,9 @@ This document captures implementation state after the preview-only `symforge_edi
 | Phase 0 evidence bundle | `08f7d14` | §12A measurement artifacts (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`) |
 | Independent GO / signoff | `07b42a8` | *Record Phase 0 12A independent GO decision* — authorization to implement `src/stel/` |
 | Phase 1 golden replay closure | `b2c0d6a` | One-step golden planner mismatches closed (29 serve rows) |
-| Phase 1 tip (this checkpoint) | `cabd978` | Preview-only `symforge_edit` handler |
+| Preview-only edit checkpoint | `cabd978` | Preview-only `symforge_edit` handler (dry_run default) |
+| Guarded apply semantics spec | `56072ce` | Normative guarded apply contract in [`stel-schema.md`](stel-schema.md) |
+| Phase 1 tip (this checkpoint) | `df89308` | Guarded `symforge_edit` apply (`apply: true`, single-file single-symbol) |
 
 **Deferred (not blocking this checkpoint):** `B-RESULTS` — RESULTS.md §8.7 post-8.0 baseline only.
 
@@ -38,6 +40,9 @@ This document captures implementation state after the preview-only `symforge_edi
 | `24e1b7c` | **Golden** | Full golden corpus classification (serve / P-FF / multi-hop / mismatch partitions) |
 | `b2c0d6a` | **L1** | Golden one-step planner mismatch reduction — 29 supported serve rows |
 | `cabd978` | **Edit** | Preview-only `symforge_edit` — dry-run `replace_symbol_body`, no apply path |
+| `9f6a86c` | **Docs** | Checkpoint doc for preview-only `symforge_edit` |
+| `56072ce` | **Docs** | Normative guarded apply semantics in `stel-schema.md` |
+| `df89308` | **Edit** | Guarded `symforge_edit` apply — `apply: true` single-file single-symbol `replace_symbol_body` |
 
 Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 
@@ -68,10 +73,20 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 - [`src/stel/planner.rs`](../src/stel/planner.rs) — `build_plan()`: intent buckets, query patterns, `smart_query` fallback
 - Single-step plans only (multi-hop golden rows deferred)
 
-### L1 — Edit planner (preview path)
+### L1 — Edit planner (preview and apply paths)
 
-- [`src/stel/edit_planner.rs`](../src/stel/edit_planner.rs) — `build_edit_plan()`: validates path/symbol/body, emits single-step `replace_symbol_body` with `dry_run: true`
+- [`src/stel/edit_planner.rs`](../src/stel/edit_planner.rs) — `build_edit_plan()`: validates path/symbol/body, emits single-step `replace_symbol_body`
+- **Default:** `dry_run: true` when `apply` is omitted or `false`
+- **`apply: true`:** `dry_run: false` in plan args; explicit opt-in only
 - Rejects unsafe paths (`..`, absolute paths) and missing symbol/body before planning
+- Forwards optional `idempotency_key` into `replace_symbol_body` args
+
+### L1 — Guarded apply pre-flight
+
+- [`src/stel/edit_apply.rs`](../src/stel/edit_apply.rs) — `run_pre_apply_gates()` for `apply: true` only
+- **Safety gates:** index readiness, symbol resolution, on-disk vs index byte match, `if_match` body check
+- **Idempotency / already-applied:** when body already matches requested content and no `idempotency_key`, returns success without rewrite; when `idempotency_key` is set, defers to `replace_symbol_body` idempotency replay (no double write)
+- **Scope:** single file, single symbol, `replace_symbol_body` only — no multi-file edits
 
 ### L2 — Economics metadata
 
@@ -87,11 +102,14 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 - Bypass response: trust envelope + host-read instruction (no `Chosen tool:` line)
 - Non-P-FF negative-net bypass metadata **not** enforced yet (still serves)
 
-### L3 — Edit preview (dry-run only)
+### L3 — Edit preview and guarded apply
 
-- `symforge_edit_stel_handler` always dispatches `replace_symbol_body` with `dry_run: true`
-- **No apply path** — no `apply: true` / `preview: false` semantics exist on the wire yet
-- **No bytes are written** — legacy dry-run contract (`[DRY RUN]`, `Write semantics: dry run (no writes)`) is enforced and tested
+- `symforge_edit_stel_handler` dispatches `replace_symbol_body` with `dry_run: true` by default (preview)
+- **`apply: true`** runs pre-apply gates, then dispatches `replace_symbol_body` with `dry_run: false`
+- Apply response includes changed file path, byte range, line range, write mode (`committed` / `already_applied`)
+- Trust envelope + ledger on both preview and apply success paths
+- Pre-apply validation failures return `InvalidRequest` **without** envelope
+- **No multi-hop routing** — always single-step `replace_symbol_body`
 
 ### L4 — Session ledger
 
@@ -99,13 +117,14 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 - Records: plan id, route tool, decision, bypass flag, schema/invoke tokens, predicted net, legacy executed, output bytes/tokens
 - Compact `ledger: {…}` JSON embedded in trust envelope
 - Edit calls record `surface: "symforge_edit"` in ledger events
+- `legacy_executed: true` only when apply commits via atomic write + reindex
 - `symforge` preview path (`preview: true`) does not append ledger rows
 
 ### Compact `status` handler
 
 - [`src/stel/status.rs`](../src/stel/status.rs) — `status_stel_tool` when `SYMFORGE_SURFACE=compact`
 - `detail: compact` (default) — operational headline: surface, Phase 0 anchors, L1–L4 availability, handler state, ledger event count, index readiness
-- Reports **`handler_symforge_edit: preview-only`** (not schema-only)
+- Reports **`handler_symforge_edit: preview-and-apply`** (not preview-only)
 - `detail: full` — adds project, symbol count, session tokens, last ledger decision/route, and calibration section
 
 ### Observational calibration (read-only)
@@ -134,18 +153,25 @@ flowchart TD
   L4 --> CAL["status detail:full\nreads ledger → calibration summary"]
 ```
 
-## Runtime flow (compact `symforge_edit` — preview-only)
+## Runtime flow (compact `symforge_edit` — preview and guarded apply)
 
 ```mermaid
 flowchart TD
-  E0["L0 symforge_edit MCP call"] --> EV["L1 edit_planner.validate + build_edit_plan"]
+  E0["L0 symforge_edit MCP call"] --> EV["L1 edit_planner.validate"]
   EV -->|invalid| REJ["InvalidRequest\nno envelope"]
-  EV --> EL2["L2 evaluate_edit_plan"]
-  EL2 --> ED["L3 replace_symbol_body\ndry_run=true only"]
-  ED --> EL4["L4 capture_ledger + trust envelope\nsurface=symforge_edit"]
+  EV --> A{apply: true?}
+  A -->|no| EL2P["L2 evaluate_edit_plan"]
+  EL2P --> EDP["L3 replace_symbol_body\ndry_run=true"]
+  EDP --> EL4P["L4 envelope + ledger\nlegacy_executed=false"]
+  A -->|yes| G["edit_apply.run_pre_apply_gates"]
+  G -->|reject| REJ
+  G -->|already applied| EL4A["L4 envelope + ledger\nno rewrite"]
+  G -->|ready| EL2A["L2 evaluate_edit_plan"]
+  EL2A --> EDA["L3 replace_symbol_body\ndry_run=false"]
+  EDA --> EL4C["L4 envelope + ledger\nbyte/line metadata\nlegacy_executed on commit"]
 ```
 
-Every successful preview call includes trust envelope + `ledger:` metadata. Failed validation returns `InvalidRequest` without planning.
+**Defaults:** preview/dry_run when `apply` is omitted or `false`. **`apply: true` is explicit opt-in only.**
 
 ---
 
@@ -157,7 +183,7 @@ Every successful preview call includes trust envelope + `ledger:` metadata. Fail
 |------|-----------------|-------|
 | `symforge` | **Yes** — full L1–L4 path | Production compact read/explore facade |
 | `status` | **Yes** — operational + calibration (full) | Requires `SYMFORGE_SURFACE=compact` |
-| `symforge_edit` | **Yes** — preview-only L1–L4 path | `replace_symbol_body` dry_run; **no apply**; **no writes** |
+| `symforge_edit` | **Yes** — preview-and-apply L1–L4 path | Default preview/dry_run; `apply: true` commits single-symbol `replace_symbol_body` |
 
 ---
 
@@ -165,12 +191,12 @@ Every successful preview call includes trust envelope + `ledger:` metadata. Fail
 
 | Suite | What it proves |
 |-------|----------------|
-| `cargo test stel::` | Unit tests across types, planner, edit_planner, controller, executor, ledger, calibration, status, envelope, golden_replay helpers |
+| `cargo test stel::` | Unit tests across types, planner, edit_planner, edit_apply, controller, executor, ledger, calibration, status, envelope, golden_replay helpers |
 | `tests/stel_golden_replay.rs` | Classifies all 36 golden rows; replays **29 supported serve** + **4 P-FF bypass** rows |
-| `tests/stel_symforge_edit.rs` | Preview-only edit: unsafe path rejection, missing fields, envelope + ledger, byte-exact no-write |
+| `tests/stel_symforge_edit.rs` | Preview/apply separation, unsafe path rejection, missing symbol, `if_match` mismatch, already-applied idempotency, idempotency-key replay, successful single-symbol apply — **all use `tempfile::tempdir()` fixtures only; no real repo source writes** |
 | `tests/stel_l3_enforcement.rs` | P-FF bypass skips legacy tools; serve still executes |
 | `tests/stel_l4_ledger.rs` | Serve and P-FF rows produce envelope `ledger:` + session ledger events |
-| `tests/stel_status.rs` | Compact guard, `handler_symforge_edit: preview-only`, full detail + calibration after serve |
+| `tests/stel_status.rs` | Compact guard, `handler_symforge_edit: preview-and-apply`, full detail + calibration after serve |
 | `cargo test --lib protocol::surface_probe` | Phase 0 measurement schemas unchanged |
 
 Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
@@ -187,7 +213,7 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 ## Preserved / unchanged
 
 - Phase 0 **`surface_probe`** and `_probe_*` harness relay on `symforge`
-- Compact-3 `tools/list` production path vs frozen probe schemas (A-025 `symforge_edit` schema unchanged)
+- Compact-3 `tools/list` production path vs frozen probe schemas (A-025 `symforge_edit` schema within budget)
 - `symforge` serve/bypass execution semantics
 - L2 margins and calibration behavior (observational only)
 - Full 32-tool surface when `SYMFORGE_SURFACE=full`
@@ -198,39 +224,42 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 | Item | Status |
 |------|--------|
-| `symforge_edit` guarded apply | **Not implemented** — normative spec in [`stel-schema.md`](stel-schema.md); preview/dry-run only today |
+| Multi-step planner / executor chains | L1 single-step only; **3 golden multi-hop rows deferred** |
+| Multi-file `symforge_edit` apply | Not implemented — single file + single symbol only |
 | Calibration auto-tuning (`CalibrationState` fudge → L2) | Not implemented — observational summary only |
 | Calibration / ledger persistence | In-memory only |
-| Multi-step planner / executor chains | L1 single-step only; 3 golden multi-hop rows deferred |
 | H3–H8 battery gates on compact surface | Not claimed |
 | `B-RESULTS` / RESULTS.md §8.7 | Deferred post-8.0 |
 
 ---
 
-## Guarded apply semantics (normative spec — not implemented)
+## Guarded apply semantics (implemented — `df89308`)
 
 **Normative contract:** [`stel-schema.md`](stel-schema.md) — sections **`StelEditRequest`** and **`Guarded apply semantics`**.
 
-Phase 1 ships preview-only (`cabd978`). The schema now defines:
+Shipped behavior (`df89308`):
 
-- explicit `apply: true` opt-in (future wire field; default remains preview/dry_run)
-- no silent writes; path/symbol/body validation; traversal and absolute-path rejection
-- pre-apply symbol resolution, edit-safety tier, on-disk content verification, idempotency
-- trust envelope + ledger on apply; changed-file and byte/line range reporting
-- normative test matrix before any apply code merges
-- `status` must distinguish preview-only vs apply-enabled
-- single-file / single-symbol scope; multi-file edits out of scope
-
-**Do not implement `apply: true` until the test matrix in `stel-schema.md` is satisfied.**
+| Requirement | Status |
+|-------------|--------|
+| `apply: true` explicit opt-in; default preview/dry_run | **Shipped** |
+| No silent writes | **Shipped** |
+| Path/symbol/body validation; traversal and absolute-path rejection | **Shipped** |
+| Pre-apply symbol resolution and on-disk content verification | **Shipped** |
+| `if_match` mismatch rejection | **Shipped** |
+| Idempotency-key replay and already-applied handling | **Shipped** |
+| Trust envelope + ledger on apply | **Shipped** |
+| Changed file + byte/line range reporting | **Shipped** |
+| `status` reports `handler_symforge_edit: preview-and-apply` | **Shipped** |
+| Single-file / single-symbol scope | **Shipped** |
+| Multi-file edits | **Out of scope** |
 
 ---
 
 ## Suggested next boundaries (risk order)
 
-1. **Guarded `symforge_edit` apply** — implement `apply: true` per [`stel-schema.md`](stel-schema.md) guarded-apply section + full test matrix; smallest path: single-symbol `replace_symbol_body`
-2. **Multi-hop routing** — replay the three `chain: multi` golden rows; larger planner + runtime expansion
-3. **Calibration persistence** — durable ledger + optional auto-tuning gate (still no silent L2 changes)
-4. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
+1. **Multi-hop routing** — replay the three `chain: multi` golden rows; larger planner + runtime expansion (optional — strong Phase 1 milestone already reached without this)
+2. **Calibration persistence** — durable ledger + optional auto-tuning gate (still no silent L2 changes)
+3. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
 
 ---
 
@@ -238,10 +267,11 @@ Phase 1 ships preview-only (`cabd978`). The schema now defines:
 
 | Module | Layer |
 |--------|-------|
-| `src/stel/types.rs` | Wire types |
+| `src/stel/types.rs` | Wire types (`StelEditRequest`: `apply`, `if_match`, `idempotency_key`) |
 | `src/stel/surface.rs`, `surface_list.rs` | L0 registry |
 | `src/stel/planner.rs` | L1 read routing |
-| `src/stel/edit_planner.rs` | L1 edit routing (preview) |
+| `src/stel/edit_planner.rs` | L1 edit routing (preview + apply plan) |
+| `src/stel/edit_apply.rs` | Guarded apply pre-flight gates |
 | `src/stel/controller.rs` | L2 |
 | `src/stel/executor.rs` | L3 bypass enforcement |
 | `src/stel/ledger.rs` | L4 record |
