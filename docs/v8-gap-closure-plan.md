@@ -424,7 +424,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
-**Progress (2026-06-13):** In-repo evidence at `c3581a5`. **B-SFBENCH CLOSED** (superseded). A-001, A-004, A-028, A-005 **VALIDATED**; A-019 **interim** compact-3 on H1 (891 B). Golden corpus: `docs/fixtures/routes.golden.jsonl`. **NO-GO** — B-SIGNOFF pending.
+**Progress (2026-06-13):** Evidence `77c4955`. B-SFBENCH **closed**. A-001/A-004/A-028/A-005 **VALIDATED**. **NO-GO** — **B-A019** interim blocks sign-off request; independent review **not solicited**.
 
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
@@ -443,7 +443,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 - [x] A-005 VALIDATED (H1 feasible) — compact probe 891 B [`A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md)
 - [x] A-025 VALIDATED (edit budget or pivot documented) — unit test PASS [`surface_probe.rs`](../src/protocol/surface_probe.rs)
-- [x] A-019 L0 surface — **interim** compact-3 on H1 (891 B); full A/B pending — [`A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md)
+- [ ] A-019 L0 surface locked — **interim** compact-3 on H1 (891 B); full A/B or non-blocking pivot required — [`A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md)
 - [x] A-006/A-027 documented (amortization policy) — [`docs/research/A-006-host-schema.md`](research/A-006-host-schema.md)
 
 **Bypass harness (serve economics trust)**
@@ -457,7 +457,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 - [x] Decision log updated in ideation.md — 2026-06-13 Phase 0 §12A entry
 - [ ] No OPEN assumption blocks Phase 1 per §9 — A-019 interim only; see [`phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md)
 
-**Phase 0 blockers (2026-06-13):** B-SIGNOFF (independent reviewer); B-A019 interim (reviewer may accept). B-SFBENCH **closed**. RESULTS.md §8.7 **deferred** (not Phase 0).
+**Phase 0 blockers (2026-06-13):** **B-A019** (interim — blocks sign-off request). **B-SIGNOFF** latent until A-019 closes. B-SFBENCH **closed**. RESULTS.md §8.7 **deferred**.
 
 **Only when every §12A box is checked → first commit in `src/stel/`.**
 

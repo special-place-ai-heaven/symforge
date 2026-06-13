@@ -25,8 +25,13 @@ Full A/B on 36-row corpus **not run** — external sf-bench deprioritized.
 
 Meta-tool surface probe **deferred** until STEL Phase 1 or explicit A/B request.
 
-## Revisit trigger
+## Close paths (pre-review gate)
 
-Invalidate interim lock if meta-tool battery beats compact on **session_net_accepted + equivalence** on pinned corpus.
+| Path | Action | Unblocks |
+|------|--------|----------|
+| **A — VALIDATED** | Run L0 A/B on pinned battery; record winner | Independent review request |
+| **B — Non-blocking pivot** | Document explicit acceptance that interim compact-3 suffices for Phase 1 pre-flight in this file + `stel-assumptions.md` §9 | Independent review request (reviewer still confirms) |
 
-**A-019 verdict:** **INTERIM LOCK (compact-3)** — full VALIDATED pending battery
+**Do not request independent sign-off while this file shows INTERIM without Path A or B recorded.**
+
+**A-019 verdict:** **INTERIM LOCK (compact-3)** — blocks sign-off request until Path A or B

@@ -81,7 +81,7 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 | No beat/pin 7.21.1 baseline | — | [phase0-12a-scope-boundary.md](./phase0-12a-scope-boundary.md) | Scope evidence | **PASS** |
 | A-005 VALIDATED (H1) | A-005 | [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md) | Schema Measurement Record | **PASS** (891 B) |
 | A-025 VALIDATED (edit budget) | A-025 | [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md) | Schema Measurement Record | **PASS** |
-| A-019 VALIDATED (L0 locked) | A-019 | [A-019-l0-surface-choice.md](./A-019-l0-surface-choice.md) | Schema Measurement Record | **INTERIM** (compact-3) |
+| A-019 VALIDATED (L0 locked) | A-019 | [A-019-l0-surface-choice.md](./A-019-l0-surface-choice.md) | Schema Measurement Record | **INTERIM** — **blocks sign-off request** |
 | A-006/A-027 documented | A-006, A-027 | [A-006-host-schema.md](./A-006-host-schema.md) | Bypass/host policy | **DOC PASS** |
 | A-012 two-hop OR H3 serve-only | A-012 | [A-012-bypass-policy.md](./A-012-bypass-policy.md) | Bypass Policy Record | **DOC PASS** |
 | P-FF + eligible H6 documented | A-032 | [A-012-bypass-policy.md](./A-012-bypass-policy.md) | Golden README rules | **DOC PASS** |
@@ -136,14 +136,24 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 
 ## Blockers (summary)
 
+**Independent review:** **NOT REQUESTED** until A-019 is closed or explicitly declared non-blocking (see sequencing below).
+
 | ID | Status | Reason |
 |----|--------|--------|
-| B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path ([phase0-12a-sf-bench-path.md](./phase0-12a-sf-bench-path.md)) |
-| B-A019 | **OPEN (interim)** | Compact-3 interim lock on H1; full L0 A/B battery pending |
-| B-SIGNOFF | **OPEN** | Independent reviewer sign-off pending |
-| B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline runs; not a Phase 0 pre-flight gate |
+| B-A019 | **OPEN** | L0 surface interim only (compact-3 on H1); full A/B not run — **primary gate** |
+| B-SIGNOFF | **LATENT** | Independent reviewer required for GO; **do not solicit until B-A019 clears** |
+| B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path |
+| B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline; not Phase 0 gate |
+| B-HYGIENE | **OPEN** | §12A signoff YAML / checklist must stay aligned with artifacts on each refresh |
 
-**Phase 0 decision:** **NO-GO** until B-SIGNOFF clears and reviewer accepts or rejects A-019 interim (see [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md)).
+### Sequencing (normative)
+
+1. **Close A-019** — run full L0 A/B **or** record explicit non-blocking declaration in [A-019](./A-019-l0-surface-choice.md) + [stel-assumptions.md](../stel-assumptions.md).
+2. **Refresh** review packet + signoff for current evidence commit.
+3. **Request** independent review ([packet](./phase0-12a-independent-review-packet.md)).
+4. **Record** GO or NO-GO in [signoff](./phase0-12a-review-signoff.md).
+
+**Phase 0 decision:** **NO-GO** — A-019 interim + no independent sign-off.
 
 ---
 
@@ -175,9 +185,9 @@ rg -n "NEEDS CLARIFICATION|\[FEATURE\]|\[###|ACTION REQUIRED|REMOVE IF UNUSED" s
 | A-004 | **VALIDATED** | [A-004-equiv-audit.md](./A-004-equiv-audit.md) — 0% FP+FN (n=20) |
 | A-028 | **VALIDATED** | [routes.golden.jsonl](../fixtures/routes.golden.jsonl) — 36 rows |
 | A-005 H1 | **VALIDATED** | compact `tools/list` **891 B** ([A-005-schema-bytes.json](./A-005-schema-bytes.json)) |
-| A-019 | **INTERIM** | compact-3 locked on H1 only |
+| A-019 | **INTERIM** | compact-3 on H1 only — **blocks sign-off request** |
 | B-SFBENCH | **CLOSED** | In-repo path supersedes external sf-bench |
-| B-SIGNOFF | **OPEN** | Independent reviewer required |
+| B-SIGNOFF | **LATENT** | Not requested until A-019 closes or non-blocking pivot recorded |
 
 ---
 

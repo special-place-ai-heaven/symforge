@@ -171,7 +171,7 @@
 
 ### Post-implementation doc refresh (2026-06-13)
 
-Producer refreshed [phase0-12a-independent-review-packet.md](../../docs/research/phase0-12a-independent-review-packet.md) and [phase0-12a-review-signoff.md](../../docs/research/phase0-12a-review-signoff.md) for evidence commit `c3581a5`. T048 remains **NO-GO** until an independent reviewer signs; producer cannot self-sign.
+Producer refreshed review packet and signoff for `77c4955`. **Independent review not requested** while B-A019 interim. Sequence: close A-019 → refresh docs → request review → T048/T049.
 
 ---
 
