@@ -1,4 +1,4 @@
-//! `StelTrustEnvelope` text formatter (L0 response header — S4 wiring deferred).
+//! `StelTrustEnvelope` text formatter (L0 response header).
 
 use super::types::AdmissionDecision;
 

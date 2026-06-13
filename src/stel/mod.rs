@@ -3,20 +3,25 @@
 //! **S2 (this slice):** schema-aligned types + compact surface registry + envelope formatter.
 //!
 //! Integration boundaries (wired in later slices):
-//! - **L0 MCP:** `protocol` compact handlers will accept [`StelRequest`] and emit
-//!   [`format_trust_envelope`] (S3–S4). Phase 0 measurement relay stays in
-//!   [`crate::protocol::surface_probe`] until S3 migrates `tools/list` schemas.
+//! - **L0 MCP:** `protocol` compact handlers accept [`SymforgeCallInput`] and prepend
+//!   [`format_trust_envelope`] (S4). Phase 0 harness relay uses `_probe_*` fields on the same
+//!   tool name. Measurement schemas remain in [`crate::protocol::surface_probe`].
 //! - **L1:** extend [`crate::protocol::smart_query`] into a plan builder (S5).
 //! - **L2:** controller consumes [`StelPlan`] → [`StelDecision`] (S6).
 //! - **L3:** legacy tool dispatch via [`crate::protocol::SymForgeServer`] (S4+).
 //! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S7).
 
 pub mod envelope;
+pub mod handler;
 pub mod surface;
 pub mod surface_list;
 pub mod types;
 
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
+pub use handler::{
+    StubServeMetrics, envelope_for_stub_serve, estimate_tokens, format_preview_body,
+    prepend_envelope, stub_plan_summary,
+};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{
     compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,
@@ -25,5 +30,5 @@ pub use types::{
     AdmissionDecision, CalibrationState, CoreToolName, GoldenRouteRow, IndexRef, IntentBucket,
     RouteConfidence, StelBypassBody, StelCacheBody, StelDecision, StelEditIntent, StelEditRequest,
     StelEstimate, StelExecution, StelExecutionTotals, StelLedgerEvent, StelPlan, StelPlanStep,
-    StelRequest, StelStatusDetail, StelStatusRequest, StelStepExecution,
+    StelRequest, StelStatusDetail, StelStatusRequest, StelStepExecution, SymforgeCallInput,
 };

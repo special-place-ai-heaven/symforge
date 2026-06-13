@@ -21,6 +21,21 @@ pub enum IntentBucket {
     Auto,
 }
 
+impl IntentBucket {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Orient => "orient",
+            Self::Find => "find",
+            Self::Read => "read",
+            Self::Trace => "trace",
+            Self::Impact => "impact",
+            Self::Edit => "edit",
+            Self::Meta => "meta",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// Route confidence for plan steps (maps to `protocol::smart_query::RouteConfidence`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +71,25 @@ pub struct StelRequest {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
+}
+
+/// MCP call input for `symforge` — production [`StelRequest`] plus optional Phase 0 harness fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SymforgeCallInput {
+    #[serde(flatten)]
+    pub request: StelRequest,
+    #[serde(default, rename = "_probe_legacy_tool")]
+    #[schemars(skip)]
+    pub probe_legacy_tool: Option<String>,
+    #[serde(default, rename = "_probe_legacy_args")]
+    #[schemars(skip)]
+    pub probe_legacy_args: Option<Value>,
+}
+
+impl SymforgeCallInput {
+    pub fn is_probe_relay(&self) -> bool {
+        self.probe_legacy_tool.is_some()
+    }
 }
 
 /// MCP input for the `symforge_edit` compact-surface tool.
@@ -273,6 +307,29 @@ impl GoldenRouteRow {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn symforge_call_input_detects_probe_relay() {
+        let probe = SymforgeCallInput {
+            request: StelRequest {
+                query: "x".to_string(),
+                ..Default::default()
+            },
+            probe_legacy_tool: Some("search_text".to_string()),
+            probe_legacy_args: Some(serde_json::json!({})),
+        };
+        assert!(probe.is_probe_relay());
+
+        let production = SymforgeCallInput {
+            request: StelRequest {
+                query: "who calls foo".to_string(),
+                ..Default::default()
+            },
+            probe_legacy_tool: None,
+            probe_legacy_args: None,
+        };
+        assert!(!production.is_probe_relay());
+    }
 
     #[test]
     fn stel_request_roundtrip_matches_schema_shape() {

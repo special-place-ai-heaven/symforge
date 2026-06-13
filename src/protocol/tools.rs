@@ -7912,28 +7912,112 @@ impl SymForgeServer {
 
     #[tool(
         name = "symforge",
-        description = "Phase 0 STEL L0 facade probe (measurement relay only; not production STEL).",
+        description = "STEL read/explore facade — natural-language code intelligence with trust envelope on the compact surface. Phase 0 batteries may pass `_probe_legacy_*` harness fields.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn symforge_facade_tool(
         &self,
-        params: Parameters<super::surface_probe::StelFacadeProbeInput>,
+        params: Parameters<crate::stel::SymforgeCallInput>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        let (legacy_tool, legacy_args) =
-            match super::surface_probe::resolve_facade_probe(&params.0) {
-                Ok(route) => route,
-                Err(message) => {
-                    return Ok(
-                        ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(message),
-                    );
+        if params.0.is_probe_relay() {
+            let legacy_tool = match params.0.probe_legacy_tool.as_deref() {
+                Some(tool) => tool,
+                None => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(
+                            "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 battery harness only)",
+                        ));
                 }
             };
-        let output = self
-            .dispatch_tool_for_tests(&legacy_tool, legacy_args)
-            .await;
-        let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
+            let legacy_args = match params.0.probe_legacy_args.clone() {
+                Some(args) => args,
+                None => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(
+                            "Phase 0 facade relay requires `_probe_legacy_args` (A-019 battery harness only)",
+                        ));
+                }
+            };
+            let output = self
+                .dispatch_tool_for_tests(legacy_tool, legacy_args)
+                .await;
+            let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
+                OutcomeClass::InvalidRequest
+            } else if output.starts_with("Index not loaded.") {
+                OutcomeClass::InternalFailure
+            } else {
+                OutcomeClass::Found
+            };
+            return statused_tool_result(output, outcome_class);
+        }
+
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "symforge STEL handler requires SYMFORGE_SURFACE=compact; use legacy tools on the full surface",
+            ));
+        }
+
+        self.symforge_stel_handler(&params.0.request).await
+    }
+
+    /// Production compact-surface `symforge` path (S4): delegate to `ask`, prepend trust envelope.
+    async fn symforge_stel_handler(
+        &self,
+        request: &crate::stel::StelRequest,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        use crate::protocol::smart_query;
+        use crate::stel::handler::{self, StubServeMetrics};
+
+        let q = smart_query::strip_leading_articles(request.query.trim());
+        if q.is_empty() {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result("query requires a non-empty question."));
+        }
+
+        let (intent, matched) = smart_query::classify_intent_with_match(q);
+        let assessment = smart_query::assess_route(&intent, matched);
+        let intent_label = request
+            .intent
+            .map(|bucket| bucket.as_str())
+            .unwrap_or("auto");
+        let plan_summary = handler::stub_plan_summary(
+            intent_label,
+            smart_query::route_tool_name(&intent),
+            smart_query::route_confidence_label(assessment.confidence),
+        );
+        let session_net = self.session_context.snapshot().total_tokens as i64;
+
+        if request.preview == Some(true) {
+            let body = handler::format_preview_body(request);
+            let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
+                plan_summary,
+                response_tokens: 0,
+                session_net_vs_manual: session_net,
+            });
+            let output = handler::prepend_envelope(&envelope, &body);
+            return statused_tool_result(output, OutcomeClass::Found);
+        }
+
+        let ask_input = SmartQueryInput {
+            query: request.query.clone(),
+            max_tokens: request.max_tokens.map(u64::from),
+        };
+        let body = self.ask(Parameters(ask_input)).await;
+        let response_tokens = handler::estimate_tokens(&body);
+        let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
+            plan_summary,
+            response_tokens,
+            session_net_vs_manual: session_net,
+        });
+        let output = handler::prepend_envelope(&envelope, &body);
+        self.session_context
+            .record_summary_output("symforge", response_tokens);
+
+        let outcome_class = if body.starts_with("Error:") || body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
-        } else if output.starts_with("Index not loaded.") {
+        } else if body.starts_with("Index not loaded.") {
             OutcomeClass::InternalFailure
         } else {
             OutcomeClass::Found
