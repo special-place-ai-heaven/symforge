@@ -1,6 +1,6 @@
 # Phase 0 §12A — assumption evidence placeholders
 
-**Updated:** 2026-06-13 (A-019 closed; evidence commit `f26f28b`, includes `e9f4102`)  
+**Updated:** 2026-06-13 (A-019 closed; evidence commit `08f7d14`, A-019 bundle `f26f28b`)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)
 
 Phase 1-blocking assumptions tracked for §12A pre-flight. Update verdicts only when linked artifacts satisfy contract rules.

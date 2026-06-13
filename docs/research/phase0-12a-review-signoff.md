@@ -2,7 +2,7 @@
 
 **Tasks:** T005, T011–T014, T046–T049  
 **Updated:** 2026-06-13 (A-019 L0 A/B closed)  
-**Evidence commit:** `f26f28b` on `v8/stel-architecture` (includes prior bundle `e9f4102`)
+**Evidence commit:** `08f7d14` on `v8/stel-architecture` (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`)
 
 > **Independent review: NOT REQUESTED** — A-019 closed; review **ready to solicit**. Producer has not self-signed.
 
@@ -59,7 +59,7 @@
 | ID | Type | Reason |
 |----|------|--------|
 | B-A019 | closed | L0 A/B complete — compact-3 wins |
-| B-HYGIENE | closed | Evidence commit references aligned at `f26f28b` |
+| B-HYGIENE | closed | Evidence commit references aligned at `08f7d14` |
 
 ### Latent
 
@@ -136,7 +136,7 @@ pre_review_gates:
     reason: L0 A/B complete — compact-3 wins
   - id: B-HYGIENE
     status: closed
-    reason: evidence commit references aligned at f26f28b
+    reason: evidence commit references aligned at 08f7d14
 blocking_gaps: []
 latent_gaps:
   - id: B-SIGNOFF
@@ -148,7 +148,7 @@ deferred_gaps:
   - id: B-RESULTS
     reason: RESULTS.md §8.7 post-8.0 only
 evidence_summary: docs/research/phase0-12a-evidence-index.md
-evidence_commit: f26f28b
+evidence_commit: 08f7d14
 validated_assumptions:
   - A-001
   - A-004
@@ -169,7 +169,7 @@ next_actions:
 
 | Step | Status |
 |------|--------|
-| Phase 0 evidence bundle | **Done** (`f26f28b`; prior `e9f4102`) |
+| Phase 0 evidence bundle | **Done** (`08f7d14`; A-019 `f26f28b`) |
 | Close A-019 | **Done** ([A-019](./A-019-l0-surface-choice.md)) |
 | Request independent review | **Next** |
 | GO / NO-GO | **NO-GO** |

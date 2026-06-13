@@ -3,7 +3,7 @@
 > **Review readiness: READY** — A-019 closed (compact-3 wins L0 A/B). Independent review **may be solicited**; producer has **not** self-signed. See §0 sequencing.
 
 **Prepared:** 2026-06-13 (A-019 L0 A/B closed)  
-**Evidence commit:** `f26f28b` on `v8/stel-architecture` (includes prior bundle `e9f4102`)  
+**Evidence commit:** `08f7d14` on `v8/stel-architecture` (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`)  
 **Producer:** Cursor agent (speckit.implement)  
 **Purpose:** Template for T048 when pre-review gates clear.
 
@@ -16,7 +16,7 @@
 | Gate | Status | Close by |
 |------|--------|----------|
 | **B-A019** | **CLOSED** | L0 A/B complete — [A-019](./A-019-l0-surface-choice.md), [battery](./A-019-l0-ab-results.json) |
-| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `f26f28b` |
+| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `08f7d14` |
 | **B-SIGNOFF** | **LATENT** | Request independent review; record GO/NO-GO |
 
 **Normative sequence:** close A-019 → refresh packet/signoff → request human review → record GO/NO-GO.
@@ -88,7 +88,7 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 | ID | Status | Note |
 |----|--------|------|
 | **B-SIGNOFF** | **LATENT** | Independent review ready to solicit; not requested |
-| **B-HYGIENE** | **CLOSED** | Aligned at `f26f28b` |
+| **B-HYGIENE** | **CLOSED** | Aligned at `08f7d14` |
 
 **Closed:** B-A019, B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025  
 **Deferred:** B-RESULTS

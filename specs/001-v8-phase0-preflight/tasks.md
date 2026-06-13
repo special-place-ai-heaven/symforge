@@ -171,7 +171,7 @@
 
 ### Post-implementation doc refresh (2026-06-13)
 
-Producer closed A-019 via L0 A/B; evidence commit `f26f28b` (includes `e9f4102`). **Independent review not requested** — ready to solicit. Sequence: request review → T048/T049.
+Producer closed A-019 via L0 A/B; evidence commit `08f7d14` (A-019 bundle `f26f28b`). **Independent review not requested** — ready to solicit. Sequence: request review → T048/T049.
 
 ---
 
