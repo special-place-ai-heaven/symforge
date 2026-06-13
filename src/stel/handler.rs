@@ -23,6 +23,7 @@ pub struct DecisionEnvelopeMetrics {
     pub response_tokens: u32,
     pub session_net_vs_manual: i64,
     pub predict_error_pct: f32,
+    pub ledger_line: Option<String>,
 }
 
 /// Back-compat alias for older call sites/tests.
@@ -41,6 +42,7 @@ pub fn envelope_for_decision(metrics: &DecisionEnvelopeMetrics) -> String {
         predict_error_pct: metrics.predict_error_pct,
         session_net_vs_manual: metrics.session_net_vs_manual,
         calibration: "pending",
+        ledger_line: metrics.ledger_line.clone(),
     })
 }
 
@@ -79,7 +81,19 @@ pub fn metrics_for_decision(
         response_tokens,
         session_net_vs_manual,
         predict_error_pct,
+        ledger_line: None,
     }
+}
+
+/// Attach ledger metadata and build the final `symforge` response string.
+pub fn finalize_symforge_output(
+    mut metrics: DecisionEnvelopeMetrics,
+    ledger_line: String,
+    body: &str,
+) -> String {
+    metrics.ledger_line = Some(ledger_line);
+    let envelope = envelope_for_decision(&metrics);
+    prepend_envelope(&envelope, body)
 }
 
 /// `StelEstimate` JSON body for `preview: true` (L2 preview).

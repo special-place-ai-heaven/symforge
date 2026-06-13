@@ -78,6 +78,8 @@ pub struct SymForgeServer {
     pub(crate) daemon_degraded: Arc<AtomicBool>,
     /// Session context tracking: records what the LLM has fetched this session.
     pub(crate) session_context: Arc<session::SessionContext>,
+    /// In-memory STEL L4 ledger for compact `symforge` invocations (no persistence yet).
+    pub(crate) stel_ledger: Arc<Mutex<crate::stel::ledger::SessionLedger>>,
     /// Tracks edit-tool calls that omitted `working_directory` while the
     /// transitional worktree observability knob was on. Surfaced by the
     /// `health` tool as a rolling "last hour" signal.
@@ -131,6 +133,7 @@ impl SymForgeServer {
             daemon_client: None,
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
         }
@@ -155,6 +158,7 @@ impl SymForgeServer {
             daemon_client: Some(Arc::new(tokio::sync::RwLock::new(daemon_client))),
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
         }
@@ -163,6 +167,12 @@ impl SymForgeServer {
     /// Accessor for tests.
     pub fn index(&self) -> &SharedIndex {
         &self.index
+    }
+
+    /// Accessor for STEL ledger integration tests.
+    #[doc(hidden)]
+    pub fn stel_ledger(&self) -> &Arc<Mutex<crate::stel::ledger::SessionLedger>> {
+        &self.stel_ledger
     }
 
     /// Return the MCP tool definitions advertised by this server.

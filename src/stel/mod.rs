@@ -9,13 +9,15 @@
 //! - **L1:** [`planner::build_plan`] maps [`StelRequest`] → [`StelPlan`] (S5).
 //! - **L2:** [`controller::evaluate_plan`] scores plans → [`StelDecision`] economics metadata (S6).
 //! - **L3:** [`executor::is_enforced_bypass`] skips legacy dispatch for P-FF bypass (S7).
-//! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S8).
+//! - **L4:** [`ledger::SessionLedger`] records decision/execution rows (S8).
+//! - **L4 calibration:** deferred — no feedback loop yet.
 
 pub mod controller;
 pub mod envelope;
 pub mod executor;
 pub mod golden_replay;
 pub mod handler;
+pub mod ledger;
 pub mod planner;
 pub mod surface;
 pub mod surface_list;
@@ -32,10 +34,14 @@ pub use controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, SERVE_MARGIN_TOKENS,
 };
 pub use executor::{format_bypass_body, is_enforced_bypass};
+pub use ledger::{
+    LedgerCaptureInput, LedgerEnvelopeMeta, SessionLedger, build_ledger_event, capture_ledger,
+    format_ledger_envelope_line,
+};
 pub use handler::{
     DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,
-    estimate_tokens, format_preview_body, format_preview_body_for_plan, format_preview_estimate,
-    metrics_for_decision, prepend_envelope, stub_plan_summary,
+    estimate_tokens, finalize_symforge_output, format_preview_body, format_preview_body_for_plan,
+    format_preview_estimate, metrics_for_decision, prepend_envelope, stub_plan_summary,
 };
 pub use planner::{build_plan, confidence_label, plan_summary_line};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};

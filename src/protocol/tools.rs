@@ -8005,18 +8005,18 @@ impl SymForgeServer {
 
         if is_enforced_bypass(&decision) {
             let body = format_bypass_body(&decision);
-            let response_tokens = handler::estimate_tokens(&body);
-            let metrics = metrics_for_decision(
-                plan_summary,
-                &decision,
+            let output = self.finalize_symforge_with_ledger(
+                request,
                 &plan,
-                response_tokens,
+                &decision,
+                plan_summary,
                 session_net,
+                &body,
+                false,
+                &step.tool,
             );
-            let envelope = handler::envelope_for_decision(&metrics);
-            let output = handler::prepend_envelope(&envelope, &body);
             self.session_context
-                .record_summary_output("symforge", response_tokens);
+                .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
@@ -8034,18 +8034,18 @@ impl SymForgeServer {
             decision.decision_reason,
         );
         let body = format!("{routing_meta}\n\n{tool_body}");
-        let response_tokens = handler::estimate_tokens(&body);
-        let metrics = metrics_for_decision(
-            plan_summary,
-            &decision,
+        let output = self.finalize_symforge_with_ledger(
+            request,
             &plan,
-            response_tokens,
+            &decision,
+            plan_summary,
             session_net,
+            &body,
+            true,
+            &step.tool,
         );
-        let envelope = handler::envelope_for_decision(&metrics);
-        let output = handler::prepend_envelope(&envelope, &body);
         self.session_context
-            .record_summary_output("symforge", response_tokens);
+            .record_summary_output("symforge", handler::estimate_tokens(&output));
 
         let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
@@ -8055,6 +8055,41 @@ impl SymForgeServer {
             OutcomeClass::Found
         };
         statused_tool_result(output, outcome_class)
+    }
+
+    fn finalize_symforge_with_ledger(
+        &self,
+        _request: &crate::stel::StelRequest,
+        plan: &crate::stel::StelPlan,
+        decision: &crate::stel::StelDecision,
+        plan_summary: String,
+        session_net: i64,
+        body: &str,
+        legacy_executed: bool,
+        selected_tool: &str,
+    ) -> String {
+        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
+        use crate::stel::ledger::{capture_ledger, format_ledger_envelope_line, LedgerCaptureInput};
+
+        let response_tokens = handler::estimate_tokens(body);
+        let metrics = metrics_for_decision(
+            plan_summary,
+            decision,
+            plan,
+            response_tokens,
+            session_net,
+        );
+        let (event, meta) = capture_ledger(&LedgerCaptureInput {
+            plan,
+            decision,
+            economics: &metrics.economics,
+            selected_tool,
+            legacy_executed,
+            output_body: body,
+        });
+        self.stel_ledger.lock().push(event.clone());
+        let ledger_line = format_ledger_envelope_line(&event, &meta);
+        finalize_symforge_output(metrics, ledger_line, body)
     }
 
     #[tool(

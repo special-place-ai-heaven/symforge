@@ -16,6 +16,7 @@ pub struct TrustEnvelopeInput {
     pub predict_error_pct: f32,
     pub session_net_vs_manual: i64,
     pub calibration: &'static str,
+    pub ledger_line: Option<String>,
 }
 
 fn decision_label(decision: AdmissionDecision) -> &'static str {
@@ -44,7 +45,7 @@ pub fn format_trust_envelope(input: &TrustEnvelopeInput) -> String {
          tokens: {served} served · {saved_label} vs manual · schema {schema} · invoke {invoke}\n\
          predicted: {predicted} · error: {error:.1}%\n\
          session_net_vs_manual: {session:+}\n\
-         calibration: {calibration}\n\
+         calibration: {calibration}{ledger}\n\
          ──",
         plan = input.plan_summary,
         decision = decision_label(input.decision),
@@ -56,6 +57,11 @@ pub fn format_trust_envelope(input: &TrustEnvelopeInput) -> String {
         error = input.predict_error_pct,
         session = input.session_net_vs_manual,
         calibration = input.calibration,
+        ledger = input
+            .ledger_line
+            .as_ref()
+            .map(|line| format!("\n{line}"))
+            .unwrap_or_default(),
     )
 }
 
@@ -76,6 +82,7 @@ mod tests {
             predict_error_pct: 5.0,
             session_net_vs_manual: 1240,
             calibration: "ok",
+            ledger_line: None,
         });
 
         assert!(text.starts_with("── stel ──\n"));
