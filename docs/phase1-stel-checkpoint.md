@@ -137,13 +137,22 @@ flowchart TD
 | Suite | What it proves |
 |-------|----------------|
 | `cargo test stel::` | Unit tests across types, planner, controller, executor, ledger, calibration, status, envelope, golden_replay helpers |
-| `tests/stel_golden_replay.rs` | Five S4 serve rows replay on compact `symforge` |
+| `tests/stel_golden_replay.rs` | Classifies all 36 golden rows; replays **13 supported serve** + **4 P-FF bypass** rows; keeps S4 five-row minimum subset |
 | `tests/stel_l3_enforcement.rs` | P-FF bypass skips legacy tools; serve still executes |
 | `tests/stel_l4_ledger.rs` | Serve and P-FF rows produce envelope `ledger:` + session ledger events |
 | `tests/stel_status.rs` | Compact guard, operational fields, full detail + calibration after serve |
 | `cargo test --lib protocol::surface_probe` | Phase 0 measurement schemas unchanged |
 
-Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** + targeted P-FF / ledger / status tests. Remaining rows (multi-hop, full corpus) are seeded for later replay expansion.
+Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
+
+| Category | Count | Notes |
+|----------|-------|-------|
+| Supported serve replay | 13 | L1 planner matches `must_call[0]`; trust envelope + `ledger:` validated |
+| Supported P-FF bypass replay | 4 | L3 enforced bypass; no legacy tool execution |
+| Deferred multi-hop | 3 | `DEFERRED_MULTI_HOP_ROW_IDS` — planner multi-step not shipped |
+| Deferred planner mismatch | 16 | Listed explicitly in `deferred_planner_mismatch_ids_are_stable` test |
+
+S4 minimum subset (`S4_EXIT_ROW_IDS`, five rows) remains a named floor inside supported serve replay.
 
 ---
 
@@ -164,7 +173,7 @@ Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** 
 | Calibration / ledger persistence | In-memory only |
 | `symforge_edit` handler | Schema only |
 | Multi-step planner / executor chains | L1 single-step only |
-| Full 36-row golden replay | Partial (5 + spot checks) — **recommended next boundary** |
+| Full 36-row golden replay | **13 serve + 4 P-FF** replayed; 3 multi-hop + 16 planner-mismatch deferred explicitly |
 | H3–H8 battery gates on compact surface | Not claimed |
 | `B-RESULTS` / RESULTS.md §8.7 | Deferred post-8.0 |
 | Unrelated pre-existing `cargo test` failures | Separate from STEL slices; not fixed in Phase 1 commits |
@@ -173,10 +182,11 @@ Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** 
 
 ## Suggested next boundaries (risk order)
 
-1. **Broader golden replay** — expand beyond five S4 exit rows toward full corpus; validates planner/controller/enforcement/ledger/calibration stack before edit semantics
-2. **`symforge_edit` handler** — higher risk (edit semantics + safety); defer until replay confidence is higher
-3. **Calibration persistence + auto-tuning** — only after observational summary is trusted; still no silent L2 changes without explicit gate
-4. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
+1. **`symforge_edit` handler** — higher risk (edit semantics + safety); defer until replay confidence is sufficient
+2. **Planner multi-hop** — replay the three `chain: multi` rows after L1 chained plans ship
+3. **Planner mismatch rows** — close the 16 single-hop gaps without forcing golden `must_call` overreach
+4. **Calibration persistence + auto-tuning** — only after observational summary is trusted; still no silent L2 changes without explicit gate
+5. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
 
 ---
 

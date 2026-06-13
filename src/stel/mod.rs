@@ -29,8 +29,11 @@ pub mod types;
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use golden_replay::{
     GOLDEN_ROUTES_FIXTURE, ReplayValidation, S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS,
-    corpus_for_row_id, load_golden_rows, parse_golden_rows, s4_exit_rows,
-    validate_s4_replay_output,
+    DEFERRED_MULTI_HOP_ROW_IDS, GoldenCorpusClassification, GoldenReplayCategory,
+    classify_golden_corpus, classify_golden_row, corpus_for_row_id, corpus_marker_for_row_id,
+    load_golden_rows, parse_golden_rows, request_for_golden_row, s4_exit_rows,
+    supported_pff_rows, supported_serve_rows, validate_pff_replay_output,
+    validate_s4_replay_output, validate_serve_replay_output,
 };
 pub use calibration::{
     StelCalibrationSummary, TUNING_REVIEW_MIN_EVENTS, format_calibration_section,

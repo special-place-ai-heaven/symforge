@@ -1,4 +1,4 @@
-//! S4 exit validation — replay five ask-aligned golden rows on the compact `symforge` path.
+//! Golden route replay — classify and replay supported rows on compact `symforge`.
 #![cfg(feature = "server")]
 #![allow(unsafe_code)] // test-only SYMFORGE_SURFACE guard (serialized by COMPACT_ENV_LOCK)
 
@@ -53,16 +53,26 @@ fn corpus_available(relative: &str, marker: &str) -> bool {
     corpus_path(relative).join(marker).is_file()
 }
 
-fn s4_corpora_available() -> bool {
+fn all_replay_corpora_available() -> bool {
     corpus_available(stel::S4_REPLAY_CORPUS, "src/lib.rs")
         && corpus_available(
             "tests/fixtures/phase0-corpus/records-python",
             "records.py",
         )
         && corpus_available(
+            "tests/fixtures/phase0-corpus/is-plain-obj-ts",
+            "index.js",
+        )
+        && corpus_available(
             "tests/fixtures/compression_ratio/rust",
             "service.rs",
         )
+}
+
+fn corpus_available_for_row(row: &GoldenRouteRow) -> bool {
+    let corpus = stel::corpus_for_row_id(&row.id);
+    let marker = stel::corpus_marker_for_row_id(&row.id);
+    corpus_available(corpus, marker)
 }
 
 fn golden_fixture_path() -> PathBuf {
@@ -73,18 +83,6 @@ fn tool_result_text(result: &serde_json::Value) -> &str {
     result["content"][0]["text"]
         .as_str()
         .expect("symforge result must contain text content")
-}
-
-fn planner_routed_tool(row: &GoldenRouteRow) -> String {
-    let mut request = row.to_request();
-    request.intent = row.intent;
-    stel::build_plan(&request).steps[0].tool.clone()
-}
-
-fn ask_routed_tool(query: &str) -> String {
-    use symforge::protocol::smart_query;
-    let intent = smart_query::classify_intent(query.trim());
-    smart_query::route_tool_name(&intent).to_string()
 }
 
 fn server_for_corpus(relative: &str, project: &str) -> SymForgeServer {
@@ -120,36 +118,28 @@ async fn replay_row(server: &SymForgeServer, row: &GoldenRouteRow) -> String {
 }
 
 #[test]
-fn find_s4_rows_matching_ask_routing() {
+fn golden_corpus_classification_lists_deferred_rows_explicitly() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
-    let matching: Vec<_> = rows
-        .iter()
-        .filter(|row| {
-            row.must_call.len() == 1
-                && row.chain.as_deref() == Some("single")
-                && row.expected_decision == stel::AdmissionDecision::Serve
-                && ask_routed_tool(&row.query) == row.must_call[0]
-        })
-        .collect();
-    eprintln!(
-        "ask-aligned single-hop serve rows ({}): {:?}",
-        matching.len(),
-        matching.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+    let classification = stel::classify_golden_corpus(&rows);
+    assert_eq!(classification.row_count(), rows.len());
+    assert_eq!(
+        classification.deferred_multi_hop.len(),
+        stel::DEFERRED_MULTI_HOP_ROW_IDS.len()
     );
+    for id in stel::DEFERRED_MULTI_HOP_ROW_IDS {
+        assert!(
+            classification.deferred_multi_hop.iter().any(|row_id| row_id == id),
+            "multi-hop row {id} must be explicitly deferred"
+        );
+    }
     assert!(
-        matching.len() >= 5,
-        "need at least 5 ask-aligned rows for S4 exit replay"
+        !classification.deferred_planner_mismatch.is_empty(),
+        "planner mismatches must be listed, not silently skipped"
     );
     for id in stel::S4_EXIT_ROW_IDS {
         assert!(
-            matching.iter().any(|row| row.id == id)
-                || stel::load_golden_rows(&golden_fixture_path())
-                    .expect("golden fixture")
-                    .iter()
-                    .find(|row| row.id == id)
-                    .map(|row| planner_routed_tool(row) == row.must_call[0])
-                    .unwrap_or(false),
-            "S4_EXIT_ROW_IDS must stay ask- or planner-aligned; missing or stale: {id}"
+            classification.supported_serve.iter().any(|row_id| row_id == id),
+            "S4 minimum subset must remain supported: {id}"
         );
     }
 }
@@ -159,13 +149,14 @@ fn s4_exit_rows_align_with_planner_routing() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let mut mismatches = Vec::new();
     for row in stel::s4_exit_rows(&rows) {
-        let routed = planner_routed_tool(row);
-        if row.must_call.first().map(String::as_str) != Some(routed.as_str()) {
+        let request = stel::request_for_golden_row(row);
+        let plan = stel::build_plan(&request);
+        if row.must_call.first().map(String::as_str) != Some(plan.steps[0].tool.as_str()) {
             mismatches.push(format!(
                 "{}: golden `{}` vs planner `{}` for {:?}",
                 row.id,
                 row.must_call.first().map(String::as_str).unwrap_or("?"),
-                routed,
+                plan.steps[0].tool,
                 row.query
             ));
         }
@@ -178,11 +169,9 @@ fn s4_exit_rows_align_with_planner_routing() {
 }
 
 #[tokio::test]
-async fn s4_golden_rows_replay_on_compact_symforge() {
-    if !s4_corpora_available() {
-        eprintln!(
-            "skip s4_golden_rows_replay_on_compact_symforge: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md"
-        );
+async fn s4_minimum_subset_replays_on_compact_symforge() {
+    if !all_replay_corpora_available() {
+        eprintln!("skip s4_minimum_subset_replays: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md");
         return;
     }
 
@@ -191,9 +180,50 @@ async fn s4_golden_rows_replay_on_compact_symforge() {
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let exit_rows = stel::s4_exit_rows(&rows);
+    replay_serve_rows_grouped_by_corpus(&exit_rows).await;
+}
+
+#[tokio::test]
+async fn supported_serve_rows_replay_with_envelope_and_ledger() {
+    if !all_replay_corpora_available() {
+        eprintln!("skip supported_serve_rows_replay: missing corpora");
+        return;
+    }
+
+    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
+    let serve_rows: Vec<_> = stel::supported_serve_rows(&rows)
+        .into_iter()
+        .filter(|row| corpus_available_for_row(row))
+        .collect();
+    assert!(
+        serve_rows.len() >= stel::S4_EXIT_ROW_IDS.len(),
+        "supported serve replay must be broader than the S4 minimum subset"
+    );
+    replay_serve_rows_grouped_by_corpus(&serve_rows).await;
+}
+
+#[tokio::test]
+async fn supported_pff_rows_bypass_without_legacy_execution() {
+    if !all_replay_corpora_available() {
+        eprintln!("skip supported_pff_rows_bypass: missing corpora");
+        return;
+    }
+
+    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
+    let pff_rows: Vec<_> = stel::supported_pff_rows(&rows)
+        .into_iter()
+        .filter(|row| corpus_available_for_row(row))
+        .collect();
+    assert_eq!(pff_rows.len(), 4, "all four P-FF golden rows must replay");
 
     let mut by_corpus: BTreeMap<&str, Vec<&GoldenRouteRow>> = BTreeMap::new();
-    for row in exit_rows {
+    for row in pff_rows {
         by_corpus
             .entry(stel::corpus_for_row_id(&row.id))
             .or_default()
@@ -209,7 +239,43 @@ async fn s4_golden_rows_replay_on_compact_symforge() {
         let server = server_for_corpus(corpus, project);
         for row in corpus_rows {
             let output = replay_row(&server, row).await;
-            let validation = stel::validate_s4_replay_output(row, &output);
+            let validation = stel::validate_pff_replay_output(row, &output);
+            if !validation.passed {
+                failures.push(format!(
+                    "{}: {}",
+                    validation.row_id,
+                    validation.errors.join("; ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "P-FF golden replay failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+async fn replay_serve_rows_grouped_by_corpus(rows: &[&GoldenRouteRow]) {
+    let mut by_corpus: BTreeMap<&str, Vec<&GoldenRouteRow>> = BTreeMap::new();
+    for row in rows {
+        by_corpus
+            .entry(stel::corpus_for_row_id(&row.id))
+            .or_default()
+            .push(row);
+    }
+
+    let mut failures = Vec::new();
+    for (corpus, corpus_rows) in by_corpus {
+        let project = Path::new(corpus)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("replay");
+        let server = server_for_corpus(corpus, project);
+        for row in corpus_rows {
+            let output = replay_row(&server, row).await;
+            let validation = stel::validate_serve_replay_output(row, &output);
             if !validation.passed {
                 let tail: String = output
                     .chars()
@@ -228,11 +294,9 @@ async fn s4_golden_rows_replay_on_compact_symforge() {
         }
     }
 
-    drop(_guard);
-
     assert!(
         failures.is_empty(),
-        "S4 golden replay failures:\n{}",
+        "serve golden replay failures:\n{}",
         failures.join("\n\n")
     );
 }
