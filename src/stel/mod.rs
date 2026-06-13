@@ -1,16 +1,17 @@
 //! STEL (SymForge Token Economics Layer) — Phase 1 product module.
 //!
-//! **S2 (this slice):** schema-aligned types + compact surface registry + envelope formatter.
+//! Checkpoint: `31d9bf1` on `v8/stel-architecture` — see [`docs/phase1-stel-checkpoint.md`].
 //!
-//! Integration boundaries (wired in later slices):
-//! - **L0 MCP:** `protocol` compact handlers accept [`SymforgeCallInput`] and prepend
-//!   [`format_trust_envelope`] (S4). Phase 0 harness relay uses `_probe_*` fields on the same
-//!   tool name. Measurement schemas remain in [`crate::protocol::surface_probe`].
-//! - **L1:** [`planner::build_plan`] maps [`StelRequest`] → [`StelPlan`] (S5).
-//! - **L2:** [`controller::evaluate_plan`] scores plans → [`StelDecision`] economics metadata (S6).
-//! - **L3:** [`executor::is_enforced_bypass`] skips legacy dispatch for P-FF bypass (S7).
-//! - **L4:** [`ledger::SessionLedger`] records decision/execution rows (S8).
-//! - **L4 calibration:** deferred — no feedback loop yet.
+//! Shipped layers on compact `symforge`:
+//! - **L0:** MCP compact surface (`symforge` | `symforge_edit` | `status`); production list via
+//!   [`surface_list::compact_surface_tools`]. Phase 0 harness relay + frozen schemas in
+//!   [`crate::protocol::surface_probe`].
+//! - **L1:** [`planner::build_plan`] — `StelRequest` → single-step [`StelPlan`].
+//! - **L2:** [`controller::evaluate_plan`] — economics → [`StelDecision`] / [`StelEstimate`].
+//! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch.
+//! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
+//!
+//! Deferred: calibration feedback, `symforge_edit` / `status` handlers, multi-step plans, persistence.
 
 pub mod controller;
 pub mod envelope;

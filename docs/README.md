@@ -20,6 +20,7 @@ We write ideation down first, validate assumptions, then implement. Details deep
 | [`stel-architecture.md`](stel-architecture.md) | STEL charter, gates H1–H8 |
 | [`stel-schema.md`](stel-schema.md) | Normative types, controller algorithm |
 | [`stel-assumptions.md`](stel-assumptions.md) | Assumption register A-001.. |
+| [`phase1-stel-checkpoint.md`](phase1-stel-checkpoint.md) | **Phase 1 implementation checkpoint** (L4 ledger @ `31d9bf1`) |
 | [`v8-admin-ui.md`](v8-admin-ui.md) | **Committed** operator UX — admin, onboarding, harness hub (O1–O8) |
 | [`v8-aap-integration.md`](v8-aap-integration.md) | **Committed** AAP embed + operator presets (`Agent_Army_Professionals`) |
 

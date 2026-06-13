@@ -340,11 +340,13 @@ Report both raw 36 and eligible counts in RESULTS.md
 | 0.11 | Document P-FF + eligible H6 rules | G-031 |
 | 0.12 | rmcp compile spike doc | A-031 |
 
-### Phase 1 — L0 + H1
+### Phase 1 — L0 + H1 + L1–L4 skeleton
 
-All of S2–S4 in [`stel-schema.md`](stel-schema.md). Exit: **H1 PASS**, 5 golden rows replay.
+All of S2–S4 in [`stel-schema.md`](stel-schema.md). **Implementation checkpoint:** [`phase1-stel-checkpoint.md`](phase1-stel-checkpoint.md) (`31d9bf1`).
 
-### Phase 2 — L1 + L2
+Shipped on `v8/stel-architecture`: compact-3 surface, `symforge` L1 planner → L2 economics → L3 P-FF enforcement → L4 in-memory ledger. Exit criteria for full Phase 1/H1 battery replay remain open (see checkpoint doc).
+
+### Phase 2 — L1 + L2 (battery gates)
 
 S5–S6. T2 spike start (§6.1). Exit: **H3, H4, H5** on compact surface.
 
