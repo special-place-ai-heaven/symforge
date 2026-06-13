@@ -3,7 +3,8 @@
 **Feature:** [specs/001-v8-phase0-preflight](../../specs/001-v8-phase0-preflight/spec.md)  
 **Plan:** [plan.md](../../specs/001-v8-phase0-preflight/plan.md)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)  
-**Updated:** 2026-06-13 (remediation pass)
+**Updated:** 2026-06-13 (in-repo evidence refresh)  
+**Evidence commit:** `c3581a5` on `v8/stel-architecture`
 
 Central index for Section 12A pre-flight readiness. Final decision: [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md).  
 Independent reviewer handoff: [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md).
@@ -60,7 +61,7 @@ See [phase0-12a-sf-bench-path.md](./phase0-12a-sf-bench-path.md). Gather: `scrip
 | Command | `powershell -ExecutionPolicy Bypass -File scripts/measure-schema-bytes.ps1` |
 | Output | `docs/research/A-005-schema-bytes.json` |
 | Assumptions | A-005, A-025 |
-| Status | **PARTIAL** (see [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md)) |
+| Status | **PASS** (891 B compact; see [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md)) |
 
 ---
 
@@ -135,10 +136,14 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 
 ## Blockers (summary)
 
-| ID | Reason |
-|----|--------|
-| B-A019 | Interim compact lock only; full L0 A/B battery pending |
-| B-SIGNOFF | Independent reviewer sign-off pending |
+| ID | Status | Reason |
+|----|--------|--------|
+| B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path ([phase0-12a-sf-bench-path.md](./phase0-12a-sf-bench-path.md)) |
+| B-A019 | **OPEN (interim)** | Compact-3 interim lock on H1; full L0 A/B battery pending |
+| B-SIGNOFF | **OPEN** | Independent reviewer sign-off pending |
+| B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline runs; not a Phase 0 pre-flight gate |
+
+**Phase 0 decision:** **NO-GO** until B-SIGNOFF clears and reviewer accepts or rejects A-019 interim (see [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md)).
 
 ---
 
@@ -162,12 +167,17 @@ rg -n "NEEDS CLARIFICATION|\[FEATURE\]|\[###|ACTION REQUIRED|REMOVE IF UNUSED" s
 
 ---
 
-## Remediation (2026-06-13, session 3)
+## Remediation status (2026-06-13)
 
-- In-repo battery: [A-001-tool-battery-run1.json](./A-001-tool-battery-run1.json) + run2 — **20 rows, 0% session_net variance**
-- Golden corpus: [docs/fixtures/routes.golden.jsonl](../fixtures/routes.golden.jsonl) — **36 rows validated**
-- A-004 equiv audit: **PASS** (20 stratified samples)
-- Remaining: **B-A019** interim lock, **B-SIGNOFF** independent reviewer
+| Assumption / gap | Verdict | Artifact |
+|------------------|---------|----------|
+| A-001 | **VALIDATED** | [run1](./A-001-tool-battery-run1.json), [run2](./A-001-tool-battery-run2.json) — 0% session_net variance |
+| A-004 | **VALIDATED** | [A-004-equiv-audit.md](./A-004-equiv-audit.md) — 0% FP+FN (n=20) |
+| A-028 | **VALIDATED** | [routes.golden.jsonl](../fixtures/routes.golden.jsonl) — 36 rows |
+| A-005 H1 | **VALIDATED** | compact `tools/list` **891 B** ([A-005-schema-bytes.json](./A-005-schema-bytes.json)) |
+| A-019 | **INTERIM** | compact-3 locked on H1 only |
+| B-SFBENCH | **CLOSED** | In-repo path supersedes external sf-bench |
+| B-SIGNOFF | **OPEN** | Independent reviewer required |
 
 ---
 

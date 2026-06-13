@@ -165,9 +165,13 @@
 
 ### Blocking Rules
 
-- Any missing sf-bench workspace, failed threshold, missing artifact link, unresolved OPEN Phase 1-blocking assumption, or missing independent sign-off results in NO-GO.
+- Any failed threshold, missing artifact link, unresolved Phase 1-blocking OPEN assumption, or missing independent sign-off results in NO-GO. External sf-bench workspace is **optional** (B-SFBENCH superseded by in-repo evidence per `docs/research/phase0-12a-sf-bench-path.md`).
 - `src/stel/**` remains forbidden until every Section 12A checkbox is accepted and T048/T049 record independent sign-off.
 - Section 12B items are not required for first `src/stel/**` commit and must not be pulled into this feature unless they are explicitly documented as future dependencies.
+
+### Post-implementation doc refresh (2026-06-13)
+
+Producer refreshed [phase0-12a-independent-review-packet.md](../../docs/research/phase0-12a-independent-review-packet.md) and [phase0-12a-review-signoff.md](../../docs/research/phase0-12a-review-signoff.md) for evidence commit `c3581a5`. T048 remains **NO-GO** until an independent reviewer signs; producer cannot self-sign.
 
 ---
 

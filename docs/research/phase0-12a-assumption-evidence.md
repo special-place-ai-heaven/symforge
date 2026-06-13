@@ -1,7 +1,6 @@
 # Phase 0 §12A — assumption evidence placeholders
 
-**Created:** 2026-06-13  
-**Task:** T004  
+**Updated:** 2026-06-13 (in-repo evidence refresh; evidence commit `c3581a5`)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)
 
 Phase 1-blocking assumptions tracked for §12A pre-flight. Update verdicts only when linked artifacts satisfy contract rules.
@@ -18,9 +17,9 @@ validation:
   kind: performance
   method: "Re-run battery 2×; accepted-session net variance ≤ 2%"
   artifact: docs/research/A-001-measurement-repeatability.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench workspace missing (B-SFBENCH)"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "In-repo 2× battery; 0% session_net variance (14,389; 20 rows). B-SFBENCH closed."
 ```
 
 ---
@@ -35,9 +34,9 @@ validation:
   kind: performance
   method: "6 spot checks: manual harness vs judge expectations"
   artifact: docs/research/A-002-manual-spotcheck.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench workspace missing (B-SFBENCH)"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "6/6 spot checks in-repo"
 ```
 
 ---
@@ -52,9 +51,9 @@ validation:
   kind: performance
   method: "results-v8-harness-shakedown.json on target/release"
   artifact: docs/research/A-003-harness-shakedown.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench workspace missing (B-SFBENCH)"
+verdict: PARTIAL
+validated_at: 2026-06-13
+notes: "MCP shakedown PASS (A-003-mcp-shakedown.jsonl); full battery row classification deferred"
 ```
 
 ---
@@ -69,9 +68,9 @@ validation:
   kind: performance
   method: "20 stratified samples; FP+FN ≤ 10%"
   artifact: docs/research/A-004-equiv-audit.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench workspace missing (B-SFBENCH)"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "20 stratified samples; 0% FP+FN"
 ```
 
 ---
@@ -86,9 +85,9 @@ validation:
   kind: host_measurement
   method: "scripts/measure-schema-bytes.ps1"
   artifact: docs/research/A-005-schema-bytes-summary.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench missing (B-SFBENCH). Stub proposal: docs/research/A-005-compact-stub-proposal.md (awaiting approval)"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "Compact tools/list 891 B (budget 5,000 B); surface_probe.rs"
 ```
 
 ---
@@ -137,9 +136,9 @@ validation:
   kind: performance
   method: "A/B compact-3 vs meta-tool vs full-32 on pinned battery"
   artifact: docs/research/A-019-l0-surface-choice.md
-verdict: OPEN
+verdict: INTERIM
 validated_at: null
-notes: "BLOCKED: sf-bench battery + compact stub required"
+notes: "Interim lock compact-3 on H1 (891 B); full L0 A/B battery pending"
 ```
 
 ---
@@ -154,9 +153,9 @@ validation:
   kind: host_measurement
   method: "Measured list_tools bytes for edit surface"
   artifact: docs/research/A-005-schema-bytes-summary.md
-verdict: OPEN
-validated_at: null
-notes: "PIVOT DOCUMENTED: merge edit into symforge with intent=edit until measured"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "Unit test PASS; edit schema ≤1,500 B"
 ```
 
 ---
@@ -188,9 +187,9 @@ validation:
   kind: path
   method: "36-row JSONL validation + 10-row human semantic review"
   artifact: docs/research/A-028-golden-routes.md
-verdict: OPEN
-validated_at: null
-notes: "BLOCKED: sf-bench routes.golden.jsonl missing (B-SFBENCH)"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "36 rows docs/fixtures/routes.golden.jsonl; validator PASS; 13 reviewed notes"
 ```
 
 ---
@@ -205,7 +204,7 @@ validation:
   kind: path
   method: "4 rows in routes.golden.jsonl + README rules"
   artifact: docs/research/A-012-bypass-policy.md
-verdict: OPEN
-validated_at: null
-notes: "RULES DOCUMENTED; corpus enforcement blocked on B-SFBENCH"
+verdict: PARTIAL
+validated_at: 2026-06-13
+notes: "4 P-FF rows seeded in golden corpus; battery enforcement §12B"
 ```
