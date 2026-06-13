@@ -679,8 +679,13 @@ impl ServerHandler for SymForgeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let profile = surface_probe::surface_profile_from_env();
+        let tools = match profile {
+            surface_probe::SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
+            _ => surface_probe::list_tools_for_profile(profile),
+        };
         Ok(ListToolsResult {
-            tools: surface_probe::list_tools_for_profile(surface_probe::surface_profile_from_env()),
+            tools,
             meta: None,
             next_cursor: None,
         })

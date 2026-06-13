@@ -1,8 +1,9 @@
 //! Non-shipping L0 surface probe for Phase 0 §12A schema-byte measurement (A-005 / A-025).
 //!
-//! When `SYMFORGE_SURFACE=compact`, `tools/list` advertises three STEL-shaped tools
-//! with draft schemas from `docs/stel-schema.md`. Does not implement STEL execution.
-//! `SYMFORGE_SURFACE=meta` exposes a single-tool meta-1 facade for A-019 L0 A/B.
+//! Frozen hand-written schemas for A-005 / A-019 measurement artifacts. Production
+//! `SYMFORGE_SURFACE=compact` `tools/list` is served from [`crate::stel::compact_surface_tools`]
+//! (Phase 1 S3). This module remains for meta-1 A/B, full-surface listing, and byte
+//! replay against pinned Phase 0 evidence.
 
 use std::borrow::Cow;
 use std::sync::Arc;

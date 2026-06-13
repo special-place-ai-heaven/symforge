@@ -13,12 +13,17 @@
 
 pub mod envelope;
 pub mod surface;
+pub mod surface_list;
 pub mod types;
 
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
+pub use surface_list::{
+    compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,
+};
 pub use types::{
     AdmissionDecision, CalibrationState, CoreToolName, GoldenRouteRow, IndexRef, IntentBucket,
-    RouteConfidence, StelBypassBody, StelCacheBody, StelDecision, StelEstimate, StelExecution,
-    StelExecutionTotals, StelLedgerEvent, StelPlan, StelPlanStep, StelRequest, StelStepExecution,
+    RouteConfidence, StelBypassBody, StelCacheBody, StelDecision, StelEditIntent, StelEditRequest,
+    StelEstimate, StelExecution, StelExecutionTotals, StelLedgerEvent, StelPlan, StelPlanStep,
+    StelRequest, StelStatusDetail, StelStatusRequest, StelStepExecution,
 };

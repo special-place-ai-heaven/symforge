@@ -52,9 +52,44 @@ pub struct StelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 64))]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
+}
+
+/// MCP input for the `symforge_edit` compact-surface tool.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StelEditRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<StelEditIntent>,
+}
+
+/// Edit intent for `symforge_edit` (L0 routes structural mutations here).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StelEditIntent {
+    Edit,
+}
+
+/// Detail level for the `status` compact-surface tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StelStatusDetail {
+    Compact,
+    Full,
+}
+
+/// MCP input for the `status` compact-surface tool.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StelStatusRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<StelStatusDetail>,
 }
 
 /// Index file reference driving manual-baseline estimation.
