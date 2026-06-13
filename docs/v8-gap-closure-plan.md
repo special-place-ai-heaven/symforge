@@ -424,7 +424,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
-**Progress (2026-06-12):** `E:\project\sf-bench\compare-results.js` + `routes.golden.jsonl` skeleton + `fixtures/preflight-minimal.json` landed (sf-bench `16acb4b`). `symforge/scripts/measure-schema-bytes.ps1` stub landed (`f7af058`). Preflight: `node compare-results.js --preflight --release 8.0` exits 0 on synthetic fixture. Golden semantics, A-001..A-004, and battery row fields still OPEN.
+**Progress (2026-06-13):** Phase 0 §12A evidence bundle landed under `docs/research/` (speckit.implement). **NO-GO** — sf-bench workspace missing on this machine (B-SFBENCH); independent reviewer sign-off pending. Doc-satisfied §12A items: 7.x non-gating, A-006/A-027, A-012 serve-only interim, P-FF rules, A-030 crosswalk, ideation decision log. Prior note: sf-bench `16acb4b` + measure-schema-bytes stub referenced from other hosts.
 
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
@@ -437,24 +437,24 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 - [ ] `compare-results.js` runs on harness shakedown JSON (**`--preflight` mode** — synthetic or self-diff baseline; see §5.2)
 - [ ] `sf-bench/routes.golden.jsonl` 36 rows + schema validated (canonical path; symlink/copy OK in CI)
 - [ ] RESULTS.md §8.7 + compare-results columns live *(v8 runs only)*
-- [ ] **No requirement** to beat or pin `results-7.21.1-baseline.json`
+- [x] **No requirement** to beat or pin `results-7.21.1-baseline.json` — [`docs/research/phase0-12a-scope-boundary.md`](research/phase0-12a-scope-boundary.md)
 
 **Surface choice**
 
 - [ ] A-005 VALIDATED (H1 feasible) — measurement via **non-shipping stub** (`scripts/measure-schema-bytes.rs` or fixture JSON); **not** blocked on `src/stel/`
 - [ ] A-025 VALIDATED (edit budget or pivot documented) — same stub policy
 - [ ] A-019 VALIDATED (L0 surface locked)
-- [ ] A-006/A-027 documented (amortization policy)
+- [x] A-006/A-027 documented (amortization policy) — [`docs/research/A-006-host-schema.md`](research/A-006-host-schema.md)
 
 **Bypass harness (serve economics trust)**
 
-- [ ] A-012 two-hop harness spec implemented **or** H3 scoped to serve-only in compare-results until implemented
+- [x] A-012 two-hop harness spec implemented **or** H3 scoped to serve-only in compare-results until implemented — [`docs/research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) (serve-only interim)
 
 **Process**
 
-- [ ] P-FF + eligible H6 rules **documented** in golden-file README (implementation of 4 bypass rows may wait for §12B)
-- [ ] Phase crosswalk reviewed (A-030)
-- [ ] Decision log updated in ideation.md
+- [x] P-FF + eligible H6 rules **documented** in golden-file README (implementation of 4 bypass rows may wait for §12B) — [`docs/research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md)
+- [x] Phase crosswalk reviewed (A-030) — [`docs/research/A-030-phase-crosswalk.md`](research/A-030-phase-crosswalk.md)
+- [x] Decision log updated in ideation.md — 2026-06-13 Phase 0 §12A entry
 - [ ] No OPEN assumption blocks Phase 1 per §9
 
 **Only when every §12A box is checked → first commit in `src/stel/`.**

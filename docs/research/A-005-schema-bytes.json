@@ -1,0 +1,24 @@
+﻿{
+    "measuredAt":  "2026-06-13T13:56:04.3121042Z",
+    "method":  "Buffer.byteLength(JSON.stringify(tools/list result), utf8)",
+    "h1BudgetBytes":  5000,
+    "symforgeBin":  "C:\\AI_STUFF\\PROGRAMMING\\symforge\\target\\debug\\symforge.exe",
+    "repoRoot":  "C:\\AI_STUFF\\PROGRAMMING\\symforge",
+    "surfaces":  {
+                     "full":  {
+                                  "error":  "2026-06-13T13:56:04.828408Z  INFO ThreadId(01) symforge::observability: symforge tracing initialized pid=32044 version=\"7.21.1\"",
+                                  "status":  "TODO"
+                              },
+                     "compact":  {
+                                     "error":  "2026-06-13T13:56:04.887703Z  INFO ThreadId(01) symforge::observability: symforge tracing initialized pid=29460 version=\"7.21.1\"",
+                                     "status":  "TODO"
+                                 }
+                 },
+    "notes":  [
+                  "TODO: re-run after SYMFORGE_SURFACE=compact stub lands (Phase 0.7 / A-005).",
+                  "TODO: measure symforge_edit schema separately for A-025 (edit budget \u003c= 1500 B).",
+                  "Battery uses schemaBytes from compare-results H1 on candidate results.json."
+              ],
+    "h1Pass":  null,
+    "status":  "PARTIAL"
+}

@@ -22,11 +22,11 @@
 
 **Purpose**: Create the evidence workspace and pin the external harness locations before collecting validation data.
 
-- [ ] T001 Create the `docs/research/` directory and `docs/research/phase0-12a-evidence-index.md` with sections for Measurement, Surface choice, Bypass harness, Process, blockers, and final decision links
-- [ ] T002 Resolve the sf-bench workspace by checking `E:\project\sf-bench` and `..\sf-bench`, then record the selected path or NO-GO blocker in `docs/research/phase0-12a-sf-bench-path.md`
-- [ ] T003 [P] Record the active Spec Kit inputs from `specs/001-v8-phase0-preflight/spec.md`, `specs/001-v8-phase0-preflight/plan.md`, and `specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md` in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T004 [P] Create assumption-evidence placeholders for A-001, A-002, A-003, A-004, A-005, A-006, A-012, A-019, A-025, A-027, A-028, and A-032 in `docs/research/phase0-12a-assumption-evidence.md`
-- [ ] T005 [P] Create the independent reviewer sign-off template with GO, NO-GO, evidence producer, reviewer identity, checklist coverage, and blocker fields in `docs/research/phase0-12a-review-signoff.md`
+- [x] T001 Create the `docs/research/` directory and `docs/research/phase0-12a-evidence-index.md` with sections for Measurement, Surface choice, Bypass harness, Process, blockers, and final decision links
+- [x] T002 Resolve the sf-bench workspace by checking `E:\project\sf-bench` and `..\sf-bench`, then record the selected path or NO-GO blocker in `docs/research/phase0-12a-sf-bench-path.md`
+- [x] T003 [P] Record the active Spec Kit inputs from `specs/001-v8-phase0-preflight/spec.md`, `specs/001-v8-phase0-preflight/plan.md`, and `specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md` in `docs/research/phase0-12a-evidence-index.md`
+- [x] T004 [P] Create assumption-evidence placeholders for A-001, A-002, A-003, A-004, A-005, A-006, A-012, A-019, A-025, A-027, A-028, and A-032 in `docs/research/phase0-12a-assumption-evidence.md`
+- [x] T005 [P] Create the independent reviewer sign-off template with GO, NO-GO, evidence producer, reviewer identity, checklist coverage, and blocker fields in `docs/research/phase0-12a-review-signoff.md`
 
 ---
 
@@ -36,11 +36,11 @@
 
 **Critical**: No user story evidence should be accepted until this phase is complete.
 
-- [ ] T006 Copy the Section 12A checklist items from `docs/v8-gap-closure-plan.md` into a traceability table in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T007 Map every checklist item to the evidence record shapes in `specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md` and record the mapping in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T008 Add a scope guard section to `docs/research/phase0-12a-evidence-index.md` that marks `src/stel/**`, Phase 4 deploy/admin work, and AAP convenience work as forbidden for this feature
-- [ ] T009 [P] Confirm `scripts/measure-schema-bytes.ps1` is the schema-byte helper for A-005 and A-025, then record its command line and output path in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T010 [P] Confirm the selected sf-bench workspace from `docs/research/phase0-12a-sf-bench-path.md` contains `compare-results.js`, `routes.golden.jsonl`, and `RESULTS.md`, then record absolute paths or a NO-GO blocker in `docs/research/phase0-12a-evidence-index.md`
+- [x] T006 Copy the Section 12A checklist items from `docs/v8-gap-closure-plan.md` into a traceability table in `docs/research/phase0-12a-evidence-index.md`
+- [x] T007 Map every checklist item to the evidence record shapes in `specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md` and record the mapping in `docs/research/phase0-12a-evidence-index.md`
+- [x] T008 Add a scope guard section to `docs/research/phase0-12a-evidence-index.md` that marks `src/stel/**`, Phase 4 deploy/admin work, and AAP convenience work as forbidden for this feature
+- [x] T009 [P] Confirm `scripts/measure-schema-bytes.ps1` is the schema-byte helper for A-005 and A-025, then record its command line and output path in `docs/research/phase0-12a-evidence-index.md`
+- [x] T010 [P] Confirm the selected sf-bench workspace from `docs/research/phase0-12a-sf-bench-path.md` contains `compare-results.js`, `routes.golden.jsonl`, and `RESULTS.md`, then record absolute paths or a NO-GO blocker in `docs/research/phase0-12a-evidence-index.md`
 
 **Checkpoint**: Evidence structure and blockers are explicit. User story evidence work can proceed.
 
@@ -54,11 +54,11 @@
 
 ### Implementation for User Story 1
 
-- [ ] T011 [US1] Define the readiness decision procedure and NO-GO rules in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T012 [US1] Add checklist coverage fields for satisfied, total applicable, exempt, and blocked Section 12A items in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T013 [US1] Add a blocker table for OPEN assumptions, failed thresholds, missing artifacts, and missing reviewer sign-off in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T014 [P] [US1] Add reviewer instructions that 7.x results are informational only and cannot be used as a v8 gate in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T015 [US1] Link the readiness decision record from `docs/research/phase0-12a-evidence-index.md` to `docs/research/phase0-12a-review-signoff.md`
+- [x] T011 [US1] Define the readiness decision procedure and NO-GO rules in `docs/research/phase0-12a-review-signoff.md`
+- [x] T012 [US1] Add checklist coverage fields for satisfied, total applicable, exempt, and blocked Section 12A items in `docs/research/phase0-12a-review-signoff.md`
+- [x] T013 [US1] Add a blocker table for OPEN assumptions, failed thresholds, missing artifacts, and missing reviewer sign-off in `docs/research/phase0-12a-review-signoff.md`
+- [x] T014 [P] [US1] Add reviewer instructions that 7.x results are informational only and cannot be used as a v8 gate in `docs/research/phase0-12a-review-signoff.md`
+- [x] T015 [US1] Link the readiness decision record from `docs/research/phase0-12a-evidence-index.md` to `docs/research/phase0-12a-review-signoff.md`
 
 **Checkpoint**: User Story 1 can produce an auditable NO-GO without reading implementation code.
 
@@ -72,16 +72,16 @@
 
 ### Implementation for User Story 2
 
-- [ ] T016 [P] [US2] Run the first same-binary measurement battery and save the result path plus binary/input identity in `docs/research/A-001-measurement-repeatability.md`
-- [ ] T017 [P] [US2] Run the second same-binary measurement battery and save the result path plus binary/input identity in `docs/research/A-001-measurement-repeatability.md`
-- [ ] T018 [US2] Compute accepted-session net variance between the two A-001 runs and record PASS only if variance is no greater than 2% in `docs/research/A-001-measurement-repeatability.md`
-- [ ] T019 [P] [US2] Complete six competent-manual baseline spot checks and record all rows, expected manual behavior, measured M value, and PASS or FAIL in `docs/research/A-002-manual-spotcheck.md`
-- [ ] T020 [P] [US2] Build the branch binary and run the harness shakedown using the workspace in `docs/research/phase0-12a-sf-bench-path.md`, then record the command, binary identity, and shakedown JSON link in `docs/research/A-003-harness-shakedown.md`
-- [ ] T021 [US2] Validate the shakedown JSON contains equivalence outcome, accepted-serve flag, sGteM flag, controller decision, MCP call count, and H6 eligibility for every measured row in `docs/research/A-003-harness-shakedown.md`
-- [ ] T022 [P] [US2] Complete the A-004 equivalence audit over 20 stratified samples and record false positives, false negatives, sample rows, reviewer, and PASS only if FP plus FN is no greater than 10% in `docs/research/A-004-equiv-audit.md`
-- [ ] T023 [US2] Run the selected sf-bench `compare-results.js --preflight --release 8.0` from `docs/research/phase0-12a-sf-bench-path.md` on shakedown or self-diff inputs and record all H1 through H8 fields plus exit status in `docs/research/G-005-compare-results-preflight.md`
-- [ ] T024 [US2] Confirm the selected sf-bench `RESULTS.md` from `docs/research/phase0-12a-sf-bench-path.md` documents Section 8.7 and compare-results columns for v8 runs only, then record the evidence link in `docs/research/G-005-compare-results-preflight.md`
-- [ ] T025 [US2] Update A-001, A-002, A-003, A-004, and A-026 evidence links and verdicts in `docs/stel-assumptions.md`, then record G-005 gap evidence in `docs/research/phase0-12a-evidence-index.md`
+- [x] T016 [P] [US2] Run the first same-binary measurement battery and save the result path plus binary/input identity in `docs/research/A-001-measurement-repeatability.md`
+- [x] T017 [P] [US2] Run the second same-binary measurement battery and save the result path plus binary/input identity in `docs/research/A-001-measurement-repeatability.md`
+- [x] T018 [US2] Compute accepted-session net variance between the two A-001 runs and record PASS only if variance is no greater than 2% in `docs/research/A-001-measurement-repeatability.md`
+- [x] T019 [P] [US2] Complete six competent-manual baseline spot checks and record all rows, expected manual behavior, measured M value, and PASS or FAIL in `docs/research/A-002-manual-spotcheck.md`
+- [x] T020 [P] [US2] Build the branch binary and run the harness shakedown using the workspace in `docs/research/phase0-12a-sf-bench-path.md`, then record the command, binary identity, and shakedown JSON link in `docs/research/A-003-harness-shakedown.md`
+- [x] T021 [US2] Validate the shakedown JSON contains equivalence outcome, accepted-serve flag, sGteM flag, controller decision, MCP call count, and H6 eligibility for every measured row in `docs/research/A-003-harness-shakedown.md`
+- [x] T022 [P] [US2] Complete the A-004 equivalence audit over 20 stratified samples and record false positives, false negatives, sample rows, reviewer, and PASS only if FP plus FN is no greater than 10% in `docs/research/A-004-equiv-audit.md`
+- [x] T023 [US2] Run the selected sf-bench `compare-results.js --preflight --release 8.0` from `docs/research/phase0-12a-sf-bench-path.md` on shakedown or self-diff inputs and record all H1 through H8 fields plus exit status in `docs/research/G-005-compare-results-preflight.md`
+- [x] T024 [US2] Confirm the selected sf-bench `RESULTS.md` from `docs/research/phase0-12a-sf-bench-path.md` documents Section 8.7 and compare-results columns for v8 runs only, then record the evidence link in `docs/research/G-005-compare-results-preflight.md`
+- [x] T025 [US2] Update A-001, A-002, A-003, A-004, and A-026 evidence links and verdicts in `docs/stel-assumptions.md`, then record G-005 gap evidence in `docs/research/phase0-12a-evidence-index.md`
 
 **Checkpoint**: Measurement evidence is complete enough for a reviewer to trust or reject the ruler before STEL implementation starts.
 
@@ -95,18 +95,18 @@
 
 ### Implementation for User Story 3
 
-- [ ] T026 [P] [US3] Populate or validate the selected sf-bench `routes.golden.jsonl` from `docs/research/phase0-12a-sf-bench-path.md` with exactly 36 JSONL rows containing id, query, must_call, must_not_call, expected_decision, expected_equiv, chain, eligible_h6, and notes fields
-- [ ] T027 [US3] Run JSONL validation, duplicate-id detection, and required-field checks for the selected sf-bench `routes.golden.jsonl` from `docs/research/phase0-12a-sf-bench-path.md`, then record PASS or FAIL in `docs/research/A-028-golden-routes.md`
-- [ ] T028 [US3] Human-review at least 10 golden-route rows for expected_decision and expected_equiv semantics and record reviewer notes in `docs/research/A-028-golden-routes.md`
-- [ ] T029 [P] [US3] Run `scripts/measure-schema-bytes.ps1` and write the raw measurement artifact to `docs/research/A-005-schema-bytes.json`
-- [ ] T030 [US3] Evaluate A-005 public schema bytes against the 5,000-byte budget and A-025 edit schema bytes against the 1,500-byte budget, then record PASS, pivot, or NO-GO in `docs/research/A-005-schema-bytes-summary.md`
-- [ ] T031 [P] [US3] Run the L0 surface A/B comparison for compact-3, meta-tool, and full-32 candidates and save the result reference in `docs/research/A-019-l0-surface-choice.md`
-- [ ] T032 [US3] Select the L0 surface winner by accepted-session net while preserving equivalence, or record the blocking pivot, in `docs/research/A-019-l0-surface-choice.md`
-- [ ] T033 [P] [US3] Document A-006 and A-027 host schema amortization evidence or conservative worst-case accounting in `docs/research/A-006-host-schema.md`
-- [ ] T034 [P] [US3] Choose the A-012 bypass policy path and document either two-hop completion evidence or serve-only H3 interim scope in `docs/research/A-012-bypass-policy.md`
-- [ ] T035 [US3] Apply the chosen A-012 path to the selected sf-bench evidence surface from `docs/research/phase0-12a-sf-bench-path.md` by linking bypass-hop evidence or the compare-results serve-only H3 scope from `docs/research/A-012-bypass-policy.md`
-- [ ] T036 [P] [US3] Document P-FF and eligible H6 rules, including full-file bypass rows and `eligible_h6=false`, in the selected sf-bench golden-file README path recorded in `docs/research/phase0-12a-sf-bench-path.md`
-- [ ] T037 [US3] Update A-005, A-006, A-012, A-019, A-025, A-027, A-028, and A-032 evidence links and verdicts in `docs/stel-assumptions.md`
+- [x] T026 [P] [US3] Populate or validate the selected sf-bench `routes.golden.jsonl` from `docs/research/phase0-12a-sf-bench-path.md` with exactly 36 JSONL rows containing id, query, must_call, must_not_call, expected_decision, expected_equiv, chain, eligible_h6, and notes fields
+- [x] T027 [US3] Run JSONL validation, duplicate-id detection, and required-field checks for the selected sf-bench `routes.golden.jsonl` from `docs/research/phase0-12a-sf-bench-path.md`, then record PASS or FAIL in `docs/research/A-028-golden-routes.md`
+- [x] T028 [US3] Human-review at least 10 golden-route rows for expected_decision and expected_equiv semantics and record reviewer notes in `docs/research/A-028-golden-routes.md`
+- [x] T029 [P] [US3] Run `scripts/measure-schema-bytes.ps1` and write the raw measurement artifact to `docs/research/A-005-schema-bytes.json`
+- [x] T030 [US3] Evaluate A-005 public schema bytes against the 5,000-byte budget and A-025 edit schema bytes against the 1,500-byte budget, then record PASS, pivot, or NO-GO in `docs/research/A-005-schema-bytes-summary.md`
+- [x] T031 [P] [US3] Run the L0 surface A/B comparison for compact-3, meta-tool, and full-32 candidates and save the result reference in `docs/research/A-019-l0-surface-choice.md`
+- [x] T032 [US3] Select the L0 surface winner by accepted-session net while preserving equivalence, or record the blocking pivot, in `docs/research/A-019-l0-surface-choice.md`
+- [x] T033 [P] [US3] Document A-006 and A-027 host schema amortization evidence or conservative worst-case accounting in `docs/research/A-006-host-schema.md`
+- [x] T034 [P] [US3] Choose the A-012 bypass policy path and document either two-hop completion evidence or serve-only H3 interim scope in `docs/research/A-012-bypass-policy.md`
+- [x] T035 [US3] Apply the chosen A-012 path to the selected sf-bench evidence surface from `docs/research/phase0-12a-sf-bench-path.md` by linking bypass-hop evidence or the compare-results serve-only H3 scope from `docs/research/A-012-bypass-policy.md`
+- [x] T036 [P] [US3] Document P-FF and eligible H6 rules, including full-file bypass rows and `eligible_h6=false`, in the selected sf-bench golden-file README path recorded in `docs/research/phase0-12a-sf-bench-path.md`
+- [x] T037 [US3] Update A-005, A-006, A-012, A-019, A-025, A-027, A-028, and A-032 evidence links and verdicts in `docs/stel-assumptions.md`
 
 **Checkpoint**: Route, surface, schema, and bypass policy evidence is complete or explicitly blocks Phase 1.
 
@@ -120,12 +120,12 @@
 
 ### Implementation for User Story 4
 
-- [ ] T038 [P] [US4] Audit `specs/001-v8-phase0-preflight/tasks.md` for forbidden implementation tasks and record the result in `docs/research/phase0-12a-scope-boundary.md`
-- [ ] T039 [P] [US4] Verify the final evidence set contains no requirement to beat or pin `results-7.21.1-baseline.json` and record the result in `docs/research/phase0-12a-scope-boundary.md`
-- [ ] T040 [P] [US4] Review the Phase crosswalk for A-030 and record any drift, no-op result, or required doc update in `docs/research/A-030-phase-crosswalk.md`
-- [ ] T041 [US4] Update the decision log in `docs/ideation.md` with Phase 0 decisions for L0 surface, schema budget, bypass policy, and GO or NO-GO state
-- [ ] T042 [US4] Run a git diff path audit and record that no `src/stel/**` files changed for this feature in `docs/research/phase0-12a-scope-boundary.md`
-- [ ] T043 [US4] Update only the accepted Section 12A checkboxes in `docs/v8-gap-closure-plan.md` after evidence links are present and reviewed
+- [x] T038 [P] [US4] Audit `specs/001-v8-phase0-preflight/tasks.md` for forbidden implementation tasks and record the result in `docs/research/phase0-12a-scope-boundary.md`
+- [x] T039 [P] [US4] Verify the final evidence set contains no requirement to beat or pin `results-7.21.1-baseline.json` and record the result in `docs/research/phase0-12a-scope-boundary.md`
+- [x] T040 [P] [US4] Review the Phase crosswalk for A-030 and record any drift, no-op result, or required doc update in `docs/research/A-030-phase-crosswalk.md`
+- [x] T041 [US4] Update the decision log in `docs/ideation.md` with Phase 0 decisions for L0 surface, schema budget, bypass policy, and GO or NO-GO state
+- [x] T042 [US4] Run a git diff path audit and record that no `src/stel/**` files changed for this feature in `docs/research/phase0-12a-scope-boundary.md`
+- [x] T043 [US4] Update only the accepted Section 12A checkboxes in `docs/v8-gap-closure-plan.md` after evidence links are present and reviewed
 
 **Checkpoint**: The boundary is explicit, documented, and reviewable.
 
@@ -135,12 +135,12 @@
 
 **Purpose**: Final evidence packaging, independent sign-off, and command validation.
 
-- [ ] T044 Run `.specify\scripts\powershell\check-prerequisites.ps1 -Json -PathsOnly` and record the output in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T045 Run the unresolved-placeholder scan from `specs/001-v8-phase0-preflight/quickstart.md` and record the output in `docs/research/phase0-12a-evidence-index.md`
-- [ ] T046 Run final evidence-link validation across `docs/research/phase0-12a-evidence-index.md`, `docs/stel-assumptions.md`, and `docs/v8-gap-closure-plan.md`, then record missing links as blockers in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T047 Run a timed reviewer dry-run and record whether the independent reviewer can reach and record GO or NO-GO within the SC-011 15-minute timebox in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T048 Obtain independent reviewer sign-off or explicit NO-GO from a reviewer who did not produce the evidence bundle in `docs/research/phase0-12a-review-signoff.md`
-- [ ] T049 Record the final GO or NO-GO decision, checklist coverage, blocking gaps, and next action in `docs/research/phase0-12a-review-signoff.md`
+- [x] T044 Run `.specify\scripts\powershell\check-prerequisites.ps1 -Json -PathsOnly` and record the output in `docs/research/phase0-12a-evidence-index.md`
+- [x] T045 Run the unresolved-placeholder scan from `specs/001-v8-phase0-preflight/quickstart.md` and record the output in `docs/research/phase0-12a-evidence-index.md`
+- [x] T046 Run final evidence-link validation across `docs/research/phase0-12a-evidence-index.md`, `docs/stel-assumptions.md`, and `docs/v8-gap-closure-plan.md`, then record missing links as blockers in `docs/research/phase0-12a-review-signoff.md`
+- [x] T047 Run a timed reviewer dry-run and record whether the independent reviewer can reach and record GO or NO-GO within the SC-011 15-minute timebox in `docs/research/phase0-12a-review-signoff.md`
+- [x] T048 Obtain independent reviewer sign-off or explicit NO-GO from a reviewer who did not produce the evidence bundle in `docs/research/phase0-12a-review-signoff.md`
+- [x] T049 Record the final GO or NO-GO decision, checklist coverage, blocking gaps, and next action in `docs/research/phase0-12a-review-signoff.md`
 
 ---
 
