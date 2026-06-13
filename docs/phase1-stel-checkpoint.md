@@ -1,10 +1,10 @@
-# Phase 1 STEL checkpoint (L4 ledger)
+# Phase 1 STEL checkpoint (observational calibration)
 
 **Branch:** `v8/stel-architecture`  
-**Checkpoint commit:** `31d9bf1` — *Add Phase 1 STEL L4 session ledger*  
-**Status:** Phase 1 **L1–L4 skeleton works** on compact `symforge`; calibration, `symforge_edit`, and `status` handlers not started.
+**Checkpoint commit:** `15c0685` — *Add Phase 1 STEL observational calibration summary*
+**Status:** Phase 1 **L1–L4 + compact `status` + observational calibration** work on compact `symforge`; `symforge_edit` handler not started.
 
-This document captures implementation state after the L4 ledger slice. It does **not** change runtime behavior.
+This document captures implementation state after the observational calibration slice. It does **not** change runtime behavior.
 
 ---
 
@@ -14,7 +14,8 @@ This document captures implementation state after the L4 ledger slice. It does *
 |--------|-------------------|------|
 | Phase 0 evidence bundle | `08f7d14` | §12A measurement artifacts (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`) |
 | Independent GO / signoff | `07b42a8` | *Record Phase 0 12A independent GO decision* — authorization to implement `src/stel/` |
-| Phase 1 tip (this checkpoint) | `31d9bf1` | L4 in-memory session ledger wired |
+| Phase 1 checkpoint doc (prior) | `467003d` | L4 ledger checkpoint narrative |
+| Phase 1 tip (this checkpoint) | `15c0685` | Observational calibration summary via `status detail: full` |
 
 **Deferred (not blocking this checkpoint):** `B-RESULTS` — RESULTS.md §8.7 post-8.0 baseline only.
 
@@ -32,6 +33,9 @@ This document captures implementation state after the L4 ledger slice. It does *
 | `20b4e17` | **L2** | Economics controller — `evaluate_plan` → `StelDecision` / `StelEstimate` metadata |
 | `5038ac3` | **L3** | P-FF bypass enforcement — skip legacy dispatch when `StelBypassBody` present |
 | `31d9bf1` | **L4** | Session ledger — in-memory `StelLedgerEvent` + envelope `ledger:` JSON line |
+| `467003d` | **Doc** | Phase 1 checkpoint doc (L4 ledger state) |
+| `3995643` | **Status** | Compact `status` handler — operational STEL/index headline |
+| `15c0685` | **Calibration** | Observational calibration summary from in-memory ledger (read-only) |
 
 Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 
@@ -66,6 +70,7 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 - [`src/stel/controller.rs`](../src/stel/controller.rs) — conservative schema (45) + invoke (80) per call (A-006 path)
 - P-FF detection → `bypass` + `StelBypassBody`
 - Serve when predicted net > margin; preview via `StelEstimate`
+- **No calibration-driven fudge or margin changes yet**
 
 ### L3 — P-FF bypass enforcement
 
@@ -79,6 +84,20 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 - Records: plan id, route tool, decision, bypass flag, schema/invoke tokens, predicted net, legacy executed, output bytes/tokens
 - Compact `ledger: {…}` JSON embedded in trust envelope
 - Preview path does not append ledger rows (no L3 execution)
+
+### Compact `status` handler
+
+- [`src/stel/status.rs`](../src/stel/status.rs) — `status_stel_tool` when `SYMFORGE_SURFACE=compact`
+- `detail: compact` (default) — operational headline: surface, Phase 0 anchors, L1–L4 availability, handler state, ledger event count, index readiness
+- `detail: full` — adds project, symbol count, session tokens, last ledger decision/route, and calibration section
+
+### Observational calibration (read-only)
+
+- [`src/stel/calibration.rs`](../src/stel/calibration.rs) — `summarize_calibration()` over in-memory `SessionLedger` events
+- **Derived only** from appended `StelLedgerEvent` rows; does not write back to L2 or alter serve/bypass decisions
+- Summary fields: event totals, serve/bypass/P-FF counts, legacy-executed count, schema/invoke token totals, predicted net aggregate, predicted vs actual response tokens, tuning sufficiency note
+- Exposed in `status detail: full` under `── calibration (observational) ──`
+- **No persistence** across restarts; **no auto-tuning**; **no L2 margin or route decision changes**
 
 ---
 
@@ -96,6 +115,7 @@ flowchart TD
   BYP --> L4["L4 capture_ledger + envelope"]
   SER --> L4
   EST --> ENV["Trust envelope only"]
+  L4 --> CAL["status detail:full\nreads ledger → calibration summary"]
 ```
 
 ---
@@ -107,8 +127,8 @@ flowchart TD
 | Tool | Shipped handler | Notes |
 |------|-----------------|-------|
 | `symforge` | **Yes** — full L1–L4 path | Production compact read/explore facade |
+| `status` | **Yes** — operational + calibration (full) | Requires `SYMFORGE_SURFACE=compact` |
 | `symforge_edit` | Schema only | Handler deferred |
-| `status` | Schema only | Handler deferred — **recommended next boundary** |
 
 ---
 
@@ -116,13 +136,14 @@ flowchart TD
 
 | Suite | What it proves |
 |-------|----------------|
-| `cargo test stel::` | Unit tests across types, planner, controller, executor, ledger, envelope, golden_replay helpers |
+| `cargo test stel::` | Unit tests across types, planner, controller, executor, ledger, calibration, status, envelope, golden_replay helpers |
 | `tests/stel_golden_replay.rs` | Five S4 serve rows replay on compact `symforge` |
 | `tests/stel_l3_enforcement.rs` | P-FF bypass skips legacy tools; serve still executes |
 | `tests/stel_l4_ledger.rs` | Serve and P-FF rows produce envelope `ledger:` + session ledger events |
+| `tests/stel_status.rs` | Compact guard, operational fields, full detail + calibration after serve |
 | `cargo test --lib protocol::surface_probe` | Phase 0 measurement schemas unchanged |
 
-Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** + targeted P-FF / ledger tests. Remaining rows (multi-hop, full corpus) are seeded for later replay expansion.
+Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** + targeted P-FF / ledger / status tests. Remaining rows (multi-hop, full corpus) are seeded for later replay expansion.
 
 ---
 
@@ -139,12 +160,11 @@ Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** 
 
 | Item | Status |
 |------|--------|
-| Calibration feedback (`CalibrationState` → L2 fudge) | Not implemented |
+| Calibration auto-tuning (`CalibrationState` fudge → L2) | Not implemented — observational summary only |
+| Calibration / ledger persistence | In-memory only |
 | `symforge_edit` handler | Schema only |
-| `status` handler | Schema only |
-| Ledger persistence / analytics export | In-memory only |
 | Multi-step planner / executor chains | L1 single-step only |
-| Full 36-row golden replay | Partial (5 + spot checks) |
+| Full 36-row golden replay | Partial (5 + spot checks) — **recommended next boundary** |
 | H3–H8 battery gates on compact surface | Not claimed |
 | `B-RESULTS` / RESULTS.md §8.7 | Deferred post-8.0 |
 | Unrelated pre-existing `cargo test` failures | Separate from STEL slices; not fixed in Phase 1 commits |
@@ -153,11 +173,10 @@ Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** 
 
 ## Suggested next boundaries (risk order)
 
-1. **`status` handler** — lowest risk; compact-3 already advertises the tool; truthful runtime/ledger headline before economics learning
-2. **Calibration feedback** — important; keep narrow (EMA record only, no auto-tightening yet)
-3. **`symforge_edit` handler** — higher risk (edit semantics + safety)
-4. **Broader golden replay** — expand beyond five S4 exit rows toward full corpus
-5. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
+1. **Broader golden replay** — expand beyond five S4 exit rows toward full corpus; validates planner/controller/enforcement/ledger/calibration stack before edit semantics
+2. **`symforge_edit` handler** — higher risk (edit semantics + safety); defer until replay confidence is higher
+3. **Calibration persistence + auto-tuning** — only after observational summary is trusted; still no silent L2 changes without explicit gate
+4. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
 
 ---
 
@@ -171,9 +190,11 @@ Golden corpus has **36 rows**; replay currently exercises **5 serve exit rows** 
 | `src/stel/controller.rs` | L2 |
 | `src/stel/executor.rs` | L3 enforcement |
 | `src/stel/ledger.rs` | L4 record |
+| `src/stel/calibration.rs` | Observational calibration summary |
+| `src/stel/status.rs` | Compact `status` handler |
 | `src/stel/handler.rs`, `envelope.rs` | Envelope + preview |
 | `src/stel/golden_replay.rs` | S4 validation helpers |
-| `src/protocol/tools.rs` | `symforge_stel_handler` integration |
+| `src/protocol/tools.rs` | `symforge_stel_handler` + `status_stel_tool` integration |
 | `src/protocol/surface_probe.rs` | Phase 0 frozen measurement |
 
 ---
