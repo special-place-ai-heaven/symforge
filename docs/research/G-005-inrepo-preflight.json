@@ -1,0 +1,30 @@
+{
+  "gatheredAt": "2026-06-13T15:00:00Z",
+  "source": "in-repo symforge (scripts/gather-phase0-evidence.ps1 + phase0-mcp-battery.cjs)",
+  "mode": "preflight",
+  "release_scope": "8.0",
+  "inputs": {
+    "baseline": "docs/research/A-001-tool-battery-run1.json",
+    "candidate": "docs/research/A-001-tool-battery-run2.json",
+    "shakedown": "docs/research/A-003-mcp-shakedown.jsonl"
+  },
+  "gates": {
+    "H1": { "schemaBytes": 891, "budget": 5000, "pass": true },
+    "H2": { "trajectoryPassRate": null, "note": "requires symforge STEL replay on golden corpus" },
+    "H3": { "smallServeSGteMCount": 0, "note": "20-row battery; no sGteM on accepted serve rows" },
+    "H4": { "sessionNetAccepted": 14389, "pass": true, "note": "20-row in-repo battery run1" },
+    "H5": { "singleChainMcpCallsOk": null, "note": "requires STEL executor; golden multi-chain rows seeded" },
+    "H6": { "equivalent": 20, "eligible": 20, "note": "producer equiv audit on battery rows; 8.1 gate" },
+    "H7": { "acceptedNetVariance": 0.0, "pass": true, "note": "session_net_accepted 14389 both runs" },
+    "H8": { "perLanguageAcceptedLosses": { "rust": "positive", "python": "positive", "typescript": "positive" }, "note": "diagnostic only" }
+  },
+  "measurementRepeatability": {
+    "run1SessionNet": 14389,
+    "run2SessionNet": 14389,
+    "variancePercent": 0.0,
+    "pass": true,
+    "run1CompactBytes": 891,
+    "run2CompactBytes": 891
+  },
+  "exit_status": "diagnostic"
+}

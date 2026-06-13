@@ -3783,9 +3783,56 @@ fn test_format_hook_adoption_marks_no_sidecar_fail_open_as_mostly_benign() {
 // --- compact_savings_footer tests ---
 
 #[test]
+fn test_competent_manual_baseline_caps_large_files() {
+    assert_eq!(competent_manual_baseline_chars(500_000), 4000);
+    assert_eq!(competent_manual_baseline_chars(100), 100);
+}
+
+#[test]
+fn test_is_small_indexed_file_by_lines_or_chars() {
+    assert!(is_small_indexed_file(5000, 45));
+    assert!(is_small_indexed_file(150, 200));
+    assert!(!is_small_indexed_file(5000, 200));
+}
+
+#[test]
+fn test_resolve_read_max_tokens_defaults_to_window() {
+    assert_eq!(resolve_read_max_tokens(None, 500_000), 1000);
+    assert_eq!(resolve_read_max_tokens(None, 100), 64);
+    assert_eq!(resolve_read_max_tokens(Some(500), 500_000), 500);
+}
+
+#[test]
+fn test_content_anchored_symbol_window_finds_doc_comment_match() {
+    let content = br#"/// Example
+#[tokio::main]
+pub async fn hard_link() {}
+"#;
+    let (_key, file) = make_file("src/fs/hard_link.rs", content, vec![]);
+    let window = content_anchored_symbol_window(&file, "main", 5).expect("window");
+    assert!(
+        window.contains("hard_link"),
+        "window should include nearby source: {window}"
+    );
+    assert!(
+        window.contains("content-anchored"),
+        "should label fallback: {window}"
+    );
+}
+
+#[test]
+fn test_saved_tokens_vs_competent_manual_uses_window() {
+    assert_eq!(saved_tokens_vs_competent_manual(200, 500_000), 950);
+}
+
+#[test]
 fn test_compact_savings_footer_shows_savings() {
     let footer = compact_savings_footer(200, 2000);
-    assert!(footer.contains("tokens saved"), "got: {footer}");
+    assert!(footer.contains("whole-file read"), "got: {footer}");
+    assert!(
+        footer.contains("windowed read"),
+        "should show competent-manual baseline: {footer}"
+    );
 }
 
 #[test]

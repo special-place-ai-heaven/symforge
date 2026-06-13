@@ -1,0 +1,27 @@
+﻿{
+    "measuredAt":  "2026-06-13T16:08:07.6919925Z",
+    "method":  "Buffer.byteLength(JSON.stringify(tools/list result), utf8)",
+    "h1BudgetBytes":  5000,
+    "symforgeBin":  "C:\\AI_STUFF\\PROGRAMMING\\symforge\\target\\debug\\symforge.exe",
+    "repoRoot":  "C:\\AI_STUFF\\PROGRAMMING\\symforge\\tests\\fixtures\\compression_ratio\\rust",
+    "surfaces":  {
+                     "full":  {
+                                  "toolCount":  32,
+                                  "schemaBytes":  62574
+                              },
+                     "compact":  {
+                                     "toolCount":  3,
+                                     "schemaBytes":  891
+                                 },
+                     "meta":  {
+                                  "toolCount":  1,
+                                  "schemaBytes":  407
+                              }
+                 },
+    "notes":  [
+                  "Phase 0 compact probe via SYMFORGE_SURFACE=compact (src/protocol/surface_probe.rs).",
+                  "symforge_edit input_schema bytes recorded separately for A-025.",
+                  "see cargo test surface_probe::tests::symforge_edit_schema_under_a025_budget"
+              ],
+    "h1Pass":  true
+}

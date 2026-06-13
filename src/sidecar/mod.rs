@@ -106,17 +106,23 @@ impl TokenStats {
         })
     }
 
-    /// Record a Read hook fire. Savings = (file_bytes - output_bytes) / 4.
+    /// Record a Read hook fire. Savings vs competent-manual windowed-read baseline.
     pub fn record_read(&self, file_bytes: u64, output_bytes: u64) {
         self.read_fires.fetch_add(1, Ordering::Relaxed);
-        let saved = file_bytes.saturating_sub(output_bytes) / 4;
+        let saved = crate::protocol::format::saved_tokens_vs_competent_manual(
+            output_bytes as usize,
+            file_bytes as usize,
+        );
         self.read_saved_tokens.fetch_add(saved, Ordering::Relaxed);
     }
 
-    /// Record an Edit hook fire. Savings = (file_bytes - output_bytes) / 4.
+    /// Record an Edit hook fire. Savings vs competent-manual windowed-read baseline.
     pub fn record_edit(&self, file_bytes: u64, output_bytes: u64) {
         self.edit_fires.fetch_add(1, Ordering::Relaxed);
-        let saved = file_bytes.saturating_sub(output_bytes) / 4;
+        let saved = crate::protocol::format::saved_tokens_vs_competent_manual(
+            output_bytes as usize,
+            file_bytes as usize,
+        );
         self.edit_saved_tokens.fetch_add(saved, Ordering::Relaxed);
     }
 
@@ -125,10 +131,16 @@ impl TokenStats {
         self.write_fires.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a Grep hook fire. Savings = (file_bytes - output_bytes) / 4.
-    pub fn record_grep(&self, file_bytes: u64, output_bytes: u64) {
+    /// Record a Grep hook fire. Savings vs competent-manual grep+window baseline.
+    pub fn record_grep(&self, _file_bytes: u64, output_bytes: u64) {
         self.grep_fires.fetch_add(1, Ordering::Relaxed);
-        let saved = file_bytes.saturating_sub(output_bytes) / 4;
+        let baseline_chars =
+            crate::protocol::format::estimate_listing_baseline_chars(output_bytes as usize)
+                .max(output_bytes as usize);
+        let saved = crate::protocol::format::saved_tokens_vs_competent_manual(
+            output_bytes as usize,
+            baseline_chars,
+        );
         self.grep_saved_tokens.fetch_add(saved, Ordering::Relaxed);
     }
 
@@ -335,8 +347,11 @@ mod tests {
         stats.record_grep(2000, 100);
         let snap = stats.summary();
         assert_eq!(snap.grep_fires, 1);
-        // (2000 - 100) / 4 = 475
-        assert_eq!(snap.grep_saved_tokens, 475);
+        let expected = crate::protocol::format::saved_tokens_vs_competent_manual(
+            100,
+            crate::protocol::format::estimate_listing_baseline_chars(100),
+        );
+        assert_eq!(snap.grep_saved_tokens, expected);
     }
 
     #[test]

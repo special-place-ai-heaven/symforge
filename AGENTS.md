@@ -260,3 +260,9 @@ Direct file reads are still appropriate for:
 - configuration files where exact raw contents are the point of inspection
 
 Do not default to broad raw file reads for source-code inspection when SymForge can answer the question more directly.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+at specs\001-v8-phase0-preflight\plan.md
+<!-- SPECKIT END -->

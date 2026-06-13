@@ -3180,6 +3180,16 @@ impl SymForgeServer {
             let has_symbol_lookup = captured
                 .iter()
                 .any(|entry| matches!(entry, CapturedGetSymbolsEntry::SymbolLookup { .. }));
+            let batch_baseline_chars: usize = captured
+                .iter()
+                .filter_map(|entry| match entry {
+                    CapturedGetSymbolsEntry::SymbolLookup { file, .. }
+                    | CapturedGetSymbolsEntry::CodeSlice { file, .. } => Some(
+                        format::competent_manual_baseline_chars(file.as_ref().content.len()),
+                    ),
+                    CapturedGetSymbolsEntry::FileNotFound { .. } => None,
+                })
+                .sum();
             let mut output = captured
                 .into_iter()
                 .map(|entry| match entry {
@@ -3215,7 +3225,7 @@ impl SymForgeServer {
             }
             self.record_tool_savings_named(
                 "get_symbol",
-                (output.len() * 5 / 4) as u64,
+                format::estimate_tokens_from_chars(batch_baseline_chars),
                 (output.len() / 4) as u64,
             );
             self.bump_frecency(&bump_paths);
@@ -3271,23 +3281,32 @@ impl SymForgeServer {
 
         match file {
             Some(file) => {
+                let raw_chars = file.content.len();
+                let line_count = format::indexed_file_line_count(&file.content);
+                let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
                 let body = format::symbol_detail_from_indexed_file(
                     file.as_ref(),
                     &params.0.name,
                     params.0.kind.as_deref(),
                     params.0.symbol_line,
                 );
-                let output = format!(
-                    "{body}{}",
+                let hint = if is_small_file {
+                    String::new()
+                } else {
                     format::compact_next_step_hint(&[
                         "get_symbol_context (callers/callees/types)",
                         "find_references (usages)",
                         "edit_within_symbol / replace_symbol_body (edits)",
                     ])
-                );
+                    .to_string()
+                };
+                let output = format!("{body}{hint}");
+                let max_tokens = format::resolve_read_max_tokens(params.0.max_tokens, raw_chars);
                 self.record_tool_savings_named(
                     "get_symbol",
-                    (output.len() * 5 / 4) as u64,
+                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
+                        raw_chars,
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context.record_symbol(
@@ -3299,7 +3318,7 @@ impl SymForgeServer {
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                output
+                format::enforce_token_budget(output, Some(max_tokens))
             }
             None => {
                 let suggestions = {
@@ -3538,31 +3557,45 @@ impl SymForgeServer {
                 return format::not_found_file(&params.0.path);
             }
         }
-        const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 2000;
-        let (raw_chars, symbol_count, reference_count) = {
+        const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 1000;
+        let (raw_chars, line_count, symbol_count, reference_count) = {
             let guard = self.index.read();
             loading_guard!(guard);
             let stats = guard
                 .capture_shared_file(&params.0.path)
-                .map(|f| (f.content.len(), f.symbols.len(), f.references.len()))
-                .unwrap_or((0, 0, 0));
+                .map(|f| {
+                    (
+                        f.content.len(),
+                        format::indexed_file_line_count(&f.content),
+                        f.symbols.len(),
+                        f.references.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             drop(guard);
             stats
         };
-        let large_default_summary = params.0.sections.is_none()
+        let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
+        let large_default_summary = !is_small_file
+            && params.0.sections.is_none()
             && (raw_chars > 200_000 || symbol_count > 250 || reference_count > 800);
 
         let state = sidecar_state_for_server(self);
         let include_tests = include_tests_from_sections(params.0.sections.as_ref());
-        let sections = if large_default_summary {
+        let sections = if is_small_file {
+            Some(vec!["outline".to_string()])
+        } else if large_default_summary {
             Some(vec!["outline".to_string(), "imports".to_string()])
         } else {
             visible_sections(&params.0.sections)
         };
-        let context_max_tokens = params
-            .0
-            .max_tokens
-            .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS));
+        let context_max_tokens = Some(format::resolve_read_max_tokens(
+            params
+                .0
+                .max_tokens
+                .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS)),
+            raw_chars,
+        ));
         let outline = OutlineParams {
             path: params.0.path.clone(),
             max_tokens: context_max_tokens,
@@ -3583,16 +3616,18 @@ impl SymForgeServer {
                         format!("{note}\n\n{result}")
                     };
                 }
-                let hint = format::compact_next_step_hint(&[
-                    "get_symbol (body)",
-                    "find_references (callers/imports)",
-                    "search_text (string/pattern usage)",
-                    "get_file_content (exact raw text)",
-                ]);
+                let hint = if is_small_file {
+                    String::new()
+                } else {
+                    format::compact_next_step_hint(&[
+                        "get_symbol (body)",
+                        "find_references (callers/imports)",
+                        "search_text (string/pattern usage)",
+                        "get_file_content (exact raw text)",
+                    ])
+                };
                 let body = format!("{result}{hint}");
-                let saved = raw_chars.saturating_sub(body.len());
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                self.record_read_savings((saved / 4) as u64);
                 let output =
                     format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
                 self.session_context
@@ -3751,9 +3786,11 @@ impl SymForgeServer {
             } else {
                 result
             };
-            let saved = raw_chars.saturating_sub(result.len());
             let footer = format::compact_savings_footer(result.len(), raw_chars);
-            self.record_read_savings((saved / 4) as u64);
+            self.record_read_savings(format::saved_tokens_vs_competent_manual(
+                result.len(),
+                raw_chars,
+            ));
             let output = format!("{result}{footer}");
             self.session_context
                 .record_symbol(&path, &params.0.name, (output.len() / 4) as u32);
@@ -3890,9 +3927,7 @@ impl SymForgeServer {
                     "find_references (usages)",
                     "edit_within_symbol / replace_symbol_body (edits)",
                 ]));
-                let saved = raw_chars.saturating_sub(output.len());
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
-                self.record_read_savings((saved / 4) as u64);
                 // Frecency bump — commitment tool, default-mode happy path.
                 // Resolve the bump path the same way the output did:
                 // explicit params first, auto-resolved path as fallback.
@@ -3925,8 +3960,10 @@ impl SymForgeServer {
                         "find_references (usages)",
                     ]));
                     let footer = format::compact_savings_footer(body.len(), raw_chars);
-                    let saved = raw_chars.saturating_sub(body.len());
-                    self.record_read_savings((saved / 4) as u64);
+                    self.record_read_savings(format::saved_tokens_vs_competent_manual(
+                        body.len(),
+                        raw_chars,
+                    ));
                     let output = format!("{body}{footer}");
                     if let Some(ref p) = resolved_path {
                         self.session_context.record_symbol(
@@ -4175,9 +4212,64 @@ impl SymForgeServer {
             Some(envelope) => format!("{envelope}\n\n{output}{hint}"),
             None => format!("{output}{hint}"),
         };
+        let output = if !is_browse
+            && query_str.len() >= 2
+            && result.hits.len() < options.result_limit.get() / 2
+        {
+            let text_fallback = {
+                let guard = self.index.read();
+                loading_guard!(guard);
+                let mut text_options = search::TextSearchOptions::for_current_code_search();
+                text_options.path_scope = options.path_scope.clone();
+                text_options.noise_policy = options.noise_policy;
+                text_options.include_personal_tooling = options.include_personal_tooling;
+                text_options.language_filter = options.language_filter.clone();
+                text_options.total_limit = 15;
+                text_options.max_per_file = 1;
+                search::search_text_with_options(
+                    &guard,
+                    Some(query_str),
+                    None,
+                    false,
+                    &text_options,
+                )
+                .unwrap_or_else(|_| search::TextSearchResult {
+                    label: String::new(),
+                    total_matches: 0,
+                    files: vec![],
+                    suppressed_by_noise: 0,
+                    overflow_count: 0,
+                })
+            };
+            let symbol_paths: std::collections::HashSet<&str> =
+                result.hits.iter().map(|h| h.path.as_str()).collect();
+            let extra_paths: Vec<String> = text_fallback
+                .files
+                .iter()
+                .filter(|file| !symbol_paths.contains(file.path.as_str()))
+                .filter_map(|file| {
+                    file.matches
+                        .first()
+                        .map(|m| format!("{}:{}", file.path, m.line_number))
+                })
+                .take(10)
+                .collect();
+            if extra_paths.is_empty() {
+                output
+            } else {
+                format!(
+                    "{output}\n\nText path fallback (sparse symbol hits):\n{}",
+                    extra_paths.join("\n")
+                )
+            }
+        } else {
+            output
+        };
         self.record_tool_savings_named(
             "search_symbols",
-            (output.len() * 10 / 4) as u64,
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
             (output.len() / 4) as u64,
         );
         self.session_context.record_summary_output(
@@ -4193,10 +4285,11 @@ impl SymForgeServer {
         // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
         // §"Search tools deliberately do NOT bump" for the positive-feedback-
         // loop rationale.
-        format::enforce_token_budget(output, params.0.max_tokens)
+        format::enforce_token_budget(
+            output,
+            Some(format::resolve_read_max_tokens(params.0.max_tokens, 4000)),
+        )
     }
-
-    /// Full-text search across file contents — literal, OR-terms, regex, or structural AST patterns.
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
     /// follow_refs=true to inline callers. Set structural=true to match AST patterns using
     /// ast-grep syntax ($VAR for metavariables, $$$ for multi-node wildcards).
@@ -6053,7 +6146,7 @@ impl SymForgeServer {
     pub(crate) async fn get_file_content(&self, params: Parameters<GetFileContentInput>) -> String {
         let mut input = params.0;
         input.path = normalize_exact_path(&input.path);
-        let max_tokens = input.max_tokens;
+        let explicit_max_tokens = input.max_tokens;
 
         if let Err(e) = normalize_file_content_aliases(&mut input) {
             return e;
@@ -6062,7 +6155,7 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_file_content", &input).await {
             return format::enforce_token_budget(
                 format::cap_file_content_output(result),
-                max_tokens,
+                explicit_max_tokens,
             );
         }
         // Estimate mode: return token cost without reading content
@@ -6124,13 +6217,19 @@ impl SymForgeServer {
         match file {
             Some(file) => {
                 let raw_chars = file.as_ref().content.len();
+                let max_tokens = Some(format::resolve_read_max_tokens(
+                    explicit_max_tokens,
+                    raw_chars,
+                ));
                 let output = format::file_content_from_indexed_file_with_context(
                     file.as_ref(),
                     options.content_context,
                 );
                 self.record_tool_savings_named(
                     "get_file_content",
-                    (raw_chars / 4) as u64,
+                    format::estimate_tokens_from_chars(format::competent_manual_baseline_chars(
+                        raw_chars,
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context
@@ -6184,6 +6283,10 @@ impl SymForgeServer {
                                 ));
                                 let with_warning =
                                     format::append_nul_byte_warning(capped, &content);
+                                let max_tokens = Some(format::resolve_read_max_tokens(
+                                    explicit_max_tokens,
+                                    content.len(),
+                                ));
                                 return format::enforce_token_budget(with_warning, max_tokens);
                             }
                             Err(e) => {
@@ -6496,7 +6599,9 @@ impl SymForgeServer {
 
                 self.record_tool_savings_named(
                     "find_references",
-                    (output.len() * 8 / 4) as u64,
+                    format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                        output.len(),
+                    )),
                     (output.len() / 4) as u64,
                 );
                 self.session_context.record_summary_output(
@@ -7693,7 +7798,9 @@ impl SymForgeServer {
 
         self.record_tool_savings_named(
             "explore",
-            (output.len() * 10 / 4) as u64,
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
             (output.len() / 4) as u64,
         );
         self.session_context
@@ -7801,6 +7908,401 @@ impl SymForgeServer {
             (output.len() / 4).min(u32::MAX as usize) as u32,
         );
         output
+    }
+
+    #[tool(
+        name = "symforge",
+        description = "STEL read/explore facade — natural-language code intelligence with trust envelope on the compact surface. Phase 0 batteries may pass `_probe_legacy_*` harness fields.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn symforge_facade_tool(
+        &self,
+        params: Parameters<crate::stel::SymforgeCallInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if params.0.is_probe_relay() {
+            let legacy_tool = match params.0.probe_legacy_tool.as_deref() {
+                Some(tool) => tool,
+                None => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(
+                            "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 battery harness only)",
+                        ));
+                }
+            };
+            let legacy_args = match params.0.probe_legacy_args.clone() {
+                Some(args) => args,
+                None => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(
+                            "Phase 0 facade relay requires `_probe_legacy_args` (A-019 battery harness only)",
+                        ));
+                }
+            };
+            let output = self.dispatch_tool_for_tests(legacy_tool, legacy_args).await;
+            let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
+                OutcomeClass::InvalidRequest
+            } else if output.starts_with("Index not loaded.") {
+                OutcomeClass::InternalFailure
+            } else {
+                OutcomeClass::Found
+            };
+            return statused_tool_result(output, outcome_class);
+        }
+
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "symforge STEL handler requires SYMFORGE_SURFACE=compact; use legacy tools on the full surface",
+            ));
+        }
+
+        self.symforge_stel_handler(&params.0.request).await
+    }
+
+    /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.
+    async fn symforge_stel_handler(
+        &self,
+        request: &crate::stel::StelRequest,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        use crate::protocol::smart_query;
+        use crate::stel::controller::{build_estimate, evaluate_plan};
+        use crate::stel::executor::{format_bypass_body, is_enforced_bypass};
+        use crate::stel::handler::{self, metrics_for_decision};
+        use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
+
+        let q = smart_query::strip_leading_articles(request.query.trim());
+        if q.is_empty() {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result("query requires a non-empty question."));
+        }
+
+        let plan = build_plan(request);
+        let decision = evaluate_plan(request, &plan);
+        let step = plan
+            .steps
+            .first()
+            .expect("L1 planner always emits at least one step");
+        let plan_summary = plan_summary_line(&plan);
+        let session_net = self.session_context.snapshot().total_tokens as i64;
+
+        if request.preview == Some(true) {
+            let estimate = build_estimate(request, &plan, &decision);
+            let body = handler::format_preview_estimate(&estimate);
+            let metrics = metrics_for_decision(plan_summary, &decision, &plan, 0, session_net);
+            let envelope = handler::envelope_for_decision(&metrics);
+            let output = handler::prepend_envelope(&envelope, &body);
+            return statused_tool_result(output, OutcomeClass::Found);
+        }
+
+        if is_enforced_bypass(&decision) {
+            let body = format_bypass_body(&decision);
+            let output = self.finalize_symforge_with_ledger(
+                "symforge",
+                request,
+                &plan,
+                &decision,
+                plan_summary,
+                session_net,
+                &body,
+                false,
+                &step.tool,
+            );
+            self.session_context
+                .record_summary_output("symforge", handler::estimate_tokens(&output));
+            return statused_tool_result(output, OutcomeClass::Found);
+        }
+
+        let tool_body = self
+            .dispatch_tool_for_tests(&step.tool, step.args.clone())
+            .await;
+        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+        let routing_meta = format!(
+            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
+            confidence_label(plan.confidence),
+            step.tool,
+            invocation,
+            plan.confidence_rationale,
+            decision.decision.as_str(),
+            decision.decision_reason,
+        );
+        let body = format!("{routing_meta}\n\n{tool_body}");
+        let output = self.finalize_symforge_with_ledger(
+            "symforge",
+            request,
+            &plan,
+            &decision,
+            plan_summary,
+            session_net,
+            &body,
+            true,
+            &step.tool,
+        );
+        self.session_context
+            .record_summary_output("symforge", handler::estimate_tokens(&output));
+
+        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
+            OutcomeClass::InvalidRequest
+        } else if tool_body.starts_with("Index not loaded.") {
+            OutcomeClass::InternalFailure
+        } else {
+            OutcomeClass::Found
+        };
+        statused_tool_result(output, outcome_class)
+    }
+
+    #[tool(
+        name = "symforge_edit",
+        description = "STEL structural edit facade — symbol-aware edits with economics gate; preview by default, apply:true commits.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn symforge_edit_facade_tool(
+        &self,
+        params: Parameters<crate::stel::StelEditRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "symforge_edit STEL handler requires SYMFORGE_SURFACE=compact; use legacy edit tools on the full surface",
+            ));
+        }
+
+        self.symforge_edit_stel_handler(&params.0).await
+    }
+
+    /// Production compact-surface `symforge_edit` path: L1 edit plan → L2 economics → preview or guarded apply.
+    async fn symforge_edit_stel_handler(
+        &self,
+        request: &crate::stel::StelEditRequest,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        use crate::stel::controller::evaluate_edit_plan;
+        use crate::stel::edit_apply::{
+            PreApplyOutcome, apply_requested, format_already_applied_body, format_apply_metadata,
+            run_pre_apply_gates,
+        };
+        use crate::stel::edit_planner::{build_edit_plan, edit_plan_summary_line};
+        use crate::stel::handler;
+        use crate::stel::planner::confidence_label;
+
+        if let Err(error) = crate::stel::edit_planner::validate_edit_request(request) {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result(error.message));
+        }
+
+        let apply = apply_requested(request);
+        let mut resolved_symbol = None;
+
+        if apply {
+            let abs_path =
+                match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim()) {
+                    Ok((path, _)) => path,
+                    Err(message) => {
+                        return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                            .into_call_tool_result(message));
+                    }
+                };
+            match run_pre_apply_gates(&self.index, request, &abs_path) {
+                Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
+                Ok(PreApplyOutcome::AlreadyApplied(symbol)) => {
+                    let plan = build_edit_plan(request).expect("validated edit request");
+                    let decision = evaluate_edit_plan(&plan);
+                    let plan_summary = edit_plan_summary_line(&plan);
+                    let session_net = self.session_context.snapshot().total_tokens as i64;
+                    let tool_body = format_already_applied_body(&symbol);
+                    let routing_meta = format!(
+                        "Mode: guarded apply (already applied)\n\
+                         Route confidence: {}\n\
+                         Chosen tool: replace_symbol_body\n\
+                         Economics: {} ({})",
+                        confidence_label(plan.confidence),
+                        decision.decision.as_str(),
+                        decision.decision_reason,
+                    );
+                    let body = format!("{routing_meta}\n\n{tool_body}");
+                    let output = self.finalize_symforge_with_ledger(
+                        "symforge_edit",
+                        &crate::stel::StelRequest::default(),
+                        &plan,
+                        &decision,
+                        plan_summary,
+                        session_net,
+                        &body,
+                        false,
+                        "replace_symbol_body",
+                    );
+                    self.session_context
+                        .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
+                    return statused_tool_result(output, OutcomeClass::Found);
+                }
+                Err(error) => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(error.message));
+                }
+            }
+        }
+
+        let plan = match build_edit_plan(request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                    .into_call_tool_result(error.message));
+            }
+        };
+        let decision = evaluate_edit_plan(&plan);
+        let step = plan
+            .steps
+            .first()
+            .expect("edit planner always emits at least one step");
+        let plan_summary = edit_plan_summary_line(&plan);
+        let session_net = self.session_context.snapshot().total_tokens as i64;
+
+        let tool_body = self
+            .dispatch_tool_for_tests(&step.tool, step.args.clone())
+            .await;
+        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+        let mode_line = if apply {
+            "Mode: guarded apply (committed when validation succeeds)"
+        } else {
+            "Mode: preview-only (dry_run); default when apply is omitted or false"
+        };
+        let routing_meta = format!(
+            "{mode_line}\n\
+             Route confidence: {}\n\
+             Chosen tool: {}\n\
+             Invocation: {}\n\
+             Rationale: {}\n\
+             Economics: {} ({})",
+            confidence_label(plan.confidence),
+            step.tool,
+            invocation,
+            plan.confidence_rationale,
+            decision.decision.as_str(),
+            decision.decision_reason,
+        );
+        let mut body = format!("{routing_meta}\n\n{tool_body}");
+        if apply && let Some(symbol) = resolved_symbol.as_ref() {
+            let write_mode = if tool_body.contains("replaced") {
+                "committed"
+            } else if tool_body.contains("[DRY RUN]") {
+                "dry_run"
+            } else {
+                "failed"
+            };
+            body = format!(
+                "{routing_meta}\n\n{}\n\n{tool_body}",
+                format_apply_metadata(symbol, write_mode)
+            );
+        }
+
+        let legacy_executed = apply
+            && tool_body.contains("replaced")
+            && tool_body.contains("Write semantics: atomic write + reindex");
+        let output = self.finalize_symforge_with_ledger(
+            "symforge_edit",
+            &crate::stel::StelRequest::default(),
+            &plan,
+            &decision,
+            plan_summary,
+            session_net,
+            &body,
+            legacy_executed,
+            &step.tool,
+        );
+        self.session_context
+            .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
+
+        let outcome_class = Self::classify_symforge_edit_outcome(&tool_body, apply, &body);
+        statused_tool_result(output, outcome_class)
+    }
+
+    fn classify_symforge_edit_outcome(
+        tool_body: &str,
+        apply: bool,
+        full_body: &str,
+    ) -> OutcomeClass {
+        if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
+            OutcomeClass::InvalidRequest
+        } else if tool_body.starts_with("Index not loaded.")
+            || (apply
+                && (full_body.contains("Write mode: failed")
+                    || tool_body.contains(": edit safety blocked")))
+        {
+            OutcomeClass::InternalFailure
+        } else {
+            OutcomeClass::Found
+        }
+    }
+
+    #[tool(
+        name = "status",
+        description = "STEL trust envelope and index health summary.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn status_stel_tool(
+        &self,
+        params: Parameters<crate::stel::StelStatusRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "status STEL handler requires SYMFORGE_SURFACE=compact; use health or health_compact on the full surface",
+            ));
+        }
+
+        let guard = self.index.read();
+        let ledger = self.stel_ledger.lock();
+        let ctx = crate::stel::StelStatusContext::from_server(
+            "compact",
+            &self.project_name,
+            guard.is_ready(),
+            guard.file_count(),
+            guard.symbol_count(),
+            &ledger,
+            self.session_context.snapshot().total_tokens,
+        );
+        let body = crate::stel::format_stel_status(&params.0, &ctx);
+        statused_tool_result(body, OutcomeClass::Found)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_symforge_with_ledger(
+        &self,
+        surface: &'static str,
+        _request: &crate::stel::StelRequest,
+        plan: &crate::stel::StelPlan,
+        decision: &crate::stel::StelDecision,
+        plan_summary: String,
+        session_net: i64,
+        body: &str,
+        legacy_executed: bool,
+        selected_tool: &str,
+    ) -> String {
+        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
+        use crate::stel::ledger::{
+            LedgerCaptureInput, capture_ledger, format_ledger_envelope_line,
+        };
+
+        let response_tokens = handler::estimate_tokens(body);
+        let metrics =
+            metrics_for_decision(plan_summary, decision, plan, response_tokens, session_net);
+        let (event, meta) = capture_ledger(&LedgerCaptureInput {
+            plan,
+            decision,
+            economics: &metrics.economics,
+            selected_tool,
+            legacy_executed,
+            output_body: body,
+            surface,
+        });
+        self.stel_ledger.lock().push(event.clone());
+        let ledger_line = format_ledger_envelope_line(&event, &meta);
+        finalize_symforge_output(metrics, ledger_line, body)
     }
 
     #[tool(
@@ -8167,7 +8669,12 @@ impl SymForgeServer {
             params.0.language.as_deref(),
             code_only,
         );
-        self.record_tool_savings((output.len() * 5 / 4) as u64, (output.len() / 4) as u64);
+        self.record_tool_savings(
+            format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
+                output.len(),
+            )),
+            (output.len() / 4) as u64,
+        );
         self.session_context.record_summary_output(
             "diff_symbols",
             (output.len() / 4).min(u32::MAX as usize) as u32,
@@ -8687,6 +9194,7 @@ mod tests {
             symbol_line: None,
             targets: None,
             estimate: None,
+            max_tokens: None,
         }
     }
 
@@ -8863,6 +9371,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert_eq!(
@@ -8941,6 +9450,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -8999,6 +9509,7 @@ mod tests {
                 symbol_line: None,
                 targets: None,
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         // Should return source body or not-found message — not a guard message
@@ -13771,6 +14282,7 @@ mod tests {
                     end_byte: None,
                 }]),
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(
@@ -13803,6 +14315,7 @@ mod tests {
                     end_byte: Some(8),
                 }]),
                 estimate: None,
+                max_tokens: None,
             }))
             .await;
         assert!(

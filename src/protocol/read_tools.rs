@@ -279,6 +279,9 @@ pub struct GetSymbolInput {
     /// Useful for budget planning before fetching large symbols.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
+    /// Optional maximum token budget for the response (~1000 default when unset).
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// A single target in a `get_symbols` batch request.

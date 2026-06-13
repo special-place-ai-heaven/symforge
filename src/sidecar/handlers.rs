@@ -705,8 +705,10 @@ fn outline_text(
 
     let output_bytes = text.len() as u64;
     if options.include_savings_footer {
-        let saved_tokens = file_bytes.saturating_sub(output_bytes) / 4;
-        text.push_str(&format!("\n[~{} tokens saved]", saved_tokens));
+        text.push_str(&crate::protocol::format::compact_savings_footer(
+            output_bytes as usize,
+            file_bytes as usize,
+        ));
     }
 
     if options.record_stats {
@@ -1183,8 +1185,10 @@ async fn handle_edit_impact(
 
     let output_bytes = text.len() as u64;
     if options.include_savings_footer {
-        let saved_tokens = file_bytes.saturating_sub(output_bytes) / 4;
-        text.push_str(&format!("\n[~{} tokens saved]", saved_tokens));
+        text.push_str(&crate::protocol::format::compact_savings_footer(
+            output_bytes as usize,
+            file_bytes as usize,
+        ));
     }
 
     if options.record_stats {
@@ -1447,8 +1451,13 @@ fn symbol_context_text(
 
     let output_bytes = text.len() as u64;
     if options.include_savings_footer {
-        let saved_tokens = total_bytes.saturating_sub(output_bytes) / 4;
-        text.push_str(&format!("\n[~{} tokens saved]", saved_tokens));
+        let baseline_chars =
+            crate::protocol::format::estimate_listing_baseline_chars(output_bytes as usize)
+                .max(output_bytes as usize);
+        text.push_str(&crate::protocol::format::compact_savings_footer(
+            output_bytes as usize,
+            baseline_chars.max(total_bytes as usize),
+        ));
     }
 
     if options.record_stats {
@@ -2552,10 +2561,6 @@ mod tests {
             "outline should contain file path"
         );
         assert!(
-            result.contains("tokens saved"),
-            "outline should have token savings footer"
-        );
-        assert!(
             result.contains("Trust: exact | current index | parsed | full"),
             "outline should expose the compact trust line; got: {result}"
         );
@@ -3001,7 +3006,10 @@ mod tests {
             .unwrap();
         assert!(result.contains("src/main.rs"), "should contain the file");
         assert!(result.contains("line 5"), "should show line number");
-        assert!(result.contains("tokens saved"), "should have footer");
+        assert!(
+            result.contains("whole-file read") || result.contains("windowed read"),
+            "should have footer: {result}"
+        );
         assert!(
             result.contains("Trust: heuristic | current index | parsed | full"),
             "symbol_context should expose the compact trust line; got: {result}"

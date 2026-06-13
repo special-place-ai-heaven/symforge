@@ -15,6 +15,7 @@ pub(crate) mod search_format;
 pub(crate) mod search_tools;
 pub mod session;
 pub mod smart_query;
+pub mod surface_probe;
 pub mod tools;
 
 use std::path::{Path, PathBuf};
@@ -29,8 +30,8 @@ use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-    ServerCapabilities, ServerInfo, Tool,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
@@ -77,6 +78,8 @@ pub struct SymForgeServer {
     pub(crate) daemon_degraded: Arc<AtomicBool>,
     /// Session context tracking: records what the LLM has fetched this session.
     pub(crate) session_context: Arc<session::SessionContext>,
+    /// In-memory STEL L4 ledger for compact `symforge` invocations (no persistence yet).
+    pub(crate) stel_ledger: Arc<Mutex<crate::stel::ledger::SessionLedger>>,
     /// Tracks edit-tool calls that omitted `working_directory` while the
     /// transitional worktree observability knob was on. Surfaced by the
     /// `health` tool as a rolling "last hour" signal.
@@ -130,6 +133,7 @@ impl SymForgeServer {
             daemon_client: None,
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
         }
@@ -154,6 +158,7 @@ impl SymForgeServer {
             daemon_client: Some(Arc::new(tokio::sync::RwLock::new(daemon_client))),
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
         }
@@ -162,6 +167,12 @@ impl SymForgeServer {
     /// Accessor for tests.
     pub fn index(&self) -> &SharedIndex {
         &self.index
+    }
+
+    /// Accessor for STEL ledger integration tests.
+    #[doc(hidden)]
+    pub fn stel_ledger(&self) -> &Arc<Mutex<crate::stel::ledger::SessionLedger>> {
+        &self.stel_ledger
     }
 
     /// Return the MCP tool definitions advertised by this server.
@@ -534,6 +545,11 @@ impl SymForgeServer {
             "get_file_content" => call!(get_file_content, tools::GetFileContentInput),
             "get_symbol" => call!(get_symbol, tools::GetSymbolInput),
             "get_symbol_context" => call!(get_symbol_context, tools::GetSymbolContextInput),
+            "find_references" => call!(find_references, tools::FindReferencesInput),
+            "find_dependents" => call!(find_dependents, tools::FindDependentsInput),
+            "explore" => call!(explore, tools::ExploreInput),
+            "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),
+            "context_inventory" => self.context_inventory().await,
             "health" => call!(health, tools::HealthInput),
             "health_compact" => self.health_compact().await,
             "conventions" => self.conventions().await,
@@ -598,6 +614,11 @@ impl SymForgeServer {
                 call_statused!(get_symbol_context_tool, tools::GetSymbolContextInput)
             }
             "find_references" => call_statused!(find_references_tool, tools::FindReferencesInput),
+            "symforge" => call_statused!(symforge_facade_tool, crate::stel::SymforgeCallInput),
+            "symforge_edit" => {
+                call_statused!(symforge_edit_facade_tool, crate::stel::StelEditRequest)
+            }
+            "status" => call_statused!(status_stel_tool, crate::stel::StelStatusRequest),
             other => {
                 let text = format!(
                     "Unsupported tool `{other}` in public conformance harness.\nRecovery: add a statused dispatcher branch before adding the case, or remove the case from the public corpus."
@@ -669,6 +690,23 @@ impl ServerHandler for SymForgeServer {
     {
         let uri = request.uri;
         async move { self.read_resource_uri(&uri).await }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let profile = surface_probe::surface_profile_from_env();
+        let tools = match profile {
+            surface_probe::SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
+            _ => surface_probe::list_tools_for_profile(profile),
+        };
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
     }
 }
 
