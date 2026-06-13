@@ -45,6 +45,8 @@ pub mod protocol;
 #[cfg(feature = "server")]
 pub mod sidecar;
 #[cfg(feature = "server")]
+pub mod stel;
+#[cfg(feature = "server")]
 pub mod version_registry;
 #[cfg(feature = "server")]
 pub mod watcher;
