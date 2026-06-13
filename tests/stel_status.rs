@@ -175,4 +175,8 @@ async fn full_status_includes_project_and_ledger_summary() {
     assert!(output.contains("ledger_events: 1"));
     assert!(output.contains("last_ledger_decision: serve"));
     assert!(output.contains("last_ledger_route: find_references"));
+    assert!(output.contains("── calibration (observational) ──"));
+    assert!(output.contains("serve: 1"));
+    assert!(output.contains("legacy_executed: 1"));
+    assert!(output.contains("tuning:"));
 }

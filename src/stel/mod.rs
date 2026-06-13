@@ -11,8 +11,9 @@
 //! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch.
 //! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
 //!
-//! Deferred: calibration feedback, `symforge_edit` handler, multi-step plans, persistence.
+//! Deferred: calibration auto-tuning/persistence, `symforge_edit` handler, multi-step plans.
 
+pub mod calibration;
 pub mod controller;
 pub mod envelope;
 pub mod executor;
@@ -30,6 +31,10 @@ pub use golden_replay::{
     GOLDEN_ROUTES_FIXTURE, ReplayValidation, S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS,
     corpus_for_row_id, load_golden_rows, parse_golden_rows, s4_exit_rows,
     validate_s4_replay_output,
+};
+pub use calibration::{
+    StelCalibrationSummary, TUNING_REVIEW_MIN_EVENTS, format_calibration_section,
+    summarize_calibration,
 };
 pub use controller::{
     build_estimate, detect_pff_bypass, estimate_economics, evaluate_plan, EconomicsBreakdown,

@@ -1,5 +1,6 @@
 //! STEL compact `status` tool — operational surface report (no calibration/edit).
 
+use super::calibration::{format_calibration_section, summarize_calibration, StelCalibrationSummary};
 use super::ledger::SessionLedger;
 use super::types::{StelStatusDetail, StelStatusRequest};
 
@@ -10,7 +11,7 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 
 /// Stable comma-separated deferred-work list (sorted for test stability).
 pub const DEFERRED_ITEMS: &str =
-    "b_results,calibration,ledger_persistence,multi_step_planner,symforge_edit_handler";
+    "b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_handler";
 
 /// Inputs collected from the live server when formatting a status response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +26,7 @@ pub struct StelStatusContext<'a> {
     pub session_tokens: u64,
     pub last_ledger_decision: Option<String>,
     pub last_ledger_route: Option<String>,
+    pub calibration: StelCalibrationSummary,
 }
 
 impl<'a> StelStatusContext<'a> {
@@ -37,7 +39,9 @@ impl<'a> StelStatusContext<'a> {
         ledger: &SessionLedger,
         session_tokens: u64,
     ) -> Self {
-        let last = ledger.last();
+        let events = ledger.events();
+        let calibration = summarize_calibration(&events);
+        let last = events.last();
         let last_ledger_decision = last
             .as_ref()
             .map(|event| event.decision.as_str().to_string());
@@ -53,6 +57,7 @@ impl<'a> StelStatusContext<'a> {
             session_tokens,
             last_ledger_decision,
             last_ledger_route,
+            calibration,
         }
     }
 }
@@ -107,6 +112,7 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
             extra.push("last_ledger_route: none".to_string());
         }
     }
+    extra.push(format_calibration_section(&ctx.calibration));
     // Insert full-only lines before the closing banner.
     if let Some(pos) = body.rfind("\n──\n") {
         let (head, tail) = body.split_at(pos);
@@ -134,6 +140,7 @@ mod tests {
             session_tokens: 128,
             last_ledger_decision: Some("serve".to_string()),
             last_ledger_route: Some("search_text".to_string()),
+            calibration: summarize_calibration(&[]),
         }
     }
 
@@ -155,14 +162,14 @@ mod tests {
             "ledger_events: 2",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,calibration,ledger_persistence,multi_step_planner,symforge_edit_handler",
+            "deferred: b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_handler",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
         }
         assert!(
-            !body.contains("project:"),
-            "compact detail must not include full-only fields"
+            !body.contains("── calibration (observational) ──"),
+            "compact detail must not include calibration section"
         );
     }
 
@@ -180,6 +187,8 @@ mod tests {
             "session_tokens: 128",
             "last_ledger_decision: serve",
             "last_ledger_route: search_text",
+            "── calibration (observational) ──",
+            "tuning:",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
         }
