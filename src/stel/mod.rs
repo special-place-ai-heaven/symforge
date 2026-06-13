@@ -11,7 +11,7 @@
 //! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch.
 //! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
 //!
-//! Deferred: calibration feedback, `symforge_edit` / `status` handlers, multi-step plans, persistence.
+//! Deferred: calibration feedback, `symforge_edit` handler, multi-step plans, persistence.
 
 pub mod controller;
 pub mod envelope;
@@ -20,6 +20,7 @@ pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
 pub mod planner;
+pub mod status;
 pub mod surface;
 pub mod surface_list;
 pub mod types;
@@ -45,6 +46,10 @@ pub use handler::{
     format_preview_estimate, metrics_for_decision, prepend_envelope, stub_plan_summary,
 };
 pub use planner::{build_plan, confidence_label, plan_summary_line};
+pub use status::{
+    DEFERRED_ITEMS, PHASE0_EVIDENCE_COMMIT, PHASE0_GO_COMMIT, StelStatusContext,
+    format_stel_status,
+};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{
     compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,

@@ -615,6 +615,7 @@ impl SymForgeServer {
             }
             "find_references" => call_statused!(find_references_tool, tools::FindReferencesInput),
             "symforge" => call_statused!(symforge_facade_tool, crate::stel::SymforgeCallInput),
+            "status" => call_statused!(status_stel_tool, crate::stel::StelStatusRequest),
             other => {
                 let text = format!(
                     "Unsupported tool `{other}` in public conformance harness.\nRecovery: add a statused dispatcher branch before adding the case, or remove the case from the public corpus."

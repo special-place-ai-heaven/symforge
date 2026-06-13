@@ -8057,6 +8057,38 @@ impl SymForgeServer {
         statused_tool_result(output, outcome_class)
     }
 
+    #[tool(
+        name = "status",
+        description = "STEL trust envelope and index health summary.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn status_stel_tool(
+        &self,
+        params: Parameters<crate::stel::StelStatusRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "status STEL handler requires SYMFORGE_SURFACE=compact; use health or health_compact on the full surface",
+            ));
+        }
+
+        let guard = self.index.read();
+        let ledger = self.stel_ledger.lock();
+        let ctx = crate::stel::StelStatusContext::from_server(
+            "compact",
+            &self.project_name,
+            guard.is_ready(),
+            guard.file_count(),
+            guard.symbol_count(),
+            &ledger,
+            self.session_context.snapshot().total_tokens,
+        );
+        let body = crate::stel::format_stel_status(&params.0, &ctx);
+        statused_tool_result(body, OutcomeClass::Found)
+    }
+
     fn finalize_symforge_with_ledger(
         &self,
         _request: &crate::stel::StelRequest,
