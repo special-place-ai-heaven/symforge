@@ -1,6 +1,6 @@
 # Phase 0 §12A — assumption evidence placeholders
 
-**Updated:** 2026-06-13 (in-repo evidence refresh; evidence commit `c3581a5`)  
+**Updated:** 2026-06-13 (review gate refresh; evidence commit `7d363ab`)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)
 
 Phase 1-blocking assumptions tracked for §12A pre-flight. Update verdicts only when linked artifacts satisfy contract rules.

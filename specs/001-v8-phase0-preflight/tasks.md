@@ -171,7 +171,7 @@
 
 ### Post-implementation doc refresh (2026-06-13)
 
-Producer refreshed review packet and signoff for `77c4955`. **Independent review not requested** while B-A019 interim. Sequence: close A-019 → refresh docs → request review → T048/T049.
+Producer aligned evidence commit references at `7d363ab`. **Independent review not requested** while B-A019 interim. Sequence: close A-019 → refresh docs → request review → T048/T049.
 
 ---
 

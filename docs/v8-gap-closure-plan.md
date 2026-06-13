@@ -424,7 +424,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
-**Progress (2026-06-13):** Evidence `77c4955`. B-SFBENCH **closed**. A-001/A-004/A-028/A-005 **VALIDATED**. **NO-GO** — **B-A019** interim blocks sign-off request; independent review **not solicited**.
+**Progress (2026-06-13):** Evidence `7d363ab`. B-SFBENCH **closed**. A-001/A-004/A-028/A-005 **VALIDATED**. **NO-GO** — **B-A019** interim blocks sign-off request; independent review **not solicited**.
 
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
