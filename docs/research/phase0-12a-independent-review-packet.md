@@ -1,11 +1,12 @@
 # Phase 0 §12A — independent reviewer packet
 
-> **Review readiness: READY** — A-019 closed (compact-3 wins L0 A/B). Independent review **may be solicited**; producer has **not** self-signed. See §0 sequencing.
+> **Review status: COMPLETE — GO** — Independent review by Codex agent (2026-06-13). See [signoff](./phase0-12a-review-signoff.md).
 
-**Prepared:** 2026-06-13 (A-019 L0 A/B closed)  
-**Evidence commit:** `08f7d14` on `v8/stel-architecture` (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`)  
-**Producer:** Cursor agent (speckit.implement)  
-**Purpose:** Template for T048 when pre-review gates clear.
+**Prepared:** 2026-06-13 (independent review GO)
+**Evidence commit:** `08f7d14` on `v8/stel-architecture` (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`)
+**Producer:** Cursor agent (speckit.implement)
+**Independent reviewer:** Codex agent (OpenAI GPT-5)
+**Purpose:** Completed T048 independent §12A review record.
 
 **Do not sign if you authored the artifacts below.**
 
@@ -17,7 +18,7 @@
 |------|--------|----------|
 | **B-A019** | **CLOSED** | L0 A/B complete — [A-019](./A-019-l0-surface-choice.md), [battery](./A-019-l0-ab-results.json) |
 | **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `08f7d14` |
-| **B-SIGNOFF** | **LATENT** | Request independent review; record GO/NO-GO |
+| **B-SIGNOFF** | **CLOSED** | Independent review GO — Codex agent |
 
 **Normative sequence:** close A-019 → refresh packet/signoff → request human review → record GO/NO-GO.
 
@@ -25,7 +26,7 @@
 
 ## 1. Start here (when gates clear — ≤15 min dry-run)
 
-1. Read producer decision stub: [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md) — current decision **NO-GO**
+1. Read decision record: [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md) — **GO**
 2. Scan checklist: [phase0-12a-evidence-index.md](./phase0-12a-evidence-index.md) §12A table
 3. Verify scope: [phase0-12a-scope-boundary.md](./phase0-12a-scope-boundary.md) (`src/stel/**` untouched)
 4. Binding §12A: [v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A
@@ -76,10 +77,10 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 | 11 | **A-019 L0 locked** | **VALIDATED** (compact-3) | No |
 | 12–14 | A-006, A-012, P-FF docs | **DOC PASS** | No |
 | 15–16 | A-030, ideation | **PASS** | No |
-| 17 | §9 no OPEN blockers | **PARTIAL** (B-SIGNOFF only) | No |
-| 18 | Independent sign-off | **NOT REQUESTED** | Yes |
+| 17 | §9 no OPEN blockers | **PASS** | No |
+| 18 | Independent sign-off | **GO** (Codex agent) | No |
 
-**Producer coverage:** **16 / 18** satisfied for strict §12A (independent sign-off not counted).
+**Producer coverage:** **17 / 18** satisfied for strict §12A (RESULTS.md §8.7 deferred only).
 
 ---
 
@@ -87,10 +88,10 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 
 | ID | Status | Note |
 |----|--------|------|
-| **B-SIGNOFF** | **LATENT** | Independent review ready to solicit; not requested |
+| **B-SIGNOFF** | **CLOSED** | Independent review GO — Codex agent (2026-06-13) |
 | **B-HYGIENE** | **CLOSED** | Aligned at `08f7d14` |
 
-**Closed:** B-A019, B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025  
+**Closed:** B-A019, B-SIGNOFF, B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025
 **Deferred:** B-RESULTS
 
 ---
@@ -126,6 +127,6 @@ blocking_gaps: []
 notes: "<A-004 spot-checks; A-019 path A or B accepted>"
 ```
 
-**Producer attestation:** Not independently reviewed. **Sign-off not requested** (ready to solicit).
+**Producer attestation:** Independent review completed by Codex agent (not the evidence producer).
 
-**First `src/stel/` commit:** **NOT AUTHORIZED**
+**First `src/stel/` commit:** **AUTHORIZED**

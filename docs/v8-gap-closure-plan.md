@@ -424,7 +424,7 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 
 **Hard rule:** `src/stel/` starts only when **§12A** is 100% `[x]`. **§12B** blocks Phase 4 / 8.1 only — not Phase 1.
 
-**Progress (2026-06-13):** Evidence `08f7d14` (A-019 bundle `f26f28b`; remediation `e9f4102`). A-019 **VALIDATED**. B-A019 **closed**. **NO-GO** — independent sign-off not obtained; review **ready to solicit**.
+**Progress (2026-06-13):** Evidence `08f7d14`. **GO** — independent sign-off (Codex agent). A-019 **VALIDATED**. First `src/stel/` commit **authorized**. B-RESULTS **deferred** (not Phase 0 gate).
 
 ### §12A — Before first `src/stel/` commit (Phase 1 pre-flight)
 
@@ -455,11 +455,9 @@ No phase starts if any **blocking** assumption for that phase is OPEN.
 - [x] P-FF + eligible H6 rules **documented** in golden-file README (implementation of 4 bypass rows may wait for §12B) — [`docs/research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md)
 - [x] Phase crosswalk reviewed (A-030) — [`docs/research/A-030-phase-crosswalk.md`](research/A-030-phase-crosswalk.md)
 - [x] Decision log updated in ideation.md — 2026-06-13 Phase 0 §12A entry
-- [ ] No OPEN assumption blocks Phase 1 per §9 — A-019 closed; **B-SIGNOFF** remains — see [`phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md)
+- [x] No OPEN assumption blocks Phase 1 per §9 — independent GO recorded — [`phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md)
 
-**Phase 0 blockers (2026-06-13):** **B-SIGNOFF** (latent — independent review ready to solicit). B-A019 **closed**. B-SFBENCH **closed**. RESULTS.md §8.7 **deferred**.
-
-**Only when every §12A box is checked → first commit in `src/stel/`.**
+**Phase 0 blockers (2026-06-13):** **None** (§12A GO). B-RESULTS **deferred** (post-8.0). First commit in `src/stel/` **authorized**.
 
 ### §12B — Before Phase 4 / 8.1.0 (quality + deploy pre-flight)
 

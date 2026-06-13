@@ -1,10 +1,11 @@
 # Phase 0 §12A — independent reviewer sign-off
 
 **Tasks:** T005, T011–T014, T046–T049  
-**Updated:** 2026-06-13 (A-019 L0 A/B closed)  
+**Updated:** 2026-06-13 (independent review GO)
+
 **Evidence commit:** `08f7d14` on `v8/stel-architecture` (A-019 bundle `f26f28b`; remediation `e9f4102` / `c3581a5`)
 
-> **Independent review: NOT REQUESTED** — A-019 closed; review **ready to solicit**. Producer has not self-signed.
+> **Independent review: GO** — Codex agent independently reviewed the packet and completed the minimum checks. Producer has not self-signed.
 
 ---
 
@@ -37,17 +38,16 @@
 
 | Field | Value |
 |-------|-------|
-| Satisfied (strict §12A) | 16 |
+| Satisfied (strict §12A) | 17 |
 | Total applicable | 18 |
 | Exempt | 0 |
 | Pre-review gates open | 0 |
-| Sign-off | NOT REQUESTED |
+| Sign-off | GO |
 
-### Not counted satisfied (2)
+### Not counted satisfied (1)
 
 | Item | Reason |
 |------|--------|
-| Sign-off | Latent — ready to solicit |
 | RESULTS.md §8.7 | Deferred (not Phase 0 gate) |
 
 ---
@@ -65,7 +65,7 @@
 
 | ID | Type | Reason |
 |----|------|--------|
-| B-SIGNOFF | latent | Independent reviewer required for GO — **ready to solicit, not requested** |
+| — | — | None |
 
 ### Deferred
 
@@ -84,12 +84,13 @@
 | B-A005 | closed | VALIDATED — 891 B compact |
 | B-A025 | closed | VALIDATED — edit ≤1.5 kB |
 | B-A019 | closed | VALIDATED — compact-3 wins L0 A/B |
+| B-SIGNOFF | closed | Independent review completed by Codex agent |
 
 ---
 
 ## Reviewer instructions (T014)
 
-**Active.** B-A019 closed. Minimum checks: review packet §7.
+**Completed.** B-A019 closed. Minimum checks from review packet §7 passed.
 
 - 7.x bench is informational only
 - In-repo evidence is canonical; B-SFBENCH closed
@@ -112,24 +113,25 @@
 | Field | Value |
 |-------|-------|
 | Evidence producer | Cursor agent (speckit.implement) |
-| Independent reviewer | **NOT REQUESTED** (ready to solicit) |
-| Sign-off reference | — |
+| Independent reviewer | Codex agent (OpenAI GPT-5) |
+| Sign-off reference | `docs/research/phase0-12a-review-signoff.md#final-decision-t049` |
 
-**T048 status:** **PENDING** — A-019 closed; solicit independent reviewer (producer cannot self-sign).
+**T048 status:** **PASS** — independent reviewer is not the evidence producer.
 
 ---
 
 ## Final decision (T049)
 
 ```yaml
-decision: NO-GO
+decision: GO
 decision_date: 2026-06-13
-independent_reviewer: null
-sign_off_reference: null
-independent_review_requested: false
+independent_reviewer: Codex agent (OpenAI GPT-5)
+sign_off_reference: docs/research/phase0-12a-review-signoff.md#final-decision-t049
+independent_review_requested: true
 checklist_coverage:
-  satisfied_strict: 16
+  satisfied_strict: 17
   total_applicable: 18
+  deferred_non_blocking: 1
 pre_review_gates:
   - id: B-A019
     status: closed
@@ -138,9 +140,7 @@ pre_review_gates:
     status: closed
     reason: evidence commit references aligned at 08f7d14
 blocking_gaps: []
-latent_gaps:
-  - id: B-SIGNOFF
-    reason: independent sign-off required for GO
+latent_gaps: []
 superseded_gaps:
   - id: B-SFBENCH
     reason: in-repo evidence path active
@@ -156,12 +156,18 @@ validated_assumptions:
   - A-005
   - A-019
 interim_assumptions: []
-next_actions:
-  - Request independent review
-  - Record GO or NO-GO
+review_evidence:
+  a001_session_net_accepted_run1: 14389
+  a001_session_net_accepted_run2: 14389
+  a004_spot_checked_rows: 5
+  a004_spot_check_result: pass
+  a005_compact_schema_bytes: 891
+  routes_golden_validation: "PASS 36 rows, 4 P-FF, 13 reviewed notes"
+  a019_winner: compact-3
+next_actions: []
 ```
 
-**First `src/stel/` commit:** **NOT AUTHORIZED**
+**First `src/stel/` commit:** **AUTHORIZED**
 
 ---
 
@@ -171,5 +177,5 @@ next_actions:
 |------|--------|
 | Phase 0 evidence bundle | **Done** (`08f7d14`; A-019 `f26f28b`) |
 | Close A-019 | **Done** ([A-019](./A-019-l0-surface-choice.md)) |
-| Request independent review | **Next** |
-| GO / NO-GO | **NO-GO** |
+| Request independent review | **Done** |
+| GO / NO-GO | **GO** |

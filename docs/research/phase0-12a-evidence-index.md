@@ -29,7 +29,7 @@ Independent reviewer handoff: [phase0-12a-independent-review-packet.md](./phase0
 
 | Area | Rule |
 |------|------|
-| `src/stel/**` | No implementation until §12A 100% green + independent GO |
+| `src/stel/**` | First commit **authorized** after independent §12A GO ([signoff](./phase0-12a-review-signoff.md)) |
 | Phase 4 deploy/admin | Out of scope (document dependencies only) |
 | AAP convenience work | Out of scope |
 | Phase 1 STEL runtime | Evidence-only; no controller/router code |
@@ -87,7 +87,7 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 | P-FF + eligible H6 documented | A-032 | [A-012-bypass-policy.md](./A-012-bypass-policy.md) | Golden README rules | **DOC PASS** |
 | Phase crosswalk (A-030) | A-030 | [A-030-phase-crosswalk.md](./A-030-phase-crosswalk.md) | Process evidence | **PASS** |
 | Decision log updated | — | [ideation.md](../ideation.md) | Decision log | **PASS** |
-| No OPEN assumption blocks Phase 1 | §9 | [stel-assumptions.md](../stel-assumptions.md) | Assumption register | **PARTIAL** (B-SIGNOFF only) |
+| No OPEN assumption blocks Phase 1 | §9 | [stel-assumptions.md](../stel-assumptions.md) | Assumption register | **PASS** (independent GO) |
 
 ---
 
@@ -136,12 +136,12 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 
 ## Blockers (summary)
 
-**Independent review:** **READY TO SOLICIT** — A-019 closed; **not yet requested** (see sequencing below).
+**Independent review:** **GO** — Codex agent (2026-06-13). See [signoff](./phase0-12a-review-signoff.md).
 
 | ID | Status | Reason |
 |----|--------|--------|
 | B-A019 | **CLOSED** | L0 A/B complete — compact-3 wins ([A-019](./A-019-l0-surface-choice.md)) |
-| B-SIGNOFF | **LATENT** | Independent reviewer required for GO; **ready to solicit** |
+| B-SIGNOFF | **CLOSED** | Independent review GO — Codex agent |
 | B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path |
 | B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline; not Phase 0 gate |
 | B-HYGIENE | **CLOSED** | Evidence commit references aligned at `08f7d14` |
@@ -150,10 +150,10 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 
 1. ~~**Close A-019**~~ — **done** ([A-019](./A-019-l0-surface-choice.md), [battery](./A-019-l0-ab-results.json)).
 2. ~~**Refresh** review packet + signoff~~ — **done** (`08f7d14`).
-3. **Request** independent review ([packet](./phase0-12a-independent-review-packet.md)).
-4. **Record** GO or NO-GO in [signoff](./phase0-12a-review-signoff.md).
+3. ~~**Request** independent review~~ — **done** (Codex agent).
+4. ~~**Record** GO or NO-GO~~ — **GO** ([signoff](./phase0-12a-review-signoff.md)).
 
-**Phase 0 decision:** **NO-GO** — no independent sign-off yet.
+**Phase 0 decision:** **GO** — independent sign-off recorded. **First `src/stel/` commit authorized.** Only deferred non-gate: B-RESULTS.
 
 ---
 
@@ -187,7 +187,7 @@ rg -n "NEEDS CLARIFICATION|\[FEATURE\]|\[###|ACTION REQUIRED|REMOVE IF UNUSED" s
 | A-005 H1 | **VALIDATED** | compact `tools/list` **891 B** ([A-005-schema-bytes.json](./A-005-schema-bytes.json)) |
 | A-019 | **VALIDATED** | compact-3 wins L0 A/B — [battery](./A-019-l0-ab-results.json) |
 | B-SFBENCH | **CLOSED** | In-repo path supersedes external sf-bench |
-| B-SIGNOFF | **LATENT** | Ready to solicit; not requested |
+| B-SIGNOFF | **CLOSED** | Independent review GO — Codex agent |
 
 ---
 

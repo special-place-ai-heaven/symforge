@@ -135,7 +135,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 
 ## Phase 0 §12A evidence links (2026-06-13)
 
-Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index: [`research/phase0-12a-evidence-index.md`](research/phase0-12a-evidence-index.md). Decision: **NO-GO** — [`research/phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md).
+Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index: [`research/phase0-12a-evidence-index.md`](research/phase0-12a-evidence-index.md). Decision: **GO** — [`research/phase0-12a-review-signoff.md`](research/phase0-12a-review-signoff.md).
 
 | ID | Artifact | Verdict | Notes |
 |----|----------|---------|-------|
