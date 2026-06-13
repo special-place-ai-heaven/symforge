@@ -12,12 +12,18 @@
 //! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S7).
 
 pub mod envelope;
+pub mod golden_replay;
 pub mod handler;
 pub mod surface;
 pub mod surface_list;
 pub mod types;
 
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
+pub use golden_replay::{
+    GOLDEN_ROUTES_FIXTURE, ReplayValidation, S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS,
+    corpus_for_row_id, load_golden_rows, parse_golden_rows, s4_exit_rows,
+    validate_s4_replay_output,
+};
 pub use handler::{
     StubServeMetrics, envelope_for_stub_serve, estimate_tokens, format_preview_body,
     prepend_envelope, stub_plan_summary,
