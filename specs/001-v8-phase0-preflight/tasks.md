@@ -171,7 +171,7 @@
 
 ### Post-implementation doc refresh (2026-06-13)
 
-Producer closed A-019 via full L0 A/B (`scripts/phase0-l0-ab-battery.cjs`). **Independent review not requested** — ready to solicit after evidence-commit refresh. Sequence: refresh docs → request review → T048/T049.
+Producer closed A-019 via L0 A/B; evidence commit `f26f28b` (includes `e9f4102`). **Independent review not requested** — ready to solicit. Sequence: request review → T048/T049.
 
 ---
 
