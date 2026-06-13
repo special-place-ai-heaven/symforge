@@ -8061,8 +8061,12 @@ impl SymForgeServer {
 
     #[tool(
         name = "symforge_edit",
-        description = "STEL structural edit facade — symbol-aware edits with economics gate (Phase 1 preview-only via dry_run).",
-        annotations(read_only_hint = true, open_world_hint = false)
+        description = "STEL structural edit facade — symbol-aware edits with economics gate; preview by default, apply:true commits.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) async fn symforge_edit_facade_tool(
         &self,
@@ -8222,14 +8226,23 @@ impl SymForgeServer {
         self.session_context
             .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
 
-        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
+        let outcome_class = Self::classify_symforge_edit_outcome(&tool_body, apply, &body);
+        statused_tool_result(output, outcome_class)
+    }
+
+    fn classify_symforge_edit_outcome(tool_body: &str, apply: bool, full_body: &str) -> OutcomeClass {
+        if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
         } else if tool_body.starts_with("Index not loaded.") {
             OutcomeClass::InternalFailure
+        } else if apply
+            && (full_body.contains("Write mode: failed")
+                || tool_body.contains(": edit safety blocked"))
+        {
+            OutcomeClass::InternalFailure
         } else {
             OutcomeClass::Found
-        };
-        statused_tool_result(output, outcome_class)
+        }
     }
 
     #[tool(

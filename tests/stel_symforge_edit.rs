@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
+use symforge::protocol::result_status::RESULT_STATUS_META_KEY;
 use symforge::stel::StelEditRequest;
 
 static COMPACT_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -46,6 +47,12 @@ fn tool_result_text(result: &serde_json::Value) -> &str {
         .expect("symforge_edit result must contain text content")
 }
 
+fn outcome_class(result: &serde_json::Value) -> &str {
+    result["_meta"][RESULT_STATUS_META_KEY]["outcome_class"]
+        .as_str()
+        .expect("symforge_edit result must include result_status outcome_class")
+}
+
 fn server_for_repo(root: &Path, project: &str) -> SymForgeServer {
     let shared = LiveIndex::load(root).unwrap_or_else(|error| {
         panic!("index {}: {error}", root.display());
@@ -71,18 +78,39 @@ fn temp_rust_repo(content: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, file)
 }
 
-async fn dispatch_symforge_edit(server: &SymForgeServer, request: &StelEditRequest) -> String {
+fn temp_markdown_repo(content: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join(".git")).expect("create .git");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src");
+    let file = src.join("doc.md");
+    std::fs::write(&file, content).expect("write doc.md");
+    (dir, file)
+}
+
+async fn dispatch_symforge_edit_result(
+    server: &SymForgeServer,
+    request: &StelEditRequest,
+) -> serde_json::Value {
     let params = serde_json::to_value(request).expect("serialize edit request");
     let result = server
         .dispatch_tool_result_for_tests("symforge_edit", params)
         .await
         .expect("symforge_edit dispatch");
-    let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
-    tool_result_text(&serialized).to_string()
+    serde_json::to_value(&result).expect("serialize CallToolResult")
+}
+
+async fn dispatch_symforge_edit(server: &SymForgeServer, request: &StelEditRequest) -> String {
+    tool_result_text(&dispatch_symforge_edit_result(server, request).await).to_string()
 }
 
 #[tokio::test]
 async fn symforge_edit_rejects_non_compact_surface() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-non-compact");
     let output = dispatch_symforge_edit(
@@ -403,4 +431,81 @@ async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
         "second apply should replay stored result without rewriting:\n{second}"
     );
     assert_eq!(after_first, std::fs::read(&file_path).unwrap());
+}
+
+#[tokio::test]
+async fn symforge_edit_rejects_absolute_and_scheme_paths() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let (dir, file_path) = temp_rust_repo("fn foo() {}\n");
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-absolute-paths");
+
+    let cases = [
+        ("/tmp/x.rs", "not absolute"),
+        (r"C:\temp\x.rs", "drive or scheme"),
+        ("file:///tmp/x.rs", "drive or scheme"),
+    ];
+
+    for (path, needle) in cases {
+        let output = dispatch_symforge_edit(
+            &server,
+            &StelEditRequest {
+                path: path.to_string(),
+                symbol: Some("foo".to_string()),
+                body: Some("fn foo() {}".to_string()),
+                apply: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            output.contains(needle),
+            "path `{path}` should be rejected ({needle}):\n{output}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(&file_path).unwrap(),
+            "path `{path}` must not write"
+        );
+    }
+}
+
+#[tokio::test]
+async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "# foo\n\nOld section body.\n";
+    let (dir, file_path) = temp_markdown_repo(original);
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-failed-apply");
+
+    let result = dispatch_symforge_edit_result(
+        &server,
+        &StelEditRequest {
+            path: "src/doc.md".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("# foo\n\nNew section body.\n".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = tool_result_text(&result);
+    assert!(
+        output.contains("Write mode: failed") || output.contains("edit safety blocked"),
+        "expected failed guarded apply output:\n{output}"
+    );
+    assert_ne!(
+        outcome_class(&result),
+        "found",
+        "failed guarded apply must not classify as Found:\n{output}"
+    );
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
 }

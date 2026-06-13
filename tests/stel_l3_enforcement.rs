@@ -153,6 +153,12 @@ async fn pff_golden_rows_bypass_without_legacy_tool_execution() {
         if !output.contains("Host read:") {
             failures.push(format!("{id}: missing host-read instruction"));
         }
+        if !output.contains("(whole file)") {
+            failures.push(format!("{id}: P-FF bypass must request whole-file host read"));
+        }
+        if output.contains("lines 1-50") {
+            failures.push(format!("{id}: P-FF bypass must not cap host read at lines 1-50"));
+        }
         if output.contains("Chosen tool:") {
             failures.push(format!("{id}: must not dispatch legacy tool (Chosen tool present)"));
         }

@@ -197,7 +197,9 @@ pub struct StelBypassBody {
     pub action: String,
     pub path: String,
     pub start_line: u32,
-    pub end_line: u32,
+    /// `None` means whole-file host read (P-FF whole-file bypass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
     pub predicted_manual_tokens: u32,
     pub predicted_symforge_tokens: u32,
     pub reason: String,

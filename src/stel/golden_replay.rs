@@ -279,6 +279,12 @@ pub fn validate_pff_replay_output(row: &GoldenRouteRow, output: &str) -> ReplayV
     if !output.contains("did not execute a legacy tool") {
         errors.push("missing bypass host-read instruction".to_string());
     }
+    if output.contains("lines 1-50") {
+        errors.push("P-FF whole-file bypass must not cap host read at lines 1-50".to_string());
+    }
+    if !output.contains("(whole file)") {
+        errors.push("P-FF bypass must instruct whole-file host read".to_string());
+    }
     if output.contains("Index not loaded.") {
         errors.push("index was not loaded".to_string());
     }

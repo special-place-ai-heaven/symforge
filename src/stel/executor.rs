@@ -18,13 +18,24 @@ pub fn format_bypass_body(decision: &StelDecision) -> String {
     format_bypass_body_from(bypass, &decision.decision_reason)
 }
 
+fn format_host_read_line(bypass: &StelBypassBody) -> String {
+    match bypass.end_line {
+        Some(end) => format!(
+            "Host read: `{}` lines {}-{end}",
+            bypass.path, bypass.start_line
+        ),
+        None => format!("Host read: `{}` (whole file)", bypass.path),
+    }
+}
+
 fn format_bypass_body_from(bypass: &StelBypassBody, decision_reason: &str) -> String {
     let json = serde_json::to_string_pretty(bypass).expect("StelBypassBody serializes");
+    let host_read = format_host_read_line(bypass);
     format!(
         "Decision: bypass\n\
          Economics: bypass ({decision_reason})\n\
          Action: {}\n\
-         Host read: `{}` lines {}-{}\n\
+         {host_read}\n\
          Predicted manual tokens: {}\n\
          Predicted SymForge tokens avoided: {}\n\
          \n\
@@ -34,9 +45,6 @@ fn format_bypass_body_from(bypass: &StelBypassBody, decision_reason: &str) -> St
          --- bypass payload ---\n\
          {json}",
         bypass.action,
-        bypass.path,
-        bypass.start_line,
-        bypass.end_line,
         bypass.predicted_manual_tokens,
         bypass.predicted_symforge_tokens,
         path = bypass.path,
@@ -65,7 +73,7 @@ mod tests {
         assert!(is_enforced_bypass(&decision));
         let body = format_bypass_body(&decision);
         assert!(body.contains("Decision: bypass"));
-        assert!(body.contains("Host read: `lib.rs`"));
+        assert!(body.contains("Host read: `lib.rs` (whole file)"));
         assert!(body.contains("did not execute a legacy tool"));
         assert!(!body.contains("Chosen tool:"));
     }

@@ -190,7 +190,7 @@ pub fn detect_pff_bypass(request: &StelRequest) -> Option<StelBypassBody> {
         action: "host_read".to_string(),
         path: path.clone(),
         start_line: 1,
-        end_line: 50,
+        end_line: None,
         predicted_manual_tokens: 320,
         predicted_symforge_tokens: COMPACT_SCHEMA_TOKENS + COMPACT_INVOKE_TOKENS + 256,
         reason: format!("policy=P-FF whole-file review; host_read `{path}`"),
@@ -300,6 +300,11 @@ mod tests {
             let decision = evaluate_plan(&request, &plan);
             assert_eq!(decision.decision, AdmissionDecision::Bypass, "{id}");
             assert!(decision.bypass.is_some(), "{id} bypass body");
+            let bypass = decision.bypass.as_ref().expect("bypass body");
+            assert_eq!(
+                bypass.end_line, None,
+                "{id} P-FF bypass must request whole-file host read"
+            );
             assert_eq!(row.eligible_h6, Some(false));
             let estimate = build_estimate(&request, &plan, &decision);
             assert!(!estimate.recommended, "{id} should not recommend serve");

@@ -117,6 +117,11 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
 
 #[tokio::test]
 async fn status_rejects_non_compact_surface() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-non-compact");
     let output = dispatch_status(&server, None).await;
     assert!(
@@ -132,7 +137,9 @@ async fn compact_status_reports_operational_state() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-compact");
@@ -162,7 +169,9 @@ async fn full_status_includes_project_and_ledger_summary() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
