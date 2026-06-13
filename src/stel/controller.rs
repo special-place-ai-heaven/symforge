@@ -1,6 +1,6 @@
 //! STEL L2 economics controller — evaluate [`StelPlan`] → [`StelDecision`] / [`StelEstimate`].
 //!
-//! Phase 1 slice: decision and economics metadata only; L3 execution is not gated here yet.
+//! Phase 1 slice: economics scoring; P-FF bypass is enforced in [`super::executor`].
 
 use super::types::{
     AdmissionDecision, GoldenRouteRow, StelBypassBody, StelDecision, StelEstimate, StelPlan,
@@ -59,7 +59,7 @@ pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
         )
     } else {
         format!(
-            "predicted_net={} <= margin={} (metadata only; L3 not gated)",
+            "predicted_net={} <= margin={} (non-P-FF bypass metadata; L3 not gated)",
             economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
         )
     };

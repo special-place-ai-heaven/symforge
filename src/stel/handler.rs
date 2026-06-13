@@ -1,4 +1,4 @@
-//! Phase 1 S4+ — `symforge` response envelope wiring (L1 planner + L2 economics metadata).
+//! Phase 1 S4+ — `symforge` response envelope wiring (L1 planner + L2 economics + L3 bypass).
 
 use super::controller::{build_estimate, estimate_economics, EconomicsBreakdown};
 use super::envelope::{TrustEnvelopeInput, format_trust_envelope};
@@ -28,7 +28,7 @@ pub struct DecisionEnvelopeMetrics {
 /// Back-compat alias for older call sites/tests.
 pub type StubServeMetrics = DecisionEnvelopeMetrics;
 
-/// Build the trust envelope from L2 economics (execution may still run — gating deferred).
+/// Build the trust envelope from L2 admission and economics.
 pub fn envelope_for_decision(metrics: &DecisionEnvelopeMetrics) -> String {
     format_trust_envelope(&TrustEnvelopeInput {
         plan_summary: metrics.plan_summary.clone(),

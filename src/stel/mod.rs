@@ -8,11 +8,12 @@
 //!   tool name. Measurement schemas remain in [`crate::protocol::surface_probe`].
 //! - **L1:** [`planner::build_plan`] maps [`StelRequest`] → [`StelPlan`] (S5).
 //! - **L2:** [`controller::evaluate_plan`] scores plans → [`StelDecision`] economics metadata (S6).
-//! - **L3:** legacy tool dispatch via [`crate::protocol::SymForgeServer`] (S4+).
-//! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S7).
+//! - **L3:** [`executor::is_enforced_bypass`] skips legacy dispatch for P-FF bypass (S7).
+//! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S8).
 
 pub mod controller;
 pub mod envelope;
+pub mod executor;
 pub mod golden_replay;
 pub mod handler;
 pub mod planner;
@@ -30,6 +31,7 @@ pub use controller::{
     build_estimate, detect_pff_bypass, estimate_economics, evaluate_plan, EconomicsBreakdown,
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, SERVE_MARGIN_TOKENS,
 };
+pub use executor::{format_bypass_body, is_enforced_bypass};
 pub use handler::{
     DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,
     estimate_tokens, format_preview_body, format_preview_body_for_plan, format_preview_estimate,

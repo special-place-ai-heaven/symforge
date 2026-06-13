@@ -7962,13 +7962,14 @@ impl SymForgeServer {
         self.symforge_stel_handler(&params.0.request).await
     }
 
-    /// Production compact-surface `symforge` path (S4+): L1 plan → legacy tool dispatch, prepend trust envelope.
+    /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.
     async fn symforge_stel_handler(
         &self,
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
         use crate::stel::controller::{build_estimate, evaluate_plan};
+        use crate::stel::executor::{format_bypass_body, is_enforced_bypass};
         use crate::stel::handler::{self, metrics_for_decision};
         use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
 
@@ -8002,7 +8003,23 @@ impl SymForgeServer {
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
-        // L2 metadata only: execute planned L3 step regardless of admission (enforcement deferred).
+        if is_enforced_bypass(&decision) {
+            let body = format_bypass_body(&decision);
+            let response_tokens = handler::estimate_tokens(&body);
+            let metrics = metrics_for_decision(
+                plan_summary,
+                &decision,
+                &plan,
+                response_tokens,
+                session_net,
+            );
+            let envelope = handler::envelope_for_decision(&metrics);
+            let output = handler::prepend_envelope(&envelope, &body);
+            self.session_context
+                .record_summary_output("symforge", response_tokens);
+            return statused_tool_result(output, OutcomeClass::Found);
+        }
+
         let tool_body = self
             .dispatch_tool_for_tests(&step.tool, step.args.clone())
             .await;
