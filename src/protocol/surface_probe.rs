@@ -2,11 +2,14 @@
 //!
 //! When `SYMFORGE_SURFACE=compact`, `tools/list` advertises three STEL-shaped tools
 //! with draft schemas from `docs/stel-schema.md`. Does not implement STEL execution.
+//! `SYMFORGE_SURFACE=meta` exposes a single-tool meta-1 facade for A-019 L0 A/B.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::Tool;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::SymForgeServer;
@@ -15,6 +18,7 @@ use super::SymForgeServer;
 pub enum SurfaceProfile {
     Full,
     Compact,
+    Meta,
 }
 
 pub fn surface_profile_from_env() -> SurfaceProfile {
@@ -23,14 +27,20 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
         .map(|v| v.to_ascii_lowercase())
     {
         Some(ref s) if s == "compact" => SurfaceProfile::Compact,
+        Some(ref s) if s == "meta" => SurfaceProfile::Meta,
         _ => SurfaceProfile::Full,
     }
 }
 
 pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
     match profile {
-        SurfaceProfile::Full => SymForgeServer::tool_router().list_all(),
+        SurfaceProfile::Full => SymForgeServer::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|tool| tool.name.as_ref() != "symforge")
+            .collect(),
         SurfaceProfile::Compact => compact_probe_tools(),
+        SurfaceProfile::Meta => meta_probe_tools(),
     }
 }
 
@@ -51,27 +61,72 @@ fn probe_tool(name: &'static str, description: &'static str, input_schema: Value
     tool
 }
 
+fn symforge_facade_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string" },
+            "intent": {
+                "type": "string",
+                "enum": ["auto", "orient", "find", "read", "trace", "impact", "meta"]
+            },
+            "path": { "type": "string" },
+            "symbol": { "type": "string" },
+            "max_tokens": { "type": "integer", "minimum": 64 },
+            "preview": { "type": "boolean" }
+        },
+        "required": ["query"]
+    })
+}
+
+/// Phase 0 A-019 battery input. `_probe_*` fields are harness-only (serde accepts; not in schema).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct StelFacadeProbeInput {
+    pub query: String,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default, rename = "_probe_legacy_tool")]
+    pub probe_legacy_tool: Option<String>,
+    #[serde(default, rename = "_probe_legacy_args")]
+    pub probe_legacy_args: Option<Value>,
+}
+
+/// Resolve a compact/meta `symforge` facade call to a legacy L3 tool for measurement relay.
+pub fn resolve_facade_probe(input: &StelFacadeProbeInput) -> Result<(String, Value), String> {
+    let legacy_tool = input
+        .probe_legacy_tool
+        .as_deref()
+        .ok_or_else(|| {
+            "Phase 0 facade relay requires `_probe_legacy_tool` (A-019 battery harness only)"
+                .to_string()
+        })?;
+    let legacy_args = input.probe_legacy_args.clone().ok_or_else(|| {
+        "Phase 0 facade relay requires `_probe_legacy_args` (A-019 battery harness only)"
+            .to_string()
+    })?;
+    Ok((legacy_tool.to_string(), legacy_args))
+}
+
+/// Single-tool meta-1 surface for A-019 L0 A/B (measurement only).
+pub fn meta_probe_tools() -> Vec<Tool> {
+    vec![probe_tool(
+        "symforge",
+        "STEL meta-tool facade (Phase 0 measurement probe)",
+        symforge_facade_schema(),
+    )]
+}
+
 /// Three-tool compact surface for H1 / A-005 measurement (not STEL runtime).
 pub fn compact_probe_tools() -> Vec<Tool> {
     vec![
         probe_tool(
             "symforge",
             "STEL read/explore facade (Phase 0 measurement probe)",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "intent": {
-                        "type": "string",
-                        "enum": ["auto", "orient", "find", "read", "trace", "impact", "meta"]
-                    },
-                    "path": { "type": "string" },
-                    "symbol": { "type": "string" },
-                    "max_tokens": { "type": "integer", "minimum": 64 },
-                    "preview": { "type": "boolean" }
-                },
-                "required": ["query"]
-            }),
+            symforge_facade_schema(),
         ),
         probe_tool(
             "symforge_edit",
@@ -159,5 +214,32 @@ mod tests {
             "full surface must expose legacy tool count; got {}",
             tools.len()
         );
+        assert!(
+            !tools.iter().any(|t| t.name == "symforge"),
+            "full surface must not advertise symforge facade"
+        );
+    }
+
+    #[test]
+    fn meta_surface_is_one_tool_under_h1_budget() {
+        let (count, bytes) = list_tools_schema_bytes(SurfaceProfile::Meta);
+        assert_eq!(count, 1, "meta-1 probe must expose exactly 1 tool");
+        assert!(
+            bytes <= 5000,
+            "meta tools/list JSON must be <= 5000 B (H1); got {bytes} B"
+        );
+    }
+
+    #[test]
+    fn facade_probe_requires_harness_fields() {
+        let input = StelFacadeProbeInput {
+            query: "x".to_string(),
+            intent: None,
+            path: None,
+            symbol: None,
+            probe_legacy_tool: None,
+            probe_legacy_args: None,
+        };
+        assert!(resolve_facade_probe(&input).is_err());
     }
 }

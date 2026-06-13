@@ -22,4 +22,10 @@ node scripts/phase0-mcp-battery.cjs target/debug/symforge.exe docs/research/A-00
 node scripts/phase0-mcp-battery.cjs target/debug/symforge.exe docs/research/A-001-tool-battery-run2.json
 ```
 
+## L0 A/B (A-019)
+
+```powershell
+node scripts/phase0-l0-ab-battery.cjs target/debug/symforge.exe docs/research/A-019-l0-ab-results.json
+```
+
 Golden route seed (36 rows): `node scripts/seed-routes-golden.cjs`

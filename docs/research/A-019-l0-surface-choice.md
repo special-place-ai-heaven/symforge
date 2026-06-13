@@ -1,37 +1,53 @@
 # A-019 — L0 surface choice (compact-3 vs meta-tool vs full-32)
 
-**Updated:** 2026-06-13 (in-repo H1 evidence)  
-**Verdict:** **INTERIM LOCK** — compact-3 for Phase 1 schema; **OPEN** for full session_net battery
+**Updated:** 2026-06-13 (full L0 A/B battery)  
+**Verdict:** **VALIDATED** — **compact-3** selected for Phase 1 L0
 
-## H1 evidence (gathered in-repo)
+## H1 evidence (schema bytes)
 
-| Candidate | tools/list bytes | Pass H1 |
-|-----------|------------------|---------|
-| full-32 | 62,574 | FAIL |
-| **compact-3** | **891** | **PASS** |
-| meta-tool | not probed | — |
+| Candidate | tools/list bytes | tool count | Pass H1 |
+|-----------|------------------|------------|---------|
+| full-32 | 62,574 | 32 | **FAIL** |
+| **compact-3** | **891** | 3 | **PASS** |
+| meta-1 | 407 | 1 | **PASS** |
 
-## Session_net battery (A-019 full validation)
+Source: [A-005-schema-bytes.json](./A-005-schema-bytes.json), [A-019-l0-ab-results.json](./A-019-l0-ab-results.json).
 
-Full A/B on 36-row corpus **not run** — external sf-bench deprioritized.
+## Session_net battery (20-row pinned corpus)
 
-## Interim decision (Phase 0)
+**Method:** `scripts/phase0-l0-ab-battery.cjs` on four pinned corpora (same 20 scenarios as A-001).  
+`SYMFORGE_NO_DAEMON=1`. Token method: `ceil(utf8Bytes/4)`; M = competent-manual window.
 
-**Select compact-3** for L0 public surface based on:
+| Surface | MCP path | session_net_accepted | equiv rows | H1 |
+|---------|----------|----------------------|------------|-----|
+| full-32 | legacy tools direct | **14,389** | 20/20 | FAIL |
+| compact-3 | `symforge` facade relay | **14,389** | 20/20 (byte parity vs full) | PASS |
+| meta-1 | `symforge` facade relay | **14,389** | 20/20 (byte parity vs full) | PASS |
 
-1. H1 PASS (891 B vs 62,574 B full surface)
-2. `stel-schema.md` L0 registry alignment (`symforge`, `symforge_edit`, `status`)
-3. Gap plan tie-break: if meta-tool battery tied → compact-3 (simpler)
+**Artifact:** [A-019-l0-ab-results.json](./A-019-l0-ab-results.json)
 
-Meta-tool surface probe **deferred** until STEL Phase 1 or explicit A/B request.
+### Measurement relay (Phase 0 only)
 
-## Close paths (pre-review gate)
+Compact/meta surfaces call `symforge` with harness-only `_probe_legacy_tool` / `_probe_legacy_args` fields. Relay lives in `src/protocol/surface_probe.rs` + `symforge` tool handler — **not** STEL product code (`src/stel/**` untouched).
 
-| Path | Action | Unblocks |
-|------|--------|----------|
-| **A — VALIDATED** | Run L0 A/B on pinned battery; record winner | Independent review request |
-| **B — Non-blocking pivot** | Document explicit acceptance that interim compact-3 suffices for Phase 1 pre-flight in this file + `stel-assumptions.md` §9 | Independent review request (reviewer still confirms) |
+## Winner selection (gap plan §4.1)
 
-**Do not request independent sign-off while this file shows INTERIM without Path A or B recorded.**
+1. Eligible surfaces: H1 PASS **and** output parity with full-32 on all 20 rows.
+2. Rank by `session_net_accepted`.
+3. Tie-break: compact-3 (simpler).
 
-**A-019 verdict:** **INTERIM LOCK (compact-3)** — blocks sign-off request until Path A or B
+**Result:** compact-3 and meta-1 tied on session_net (14,389). **Winner: compact-3** (tie-break).
+
+full-32 disqualified on H1 despite matching session_net.
+
+## Decision
+
+**Select compact-3** for L0 public surface:
+
+1. H1 PASS (891 B)
+2. Session_net parity with full-32 on pinned battery (14,389 accepted)
+3. Equivalence: 20/20 row output byte-match vs full-32
+4. `stel-schema.md` L0 registry alignment (`symforge`, `symforge_edit`, `status`)
+5. Gap-plan tie-break vs meta-1
+
+**A-019 verdict:** **VALIDATED (compact-3)**

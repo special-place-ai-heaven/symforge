@@ -3,8 +3,8 @@
 **Feature:** [specs/001-v8-phase0-preflight](../../specs/001-v8-phase0-preflight/spec.md)  
 **Plan:** [plan.md](../../specs/001-v8-phase0-preflight/plan.md)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)  
-**Updated:** 2026-06-13 (review gate refresh)  
-**Evidence commit:** `e9f4102` on `v8/stel-architecture` (includes remediation bundle `c3581a5`)
+**Updated:** 2026-06-13 (A-019 L0 A/B closed)  
+**Evidence commit:** pending refresh after A-019 battery
 
 Central index for Section 12A pre-flight readiness. Final decision: [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md).  
 Independent reviewer handoff: [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md).
@@ -81,13 +81,13 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 | No beat/pin 7.21.1 baseline | — | [phase0-12a-scope-boundary.md](./phase0-12a-scope-boundary.md) | Scope evidence | **PASS** |
 | A-005 VALIDATED (H1) | A-005 | [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md) | Schema Measurement Record | **PASS** (891 B) |
 | A-025 VALIDATED (edit budget) | A-025 | [A-005-schema-bytes-summary.md](./A-005-schema-bytes-summary.md) | Schema Measurement Record | **PASS** |
-| A-019 VALIDATED (L0 locked) | A-019 | [A-019-l0-surface-choice.md](./A-019-l0-surface-choice.md) | Schema Measurement Record | **INTERIM** — **blocks sign-off request** |
+| A-019 VALIDATED (L0 locked) | A-019 | [A-019-l0-surface-choice.md](./A-019-l0-surface-choice.md) | Schema Measurement Record | **PASS** — compact-3 wins |
 | A-006/A-027 documented | A-006, A-027 | [A-006-host-schema.md](./A-006-host-schema.md) | Bypass/host policy | **DOC PASS** |
 | A-012 two-hop OR H3 serve-only | A-012 | [A-012-bypass-policy.md](./A-012-bypass-policy.md) | Bypass Policy Record | **DOC PASS** |
 | P-FF + eligible H6 documented | A-032 | [A-012-bypass-policy.md](./A-012-bypass-policy.md) | Golden README rules | **DOC PASS** |
 | Phase crosswalk (A-030) | A-030 | [A-030-phase-crosswalk.md](./A-030-phase-crosswalk.md) | Process evidence | **PASS** |
 | Decision log updated | — | [ideation.md](../ideation.md) | Decision log | **PASS** |
-| No OPEN assumption blocks Phase 1 | §9 | [stel-assumptions.md](../stel-assumptions.md) | Assumption register | **PARTIAL** (A-019 interim) |
+| No OPEN assumption blocks Phase 1 | §9 | [stel-assumptions.md](../stel-assumptions.md) | Assumption register | **PARTIAL** (B-SIGNOFF only) |
 
 ---
 
@@ -136,24 +136,24 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 
 ## Blockers (summary)
 
-**Independent review:** **NOT REQUESTED** until A-019 is closed or explicitly declared non-blocking (see sequencing below).
+**Independent review:** **READY TO SOLICIT** — A-019 closed; **not yet requested** (see sequencing below).
 
 | ID | Status | Reason |
 |----|--------|--------|
-| B-A019 | **OPEN** | L0 surface interim only (compact-3 on H1); full A/B not run — **primary gate** |
-| B-SIGNOFF | **LATENT** | Independent reviewer required for GO; **do not solicit until B-A019 clears** |
+| B-A019 | **CLOSED** | L0 A/B complete — compact-3 wins ([A-019](./A-019-l0-surface-choice.md)) |
+| B-SIGNOFF | **LATENT** | Independent reviewer required for GO; **ready to solicit** |
 | B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path |
 | B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline; not Phase 0 gate |
 | B-HYGIENE | **CLOSED** | Evidence commit references aligned at `e9f4102` |
 
 ### Sequencing (normative)
 
-1. **Close A-019** — run full L0 A/B **or** record explicit non-blocking declaration in [A-019](./A-019-l0-surface-choice.md) + [stel-assumptions.md](../stel-assumptions.md).
+1. ~~**Close A-019**~~ — **done** ([A-019](./A-019-l0-surface-choice.md), [battery](./A-019-l0-ab-results.json)).
 2. **Refresh** review packet + signoff for current evidence commit.
 3. **Request** independent review ([packet](./phase0-12a-independent-review-packet.md)).
 4. **Record** GO or NO-GO in [signoff](./phase0-12a-review-signoff.md).
 
-**Phase 0 decision:** **NO-GO** — A-019 interim + no independent sign-off.
+**Phase 0 decision:** **NO-GO** — no independent sign-off yet.
 
 ---
 
@@ -185,9 +185,9 @@ rg -n "NEEDS CLARIFICATION|\[FEATURE\]|\[###|ACTION REQUIRED|REMOVE IF UNUSED" s
 | A-004 | **VALIDATED** | [A-004-equiv-audit.md](./A-004-equiv-audit.md) — 0% FP+FN (n=20) |
 | A-028 | **VALIDATED** | [routes.golden.jsonl](../fixtures/routes.golden.jsonl) — 36 rows |
 | A-005 H1 | **VALIDATED** | compact `tools/list` **891 B** ([A-005-schema-bytes.json](./A-005-schema-bytes.json)) |
-| A-019 | **INTERIM** | compact-3 on H1 only — **blocks sign-off request** |
+| A-019 | **VALIDATED** | compact-3 wins L0 A/B — [battery](./A-019-l0-ab-results.json) |
 | B-SFBENCH | **CLOSED** | In-repo path supersedes external sf-bench |
-| B-SIGNOFF | **LATENT** | Not requested until A-019 closes or non-blocking pivot recorded |
+| B-SIGNOFF | **LATENT** | Ready to solicit; not requested |
 
 ---
 

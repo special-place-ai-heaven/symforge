@@ -7911,6 +7911,37 @@ impl SymForgeServer {
     }
 
     #[tool(
+        name = "symforge",
+        description = "Phase 0 STEL L0 facade probe (measurement relay only; not production STEL).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn symforge_facade_tool(
+        &self,
+        params: Parameters<super::surface_probe::StelFacadeProbeInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let (legacy_tool, legacy_args) =
+            match super::surface_probe::resolve_facade_probe(&params.0) {
+                Ok(route) => route,
+                Err(message) => {
+                    return Ok(
+                        ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(message),
+                    );
+                }
+            };
+        let output = self
+            .dispatch_tool_for_tests(&legacy_tool, legacy_args)
+            .await;
+        let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
+            OutcomeClass::InvalidRequest
+        } else if output.starts_with("Index not loaded.") {
+            OutcomeClass::InternalFailure
+        } else {
+            OutcomeClass::Found
+        };
+        statused_tool_result(output, outcome_class)
+    }
+
+    #[tool(
         description = "Show what symbols and files have been fetched this session. Returns a context inventory with token counts. Use to track your context budget and avoid re-fetching content you already have.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]

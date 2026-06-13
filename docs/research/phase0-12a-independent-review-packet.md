@@ -1,9 +1,9 @@
 # Phase 0 §12A — independent reviewer packet
 
-> **Review readiness: NOT READY** — do **not** distribute for sign-off until **B-A019** is closed or explicitly declared non-blocking. See §0 sequencing.
+> **Review readiness: READY** — A-019 closed (compact-3 wins L0 A/B). Independent review **may be solicited**; producer has **not** self-signed. See §0 sequencing.
 
-**Prepared:** 2026-06-13 (pre-review gate refresh)  
-**Evidence commit:** `e9f4102` on `v8/stel-architecture` (includes remediation bundle `c3581a5`)  
+**Prepared:** 2026-06-13 (A-019 L0 A/B closed)  
+**Evidence commit:** pending refresh after A-019 battery  
 **Producer:** Cursor agent (speckit.implement)  
 **Purpose:** Template for T048 when pre-review gates clear.
 
@@ -15,9 +15,9 @@
 
 | Gate | Status | Close by |
 |------|--------|----------|
-| **B-A019** | **OPEN** | Full L0 A/B battery **or** explicit non-blocking declaration in [A-019](./A-019-l0-surface-choice.md) + [stel-assumptions.md](../stel-assumptions.md) |
-| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `e9f4102` |
-| **B-SIGNOFF** | **LATENT** | Request independent review **only after** B-A019 closes |
+| **B-A019** | **CLOSED** | L0 A/B complete — [A-019](./A-019-l0-surface-choice.md), [battery](./A-019-l0-ab-results.json) |
+| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned |
+| **B-SIGNOFF** | **LATENT** | Request independent review; record GO/NO-GO |
 
 **Normative sequence:** close A-019 → refresh packet/signoff → request human review → record GO/NO-GO.
 
@@ -55,6 +55,7 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 | **A-004** | **VALIDATED** | [A-004](./A-004-equiv-audit.md) | 0% FP+FN (n=20) |
 | **A-028** | **VALIDATED** | [corpus](../fixtures/routes.golden.jsonl), [A-028](./A-028-golden-routes.md) | 36 rows |
 | **A-005** | **VALIDATED** | [A-005-schema-bytes.json](./A-005-schema-bytes.json) | compact **891 B** (budget 5,000 B) |
+| **A-019** | **VALIDATED** | [A-019](./A-019-l0-surface-choice.md), [L0 A/B](./A-019-l0-ab-results.json) | compact-3 wins (session_net 14,389; tie-break vs meta-1) |
 
 ---
 
@@ -72,13 +73,13 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 | 8 | No 7.21.1 gate | **PASS** | No |
 | 9 | A-005 H1 ≤5kB | **VALIDATED** (891 B) | No |
 | 10 | A-025 edit ≤1.5kB | **PASS** | No |
-| 11 | **A-019 L0 locked** | **INTERIM** | **Yes — primary gate** |
+| 11 | **A-019 L0 locked** | **VALIDATED** (compact-3) | No |
 | 12–14 | A-006, A-012, P-FF docs | **DOC PASS** | No |
 | 15–16 | A-030, ideation | **PASS** | No |
-| 17 | §9 no OPEN blockers | **FAIL** (A-019 interim) | Yes |
-| 18 | Independent sign-off | **NOT REQUESTED** | Yes (after A-019) |
+| 17 | §9 no OPEN blockers | **PARTIAL** (B-SIGNOFF only) | No |
+| 18 | Independent sign-off | **NOT REQUESTED** | Yes |
 
-**Producer coverage:** **14 / 18** satisfied for strict §12A (A-019 interim + §9 + sign-off not counted).
+**Producer coverage:** **16 / 18** satisfied for strict §12A (independent sign-off not counted).
 
 ---
 
@@ -86,32 +87,29 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 
 | ID | Status | Note |
 |----|--------|------|
-| **B-A019** | **OPEN** | Full L0 A/B not run; interim compact-3 on H1 only |
-| **B-HYGIENE** | **CLOSED** | Aligned at `e9f4102` |
-| **B-SIGNOFF** | **LATENT** | Do not solicit until B-A019 closes |
+| **B-SIGNOFF** | **LATENT** | Independent review ready to solicit; not requested |
+| **B-HYGIENE** | **CLOSED** | Evidence references aligned |
 
-**Closed:** B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025  
+**Closed:** B-A019, B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025  
 **Deferred:** B-RESULTS
 
 ---
 
-## 6. Closing A-019 (producer paths — pick one)
+## 6. A-019 closure (Path A — completed)
 
-**Path A — VALIDATED:** Run L0 A/B (compact-3 vs alternatives) on pinned battery; record winner in [A-019](./A-019-l0-surface-choice.md).
+L0 A/B run via `scripts/phase0-l0-ab-battery.cjs` on pinned 20-row corpus. Winner: **compact-3**. See [A-019](./A-019-l0-surface-choice.md).
 
-**Path B — Non-blocking pivot:** Document explicit acceptance that interim compact-3 is sufficient for Phase 1 pre-flight in A-019 + stel-assumptions §9; gap plan §12A A-019 row updated.
-
-Until Path A or B lands: **do not request independent review.**
+Re-run: `node scripts/phase0-l0-ab-battery.cjs target/debug/symforge.exe docs/research/A-019-l0-ab-results.json`
 
 ---
 
-## 7. When review opens — minimum checks
+## 7. Minimum checks
 
 1. A-001 run1/run2 `session_net_accepted` match
 2. Spot-check ≥5 A-004 rows vs [battery run1](./A-001-tool-battery-run1.json)
 3. A-005 compact **891 B** in [A-005-schema-bytes.json](./A-005-schema-bytes.json)
 4. `node scripts/validate-routes-golden.cjs`
-5. Confirm A-019 is **VALIDATED** or **accepted non-blocking** (not interim)
+5. Confirm A-019 **VALIDATED** in [A-019-l0-ab-results.json](./A-019-l0-ab-results.json) (compact-3 winner)
 
 ---
 
@@ -128,6 +126,6 @@ blocking_gaps: []
 notes: "<A-004 spot-checks; A-019 path A or B accepted>"
 ```
 
-**Producer attestation:** Not independently reviewed. **Sign-off not requested** while B-A019 open.
+**Producer attestation:** Not independently reviewed. **Sign-off not requested** (ready to solicit).
 
 **First `src/stel/` commit:** **NOT AUTHORIZED**

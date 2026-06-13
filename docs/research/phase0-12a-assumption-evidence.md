@@ -134,11 +134,11 @@ statement: "Selected L0 surface beats alternatives on session_net and equivalenc
 phase_blocked: [0, 1]
 validation:
   kind: performance
-  method: "A/B compact-3 vs meta-tool vs full-32 on pinned battery"
+  method: "A/B compact-3 vs meta-1 vs full-32 on pinned 20-row battery"
   artifact: docs/research/A-019-l0-surface-choice.md
-verdict: INTERIM
-validated_at: null
-notes: "Interim lock compact-3 on H1 (891 B); full L0 A/B battery pending"
+verdict: VALIDATED
+validated_at: 2026-06-13
+notes: "compact-3 wins (session_net 14389 tied with meta-1; H1 PASS 891 B; tie-break simpler)"
 ```
 
 ---

@@ -1,10 +1,10 @@
 # Phase 0 §12A — independent reviewer sign-off
 
 **Tasks:** T005, T011–T014, T046–T049  
-**Updated:** 2026-06-13 (pre-review gate refresh)  
-**Evidence commit:** `e9f4102` on `v8/stel-architecture` (includes remediation bundle `c3581a5`)
+**Updated:** 2026-06-13 (A-019 L0 A/B closed)  
+**Evidence commit:** pending refresh after A-019 battery
 
-> **Independent review: NOT REQUESTED** — A-019 interim blocks sign-off solicitation until full L0 A/B completes or non-blocking pivot is recorded.
+> **Independent review: NOT REQUESTED** — A-019 closed; review **ready to solicit**. Producer has not self-signed.
 
 ---
 
@@ -12,9 +12,9 @@
 
 1. Open [phase0-12a-evidence-index.md](./phase0-12a-evidence-index.md).
 2. Confirm each §12A row against [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md).
-3. Check [stel-assumptions.md](../stel-assumptions.md) — A-019 **interim** blocks §9 today.
+3. Check [stel-assumptions.md](../stel-assumptions.md) — A-019 **VALIDATED** (compact-3).
 4. Confirm producer ≠ independent reviewer (T048).
-5. When B-A019 clears: use [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md).
+5. Use [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md).
 6. Record decision in § Final decision.
 
 ### NO-GO rules (automatic)
@@ -37,37 +37,35 @@
 
 | Field | Value |
 |-------|-------|
-| Satisfied (strict §12A) | 14 |
+| Satisfied (strict §12A) | 16 |
 | Total applicable | 18 |
 | Exempt | 0 |
-| Pre-review gates open | 1 (B-A019) |
+| Pre-review gates open | 0 |
 | Sign-off | NOT REQUESTED |
 
-### Not counted satisfied (4)
+### Not counted satisfied (2)
 
 | Item | Reason |
 |------|--------|
-| A-019 | INTERIM — full L0 A/B not run |
-| §9 | A-019 interim blocks register |
-| Sign-off | Latent until A-019 closes |
+| Sign-off | Latent — ready to solicit |
 | RESULTS.md §8.7 | Deferred (not Phase 0 gate) |
 
 ---
 
 ## Blocker table (T013)
 
-### Pre-review gates (block sign-off solicitation)
+### Pre-review gates
 
 | ID | Type | Reason |
 |----|------|--------|
-| B-A019 | open | L0 interim compact-3 on H1; full A/B or non-blocking pivot required |
-| B-HYGIENE | closed | Evidence commit references aligned at `e9f4102` |
+| B-A019 | closed | L0 A/B complete — compact-3 wins |
+| B-HYGIENE | closed | Evidence commit references aligned |
 
-### Latent (after A-019 closes)
+### Latent
 
 | ID | Type | Reason |
 |----|------|--------|
-| B-SIGNOFF | latent | Independent reviewer required for GO — **not requested yet** |
+| B-SIGNOFF | latent | Independent reviewer required for GO — **ready to solicit, not requested** |
 
 ### Deferred
 
@@ -85,12 +83,13 @@
 | B-A028 | closed | VALIDATED — golden corpus |
 | B-A005 | closed | VALIDATED — 891 B compact |
 | B-A025 | closed | VALIDATED — edit ≤1.5 kB |
+| B-A019 | closed | VALIDATED — compact-3 wins L0 A/B |
 
 ---
 
 ## Reviewer instructions (T014)
 
-**Not active until B-A019 clears.** When opened:
+**Active.** B-A019 closed. Minimum checks: review packet §7.
 
 - 7.x bench is informational only
 - In-repo evidence is canonical; B-SFBENCH closed
@@ -103,8 +102,8 @@
 | Target | Status |
 |--------|--------|
 | phase0-12a-evidence-index.md | Mapped; sequencing documented |
-| stel-assumptions.md | A-001/A-004/A-028/A-005 VALIDATED; A-019 interim |
-| v8-gap-closure-plan.md | §12A aligned; A-019 unchecked until close |
+| stel-assumptions.md | A-001/A-004/A-028/A-005/A-019 VALIDATED |
+| v8-gap-closure-plan.md | §12A aligned; A-019 checked |
 
 ---
 
@@ -113,10 +112,10 @@
 | Field | Value |
 |-------|-------|
 | Evidence producer | Cursor agent (speckit.implement) |
-| Independent reviewer | **NOT REQUESTED** (gated on B-A019) |
+| Independent reviewer | **NOT REQUESTED** (ready to solicit) |
 | Sign-off reference | — |
 
-**T048 status:** **PENDING** — do not solicit until A-019 closes or non-blocking pivot recorded.
+**T048 status:** **PENDING** — A-019 closed; solicit independent reviewer (producer cannot self-sign).
 
 ---
 
@@ -129,21 +128,19 @@ independent_reviewer: null
 sign_off_reference: null
 independent_review_requested: false
 checklist_coverage:
-  satisfied_strict: 14
+  satisfied_strict: 16
   total_applicable: 18
 pre_review_gates:
   - id: B-A019
-    status: open
-    reason: L0 surface interim; full A/B or non-blocking pivot required
+    status: closed
+    reason: L0 A/B complete — compact-3 wins
   - id: B-HYGIENE
     status: closed
-    reason: evidence commit references aligned at e9f4102
-blocking_gaps:
-  - id: B-A019
-    reason: interim compact-3 only; blocks sign-off request
+    reason: evidence commit references aligned
+blocking_gaps: []
 latent_gaps:
   - id: B-SIGNOFF
-    reason: independent sign-off required for GO after A-019 closes
+    reason: independent sign-off required for GO
 superseded_gaps:
   - id: B-SFBENCH
     reason: in-repo evidence path active
@@ -157,11 +154,10 @@ validated_assumptions:
   - A-004
   - A-028
   - A-005
-interim_assumptions:
   - A-019
+interim_assumptions: []
 next_actions:
-  - Close A-019 (L0 A/B or non-blocking declaration)
-  - Refresh packet and signoff YAML
+  - Refresh packet/signoff evidence commit
   - Request independent review
   - Record GO or NO-GO
 ```
@@ -175,6 +171,6 @@ next_actions:
 | Step | Status |
 |------|--------|
 | Phase 0 evidence bundle | **Done** (`e9f4102`; remediation `c3581a5`) |
-| Close A-019 | **Next** |
-| Request independent review | **Blocked on A-019** |
+| Close A-019 | **Done** ([A-019](./A-019-l0-surface-choice.md)) |
+| Request independent review | **Next** |
 | GO / NO-GO | **NO-GO** |

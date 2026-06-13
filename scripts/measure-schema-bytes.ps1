@@ -124,7 +124,7 @@ if (-not $bin) {
     Write-Warning $artifact.error
 } else {
     $env:RUST_LOG = "off"
-    foreach ($surface in @("full", "compact")) {
+    foreach ($surface in @("full", "compact", "meta")) {
         try {
             $result = Measure-ToolsListBytes -Bin $bin -Cwd $measureCwd -Surface $surface
             $artifact.surfaces[$surface] = $result

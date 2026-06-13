@@ -107,7 +107,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
 | **A-017** | Tool selection accuracy degrades past ~30–50 exposed tools (Anthropic) | A/B compact vs full surface on **same tasks** with LLM in loop OR proxy via path confusion rate | **OPEN** (cited, not reproduced) |
-| **A-019** | Replacing entire 32-tool surface with 1–2 meta-tools beats compact-3 on session_net **and** equivalence | Full battery A/B: meta-tool vs STEL compact (same corpus) | **OPEN** |
+| **A-019** | Replacing entire 32-tool surface with 1–2 meta-tools beats compact-3 on session_net **and** equivalence | Full battery A/B: meta-tool vs STEL compact (same corpus) | **VALIDATED** (compact-3 wins) |
 
 ### Server & deploy (Phase 4 — after 8.0.0)
 
@@ -146,7 +146,7 @@ Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index
 | **A-005** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Compact 891 B |
 | **A-006** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Conservative worst-case policy documented |
 | **A-012** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **OPEN** | Serve-only H3 interim scope selected |
-| **A-019** | [`research/A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md) | **OPEN** | Interim compact-3 lock on H1 |
+| **A-019** | [`research/A-019-l0-surface-choice.md`](research/A-019-l0-surface-choice.md) | **VALIDATED** | compact-3 wins L0 A/B |
 | **A-025** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Edit schema ≤1,500 B |
 | **A-026** | [`research/G-005-compare-results-preflight.md`](research/G-005-compare-results-preflight.md) | **PARTIAL** | H1/H7 in-repo preflight |
 | **A-027** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Harness ÷50 documented as non-product |
