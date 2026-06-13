@@ -4,7 +4,7 @@
 **Plan:** [plan.md](../../specs/001-v8-phase0-preflight/plan.md)  
 **Contract:** [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contracts/preflight-evidence-contract.md)  
 **Updated:** 2026-06-13 (review gate refresh)  
-**Evidence commit:** `7d363ab` on `v8/stel-architecture`
+**Evidence commit:** `f7207b7` on `v8/stel-architecture`
 
 Central index for Section 12A pre-flight readiness. Final decision: [phase0-12a-review-signoff.md](./phase0-12a-review-signoff.md).  
 Independent reviewer handoff: [phase0-12a-independent-review-packet.md](./phase0-12a-independent-review-packet.md).
@@ -144,7 +144,7 @@ Binding source: [docs/v8-gap-closure-plan.md](../v8-gap-closure-plan.md) §12A.
 | B-SIGNOFF | **LATENT** | Independent reviewer required for GO; **do not solicit until B-A019 clears** |
 | B-SFBENCH | **CLOSED** | Superseded by in-repo evidence path |
 | B-RESULTS | **DEFERRED** | RESULTS.md §8.7 — post-8.0 baseline; not Phase 0 gate |
-| B-HYGIENE | **CLOSED** | Evidence commit references aligned at `7d363ab` |
+| B-HYGIENE | **CLOSED** | Evidence commit references aligned at `f7207b7` |
 
 ### Sequencing (normative)
 

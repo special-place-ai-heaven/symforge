@@ -3,7 +3,7 @@
 > **Review readiness: NOT READY** — do **not** distribute for sign-off until **B-A019** is closed or explicitly declared non-blocking. See §0 sequencing.
 
 **Prepared:** 2026-06-13 (pre-review gate refresh)  
-**Evidence commit:** `7d363ab` on `v8/stel-architecture`  
+**Evidence commit:** `f7207b7` on `v8/stel-architecture`  
 **Producer:** Cursor agent (speckit.implement)  
 **Purpose:** Template for T048 when pre-review gates clear.
 
@@ -16,7 +16,7 @@
 | Gate | Status | Close by |
 |------|--------|----------|
 | **B-A019** | **OPEN** | Full L0 A/B battery **or** explicit non-blocking declaration in [A-019](./A-019-l0-surface-choice.md) + [stel-assumptions.md](../stel-assumptions.md) |
-| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `7d363ab` |
+| **B-HYGIENE** | **CLOSED** | Evidence commit references aligned at `f7207b7` |
 | **B-SIGNOFF** | **LATENT** | Request independent review **only after** B-A019 closes |
 
 **Normative sequence:** close A-019 → refresh packet/signoff → request human review → record GO/NO-GO.
@@ -87,7 +87,7 @@ From [preflight-evidence-contract.md](../../specs/001-v8-phase0-preflight/contra
 | ID | Status | Note |
 |----|--------|------|
 | **B-A019** | **OPEN** | Full L0 A/B not run; interim compact-3 on H1 only |
-| **B-HYGIENE** | **CLOSED** | Aligned at `7d363ab` |
+| **B-HYGIENE** | **CLOSED** | Aligned at `f7207b7` |
 | **B-SIGNOFF** | **LATENT** | Do not solicit until B-A019 closes |
 
 **Closed:** B-SFBENCH, B-A001, B-A004, B-A028, B-A005, B-A025  

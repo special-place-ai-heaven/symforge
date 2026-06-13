@@ -2,7 +2,7 @@
 
 **Tasks:** T005, T011–T014, T046–T049  
 **Updated:** 2026-06-13 (pre-review gate refresh)  
-**Evidence commit:** `7d363ab` on `v8/stel-architecture`
+**Evidence commit:** `f7207b7` on `v8/stel-architecture`
 
 > **Independent review: NOT REQUESTED** — A-019 interim blocks sign-off solicitation until full L0 A/B completes or non-blocking pivot is recorded.
 
@@ -61,7 +61,7 @@
 | ID | Type | Reason |
 |----|------|--------|
 | B-A019 | open | L0 interim compact-3 on H1; full A/B or non-blocking pivot required |
-| B-HYGIENE | closed | Evidence commit references aligned at `7d363ab` |
+| B-HYGIENE | closed | Evidence commit references aligned at `f7207b7` |
 
 ### Latent (after A-019 closes)
 
@@ -137,7 +137,7 @@ pre_review_gates:
     reason: L0 surface interim; full A/B or non-blocking pivot required
   - id: B-HYGIENE
     status: closed
-    reason: evidence commit references aligned at 7d363ab
+    reason: evidence commit references aligned at f7207b7
 blocking_gaps:
   - id: B-A019
     reason: interim compact-3 only; blocks sign-off request
@@ -151,7 +151,7 @@ deferred_gaps:
   - id: B-RESULTS
     reason: RESULTS.md §8.7 post-8.0 only
 evidence_summary: docs/research/phase0-12a-evidence-index.md
-evidence_commit: 7d363ab
+evidence_commit: f7207b7
 validated_assumptions:
   - A-001
   - A-004
@@ -174,7 +174,7 @@ next_actions:
 
 | Step | Status |
 |------|--------|
-| Phase 0 evidence bundle | **Done** (`7d363ab`) |
+| Phase 0 evidence bundle | **Done** (`f7207b7`) |
 | Close A-019 | **Next** |
 | Request independent review | **Blocked on A-019** |
 | GO / NO-GO | **NO-GO** |
