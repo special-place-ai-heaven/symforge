@@ -146,7 +146,7 @@ async fn compact_status_reports_operational_state() {
         "l1_planner: active",
         "l4_ledger: active",
         "handler_status: active",
-        "handler_symforge_edit: preview-only",
+        "handler_symforge_edit: preview-and-apply",
         "ledger_events: 0",
         "index_ready: true",
         &format!("deferred: {}", stel::DEFERRED_ITEMS),

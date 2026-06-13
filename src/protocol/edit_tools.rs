@@ -276,7 +276,7 @@ fn edit_capability_label(
     }
 }
 
-pub(super) fn prepare_exact_path_for_edit(
+pub(crate) fn prepare_exact_path_for_edit(
     server: &SymForgeServer,
     relative_path: &str,
 ) -> Result<(PathBuf, edit_format::EditSourceAuthority), String> {

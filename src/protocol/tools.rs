@@ -8079,15 +8079,76 @@ impl SymForgeServer {
         self.symforge_edit_stel_handler(&params.0).await
     }
 
-    /// Production compact-surface `symforge_edit` path: L1 edit plan → L2 economics → dry-run preview only.
+    /// Production compact-surface `symforge_edit` path: L1 edit plan → L2 economics → preview or guarded apply.
     async fn symforge_edit_stel_handler(
         &self,
         request: &crate::stel::StelEditRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::stel::controller::evaluate_edit_plan;
+        use crate::stel::edit_apply::{
+            PreApplyOutcome, apply_requested, format_already_applied_body, format_apply_metadata,
+            run_pre_apply_gates,
+        };
         use crate::stel::edit_planner::{build_edit_plan, edit_plan_summary_line};
         use crate::stel::handler;
         use crate::stel::planner::confidence_label;
+
+        if let Err(error) = crate::stel::edit_planner::validate_edit_request(request) {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result(error.message));
+        }
+
+        let apply = apply_requested(request);
+        let mut resolved_symbol = None;
+
+        if apply {
+            let abs_path = match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim())
+            {
+                Ok((path, _)) => path,
+                Err(message) => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(message));
+                }
+            };
+            match run_pre_apply_gates(&self.index, request, &abs_path) {
+                Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
+                Ok(PreApplyOutcome::AlreadyApplied(symbol)) => {
+                    let plan = build_edit_plan(request).expect("validated edit request");
+                    let decision = evaluate_edit_plan(&plan);
+                    let plan_summary = edit_plan_summary_line(&plan);
+                    let session_net = self.session_context.snapshot().total_tokens as i64;
+                    let tool_body = format_already_applied_body(&symbol);
+                    let routing_meta = format!(
+                        "Mode: guarded apply (already applied)\n\
+                         Route confidence: {}\n\
+                         Chosen tool: replace_symbol_body\n\
+                         Economics: {} ({})",
+                        confidence_label(plan.confidence),
+                        decision.decision.as_str(),
+                        decision.decision_reason,
+                    );
+                    let body = format!("{routing_meta}\n\n{tool_body}");
+                    let output = self.finalize_symforge_with_ledger(
+                        "symforge_edit",
+                        &crate::stel::StelRequest::default(),
+                        &plan,
+                        &decision,
+                        plan_summary,
+                        session_net,
+                        &body,
+                        false,
+                        "replace_symbol_body",
+                    );
+                    self.session_context
+                        .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
+                    return statused_tool_result(output, OutcomeClass::Found);
+                }
+                Err(error) => {
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(error.message));
+                }
+            }
+        }
 
         let plan = match build_edit_plan(request) {
             Ok(plan) => plan,
@@ -8108,8 +8169,13 @@ impl SymForgeServer {
             .dispatch_tool_for_tests(&step.tool, step.args.clone())
             .await;
         let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+        let mode_line = if apply {
+            "Mode: guarded apply (committed when validation succeeds)"
+        } else {
+            "Mode: preview-only (dry_run); default when apply is omitted or false"
+        };
         let routing_meta = format!(
-            "Mode: preview-only (dry_run); apply not supported on compact symforge_edit in Phase 1.\n\
+            "{mode_line}\n\
              Route confidence: {}\n\
              Chosen tool: {}\n\
              Invocation: {}\n\
@@ -8122,7 +8188,26 @@ impl SymForgeServer {
             decision.decision.as_str(),
             decision.decision_reason,
         );
-        let body = format!("{routing_meta}\n\n{tool_body}");
+        let mut body = format!("{routing_meta}\n\n{tool_body}");
+        if apply {
+            if let Some(symbol) = resolved_symbol.as_ref() {
+                let write_mode = if tool_body.contains("replaced") {
+                    "committed"
+                } else if tool_body.contains("[DRY RUN]") {
+                    "dry_run"
+                } else {
+                    "failed"
+                };
+                body = format!(
+                    "{routing_meta}\n\n{}\n\n{tool_body}",
+                    format_apply_metadata(symbol, write_mode)
+                );
+            }
+        }
+
+        let legacy_executed = apply
+            && tool_body.contains("replaced")
+            && tool_body.contains("Write semantics: atomic write + reindex");
         let output = self.finalize_symforge_with_ledger(
             "symforge_edit",
             &crate::stel::StelRequest::default(),
@@ -8131,7 +8216,7 @@ impl SymForgeServer {
             plan_summary,
             session_net,
             &body,
-            true,
+            legacy_executed,
             &step.tool,
         );
         self.session_context

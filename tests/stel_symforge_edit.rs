@@ -1,4 +1,4 @@
-//! Compact-surface `symforge_edit` — preview-only structural edit facade.
+//! Compact-surface `symforge_edit` — preview and guarded apply structural edit facade.
 #![cfg(feature = "server")]
 #![allow(unsafe_code)]
 
@@ -103,7 +103,9 @@ async fn symforge_edit_rejects_non_compact_surface() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_unsafe_path() {
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
@@ -126,7 +128,9 @@ async fn symforge_edit_rejects_unsafe_path() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_missing_symbol_and_body() {
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
@@ -147,7 +151,9 @@ async fn symforge_edit_rejects_missing_symbol_and_body() {
 
 #[tokio::test]
 async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writes() {
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
 
     let original = "fn foo() { old }\n";
@@ -180,4 +186,221 @@ async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writ
 
     let after = std::fs::read(&file_path).expect("read file after edit");
     assert_eq!(before, after, "preview must not mutate source bytes");
+}
+
+#[tokio::test]
+async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "fn foo() { old }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let before = std::fs::read(&file_path).expect("read file before edit");
+    let server = server_for_repo(dir.path(), "edit-apply-false");
+
+    let output = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { new }".to_string()),
+            apply: Some(false),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(output.contains("[DRY RUN]"), "output:\n{output}");
+    let after = std::fs::read(&file_path).expect("read file after edit");
+    assert_eq!(before, after, "apply:false must not write");
+}
+
+#[tokio::test]
+async fn symforge_edit_rejects_missing_symbol_on_apply() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-missing-symbol");
+
+    let output = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("missing_symbol".to_string()),
+            body: Some("fn missing_symbol() {}".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        output.contains("symbol not found"),
+        "unexpected output:\n{output}"
+    );
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
+    assert!(
+        !output.contains("── stel ──"),
+        "pre-apply reject must not include envelope"
+    );
+}
+
+#[tokio::test]
+async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "fn foo() { old }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-if-match");
+
+    let output = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { new }".to_string()),
+            apply: Some(true),
+            if_match: Some("fn foo() { wrong }".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        output.contains("if_match does not match"),
+        "unexpected output:\n{output}"
+    );
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
+}
+
+#[tokio::test]
+async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "fn foo() { same }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-already-applied");
+
+    let output = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { same }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for needle in [
+        "── stel ──",
+        "already applied",
+        "Write mode: already_applied",
+        "ledger:",
+    ] {
+        assert!(output.contains(needle), "missing `{needle}` in:\n{output}");
+    }
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
+}
+
+#[tokio::test]
+async fn symforge_edit_preview_then_apply_writes_once() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "fn foo() { old }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let server = server_for_repo(dir.path(), "edit-preview-then-apply");
+
+    let preview = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { new }".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(preview.contains("[DRY RUN]"), "preview:\n{preview}");
+    assert!(
+        std::fs::read_to_string(&file_path).unwrap().contains("old"),
+        "preview must not write"
+    );
+
+    let apply = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { new }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for needle in [
+        "── stel ──",
+        "ledger:",
+        "Write mode: committed",
+        "Byte range:",
+        "Line range:",
+        "replaced",
+        "Write semantics: atomic write + reindex",
+    ] {
+        assert!(apply.contains(needle), "missing `{needle}` in:\n{apply}");
+    }
+    let on_disk = std::fs::read_to_string(&file_path).unwrap();
+    assert!(on_disk.contains("new"), "disk after apply: {on_disk}");
+    assert!(!on_disk.contains("old"), "disk after apply: {on_disk}");
+}
+
+#[tokio::test]
+async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+    let original = "fn foo() { old }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let server = server_for_repo(dir.path(), "edit-idempotency");
+
+    let request = StelEditRequest {
+        path: "src/lib.rs".to_string(),
+        symbol: Some("foo".to_string()),
+        body: Some("fn foo() { new }".to_string()),
+        apply: Some(true),
+        idempotency_key: Some("stel-edit-replay-key".to_string()),
+        ..Default::default()
+    };
+
+    let first = dispatch_symforge_edit(&server, &request).await;
+    assert!(first.contains("replaced"), "first apply:\n{first}");
+    let after_first = std::fs::read(&file_path).unwrap();
+
+    let second = dispatch_symforge_edit(&server, &request).await;
+    assert!(
+        second.contains("replaced"),
+        "second apply should replay stored result without rewriting:\n{second}"
+    );
+    assert_eq!(after_first, std::fs::read(&file_path).unwrap());
 }

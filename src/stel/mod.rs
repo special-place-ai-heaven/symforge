@@ -15,6 +15,7 @@
 
 pub mod calibration;
 pub mod controller;
+pub mod edit_apply;
 pub mod edit_planner;
 pub mod envelope;
 pub mod executor;
@@ -27,6 +28,10 @@ pub mod surface;
 pub mod surface_list;
 pub mod types;
 
+pub use edit_apply::{
+    PreApplyOutcome, ResolvedEditSymbol, apply_requested, format_already_applied_body,
+    format_apply_metadata, run_pre_apply_gates,
+};
 pub use edit_planner::{
     EditValidationError, build_edit_plan, edit_plan_summary_line, validate_edit_request,
 };

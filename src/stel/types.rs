@@ -114,6 +114,15 @@ pub struct StelEditRequest {
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<StelEditIntent>,
+    /// When true, commit a validated single-symbol edit. Default / omitted = preview dry_run only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<bool>,
+    /// When set on apply, must match the current indexed symbol body bytes exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<String>,
+    /// Replay guard for committed apply (forwarded to legacy `replace_symbol_body`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Edit intent for `symforge_edit` (L0 routes structural mutations here).

@@ -2,8 +2,6 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
-
 use super::types::{
     IntentBucket, RouteConfidence, StelEditRequest, StelPlan, StelPlanStep,
 };
@@ -15,7 +13,7 @@ pub struct EditValidationError {
 }
 
 impl EditValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -66,18 +64,22 @@ pub fn validate_edit_request(request: &StelEditRequest) -> Result<(), EditValida
     Ok(())
 }
 
-/// Build a single-step dry-run `replace_symbol_body` plan for compact `symforge_edit`.
+/// Build a single-step `replace_symbol_body` plan for compact `symforge_edit`.
 pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValidationError> {
     validate_edit_request(request)?;
     let symbol = request.symbol.as_deref().unwrap_or("").trim();
     let body = request.body.as_deref().unwrap_or("").trim();
     let path = request.path.trim();
-    let args = json!({
+    let dry_run = !super::edit_apply::apply_requested(request);
+    let mut args = serde_json::json!({
         "path": path,
         "name": symbol,
         "new_body": body,
-        "dry_run": true,
+        "dry_run": dry_run,
     });
+    if let Some(key) = &request.idempotency_key {
+        args["idempotency_key"] = serde_json::json!(key);
+    }
     Ok(StelPlan {
         plan_id: edit_plan_id(request),
         intent: IntentBucket::Edit,
@@ -176,5 +178,18 @@ mod tests {
         assert_eq!(plan.steps[0].tool, "replace_symbol_body");
         assert_eq!(plan.steps[0].args["dry_run"], true);
         assert_eq!(plan.steps[0].args["name"], "helper");
+    }
+
+    #[test]
+    fn build_edit_plan_apply_sets_dry_run_false() {
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        })
+        .expect("valid edit request");
+        assert_eq!(plan.steps[0].args["dry_run"], false);
     }
 }
