@@ -6,7 +6,7 @@
 //! - **L0 MCP:** `protocol` compact handlers accept [`SymforgeCallInput`] and prepend
 //!   [`format_trust_envelope`] (S4). Phase 0 harness relay uses `_probe_*` fields on the same
 //!   tool name. Measurement schemas remain in [`crate::protocol::surface_probe`].
-//! - **L1:** extend [`crate::protocol::smart_query`] into a plan builder (S5).
+//! - **L1:** [`planner::build_plan`] maps [`StelRequest`] → [`StelPlan`] (S5).
 //! - **L2:** controller consumes [`StelPlan`] → [`StelDecision`] (S6).
 //! - **L3:** legacy tool dispatch via [`crate::protocol::SymForgeServer`] (S4+).
 //! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S7).
@@ -14,6 +14,7 @@
 pub mod envelope;
 pub mod golden_replay;
 pub mod handler;
+pub mod planner;
 pub mod surface;
 pub mod surface_list;
 pub mod types;
@@ -26,8 +27,9 @@ pub use golden_replay::{
 };
 pub use handler::{
     StubServeMetrics, envelope_for_stub_serve, estimate_tokens, format_preview_body,
-    prepend_envelope, stub_plan_summary,
+    format_preview_body_for_plan, prepend_envelope, stub_plan_summary,
 };
+pub use planner::{build_plan, confidence_label, plan_summary_line};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{
     compact_surface_list_schema_bytes, compact_surface_tools, symforge_edit_schema_bytes,

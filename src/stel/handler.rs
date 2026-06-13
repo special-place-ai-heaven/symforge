@@ -1,4 +1,4 @@
-//! Phase 1 S4 — minimal `symforge` response envelope wiring (no L1 planner / L2 controller).
+//! Phase 1 S4+ — `symforge` response envelope wiring (L1 planner; L2 controller deferred).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,8 +49,14 @@ fn preview_plan_id(request: &StelRequest) -> String {
 
 /// `StelEstimate` JSON body for `preview: true` (L2 preview stub).
 pub fn format_preview_body(request: &StelRequest) -> String {
+    format_preview_body_for_plan(request, &preview_plan_id(request))
+}
+
+/// `StelEstimate` JSON when L1 has already built a [`StelPlan`].
+pub fn format_preview_body_for_plan(request: &StelRequest, plan_id: &str) -> String {
+    let _ = request;
     let estimate = StelEstimate {
-        plan_id: preview_plan_id(request),
+        plan_id: plan_id.to_string(),
         decision: AdmissionDecision::Serve,
         predicted_response_tokens: 400,
         predicted_manual_tokens: 800,

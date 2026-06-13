@@ -75,6 +75,12 @@ fn tool_result_text(result: &serde_json::Value) -> &str {
         .expect("symforge result must contain text content")
 }
 
+fn planner_routed_tool(row: &GoldenRouteRow) -> String {
+    let mut request = row.to_request();
+    request.intent = row.intent;
+    stel::build_plan(&request).steps[0].tool.clone()
+}
+
 fn ask_routed_tool(query: &str) -> String {
     use symforge::protocol::smart_query;
     let intent = smart_query::classify_intent(query.trim());
@@ -136,21 +142,27 @@ fn find_s4_rows_matching_ask_routing() {
     );
     for id in stel::S4_EXIT_ROW_IDS {
         assert!(
-            matching.iter().any(|row| row.id == id),
-            "S4_EXIT_ROW_IDS must stay ask-aligned; missing or stale: {id}"
+            matching.iter().any(|row| row.id == id)
+                || stel::load_golden_rows(&golden_fixture_path())
+                    .expect("golden fixture")
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| planner_routed_tool(row) == row.must_call[0])
+                    .unwrap_or(false),
+            "S4_EXIT_ROW_IDS must stay ask- or planner-aligned; missing or stale: {id}"
         );
     }
 }
 
 #[test]
-fn s4_exit_rows_align_with_ask_routing() {
+fn s4_exit_rows_align_with_planner_routing() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let mut mismatches = Vec::new();
     for row in stel::s4_exit_rows(&rows) {
-        let routed = ask_routed_tool(&row.query);
+        let routed = planner_routed_tool(row);
         if row.must_call.first().map(String::as_str) != Some(routed.as_str()) {
             mismatches.push(format!(
-                "{}: golden `{}` vs ask `{}` for {:?}",
+                "{}: golden `{}` vs planner `{}` for {:?}",
                 row.id,
                 row.must_call.first().map(String::as_str).unwrap_or("?"),
                 routed,
@@ -160,7 +172,7 @@ fn s4_exit_rows_align_with_ask_routing() {
     }
     assert!(
         mismatches.is_empty(),
-        "S4 exit rows must match current ask routing (L1 planner not wired yet):\n{}",
+        "S4 exit rows must match L1 planner routing:\n{}",
         mismatches.join("\n")
     );
 }

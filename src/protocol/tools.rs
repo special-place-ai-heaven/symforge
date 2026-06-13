@@ -7962,13 +7962,14 @@ impl SymForgeServer {
         self.symforge_stel_handler(&params.0.request).await
     }
 
-    /// Production compact-surface `symforge` path (S4): delegate to `ask`, prepend trust envelope.
+    /// Production compact-surface `symforge` path (S4+): L1 plan → legacy tool dispatch, prepend trust envelope.
     async fn symforge_stel_handler(
         &self,
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
         use crate::stel::handler::{self, StubServeMetrics};
+        use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
 
         let q = smart_query::strip_leading_articles(request.query.trim());
         if q.is_empty() {
@@ -7976,21 +7977,16 @@ impl SymForgeServer {
                 .into_call_tool_result("query requires a non-empty question."));
         }
 
-        let (intent, matched) = smart_query::classify_intent_with_match(q);
-        let assessment = smart_query::assess_route(&intent, matched);
-        let intent_label = request
-            .intent
-            .map(|bucket| bucket.as_str())
-            .unwrap_or("auto");
-        let plan_summary = handler::stub_plan_summary(
-            intent_label,
-            smart_query::route_tool_name(&intent),
-            smart_query::route_confidence_label(assessment.confidence),
-        );
+        let plan = build_plan(request);
+        let step = plan
+            .steps
+            .first()
+            .expect("L1 planner always emits at least one step");
+        let plan_summary = plan_summary_line(&plan);
         let session_net = self.session_context.snapshot().total_tokens as i64;
 
         if request.preview == Some(true) {
-            let body = handler::format_preview_body(request);
+            let body = handler::format_preview_body_for_plan(request, &plan.plan_id);
             let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
                 plan_summary,
                 response_tokens: 0,
@@ -8000,11 +7996,18 @@ impl SymForgeServer {
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
-        let ask_input = SmartQueryInput {
-            query: request.query.clone(),
-            max_tokens: request.max_tokens.map(u64::from),
-        };
-        let body = self.ask(Parameters(ask_input)).await;
+        let tool_body = self
+            .dispatch_tool_for_tests(&step.tool, step.args.clone())
+            .await;
+        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+        let routing_meta = format!(
+            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}",
+            confidence_label(plan.confidence),
+            step.tool,
+            invocation,
+            plan.confidence_rationale,
+        );
+        let body = format!("{routing_meta}\n\n{tool_body}");
         let response_tokens = handler::estimate_tokens(&body);
         let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
             plan_summary,
@@ -8015,9 +8018,9 @@ impl SymForgeServer {
         self.session_context
             .record_summary_output("symforge", response_tokens);
 
-        let outcome_class = if body.starts_with("Error:") || body.starts_with("Invalid") {
+        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
-        } else if body.starts_with("Index not loaded.") {
+        } else if tool_body.starts_with("Index not loaded.") {
             OutcomeClass::InternalFailure
         } else {
             OutcomeClass::Found
