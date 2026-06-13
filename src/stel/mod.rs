@@ -7,10 +7,11 @@
 //!   [`format_trust_envelope`] (S4). Phase 0 harness relay uses `_probe_*` fields on the same
 //!   tool name. Measurement schemas remain in [`crate::protocol::surface_probe`].
 //! - **L1:** [`planner::build_plan`] maps [`StelRequest`] → [`StelPlan`] (S5).
-//! - **L2:** controller consumes [`StelPlan`] → [`StelDecision`] (S6).
+//! - **L2:** [`controller::evaluate_plan`] scores plans → [`StelDecision`] economics metadata (S6).
 //! - **L3:** legacy tool dispatch via [`crate::protocol::SymForgeServer`] (S4+).
 //! - **L4:** append [`StelLedgerEvent`] + [`CalibrationState`] feedback (S7).
 
+pub mod controller;
 pub mod envelope;
 pub mod golden_replay;
 pub mod handler;
@@ -25,9 +26,14 @@ pub use golden_replay::{
     corpus_for_row_id, load_golden_rows, parse_golden_rows, s4_exit_rows,
     validate_s4_replay_output,
 };
+pub use controller::{
+    build_estimate, detect_pff_bypass, estimate_economics, evaluate_plan, EconomicsBreakdown,
+    COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, SERVE_MARGIN_TOKENS,
+};
 pub use handler::{
-    StubServeMetrics, envelope_for_stub_serve, estimate_tokens, format_preview_body,
-    format_preview_body_for_plan, prepend_envelope, stub_plan_summary,
+    DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,
+    estimate_tokens, format_preview_body, format_preview_body_for_plan, format_preview_estimate,
+    metrics_for_decision, prepend_envelope, stub_plan_summary,
 };
 pub use planner::{build_plan, confidence_label, plan_summary_line};
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};

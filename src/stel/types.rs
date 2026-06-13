@@ -56,6 +56,18 @@ pub enum AdmissionDecision {
     Reject,
 }
 
+impl AdmissionDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Degrade => "degrade",
+            Self::Bypass => "bypass",
+            Self::CacheHit => "cache_hit",
+            Self::Reject => "reject",
+        }
+    }
+}
+
 /// MCP input for the `symforge` compact-surface tool (L0 → L1).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelRequest {

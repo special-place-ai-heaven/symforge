@@ -1,4 +1,4 @@
-//! STEL L1 planner — map [`StelRequest`] to a single-step [`StelPlan`] (economics gate deferred).
+//! STEL L1 planner — map [`StelRequest`] to a single-step [`StelPlan`] (L2 scores separately).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

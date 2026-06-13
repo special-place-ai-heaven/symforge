@@ -7968,7 +7968,8 @@ impl SymForgeServer {
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
-        use crate::stel::handler::{self, StubServeMetrics};
+        use crate::stel::controller::{build_estimate, evaluate_plan};
+        use crate::stel::handler::{self, metrics_for_decision};
         use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
 
         let q = smart_query::strip_leading_articles(request.query.trim());
@@ -7978,6 +7979,7 @@ impl SymForgeServer {
         }
 
         let plan = build_plan(request);
+        let decision = evaluate_plan(request, &plan);
         let step = plan
             .steps
             .first()
@@ -7986,34 +7988,44 @@ impl SymForgeServer {
         let session_net = self.session_context.snapshot().total_tokens as i64;
 
         if request.preview == Some(true) {
-            let body = handler::format_preview_body_for_plan(request, &plan.plan_id);
-            let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
+            let estimate = build_estimate(request, &plan, &decision);
+            let body = handler::format_preview_estimate(&estimate);
+            let metrics = metrics_for_decision(
                 plan_summary,
-                response_tokens: 0,
-                session_net_vs_manual: session_net,
-            });
+                &decision,
+                &plan,
+                0,
+                session_net,
+            );
+            let envelope = handler::envelope_for_decision(&metrics);
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
+        // L2 metadata only: execute planned L3 step regardless of admission (enforcement deferred).
         let tool_body = self
             .dispatch_tool_for_tests(&step.tool, step.args.clone())
             .await;
         let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
         let routing_meta = format!(
-            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}",
+            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
             confidence_label(plan.confidence),
             step.tool,
             invocation,
             plan.confidence_rationale,
+            decision.decision.as_str(),
+            decision.decision_reason,
         );
         let body = format!("{routing_meta}\n\n{tool_body}");
         let response_tokens = handler::estimate_tokens(&body);
-        let envelope = handler::envelope_for_stub_serve(&StubServeMetrics {
+        let metrics = metrics_for_decision(
             plan_summary,
+            &decision,
+            &plan,
             response_tokens,
-            session_net_vs_manual: session_net,
-        });
+            session_net,
+        );
+        let envelope = handler::envelope_for_decision(&metrics);
         let output = handler::prepend_envelope(&envelope, &body);
         self.session_context
             .record_summary_output("symforge", response_tokens);
