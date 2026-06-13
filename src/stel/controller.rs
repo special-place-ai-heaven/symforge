@@ -76,6 +76,38 @@ pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
     }
 }
 
+/// Evaluate L2 admission for a structural edit plan (no NL P-FF bypass path).
+pub fn evaluate_edit_plan(plan: &StelPlan) -> StelDecision {
+    let economics = estimate_economics(plan);
+    let recommended = economics.predicted_net_vs_manual > SERVE_MARGIN_TOKENS;
+    let decision = if recommended {
+        AdmissionDecision::Serve
+    } else {
+        AdmissionDecision::Bypass
+    };
+    let decision_reason = if recommended {
+        format!(
+            "predicted_net={} > margin={}",
+            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
+        )
+    } else {
+        format!(
+            "predicted_net={} <= margin={} (non-P-FF bypass metadata; L3 not gated)",
+            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
+        )
+    };
+    StelDecision {
+        plan_id: plan.plan_id.clone(),
+        decision,
+        decision_reason,
+        effective_max_tokens: None,
+        degrade_flags: vec![],
+        steps: Some(plan.steps.clone()),
+        bypass: None,
+        cache: None,
+    }
+}
+
 /// Build preview economics for `preview: true` (L1+L2 only).
 pub fn build_estimate(request: &StelRequest, plan: &StelPlan, decision: &StelDecision) -> StelEstimate {
     let economics = if decision.decision == AdmissionDecision::Bypass {

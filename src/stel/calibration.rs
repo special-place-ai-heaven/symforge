@@ -142,6 +142,7 @@ mod tests {
             selected_tool: "find_references",
             legacy_executed: true,
             output_body: "Chosen tool: find_references\n\nrefs",
+            surface: "symforge",
         })
         .0
     }
@@ -161,6 +162,7 @@ mod tests {
             selected_tool: plan.steps[0].tool.as_str(),
             legacy_executed: false,
             output_body: "Decision: bypass\nSymForge did not execute a legacy tool",
+            surface: "symforge",
         })
         .0
     }

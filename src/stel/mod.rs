@@ -11,10 +11,11 @@
 //! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch.
 //! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
 //!
-//! Deferred: calibration auto-tuning/persistence, `symforge_edit` handler, multi-step plans.
+//! Deferred: calibration auto-tuning/persistence, multi-step plans, symforge_edit apply path.
 
 pub mod calibration;
 pub mod controller;
+pub mod edit_planner;
 pub mod envelope;
 pub mod executor;
 pub mod golden_replay;
@@ -26,6 +27,9 @@ pub mod surface;
 pub mod surface_list;
 pub mod types;
 
+pub use edit_planner::{
+    EditValidationError, build_edit_plan, edit_plan_summary_line, validate_edit_request,
+};
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use golden_replay::{
     GOLDEN_ROUTES_FIXTURE, ReplayValidation, S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS,
@@ -40,8 +44,8 @@ pub use calibration::{
     summarize_calibration,
 };
 pub use controller::{
-    build_estimate, detect_pff_bypass, estimate_economics, evaluate_plan, EconomicsBreakdown,
-    COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, SERVE_MARGIN_TOKENS,
+    build_estimate, detect_pff_bypass, estimate_economics, evaluate_edit_plan, evaluate_plan,
+    EconomicsBreakdown, COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, SERVE_MARGIN_TOKENS,
 };
 pub use executor::{format_bypass_body, is_enforced_bypass};
 pub use ledger::{

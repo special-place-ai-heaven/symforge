@@ -8005,16 +8005,17 @@ impl SymForgeServer {
 
         if is_enforced_bypass(&decision) {
             let body = format_bypass_body(&decision);
-            let output = self.finalize_symforge_with_ledger(
-                request,
-                &plan,
-                &decision,
-                plan_summary,
-                session_net,
-                &body,
-                false,
-                &step.tool,
-            );
+        let output = self.finalize_symforge_with_ledger(
+            "symforge",
+            request,
+            &plan,
+            &decision,
+            plan_summary,
+            session_net,
+            &body,
+            false,
+            &step.tool,
+        );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8035,6 +8036,7 @@ impl SymForgeServer {
         );
         let body = format!("{routing_meta}\n\n{tool_body}");
         let output = self.finalize_symforge_with_ledger(
+            "symforge",
             request,
             &plan,
             &decision,
@@ -8046,6 +8048,94 @@ impl SymForgeServer {
         );
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
+
+        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
+            OutcomeClass::InvalidRequest
+        } else if tool_body.starts_with("Index not loaded.") {
+            OutcomeClass::InternalFailure
+        } else {
+            OutcomeClass::Found
+        };
+        statused_tool_result(output, outcome_class)
+    }
+
+    #[tool(
+        name = "symforge_edit",
+        description = "STEL structural edit facade — symbol-aware edits with economics gate (Phase 1 preview-only via dry_run).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn symforge_edit_facade_tool(
+        &self,
+        params: Parameters<crate::stel::StelEditRequest>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if super::surface_probe::surface_profile_from_env()
+            != super::surface_probe::SurfaceProfile::Compact
+        {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "symforge_edit STEL handler requires SYMFORGE_SURFACE=compact; use legacy edit tools on the full surface",
+            ));
+        }
+
+        self.symforge_edit_stel_handler(&params.0).await
+    }
+
+    /// Production compact-surface `symforge_edit` path: L1 edit plan → L2 economics → dry-run preview only.
+    async fn symforge_edit_stel_handler(
+        &self,
+        request: &crate::stel::StelEditRequest,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        use crate::stel::controller::evaluate_edit_plan;
+        use crate::stel::edit_planner::{build_edit_plan, edit_plan_summary_line};
+        use crate::stel::handler;
+        use crate::stel::planner::confidence_label;
+
+        let plan = match build_edit_plan(request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                    .into_call_tool_result(error.message));
+            }
+        };
+        let decision = evaluate_edit_plan(&plan);
+        let step = plan
+            .steps
+            .first()
+            .expect("edit planner always emits at least one step");
+        let plan_summary = edit_plan_summary_line(&plan);
+        let session_net = self.session_context.snapshot().total_tokens as i64;
+
+        let tool_body = self
+            .dispatch_tool_for_tests(&step.tool, step.args.clone())
+            .await;
+        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+        let routing_meta = format!(
+            "Mode: preview-only (dry_run); apply not supported on compact symforge_edit in Phase 1.\n\
+             Route confidence: {}\n\
+             Chosen tool: {}\n\
+             Invocation: {}\n\
+             Rationale: {}\n\
+             Economics: {} ({})",
+            confidence_label(plan.confidence),
+            step.tool,
+            invocation,
+            plan.confidence_rationale,
+            decision.decision.as_str(),
+            decision.decision_reason,
+        );
+        let body = format!("{routing_meta}\n\n{tool_body}");
+        let output = self.finalize_symforge_with_ledger(
+            "symforge_edit",
+            &crate::stel::StelRequest::default(),
+            &plan,
+            &decision,
+            plan_summary,
+            session_net,
+            &body,
+            true,
+            &step.tool,
+        );
+        self.session_context
+            .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
 
         let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
@@ -8091,6 +8181,7 @@ impl SymForgeServer {
 
     fn finalize_symforge_with_ledger(
         &self,
+        surface: &'static str,
         _request: &crate::stel::StelRequest,
         plan: &crate::stel::StelPlan,
         decision: &crate::stel::StelDecision,
@@ -8118,6 +8209,7 @@ impl SymForgeServer {
             selected_tool,
             legacy_executed,
             output_body: body,
+            surface,
         });
         self.stel_ledger.lock().push(event.clone());
         let ledger_line = format_ledger_envelope_line(&event, &meta);

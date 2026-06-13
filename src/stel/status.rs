@@ -11,7 +11,7 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 
 /// Stable comma-separated deferred-work list (sorted for test stability).
 pub const DEFERRED_ITEMS: &str =
-    "b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_handler";
+    "b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_apply";
 
 /// Inputs collected from the live server when formatting a status response.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,7 +84,7 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         "l4_ledger: active".to_string(),
         "handler_symforge: active".to_string(),
         "handler_status: active".to_string(),
-        "handler_symforge_edit: schema-only".to_string(),
+        "handler_symforge_edit: preview-only".to_string(),
         format!("ledger_events: {}", ctx.ledger_events),
         format!("index_ready: {}", ctx.index_ready),
         format!("index_files: {}", ctx.index_files),
@@ -158,11 +158,11 @@ mod tests {
             "l4_ledger: active",
             "handler_symforge: active",
             "handler_status: active",
-            "handler_symforge_edit: schema-only",
+            "handler_symforge_edit: preview-only",
             "ledger_events: 2",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_handler",
+            "deferred: b_results,calibration_auto_tune,ledger_persistence,multi_step_planner,symforge_edit_apply",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");

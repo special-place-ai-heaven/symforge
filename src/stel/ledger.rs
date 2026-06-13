@@ -48,6 +48,7 @@ pub struct LedgerCaptureInput<'a> {
     pub selected_tool: &'a str,
     pub legacy_executed: bool,
     pub output_body: &'a str,
+    pub surface: &'static str,
 }
 
 /// Compact machine-readable metadata embedded in the trust envelope.
@@ -76,7 +77,7 @@ pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
     StelLedgerEvent {
         ts_ms: ledger_timestamp_ms(),
         plan_id: input.plan.plan_id.clone(),
-        surface: "symforge".to_string(),
+        surface: input.surface.to_string(),
         intent: input.plan.intent,
         decision: input.decision.decision,
         tools_called: if input.legacy_executed {
@@ -174,6 +175,7 @@ mod tests {
             selected_tool: "find_references",
             legacy_executed: true,
             output_body: body,
+            surface: "symforge",
         });
         assert_eq!(event.decision, AdmissionDecision::Serve);
         assert_eq!(event.tools_called, vec!["find_references".to_string()]);
@@ -202,6 +204,7 @@ mod tests {
             selected_tool: plan.steps[0].tool.as_str(),
             legacy_executed: false,
             output_body: body,
+            surface: "symforge",
         });
         assert_eq!(event.decision, AdmissionDecision::Bypass);
         assert!(event.tools_called.is_empty());
@@ -223,6 +226,7 @@ mod tests {
             selected_tool: "find_references",
             legacy_executed: true,
             output_body: "body",
+            surface: "symforge",
         });
         ledger.push(event);
         assert_eq!(ledger.len(), 1);

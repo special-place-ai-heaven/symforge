@@ -615,6 +615,9 @@ impl SymForgeServer {
             }
             "find_references" => call_statused!(find_references_tool, tools::FindReferencesInput),
             "symforge" => call_statused!(symforge_facade_tool, crate::stel::SymforgeCallInput),
+            "symforge_edit" => {
+                call_statused!(symforge_edit_facade_tool, crate::stel::StelEditRequest)
+            }
             "status" => call_statused!(status_stel_tool, crate::stel::StelStatusRequest),
             other => {
                 let text = format!(
