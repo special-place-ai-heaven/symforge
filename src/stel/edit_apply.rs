@@ -70,12 +70,12 @@ pub fn run_pre_apply_gates(
 
     let resolved = resolve_symbol_in_file(&file, path, name)?;
 
-    if let Some(if_match) = request.if_match.as_deref() {
-        if if_match != resolved.current_body {
-            return Err(EditValidationError::new(
-                "if_match does not match current symbol body",
-            ));
-        }
+    if let Some(if_match) = request.if_match.as_deref()
+        && if_match != resolved.current_body
+    {
+        return Err(EditValidationError::new(
+            "if_match does not match current symbol body",
+        ));
     }
 
     if request.idempotency_key.is_none()

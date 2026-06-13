@@ -40,6 +40,21 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn with_surface(value: &str) -> EnvVarGuard {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    EnvVarGuard::set("SYMFORGE_SURFACE", value)
+}
+
+fn with_compact_surface() -> EnvVarGuard {
+    with_surface("compact")
+}
+
+fn with_full_surface() -> EnvVarGuard {
+    with_surface("full")
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -117,10 +132,7 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
 
 #[tokio::test]
 async fn status_rejects_non_compact_surface() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+    let _surface = with_full_surface();
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-non-compact");
     let output = dispatch_status(&server, None).await;
@@ -137,10 +149,7 @@ async fn compact_status_reports_operational_state() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-compact");
     let output = dispatch_status(&server, None).await;
@@ -169,10 +178,7 @@ async fn full_status_includes_project_and_ledger_summary() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");

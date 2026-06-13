@@ -61,10 +61,10 @@ pub fn confidence_label(confidence: RouteConfidence) -> &'static str {
 
 fn plan_step(request: &StelRequest) -> PlannedStep {
     let bucket = request.intent.unwrap_or(IntentBucket::Auto);
-    if bucket != IntentBucket::Auto {
-        if let Some(step) = route_with_bucket(request, bucket) {
-            return step;
-        }
+    if bucket != IntentBucket::Auto
+        && let Some(step) = route_with_bucket(request, bucket)
+    {
+        return step;
     }
     if let Some(step) = route_with_query_patterns(request) {
         return step;
@@ -519,13 +519,13 @@ fn parse_bare_references_target(query: &str) -> Option<String> {
 }
 
 fn parse_bounded_content_read(query: &str, lower: &str) -> Option<(String, Option<u32>)> {
-    if let Some(rest) = lower.strip_prefix("first ") {
-        if let Some((lines, path)) = rest.split_once(" lines ") {
-            let lines = lines.trim().parse().ok()?;
-            let path = path.trim();
-            if !path.is_empty() {
-                return Some((normalize_path(path), Some(lines)));
-            }
+    if let Some(rest) = lower.strip_prefix("first ")
+        && let Some((lines, path)) = rest.split_once(" lines ")
+    {
+        let lines = lines.trim().parse().ok()?;
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some((normalize_path(path), Some(lines)));
         }
     }
     if let Some(rest) = lower.strip_prefix("read ") {
@@ -639,7 +639,7 @@ fn parse_find_entity_search(query: &str, lower: &str) -> Option<String> {
     }
 }
 
-fn slice_after_prefix<'a>(query: &'a str, prefix: &str) -> Option<String> {
+fn slice_after_prefix(query: &str, prefix: &str) -> Option<String> {
     let lower = query.to_ascii_lowercase();
     let pos = lower.find(&prefix.to_ascii_lowercase())?;
     let value = query[pos + prefix.len()..].trim();

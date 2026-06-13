@@ -41,6 +41,21 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn with_surface(value: &str) -> EnvVarGuard {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    EnvVarGuard::set("SYMFORGE_SURFACE", value)
+}
+
+fn with_compact_surface() -> EnvVarGuard {
+    with_surface("compact")
+}
+
+fn with_full_surface() -> EnvVarGuard {
+    with_surface("full")
+}
+
 fn tool_result_text(result: &serde_json::Value) -> &str {
     result["content"][0]["text"]
         .as_str()
@@ -106,10 +121,7 @@ async fn dispatch_symforge_edit(server: &SymForgeServer, request: &StelEditReque
 
 #[tokio::test]
 async fn symforge_edit_rejects_non_compact_surface() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+    let _surface = with_full_surface();
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-non-compact");
@@ -131,10 +143,7 @@ async fn symforge_edit_rejects_non_compact_surface() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_unsafe_path() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-unsafe-path");
@@ -156,10 +165,7 @@ async fn symforge_edit_rejects_unsafe_path() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_missing_symbol_and_body() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-missing-fields");
@@ -179,10 +185,7 @@ async fn symforge_edit_rejects_missing_symbol_and_body() {
 
 #[tokio::test]
 async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writes() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -218,10 +221,7 @@ async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writ
 
 #[tokio::test]
 async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -247,10 +247,7 @@ async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_missing_symbol_on_apply() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -281,10 +278,7 @@ async fn symforge_edit_rejects_missing_symbol_on_apply() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -313,10 +307,7 @@ async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
 
 #[tokio::test]
 async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { same }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -348,10 +339,7 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
 
 #[tokio::test]
 async fn symforge_edit_preview_then_apply_writes_once() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -403,10 +391,7 @@ async fn symforge_edit_preview_then_apply_writes_once() {
 
 #[tokio::test]
 async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -435,10 +420,7 @@ async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_absolute_and_scheme_paths() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let (dir, file_path) = temp_rust_repo("fn foo() {}\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -476,10 +458,7 @@ async fn symforge_edit_rejects_absolute_and_scheme_paths() {
 
 #[tokio::test]
 async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let original = "# foo\n\nOld section body.\n";
     let (dir, file_path) = temp_markdown_repo(original);

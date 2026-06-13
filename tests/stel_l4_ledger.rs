@@ -40,6 +40,13 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn with_compact_surface() -> EnvVarGuard {
+    let _guard = COMPACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    EnvVarGuard::set("SYMFORGE_SURFACE", "compact")
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -118,8 +125,7 @@ async fn serve_row_records_ledger_with_legacy_execution() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");
@@ -149,8 +155,7 @@ async fn pff_row_records_ledger_without_legacy_execution() {
         return;
     }
 
-    let _guard = COMPACT_ENV_LOCK.lock().expect("env lock");
-    let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+    let _surface = with_compact_surface();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/pff_whole_lib");

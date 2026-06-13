@@ -4221,7 +4221,7 @@ impl SymForgeServer {
                 loading_guard!(guard);
                 let mut text_options = search::TextSearchOptions::for_current_code_search();
                 text_options.path_scope = options.path_scope.clone();
-                text_options.noise_policy = options.noise_policy.clone();
+                text_options.noise_policy = options.noise_policy;
                 text_options.include_personal_tooling = options.include_personal_tooling;
                 text_options.language_filter = options.language_filter.clone();
                 text_options.total_limit = 15;
@@ -8185,20 +8185,18 @@ impl SymForgeServer {
             decision.decision_reason,
         );
         let mut body = format!("{routing_meta}\n\n{tool_body}");
-        if apply {
-            if let Some(symbol) = resolved_symbol.as_ref() {
-                let write_mode = if tool_body.contains("replaced") {
-                    "committed"
-                } else if tool_body.contains("[DRY RUN]") {
-                    "dry_run"
-                } else {
-                    "failed"
-                };
-                body = format!(
-                    "{routing_meta}\n\n{}\n\n{tool_body}",
-                    format_apply_metadata(symbol, write_mode)
-                );
-            }
+        if apply && let Some(symbol) = resolved_symbol.as_ref() {
+            let write_mode = if tool_body.contains("replaced") {
+                "committed"
+            } else if tool_body.contains("[DRY RUN]") {
+                "dry_run"
+            } else {
+                "failed"
+            };
+            body = format!(
+                "{routing_meta}\n\n{}\n\n{tool_body}",
+                format_apply_metadata(symbol, write_mode)
+            );
         }
 
         let legacy_executed = apply
@@ -8229,11 +8227,10 @@ impl SymForgeServer {
     ) -> OutcomeClass {
         if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
-        } else if tool_body.starts_with("Index not loaded.") {
-            OutcomeClass::InternalFailure
-        } else if apply
-            && (full_body.contains("Write mode: failed")
-                || tool_body.contains(": edit safety blocked"))
+        } else if tool_body.starts_with("Index not loaded.")
+            || (apply
+                && (full_body.contains("Write mode: failed")
+                    || tool_body.contains(": edit safety blocked")))
         {
             OutcomeClass::InternalFailure
         } else {
@@ -8273,6 +8270,7 @@ impl SymForgeServer {
         statused_tool_result(body, OutcomeClass::Found)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_symforge_with_ledger(
         &self,
         surface: &'static str,

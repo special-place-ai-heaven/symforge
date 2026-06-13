@@ -159,14 +159,14 @@ pub fn classify_golden_corpus(rows: &[GoldenRouteRow]) -> GoldenCorpusClassifica
 }
 
 /// Select rows classified as supported single-hop serve replay.
-pub fn supported_serve_rows<'a>(rows: &'a [GoldenRouteRow]) -> Vec<&'a GoldenRouteRow> {
+pub fn supported_serve_rows(rows: &[GoldenRouteRow]) -> Vec<&GoldenRouteRow> {
     rows.iter()
         .filter(|row| classify_golden_row(row) == GoldenReplayCategory::SupportedServe)
         .collect()
 }
 
 /// Select rows classified as supported P-FF bypass replay.
-pub fn supported_pff_rows<'a>(rows: &'a [GoldenRouteRow]) -> Vec<&'a GoldenRouteRow> {
+pub fn supported_pff_rows(rows: &[GoldenRouteRow]) -> Vec<&GoldenRouteRow> {
     rows.iter()
         .filter(|row| classify_golden_row(row) == GoldenReplayCategory::SupportedPffBypass)
         .collect()
@@ -193,7 +193,7 @@ pub fn load_golden_rows(path: &Path) -> std::io::Result<Vec<GoldenRouteRow>> {
 }
 
 /// Select the five S4 minimum subset rows from a parsed golden corpus.
-pub fn s4_exit_rows<'a>(rows: &'a [GoldenRouteRow]) -> Vec<&'a GoldenRouteRow> {
+pub fn s4_exit_rows(rows: &[GoldenRouteRow]) -> Vec<&GoldenRouteRow> {
     S4_EXIT_ROW_IDS
         .iter()
         .map(|id| {

@@ -28,6 +28,10 @@ impl SessionLedger {
         self.events.lock().expect("session ledger lock").len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.events.lock().expect("session ledger lock").is_empty()
+    }
+
     pub fn last(&self) -> Option<StelLedgerEvent> {
         self.events
             .lock()
