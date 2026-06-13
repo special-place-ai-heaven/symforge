@@ -7,9 +7,7 @@ use serde::Serialize;
 
 use super::controller::EconomicsBreakdown;
 use super::handler::estimate_tokens;
-use super::types::{
-    AdmissionDecision, StelDecision, StelLedgerEvent, StelPlan,
-};
+use super::types::{AdmissionDecision, StelDecision, StelLedgerEvent, StelPlan};
 
 /// In-memory append-only ledger for one MCP server session (no persistence in this slice).
 #[derive(Debug, Default)]
@@ -31,7 +29,11 @@ impl SessionLedger {
     }
 
     pub fn last(&self) -> Option<StelLedgerEvent> {
-        self.events.lock().expect("session ledger lock").last().cloned()
+        self.events
+            .lock()
+            .expect("session ledger lock")
+            .last()
+            .cloned()
     }
 
     pub fn events(&self) -> Vec<StelLedgerEvent> {
@@ -95,19 +97,14 @@ pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
 }
 
 /// Format compact ledger metadata for the trust envelope `ledger:` line.
-pub fn format_ledger_envelope_line(
-    event: &StelLedgerEvent,
-    meta: &LedgerEnvelopeMeta,
-) -> String {
+pub fn format_ledger_envelope_line(event: &StelLedgerEvent, meta: &LedgerEnvelopeMeta) -> String {
     let json = serde_json::to_string(meta).expect("ledger meta serializes");
     let _ = event;
     format!("ledger: {json}")
 }
 
 /// Build envelope metadata and ledger event together.
-pub fn capture_ledger(
-    input: &LedgerCaptureInput<'_>,
-) -> (StelLedgerEvent, LedgerEnvelopeMeta) {
+pub fn capture_ledger(input: &LedgerCaptureInput<'_>) -> (StelLedgerEvent, LedgerEnvelopeMeta) {
     let output_tokens = estimate_tokens(input.output_body);
     let output_bytes = input.output_body.len() as u64;
     let event = build_ledger_event(input);
@@ -136,7 +133,7 @@ fn ledger_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stel::controller::{evaluate_plan, estimate_economics};
+    use crate::stel::controller::{estimate_economics, evaluate_plan};
     use crate::stel::planner::build_plan;
     use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest};
 

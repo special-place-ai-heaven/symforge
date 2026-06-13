@@ -55,18 +55,9 @@ fn corpus_available(relative: &str, marker: &str) -> bool {
 
 fn all_replay_corpora_available() -> bool {
     corpus_available(stel::S4_REPLAY_CORPUS, "src/lib.rs")
-        && corpus_available(
-            "tests/fixtures/phase0-corpus/records-python",
-            "records.py",
-        )
-        && corpus_available(
-            "tests/fixtures/phase0-corpus/is-plain-obj-ts",
-            "index.js",
-        )
-        && corpus_available(
-            "tests/fixtures/compression_ratio/rust",
-            "service.rs",
-        )
+        && corpus_available("tests/fixtures/phase0-corpus/records-python", "records.py")
+        && corpus_available("tests/fixtures/phase0-corpus/is-plain-obj-ts", "index.js")
+        && corpus_available("tests/fixtures/compression_ratio/rust", "service.rs")
 }
 
 fn corpus_available_for_row(row: &GoldenRouteRow) -> bool {
@@ -128,7 +119,10 @@ fn golden_corpus_classification_lists_deferred_rows_explicitly() {
     );
     for id in stel::DEFERRED_MULTI_HOP_ROW_IDS {
         assert!(
-            classification.deferred_multi_hop.iter().any(|row_id| row_id == id),
+            classification
+                .deferred_multi_hop
+                .iter()
+                .any(|row_id| row_id == id),
             "multi-hop row {id} must be explicitly deferred"
         );
     }
@@ -138,7 +132,10 @@ fn golden_corpus_classification_lists_deferred_rows_explicitly() {
     );
     for id in stel::S4_EXIT_ROW_IDS {
         assert!(
-            classification.supported_serve.iter().any(|row_id| row_id == id),
+            classification
+                .supported_serve
+                .iter()
+                .any(|row_id| row_id == id),
             "S4 minimum subset must remain supported: {id}"
         );
     }
@@ -171,7 +168,9 @@ fn s4_exit_rows_align_with_planner_routing() {
 #[tokio::test]
 async fn s4_minimum_subset_replays_on_compact_symforge() {
     if !all_replay_corpora_available() {
-        eprintln!("skip s4_minimum_subset_replays: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md");
+        eprintln!(
+            "skip s4_minimum_subset_replays: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md"
+        );
         return;
     }
 

@@ -393,8 +393,8 @@ mod tests {
             }],
             suggested_followup: None,
         };
-        let back: StelPlan = serde_json::from_value(serde_json::to_value(&plan).expect("ser"))
-            .expect("de");
+        let back: StelPlan =
+            serde_json::from_value(serde_json::to_value(&plan).expect("ser")).expect("de");
         assert_eq!(back, plan);
     }
 

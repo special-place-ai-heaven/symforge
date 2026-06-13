@@ -128,8 +128,7 @@ async fn serve_row_records_ledger_with_legacy_execution() {
 
     assert!(output.contains("ledger: "));
     let ledger_json = ledger_meta_line(&output).trim_start_matches("ledger: ");
-    let meta: stel::LedgerEnvelopeMeta =
-        serde_json::from_str(ledger_json).expect("ledger json");
+    let meta: stel::LedgerEnvelopeMeta = serde_json::from_str(ledger_json).expect("ledger json");
     assert_eq!(meta.decision, "serve");
     assert!(!meta.bypass);
     assert!(meta.legacy_executed);
@@ -160,8 +159,7 @@ async fn pff_row_records_ledger_without_legacy_execution() {
 
     assert!(output.contains("ledger: "));
     let ledger_json = ledger_meta_line(&output).trim_start_matches("ledger: ");
-    let meta: stel::LedgerEnvelopeMeta =
-        serde_json::from_str(ledger_json).expect("ledger json");
+    let meta: stel::LedgerEnvelopeMeta = serde_json::from_str(ledger_json).expect("ledger json");
     assert_eq!(meta.decision, "bypass");
     assert!(meta.bypass);
     assert!(!meta.legacy_executed);

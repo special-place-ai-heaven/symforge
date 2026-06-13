@@ -340,7 +340,8 @@ mod tests {
             eligible_h6: Some(true),
             notes: None,
         };
-        let output = "── stel ──\ndecision: serve\nledger: {}\n──\n\nChosen tool: search_text\n\nresults";
+        let output =
+            "── stel ──\ndecision: serve\nledger: {}\n──\n\nChosen tool: search_text\n\nresults";
         let validation = validate_serve_replay_output(&row, output);
         assert!(validation.passed, "{:?}", validation.errors);
     }
@@ -387,7 +388,10 @@ mod tests {
         assert_eq!(classification.deferred_multi_hop, expected_multi);
         for id in S4_EXIT_ROW_IDS {
             assert!(
-                classification.supported_serve.iter().any(|row_id| row_id == id),
+                classification
+                    .supported_serve
+                    .iter()
+                    .any(|row_id| row_id == id),
                 "S4 minimum subset row {id} must be supported serve replay"
             );
         }

@@ -4248,9 +4248,9 @@ impl SymForgeServer {
                 .iter()
                 .filter(|file| !symbol_paths.contains(file.path.as_str()))
                 .filter_map(|file| {
-                    file.matches.first().map(|m| {
-                        format!("{}:{}", file.path, m.line_number)
-                    })
+                    file.matches
+                        .first()
+                        .map(|m| format!("{}:{}", file.path, m.line_number))
                 })
                 .take(10)
                 .collect();
@@ -7938,9 +7938,7 @@ impl SymForgeServer {
                         ));
                 }
             };
-            let output = self
-                .dispatch_tool_for_tests(legacy_tool, legacy_args)
-                .await;
+            let output = self.dispatch_tool_for_tests(legacy_tool, legacy_args).await;
             let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
                 OutcomeClass::InvalidRequest
             } else if output.starts_with("Index not loaded.") {
@@ -7991,13 +7989,7 @@ impl SymForgeServer {
         if request.preview == Some(true) {
             let estimate = build_estimate(request, &plan, &decision);
             let body = handler::format_preview_estimate(&estimate);
-            let metrics = metrics_for_decision(
-                plan_summary,
-                &decision,
-                &plan,
-                0,
-                session_net,
-            );
+            let metrics = metrics_for_decision(plan_summary, &decision, &plan, 0, session_net);
             let envelope = handler::envelope_for_decision(&metrics);
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8005,17 +7997,17 @@ impl SymForgeServer {
 
         if is_enforced_bypass(&decision) {
             let body = format_bypass_body(&decision);
-        let output = self.finalize_symforge_with_ledger(
-            "symforge",
-            request,
-            &plan,
-            &decision,
-            plan_summary,
-            session_net,
-            &body,
-            false,
-            &step.tool,
-        );
+            let output = self.finalize_symforge_with_ledger(
+                "symforge",
+                request,
+                &plan,
+                &decision,
+                plan_summary,
+                session_net,
+                &body,
+                false,
+                &step.tool,
+            );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8106,14 +8098,14 @@ impl SymForgeServer {
         let mut resolved_symbol = None;
 
         if apply {
-            let abs_path = match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim())
-            {
-                Ok((path, _)) => path,
-                Err(message) => {
-                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                        .into_call_tool_result(message));
-                }
-            };
+            let abs_path =
+                match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim()) {
+                    Ok((path, _)) => path,
+                    Err(message) => {
+                        return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                            .into_call_tool_result(message));
+                    }
+                };
             match run_pre_apply_gates(&self.index, request, &abs_path) {
                 Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
                 Ok(PreApplyOutcome::AlreadyApplied(symbol)) => {
@@ -8230,7 +8222,11 @@ impl SymForgeServer {
         statused_tool_result(output, outcome_class)
     }
 
-    fn classify_symforge_edit_outcome(tool_body: &str, apply: bool, full_body: &str) -> OutcomeClass {
+    fn classify_symforge_edit_outcome(
+        tool_body: &str,
+        apply: bool,
+        full_body: &str,
+    ) -> OutcomeClass {
         if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
         } else if tool_body.starts_with("Index not loaded.") {
@@ -8290,16 +8286,13 @@ impl SymForgeServer {
         selected_tool: &str,
     ) -> String {
         use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
-        use crate::stel::ledger::{capture_ledger, format_ledger_envelope_line, LedgerCaptureInput};
+        use crate::stel::ledger::{
+            LedgerCaptureInput, capture_ledger, format_ledger_envelope_line,
+        };
 
         let response_tokens = handler::estimate_tokens(body);
-        let metrics = metrics_for_decision(
-            plan_summary,
-            decision,
-            plan,
-            response_tokens,
-            session_net,
-        );
+        let metrics =
+            metrics_for_decision(plan_summary, decision, plan, response_tokens, session_net);
         let (event, meta) = capture_ledger(&LedgerCaptureInput {
             plan,
             decision,

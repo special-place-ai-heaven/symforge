@@ -68,9 +68,9 @@ pub fn summarize_calibration(events: &[StelLedgerEvent]) -> StelCalibrationSumma
 fn tuning_sufficiency_note(total_events: usize) -> String {
     match total_events {
         0 => "insufficient: no ledger events; auto-tuning deferred".to_string(),
-        n if n < TUNING_REVIEW_MIN_EVENTS => format!(
-            "insufficient: {n} events (<{TUNING_REVIEW_MIN_EVENTS}); observational only"
-        ),
+        n if n < TUNING_REVIEW_MIN_EVENTS => {
+            format!("insufficient: {n} events (<{TUNING_REVIEW_MIN_EVENTS}); observational only")
+        }
         n => format!(
             "observational: {n} events adequate for offline review; auto-tuning still deferred"
         ),
@@ -106,12 +106,10 @@ pub fn format_calibration_section(summary: &StelCalibrationSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stel::controller::{evaluate_plan, estimate_economics, economics_for_bypass};
-    use crate::stel::ledger::{capture_ledger, LedgerCaptureInput};
+    use crate::stel::controller::{economics_for_bypass, estimate_economics, evaluate_plan};
+    use crate::stel::ledger::{LedgerCaptureInput, capture_ledger};
     use crate::stel::planner::build_plan;
-    use crate::stel::types::{
-        IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest,
-    };
+    use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest};
 
     fn serve_event() -> StelLedgerEvent {
         let plan = StelPlan {
@@ -190,8 +188,14 @@ mod tests {
         assert_eq!(summary.bypass_count, 0);
         assert_eq!(summary.pff_bypass_count, 0);
         assert_eq!(summary.legacy_executed_count, 1);
-        assert_eq!(summary.total_schema_tokens, u64::from(COMPACT_SCHEMA_TOKENS));
-        assert_eq!(summary.total_invoke_tokens, u64::from(COMPACT_INVOKE_TOKENS));
+        assert_eq!(
+            summary.total_schema_tokens,
+            u64::from(COMPACT_SCHEMA_TOKENS)
+        );
+        assert_eq!(
+            summary.total_invoke_tokens,
+            u64::from(COMPACT_INVOKE_TOKENS)
+        );
         assert!(summary.total_predicted_net != 0);
         assert!(summary.total_actual_response_tokens > 0);
         assert!(summary.tuning_note.contains("insufficient"));

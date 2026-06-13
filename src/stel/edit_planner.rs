@@ -2,9 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::types::{
-    IntentBucket, RouteConfidence, StelEditRequest, StelPlan, StelPlanStep,
-};
+use super::types::{IntentBucket, RouteConfidence, StelEditRequest, StelPlan, StelPlanStep};
 
 /// Validation failure before an edit plan can be built.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,11 +115,7 @@ fn edit_plan_id(request: &StelEditRequest) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path_token = request
-        .path
-        .trim()
-        .replace('/', "-")
-        .replace('\\', "-");
+    let path_token = request.path.trim().replace('/', "-").replace('\\', "-");
     format!("stel-edit-{path_token}-{ts}")
 }
 

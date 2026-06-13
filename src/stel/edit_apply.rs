@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::live_index::IndexState;
 use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
 use crate::live_index::{IndexedFile, SharedIndex};
-use crate::live_index::IndexState;
 
 use super::edit_planner::EditValidationError;
 use super::types::StelEditRequest;

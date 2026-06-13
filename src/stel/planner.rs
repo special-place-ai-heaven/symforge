@@ -6,9 +6,7 @@ use serde_json::{Value, json};
 
 use crate::protocol::smart_query;
 
-use super::types::{
-    IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest,
-};
+use super::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest};
 
 struct PlannedStep {
     tool: String,
@@ -423,8 +421,12 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
         "search_text" => json!({ "query": request.query.trim() }),
         "search_symbols" => json!({ "query": request.query.trim() }),
         "search_files" => json!({ "query": request.query.trim() }),
-        "get_file_context" => json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) }),
-        "get_file_content" => json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) }),
+        "get_file_context" => {
+            json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) })
+        }
+        "get_file_content" => {
+            json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) })
+        }
         "get_symbol" => json!({
             "path": request.path.clone().unwrap_or_default(),
             "name": request.symbol.clone().unwrap_or_else(|| request.query.trim().to_string()),
@@ -433,7 +435,9 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
             "name": request.symbol.clone().unwrap_or_else(|| request.query.trim().to_string()),
             "compact": true,
         }),
-        "find_dependents" => json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) }),
+        "find_dependents" => {
+            json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) })
+        }
         "explore" => json!({ "query": request.query.trim(), "depth": 2 }),
         "what_changed" => json!({}),
         "get_repo_map" => json!({}),
@@ -680,7 +684,8 @@ mod tests {
 
     #[test]
     fn planner_matches_cfg_if_golden_subset() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(super::super::golden_replay::GOLDEN_ROUTES_FIXTURE);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(super::super::golden_replay::GOLDEN_ROUTES_FIXTURE);
         let rows = super::super::golden_replay::load_golden_rows(&path).expect("golden fixture");
         let subset = [
             "cfg-if/t1_search",
@@ -703,7 +708,8 @@ mod tests {
 
     #[test]
     fn planner_honors_s4_exit_rows() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(super::super::golden_replay::GOLDEN_ROUTES_FIXTURE);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(super::super::golden_replay::GOLDEN_ROUTES_FIXTURE);
         let rows = super::super::golden_replay::load_golden_rows(&path).expect("golden fixture");
         for row in super::super::golden_replay::s4_exit_rows(&rows) {
             let mut request = row.to_request();

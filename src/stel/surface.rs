@@ -16,11 +16,8 @@ pub enum CompactSurfaceTool {
 }
 
 impl CompactSurfaceTool {
-    pub const ALL: [Self; COMPACT_SURFACE_TOOL_COUNT] = [
-        Self::Symforge,
-        Self::SymforgeEdit,
-        Self::Status,
-    ];
+    pub const ALL: [Self; COMPACT_SURFACE_TOOL_COUNT] =
+        [Self::Symforge, Self::SymforgeEdit, Self::Status];
 
     pub const fn as_str(self) -> &'static str {
         match self {

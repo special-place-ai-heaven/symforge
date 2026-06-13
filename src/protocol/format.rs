@@ -811,11 +811,9 @@ pub fn symbol_detail_from_indexed_file(
             )
         }
         SymbolSelectorMatch::NotFound => {
-            if let Some(window) = content_anchored_symbol_window(
-                file,
-                name,
-                COMPETENT_READ_WINDOW_LINES / 2,
-            ) {
+            if let Some(window) =
+                content_anchored_symbol_window(file, name, COMPETENT_READ_WINDOW_LINES / 2)
+            {
                 return window;
             }
             render_not_found_symbol(&file.relative_path, &file.symbols, name)

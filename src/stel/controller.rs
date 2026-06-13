@@ -109,7 +109,11 @@ pub fn evaluate_edit_plan(plan: &StelPlan) -> StelDecision {
 }
 
 /// Build preview economics for `preview: true` (L1+L2 only).
-pub fn build_estimate(request: &StelRequest, plan: &StelPlan, decision: &StelDecision) -> StelEstimate {
+pub fn build_estimate(
+    request: &StelRequest,
+    plan: &StelPlan,
+    decision: &StelDecision,
+) -> StelEstimate {
     let economics = if decision.decision == AdmissionDecision::Bypass {
         decision
             .bypass
@@ -136,21 +140,13 @@ pub fn build_estimate(request: &StelRequest, plan: &StelPlan, decision: &StelDec
 
 /// Sum step estimates + compact surface overhead into a manual-vs-symforge comparison.
 pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
-    let predicted_response_tokens: u32 = plan
-        .steps
-        .iter()
-        .map(|step| step.est_response_tokens)
-        .sum();
-    let predicted_manual_tokens: u32 = plan
-        .steps
-        .iter()
-        .map(|step| step.est_manual_tokens)
-        .sum();
+    let predicted_response_tokens: u32 =
+        plan.steps.iter().map(|step| step.est_response_tokens).sum();
+    let predicted_manual_tokens: u32 = plan.steps.iter().map(|step| step.est_manual_tokens).sum();
     let predicted_symforge_tokens = predicted_response_tokens
         .saturating_add(COMPACT_SCHEMA_TOKENS)
         .saturating_add(COMPACT_INVOKE_TOKENS);
-    let predicted_net_vs_manual =
-        predicted_manual_tokens as i32 - predicted_symforge_tokens as i32;
+    let predicted_net_vs_manual = predicted_manual_tokens as i32 - predicted_symforge_tokens as i32;
     EconomicsBreakdown {
         predicted_response_tokens,
         predicted_manual_tokens,
@@ -226,9 +222,12 @@ fn extract_pff_path(query: &str, lower: &str) -> Option<String> {
     None
 }
 
-
 /// Golden-row helper: L2 decision should match fixture `expected_decision` for representative rows.
-pub fn decision_matches_golden(row: &GoldenRouteRow, plan: &StelPlan, request: &StelRequest) -> bool {
+pub fn decision_matches_golden(
+    row: &GoldenRouteRow,
+    plan: &StelPlan,
+    request: &StelRequest,
+) -> bool {
     let decision = evaluate_plan(request, plan);
     decision.decision == row.expected_decision
 }
@@ -238,7 +237,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use crate::stel::golden_replay::{load_golden_rows, GOLDEN_ROUTES_FIXTURE};
+    use crate::stel::golden_replay::{GOLDEN_ROUTES_FIXTURE, load_golden_rows};
     use crate::stel::planner::build_plan;
     use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
 
@@ -317,7 +316,9 @@ mod tests {
         let rows = load_golden_rows(&path).expect("golden fixture");
         let eligible: Vec<_> = rows
             .iter()
-            .filter(|row| row.eligible_h6 == Some(true) && row.expected_decision == AdmissionDecision::Serve)
+            .filter(|row| {
+                row.eligible_h6 == Some(true) && row.expected_decision == AdmissionDecision::Serve
+            })
             .collect();
         assert!(eligible.len() >= 20);
         for row in eligible.iter().take(6) {

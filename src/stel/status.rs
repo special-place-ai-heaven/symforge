@@ -1,6 +1,8 @@
 //! STEL compact `status` tool — operational surface report (no calibration/edit).
 
-use super::calibration::{format_calibration_section, summarize_calibration, StelCalibrationSummary};
+use super::calibration::{
+    StelCalibrationSummary, format_calibration_section, summarize_calibration,
+};
 use super::ledger::SessionLedger;
 use super::types::{StelStatusDetail, StelStatusRequest};
 

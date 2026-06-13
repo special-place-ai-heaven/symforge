@@ -58,14 +58,8 @@ fn corpus_available(relative: &str, marker: &str) -> bool {
 
 fn l3_corpora_available() -> bool {
     corpus_available(stel::S4_REPLAY_CORPUS, "src/lib.rs")
-        && corpus_available(
-            "tests/fixtures/phase0-corpus/records-python",
-            "records.py",
-        )
-        && corpus_available(
-            "tests/fixtures/compression_ratio/rust",
-            "service.rs",
-        )
+        && corpus_available("tests/fixtures/phase0-corpus/records-python", "records.py")
+        && corpus_available("tests/fixtures/compression_ratio/rust", "service.rs")
 }
 
 fn tool_result_text(result: &serde_json::Value) -> &str {
@@ -115,7 +109,9 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
 #[tokio::test]
 async fn pff_golden_rows_bypass_without_legacy_tool_execution() {
     if !l3_corpora_available() {
-        eprintln!("skip pff_golden_rows_bypass: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md");
+        eprintln!(
+            "skip pff_golden_rows_bypass: clone phase0 corpora per tests/fixtures/phase0-corpus/README.md"
+        );
         return;
     }
 
@@ -154,13 +150,19 @@ async fn pff_golden_rows_bypass_without_legacy_tool_execution() {
             failures.push(format!("{id}: missing host-read instruction"));
         }
         if !output.contains("(whole file)") {
-            failures.push(format!("{id}: P-FF bypass must request whole-file host read"));
+            failures.push(format!(
+                "{id}: P-FF bypass must request whole-file host read"
+            ));
         }
         if output.contains("lines 1-50") {
-            failures.push(format!("{id}: P-FF bypass must not cap host read at lines 1-50"));
+            failures.push(format!(
+                "{id}: P-FF bypass must not cap host read at lines 1-50"
+            ));
         }
         if output.contains("Chosen tool:") {
-            failures.push(format!("{id}: must not dispatch legacy tool (Chosen tool present)"));
+            failures.push(format!(
+                "{id}: must not dispatch legacy tool (Chosen tool present)"
+            ));
         }
         for tool in &row.must_not_call {
             if output.contains(&format!("Chosen tool: {tool}")) {
@@ -191,7 +193,11 @@ async fn serve_golden_row_still_executes_legacy_tool() {
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "cfg-if-rust");
     let output = replay_row(&server, row).await;
 
-    assert!(output.contains("decision: serve"), "output tail: {}", &output[output.len().saturating_sub(200)..]);
+    assert!(
+        output.contains("decision: serve"),
+        "output tail: {}",
+        &output[output.len().saturating_sub(200)..]
+    );
     assert!(
         output.contains("Chosen tool: find_references"),
         "serve path must still execute planned legacy tool"

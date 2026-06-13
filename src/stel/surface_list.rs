@@ -21,7 +21,11 @@ fn schema_object<T: JsonSchema>() -> Arc<Map<String, Value>> {
     )
 }
 
-fn surface_tool(name: &'static str, description: &'static str, input_schema: Arc<Map<String, Value>>) -> Tool {
+fn surface_tool(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Arc<Map<String, Value>>,
+) -> Tool {
     let mut tool = Tool::default();
     tool.name = Cow::Borrowed(name);
     tool.description = Some(Cow::Borrowed(description));

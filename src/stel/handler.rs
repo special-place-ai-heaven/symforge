@@ -1,6 +1,6 @@
 //! Phase 1 S4+ — `symforge` response envelope wiring (L1 planner + L2 economics + L3 bypass).
 
-use super::controller::{build_estimate, estimate_economics, EconomicsBreakdown};
+use super::controller::{EconomicsBreakdown, build_estimate, estimate_economics};
 use super::envelope::{TrustEnvelopeInput, format_trust_envelope};
 use super::types::{AdmissionDecision, StelDecision, StelEstimate, StelPlan, StelRequest};
 
