@@ -60,6 +60,8 @@ No feature flags for dead approaches. No “keep old router behind env.” One w
 
 **Single L0 entry for read/explore:** `symforge` runs L1→L2→L3→L4 in one MCP round-trip.
 
+**Single L0 entry for structural edits:** `symforge_edit` runs L1→L2→L3→L4 in one MCP round-trip. **Phase 1 ships preview-only** (`dry_run`); guarded apply is specified below but **not implemented**.
+
 ---
 
 ## Layer contracts
@@ -146,6 +148,168 @@ MCP input schema for `symforge` (JSON Schema source of truth for compact surface
 | `path` / `symbol` | Disambiguation; reduces L1 inference error |
 | `max_tokens` | Hard ceiling on **response**; L2 may set lower |
 | `preview` | Pre-flight: estimate tokens & decision without L3 execution |
+
+---
+
+## `StelEditRequest` (L0 → L1 edit surface)
+
+MCP input schema for `symforge_edit` (JSON Schema source of truth for compact surface; A-025 budget).
+
+### Shipped wire schema (Phase 1 — preview-only)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string", "description": "Repository-relative file path" },
+    "symbol": { "type": "string", "description": "Symbol name to replace" },
+    "body": { "type": "string", "description": "Complete new symbol source" },
+    "intent": { "type": "string", "enum": ["edit"] }
+  },
+  "required": ["path"]
+}
+```
+
+| Field | Role |
+|-------|------|
+| `path` | Required; repository-relative path to the file containing the symbol |
+| `symbol` | Required for preview/apply; names the symbol whose body will be replaced |
+| `body` | Required for preview/apply; full replacement source for the symbol definition |
+| `intent` | Optional; `edit` when set (L0 routes structural mutations to `symforge_edit`, not `symforge`) |
+
+**Runtime today (commit `cabd978`):** every call is **preview-only**. The handler plans `replace_symbol_body` with `dry_run: true`, dispatches the legacy tool in dry-run mode, prepends the trust envelope, and appends a ledger row with `surface: "symforge_edit"`. **No file bytes are written.**
+
+### Future wire field — `apply` (not shipped)
+
+When guarded apply is implemented, extend the schema with an explicit opt-in flag (subject to A-025 byte budget or documented pivot):
+
+```json
+{
+  "apply": {
+    "type": "boolean",
+    "default": false,
+    "description": "If true, commit the planned edit after pre-apply validation. Default false = preview/dry_run only."
+  }
+}
+```
+
+| Rule | Norm |
+|------|------|
+| Default | `apply` omitted or `false` → **preview/dry_run only** (current behavior) |
+| Opt-in | `apply: true` → may commit **only** after all guarded-apply gates pass |
+| Forbidden | Implicit apply, env-var apply, or “second call auto-commits preview” patterns |
+
+Optional future companion fields (also not shipped): `idempotency_key` (replay committed apply), `symbol_line` (disambiguation), `expected_body_hash` or `if_match` (optimistic concurrency). Any addition must stay within A-025 or trigger the G-025 pivot documented in [`v8-gap-closure-plan.md`](v8-gap-closure-plan.md).
+
+---
+
+## Guarded apply semantics (normative — not implemented)
+
+**Gate:** no `apply: true` implementation merges until this section is satisfied by code **and** tests. Phase 1 checkpoint: [`phase1-stel-checkpoint.md`](phase1-stel-checkpoint.md) (`9f6a86c`).
+
+### Invariants
+
+1. **Preview remains the default** — absent `apply: true`, the handler must call legacy edit tools with `dry_run: true` only.
+2. **No silent writes** — a successful MCP response must never mutate on-disk source unless the request explicitly opted into apply and passed every gate below.
+3. **Single-hop, single-file** — Phase 1 guarded apply is one `replace_symbol_body` on one `path` + one `symbol`. Multi-file edits (`batch_edit`, `batch_rename`, etc.) are **out of scope** unless separately specified.
+4. **Same trust path as read** — apply responses must include `StelTrustEnvelope` + compact `ledger:` metadata, identical contract to `symforge` serve.
+
+### L1 validation (preview and apply)
+
+These checks run **before** planning; failures return `reject` / `InvalidRequest` with **no** envelope and **no** ledger row:
+
+| Check | Rule |
+|-------|------|
+| Path present | `path` non-empty after trim |
+| Path traversal | Reject `..` segments |
+| Absolute paths | Reject leading `/` or `\\` |
+| Drive / scheme prefixes | Reject `:` in path (Windows drives, URLs) |
+| Symbol / body | Both required for edit preview and apply |
+| Index ready | Index must be loaded for the repository root |
+
+Implemented today in [`edit_planner.rs`](../src/stel/edit_planner.rs); apply must not weaken these rules.
+
+### Pre-apply gates (`apply: true` only)
+
+Additional gates before any write:
+
+| Gate | Requirement |
+|------|-------------|
+| Symbol resolution | Index resolves exactly one symbol span for `(path, symbol)` (or explicit `symbol_line` when added); ambiguous or missing → reject, no write |
+| Edit-safety tier | Target file/language must pass the same structural-edit safety checks as legacy `replace_symbol_body` |
+| Content verification | Before write, verify on-disk bytes for the resolved symbol span match the index snapshot used for planning (detect external drift). Mismatch → reject, no write |
+| Expected match (recommended) | Caller may supply `if_match` / hash of the **current** symbol body; mismatch → reject, no write |
+| Idempotency | When `idempotency_key` is set, replay with the same key + same canonical request hash returns the stored outcome; same key + different hash → deterministic reject |
+| Already applied | If the on-disk symbol body already equals the requested `body`, return success without rewrite (idempotent no-op) or return a deterministic “already applied” outcome — must not double-apply destructively |
+
+### Apply execution
+
+```text
+INPUT:  StelEditRequest with apply=true, StelPlan (replace_symbol_body), IndexSnapshot
+
+1. Run all L1 validation gates
+2. Run all pre-apply gates (symbol resolve, safety tier, content verify)
+3. Re-evaluate L2 economics (evaluate_edit_plan) — unchanged margins vs preview slice
+4. Dispatch replace_symbol_body with dry_run=false
+5. On success: re-index affected file; capture ledger with legacy_executed=true
+6. On failure: no partial multi-file state (single-file scope); return error with envelope when execution started
+
+OUTPUT: StelTrustEnvelope + body + ledger line
+```
+
+**Rollback / error behavior:** Phase 1 apply is **single-symbol, single-file**. On failure after write begins, behavior follows legacy `replace_symbol_body` atomicity (no multi-file transaction). Callers must use `what_changed` / `validate_file_syntax` after apply. Multi-file rollback is out of scope.
+
+### Response body (apply)
+
+Apply responses must report, at minimum:
+
+| Field | Content |
+|-------|---------|
+| Changed files | Repository-relative path(s) — one file in Phase 1 |
+| Symbol | Name (and `symbol_line` when used) |
+| Byte range | Start/end byte offsets of the replaced span (from index resolution) |
+| Line range | Start/end 1-based lines covering the replaced definition |
+| Write mode | `committed` vs `dry_run` |
+| Tool | `replace_symbol_body` |
+
+Dry-run preview responses continue to include `[DRY RUN]` and `Write semantics: dry run (no writes)` from the legacy tool.
+
+### Ledger (apply)
+
+`StelLedgerEvent` for apply must set:
+
+- `surface`: `"symforge_edit"`
+- `decision`: `serve` when commit succeeds (or `reject` when gated — see preview invariant: no ledger on pre-plan validation failures)
+- `tools_called`: `["replace_symbol_body"]` when legacy tool ran
+- `legacy_executed`: `true` only when `dry_run=false` and bytes were committed
+
+Envelope `ledger:` JSON must mirror the same metadata as preview (`plan_id`, `route_tool`, `decision`, `legacy_executed`, token economics).
+
+### `status` reporting
+
+| Phase | `handler_symforge_edit` value |
+|-------|-------------------------------|
+| Preview-only (today) | `preview-only` |
+| After guarded apply ships | `active` or `preview-and-apply` — must **not** imply apply is available while default remains dry-run |
+
+`status` must never report apply-enabled until integration tests prove opt-in writes.
+
+### Normative test matrix (future apply slice)
+
+Tests must exist before apply ships (extend [`tests/stel_symforge_edit.rs`](../tests/stel_symforge_edit.rs)):
+
+| Test | Proves |
+|------|--------|
+| Default / omitted `apply` | No bytes written; `dry_run` invoked |
+| Explicit `apply: false` | Same as default |
+| Preview then apply separation | Preview call leaves file unchanged; apply call with same args writes once |
+| Unsafe path / missing fields | Rejected without write (existing preview tests) |
+| Symbol not found | Rejected without write |
+| Content drift / `if_match` mismatch | Rejected without write when on-disk span ≠ expected |
+| Idempotent replay | Same `idempotency_key` + request → same outcome, no double write |
+| Already applied | Second apply with same body → no destructive rewrite |
+| Successful apply | Bytes change; envelope + `ledger:` present; `legacy_executed: true` |
+| Ledger surface | `surface: "symforge_edit"` on apply rows |
 
 ---
 
@@ -282,7 +446,7 @@ Every execution **must** populate `totals` for ledger; bypass/cache use zero L3 
 
 ## `StelTrustEnvelope` (L0 response header)
 
-Prepended to every `symforge` body (text or structured). Parsed by hosts; displayed to LLM.
+Prepended to every `symforge` and `symforge_edit` body (text or structured). Parsed by hosts; displayed to LLM.
 
 ```text
 ── stel ──
@@ -321,6 +485,8 @@ Machine-readable mirror in JSON mode (future): `StelResponse { envelope, body }`
 ```
 
 Battery runs attach `equivalence` from sf-bench judge post-hoc.
+
+Edit apply rows use `"surface": "symforge_edit"` with the same field contract.
 
 ---
 
@@ -430,6 +596,8 @@ Expansion triggered only when trajectory replay proves a core tool beats facade 
 | **S2** | Rust types in `src/stel/mod.rs` matching schemas | compile |
 | **S3** | Compact surface (`SYMFORGE_SURFACE=compact`) — 3 tools in `tools/list` | **H1**; external **H5** (one MCP call) once L1–L2 execute inside that call (full H5 proof: Phase 2 exit per gap plan §7) |
 | **S4** | `StelRequest` MCP tool + envelope formatter | path replay 5 rows |
+| **S4e** | `symforge_edit` preview-only handler | `tests/stel_symforge_edit.rs` |
+| **S4e+** | `symforge_edit` guarded apply (`apply: true`) | normative tests in `stel-schema.md` § Guarded apply — **blocked until S4e+ tests pass** |
 | **S5** | L1 plan builder (extend smart_query) | H2 partial |
 | **S6** | L2 controller + bypass | **H3/H4** on **compact** surface |
 | **S7** | L4 ledger + calibration | H7 repeatability |

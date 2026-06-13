@@ -198,7 +198,7 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 | Item | Status |
 |------|--------|
-| `symforge_edit` guarded apply | **Not implemented** — preview/dry-run only; see design note below |
+| `symforge_edit` guarded apply | **Not implemented** — normative spec in [`stel-schema.md`](stel-schema.md); preview/dry-run only today |
 | Calibration auto-tuning (`CalibrationState` fudge → L2) | Not implemented — observational summary only |
 | Calibration / ledger persistence | In-memory only |
 | Multi-step planner / executor chains | L1 single-step only; 3 golden multi-hop rows deferred |
@@ -207,26 +207,27 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 ---
 
-## Guarded apply semantics (design note — not implemented)
+## Guarded apply semantics (normative spec — not implemented)
 
-**Do not ship apply until this contract is normative in `stel-schema.md` and tested.**
+**Normative contract:** [`stel-schema.md`](stel-schema.md) — sections **`StelEditRequest`** and **`Guarded apply semantics`**.
 
-Recommended minimum apply gate for a future slice:
+Phase 1 ships preview-only (`cabd978`). The schema now defines:
 
-1. **Explicit opt-in** — wire field such as `apply: true` (or `preview: false`) on `StelEditRequest`; default remains preview-only.
-2. **No silent writes** — absent explicit apply, handler must never call legacy edit tools without `dry_run: true`.
-3. **Pre-apply validation** — same path/symbol/body checks as preview; symbol must resolve in index; edit-safety tier must allow the operation.
-4. **Idempotency** — committed apply should accept `idempotency_key` and replay stored outcomes (align with legacy `replace_symbol_body`).
-5. **Post-apply evidence** — trust envelope + ledger must record `legacy_executed: true`, route tool, and outcome; tests must prove on-disk bytes change only when apply is explicitly requested.
-6. **Rollback story** — document whether apply is single-file/single-symbol only in Phase 1 (recommended) before `batch_edit` surfaces on compact.
+- explicit `apply: true` opt-in (future wire field; default remains preview/dry_run)
+- no silent writes; path/symbol/body validation; traversal and absolute-path rejection
+- pre-apply symbol resolution, edit-safety tier, on-disk content verification, idempotency
+- trust envelope + ledger on apply; changed-file and byte/line range reporting
+- normative test matrix before any apply code merges
+- `status` must distinguish preview-only vs apply-enabled
+- single-file / single-symbol scope; multi-file edits out of scope
 
-**Recommendation:** ship guarded apply only after the above is documented and covered by integration tests; do not rush apply for golden-count wins.
+**Do not implement `apply: true` until the test matrix in `stel-schema.md` is satisfied.**
 
 ---
 
 ## Suggested next boundaries (risk order)
 
-1. **Guarded `symforge_edit` apply** — after apply semantics are documented (section above); smallest path: single-symbol `replace_symbol_body` with explicit `apply: true`
+1. **Guarded `symforge_edit` apply** — implement `apply: true` per [`stel-schema.md`](stel-schema.md) guarded-apply section + full test matrix; smallest path: single-symbol `replace_symbol_body`
 2. **Multi-hop routing** — replay the three `chain: multi` golden rows; larger planner + runtime expansion
 3. **Calibration persistence** — durable ledger + optional auto-tuning gate (still no silent L2 changes)
 4. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
@@ -255,7 +256,7 @@ Recommended minimum apply gate for a future slice:
 
 ## Related docs
 
-- [stel-schema.md](stel-schema.md) — normative types and controller algorithm
+- [stel-schema.md](stel-schema.md) — normative types, controller algorithm, **guarded apply semantics**
 - [stel-architecture.md](stel-architecture.md) — charter and H1–H8 gates
 - [v8-gap-closure-plan.md](v8-gap-closure-plan.md) — binding pre-flight and phase map
 - [phase0-12a-review-signoff.md](research/phase0-12a-review-signoff.md) — GO decision record
