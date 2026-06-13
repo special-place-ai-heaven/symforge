@@ -171,7 +171,7 @@
 
 ### Post-implementation doc refresh (2026-06-13)
 
-Producer aligned evidence commit references at `f7207b7`. **Independent review not requested** while B-A019 interim. Sequence: close A-019 → refresh docs → request review → T048/T049.
+Producer aligned evidence commit references at `e9f4102` (includes `c3581a5`). **Independent review not requested** while B-A019 interim. Sequence: close A-019 → refresh docs → request review → T048/T049.
 
 ---
 
