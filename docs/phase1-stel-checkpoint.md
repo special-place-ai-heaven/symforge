@@ -137,7 +137,7 @@ flowchart TD
 | Suite | What it proves |
 |-------|----------------|
 | `cargo test stel::` | Unit tests across types, planner, controller, executor, ledger, calibration, status, envelope, golden_replay helpers |
-| `tests/stel_golden_replay.rs` | Classifies all 36 golden rows; replays **13 supported serve** + **4 P-FF bypass** rows; keeps S4 five-row minimum subset |
+| `tests/stel_golden_replay.rs` | Classifies all 36 golden rows; replays **29 supported serve** + **4 P-FF bypass** rows; keeps S4 five-row minimum subset |
 | `tests/stel_l3_enforcement.rs` | P-FF bypass skips legacy tools; serve still executes |
 | `tests/stel_l4_ledger.rs` | Serve and P-FF rows produce envelope `ledger:` + session ledger events |
 | `tests/stel_status.rs` | Compact guard, operational fields, full detail + calibration after serve |
@@ -147,10 +147,10 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 | Category | Count | Notes |
 |----------|-------|-------|
-| Supported serve replay | 13 | L1 planner matches `must_call[0]`; trust envelope + `ledger:` validated |
+| Supported serve replay | 29 | L1 planner matches `must_call[0]`; trust envelope + `ledger:` validated |
 | Supported P-FF bypass replay | 4 | L3 enforced bypass; no legacy tool execution |
 | Deferred multi-hop | 3 | `DEFERRED_MULTI_HOP_ROW_IDS` — planner multi-step not shipped |
-| Deferred planner mismatch | 16 | Listed explicitly in `deferred_planner_mismatch_ids_are_stable` test |
+| Deferred planner mismatch | 0 | Narrow L1 route patterns cover remaining single-hop rows |
 
 S4 minimum subset (`S4_EXIT_ROW_IDS`, five rows) remains a named floor inside supported serve replay.
 

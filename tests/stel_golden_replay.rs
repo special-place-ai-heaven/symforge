@@ -133,8 +133,8 @@ fn golden_corpus_classification_lists_deferred_rows_explicitly() {
         );
     }
     assert!(
-        !classification.deferred_planner_mismatch.is_empty(),
-        "planner mismatches must be listed, not silently skipped"
+        classification.deferred_planner_mismatch.is_empty(),
+        "planner mismatches must be empty or listed explicitly in deferred_planner_mismatch_ids_are_stable"
     );
     for id in stel::S4_EXIT_ROW_IDS {
         assert!(

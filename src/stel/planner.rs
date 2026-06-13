@@ -124,6 +124,110 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
         ));
     }
 
+    if let Some(name) = parse_bare_references_target(query) {
+        return Some(planned(
+            "find_references",
+            json!({ "name": name, "compact": true }),
+            IntentBucket::Trace,
+            RouteConfidence::Inferred,
+            "references {symbol} phrasing",
+        ));
+    }
+
+    if lower.contains("repo map") {
+        return Some(planned(
+            "get_repo_map",
+            json!({}),
+            IntentBucket::Orient,
+            RouteConfidence::Inferred,
+            "repo map phrasing",
+        ));
+    }
+
+    if lower == "index health" {
+        return Some(planned(
+            "health_compact",
+            json!({}),
+            IntentBucket::Meta,
+            RouteConfidence::Exact,
+            "index health probe",
+        ));
+    }
+
+    if let Some((path, max_lines)) = parse_bounded_content_read(query, &lower) {
+        let mut args = json!({ "path": path });
+        if let Some(max_lines) = max_lines {
+            args["max_lines"] = json!(max_lines);
+        }
+        return Some(planned(
+            "get_file_content",
+            args,
+            IntentBucket::Read,
+            RouteConfidence::Inferred,
+            "bounded file content read",
+        ));
+    }
+
+    if let Some((name, path)) = parse_symbol_in_path(query, &lower) {
+        return Some(planned(
+            "get_symbol",
+            json!({ "path": path, "name": name }),
+            IntentBucket::Read,
+            RouteConfidence::Inferred,
+            "symbol-in-path phrasing",
+        ));
+    }
+
+    if let Some(name) = parse_symbol_body_phrase(query, &lower) {
+        return Some(planned(
+            "get_symbol",
+            json!({ "name": name }),
+            IntentBucket::Read,
+            RouteConfidence::Inferred,
+            "symbol body phrasing",
+        ));
+    }
+
+    if let Some(name) = parse_trailing_symbol_phrase(query, &lower) {
+        return Some(planned(
+            "search_symbols",
+            json!({ "query": name }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            "trailing symbol phrasing",
+        ));
+    }
+
+    if let Some(hint) = parse_files_named_hint(query, &lower) {
+        return Some(planned(
+            "search_files",
+            json!({ "query": hint }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            "files named phrasing",
+        ));
+    }
+
+    if let Some(hint) = parse_files_for_hint(query, &lower) {
+        return Some(planned(
+            "search_files",
+            json!({ "query": hint }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            "files for phrasing",
+        ));
+    }
+
+    if let Some(term) = parse_find_entity_search(query, &lower) {
+        return Some(planned(
+            "search_text",
+            json!({ "query": term }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            "find class/function phrasing",
+        ));
+    }
+
     if lower.contains("macro usage") || (lower.starts_with("find ") && lower.contains(" usage")) {
         let term = extract_find_subject(query).unwrap_or_else(|| query.to_string());
         let mut args = json!({ "query": term });
@@ -333,6 +437,7 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
         "explore" => json!({ "query": request.query.trim(), "depth": 2 }),
         "what_changed" => json!({}),
         "get_repo_map" => json!({}),
+        "health_compact" => json!({}),
         _ => json!({ "query": request.query.trim() }),
     }
 }
@@ -346,7 +451,9 @@ fn intent_bucket_for_tool(tool: &str) -> IntentBucket {
             IntentBucket::Impact
         }
         "explore" | "get_repo_map" | "conventions" => IntentBucket::Orient,
-        "context_inventory" | "investigation_suggest" | "ask" => IntentBucket::Meta,
+        "context_inventory" | "investigation_suggest" | "ask" | "health_compact" => {
+            IntentBucket::Meta
+        }
         _ => IntentBucket::Auto,
     }
 }
@@ -390,11 +497,153 @@ fn parse_reference_target(query: &str) -> Option<String> {
         if let Some(target) = lower.strip_prefix(prefix) {
             let target = target.trim();
             if !target.is_empty() {
-                return Some(target.to_string());
+                return slice_after_prefix(query, prefix);
             }
         }
     }
     None
+}
+
+fn parse_bare_references_target(query: &str) -> Option<String> {
+    const PREFIX: &str = "references ";
+    let lower = query.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix(PREFIX)?.trim();
+    if rest.is_empty() || rest.starts_with("to ") {
+        return None;
+    }
+    slice_after_prefix(query, PREFIX)
+}
+
+fn parse_bounded_content_read(query: &str, lower: &str) -> Option<(String, Option<u32>)> {
+    if let Some(rest) = lower.strip_prefix("first ") {
+        if let Some((lines, path)) = rest.split_once(" lines ") {
+            let lines = lines.trim().parse().ok()?;
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some((normalize_path(path), Some(lines)));
+            }
+        }
+    }
+    if let Some(rest) = lower.strip_prefix("read ") {
+        if let Some((path, limit)) = rest.split_once(" limit ") {
+            let lines = limit.trim().parse().ok()?;
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some((path.to_string(), Some(lines)));
+            }
+        }
+        if rest.ends_with(" header") {
+            let path = rest.strip_suffix(" header")?.trim();
+            if !path.is_empty() {
+                return Some((path.to_string(), Some(40)));
+            }
+        }
+    }
+    let _ = query;
+    None
+}
+
+fn parse_symbol_in_path(query: &str, lower: &str) -> Option<(String, String)> {
+    let marker = " symbol in ";
+    let idx = lower.rfind(marker)?;
+    let name = query[..idx].trim();
+    let path = query[idx + marker.len()..].trim();
+    if name.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), path.to_string()))
+}
+
+fn parse_symbol_body_phrase(query: &str, lower: &str) -> Option<String> {
+    if lower.ends_with(" symbol body") {
+        let name = query.trim().strip_suffix(" symbol body")?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        return Some(name.to_string());
+    }
+    if lower.ends_with(" body") && !lower.starts_with("body of ") {
+        let name = query.trim().strip_suffix(" body")?.trim();
+        if name.is_empty() || name.contains(' ') {
+            return None;
+        }
+        return Some(name.to_string());
+    }
+    None
+}
+
+fn parse_trailing_symbol_phrase(query: &str, lower: &str) -> Option<String> {
+    if !lower.ends_with(" symbol") || lower.starts_with("locate ") {
+        return None;
+    }
+    let name = query.trim().strip_suffix(" symbol")?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn parse_files_named_hint(query: &str, lower: &str) -> Option<String> {
+    let rest = lower.strip_prefix("files named ")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    slice_after_prefix(query, "files named ")
+}
+
+fn parse_files_for_hint(query: &str, lower: &str) -> Option<String> {
+    let marker = " files for ";
+    let idx = lower.find(marker)?;
+    let hint = query[idx + marker.len()..].trim();
+    if hint.is_empty() {
+        None
+    } else {
+        Some(hint.to_string())
+    }
+}
+
+fn parse_find_entity_search(query: &str, lower: &str) -> Option<String> {
+    if !lower.starts_with("find ") {
+        return None;
+    }
+    let term = if lower.ends_with(" function") {
+        query
+            .trim()
+            .strip_prefix("find ")
+            .and_then(|s| s.strip_suffix(" function"))
+            .map(str::trim)
+    } else if lower.contains(" class") {
+        query
+            .trim()
+            .strip_prefix("find ")
+            .and_then(|s| s.strip_suffix(" class"))
+            .map(str::trim)
+    } else if lower.ends_with(" check") {
+        query
+            .trim()
+            .strip_prefix("find ")
+            .and_then(|s| s.strip_suffix(" check"))
+            .map(str::trim)
+    } else {
+        None
+    }?;
+    if term.is_empty() {
+        None
+    } else {
+        Some(term.to_string())
+    }
+}
+
+fn slice_after_prefix<'a>(query: &'a str, prefix: &str) -> Option<String> {
+    let lower = query.to_ascii_lowercase();
+    let pos = lower.find(&prefix.to_ascii_lowercase())?;
+    let value = query[pos + prefix.len()..].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn extract_find_subject(query: &str) -> Option<String> {
@@ -491,6 +740,130 @@ mod tests {
                 ..Default::default()
             }),
             "get_file_context"
+        );
+    }
+
+    #[test]
+    fn repo_map_phrasing_plans_get_repo_map() {
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "repo map cfg-if".to_string(),
+                ..Default::default()
+            }),
+            "get_repo_map"
+        );
+    }
+
+    #[test]
+    fn bounded_content_reads_plan_get_file_content() {
+        let req = StelRequest {
+            query: "first 80 lines lib.rs".to_string(),
+            ..Default::default()
+        };
+        let plan = build_plan(&req);
+        assert_eq!(plan.steps[0].tool, "get_file_content");
+        assert_eq!(plan.steps[0].args["path"], "src/lib.rs");
+        assert_eq!(plan.steps[0].args["max_lines"], 80);
+
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "read index.js limit 80".to_string(),
+                ..Default::default()
+            }),
+            "get_file_content"
+        );
+    }
+
+    #[test]
+    fn find_entity_phrasing_plans_search_text() {
+        for query in [
+            "find reconcile function",
+            "find Database class",
+            "find plainObject check",
+        ] {
+            assert_eq!(
+                plan_tool(StelRequest {
+                    query: query.to_string(),
+                    ..Default::default()
+                }),
+                "search_text",
+                "query: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_references_phrasing_plans_find_references() {
+        let plan = build_plan(&StelRequest {
+            query: "references isPlainObject".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "find_references");
+        assert_eq!(plan.steps[0].args["name"], "isPlainObject");
+    }
+
+    #[test]
+    fn symbol_body_and_in_path_phrasing_plan_get_symbol() {
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "Database symbol in records.py".to_string(),
+                ..Default::default()
+            }),
+            "get_symbol"
+        );
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "reconcile symbol body".to_string(),
+                ..Default::default()
+            }),
+            "get_symbol"
+        );
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "isPlainObject body".to_string(),
+                ..Default::default()
+            }),
+            "get_symbol"
+        );
+    }
+
+    #[test]
+    fn trailing_symbol_phrasing_plans_search_symbols() {
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "isPlainObject symbol".to_string(),
+                ..Default::default()
+            }),
+            "search_symbols"
+        );
+    }
+
+    #[test]
+    fn files_search_phrasing_plans_search_files() {
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "files named records".to_string(),
+                ..Default::default()
+            }),
+            "search_files"
+        );
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "test files for plain object".to_string(),
+                ..Default::default()
+            }),
+            "search_files"
+        );
+    }
+
+    #[test]
+    fn index_health_plans_health_compact() {
+        assert_eq!(
+            plan_tool(StelRequest {
+                query: "index health".to_string(),
+                ..Default::default()
+            }),
+            "health_compact"
         );
     }
 }

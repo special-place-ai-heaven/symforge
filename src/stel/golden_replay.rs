@@ -400,8 +400,8 @@ mod tests {
             );
         }
         assert!(
-            !classification.deferred_planner_mismatch.is_empty(),
-            "planner mismatches must be listed explicitly, not silently skipped"
+            classification.deferred_planner_mismatch.is_empty(),
+            "planner mismatches must be empty or listed explicitly in deferred_planner_mismatch_ids_are_stable"
         );
         assert!(
             classification.supported_serve.len() >= 5,
@@ -414,24 +414,7 @@ mod tests {
     fn deferred_planner_mismatch_ids_are_stable() {
         let rows = fixture_rows();
         let classification = classify_golden_corpus(&rows);
-        let expected = [
-            "cfg-if/t6_map",
-            "cfg-if/t7_content",
-            "compression/t1_search",
-            "compression/t3_symbol",
-            "compression/t4_refs",
-            "is-plain/t1_search",
-            "is-plain/t3_content",
-            "is-plain/t4_symbols",
-            "is-plain/t5_symbol",
-            "is-plain/t6_refs",
-            "is-plain/t7_files",
-            "is-plain/t8_health",
-            "records/t1_search",
-            "records/t3_files",
-            "records/t5_symbol",
-            "records/t7_content",
-        ];
+        let expected: [&str; 0] = [];
         assert_eq!(classification.deferred_planner_mismatch, expected);
     }
 
@@ -445,13 +428,29 @@ mod tests {
             "cfg-if/t3_symbols",
             "cfg-if/t4_refs",
             "cfg-if/t5_symbol",
+            "cfg-if/t6_map",
+            "cfg-if/t7_content",
             "cfg-if/t8_explore",
+            "compression/t1_search",
             "compression/t2_context",
+            "compression/t3_symbol",
+            "compression/t4_refs",
             "compression/t5_dependents",
+            "is-plain/t1_search",
             "is-plain/t2_context",
+            "is-plain/t3_content",
+            "is-plain/t4_symbols",
+            "is-plain/t5_symbol",
+            "is-plain/t6_refs",
+            "is-plain/t7_files",
+            "is-plain/t8_health",
+            "records/t1_search",
             "records/t2_context",
+            "records/t3_files",
             "records/t4_refs",
+            "records/t5_symbol",
             "records/t6_dependents",
+            "records/t7_content",
             "records/t8_explore",
         ];
         assert_eq!(classification.supported_serve, expected);
