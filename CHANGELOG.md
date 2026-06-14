@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.23.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.22.0...v7.23.0) (2026-06-14)
+
+
+### Features
+
+* **stel:** close Phase 2 multi-hop golden replay ([3d64b96](https://github.com/special-place-ai-heaven/symforge/commit/3d64b965991db91d6c6b5d2b11b7857ce52322e9))
+
 ## [7.22.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.2...v7.22.0) (2026-06-14)
 
 
