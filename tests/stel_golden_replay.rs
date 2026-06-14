@@ -1,52 +1,15 @@
 //! Golden route replay — classify and replay supported rows on compact `symforge`.
 #![cfg(feature = "server")]
-#![allow(unsafe_code)] // test-only SYMFORGE_SURFACE guard (serialized by COMPACT_ENV_LOCK)
+
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::stel::{self, GoldenRouteRow};
-
-static COMPACT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(previous) => unsafe {
-                std::env::set_var(self.key, previous);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
-        }
-    }
-}
-
-fn with_compact_surface() -> EnvVarGuard {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    EnvVarGuard::set("SYMFORGE_SURFACE", "compact")
-}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -181,7 +144,8 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let exit_rows = stel::s4_exit_rows(&rows);
@@ -195,7 +159,8 @@ async fn supported_serve_rows_replay_with_envelope_and_ledger() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let serve_rows: Vec<_> = stel::supported_serve_rows(&rows)
@@ -216,7 +181,8 @@ async fn supported_pff_rows_bypass_without_legacy_execution() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let pff_rows: Vec<_> = stel::supported_pff_rows(&rows)

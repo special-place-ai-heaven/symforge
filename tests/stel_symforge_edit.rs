@@ -1,60 +1,15 @@
 //! Compact-surface `symforge_edit` — preview and guarded apply structural edit facade.
 #![cfg(feature = "server")]
-#![allow(unsafe_code)]
 
-use std::ffi::OsString;
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::protocol::result_status::RESULT_STATUS_META_KEY;
 use symforge::stel::StelEditRequest;
-
-static COMPACT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(previous) => unsafe {
-                std::env::set_var(self.key, previous);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
-        }
-    }
-}
-
-fn with_surface(value: &str) -> EnvVarGuard {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    EnvVarGuard::set("SYMFORGE_SURFACE", value)
-}
-
-fn with_compact_surface() -> EnvVarGuard {
-    with_surface("compact")
-}
-
-fn with_full_surface() -> EnvVarGuard {
-    with_surface("full")
-}
 
 fn tool_result_text(result: &serde_json::Value) -> &str {
     result["content"][0]["text"]
@@ -121,7 +76,8 @@ async fn dispatch_symforge_edit(server: &SymForgeServer, request: &StelEditReque
 
 #[tokio::test]
 async fn symforge_edit_rejects_non_compact_surface() {
-    let _surface = with_full_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full");
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-non-compact");
@@ -143,7 +99,8 @@ async fn symforge_edit_rejects_non_compact_surface() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_unsafe_path() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-unsafe-path");
@@ -165,7 +122,8 @@ async fn symforge_edit_rejects_unsafe_path() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_missing_symbol_and_body() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-missing-fields");
@@ -185,7 +143,8 @@ async fn symforge_edit_rejects_missing_symbol_and_body() {
 
 #[tokio::test]
 async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writes() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -221,7 +180,8 @@ async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writ
 
 #[tokio::test]
 async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -247,7 +207,8 @@ async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_missing_symbol_on_apply() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -278,7 +239,8 @@ async fn symforge_edit_rejects_missing_symbol_on_apply() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -307,7 +269,8 @@ async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
 
 #[tokio::test]
 async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { same }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -339,7 +302,8 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
 
 #[tokio::test]
 async fn symforge_edit_preview_then_apply_writes_once() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -391,7 +355,8 @@ async fn symforge_edit_preview_then_apply_writes_once() {
 
 #[tokio::test]
 async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -420,7 +385,8 @@ async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
 
 #[tokio::test]
 async fn symforge_edit_rejects_absolute_and_scheme_paths() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let (dir, file_path) = temp_rust_repo("fn foo() {}\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -458,7 +424,8 @@ async fn symforge_edit_rejects_absolute_and_scheme_paths() {
 
 #[tokio::test]
 async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let original = "# foo\n\nOld section body.\n";
     let (dir, file_path) = temp_markdown_repo(original);

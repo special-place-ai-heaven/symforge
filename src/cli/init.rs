@@ -352,6 +352,9 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__edit_plan",
     "mcp__symforge__context_inventory",
     "mcp__symforge__investigation_suggest",
+    "mcp__symforge__status",
+    "mcp__symforge__symforge",
+    "mcp__symforge__symforge_edit",
 ];
 
 const KILO_ALWAYS_ALLOW: &[&str] = &[
@@ -387,6 +390,9 @@ const KILO_ALWAYS_ALLOW: &[&str] = &[
     "edit_plan",
     "context_inventory",
     "investigation_suggest",
+    "status",
+    "symforge",
+    "symforge_edit",
 ];
 
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
@@ -422,6 +428,9 @@ const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "edit_plan",
     "context_inventory",
     "investigation_suggest",
+    "status",
+    "symforge",
+    "symforge_edit",
 ];
 
 fn merge_allowed_tools(settings: &mut Value) {

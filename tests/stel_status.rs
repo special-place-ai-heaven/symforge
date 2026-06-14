@@ -1,59 +1,14 @@
 //! Compact-surface `status` tool — operational STEL report.
 #![cfg(feature = "server")]
-#![allow(unsafe_code)]
 
-use std::ffi::OsString;
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::stel::{self, GoldenRouteRow};
-
-static COMPACT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(previous) => unsafe {
-                std::env::set_var(self.key, previous);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
-        }
-    }
-}
-
-fn with_surface(value: &str) -> EnvVarGuard {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    EnvVarGuard::set("SYMFORGE_SURFACE", value)
-}
-
-fn with_compact_surface() -> EnvVarGuard {
-    with_surface("compact")
-}
-
-fn with_full_surface() -> EnvVarGuard {
-    with_surface("full")
-}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -132,7 +87,8 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
 
 #[tokio::test]
 async fn status_rejects_non_compact_surface() {
-    let _surface = with_full_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full");
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-non-compact");
     let output = dispatch_status(&server, None).await;
@@ -149,7 +105,8 @@ async fn compact_status_reports_operational_state() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-compact");
     let output = dispatch_status(&server, None).await;
@@ -178,7 +135,8 @@ async fn full_status_includes_project_and_ledger_summary() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");

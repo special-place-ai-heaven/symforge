@@ -62,6 +62,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "context_inventory",
     "investigation_suggest",
     "health_compact",
+    "status",
+    "symforge",
+    "symforge_edit",
 ];
 
 const PUBLIC_CONFORMANCE_CORPUS_VERSION: u8 = 1;
@@ -554,6 +557,8 @@ fn all_tools_have_annotations() {
         "investigation_suggest",
         "context_inventory",
         "health_compact",
+        "status",
+        "symforge",
     ];
 
     const DESTRUCTIVE_WRITE: &[&str] = &[
@@ -561,6 +566,7 @@ fn all_tools_have_annotations() {
         "delete_symbol",
         "batch_edit",
         "batch_rename",
+        "symforge_edit",
     ];
 
     const ADDITIVE_WRITE: &[&str] = &["insert_symbol", "edit_within_symbol", "batch_insert"];

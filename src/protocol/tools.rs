@@ -8057,6 +8057,7 @@ impl SymForgeServer {
         annotations(
             read_only_hint = false,
             destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -8812,6 +8813,30 @@ mod tests {
         }
     }
 
+    fn medium_test_source_with_prefix(core: &str, line_prefix: &str) -> Vec<u8> {
+        use crate::protocol::format::{SMALL_FILE_CHAR_THRESHOLD, SMALL_FILE_LINE_THRESHOLD};
+
+        let mut out = core.to_string();
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let mut line_count = out.lines().count();
+        while line_count <= SMALL_FILE_LINE_THRESHOLD {
+            out.push_str(line_prefix);
+            out.push_str("test fixture padding\n");
+            line_count += 1;
+        }
+        while out.len() <= SMALL_FILE_CHAR_THRESHOLD {
+            out.push_str(line_prefix);
+            out.push_str("pad\n");
+        }
+        out.into_bytes()
+    }
+
+    fn medium_test_source(core: &str) -> Vec<u8> {
+        medium_test_source_with_prefix(core, "// ")
+    }
+
     fn make_file(path: &str, content: &[u8], symbols: Vec<SymbolRecord>) -> (String, IndexedFile) {
         (
             path.to_string(),
@@ -9481,7 +9506,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_file_context_outline_only_contains_path_and_symbol() {
         let sym = make_symbol("main", SymbolKind::Function, 1, 5);
-        let (key, file) = make_file("src/main.rs", b"fn main() {}", vec![sym]);
+        let content = medium_test_source("fn main() {}");
+        let (key, file) = make_file("src/main.rs", &content, vec![sym]);
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
@@ -9499,7 +9525,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_symbol_delegates_to_formatter() {
         let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
-        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![sym]);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
@@ -9693,10 +9720,12 @@ mod tests {
     async fn test_get_file_context_returns_outline_and_key_references() {
         let callee = make_symbol("target", SymbolKind::Function, 1, 3);
         let caller = make_symbol("caller", SymbolKind::Function, 1, 3);
-        let target_file = make_file("src/target.rs", b"pub fn target() {}", vec![callee]);
+        let target_content = medium_test_source("pub fn target() {}");
+        let caller_content = medium_test_source("use crate::target;\nfn caller() { target(); }");
+        let target_file = make_file("src/target.rs", &target_content, vec![callee]);
         let caller_file = make_file_with_refs(
             "src/caller.rs",
-            b"use crate::target;\nfn caller() { target(); }",
+            &caller_content,
             vec![caller],
             vec![
                 ReferenceRecord {
@@ -9810,9 +9839,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_file_context_shows_parse_diagnostic_for_partial_file() {
+        let content = medium_test_source_with_prefix(
+            "[package]\nname = \"symforge\"\ninvalid = \"unterminated\n",
+            "# ",
+        );
         let (key, mut file) = make_file(
             "Cargo.toml",
-            b"[package]\nname = \"symforge\"\ninvalid = \"unterminated\n",
+            &content,
             vec![make_symbol("package", SymbolKind::Key, 1, 1)],
         );
         let diagnostic = crate::domain::ParseDiagnostic {
@@ -9833,7 +9866,7 @@ mod tests {
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "Cargo.toml".to_string(),
-                max_tokens: None,
+                max_tokens: Some(2000),
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -10396,9 +10429,10 @@ mod tests {
         let callee = make_symbol("target", SymbolKind::Function, 1, 3);
         let caller = make_symbol("caller", SymbolKind::Function, 1, 3);
         // caller.rs imports from crate::target and calls target().
+        let caller_content = medium_test_source("use crate::target;\nfn caller() { target(); }");
         let caller_file = make_file_with_refs(
             "src/caller.rs",
-            b"use crate::target;\nfn caller() { target(); }",
+            &caller_content,
             vec![caller],
             vec![
                 ReferenceRecord {
@@ -10419,7 +10453,8 @@ mod tests {
                 },
             ],
         );
-        let target_file = make_file("src/target.rs", b"pub fn target() {}", vec![callee]);
+        let target_content = medium_test_source("pub fn target() {}");
+        let target_file = make_file("src/target.rs", &target_content, vec![callee]);
         let server = make_server(make_live_index_ready(vec![target_file, caller_file]));
 
         // Check caller.rs — should have "Imports from" section.

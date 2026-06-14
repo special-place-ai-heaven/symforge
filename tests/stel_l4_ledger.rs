@@ -1,51 +1,14 @@
 //! L4 ledger — serve and P-FF bypass invocations record decision/execution metadata.
 #![cfg(feature = "server")]
-#![allow(unsafe_code)]
 
-use std::ffi::OsString;
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::stel::{self, AdmissionDecision, GoldenRouteRow};
-
-static COMPACT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(previous) => unsafe {
-                std::env::set_var(self.key, previous);
-            },
-            None => unsafe {
-                std::env::remove_var(self.key);
-            },
-        }
-    }
-}
-
-fn with_compact_surface() -> EnvVarGuard {
-    let _guard = COMPACT_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    EnvVarGuard::set("SYMFORGE_SURFACE", "compact")
-}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -125,7 +88,8 @@ async fn serve_row_records_ledger_with_legacy_execution() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");
@@ -155,7 +119,8 @@ async fn pff_row_records_ledger_without_legacy_execution() {
         return;
     }
 
-    let _surface = with_compact_surface();
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/pff_whole_lib");
