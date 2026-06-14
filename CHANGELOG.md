@@ -26,6 +26,22 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.22.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.2...v7.22.0) (2026-06-14)
+
+
+### Features
+
+* **stel:** implement Phase 1 compact-3 surface ([29a39f3](https://github.com/special-place-ai-heaven/symforge/commit/29a39f3147b05d464b0511f7e6cb9f7700f9448f))
+* **v8:** real token savings payloads and STEL architecture charter ([558cb69](https://github.com/special-place-ai-heaven/symforge/commit/558cb693f3cc5b60313b09d7b0aa091fdb0911a9))
+
+
+### Bug Fixes
+
+* **ci:** align STEL tools with allow lists and test fixtures ([d4fcd0a](https://github.com/special-place-ai-heaven/symforge/commit/d4fcd0ac0deac564eda4fa5ae2b8b7613ae461d0))
+* **ci:** satisfy clippy gates for STEL integration tests ([cf87d8e](https://github.com/special-place-ai-heaven/symforge/commit/cf87d8ebe255cd7c0ca09f89deb09c2dfdff0e26))
+* **health:** report token savings against windowed-read baseline ([0db0325](https://github.com/special-place-ai-heaven/symforge/commit/0db0325f37d05a10a42afe91589fde6a345871d3))
+* **test:** align hook and sidecar tests with savings footer format ([66742f1](https://github.com/special-place-ai-heaven/symforge/commit/66742f14f82f94044917ffc911ffb8afc4a9f251))
+
 ## [7.21.2](https://github.com/special-place-ai-heaven/symforge/compare/v7.21.1...v7.21.2) (2026-06-12)
 
 
