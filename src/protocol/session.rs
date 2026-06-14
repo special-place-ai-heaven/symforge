@@ -118,6 +118,26 @@ impl SessionContext {
         inner.fetched_files.contains_key(path)
     }
 
+    /// Prior token cost recorded for a fetched symbol, if any.
+    pub fn symbol_prior_tokens(&self, path: &str, name: &str) -> Option<u32> {
+        let inner = self.inner.lock();
+        inner
+            .fetched_symbols
+            .get(&(path.to_string(), name.to_string()))
+            .copied()
+    }
+
+    /// Prior token cost recorded for a fetched file, if any.
+    pub fn file_prior_tokens(&self, path: &str) -> Option<u32> {
+        let inner = self.inner.lock();
+        inner.fetched_files.get(path).copied()
+    }
+
+    /// Session age in seconds for cache-hit metadata.
+    pub fn session_age_secs(&self) -> u64 {
+        self.inner.lock().started_at.elapsed().as_secs()
+    }
+
     /// Take a snapshot for display.
     pub fn snapshot(&self) -> SessionSnapshot {
         let inner = self.inner.lock();

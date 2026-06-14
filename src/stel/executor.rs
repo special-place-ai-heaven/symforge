@@ -5,8 +5,11 @@ use serde_json;
 use crate::protocol::result_status::OutcomeClass;
 use crate::protocol::tools::{classify_compact_tool_output, compact_tool_output_is_success};
 
+use super::controller::DEGRADE_DEFAULT_MAX_TOKENS;
 use super::planner::confidence_label;
-use super::types::{AdmissionDecision, StelBypassBody, StelDecision, StelPlan, StelPlanStep};
+use super::types::{
+    AdmissionDecision, StelBypassBody, StelCacheBody, StelDecision, StelPlan, StelPlanStep,
+};
 
 /// Outcome of one in-process legacy tool dispatch during a multi-step serve chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,9 +18,30 @@ pub struct ServedStepResult {
     pub body: String,
 }
 
-/// Whether L3 should skip legacy tool dispatch (P-FF bypass only in this slice).
+/// Whether L3 should skip legacy tool dispatch (`bypass` or `cache_hit`).
+pub fn should_skip_legacy_dispatch(decision: &StelDecision) -> bool {
+    matches!(
+        decision.decision,
+        AdmissionDecision::Bypass if decision.bypass.is_some()
+    ) || matches!(
+        decision.decision,
+        AdmissionDecision::CacheHit if decision.cache.is_some()
+    )
+}
+
+/// Back-compat alias — enforced bypass/cache_hit paths must not execute legacy tools.
 pub fn is_enforced_bypass(decision: &StelDecision) -> bool {
-    decision.decision == AdmissionDecision::Bypass && decision.bypass.is_some()
+    should_skip_legacy_dispatch(decision)
+}
+
+/// Whether the bypass body is policy P-FF (whole-file host read).
+pub fn is_pff_bypass_body(bypass: &StelBypassBody) -> bool {
+    bypass.reason.contains("policy=P-FF")
+}
+
+/// Whether L2 chose a degrade admission (caps applied before L3 dispatch).
+pub fn is_degrade(decision: &StelDecision) -> bool {
+    decision.decision == AdmissionDecision::Degrade
 }
 
 /// Human-readable bypass body plus machine-readable [`StelBypassBody`] JSON.
@@ -42,6 +66,17 @@ fn format_host_read_line(bypass: &StelBypassBody) -> String {
 fn format_bypass_body_from(bypass: &StelBypassBody, decision_reason: &str) -> String {
     let json = serde_json::to_string_pretty(bypass).expect("StelBypassBody serializes");
     let host_read = format_host_read_line(bypass);
+    let guidance = if bypass.end_line.is_none() {
+        format!(
+            "Open `{path}` in your editor and review the file directly for whole-file tasks.",
+            path = bypass.path
+        )
+    } else {
+        format!(
+            "Open `{path}` in your editor and read the suggested line range directly.",
+            path = bypass.path
+        )
+    };
     format!(
         "Decision: bypass\n\
          Economics: bypass ({decision_reason})\n\
@@ -51,14 +86,91 @@ fn format_bypass_body_from(bypass: &StelBypassBody, decision_reason: &str) -> St
          Predicted SymForge tokens avoided: {}\n\
          \n\
          SymForge did not execute a legacy tool for this request.\n\
-         Open `{path}` in your editor and review the file directly for whole-file tasks.\n\
+         {guidance}\n\
          \n\
          --- bypass payload ---\n\
          {json}",
-        bypass.action,
-        bypass.predicted_manual_tokens,
-        bypass.predicted_symforge_tokens,
-        path = bypass.path,
+        bypass.action, bypass.predicted_manual_tokens, bypass.predicted_symforge_tokens,
+    )
+}
+
+/// Human-readable cache-hit body plus machine-readable [`StelCacheBody`] JSON.
+pub fn format_cache_hit_body(decision: &StelDecision) -> String {
+    let cache = decision
+        .cache
+        .as_ref()
+        .expect("cache_hit requires StelCacheBody");
+    format_cache_hit_body_from(cache, &decision.decision_reason)
+}
+
+fn format_cache_hit_body_from(cache: &StelCacheBody, decision_reason: &str) -> String {
+    let json = serde_json::to_string_pretty(cache).expect("StelCacheBody serializes");
+    let target = if cache.name.is_empty() {
+        format!("file `{}`", cache.path)
+    } else {
+        format!("symbol `{}` in `{}`", cache.name, cache.path)
+    };
+    format!(
+        "Decision: cache_hit\n\
+         Economics: cache_hit ({decision_reason})\n\
+         Session cache: {} {target} (prior_tokens={}, session_age_secs={})\n\
+         \n\
+         SymForge did not re-execute a legacy tool for this request.\n\
+         Reuse the content already loaded in this session.\n\
+         \n\
+         --- cache payload ---\n\
+         {json}",
+        cache.kind, cache.prior_tokens, cache.session_age_secs,
+    )
+}
+
+/// Apply L2 degrade caps to a plan before L3 dispatch.
+pub fn apply_degrade_to_plan(plan: &StelPlan, decision: &StelDecision) -> StelPlan {
+    let mut degraded = plan.clone();
+    let cap = decision
+        .effective_max_tokens
+        .unwrap_or(DEGRADE_DEFAULT_MAX_TOKENS);
+    let outline_only = decision
+        .degrade_flags
+        .iter()
+        .any(|flag| flag == "outline_only");
+    let max_tokens_cap = decision
+        .degrade_flags
+        .iter()
+        .any(|flag| flag == "max_tokens_cap");
+
+    for step in &mut degraded.steps {
+        let Some(args) = step.args.as_object_mut() else {
+            continue;
+        };
+        if outline_only && step.tool == "get_file_context" {
+            args.insert("sections".to_string(), serde_json::json!(["outline"]));
+        }
+        if max_tokens_cap && supports_max_tokens_cap(&step.tool) {
+            let existing = args.get("max_tokens").and_then(|value| value.as_u64());
+            let capped = existing
+                .map(|value| value.min(u64::from(cap)))
+                .unwrap_or(u64::from(cap));
+            args.insert("max_tokens".to_string(), serde_json::json!(capped));
+        }
+    }
+    degraded
+}
+
+fn supports_max_tokens_cap(tool: &str) -> bool {
+    matches!(
+        tool,
+        "get_file_context"
+            | "get_file_content"
+            | "get_symbol"
+            | "get_symbol_context"
+            | "search_symbols"
+            | "search_text"
+            | "find_references"
+            | "find_dependents"
+            | "get_repo_map"
+            | "explore"
+            | "ask"
     )
 }
 
@@ -75,15 +187,28 @@ pub fn format_serve_step_meta(
     } else {
         "multi-hop chain step"
     };
+    let economics =
+        if decision.decision == AdmissionDecision::Degrade && !decision.degrade_flags.is_empty() {
+            format!(
+                "{} ({}) flags=[{}]",
+                decision.decision.as_str(),
+                decision.decision_reason,
+                decision.degrade_flags.join(",")
+            )
+        } else {
+            format!(
+                "{} ({})",
+                decision.decision.as_str(),
+                decision.decision_reason
+            )
+        };
     format!(
-        "Step {}: Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
+        "Step {}: Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {economics}",
         step_index + 1,
         confidence_label(plan.confidence),
         step.tool,
         invocation,
         rationale,
-        decision.decision.as_str(),
-        decision.decision_reason,
     )
 }
 
@@ -243,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_net_without_pff_body_is_not_enforced() {
+    fn negative_net_economics_bypass_skips_legacy_dispatch() {
         use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
         let plan = StelPlan {
             plan_id: "x".to_string(),
@@ -253,7 +378,7 @@ mod tests {
             steps: vec![StelPlanStep {
                 order: 1,
                 tool: "get_file_context".to_string(),
-                args: serde_json::json!({}),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
                 est_response_tokens: 900,
                 est_manual_tokens: 100,
                 index_refs: vec![],
@@ -263,7 +388,96 @@ mod tests {
         let request = StelRequest::default();
         let decision = evaluate_plan(&request, &plan);
         assert_eq!(decision.decision, AdmissionDecision::Bypass);
-        assert!(!is_enforced_bypass(&decision));
+        assert!(is_enforced_bypass(&decision));
+        let bypass = decision.bypass.as_ref().expect("economics bypass body");
+        assert!(!is_pff_bypass_body(bypass));
+        let body = format_bypass_body(&decision);
+        assert!(body.contains("lines 1-80"));
+        assert!(!body.contains("(whole file)"));
+    }
+
+    #[test]
+    fn cache_hit_skips_legacy_dispatch() {
+        use crate::protocol::session::SessionContext;
+        use crate::stel::controller::evaluate_plan_with_session;
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+
+        let session = SessionContext::new();
+        session.record_symbol("src/lib.rs", "cfg_if", 96);
+        let plan = StelPlan {
+            plan_id: "cache".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Exact,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_symbol".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs", "name": "cfg_if" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan_with_session(&request, &plan, Some(&session));
+        assert_eq!(decision.decision, AdmissionDecision::CacheHit);
+        assert!(should_skip_legacy_dispatch(&decision));
+        let body = format_cache_hit_body(&decision);
+        assert!(body.contains("Decision: cache_hit"));
+        assert!(body.contains("did not re-execute a legacy tool"));
+    }
+
+    #[test]
+    fn apply_degrade_caps_outline_only_for_file_context() {
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "degrade".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 530,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        assert_eq!(decision.decision, AdmissionDecision::Degrade);
+        let degraded = apply_degrade_to_plan(&plan, &decision);
+        let args = degraded.steps[0].args.as_object().expect("object args");
+        assert_eq!(args["sections"], serde_json::json!(["outline"]));
+    }
+
+    #[test]
+    fn apply_degrade_caps_max_tokens_for_content_reads() {
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "degrade".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Fallback,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_content".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 530,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        assert_eq!(decision.decision, AdmissionDecision::Degrade);
+        let degraded = apply_degrade_to_plan(&plan, &decision);
+        let args = degraded.steps[0].args.as_object().expect("object args");
+        assert_eq!(args["max_tokens"], serde_json::json!(400));
     }
 
     #[test]

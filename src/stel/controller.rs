@@ -1,18 +1,24 @@
 //! STEL L2 economics controller — evaluate [`StelPlan`] → [`StelDecision`] / [`StelEstimate`].
 //!
-//! Phase 1 slice: economics scoring; P-FF bypass is enforced in [`super::executor`].
+//! Phase 2 P2-S3: normative admission states (`serve | degrade | bypass | cache_hit`).
+
+use crate::protocol::session::SessionContext;
 
 use super::types::{
-    AdmissionDecision, GoldenRouteRow, StelBypassBody, StelDecision, StelEstimate, StelPlan,
-    StelRequest,
+    AdmissionDecision, GoldenRouteRow, RouteConfidence, StelBypassBody, StelCacheBody,
+    StelDecision, StelEstimate, StelPlan, StelPlanStep, StelRequest,
 };
 
 /// Compact-3 worst-case schema tax per call (A-006 conservative path; no amortization credit).
 pub const COMPACT_SCHEMA_TOKENS: u32 = 45;
 /// Compact `symforge` invoke overhead per call (schema example + Phase 0 doctrine).
 pub const COMPACT_INVOKE_TOKENS: u32 = 80;
-/// Minimum predicted net vs manual before `serve` is recommended (schema example).
+/// Minimum predicted net vs manual before `serve` (schema `margin_high`).
 pub const SERVE_MARGIN_TOKENS: i32 = 50;
+/// Predicted net at or below this (but above zero) triggers `degrade` (`margin_low`).
+pub const DEGRADE_MARGIN_LOW_TOKENS: i32 = SERVE_MARGIN_TOKENS;
+/// Default capped response budget applied on degrade when request omits `max_tokens`.
+pub const DEGRADE_DEFAULT_MAX_TOKENS: u32 = 400;
 
 /// Token economics breakdown for one planned invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,14 +33,36 @@ pub struct EconomicsBreakdown {
 
 /// Evaluate L2 admission for a draft plan (does not execute L3).
 pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
+    evaluate_plan_with_session(request, plan, None)
+}
+
+/// Evaluate L2 admission with optional in-process session context for cache-hit detection.
+pub fn evaluate_plan_with_session(
+    request: &StelRequest,
+    plan: &StelPlan,
+    session: Option<&SessionContext>,
+) -> StelDecision {
     if let Some(bypass) = detect_pff_bypass(request) {
-        let economics = economics_for_bypass(&bypass);
+        return decision_from_pff_bypass(plan, request, bypass);
+    }
+
+    if let Some(session) = session
+        && let Some(cache) = detect_session_cache_hit(plan, session)
+    {
+        return decision_from_cache_hit(plan, request, cache);
+    }
+
+    let economics = estimate_economics(plan);
+    let net = economics.predicted_net_vs_manual;
+
+    if net <= 0 {
+        let bypass = economics_bypass_body(plan, &economics);
         return StelDecision {
             plan_id: plan.plan_id.clone(),
             decision: AdmissionDecision::Bypass,
             decision_reason: format!(
-                "{}; predicted_net={}",
-                bypass.reason, economics.predicted_net_vs_manual
+                "predicted_net={net} <= 0; economics bypass via host_read `{}`",
+                bypass.path
             ),
             effective_max_tokens: request.max_tokens,
             degrade_flags: vec![],
@@ -44,30 +72,60 @@ pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
         };
     }
 
-    let economics = estimate_economics(plan);
-    let recommended = economics.predicted_net_vs_manual > SERVE_MARGIN_TOKENS;
-    let decision = if recommended {
-        AdmissionDecision::Serve
-    } else {
-        // Metadata classification only — enforcement deferred to a later slice.
-        AdmissionDecision::Bypass
-    };
-    let decision_reason = if recommended {
-        format!(
-            "predicted_net={} > margin={}",
-            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
-        )
-    } else {
-        format!(
-            "predicted_net={} <= margin={} (non-P-FF bypass metadata; L3 not gated)",
-            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
-        )
-    };
+    let mandatory_degrade =
+        plan.confidence == RouteConfidence::Fallback && net < SERVE_MARGIN_TOKENS;
+    let economics_degrade = net <= DEGRADE_MARGIN_LOW_TOKENS;
+
+    if mandatory_degrade || economics_degrade {
+        let mut degrade_flags = Vec::new();
+        if mandatory_degrade {
+            degrade_flags.push("fallback_mandatory".to_string());
+        }
+        if plan
+            .steps
+            .iter()
+            .any(|step| step.tool == "get_file_context")
+        {
+            degrade_flags.push("outline_only".to_string());
+        } else {
+            degrade_flags.push("max_tokens_cap".to_string());
+        }
+        degrade_flags.sort();
+        degrade_flags.dedup();
+
+        let effective_max_tokens = request
+            .max_tokens
+            .or(Some(DEGRADE_DEFAULT_MAX_TOKENS))
+            .map(|cap| cap.min(DEGRADE_DEFAULT_MAX_TOKENS));
+
+        let reason = if mandatory_degrade {
+            format!(
+                "predicted_net={net} < margin={}; fallback confidence requires degrade",
+                SERVE_MARGIN_TOKENS
+            )
+        } else {
+            format!(
+                "predicted_net={net} <= margin_low={}",
+                DEGRADE_MARGIN_LOW_TOKENS
+            )
+        };
+
+        return StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Degrade,
+            decision_reason: reason,
+            effective_max_tokens,
+            degrade_flags,
+            steps: Some(plan.steps.clone()),
+            bypass: None,
+            cache: None,
+        };
+    }
 
     StelDecision {
         plan_id: plan.plan_id.clone(),
-        decision,
-        decision_reason,
+        decision: AdmissionDecision::Serve,
+        decision_reason: format!("predicted_net={net} > margin={}", SERVE_MARGIN_TOKENS),
         effective_max_tokens: request.max_tokens,
         degrade_flags: vec![],
         steps: Some(plan.steps.clone()),
@@ -76,30 +134,163 @@ pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
     }
 }
 
+fn decision_from_pff_bypass(
+    plan: &StelPlan,
+    request: &StelRequest,
+    bypass: StelBypassBody,
+) -> StelDecision {
+    let economics = economics_for_bypass(&bypass);
+    StelDecision {
+        plan_id: plan.plan_id.clone(),
+        decision: AdmissionDecision::Bypass,
+        decision_reason: format!(
+            "{}; predicted_net={}",
+            bypass.reason, economics.predicted_net_vs_manual
+        ),
+        effective_max_tokens: request.max_tokens,
+        degrade_flags: vec![],
+        steps: None,
+        bypass: Some(bypass),
+        cache: None,
+    }
+}
+
+fn decision_from_cache_hit(
+    plan: &StelPlan,
+    request: &StelRequest,
+    cache: StelCacheBody,
+) -> StelDecision {
+    StelDecision {
+        plan_id: plan.plan_id.clone(),
+        decision: AdmissionDecision::CacheHit,
+        decision_reason: format!(
+            "session cache hit for {} `{}` (prior_tokens={})",
+            cache.kind, cache.path, cache.prior_tokens
+        ),
+        effective_max_tokens: request.max_tokens,
+        degrade_flags: vec![],
+        steps: None,
+        bypass: None,
+        cache: Some(cache),
+    }
+}
+
+fn detect_session_cache_hit(plan: &StelPlan, session: &SessionContext) -> Option<StelCacheBody> {
+    let step = plan.steps.first()?;
+    let age = session.session_age_secs();
+    match step.tool.as_str() {
+        "get_symbol" => {
+            let name = step.args.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let path = step
+                .args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if !path.is_empty() && session.has_symbol(path, name) {
+                return Some(StelCacheBody {
+                    kind: "symbol".to_string(),
+                    path: path.to_string(),
+                    name: name.to_string(),
+                    prior_tokens: session.symbol_prior_tokens(path, name).unwrap_or(0),
+                    session_age_secs: age,
+                });
+            }
+            None
+        }
+        "get_file_context" | "get_file_content" => {
+            let path = step.args.get("path")?.as_str()?.trim();
+            if path.is_empty() || !session.has_file(path) {
+                return None;
+            }
+            Some(StelCacheBody {
+                kind: "file".to_string(),
+                path: path.to_string(),
+                name: String::new(),
+                prior_tokens: session.file_prior_tokens(path).unwrap_or(0),
+                session_age_secs: age,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn economics_bypass_body(plan: &StelPlan, economics: &EconomicsBreakdown) -> StelBypassBody {
+    let path = plan_primary_path(plan).unwrap_or_else(|| "unknown".to_string());
+    StelBypassBody {
+        action: "host_read".to_string(),
+        path: path.clone(),
+        start_line: 1,
+        end_line: Some(80),
+        predicted_manual_tokens: economics.predicted_manual_tokens,
+        predicted_symforge_tokens: economics.predicted_symforge_tokens,
+        reason: format!(
+            "predicted_net={} <= 0; host_read `{path}` cheaper than serve",
+            economics.predicted_net_vs_manual
+        ),
+    }
+}
+
+fn plan_primary_path(plan: &StelPlan) -> Option<String> {
+    plan.steps.first().and_then(primary_path_from_step)
+}
+
+fn primary_path_from_step(step: &StelPlanStep) -> Option<String> {
+    step.args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            step.args
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Evaluate L2 admission for a structural edit plan (no NL P-FF bypass path).
 pub fn evaluate_edit_plan(plan: &StelPlan) -> StelDecision {
     let economics = estimate_economics(plan);
-    let recommended = economics.predicted_net_vs_manual > SERVE_MARGIN_TOKENS;
-    let decision = if recommended {
-        AdmissionDecision::Serve
-    } else {
-        AdmissionDecision::Bypass
-    };
-    let decision_reason = if recommended {
-        format!(
-            "predicted_net={} > margin={}",
-            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
-        )
-    } else {
-        format!(
-            "predicted_net={} <= margin={} (non-P-FF bypass metadata; L3 not gated)",
-            economics.predicted_net_vs_manual, SERVE_MARGIN_TOKENS
-        )
-    };
+    let net = economics.predicted_net_vs_manual;
+    if net <= 0 {
+        let bypass = economics_bypass_body(plan, &economics);
+        return StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Bypass,
+            decision_reason: format!("predicted_net={net} <= 0; edit economics bypass"),
+            effective_max_tokens: None,
+            degrade_flags: vec![],
+            steps: Some(plan.steps.clone()),
+            bypass: Some(bypass),
+            cache: None,
+        };
+    }
+    if net <= DEGRADE_MARGIN_LOW_TOKENS {
+        return StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Degrade,
+            decision_reason: format!(
+                "predicted_net={net} <= margin_low={}",
+                DEGRADE_MARGIN_LOW_TOKENS
+            ),
+            effective_max_tokens: Some(DEGRADE_DEFAULT_MAX_TOKENS),
+            degrade_flags: vec!["max_tokens_cap".to_string()],
+            steps: Some(plan.steps.clone()),
+            bypass: None,
+            cache: None,
+        };
+    }
     StelDecision {
         plan_id: plan.plan_id.clone(),
-        decision,
-        decision_reason,
+        decision: AdmissionDecision::Serve,
+        decision_reason: format!("predicted_net={net} > margin={}", SERVE_MARGIN_TOKENS),
         effective_max_tokens: None,
         degrade_flags: vec![],
         steps: Some(plan.steps.clone()),
@@ -253,6 +444,24 @@ mod tests {
         request
     }
 
+    fn low_net_plan() -> StelPlan {
+        StelPlan {
+            plan_id: "low-net".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 900,
+                est_manual_tokens: 100,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        }
+    }
+
     #[test]
     fn serve_rows_classify_as_serve() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN_ROUTES_FIXTURE);
@@ -308,6 +517,95 @@ mod tests {
             let estimate = build_estimate(&request, &plan, &decision);
             assert!(!estimate.recommended, "{id} should not recommend serve");
         }
+    }
+
+    #[test]
+    fn negative_net_non_pff_bypass_has_host_read_body() {
+        let plan = low_net_plan();
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        assert_eq!(decision.decision, AdmissionDecision::Bypass);
+        let bypass = decision.bypass.as_ref().expect("economics bypass body");
+        assert_eq!(bypass.path, "src/lib.rs");
+        assert!(decision.decision_reason.contains("predicted_net="));
+    }
+
+    #[test]
+    fn marginal_net_degrades_with_outline_only_flag() {
+        let plan = StelPlan {
+            plan_id: "degrade".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 530,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        assert_eq!(decision.decision, AdmissionDecision::Degrade);
+        assert!(decision.degrade_flags.contains(&"outline_only".to_string()));
+        assert!(decision.effective_max_tokens.is_some());
+    }
+
+    #[test]
+    fn fallback_confidence_forces_degrade_below_margin_high() {
+        let plan = StelPlan {
+            plan_id: "fallback".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Fallback,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_content".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 530,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        assert_eq!(decision.decision, AdmissionDecision::Degrade);
+        assert!(
+            decision
+                .degrade_flags
+                .contains(&"fallback_mandatory".to_string())
+        );
+    }
+
+    #[test]
+    fn session_cache_hit_for_prefetched_symbol() {
+        let session = SessionContext::new();
+        session.record_symbol("src/lib.rs", "cfg_if", 128);
+        let plan = StelPlan {
+            plan_id: "cache".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Exact,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_symbol".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs", "name": "cfg_if" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan_with_session(&request, &plan, Some(&session));
+        assert_eq!(decision.decision, AdmissionDecision::CacheHit);
+        let cache = decision.cache.as_ref().expect("cache body");
+        assert_eq!(cache.kind, "symbol");
+        assert_eq!(cache.prior_tokens, 128);
     }
 
     #[test]

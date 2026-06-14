@@ -8011,12 +8011,13 @@ impl SymForgeServer {
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
-        use crate::stel::controller::{build_estimate, evaluate_plan};
+        use crate::stel::controller::{build_estimate, evaluate_plan_with_session};
         use crate::stel::executor::{
-            ServedStepResult, chain_failure_decision, format_bypass_body,
-            format_multi_step_serve_body, format_partial_multi_step_serve_body,
-            format_single_step_serve_body, is_enforced_bypass, route_tool_label,
-            serve_chain_outcome_class, serve_step_failed, serve_step_outcome, tools_executed,
+            ServedStepResult, apply_degrade_to_plan, chain_failure_decision, format_bypass_body,
+            format_cache_hit_body, format_multi_step_serve_body,
+            format_partial_multi_step_serve_body, format_single_step_serve_body, is_degrade,
+            route_tool_label, serve_chain_outcome_class, serve_step_failed, serve_step_outcome,
+            should_skip_legacy_dispatch, tools_executed,
         };
         use crate::stel::handler::{self, metrics_for_decision};
         use crate::stel::planner::{build_plan, plan_summary_line};
@@ -8028,7 +8029,7 @@ impl SymForgeServer {
         }
 
         let plan = build_plan(request);
-        let decision = evaluate_plan(request, &plan);
+        let decision = evaluate_plan_with_session(request, &plan, Some(&self.session_context));
         let step = plan
             .steps
             .first()
@@ -8045,8 +8046,12 @@ impl SymForgeServer {
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
-        if is_enforced_bypass(&decision) {
-            let body = format_bypass_body(&decision);
+        if should_skip_legacy_dispatch(&decision) {
+            let body = if decision.decision == crate::stel::AdmissionDecision::CacheHit {
+                format_cache_hit_body(&decision)
+            } else {
+                format_bypass_body(&decision)
+            };
             let output = self.finalize_symforge_with_ledger(
                 "symforge",
                 request,
@@ -8064,10 +8069,16 @@ impl SymForgeServer {
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
+        let exec_plan = if is_degrade(&decision) {
+            apply_degrade_to_plan(&plan, &decision)
+        } else {
+            plan.clone()
+        };
+
         let mut step_results = Vec::new();
         let mut outcome_class = OutcomeClass::Found;
         let mut chain_failed = false;
-        for step in &plan.steps {
+        for step in &exec_plan.steps {
             let tool_body = self
                 .dispatch_tool_for_tests(&step.tool, step.args.clone())
                 .await;
@@ -8093,11 +8104,11 @@ impl SymForgeServer {
         }
 
         let chain_failure_note = chain_failed.then(|| effective_decision.decision_reason.clone());
-        let body = if plan.steps.len() == 1 {
+        let body = if exec_plan.steps.len() == 1 {
             format_single_step_serve_body(
                 &plan,
                 &effective_decision,
-                &plan.steps[0],
+                &exec_plan.steps[0],
                 &step_results[0].body,
             )
         } else if chain_failed {

@@ -8,7 +8,7 @@
 //!   [`crate::protocol::surface_probe`].
 //! - **L1:** [`planner::build_plan`] — `StelRequest` → single- or multi-step [`StelPlan`].
 //! - **L2:** [`controller::evaluate_plan`] — economics → [`StelDecision`] / [`StelEstimate`].
-//! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch; multi-step in-process chain on `serve`.
+//! - **L3:** [`executor::should_skip_legacy_dispatch`] — bypass/cache_hit skip legacy dispatch; degrade caps; multi-step chain on `serve`.
 //! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
 //!
 //! Deferred: calibration auto-tuning/persistence, symforge_edit apply path.
@@ -35,6 +35,7 @@ pub use calibration::{
 pub use controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, EconomicsBreakdown, SERVE_MARGIN_TOKENS,
     build_estimate, detect_pff_bypass, estimate_economics, evaluate_edit_plan, evaluate_plan,
+    evaluate_plan_with_session,
 };
 pub use edit_apply::{
     PreApplyOutcome, ResolvedEditSymbol, apply_requested, format_already_applied_body,
@@ -45,10 +46,12 @@ pub use edit_planner::{
 };
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use executor::{
-    ServedStepResult, chain_failure_decision, extract_served_step_bodies, format_bypass_body,
-    format_multi_step_serve_body, format_partial_multi_step_serve_body, format_serve_step_meta,
-    format_single_step_serve_body, is_enforced_bypass, route_tool_label, serve_chain_outcome_class,
-    serve_step_failed, serve_step_outcome, tools_executed,
+    ServedStepResult, apply_degrade_to_plan, chain_failure_decision, extract_served_step_bodies,
+    format_bypass_body, format_cache_hit_body, format_multi_step_serve_body,
+    format_partial_multi_step_serve_body, format_serve_step_meta, format_single_step_serve_body,
+    is_degrade, is_enforced_bypass, is_pff_bypass_body, route_tool_label,
+    serve_chain_outcome_class, serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch,
+    tools_executed,
 };
 pub use golden_replay::{
     DEFERRED_MULTI_HOP_ROW_IDS, GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification,

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use super::controller::EconomicsBreakdown;
+use super::executor::is_pff_bypass_body;
 use super::handler::estimate_tokens;
 use super::types::{AdmissionDecision, StelDecision, StelLedgerEvent, StelPlan};
 
@@ -65,6 +66,10 @@ pub struct LedgerEnvelopeMeta {
     pub route_tool: String,
     pub decision: String,
     pub bypass: bool,
+    pub pff_bypass: bool,
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degrade_flags: Vec<String>,
     pub legacy_executed: bool,
     pub schema_tokens: u32,
     pub invoke_tokens: u32,
@@ -101,6 +106,19 @@ pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
         net_vs_manual,
         equivalence: None,
         route_confidence: input.plan.confidence,
+        pff_bypass: (input.decision.decision == AdmissionDecision::Bypass).then(|| {
+            input
+                .decision
+                .bypass
+                .as_ref()
+                .is_some_and(is_pff_bypass_body)
+        }),
+        cache_hit: (input.decision.decision == AdmissionDecision::CacheHit).then_some(true),
+        degrade_flags: if input.decision.decision == AdmissionDecision::Degrade {
+            input.decision.degrade_flags.clone()
+        } else {
+            vec![]
+        },
     }
 }
 
@@ -121,6 +139,18 @@ pub fn capture_ledger(input: &LedgerCaptureInput<'_>) -> (StelLedgerEvent, Ledge
         route_tool: input.selected_tool.to_string(),
         decision: input.decision.decision.as_str().to_string(),
         bypass: input.decision.decision == AdmissionDecision::Bypass,
+        pff_bypass: input.decision.decision == AdmissionDecision::Bypass
+            && input
+                .decision
+                .bypass
+                .as_ref()
+                .is_some_and(is_pff_bypass_body),
+        cache_hit: input.decision.decision == AdmissionDecision::CacheHit,
+        degrade_flags: if input.decision.decision == AdmissionDecision::Degrade {
+            input.decision.degrade_flags.clone()
+        } else {
+            vec![]
+        },
         legacy_executed: input.legacy_executed,
         schema_tokens: input.economics.predicted_schema_tokens,
         invoke_tokens: input.economics.predicted_invoke_tokens,
@@ -187,6 +217,9 @@ mod tests {
         assert_eq!(event.tools_called, vec!["find_references".to_string()]);
         assert!(meta.legacy_executed);
         assert!(!meta.bypass);
+        assert!(!meta.pff_bypass);
+        assert!(!meta.cache_hit);
+        assert!(meta.degrade_flags.is_empty());
         assert_eq!(meta.route_tool, "find_references");
         assert!(meta.output_bytes > 0);
     }
@@ -216,7 +249,83 @@ mod tests {
         assert_eq!(event.decision, AdmissionDecision::Bypass);
         assert!(event.tools_called.is_empty());
         assert!(meta.bypass);
+        assert!(meta.pff_bypass);
+        assert!(!meta.cache_hit);
         assert!(!meta.legacy_executed);
+    }
+
+    #[test]
+    fn economics_bypass_ledger_records_non_pff_bypass() {
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "low-net".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 900,
+                est_manual_tokens: 100,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        let economics = estimate_economics(&plan);
+        let (event, meta) = capture_ledger(&LedgerCaptureInput {
+            plan: &plan,
+            decision: &decision,
+            economics: &economics,
+            selected_tool: "get_file_context",
+            tools_called: None,
+            legacy_executed: false,
+            output_body: "Decision: bypass",
+            surface: "symforge",
+        });
+        assert_eq!(event.decision, AdmissionDecision::Bypass);
+        assert!(meta.bypass);
+        assert!(!meta.pff_bypass);
+        assert!(!meta.legacy_executed);
+    }
+
+    #[test]
+    fn degrade_ledger_records_flags_without_legacy_tools_when_skipped() {
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "degrade".to_string(),
+            intent: IntentBucket::Read,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                est_response_tokens: 400,
+                est_manual_tokens: 530,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        let economics = estimate_economics(&plan);
+        let (event, meta) = capture_ledger(&LedgerCaptureInput {
+            plan: &plan,
+            decision: &decision,
+            economics: &economics,
+            selected_tool: "get_file_context",
+            tools_called: None,
+            legacy_executed: true,
+            output_body: "Economics: degrade",
+            surface: "symforge",
+        });
+        assert_eq!(event.decision, AdmissionDecision::Degrade);
+        assert!(!meta.bypass);
+        assert!(meta.degrade_flags.contains(&"outline_only".to_string()));
+        assert!(meta.legacy_executed);
     }
 
     #[test]

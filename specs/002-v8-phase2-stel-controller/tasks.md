@@ -39,12 +39,12 @@
 
 ## P2-S3: L2 Admission Hardening (US2)
 
-- [ ] T020 [US2] Implement `cache_hit` decision path in `src/stel/controller.rs` (session target match)
-- [ ] T021 [US2] Implement `degrade` path with degrade_flags (outline_only, token caps) per stel-schema
-- [ ] T022 [US2] Implement non-P-FF `bypass` when predicted net ≤ 0 (honest StelBypassBody)
-- [ ] T023 [US2] Ensure L3 honors all four decisions in `src/stel/executor.rs`
-- [ ] T024 [P] [US2] Add L2 admission unit tests (`src/stel/controller.rs` tests or `tests/stel_l2_admission.rs`)
-- [ ] T025 [US2] Verify P-FF bypass enforcement unchanged (`tests/stel_l3_enforcement.rs`)
+- [x] T020 [US2] Implement `cache_hit` decision path in `src/stel/controller.rs` (session target match)
+- [x] T021 [US2] Implement `degrade` path with degrade_flags (outline_only, token caps) per stel-schema
+- [x] T022 [US2] Implement non-P-FF `bypass` when predicted net ≤ 0 (honest StelBypassBody)
+- [x] T023 [US2] Ensure L3 honors all four decisions in `src/stel/executor.rs`
+- [x] T024 [P] [US2] Add L2 admission unit tests (`src/stel/controller.rs` tests or `tests/stel_l2_admission.rs`)
+- [x] T025 [US2] Verify P-FF bypass enforcement unchanged (`tests/stel_l3_enforcement.rs`)
 
 **Checkpoint**: All admission states covered by tests; golden + L3 suites green.
 
