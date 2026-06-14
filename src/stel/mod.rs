@@ -13,6 +13,7 @@
 //!
 //! Deferred: calibration auto-tuning/persistence, symforge_edit apply path.
 
+pub mod a029;
 pub mod calibration;
 pub mod controller;
 pub mod edit_apply;
@@ -29,6 +30,10 @@ pub mod surface;
 pub mod surface_list;
 pub mod types;
 
+pub use a029::{
+    A029_T2_PASS_THRESHOLD, A029SpikeResults, A029T2Row, A029Verdict, T2Equivalence,
+    classify_t2_equivalence, evaluate_a029_verdict, normalize_spike_results,
+};
 pub use calibration::{
     StelCalibrationSummary, TUNING_REVIEW_MIN_EVENTS, format_calibration_section,
     summarize_calibration,

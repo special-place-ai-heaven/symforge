@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **P2-S4.1 H3 remediation** — H3/H4/H5 PASS on refreshed battery evidence.
+**Status**: **P2-S5 A-029 spike** — PIVOT (0/4 T2 equiv; P-T2 registered); H3/H4/H5 preserved.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -65,12 +65,12 @@
 
 ## P2-S5: A-029 Spike (US4)
 
-- [ ] T040 [US4] Create `docs/research/A-029-t2-spike.md` with method and repos
-- [ ] T041 [US4] Run T2 spike on tokio + django reference tasks (compact surface)
-- [ ] T042 [US4] Record PASS (≥2/4 equiv) or P-T2 pivot or KILL
-- [ ] T043 [P] [US4] Optional T3 large-row degrade validation for A-014 (document pass/pivot)
+- [x] T040 [US4] Create `docs/research/A-029-t2-spike.md` with method and repos
+- [x] T041 [US4] Run T2 spike on tokio + django reference tasks (compact surface)
+- [x] T042 [US4] Record PASS (≥2/4 equiv) or P-T2 pivot or KILL — **PIVOT** (0/4 equiv; P-T2)
+- [x] T043 [P] [US4] Optional T3 large-row degrade validation for A-014 (document pass/pivot) — deferred; noted in spike artifact
 
-**Checkpoint**: A-029 artifact complete; assumption register updated.
+**Checkpoint**: A-029 artifact complete; P-T2 pivot documented; assumption register note in spike + evidence index.
 
 ---
 

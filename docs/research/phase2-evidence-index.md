@@ -1,6 +1,6 @@
 # Phase 2 STEL evidence index
 
-**Status:** P2-S4 battery gates + H3 remediation — H3/H4/H5 PASS (2026-06-14)
+**Status:** P2-S5 A-029 T2 spike complete — **PIVOT** (0/4 T2 equiv); H3/H4/H5 PASS preserved (2026-06-14)
 
 **Created**: 2026-06-14
 
@@ -22,7 +22,7 @@
 - Phase 1 shipped: [`phase1-stel-checkpoint.md`](../phase1-stel-checkpoint.md)
 - Phase 2 Slice 1 merged: `3d64b96` (multi-hop golden closure)
 - Phase 2 Slice 2 merged: PR #306 / `896840f` (L2 admission hardening)
-- Phase 2 Slice 4 merged: PR #308 / `b1f6019` (battery gate evidence)
+- Phase 2 Slice 4.1 merged: PR #309 / H3 remediation on `records/t8_explore`
 
 ## T002 spec reviewer sign-off
 
@@ -45,7 +45,10 @@
 | Gate computation (Rust) | [`src/stel/gates.rs`](../../src/stel/gates.rs) | **COMPLETE** |
 | Gate test fixtures | [`tests/fixtures/phase2-gate/`](../../tests/fixtures/phase2-gate/) | **COMPLETE** |
 | Gate integration tests | [`tests/stel_battery_gates.rs`](../../tests/stel_battery_gates.rs) | **COMPLETE** |
-| A-029 spike | `docs/research/A-029-t2-spike.md` | NOT STARTED (P2-S5 blocked) |
+| A-029 spike | [`A-029-t2-spike.md`](./A-029-t2-spike.md) | **COMPLETE** — PIVOT (0/4 T2 equiv; P-T2 registered) |
+| A-029 results JSON | [`a029-t2-results.json`](./a029-t2-results.json) | **COMPLETE** |
+| A-029 spike script | [`scripts/a029-t2-spike.cjs`](../../scripts/a029-t2-spike.cjs) | **COMPLETE** |
+| A-029 verdict (Rust) | [`src/stel/a029.rs`](../../src/stel/a029.rs) | **COMPLETE** |
 | Phase 2 checkpoint | `docs/phase2-stel-checkpoint.md` | NOT STARTED (P2-S6) |
 | Exit record | per gate evidence contract | IN_PROGRESS |
 
@@ -58,6 +61,16 @@ node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json 
 cargo test --test stel_battery_gates -- --test-threads=1
 ```
 
+## P2-S5 A-029 commands (operator)
+
+```bash
+cargo build -p symforge
+node scripts/a029-t2-spike.cjs target/debug/symforge docs/research/a029-t2-results.json
+cargo test --test stel_a029_spike -- --test-threads=1
+```
+
+Requires tokio + django clones per [`tests/fixtures/a029-t2/README.md`](../../tests/fixtures/a029-t2/README.md). Exit 0 on PASS; exit 1 on PIVOT/KILL (truthful non-pass).
+
 Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-report.md); re-running compare-results writes only [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md).
 
 ## Local corpus note (golden replay)
@@ -69,4 +82,4 @@ Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-repo
 - Calibration / ledger persistence → Phase 3
 - B-RESULTS / RESULTS.md §8.7 → post–8.0 tag (A-024)
 - H6/H7/H8 PASS → Phase 3–4
-- A-029 T2 spike → P2-S5 (blocked until P2-S4 merge)
+- A-029 T2 spike → **PIVOT** (P-T2); see [`A-029-t2-spike.md`](./A-029-t2-spike.md)
