@@ -68,14 +68,15 @@ Verify unit coverage for: `serve`, `degrade`, `bypass`, `cache_hit`.
 
 ## 5. Compact-surface battery (Slice P2-S4)
 
-Run sf-bench compact surface battery (exact command depends on sf-bench workspace):
+Run in-repo compact battery and compare-results (see [`docs/research/phase2-evidence-index.md`](../../docs/research/phase2-evidence-index.md)):
 
 ```bash
-# Example — adjust paths to local sf-bench checkout
-# node compare-results.js baseline.json candidate.json --surface compact
+cargo build -p symforge
+node scripts/phase2-compact-battery.cjs target/debug/symforge docs/research/results-v8-phase2-candidate.json
+node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json --report docs/research/phase2-gate-report.generated.md
 ```
 
-Record output in `docs/research/phase2-gate-report.md` per [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md).
+Curated reviewer report: `docs/research/phase2-gate-report.md`. Reproducible script output: `docs/research/phase2-gate-report.generated.md` per [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md).
 
 Required PASS for Phase 2 exit: **H3**, **H4**; **H5** strongly recommended.
 

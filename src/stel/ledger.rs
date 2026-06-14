@@ -8,6 +8,7 @@ use serde::Serialize;
 use super::controller::EconomicsBreakdown;
 use super::executor::is_pff_bypass_body;
 use super::handler::estimate_tokens;
+use super::planner::confidence_label;
 use super::types::{AdmissionDecision, StelDecision, StelLedgerEvent, StelPlan};
 
 /// In-memory append-only ledger for one MCP server session (no persistence in this slice).
@@ -76,6 +77,7 @@ pub struct LedgerEnvelopeMeta {
     pub predicted_net: i32,
     pub output_bytes: u64,
     pub output_tokens: u32,
+    pub route_confidence: String,
 }
 
 /// Build a schema-aligned [`StelLedgerEvent`] from a completed `symforge` invocation.
@@ -157,6 +159,7 @@ pub fn capture_ledger(input: &LedgerCaptureInput<'_>) -> (StelLedgerEvent, Ledge
         predicted_net: input.economics.predicted_net_vs_manual,
         output_bytes,
         output_tokens,
+        route_confidence: confidence_label(input.plan.confidence).to_string(),
     };
     (event, meta)
 }

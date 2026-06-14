@@ -1,0 +1,23 @@
+{
+  "surface": "compact",
+  "baselineCommit": "synthetic",
+  "rows": [
+    {
+      "id": "cfg-if/t1_search",
+      "S": 900,
+      "M": 500,
+      "sGteM": true,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true
+    }
+  ],
+  "session_net_accepted": -400,
+  "session_net_all36": -400,
+  "rowCount": 1,
+  "skippedRows": []
+}

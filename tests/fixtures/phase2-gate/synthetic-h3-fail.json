@@ -1,0 +1,23 @@
+{
+  "surface": "compact",
+  "baselineCommit": "synthetic",
+  "rows": [
+    {
+      "id": "tokio/t2_small",
+      "S": 600,
+      "M": 500,
+      "sGteM": true,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "tokio/t2_small",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true
+    }
+  ],
+  "session_net_accepted": -100,
+  "session_net_all36": -100,
+  "rowCount": 1,
+  "skippedRows": []
+}
