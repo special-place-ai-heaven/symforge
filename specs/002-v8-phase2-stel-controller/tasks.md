@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **P2-S4 battery gates** — H4/H5 PASS; H3 FAIL documented on `cursor/v8-phase2-battery-gates`.
+**Status**: **P2-S4.1 H3 remediation** — H3/H4/H5 PASS on refreshed battery evidence.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -55,11 +55,11 @@
 - [x] T030 [US3] Ensure sf-bench row writer populates STEL extension fields per contract
 - [x] T031 [US3] Run compact-surface battery; save candidate results JSON (operator path)
 - [x] T032 [US3] Run compare-results; write `docs/research/phase2-gate-report.md`
-- [x] T033 [US3] Verify H3 PASS under A-012 documented scope — **FAIL** (1 row: `records/t8_explore`; see gate report)
+- [x] T033 [US3] Verify H3 PASS under A-012 documented scope — **PASS** (remediated `records/t8_explore`; see gate report)
 - [x] T034 [US3] Verify H4 PASS (`session_net_accepted ≥ 0`)
 - [x] T035 [P] [US3] Verify H5 PASS for `chain=single` rows (external mcpCalls ≤ 1)
 
-**Checkpoint**: Gate report shows H4/H5 PASS; H3 FAIL documented with action notes.
+**Checkpoint**: Gate report shows H3/H4/H5 PASS on refreshed candidate artifact.
 
 ---
 

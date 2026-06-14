@@ -6,6 +6,14 @@ use crate::protocol::result_status::OutcomeClass;
 use crate::protocol::tools::{classify_compact_tool_output, compact_tool_output_is_success};
 
 use super::controller::DEGRADE_DEFAULT_MAX_TOKENS;
+
+/// Competent-manual token budget for Phase 2 H3 explore golden rows (4000-char window).
+pub const H3_EXPLORE_MANUAL_TOKENS: u32 = 1000;
+/// Reserve STEL envelope + serve routing meta when capping explore on compact serve.
+pub const COMPACT_SERVE_EXPLORE_OVERHEAD_TOKENS: u32 = 250;
+/// Max explore tool tokens on compact `symforge` serve so full response stays within H3 window.
+pub const COMPACT_SERVE_EXPLORE_MAX_TOKENS: u32 =
+    H3_EXPLORE_MANUAL_TOKENS.saturating_sub(COMPACT_SERVE_EXPLORE_OVERHEAD_TOKENS);
 use super::planner::confidence_label;
 use super::types::{
     AdmissionDecision, StelBypassBody, StelCacheBody, StelDecision, StelPlan, StelPlanStep,
@@ -155,6 +163,30 @@ pub fn apply_degrade_to_plan(plan: &StelPlan, decision: &StelDecision) -> StelPl
         }
     }
     degraded
+}
+
+/// Apply compact-surface serve caps before L3 dispatch (H3 explore guidance budget).
+pub fn apply_compact_serve_caps(plan: &StelPlan, decision: &StelDecision) -> StelPlan {
+    if decision.decision != AdmissionDecision::Serve {
+        return plan.clone();
+    }
+    let mut capped = plan.clone();
+    for step in &mut capped.steps {
+        if step.tool != "explore" {
+            continue;
+        }
+        let Some(args) = step.args.as_object_mut() else {
+            continue;
+        };
+        let cap = u64::from(COMPACT_SERVE_EXPLORE_MAX_TOKENS);
+        let capped_val = args
+            .get("max_tokens")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.min(cap))
+            .unwrap_or(cap);
+        args.insert("max_tokens".to_string(), serde_json::json!(capped_val));
+    }
+    capped
 }
 
 fn supports_max_tokens_cap(tool: &str) -> bool {
@@ -452,6 +484,44 @@ mod tests {
         let degraded = apply_degrade_to_plan(&plan, &decision);
         let args = degraded.steps[0].args.as_object().expect("object args");
         assert_eq!(args["sections"], serde_json::json!(["outline"]));
+    }
+
+    #[test]
+    fn apply_compact_serve_caps_explore_max_tokens_for_h3_window() {
+        use crate::stel::types::{
+            AdmissionDecision, IntentBucket, RouteConfidence, StelDecision, StelPlan, StelPlanStep,
+        };
+        let plan = StelPlan {
+            plan_id: "serve-explore".to_string(),
+            intent: IntentBucket::Orient,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "explore".to_string(),
+                args: serde_json::json!({ "query": "how to use records ORM", "depth": 2 }),
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let decision = StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Serve,
+            decision_reason: "test".to_string(),
+            effective_max_tokens: None,
+            degrade_flags: vec![],
+            steps: Some(plan.steps.clone()),
+            bypass: None,
+            cache: None,
+        };
+        let capped = apply_compact_serve_caps(&plan, &decision);
+        let args = capped.steps[0].args.as_object().expect("object args");
+        assert_eq!(
+            args["max_tokens"],
+            serde_json::json!(COMPACT_SERVE_EXPLORE_MAX_TOKENS)
+        );
     }
 
     #[test]

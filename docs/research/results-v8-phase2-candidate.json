@@ -1,9 +1,9 @@
 {
-  "measuredAt": "2026-06-14T13:42:53.593Z",
+  "measuredAt": "2026-06-14T15:07:35.548Z",
   "symforgeBin": "/workspace/target/debug/symforge",
   "surface": "compact",
   "method": "ceil(bytes/4); M=competent_manual_window; STEL ledger metadata",
-  "baselineCommit": "896840f984738ce0f77e9a9c1aae94011ceaee45",
+  "baselineCommit": "b1f60196e763b19cdde35584bde284f625576f2a",
   "rows": [
     {
       "id": "cfg-if/multi_search_symbol",
@@ -20,7 +20,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef93b-29",
+        "plan_id": "plan-19ec6ac847e-29",
         "decision": "serve",
         "tools_called": [
           "search_symbols",
@@ -47,7 +47,7 @@
       "mcpCalls": 1,
       "eligibleH6": false,
       "stel": {
-        "plan_id": "plan-19ec65ef80b-33",
+        "plan_id": "plan-19ec6ac836f-33",
         "decision": "bypass",
         "tools_called": [
           "explore"
@@ -73,7 +73,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef800-23",
+        "plan_id": "plan-19ec6ac8363-23",
         "decision": "serve",
         "tools_called": [
           "search_text"
@@ -99,7 +99,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef801-18",
+        "plan_id": "plan-19ec6ac8364-18",
         "decision": "serve",
         "tools_called": [
           "get_file_context"
@@ -125,7 +125,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef804-20",
+        "plan_id": "plan-19ec6ac8366-20",
         "decision": "reject",
         "tools_called": [
           "search_symbols"
@@ -151,7 +151,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef805-21",
+        "plan_id": "plan-19ec6ac8368-21",
         "decision": "serve",
         "tools_called": [
           "find_references"
@@ -177,7 +177,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef806-24",
+        "plan_id": "plan-19ec6ac8369-24",
         "decision": "serve",
         "tools_called": [
           "get_symbol"
@@ -203,7 +203,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef807-15",
+        "plan_id": "plan-19ec6ac836b-15",
         "decision": "serve",
         "tools_called": [
           "get_repo_map"
@@ -229,7 +229,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef808-21",
+        "plan_id": "plan-19ec6ac836c-21",
         "decision": "reject",
         "tools_called": [
           "get_file_content"
@@ -243,10 +243,10 @@
     {
       "id": "cfg-if/t8_explore",
       "corpus": "cfg-if-rust",
-      "S": 392,
+      "S": 396,
       "M": 1000,
       "sGteM": false,
-      "responseBytes": 1566,
+      "responseBytes": 1583,
       "acceptedServe": true,
       "equivalence": "EQUIVALENT",
       "goldenId": "cfg-if/t8_explore",
@@ -255,13 +255,13 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef809-20",
+        "plan_id": "plan-19ec6ac836d-20",
         "decision": "serve",
         "tools_called": [
           "explore"
         ],
         "predicted_tokens": 400,
-        "actual_tokens": 262,
+        "actual_tokens": 267,
         "net_vs_manual": 275,
         "route_confidence": "inferred"
       }
@@ -281,7 +281,7 @@
       "mcpCalls": 1,
       "eligibleH6": false,
       "stel": {
-        "plan_id": "plan-19ec65ef900-27",
+        "plan_id": "plan-19ec6ac8438-27",
         "decision": "bypass",
         "tools_called": [
           "search_files"
@@ -307,7 +307,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef8dd-23",
+        "plan_id": "plan-19ec6ac842d-23",
         "decision": "serve",
         "tools_called": [
           "search_text"
@@ -333,7 +333,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef8fa-18",
+        "plan_id": "plan-19ec6ac842e-18",
         "decision": "serve",
         "tools_called": [
           "get_file_context"
@@ -359,7 +359,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef8fd-21",
+        "plan_id": "plan-19ec6ac8434-21",
         "decision": "reject",
         "tools_called": [
           "get_symbol"
@@ -385,7 +385,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef8fe-20",
+        "plan_id": "plan-19ec6ac8437-20",
         "decision": "reject",
         "tools_called": [
           "find_references"
@@ -411,7 +411,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef8ff-24",
+        "plan_id": "plan-19ec6ac8438-24",
         "decision": "serve",
         "tools_called": [
           "find_dependents"
@@ -437,7 +437,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef992-25",
+        "plan_id": "plan-19ec6ac84f2-25",
         "decision": "serve",
         "tools_called": [
           "search_files",
@@ -464,7 +464,7 @@
       "mcpCalls": 1,
       "eligibleH6": false,
       "stel": {
-        "plan_id": "plan-19ec65ef88a-35",
+        "plan_id": "plan-19ec6ac83e4-35",
         "decision": "bypass",
         "tools_called": [
           "explore"
@@ -490,7 +490,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef880-22",
+        "plan_id": "plan-19ec6ac83dc-22",
         "decision": "serve",
         "tools_called": [
           "search_text"
@@ -516,7 +516,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef881-16",
+        "plan_id": "plan-19ec6ac83dd-16",
         "decision": "serve",
         "tools_called": [
           "get_file_context"
@@ -542,7 +542,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef882-22",
+        "plan_id": "plan-19ec6ac83de-22",
         "decision": "reject",
         "tools_called": [
           "get_file_content"
@@ -568,7 +568,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef883-20",
+        "plan_id": "plan-19ec6ac83df-20",
         "decision": "serve",
         "tools_called": [
           "search_symbols"
@@ -594,7 +594,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef884-18",
+        "plan_id": "plan-19ec6ac83e0-18",
         "decision": "reject",
         "tools_called": [
           "get_symbol"
@@ -620,7 +620,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef885-24",
+        "plan_id": "plan-19ec6ac83e1-24",
         "decision": "serve",
         "tools_called": [
           "find_references"
@@ -646,7 +646,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef886-27",
+        "plan_id": "plan-19ec6ac83e1-27",
         "decision": "reject",
         "tools_called": [
           "search_files"
@@ -672,7 +672,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef888-12",
+        "plan_id": "plan-19ec6ac83e3-12",
         "decision": "serve",
         "tools_called": [
           "health_compact"
@@ -698,7 +698,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef96b-33",
+        "plan_id": "plan-19ec6ac84c7-33",
         "decision": "serve",
         "tools_called": [
           "get_file_context",
@@ -725,7 +725,7 @@
       "mcpCalls": 1,
       "eligibleH6": false,
       "stel": {
-        "plan_id": "plan-19ec65ef848-34",
+        "plan_id": "plan-19ec6ac83ad-34",
         "decision": "bypass",
         "tools_called": [
           "explore"
@@ -751,7 +751,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef83c-19",
+        "plan_id": "plan-19ec6ac83a1-19",
         "decision": "serve",
         "tools_called": [
           "search_text"
@@ -777,7 +777,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef83d-18",
+        "plan_id": "plan-19ec6ac83a3-18",
         "decision": "serve",
         "tools_called": [
           "get_file_context"
@@ -803,7 +803,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef83f-19",
+        "plan_id": "plan-19ec6ac83a5-19",
         "decision": "serve",
         "tools_called": [
           "search_files"
@@ -829,7 +829,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef841-24",
+        "plan_id": "plan-19ec6ac83a6-24",
         "decision": "serve",
         "tools_called": [
           "find_references"
@@ -855,7 +855,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef841-29",
+        "plan_id": "plan-19ec6ac83a6-29",
         "decision": "serve",
         "tools_called": [
           "get_symbol"
@@ -881,7 +881,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef842-26",
+        "plan_id": "plan-19ec6ac83a7-26",
         "decision": "serve",
         "tools_called": [
           "find_dependents"
@@ -907,7 +907,7 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef843-22",
+        "plan_id": "plan-19ec6ac83a8-22",
         "decision": "reject",
         "tools_called": [
           "get_file_content"
@@ -921,10 +921,10 @@
     {
       "id": "records/t8_explore",
       "corpus": "records-python",
-      "S": 1143,
+      "S": 929,
       "M": 1000,
-      "sGteM": true,
-      "responseBytes": 4572,
+      "sGteM": false,
+      "responseBytes": 3716,
       "acceptedServe": true,
       "equivalence": "EQUIVALENT",
       "goldenId": "records/t8_explore",
@@ -933,20 +933,20 @@
       "mcpCalls": 1,
       "eligibleH6": true,
       "stel": {
-        "plan_id": "plan-19ec65ef844-22",
+        "plan_id": "plan-19ec6ac83a9-22",
         "decision": "serve",
         "tools_called": [
           "explore"
         ],
         "predicted_tokens": 400,
-        "actual_tokens": 1013,
+        "actual_tokens": 800,
         "net_vs_manual": 275,
         "route_confidence": "inferred"
       }
     }
   ],
-  "session_net_accepted": 13543,
-  "session_net_all36": 22602,
+  "session_net_accepted": 13753,
+  "session_net_all36": 22812,
   "rowCount": 36,
   "skippedRows": []
 }

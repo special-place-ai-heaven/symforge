@@ -2,9 +2,9 @@
 
 **Report ID:** phase2-gate-2026-06-14  
 **Surface:** `compact` (`SYMFORGE_SURFACE=compact`)  
-**Baseline commit:** `896840f984738ce0f77e9a9c1aae94011ceaee45`  
-**Candidate results:** [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json)  
-**Baseline results:** self (first compact-surface Phase 2 battery pin)  
+**Baseline commit:** `896840f984738ce0f77e9a9c1aae94011ceaee45` (P2-S4 first pin)
+**Candidate results:** [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json)
+**Refreshed at:** H3 remediation merge (post-#308)
 **Compare command (reproducible script output — does not overwrite this file):**
 
 ```bash
@@ -38,7 +38,7 @@ H3 scope uses all accepted serve rows when no `*_small` task ids exist (Phase 2 
 |------|--------|
 | H1 | NOT_CLAIMED |
 | H2 | NOT_CLAIMED |
-| H3 | **FAIL** |
+| H3 | **PASS** |
 | H4 | **PASS** |
 | H5 | **PASS** |
 | H6 | NOT_CLAIMED |
@@ -49,35 +49,27 @@ H3 scope uses all accepted serve rows when no `*_small` task ids exist (Phase 2 
 
 | Metric | Value |
 |--------|------:|
-| `session_net_accepted` | 13543 |
-| `session_net_all36` | 22602 |
+| `session_net_accepted` | 13753 |
+| `session_net_all36` | 22812 |
 | H3 scope rows | 24 |
-| H3 sGteM violations | 1 |
+| H3 sGteM violations | 0 |
 | H5 single-chain violations | 0 |
 | Measured rows | 36 |
 | Skipped rows | 0 |
 
 ## Diagnostics
 
-H3 violations: `records/t8_explore` (S=1143, M=1000)
+All computed Phase 2 gates passed on measured rows.
 
-All other accepted serve rows: `sGteM=false`.
+Prior P2-S4 failure (`records/t8_explore` S=1143, M=1000) remediated by compact-serve explore `max_tokens` cap (`COMPACT_SERVE_EXPLORE_MAX_TOKENS=750` in `src/stel/executor.rs`); refreshed row S=929, M=1000.
 
-## Reviewer / action notes (H3 FAIL)
+## H3 remediation note (P2-S4.1)
 
-**Row:** `records/t8_explore` — `explore` guidance response exceeds competent-manual window (M=1000 tokens at 4000-char cap).
+**Row:** `records/t8_explore` — explore guidance on `records-python` exceeded competent-manual window before cap.
 
-**Observed:** Single compact `symforge` call returns 1143 response tokens including STEL envelope + explore guidance body.
+**Fix:** On compact `symforge` **serve**, apply `max_tokens=750` to `explore` steps (250-token reserve for STEL envelope + serve routing meta vs H3 M=1000). Decision remains `serve`; guidance is truncated with standard budget footer when needed.
 
-**Not a multi-hop or MCP-call regression:** H5 PASS; decision=`serve`; `mcpCalls=1`.
-
-**Recommended follow-up (out of P2-S4 scope):**
-
-1. Route high-token explore queries through L2 `degrade` with `max_tokens_cap`, or
-2. Tighten explore output budget on compact surface, or
-3. Revisit M baseline for guidance-class tasks in a future measurement spike (A-011).
-
-**Phase 2 minimum exit:** H3 FAIL blocks full Phase 2 exit until resolved or spec-amended. H4 + H5 PASS on this artifact.
+**Not changed:** L2 economics thresholds, A-029, persistence, H6–H8 claims, compact-3 tool names.
 
 ## STEL extension fields (T030)
 
