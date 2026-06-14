@@ -4,4 +4,5 @@ Evidence: symbol token `do_thing` anchored at src/call.rs:1
 
 ── src/call.rs ──
   line 1  in fn caller
-[~0 tokens saved]
+
+~1011 tokens vs whole-file read; ~951 tokens vs ~50-line windowed read (competent-manual baseline)

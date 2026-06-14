@@ -7,4 +7,5 @@ Evidence: file anchor `src/lib.rs`
 
 ── src/lib.rs (1 symbols, Rust) ──
   fn         hello  L2-2
-[~0 tokens saved]
+
+~285 tokens vs whole-file read; ~285 tokens vs ~50-line windowed read (competent-manual baseline)

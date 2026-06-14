@@ -128,8 +128,19 @@ fn assert_golden(name: &str, actual: &str) {
 // test code is fine to duplicate and the existing helpers aren't `pub`).
 // ---------------------------------------------------------------------------
 
+fn medium_fixture_content() -> Vec<u8> {
+    let mut out = String::from("// fixed fixture content\n");
+    while out.lines().count() <= 50 {
+        out.push_str("// golden fixture padding\n");
+    }
+    while out.len() <= 200 {
+        out.push_str("// pad\n");
+    }
+    out.into_bytes()
+}
+
 fn make_rust_file_with_symbols(path: &str, symbols: Vec<(&str, SymbolKind)>) -> IndexedFile {
-    let content = b"// fixed fixture content\n".to_vec();
+    let content = medium_fixture_content();
     let symbol_records: Vec<SymbolRecord> = symbols
         .into_iter()
         .enumerate()
@@ -388,7 +399,7 @@ async fn test_impact_edit_contract_golden() {
     // fixture content byte-for-byte so the diff outcome is deterministic.
     let src_dir = tmp.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
-    std::fs::write(src_dir.join("edit.rs"), b"// fixed fixture content\n").unwrap();
+    std::fs::write(src_dir.join("edit.rs"), medium_fixture_content()).unwrap();
 
     let index = build_shared_index(vec![make_rust_file_with_symbols(
         "src/edit.rs",

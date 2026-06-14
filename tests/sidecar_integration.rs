@@ -38,6 +38,10 @@ use tokio::sync::Mutex;
 // ---------------------------------------------------------------------------
 static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+fn has_savings_footer(body: &str) -> bool {
+    body.contains("whole-file read") || body.contains("windowed read")
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
@@ -231,7 +235,17 @@ async fn test_outline_endpoint() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(vec![make_rust_file("src/foo.rs", "hello")]);
+    let mut file = make_rust_file("src/foo.rs", "hello");
+    let mut padded = String::from_utf8(file.content).unwrap();
+    while padded.lines().count() <= 50 {
+        padded.push_str("// test fixture padding\n");
+    }
+    while padded.len() <= 200 {
+        padded.push_str("// pad\n");
+    }
+    file.content = padded.into_bytes();
+    file.byte_len = file.content.len() as u64;
+    let index = build_shared_index(vec![file]);
     let handle = spawn_sidecar(Arc::clone(&index), "127.0.0.1", None)
         .await
         .expect("spawn_sidecar should succeed");
@@ -250,7 +264,7 @@ async fn test_outline_endpoint() {
         "outline should include the symbol name"
     );
     assert!(
-        body.contains("tokens saved"),
+        has_savings_footer(&body),
         "outline should include the token savings footer"
     );
 

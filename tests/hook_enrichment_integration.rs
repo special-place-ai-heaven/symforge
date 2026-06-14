@@ -41,6 +41,24 @@ static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 // Test helpers
 // ---------------------------------------------------------------------------
 
+fn medium_rust_source(core: &str) -> Vec<u8> {
+    let mut out = core.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    while out.lines().count() <= 50 {
+        out.push_str("// test fixture padding\n");
+    }
+    while out.len() <= 200 {
+        out.push_str("// pad\n");
+    }
+    out.into_bytes()
+}
+
+fn has_savings_footer(body: &str) -> bool {
+    body.contains("whole-file read") || body.contains("windowed read")
+}
+
 /// Build a minimal `IndexedFile` for a Rust source file with named functions.
 fn make_rust_file_with_symbols(path: &str, symbols: Vec<(&str, SymbolKind)>) -> IndexedFile {
     let symbol_records: Vec<SymbolRecord> = symbols
@@ -361,7 +379,11 @@ async fn test_edit_hook_shows_callers() {
     // Write file a.rs to disk (the file we'll "edit").
     let src_dir = tmp.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
-    std::fs::write(src_dir.join("a.rs"), b"fn helper_func() {}").unwrap();
+    std::fs::write(
+        src_dir.join("a.rs"),
+        medium_rust_source("fn helper_func() {}"),
+    )
+    .unwrap();
 
     // File a.rs defines helper_func; file b.rs references it.
     let file_a =
@@ -392,9 +414,9 @@ async fn test_edit_hook_shows_callers() {
         &body[..body.len().min(200)]
     );
 
-    // It should contain a token savings footer.
+    // It should contain a token savings footer when the source file is large enough.
     assert!(
-        body.contains("tokens saved"),
+        has_savings_footer(&body),
         "impact response must have token savings footer; body: {body}"
     );
 
@@ -732,8 +754,9 @@ async fn test_token_savings_footer() {
         ("handle_error", SymbolKind::Function),
     ];
     let mut file = make_rust_file_with_symbols("src/service.rs", symbols);
-    // Give it a large byte_len so savings > 0.
-    file.byte_len = 5000;
+    file.content =
+        medium_rust_source("fn process_request() {}\nfn validate_input() {}\nfn handle_error() {}");
+    file.byte_len = file.content.len() as u64;
 
     let index = build_shared_index(vec![file]);
     let handle = spawn_sidecar(Arc::clone(&index), "127.0.0.1", None)
@@ -745,10 +768,10 @@ async fn test_token_savings_footer() {
     let body = raw_http_get(handle.port, "/outline", "path=src/service.rs")
         .expect("GET /outline must succeed");
 
-    // Must contain "[~N tokens saved]" footer pattern.
+    // Must contain a competent-manual savings footer.
     assert!(
-        body.contains("[~") && body.contains("tokens saved]"),
-        "outline response must contain '[~N tokens saved]' footer; body: {body}"
+        has_savings_footer(&body),
+        "outline response must contain a savings footer; body: {body}"
     );
 
     handle.shutdown_and_join().await;

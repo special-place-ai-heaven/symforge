@@ -2,4 +2,5 @@
 Status: indexed and unchanged
 Symbols: 0
 Tip: Use what_changed to see recent modifications.
-[~0 tokens saved]
+
+~300 tokens vs whole-file read; ~300 tokens vs ~50-line windowed read (competent-manual baseline)
