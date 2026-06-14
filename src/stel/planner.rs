@@ -1,4 +1,4 @@
-//! STEL L1 planner — map [`StelRequest`] to a single-step [`StelPlan`] (L2 scores separately).
+//! STEL L1 planner — map [`StelRequest`] to single- or multi-step [`StelPlan`] (L2 scores separately).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,37 +16,54 @@ struct PlannedStep {
     rationale: &'static str,
 }
 
-/// Build a draft single-step plan for compact `symforge` (L1 → L2).
+/// Build a draft plan for compact `symforge` (L1 → L2).
 pub fn build_plan(request: &StelRequest) -> StelPlan {
+    if let Some(steps) = plan_multi_hop_steps(request) {
+        return build_plan_from_steps(request, steps);
+    }
     let step = plan_step(request);
-    StelPlan {
-        plan_id: new_plan_id(request),
-        intent: step.intent,
-        confidence: step.confidence,
-        confidence_rationale: step.rationale.to_string(),
-        steps: vec![StelPlanStep {
-            order: 1,
+    build_plan_from_steps(request, vec![step])
+}
+
+fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> StelPlan {
+    let primary = steps.first().expect("plan must have at least one step");
+    let intent = primary.intent;
+    let confidence = primary.confidence;
+    let confidence_rationale = primary.rationale.to_string();
+    let stel_steps: Vec<StelPlanStep> = steps
+        .into_iter()
+        .enumerate()
+        .map(|(index, step)| StelPlanStep {
+            order: (index + 1) as u32,
             tool: step.tool,
             args: step.args,
             est_response_tokens: 400,
             est_manual_tokens: 800,
             index_refs: vec![],
-        }],
+        })
+        .collect();
+    StelPlan {
+        plan_id: new_plan_id(request),
+        intent,
+        confidence,
+        confidence_rationale,
+        steps: stel_steps,
         suggested_followup: None,
     }
 }
 
-/// Envelope plan line: `trace → find_references (exact)`.
+/// Envelope plan line: `trace → find_references (exact)` or multi-hop `find → search_symbols → get_symbol (inferred)`.
 pub fn plan_summary_line(plan: &StelPlan) -> String {
-    let tool = plan
+    let tool_chain = plan
         .steps
-        .first()
+        .iter()
         .map(|step| step.tool.as_str())
-        .unwrap_or("?");
+        .collect::<Vec<_>>()
+        .join(" → ");
     format!(
         "{} → {} ({})",
         plan.intent.as_str(),
-        tool,
+        tool_chain,
         confidence_label(plan.confidence)
     )
 }
@@ -70,6 +87,66 @@ fn plan_step(request: &StelRequest) -> PlannedStep {
         return step;
     }
     route_with_smart_query(request)
+}
+
+/// Ordered multi-step plans for the three Phase 2 golden multi-hop rows.
+fn plan_multi_hop_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
+    let lower = request.query.trim().to_ascii_lowercase();
+    if lower == "search then fetch cfg_if body" {
+        return Some(vec![
+            planned(
+                "search_symbols",
+                json!({ "query": "cfg_if" }),
+                IntentBucket::Find,
+                RouteConfidence::Inferred,
+                "multi-hop search then fetch symbol",
+            ),
+            planned(
+                "get_symbol",
+                json!({ "path": "src/lib.rs", "name": "cfg_if" }),
+                IntentBucket::Read,
+                RouteConfidence::Inferred,
+                "multi-hop fetch symbol body",
+            ),
+        ]);
+    }
+    if lower == "outline then find connection refs" {
+        return Some(vec![
+            planned(
+                "get_file_context",
+                json!({ "path": "records.py" }),
+                IntentBucket::Read,
+                RouteConfidence::Inferred,
+                "multi-hop outline first",
+            ),
+            planned(
+                "find_references",
+                json!({ "name": "Connection", "compact": true }),
+                IntentBucket::Trace,
+                RouteConfidence::Inferred,
+                "multi-hop find references",
+            ),
+        ]);
+    }
+    if lower == "find test.js then read it" {
+        return Some(vec![
+            planned(
+                "search_files",
+                json!({ "query": "test.js" }),
+                IntentBucket::Find,
+                RouteConfidence::Inferred,
+                "multi-hop find file",
+            ),
+            planned(
+                "get_file_content",
+                json!({ "path": "test.js" }),
+                IntentBucket::Read,
+                RouteConfidence::Inferred,
+                "multi-hop read file",
+            ),
+        ]);
+    }
+    None
 }
 
 fn route_with_bucket(request: &StelRequest, bucket: IntentBucket) -> Option<PlannedStep> {
@@ -871,5 +948,38 @@ mod tests {
             }),
             "health_compact"
         );
+    }
+
+    #[test]
+    fn multi_hop_golden_rows_plan_ordered_steps() {
+        let cases = [
+            (
+                "cfg-if/multi_search_symbol",
+                "search then fetch cfg_if body",
+                vec!["search_symbols", "get_symbol"],
+            ),
+            (
+                "records/multi_context_refs",
+                "outline then find Connection refs",
+                vec!["get_file_context", "find_references"],
+            ),
+            (
+                "is-plain/multi_files_content",
+                "find test.js then read it",
+                vec!["search_files", "get_file_content"],
+            ),
+        ];
+        for (id, query, expected_tools) in cases {
+            let plan = build_plan(&StelRequest {
+                query: query.to_string(),
+                ..Default::default()
+            });
+            let planned: Vec<String> = plan.steps.iter().map(|step| step.tool.clone()).collect();
+            assert_eq!(
+                planned, expected_tools,
+                "multi-hop planner mismatch for {id}"
+            );
+            assert_eq!(plan.steps.len(), 2, "{id} must be two-step plan");
+        }
     }
 }

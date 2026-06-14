@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **Planning only — all tasks pending spec approval and milestone branch creation.** Do not implement on `main` without explicit Phase 2 milestone.
+**Status**: **T002 GO recorded** — milestone branch `cursor/v8-phase2-stel-controller` authorized; P2-S1/P2-S2 in progress.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -16,8 +16,8 @@
 ## P2-S0: Spec & Review (current)
 
 - [x] T001 Record Spec Kit inputs in `docs/research/phase2-evidence-index.md` (spec, plan, contract paths)
-- [ ] T002 Reviewer sign-off on `specs/002-v8-phase2-stel-controller/spec.md` (independent from implementer)
-- [ ] T003 Open milestone branch `cursor/v8-phase2-stel-controller` from green `main`
+- [x] T002 Reviewer sign-off on `specs/002-v8-phase2-stel-controller/spec.md` (independent from implementer) — GO in [`docs/research/phase2-spec-review-signoff.md`](../../docs/research/phase2-spec-review-signoff.md)
+- [x] T003 Open milestone branch `cursor/v8-phase2-stel-controller` from green `main`
 
 **Checkpoint**: Spec approved; branch created; v8 Phase 1 CI green on branch base.
 
@@ -25,13 +25,13 @@
 
 ## P2-S1 / P2-S2: Multi-Hop L1 + Executor (US1)
 
-- [ ] T010 [US1] Extend `StelPlan` / types for ordered multi-step plans in `src/stel/types.rs`
-- [ ] T011 [US1] Implement multi-hop routing in `src/stel/planner.rs` for three golden row patterns
-- [ ] T012 [US1] Extend `src/stel/executor.rs` for in-process step chain (fail-fast on mid-chain error)
-- [ ] T013 [US1] Wire multi-step dispatch in `symforge_stel_handler` (`src/protocol/tools.rs`)
-- [ ] T014 [US1] Remove `DEFERRED_MULTI_HOP_ROW_IDS` deferral — replay as SupportedServe in `src/stel/golden_replay.rs`
-- [ ] T015 [US1] Add/extend `tests/stel_golden_replay.rs` for 36/36 classification (0 deferred multi-hop)
-- [ ] T016 [P] [US1] Add fixture corpus for `is-plain/multi_files_content` if needed under `tests/fixtures/`
+- [x] T010 [US1] Extend `StelPlan` / types for ordered multi-step plans in `src/stel/types.rs`
+- [x] T011 [US1] Implement multi-hop routing in `src/stel/planner.rs` for three golden row patterns
+- [x] T012 [US1] Extend `src/stel/executor.rs` for in-process step chain (fail-fast on mid-chain error)
+- [x] T013 [US1] Wire multi-step dispatch in `symforge_stel_handler` (`src/protocol/tools.rs`)
+- [x] T014 [US1] Remove `DEFERRED_MULTI_HOP_ROW_IDS` deferral — replay as SupportedServe in `src/stel/golden_replay.rs`
+- [x] T015 [US1] Add/extend `tests/stel_golden_replay.rs` for 36/36 classification (0 deferred multi-hop)
+- [x] T016 [P] [US1] Add fixture corpus for `is-plain/multi_files_content` if needed under `tests/fixtures/` (existing is-plain corpus sufficient)
 
 **Checkpoint**: `cargo test --test stel_golden_replay` — 0 deferred multi-hop; CI green.
 

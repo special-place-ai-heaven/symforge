@@ -216,6 +216,51 @@ fn classify_find_references_output(text: &str) -> OutcomeClass {
     }
 }
 
+fn classify_get_file_context_output(text: &str) -> OutcomeClass {
+    if is_index_unavailable_output(text) {
+        OutcomeClass::InternalFailure
+    } else if text.starts_with("Error:") || text.starts_with("Invalid get_file_context") {
+        OutcomeClass::InvalidRequest
+    } else if text.starts_with("File not found:")
+        || text.starts_with("File not found on disk:")
+        || text.starts_with("No symbol ")
+    {
+        OutcomeClass::NotFound
+    } else if text.starts_with("Ambiguous") {
+        OutcomeClass::Ambiguous
+    } else {
+        OutcomeClass::Found
+    }
+}
+
+/// Classify compact-surface legacy tool output for STEL chain admission and replay validation.
+pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeClass {
+    match tool {
+        "get_symbol" => classify_get_symbol_output(text),
+        "get_symbol_context" => classify_get_symbol_context_output(text),
+        "get_file_content" => classify_get_file_content_output(text),
+        "get_file_context" => classify_get_file_context_output(text),
+        "search_symbols" => classify_search_symbols_output(text),
+        "search_text" => classify_search_text_output(text),
+        "search_files" => classify_search_files_output(text),
+        "find_references" => classify_find_references_output(text),
+        _ => {
+            if is_index_unavailable_output(text) {
+                OutcomeClass::InternalFailure
+            } else if text.starts_with("Error:") || text.starts_with("Invalid") {
+                OutcomeClass::InvalidRequest
+            } else {
+                OutcomeClass::Found
+            }
+        }
+    }
+}
+
+/// Whether a legacy tool body represents successful serve output for STEL chain continuation.
+pub(crate) fn compact_tool_output_is_success(tool: &str, text: &str) -> bool {
+    classify_compact_tool_output(tool, text) == OutcomeClass::Found
+}
+
 /// Deserialize a required `u32` from either a JSON number or a stringified number.
 use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkipReason};
 use crate::domain::{FileClassification, LanguageId, ReferenceKind};
@@ -7967,9 +8012,14 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
         use crate::stel::controller::{build_estimate, evaluate_plan};
-        use crate::stel::executor::{format_bypass_body, is_enforced_bypass};
+        use crate::stel::executor::{
+            ServedStepResult, chain_failure_decision, format_bypass_body,
+            format_multi_step_serve_body, format_partial_multi_step_serve_body,
+            format_single_step_serve_body, is_enforced_bypass, route_tool_label,
+            serve_chain_outcome_class, serve_step_failed, serve_step_outcome, tools_executed,
+        };
         use crate::stel::handler::{self, metrics_for_decision};
-        use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
+        use crate::stel::planner::{build_plan, plan_summary_line};
 
         let q = smart_query::strip_leading_articles(request.query.trim());
         if q.is_empty() {
@@ -8007,47 +8057,76 @@ impl SymForgeServer {
                 &body,
                 false,
                 &step.tool,
+                None,
             );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
-        let tool_body = self
-            .dispatch_tool_for_tests(&step.tool, step.args.clone())
-            .await;
-        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
-        let routing_meta = format!(
-            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
-            confidence_label(plan.confidence),
-            step.tool,
-            invocation,
-            plan.confidence_rationale,
-            decision.decision.as_str(),
-            decision.decision_reason,
-        );
-        let body = format!("{routing_meta}\n\n{tool_body}");
+        let mut step_results = Vec::new();
+        let mut outcome_class = OutcomeClass::Found;
+        let mut chain_failed = false;
+        for step in &plan.steps {
+            let tool_body = self
+                .dispatch_tool_for_tests(&step.tool, step.args.clone())
+                .await;
+            step_results.push(ServedStepResult {
+                tool: step.tool.clone(),
+                body: tool_body.clone(),
+            });
+            if serve_step_failed(&step.tool, &tool_body) {
+                outcome_class =
+                    serve_chain_outcome_class(serve_step_outcome(&step.tool, &tool_body));
+                chain_failed = true;
+                break;
+            }
+        }
+
+        let mut effective_decision = decision.clone();
+        if chain_failed {
+            let failed_index = step_results.len().saturating_sub(1);
+            let failed_tool = step_results[failed_index].tool.as_str();
+            let failed_outcome = serve_step_outcome(failed_tool, &step_results[failed_index].body);
+            effective_decision =
+                chain_failure_decision(&plan, &decision, failed_index, failed_tool, failed_outcome);
+        }
+
+        let chain_failure_note = chain_failed.then(|| effective_decision.decision_reason.clone());
+        let body = if plan.steps.len() == 1 {
+            format_single_step_serve_body(
+                &plan,
+                &effective_decision,
+                &plan.steps[0],
+                &step_results[0].body,
+            )
+        } else if chain_failed {
+            format_partial_multi_step_serve_body(
+                &plan,
+                &effective_decision,
+                &step_results,
+                chain_failure_note.as_deref(),
+            )
+        } else {
+            format_multi_step_serve_body(&plan, &effective_decision, &step_results)
+        };
+        let tools = tools_executed(&step_results);
+        let route_label = route_tool_label(&tools);
+        let tools_called = if tools.len() > 1 { Some(tools) } else { None };
         let output = self.finalize_symforge_with_ledger(
             "symforge",
             request,
             &plan,
-            &decision,
+            &effective_decision,
             plan_summary,
             session_net,
             &body,
-            true,
-            &step.tool,
+            !step_results.is_empty(),
+            &route_label,
+            tools_called,
         );
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
-
-        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
-            OutcomeClass::InvalidRequest
-        } else if tool_body.starts_with("Index not loaded.") {
-            OutcomeClass::InternalFailure
-        } else {
-            OutcomeClass::Found
-        };
         statused_tool_result(output, outcome_class)
     }
 
@@ -8135,6 +8214,7 @@ impl SymForgeServer {
                         &body,
                         false,
                         "replace_symbol_body",
+                        None,
                     );
                     self.session_context
                         .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
@@ -8213,6 +8293,7 @@ impl SymForgeServer {
             &body,
             legacy_executed,
             &step.tool,
+            None,
         );
         self.session_context
             .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
@@ -8283,6 +8364,7 @@ impl SymForgeServer {
         body: &str,
         legacy_executed: bool,
         selected_tool: &str,
+        tools_called: Option<Vec<String>>,
     ) -> String {
         use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
         use crate::stel::ledger::{
@@ -8297,6 +8379,7 @@ impl SymForgeServer {
             decision,
             economics: &metrics.economics,
             selected_tool,
+            tools_called: tools_called.as_deref(),
             legacy_executed,
             output_body: body,
             surface,

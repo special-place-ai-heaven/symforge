@@ -1,6 +1,6 @@
 # Phase 2 STEL evidence index
 
-**Status**: Spec Kit planning — **no implementation**
+**Status**: T002 GO — Phase 2 implementation authorized on `cursor/v8-phase2-stel-controller`
 
 **Created**: 2026-06-14
 
@@ -21,6 +21,15 @@
 
 - Phase 1 shipped: [`phase1-stel-checkpoint.md`](../phase1-stel-checkpoint.md)
 - Main repair commits: `d4fcd0a`, `66742f1`
+
+## T002 spec reviewer sign-off
+
+| Field | Value |
+|-------|-------|
+| Artifact | [`phase2-spec-review-signoff.md`](./phase2-spec-review-signoff.md) |
+| Decision | **GO** (2026-06-14) |
+| Baseline commit | `bc738c3` (PR #303 merge) |
+| First slice | P2-S1/P2-S2 — multi-hop golden closure (T010–T016) |
 
 ## Evidence slots (to fill during Phase 2 implementation)
 

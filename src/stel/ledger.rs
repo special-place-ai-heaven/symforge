@@ -52,6 +52,7 @@ pub struct LedgerCaptureInput<'a> {
     pub decision: &'a StelDecision,
     pub economics: &'a EconomicsBreakdown,
     pub selected_tool: &'a str,
+    pub tools_called: Option<&'a [String]>,
     pub legacy_executed: bool,
     pub output_body: &'a str,
     pub surface: &'static str,
@@ -87,7 +88,10 @@ pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
         intent: input.plan.intent,
         decision: input.decision.decision,
         tools_called: if input.legacy_executed {
-            vec![input.selected_tool.to_string()]
+            input
+                .tools_called
+                .map(|tools| tools.to_vec())
+                .unwrap_or_else(|| vec![input.selected_tool.to_string()])
         } else {
             vec![]
         },
@@ -174,6 +178,7 @@ mod tests {
             decision: &decision,
             economics: &economics,
             selected_tool: "find_references",
+            tools_called: None,
             legacy_executed: true,
             output_body: body,
             surface: "symforge",
@@ -203,6 +208,7 @@ mod tests {
             decision: &decision,
             economics: &economics,
             selected_tool: plan.steps[0].tool.as_str(),
+            tools_called: None,
             legacy_executed: false,
             output_body: body,
             surface: "symforge",
@@ -225,6 +231,7 @@ mod tests {
             decision: &decision,
             economics: &economics,
             selected_tool: "find_references",
+            tools_called: None,
             legacy_executed: true,
             output_body: "body",
             surface: "symforge",
