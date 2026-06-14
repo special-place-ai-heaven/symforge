@@ -49,7 +49,7 @@ Store records in this file (human) and optionally `docs/stel-assumptions.json` (
 | **0 baseline** | Phase 0 **exits** when A-001..A-004 validated (measurement harness trustworthy) |
 | **0 L0 choice** | A-019 validated (compact-3 vs meta-tool — **before** locking Phase 1 tools) |
 | **1 types + L0** | A-005, A-025 validated (compact schema ≤5kB including edit) |
-| **2 L1 + L2** | A-008..A-014 validated; A-029 spike started (T2/T3) |
+| **2 L1 + L2** | A-008..A-014 evidence recorded (PARTIAL/VALIDATED/OPEN); A-029 spike complete (PIVOT/P-T2) |
 | **3 executor + 8.0** | A-015..A-016 validated |
 | **4 quality + deploy + 8.1** | 8.0.0 shipped; A-020..A-022 validated |
 
@@ -82,8 +82,8 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
-| **A-008** | `smart_query` + NL achieves ≥ **95%** trajectory pass on `routes.golden.jsonl` | Build golden file; replay via `symforge` | **OPEN** |
-| **A-009** | Multi-step internal chain (search→symbol) improves equivalence **without** increasing tokens vs single-hop | A/B on failing T1/T4 rows | **OPEN** |
+| **A-008** | `smart_query` + NL achieves ≥ **95%** trajectory pass on `routes.golden.jsonl` | Build golden file; replay via `symforge` | **PARTIAL** |
+| **A-009** | Multi-step internal chain (search→symbol) improves equivalence **without** increasing tokens vs single-hop | A/B on failing T1/T4 rows | **VALIDATED** |
 | **A-010** | Structured `intent` bucket reduces fallback rate vs NL-only | A/B NL-only vs intent-hint on golden corpus | **OPEN** |
 
 ### Controller & economics
@@ -91,8 +91,8 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
 | **A-011** | Index `raw_chars` + line count predict response tokens within **±20%** | Compare `est_response_tokens` vs actual on full battery | **OPEN** |
-| **A-012** | **Bypass** on small files eliminates `sGteM` while preserving task completion via host Read | Battery `*_small` rows with controller; **two-hop harness** (BYPASS → simulated Read → completion check) or H3 scoped to **serve-only** small rows | **OPEN** |
-| **A-013** | **cache_hit** via `SessionContext` saves tokens without equivalence loss | Path tests with duplicate fetch scenarios | **OPEN** |
+| **A-012** | **Bypass** on small files eliminates `sGteM` while preserving task completion via host Read | Battery `*_small` rows with controller; **two-hop harness** (BYPASS → simulated Read → completion check) or H3 scoped to **serve-only** small rows | **PARTIAL** |
+| **A-013** | **cache_hit** via `SessionContext` saves tokens without equivalence loss | Path tests with duplicate fetch scenarios | **VALIDATED** |
 | **A-014** | Degrade (outline-only, cap 1000 tok) beats 7.x on T3 large **and** raises equivalence | Battery diff fmt/tokio T3 large rows | **OPEN** |
 
 ### Trust & calibration
@@ -153,6 +153,21 @@ Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index
 | **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **VALIDATED** | 36 rows [`fixtures/routes.golden.jsonl`](fixtures/routes.golden.jsonl) |
 | **A-032** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **PARTIAL** | 4 P-FF rows seeded; battery enforcement §12B |
 
+## Phase 2 evidence links (2026-06-14)
+
+Updated by [speckit.implement](../specs/002-v8-phase2-stel-controller/tasks.md) P2-S6. Index: [`research/phase2-evidence-index.md`](research/phase2-evidence-index.md). Exit: [`phase2-stel-checkpoint.md`](phase2-stel-checkpoint.md).
+
+| ID | Artifact | Verdict | Notes |
+|----|----------|---------|-------|
+| **A-008** | [`tests/stel_golden_replay.rs`](../tests/stel_golden_replay.rs) | **PARTIAL** | 32 serve + 4 P-FF replay; 95% trajectory metric not numerically measured |
+| **A-009** | [`tests/stel_multi_hop_chain.rs`](../tests/stel_multi_hop_chain.rs) | **VALIDATED** | 3 multi-hop golden rows; one external MCP call |
+| **A-010** | — | **OPEN** | Intent-bucket A/B not run in Phase 2 |
+| **A-011** | [`research/phase2-gate-report.md`](research/phase2-gate-report.md) | **OPEN** | Predictor ±20% not validated on full battery |
+| **A-012** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md), [`research/phase2-gate-report.md`](research/phase2-gate-report.md) | **PARTIAL** | Serve-only H3 scope; H3 PASS; two-hop completion not shipped |
+| **A-013** | [`tests/stel_l2_admission.rs`](../tests/stel_l2_admission.rs) | **VALIDATED** | cache_hit admission + tests |
+| **A-014** | [`src/stel/executor.rs`](../src/stel/executor.rs) degrade caps | **OPEN** | Degrade shipped; T3-large battery deferred |
+| **A-029** | [`research/A-029-t2-spike.md`](research/A-029-t2-spike.md) | **PIVOT** | 0/4 T2 equiv; P-T2 bypass-only; `eligible_h6=false` when policy lands |
+
 ## When an assumption is invalidated
 
 ```text
@@ -185,7 +200,15 @@ Append as dated section below or link PR / note.
 
 ### Research log
 
-_(empty — populate on first INVALIDATED assumption)_
+#### A-029 — T2 reference parity (2026-06-14)
+
+```text
+assumption_id: A-029
+failure: 0/4 T2 equivalence on tokio+django (rg baseline recall 5–14% vs index find_references)
+research: docs/research/A-029-t2-spike.md; scripts/a029-t2-spike.cjs
+conclusion: PIVOT — register P-T2 bypass-only for T2 reference tasks; eligible_h6=false; 8.1 index-recall program
+resume: Phase 3 executor + 8.1 T2/T3 quality program — not Phase 2 runtime masking
+```
 
 ---
 
