@@ -17,18 +17,21 @@
   "missed_paths_count": 236,
   "baseline_recall": 0.0635,
   "baseline_bucket_counts": {
-    "source": 96,
+    "source": 82,
     "test": 155,
-    "example": 1
+    "example": 1,
+    "bench": 14
   },
   "missed_bucket_counts": {
-    "source": 86,
+    "source": 73,
     "test": 149,
-    "example": 1
+    "example": 1,
+    "bench": 13
   },
   "matched_bucket_counts": {
     "test": 6,
-    "source": 10
+    "source": 9,
+    "bench": 1
   },
   "top_missed_prefixes": [
     {
@@ -623,5 +626,6 @@
     "examples/dump.rs",
     "tokio-test/src/task.rs",
     "tokio-test/tests/task.rs"
-  ]
+  ],
+  "bucket_recompute_note": "2026-06-14 T019 cleanup: bench pattern (^|/)benches?/"
 }

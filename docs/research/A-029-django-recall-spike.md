@@ -9,12 +9,14 @@
 
 | Task ID | Symbol | min recall | baseline files | cited files | matched | recall | equiv (A-029) |
 |---------|--------|------------|----------------|-------------|---------|--------|---------------|
-| `django/t2_queryset` | QuerySet | 35% | 71 | 7 | 7 | **9.9%** | SYMFORGE-LESS |
-| `django/t2_model` | Model | 25% | 354 | 17 | 17 | **4.8%** | SYMFORGE-LESS |
+| `django/t2_queryset` | QuerySet | 35% | 71 | **7** | 7 | **9.9%** | SYMFORGE-LESS |
+| `django/t2_model` | Model | 25% | 354 | **17** | 17 | **4.8%** | SYMFORGE-LESS |
 
 Artifacts: [`rg-hits/django/t2_queryset.json`](./rg-hits/django/t2_queryset.json), [`rg-hits/django/t2_model.json`](./rg-hits/django/t2_model.json)
 
 ## Missed-site bucket summary
+
+From committed `missed_bucket_counts`:
 
 | Task | missed total | source | test |
 |------|--------------|--------|------|
@@ -32,11 +34,11 @@ Artifacts: [`rg-hits/django/t2_queryset.json`](./rg-hits/django/t2_queryset.json
 
 ## Observations
 
-1. **High fan-out symbol (`Model`):** 354 rg baseline files; only 17 cited — worst recall row (4.8%).
-2. **`QuerySet` narrower:** 71 baseline files, 7 cited — likely at compact output file budget.
-3. **Misses skew to `django/contrib` and `tests/**`** — consistent with structured-ref extraction gaps and/or serve output limits.
-4. **No bench paths** in django rg baseline for these symbols (Python bench layout differs from tokio `benches/*.rs`).
-5. **Markdown/docs:** not in rg baseline (`*.py` glob); docs/tests markdown cross-refs remain §6.1 follow-up.
+1. **High fan-out symbol (`Model`):** 354 rg baseline files; **17 cited** — worst recall row (4.8%). **Not cap-bound at 20** (17 < 20).
+2. **`QuerySet`:** 71 baseline files, **7 cited** — **not** at compact output file budget (7 ≪ 20). Low recall is **not** explained by FM-CAP.
+3. **Django is TX-02-bound:** misses skew to `source` bucket (48 / 293) — structured xref / symbol resolution gaps dominate over output truncation.
+4. **FM-CAP / TX-01:** apply TX-01 first for cheap tokio cap proof, then **re-measure per repo**. Django flat recall after TX-01 must not be misread as TX-01 failure — expect django lift from **TX-02** (xref) and **TX-04** (tests).
+5. **No bench paths** in django rg baseline for these symbols. **Markdown/docs:** not in rg baseline (`*.py` glob).
 
 ## Reproduce
 

@@ -245,5 +245,6 @@
     "django/views/generic/detail.py",
     "django/contrib/admin/utils.py",
     "django/contrib/admin/options.py"
-  ]
+  ],
+  "bucket_recompute_note": "2026-06-14 T019 cleanup: bench pattern (^|/)benches?/"
 }

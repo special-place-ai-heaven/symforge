@@ -106,4 +106,4 @@ Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-repo
 | Evidence index | [`81-index-recall-evidence-index.md`](./81-index-recall-evidence-index.md) |
 | T019 gate | [`81-index-recall-taxonomy-signoff.md`](./81-index-recall-taxonomy-signoff.md) |
 
-**Status:** T2.1 audit artifacts produced; T019 reviewer decision **PENDING** — no recall fixes authorized until GO.
+**Status:** T2.1 audit complete; T019 **GO** (PR #314 cleanup pre-merge) — implementation (TX-01) after merge + green main.

@@ -18,15 +18,18 @@
   "baseline_recall": 0.1418,
   "baseline_bucket_counts": {
     "test": 78,
-    "source": 63
+    "source": 47,
+    "bench": 16
   },
   "missed_bucket_counts": {
     "test": 72,
-    "source": 49
+    "source": 42,
+    "bench": 7
   },
   "matched_bucket_counts": {
     "test": 6,
-    "source": 14
+    "source": 5,
+    "bench": 9
   },
   "top_missed_prefixes": [
     {
@@ -399,5 +402,6 @@
     "tokio/src/task/local.rs",
     "tokio/src/task/spawn.rs",
     "tokio/src/macros/cfg.rs"
-  ]
+  ],
+  "bucket_recompute_note": "2026-06-14 T019 cleanup: bench pattern (^|/)benches?/"
 }

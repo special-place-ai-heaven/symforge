@@ -822,5 +822,6 @@
     "django/contrib/auth/management/__init__.py",
     "django/contrib/admindocs/views.py",
     "django/contrib/flatpages/models.py"
-  ]
+  ],
+  "bucket_recompute_note": "2026-06-14 T019 cleanup: bench pattern (^|/)benches?/"
 }

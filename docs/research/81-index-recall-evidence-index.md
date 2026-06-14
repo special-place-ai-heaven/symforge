@@ -43,7 +43,7 @@
 | T010–T012 | [`A-029-t2-task-crosswalk.md`](./A-029-t2-task-crosswalk.md) | **COMPLETE** |
 | T013–T016 | [`rg-hits/`](./rg-hits/) + spike summaries below | **COMPLETE** |
 | T017–T018 | [`A-029-gap-taxonomy.md`](./A-029-gap-taxonomy.md) | **COMPLETE** |
-| T019 | [`81-index-recall-taxonomy-signoff.md`](./81-index-recall-taxonomy-signoff.md) | **PENDING** reviewer |
+| T019 | [`81-index-recall-taxonomy-signoff.md`](./81-index-recall-taxonomy-signoff.md) | **GO** (cleanup pre-merge) |
 
 | Repo spike summary | Path |
 |--------------------|------|

@@ -69,8 +69,7 @@ function baselineReferencePaths(corpusDirPath, symbol, repo) {
 function categorizePath(p) {
   const norm = p.replace(/\\/g, "/");
   if (/\.md$/i.test(norm)) return "markdown";
-  if (/\/benches?\//i.test(norm) || /\/bench\//i.test(norm) || /_bench\.rs$/i.test(norm))
-    return "bench";
+  if (/(^|\/)benches?\//i.test(norm) || /_bench\.rs$/i.test(norm)) return "bench";
   if (/\/tests?\//i.test(norm) || /\/test_/i.test(norm) || /_test\.(rs|py)$/i.test(norm))
     return "test";
   if (/\/docs?\//i.test(norm)) return "docs";
