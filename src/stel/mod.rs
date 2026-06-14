@@ -52,12 +52,13 @@ pub use edit_planner::{
 };
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use executor::{
-    ServedStepResult, apply_degrade_to_plan, chain_failure_decision, extract_served_step_bodies,
-    format_bypass_body, format_cache_hit_body, format_multi_step_serve_body,
-    format_partial_multi_step_serve_body, format_serve_step_meta, format_single_step_serve_body,
-    is_degrade, is_enforced_bypass, is_pff_bypass_body, route_tool_label,
-    serve_chain_outcome_class, serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch,
-    tools_executed,
+    COMPACT_SERVE_EXPLORE_MAX_TOKENS, COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT,
+    COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE, ServedStepResult, apply_compact_serve_caps,
+    apply_degrade_to_plan, chain_failure_decision, extract_served_step_bodies, format_bypass_body,
+    format_cache_hit_body, format_multi_step_serve_body, format_partial_multi_step_serve_body,
+    format_serve_step_meta, format_single_step_serve_body, is_degrade, is_enforced_bypass,
+    is_pff_bypass_body, route_tool_label, serve_chain_outcome_class, serve_step_failed,
+    serve_step_outcome, should_skip_legacy_dispatch, tools_executed,
 };
 pub use gates::{
     BatteryResults, BatteryRow, BatteryRowStel, GateStatus, Phase2GateReport, Phase2GateStatuses,

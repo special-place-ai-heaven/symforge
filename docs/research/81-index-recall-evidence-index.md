@@ -92,6 +92,9 @@ Source: [`a029-t2-results.json`](./a029-t2-results.json), Phase 2 #311.
 | T006 | [`81-index-recall-review-signoff.md`](./81-index-recall-review-signoff.md) | T2.1 start (spec GO) |
 | T019 | [`81-index-recall-taxonomy-signoff.md`](./81-index-recall-taxonomy-signoff.md) | T2.2/T2.3 implementation |
 
+| TX-01 cap evidence | [`A-029-tx01-cap-evidence.md`](./A-029-tx01-cap-evidence.md) | **COMPLETE** (1/4 equiv; P-T2 retained) |
+| TX-01 replay JSON | [`a029-tx01-results.json`](./a029-tx01-results.json) | post-TX-01 measure |
+
 ## Operator commands (reproduce inventory)
 
 ```bash

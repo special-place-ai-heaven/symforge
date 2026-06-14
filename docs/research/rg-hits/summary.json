@@ -1,32 +1,33 @@
 {
-  "measuredAt": "2026-06-14T21:02:32.461Z",
-  "symforgeCommit": "470826a8b5c34d014cdd1e9de07171b7b040583a",
+  "measuredAt": "2026-06-14T21:56:19.848Z",
+  "symforgeCommit": "3e0dc78dd590a9dfa94a94094df27058b87c4b17",
+  "tx01_measurement": true,
+  "t21_baseline_commit": "470826a8b5c34d014cdd1e9de07171b7b040583a",
+  "evidence": "docs/research/A-029-tx01-cap-evidence.md",
   "run_symforge": true,
   "tasks": [
     {
       "task_id": "tokio/t2_spawn",
       "baseline_paths": 252,
-      "cited_paths": 20,
-      "matched_paths": 16,
-      "baseline_recall": 0.0635,
+      "cited_paths": 100,
+      "matched_paths": 83,
+      "baseline_recall": 0.3294,
       "missed_bucket_counts": {
-        "source": 73,
-        "test": 149,
-        "example": 1,
-        "bench": 13
+        "source": 39,
+        "test": 126,
+        "bench": 4
       },
       "artifact": "docs/research/rg-hits/tokio/t2_spawn.json"
     },
     {
       "task_id": "tokio/t2_block_on",
       "baseline_paths": 141,
-      "cited_paths": 20,
-      "matched_paths": 20,
-      "baseline_recall": 0.1418,
+      "cited_paths": 100,
+      "matched_paths": 100,
+      "baseline_recall": 0.7092,
       "missed_bucket_counts": {
-        "test": 72,
-        "source": 42,
-        "bench": 7
+        "test": 28,
+        "source": 13
       },
       "artifact": "docs/research/rg-hits/tokio/t2_block_on.json"
     },
@@ -54,6 +55,5 @@
       },
       "artifact": "docs/research/rg-hits/django/t2_model.json"
     }
-  ],
-  "bucket_recompute_note": "2026-06-14 T019 cleanup: bench bucketing fix; recall unchanged"
+  ]
 }
