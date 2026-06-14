@@ -28,6 +28,14 @@ Replay uses the existing A-029 method: 4 T2 tasks in [`tests/fixtures/a029-t2/ta
 | **1/4** | **PARTIAL** | No automatic restoration of any row; document per-row gap; P-T2 retained unless spec-amended |
 | **≥2/4** | **VALIDATED** | Per-row restoration **only** for rows that independently meet equiv threshold; each restored row requires **independent reviewer sign-off** before `expected_decision=serve` + `eligible_h6=true` |
 
+**Machine vs program verdict (T2.4):** [`src/stel/a029.rs`](../../src/stel/a029.rs) emits machine verdicts **Pass / Pivot / Kill** only. Program-level outcome rules in the table above add finer labels on replay/exit:
+
+- **0/4** → **PIVOT retained** (machine: `A029Verdict::Pivot`)
+- **1/4** → **PARTIAL** — a program-level replay/exit label layered over machine `A029Verdict::Pivot`; document per-row gap in exit artifacts
+- **≥2/4** → **VALIDATED** (machine: `A029Verdict::Pass`)
+
+Do **not** require or imply adding `A029Verdict::Partial` unless a later implementation plan explicitly amends machine verdict types.
+
 **Hard rule:** Do **not** record A-029 **PASS** in `docs/stel-assumptions.md` or exit docs unless replay meets ≥2/4 equiv on refreshed [`docs/research/a029-t2-results.json`](../../docs/research/a029-t2-results.json).
 
 ---
@@ -110,10 +118,10 @@ Replay uses the existing A-029 method: 4 T2 tasks in [`tests/fixtures/a029-t2/ta
 **Purpose**: Authoritative replay, outcome-rule enforcement, assumption register update, program exit record.
 
 - [ ] T050 [US5] Run full A-029 replay: `node scripts/a029-t2-spike.cjs` → refresh `docs/research/a029-t2-results.json`; archive prior PIVOT artifact path in evidence index
-- [ ] T051 [US5] Apply outcome rules table (0/4 → PIVOT retained; 1/4 → PARTIAL; ≥2/4 → VALIDATED) and record verdict math via `src/stel/a029.rs` in `docs/research/81-index-recall-replay-summary.md`
+- [ ] T051 [US5] Apply outcome rules table (0/4 → PIVOT retained; 1/4 → PARTIAL; ≥2/4 → VALIDATED); record machine verdict via `evaluate_a029_verdict` in `src/stel/a029.rs` and program-level label (see outcome table — PARTIAL at 1/4 is not a new enum variant) in `docs/research/81-index-recall-replay-summary.md`
 - [ ] T052 [US5] **P-T2 reconsideration**: if 0/4 or 1/4, confirm P-T2 retained and all four T2 reference rows stay bypass + `eligible_h6=false`; if ≥2/4, list **only** equiv rows eligible for restoration — in replay summary
 - [ ] T053 [US5] If ≥2/4: per-row golden restoration proposal for equiv rows only; **independent reviewer sign-off required** before editing `docs/fixtures/routes.golden.jsonl` or sf-bench golden — document in `docs/research/81-t2-golden-restoration-signoff.md`
-- [ ] T054 [P] [US5] Update `docs/research/A-029-t2-spike.md` with replay date, commit, equiv count, and verdict (**PASS** only if ≥2/4; else PIVOT or PARTIAL — never PASS without threshold)
+- [ ] T054 [P] [US5] Update `docs/research/A-029-t2-spike.md` with replay date, commit, equiv count, machine verdict (Pass/Pivot/Kill), and program-level outcome (PIVOT retained / PARTIAL / VALIDATED — PARTIAL at 1/4 overlays Pivot; do not add `A029Verdict::Partial` unless spec-amended)
 - [ ] T055 [US5] Update A-029 verdict row in `docs/stel-assumptions.md` — **PASS forbidden unless T051 shows ≥2/4 equiv**
 - [ ] T056 [P] [US5] Update `docs/research/81-index-recall-evidence-index.md` with final artifact links
 - [ ] T057 [US5] Write program exit summary `docs/research/81-index-recall-exit.md`: scope audit (no B-RESULTS / persistence / EMA→L2 / H6–H8 / new MCP tools), replay outcome, P-T2 status, next program pointer (§6.2 T3 if still open)
