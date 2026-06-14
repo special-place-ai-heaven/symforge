@@ -1,0 +1,952 @@
+{
+  "measuredAt": "2026-06-14T13:42:53.593Z",
+  "symforgeBin": "/workspace/target/debug/symforge",
+  "surface": "compact",
+  "method": "ceil(bytes/4); M=competent_manual_window; STEL ledger metadata",
+  "baselineCommit": "896840f984738ce0f77e9a9c1aae94011ceaee45",
+  "rows": [
+    {
+      "id": "cfg-if/multi_search_symbol",
+      "corpus": "cfg-if-rust",
+      "S": 394,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1576,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/multi_search_symbol",
+      "decision": "serve",
+      "chain": "multi",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef93b-29",
+        "decision": "serve",
+        "tools_called": [
+          "search_symbols",
+          "get_symbol"
+        ],
+        "predicted_tokens": 800,
+        "actual_tokens": 256,
+        "net_vs_manual": 675,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/pff_whole_lib",
+      "corpus": "cfg-if-rust",
+      "S": 276,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1103,
+      "acceptedServe": false,
+      "equivalence": "BYPASS",
+      "goldenId": "cfg-if/pff_whole_lib",
+      "decision": "bypass",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": false,
+      "stel": {
+        "plan_id": "plan-19ec65ef80b-33",
+        "decision": "bypass",
+        "tools_called": [
+          "explore"
+        ],
+        "predicted_tokens": 147,
+        "actual_tokens": 147,
+        "net_vs_manual": -186,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/t1_search",
+      "corpus": "cfg-if-rust",
+      "S": 373,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1491,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef800-23",
+        "decision": "serve",
+        "tools_called": [
+          "search_text"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 243,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/t2_context",
+      "corpus": "cfg-if-rust",
+      "S": 330,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1317,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t2_context",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef801-18",
+        "decision": "serve",
+        "tools_called": [
+          "get_file_context"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 198,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "cfg-if/t3_symbols",
+      "corpus": "cfg-if-rust",
+      "S": 263,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1052,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t3_symbols",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef804-20",
+        "decision": "reject",
+        "tools_called": [
+          "search_symbols"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 131,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/t4_refs",
+      "corpus": "cfg-if-rust",
+      "S": 362,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1448,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t4_refs",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef805-21",
+        "decision": "serve",
+        "tools_called": [
+          "find_references"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 231,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "cfg-if/t5_symbol",
+      "corpus": "cfg-if-rust",
+      "S": 471,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1883,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t5_symbol",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef806-24",
+        "decision": "serve",
+        "tools_called": [
+          "get_symbol"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 342,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "cfg-if/t6_map",
+      "corpus": "cfg-if-rust",
+      "S": 268,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1071,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t6_map",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef807-15",
+        "decision": "serve",
+        "tools_called": [
+          "get_repo_map"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 136,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/t7_content",
+      "corpus": "cfg-if-rust",
+      "S": 213,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 850,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t7_content",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef808-21",
+        "decision": "reject",
+        "tools_called": [
+          "get_file_content"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 80,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/t8_explore",
+      "corpus": "cfg-if-rust",
+      "S": 392,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1566,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t8_explore",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef809-20",
+        "decision": "serve",
+        "tools_called": [
+          "explore"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 262,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "compression/pff_whole_service",
+      "corpus": "rust",
+      "S": 283,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1131,
+      "acceptedServe": false,
+      "equivalence": "BYPASS",
+      "goldenId": "compression/pff_whole_service",
+      "decision": "bypass",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": false,
+      "stel": {
+        "plan_id": "plan-19ec65ef900-27",
+        "decision": "bypass",
+        "tools_called": [
+          "search_files"
+        ],
+        "predicted_tokens": 152,
+        "actual_tokens": 152,
+        "net_vs_manual": -186,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "compression/t1_search",
+      "corpus": "rust",
+      "S": 408,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1629,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "compression/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef8dd-23",
+        "decision": "serve",
+        "tools_called": [
+          "search_text"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 277,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "compression/t2_context",
+      "corpus": "rust",
+      "S": 347,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1388,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "compression/t2_context",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef8fa-18",
+        "decision": "serve",
+        "tools_called": [
+          "get_file_context"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 216,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "compression/t3_symbol",
+      "corpus": "rust",
+      "S": 198,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 790,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "compression/t3_symbol",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef8fd-21",
+        "decision": "reject",
+        "tools_called": [
+          "get_symbol"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 68,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "compression/t4_refs",
+      "corpus": "rust",
+      "S": 309,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1234,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "compression/t4_refs",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef8fe-20",
+        "decision": "reject",
+        "tools_called": [
+          "find_references"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 175,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "compression/t5_dependents",
+      "corpus": "rust",
+      "S": 223,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 891,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "compression/t5_dependents",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef8ff-24",
+        "decision": "serve",
+        "tools_called": [
+          "find_dependents"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 90,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/multi_files_content",
+      "corpus": "is-plain-obj-ts",
+      "S": 333,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1330,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/multi_files_content",
+      "decision": "serve",
+      "chain": "multi",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef992-25",
+        "decision": "serve",
+        "tools_called": [
+          "search_files",
+          "get_file_content"
+        ],
+        "predicted_tokens": 800,
+        "actual_tokens": 193,
+        "net_vs_manual": 675,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/pff_whole_index",
+      "corpus": "is-plain-obj-ts",
+      "S": 279,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1113,
+      "acceptedServe": false,
+      "equivalence": "BYPASS",
+      "goldenId": "is-plain/pff_whole_index",
+      "decision": "bypass",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": false,
+      "stel": {
+        "plan_id": "plan-19ec65ef88a-35",
+        "decision": "bypass",
+        "tools_called": [
+          "explore"
+        ],
+        "predicted_tokens": 149,
+        "actual_tokens": 149,
+        "net_vs_manual": -186,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t1_search",
+      "corpus": "is-plain-obj-ts",
+      "S": 560,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 2239,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef880-22",
+        "decision": "serve",
+        "tools_called": [
+          "search_text"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 430,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t2_context",
+      "corpus": "is-plain-obj-ts",
+      "S": 249,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 996,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t2_context",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef881-16",
+        "decision": "serve",
+        "tools_called": [
+          "get_file_context"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 118,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "is-plain/t3_content",
+      "corpus": "is-plain-obj-ts",
+      "S": 212,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 848,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t3_content",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef882-22",
+        "decision": "reject",
+        "tools_called": [
+          "get_file_content"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 79,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t4_symbols",
+      "corpus": "is-plain-obj-ts",
+      "S": 316,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1261,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t4_symbols",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef883-20",
+        "decision": "serve",
+        "tools_called": [
+          "search_symbols"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 183,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t5_symbol",
+      "corpus": "is-plain-obj-ts",
+      "S": 199,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 794,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t5_symbol",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef884-18",
+        "decision": "reject",
+        "tools_called": [
+          "get_symbol"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 69,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t6_refs",
+      "corpus": "is-plain-obj-ts",
+      "S": 306,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1223,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t6_refs",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef885-24",
+        "decision": "serve",
+        "tools_called": [
+          "find_references"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 173,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t7_files",
+      "corpus": "is-plain-obj-ts",
+      "S": 215,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 857,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t7_files",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef886-27",
+        "decision": "reject",
+        "tools_called": [
+          "search_files"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 83,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "is-plain/t8_health",
+      "corpus": "is-plain-obj-ts",
+      "S": 413,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1650,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "is-plain/t8_health",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef888-12",
+        "decision": "serve",
+        "tools_called": [
+          "health_compact"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 282,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "records/multi_context_refs",
+      "corpus": "records-python",
+      "S": 434,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1733,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/multi_context_refs",
+      "decision": "serve",
+      "chain": "multi",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef96b-33",
+        "decision": "serve",
+        "tools_called": [
+          "get_file_context",
+          "find_references"
+        ],
+        "predicted_tokens": 800,
+        "actual_tokens": 292,
+        "net_vs_manual": 675,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/pff_whole_module",
+      "corpus": "records-python",
+      "S": 281,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1123,
+      "acceptedServe": false,
+      "equivalence": "BYPASS",
+      "goldenId": "records/pff_whole_module",
+      "decision": "bypass",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": false,
+      "stel": {
+        "plan_id": "plan-19ec65ef848-34",
+        "decision": "bypass",
+        "tools_called": [
+          "explore"
+        ],
+        "predicted_tokens": 152,
+        "actual_tokens": 152,
+        "net_vs_manual": -186,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t1_search",
+      "corpus": "records-python",
+      "S": 597,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 2385,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef83c-19",
+        "decision": "serve",
+        "tools_called": [
+          "search_text"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 466,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t2_context",
+      "corpus": "records-python",
+      "S": 847,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 3388,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t2_context",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef83d-18",
+        "decision": "serve",
+        "tools_called": [
+          "get_file_context"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 715,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "records/t3_files",
+      "corpus": "records-python",
+      "S": 262,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 1047,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t3_files",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef83f-19",
+        "decision": "serve",
+        "tools_called": [
+          "search_files"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 131,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t4_refs",
+      "corpus": "records-python",
+      "S": 246,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 983,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t4_refs",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef841-24",
+        "decision": "serve",
+        "tools_called": [
+          "find_references"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 115,
+        "net_vs_manual": 275,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "records/t5_symbol",
+      "corpus": "records-python",
+      "S": 958,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 3829,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t5_symbol",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef841-29",
+        "decision": "serve",
+        "tools_called": [
+          "get_symbol"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 827,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t6_dependents",
+      "corpus": "records-python",
+      "S": 225,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 897,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t6_dependents",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef842-26",
+        "decision": "serve",
+        "tools_called": [
+          "find_dependents"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 92,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t7_content",
+      "corpus": "records-python",
+      "S": 213,
+      "M": 1000,
+      "sGteM": false,
+      "responseBytes": 850,
+      "acceptedServe": false,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t7_content",
+      "decision": "reject",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef843-22",
+        "decision": "reject",
+        "tools_called": [
+          "get_file_content"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 80,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "records/t8_explore",
+      "corpus": "records-python",
+      "S": 1143,
+      "M": 1000,
+      "sGteM": true,
+      "responseBytes": 4572,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "records/t8_explore",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-19ec65ef844-22",
+        "decision": "serve",
+        "tools_called": [
+          "explore"
+        ],
+        "predicted_tokens": 400,
+        "actual_tokens": 1013,
+        "net_vs_manual": 275,
+        "route_confidence": "inferred"
+      }
+    }
+  ],
+  "session_net_accepted": 13543,
+  "session_net_all36": 22602,
+  "rowCount": 36,
+  "skippedRows": []
+}

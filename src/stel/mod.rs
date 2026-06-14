@@ -19,6 +19,7 @@ pub mod edit_apply;
 pub mod edit_planner;
 pub mod envelope;
 pub mod executor;
+pub mod gates;
 pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
@@ -52,6 +53,11 @@ pub use executor::{
     is_degrade, is_enforced_bypass, is_pff_bypass_body, route_tool_label,
     serve_chain_outcome_class, serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch,
     tools_executed,
+};
+pub use gates::{
+    BatteryResults, BatteryRow, BatteryRowStel, GateStatus, Phase2GateReport, Phase2GateStatuses,
+    compute_phase2_gates, format_gate_report_markdown, h3_scope_rows, is_small_file_task_id,
+    normalize_battery_results, phase2_minimum_gates_pass,
 };
 pub use golden_replay::{
     DEFERRED_MULTI_HOP_ROW_IDS, GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification,

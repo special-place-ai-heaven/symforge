@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **T002 GO recorded** — milestone branch `cursor/v8-phase2-stel-controller` authorized; P2-S1/P2-S2 in progress.
+**Status**: **P2-S4 battery gates** — H4/H5 PASS; H3 FAIL documented on `cursor/v8-phase2-battery-gates`.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -52,14 +52,14 @@
 
 ## P2-S4: Battery Gates H3/H4/H5 (US3)
 
-- [ ] T030 [US3] Ensure sf-bench row writer populates STEL extension fields per contract
-- [ ] T031 [US3] Run compact-surface battery; save candidate results JSON (operator path)
-- [ ] T032 [US3] Run compare-results; write `docs/research/phase2-gate-report.md`
-- [ ] T033 [US3] Verify H3 PASS under A-012 documented scope
-- [ ] T034 [US3] Verify H4 PASS (`session_net_accepted ≥ 0`)
-- [ ] T035 [P] [US3] Verify H5 PASS for `chain=single` rows (external mcpCalls ≤ 1)
+- [x] T030 [US3] Ensure sf-bench row writer populates STEL extension fields per contract
+- [x] T031 [US3] Run compact-surface battery; save candidate results JSON (operator path)
+- [x] T032 [US3] Run compare-results; write `docs/research/phase2-gate-report.md`
+- [x] T033 [US3] Verify H3 PASS under A-012 documented scope — **FAIL** (1 row: `records/t8_explore`; see gate report)
+- [x] T034 [US3] Verify H4 PASS (`session_net_accepted ≥ 0`)
+- [x] T035 [P] [US3] Verify H5 PASS for `chain=single` rows (external mcpCalls ≤ 1)
 
-**Checkpoint**: Gate report shows H3 + H4 PASS; H5 documented.
+**Checkpoint**: Gate report shows H4/H5 PASS; H3 FAIL documented with action notes.
 
 ---
 

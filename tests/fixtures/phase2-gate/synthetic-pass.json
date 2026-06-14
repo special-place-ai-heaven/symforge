@@ -1,0 +1,82 @@
+{
+  "measuredAt": "2026-06-14T00:00:00.000Z",
+  "symforgeBin": "target/debug/symforge",
+  "surface": "compact",
+  "method": "synthetic-fixture",
+  "baselineCommit": "synthetic",
+  "rows": [
+    {
+      "id": "cfg-if/t1_search",
+      "corpus": "cfg-if-rust",
+      "S": 194,
+      "M": 1000,
+      "sGteM": false,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/t1_search",
+      "decision": "serve",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-1",
+        "decision": "serve",
+        "tools_called": ["search_text"],
+        "predicted_tokens": 400,
+        "actual_tokens": 194,
+        "net_vs_manual": 380,
+        "route_confidence": "inferred"
+      }
+    },
+    {
+      "id": "cfg-if/pff_whole_lib",
+      "corpus": "cfg-if-rust",
+      "S": 120,
+      "M": 1000,
+      "sGteM": false,
+      "acceptedServe": false,
+      "equivalence": "BYPASS",
+      "goldenId": "cfg-if/pff_whole_lib",
+      "decision": "bypass",
+      "chain": "single",
+      "mcpCalls": 1,
+      "eligibleH6": false,
+      "stel": {
+        "plan_id": "plan-pff",
+        "decision": "bypass",
+        "tools_called": [],
+        "predicted_tokens": 0,
+        "actual_tokens": 120,
+        "net_vs_manual": 200,
+        "route_confidence": "exact"
+      }
+    },
+    {
+      "id": "cfg-if/multi_search_symbol",
+      "corpus": "cfg-if-rust",
+      "S": 350,
+      "M": 1000,
+      "sGteM": false,
+      "acceptedServe": true,
+      "equivalence": "EQUIVALENT",
+      "goldenId": "cfg-if/multi_search_symbol",
+      "decision": "serve",
+      "chain": "multi",
+      "mcpCalls": 1,
+      "eligibleH6": true,
+      "stel": {
+        "plan_id": "plan-multi",
+        "decision": "serve",
+        "tools_called": ["search_symbols", "get_symbol"],
+        "predicted_tokens": 800,
+        "actual_tokens": 350,
+        "net_vs_manual": 450,
+        "route_confidence": "inferred"
+      }
+    }
+  ],
+  "session_net_accepted": 1456,
+  "session_net_all36": 2336,
+  "rowCount": 3,
+  "skippedRows": []
+}
