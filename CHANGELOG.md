@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.24.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.24.0...v7.24.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* **stel:** remediate Phase 2 H3 explore gate ([30e393c](https://github.com/special-place-ai-heaven/symforge/commit/30e393c7267f477e6b282a8fceb14e63ff18c826))
+
 ## [7.24.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.23.0...v7.24.0) (2026-06-14)
 
 
