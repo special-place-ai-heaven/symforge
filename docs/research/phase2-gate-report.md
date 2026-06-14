@@ -5,11 +5,13 @@
 **Baseline commit:** `896840f984738ce0f77e9a9c1aae94011ceaee45`  
 **Candidate results:** [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json)  
 **Baseline results:** self (first compact-surface Phase 2 battery pin)  
-**Compare command:**
+**Compare command (reproducible script output — does not overwrite this file):**
 
 ```bash
-node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json --report docs/research/phase2-gate-report.md
+node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json --report docs/research/phase2-gate-report.generated.md
 ```
+
+**Generated report mirror:** [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md) (auto-written by compare-results; numeric results must match this curated artifact)
 
 **Battery command:**
 

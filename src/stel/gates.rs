@@ -260,7 +260,7 @@ fn chrono_date_stub() -> String {
     format!("epoch-day-{days}")
 }
 
-/// Render gate report as markdown for `docs/research/phase2-gate-report.md`.
+/// Render gate report as markdown (typically written to `phase2-gate-report.generated.md`).
 pub fn format_gate_report_markdown(report: &Phase2GateReport) -> String {
     let gates = &report.gates;
     format!(

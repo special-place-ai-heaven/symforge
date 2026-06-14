@@ -36,7 +36,8 @@
 
 | Slot | Path | Status |
 |------|------|--------|
-| Gate report | [`phase2-gate-report.md`](./phase2-gate-report.md) | **COMPLETE** — H3 FAIL (1 row), H4/H5 PASS |
+| Gate report (curated) | [`phase2-gate-report.md`](./phase2-gate-report.md) | **COMPLETE** — H3 FAIL (1 row), H4/H5 PASS |
+| Gate report (generated) | [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md) | **COMPLETE** — compare-results script output |
 | Candidate battery JSON | [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json) | **COMPLETE** — 36/36 rows, STEL fields |
 | Compare-results script | [`scripts/compare-results.cjs`](../../scripts/compare-results.cjs) | **COMPLETE** |
 | Compact battery script | [`scripts/phase2-compact-battery.cjs`](../../scripts/phase2-compact-battery.cjs) | **COMPLETE** |
@@ -52,9 +53,15 @@
 ```bash
 cargo build -p symforge
 node scripts/phase2-compact-battery.cjs target/debug/symforge docs/research/results-v8-phase2-candidate.json
-node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json --report docs/research/phase2-gate-report.md
+node scripts/compare-results.cjs docs/research/results-v8-phase2-candidate.json --report docs/research/phase2-gate-report.generated.md
 cargo test --test stel_battery_gates -- --test-threads=1
 ```
+
+Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-report.md); re-running compare-results writes only [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md).
+
+## Local corpus note (golden replay)
+
+`cargo test --test stel_golden_replay` may fail corpus-gated rows when `tests/fixtures/phase0-corpus/*` is missing or differs from the pinned clone content (empty index / not-found outcomes). This reproduces at the P2-S4 parent commit (`896840f`) and is **not caused by P2-S4** (gate code + ledger metadata only). Checked-in gate fixtures (`tests/fixtures/phase2-gate/`) and compare-results math remain deterministic; multi-hop replay against checked-in `tests/fixtures/stel_multi_hop/` passes in CI.
 
 ## Deferred from Phase 2 (explicit)
 
