@@ -76,13 +76,43 @@ const PYTHON_XREF_QUERY: &str = r#"
 ; Import alias: import numpy as np
 (aliased_import name: (dotted_name (identifier) @import.original) alias: (identifier) @import.alias)
 
-; Type annotations: x: MyType
+; Bare type identifiers in annotation positions
 (type (identifier) @ref.type)
 
-; Class inheritance: class Foo(Base)
+; Subscript type annotations: QuerySet[Model]
+(type (subscript value: (identifier) @ref.type))
+(type (subscript subscript: (identifier) @ref.type))
+(subscript value: (identifier) @ref.type)
+(subscript subscript: (identifier) @ref.type)
+(type (generic_type (identifier) @ref.type))
+(generic_type (identifier) @ref.type)
+(type (generic_type (type_parameter (type (identifier) @ref.type))))
+(generic_type (type_parameter (type (identifier) @ref.type)))
+
+; Attribute types in annotations: models.QuerySet
+(type (attribute attribute: (identifier) @ref.type))
+
+; Subscript with attribute base (legacy grammar)
+(type (subscript value: (attribute attribute: (identifier) @ref.type)))
+(subscript value: (attribute attribute: (identifier) @ref.type))
+
+; Class inheritance — attribute base: class Foo(models.Model)
+(class_definition
+  superclasses: (argument_list
+    (attribute attribute: (identifier) @ref.implements)))
+
+; Class inheritance — bare base with implementor: class Foo(Bar)
 (class_definition
   name: (identifier) @ref.implements_target
   superclasses: (argument_list (identifier) @ref.implements))
+"#;
+
+// Captures identifier/type-like tokens in call argument lists for a second pass
+// (isinstance(x, Model), ForeignKey(Model), etc.). Gated in Rust by uppercase
+// PEP-8 class-name heuristic and dedupe against the main query.
+const PYTHON_VALUE_TYPE_IDENT_QUERY: &str = r#"
+(argument_list (identifier) @ref.value)
+(argument_list (attribute attribute: (identifier) @ref.value_attr))
 "#;
 
 const JS_XREF_QUERY: &str = r#"
@@ -387,6 +417,7 @@ static RUST_QUERY: OnceLock<Query> = OnceLock::new();
 static RUST_CONST_DEF_QUERY_C: OnceLock<Query> = OnceLock::new();
 static RUST_VALUE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
 static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
+static PYTHON_VALUE_TYPE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
 static JS_QUERY: OnceLock<Query> = OnceLock::new();
 static TS_QUERY: OnceLock<Query> = OnceLock::new();
 // A tree-sitter Query binds to a specific Language's node-kind IDs. The TSX
@@ -425,6 +456,13 @@ fn rust_value_ident_query(lang: &Language) -> &'static Query {
 fn python_query(lang: &Language) -> &'static Query {
     PYTHON_QUERY
         .get_or_init(|| Query::new(lang, PYTHON_XREF_QUERY).expect("valid python xref query"))
+}
+
+fn python_value_type_ident_query(lang: &Language) -> &'static Query {
+    PYTHON_VALUE_TYPE_IDENT_QUERY_C.get_or_init(|| {
+        Query::new(lang, PYTHON_VALUE_TYPE_IDENT_QUERY)
+            .expect("valid python value-type ident query")
+    })
 }
 
 fn js_query(lang: &Language) -> &'static Query {
@@ -622,6 +660,103 @@ fn push_import_reference(
         line_range: (start.row as u32, end.row as u32),
         enclosing_symbol_index: None,
     });
+}
+
+fn python_attribute_qualified_name(node: Node, source_bytes: &[u8]) -> Option<String> {
+    if node.kind() == "attribute" {
+        return node
+            .utf8_text(source_bytes)
+            .ok()
+            .map(|text| text.trim().to_string());
+    }
+    node.parent()
+        .filter(|parent| parent.kind() == "attribute")
+        .and_then(|parent| parent.utf8_text(source_bytes).ok())
+        .map(|text| text.trim().to_string())
+}
+
+fn python_name_looks_like_type(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+/// Resolve uppercase class-name tokens in call argument lists (e.g.
+/// `isinstance(x, Model)`, `ForeignKey(Model)`).
+fn extract_python_value_refs(
+    root: &Node,
+    source: &str,
+    ts_language: &Language,
+    existing: &[ReferenceRecord],
+) -> Vec<ReferenceRecord> {
+    let source_bytes = source.as_bytes();
+    let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
+    let value_query = python_value_type_ident_query(ts_language);
+    let value_capture_names = value_query.capture_names();
+    let mut out: Vec<ReferenceRecord> = Vec::new();
+    let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(value_query, *root, source_bytes);
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut value_ident: Option<Node> = None;
+        let mut value_attr: Option<Node> = None;
+
+        for capture in m.captures {
+            match value_capture_names[capture.index as usize] {
+                "ref.value" => value_ident = Some(capture.node),
+                "ref.value_attr" => value_attr = Some(capture.node),
+                _ => {}
+            }
+        }
+
+        let (node, qualified_name) = if let Some(attr_node) = value_attr {
+            let Some(parent) = attr_node.parent().filter(|n| n.kind() == "attribute") else {
+                continue;
+            };
+            (
+                attr_node,
+                parent
+                    .utf8_text(source_bytes)
+                    .ok()
+                    .map(|text| text.trim().to_string()),
+            )
+        } else if let Some(ident_node) = value_ident {
+            (ident_node, None)
+        } else {
+            continue;
+        };
+
+        let range = (node.start_byte() as u32, node.end_byte() as u32);
+        if existing_ranges.contains(&range) || emitted_ranges.contains(&range) {
+            continue;
+        }
+
+        let Ok(text) = node.utf8_text(source_bytes) else {
+            continue;
+        };
+        let name = text.trim();
+        if name.is_empty() || !python_name_looks_like_type(name) {
+            continue;
+        }
+
+        let start = node.start_position();
+        let end = node.end_position();
+        out.push(ReferenceRecord {
+            name: name.to_string(),
+            qualified_name,
+            kind: ReferenceKind::ValueUse,
+            byte_range: range,
+            line_range: (start.row as u32, end.row as u32),
+            enclosing_symbol_index: None,
+        });
+        emitted_ranges.insert(range);
+    }
+
+    out
 }
 
 /// Resolve bare value-position references to same-file `const`/`static` items.
@@ -1014,11 +1149,12 @@ pub fn extract_references(
         {
             let name = name_text.trim().to_string();
             if !name.is_empty() {
+                let qualified_name = python_attribute_qualified_name(type_node, source_bytes);
                 let start = type_node.start_position();
                 let end = type_node.end_position();
                 references.push(ReferenceRecord {
                     name,
-                    qualified_name: None,
+                    qualified_name,
                     kind: ReferenceKind::TypeUsage,
                     byte_range: (type_node.start_byte() as u32, type_node.end_byte() as u32),
                     line_range: (start.row as u32, end.row as u32),
@@ -1047,18 +1183,26 @@ pub fn extract_references(
         }
 
         // Implements / inherits relationship
-        if let (Some(impl_node), Some(target_node)) = (ref_implements, ref_implements_target)
+        if let Some(impl_node) = ref_implements
             && let Ok(impl_text) = impl_node.utf8_text(source_bytes)
-            && let Ok(target_text) = target_node.utf8_text(source_bytes)
         {
             let trait_name = impl_text.trim().to_string();
-            let implementor = target_text.trim().to_string();
-            if !trait_name.is_empty() && !implementor.is_empty() {
+            if !trait_name.is_empty() {
+                let qualified_name = if let Some(target_node) = ref_implements_target {
+                    target_node
+                        .utf8_text(source_bytes)
+                        .ok()
+                        .map(|text| text.trim().to_string())
+                        .filter(|implementor| !implementor.is_empty())
+                } else {
+                    python_attribute_qualified_name(impl_node, source_bytes)
+                };
+
                 let start = impl_node.start_position();
                 let end = impl_node.end_position();
                 references.push(ReferenceRecord {
                     name: trait_name,
-                    qualified_name: Some(implementor),
+                    qualified_name,
                     kind: ReferenceKind::Implements,
                     byte_range: (impl_node.start_byte() as u32, impl_node.end_byte() as u32),
                     line_range: (start.row as u32, end.row as u32),
@@ -1186,6 +1330,11 @@ pub fn extract_references(
     // Strict precision gating lives in `extract_rust_value_refs`.
     if *language == LanguageId::Rust {
         let value_refs = extract_rust_value_refs(root, source, &ts_language, &references);
+        references.extend(value_refs);
+    }
+
+    if *language == LanguageId::Python {
+        let value_refs = extract_python_value_refs(root, source, &ts_language, &references);
         references.extend(value_refs);
     }
 
@@ -1741,6 +1890,69 @@ fn helper(n: usize) {
         let (refs, _) = parse_and_extract("def foo(x: MyType): pass", LanguageId::Python);
         assert!(
             has_ref(&refs, "MyType", ReferenceKind::TypeUsage),
+            "refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_python_models_model_class_inheritance() {
+        let (refs, _) = parse_and_extract(
+            "class Permission(models.Model):\n    pass",
+            LanguageId::Python,
+        );
+        let model_ref = refs.iter().find(|r| r.name == "Model");
+        assert!(
+            model_ref.is_some(),
+            "models.Model base should surface Model ref, refs: {:?}",
+            refs
+        );
+        assert_eq!(
+            model_ref.unwrap().qualified_name.as_deref(),
+            Some("models.Model")
+        );
+        assert_eq!(model_ref.unwrap().kind, ReferenceKind::Implements);
+    }
+
+    #[test]
+    fn test_python_subscript_type_annotation() {
+        let (refs, _) = parse_and_extract(
+            "def f(qs: QuerySet[Model]) -> None:\n    pass",
+            LanguageId::Python,
+        );
+        assert!(
+            has_ref(&refs, "QuerySet", ReferenceKind::TypeUsage),
+            "refs: {:?}",
+            refs
+        );
+        assert!(
+            has_ref(&refs, "Model", ReferenceKind::TypeUsage),
+            "refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_python_value_type_in_call_args() {
+        let (refs, _) = parse_and_extract(
+            "def g():\n    return isinstance(x, Model)",
+            LanguageId::Python,
+        );
+        assert!(
+            has_ref(&refs, "Model", ReferenceKind::ValueUse),
+            "refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_python_foreign_key_model_arg() {
+        let (refs, _) = parse_and_extract(
+            "field = models.ForeignKey(Model, on_delete=CASCADE)",
+            LanguageId::Python,
+        );
+        assert!(
+            has_ref(&refs, "Model", ReferenceKind::ValueUse),
             "refs: {:?}",
             refs
         );
