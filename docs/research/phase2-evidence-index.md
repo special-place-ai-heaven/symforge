@@ -97,3 +97,13 @@ Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-repo
 - B-RESULTS / RESULTS.md §8.7 → post–8.0 tag (A-024)
 - H6/H7/H8 PASS → Phase 3–4 / 8.1
 - T2 index-recall remediation → 8.1 program (not Phase 2 runtime)
+
+## Successor program — 8.1 index-recall (T2.0/T2.1)
+
+| Artifact | Path |
+|----------|------|
+| Task plan | [`specs/003-81-index-recall/tasks.md`](../../specs/003-81-index-recall/tasks.md) |
+| Evidence index | [`81-index-recall-evidence-index.md`](./81-index-recall-evidence-index.md) |
+| T019 gate | [`81-index-recall-taxonomy-signoff.md`](./81-index-recall-taxonomy-signoff.md) |
+
+**Status:** T2.1 audit artifacts produced; T019 reviewer decision **PENDING** — no recall fixes authorized until GO.

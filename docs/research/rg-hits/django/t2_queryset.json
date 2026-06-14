@@ -1,0 +1,249 @@
+{
+  "task_id": "django/t2_queryset",
+  "repo": "django",
+  "query": "who references QuerySet",
+  "symbol": "QuerySet",
+  "min_baseline_recall": 0.35,
+  "measuredAt": "2026-06-14T20:32:58.025Z",
+  "symforge_baseline_commit": "470826a8b5c34d014cdd1e9de07171b7b040583a",
+  "corpus_sha": "f1440a752ec034277ccdad914995c3f164308e41",
+  "method": {
+    "rg": "rg -l --glob '<lang>' --glob '!target/**' word-boundary symbol",
+    "symforge": "compact symforge find_references (measurement only)"
+  },
+  "baseline_paths_count": 71,
+  "cited_paths_count": 7,
+  "matched_paths_count": 7,
+  "missed_paths_count": 64,
+  "baseline_recall": 0.0986,
+  "baseline_bucket_counts": {
+    "source": 55,
+    "test": 16
+  },
+  "missed_bucket_counts": {
+    "source": 48,
+    "test": 16
+  },
+  "matched_bucket_counts": {
+    "source": 7
+  },
+  "top_missed_prefixes": [
+    {
+      "prefix": "django/db",
+      "count": 7
+    },
+    {
+      "prefix": "tests/queries",
+      "count": 4
+    },
+    {
+      "prefix": "tests/gis_tests",
+      "count": 4
+    },
+    {
+      "prefix": "django/contrib",
+      "count": 4
+    },
+    {
+      "prefix": "django/core",
+      "count": 3
+    },
+    {
+      "prefix": "tests/generic_views",
+      "count": 3
+    },
+    {
+      "prefix": "tests/composite_pk",
+      "count": 3
+    },
+    {
+      "prefix": "tests/custom_managers",
+      "count": 2
+    },
+    {
+      "prefix": "tests/get_earliest_or_latest",
+      "count": 2
+    },
+    {
+      "prefix": "tests/queryset_pickle",
+      "count": 2
+    },
+    {
+      "prefix": "tests/serializers",
+      "count": 2
+    },
+    {
+      "prefix": "tests/async",
+      "count": 2
+    },
+    {
+      "prefix": "tests/ordering",
+      "count": 1
+    },
+    {
+      "prefix": "tests/many_to_many",
+      "count": 1
+    },
+    {
+      "prefix": "tests/aggregation",
+      "count": 1
+    }
+  ],
+  "baseline_paths": [
+    "tests/ordering/models.py",
+    "tests/many_to_many/tests.py",
+    "tests/aggregation/tests.py",
+    "tests/basic/tests.py",
+    "django/forms/models.py",
+    "django/shortcuts.py",
+    "tests/prefetch_related/tests.py",
+    "tests/prefetch_related/models.py",
+    "django/core/paginator.py",
+    "tests/runtests.py",
+    "django/core/serializers/python.py",
+    "django/core/serializers/xml_serializer.py",
+    "tests/generic_views/test_list.py",
+    "tests/generic_views/test_detail.py",
+    "tests/generic_views/test_dates.py",
+    "tests/generic_views/models.py",
+    "tests/model_inheritance/tests.py",
+    "tests/custom_managers/tests.py",
+    "tests/custom_managers/models.py",
+    "tests/get_earliest_or_latest/tests.py",
+    "tests/get_earliest_or_latest/models.py",
+    "tests/queryset_pickle/tests.py",
+    "tests/queryset_pickle/models.py",
+    "tests/model_forms/tests.py",
+    "tests/delete/tests.py",
+    "tests/filtered_relation/tests.py",
+    "tests/migrations/models.py",
+    "tests/foreign_object/test_tuple_lookups.py",
+    "tests/forms_tests/tests/tests.py",
+    "tests/serializers/models/base.py",
+    "tests/serializers/test_natural.py",
+    "tests/db_functions/comparison/test_coalesce.py",
+    "tests/admin_views/test_autocomplete_view.py",
+    "tests/get_object_or_404/tests.py",
+    "tests/queries/tests.py",
+    "tests/queries/test_explain.py",
+    "tests/queries/test_qs_combinators.py",
+    "tests/queries/test_contains.py",
+    "tests/defer_regress/tests.py",
+    "tests/async/test_async_shortcuts.py",
+    "tests/async/test_async_queryset.py",
+    "tests/composite_pk/test_filter.py",
+    "tests/composite_pk/tests.py",
+    "tests/composite_pk/test_aggregate.py",
+    "tests/or_lookups/models.py",
+    "tests/lookup/tests.py",
+    "tests/backends/tests.py",
+    "tests/gis_tests/geoapp/test_regress.py",
+    "tests/distinct_on_fields/tests.py",
+    "tests/gis_tests/geoapp/tests.py",
+    "tests/annotations/tests.py",
+    "tests/pagination/tests.py",
+    "django/db/models/query.py",
+    "django/db/models/expressions.py",
+    "django/db/models/sql/compiler.py",
+    "django/db/models/sql/query.py",
+    "django/db/models/utils.py",
+    "django/db/models/fields/related_descriptors.py",
+    "tests/gis_tests/relatedapp/tests.py",
+    "django/db/models/fields/tuple_lookups.py",
+    "django/db/models/__init__.py",
+    "django/db/models/lookups.py",
+    "django/db/models/deletion.py",
+    "django/db/models/manager.py",
+    "django/contrib/contenttypes/fields.py",
+    "django/contrib/contenttypes/prefetch.py",
+    "tests/gis_tests/layermap/tests.py",
+    "django/views/generic/detail.py",
+    "django/views/generic/list.py",
+    "django/contrib/admin/utils.py",
+    "django/contrib/admin/options.py"
+  ],
+  "cited_paths": [
+    "django/db/models/__init__.py",
+    "django/db/models/fields/related_descriptors.py",
+    "django/db/models/manager.py",
+    "django/db/models/sql/query.py",
+    "django/views/generic/list.py",
+    "tests/generic_views/models.py",
+    "tests/prefetch_related/tests.py"
+  ],
+  "matched_paths": [
+    "tests/prefetch_related/tests.py",
+    "tests/generic_views/models.py",
+    "django/db/models/sql/query.py",
+    "django/db/models/fields/related_descriptors.py",
+    "django/db/models/__init__.py",
+    "django/db/models/manager.py",
+    "django/views/generic/list.py"
+  ],
+  "missed_paths": [
+    "tests/ordering/models.py",
+    "tests/many_to_many/tests.py",
+    "tests/aggregation/tests.py",
+    "tests/basic/tests.py",
+    "django/forms/models.py",
+    "django/shortcuts.py",
+    "tests/prefetch_related/models.py",
+    "django/core/paginator.py",
+    "tests/runtests.py",
+    "django/core/serializers/python.py",
+    "django/core/serializers/xml_serializer.py",
+    "tests/generic_views/test_list.py",
+    "tests/generic_views/test_detail.py",
+    "tests/generic_views/test_dates.py",
+    "tests/model_inheritance/tests.py",
+    "tests/custom_managers/tests.py",
+    "tests/custom_managers/models.py",
+    "tests/get_earliest_or_latest/tests.py",
+    "tests/get_earliest_or_latest/models.py",
+    "tests/queryset_pickle/tests.py",
+    "tests/queryset_pickle/models.py",
+    "tests/model_forms/tests.py",
+    "tests/delete/tests.py",
+    "tests/filtered_relation/tests.py",
+    "tests/migrations/models.py",
+    "tests/foreign_object/test_tuple_lookups.py",
+    "tests/forms_tests/tests/tests.py",
+    "tests/serializers/models/base.py",
+    "tests/serializers/test_natural.py",
+    "tests/db_functions/comparison/test_coalesce.py",
+    "tests/admin_views/test_autocomplete_view.py",
+    "tests/get_object_or_404/tests.py",
+    "tests/queries/tests.py",
+    "tests/queries/test_explain.py",
+    "tests/queries/test_qs_combinators.py",
+    "tests/queries/test_contains.py",
+    "tests/defer_regress/tests.py",
+    "tests/async/test_async_shortcuts.py",
+    "tests/async/test_async_queryset.py",
+    "tests/composite_pk/test_filter.py",
+    "tests/composite_pk/tests.py",
+    "tests/composite_pk/test_aggregate.py",
+    "tests/or_lookups/models.py",
+    "tests/lookup/tests.py",
+    "tests/backends/tests.py",
+    "tests/gis_tests/geoapp/test_regress.py",
+    "tests/distinct_on_fields/tests.py",
+    "tests/gis_tests/geoapp/tests.py",
+    "tests/annotations/tests.py",
+    "tests/pagination/tests.py",
+    "django/db/models/query.py",
+    "django/db/models/expressions.py",
+    "django/db/models/sql/compiler.py",
+    "django/db/models/utils.py",
+    "tests/gis_tests/relatedapp/tests.py",
+    "django/db/models/fields/tuple_lookups.py",
+    "django/db/models/lookups.py",
+    "django/db/models/deletion.py",
+    "django/contrib/contenttypes/fields.py",
+    "django/contrib/contenttypes/prefetch.py",
+    "tests/gis_tests/layermap/tests.py",
+    "django/views/generic/detail.py",
+    "django/contrib/admin/utils.py",
+    "django/contrib/admin/options.py"
+  ]
+}

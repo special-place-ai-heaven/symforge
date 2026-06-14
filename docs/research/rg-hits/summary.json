@@ -1,0 +1,56 @@
+{
+  "measuredAt": "2026-06-14T20:32:58.025Z",
+  "symforgeCommit": "470826a8b5c34d014cdd1e9de07171b7b040583a",
+  "run_symforge": true,
+  "tasks": [
+    {
+      "task_id": "tokio/t2_spawn",
+      "baseline_paths": 252,
+      "cited_paths": 20,
+      "matched_paths": 16,
+      "baseline_recall": 0.0635,
+      "missed_bucket_counts": {
+        "source": 86,
+        "test": 149,
+        "example": 1
+      },
+      "artifact": "docs/research/rg-hits/tokio/t2_spawn.json"
+    },
+    {
+      "task_id": "tokio/t2_block_on",
+      "baseline_paths": 141,
+      "cited_paths": 20,
+      "matched_paths": 20,
+      "baseline_recall": 0.1418,
+      "missed_bucket_counts": {
+        "test": 72,
+        "source": 49
+      },
+      "artifact": "docs/research/rg-hits/tokio/t2_block_on.json"
+    },
+    {
+      "task_id": "django/t2_queryset",
+      "baseline_paths": 71,
+      "cited_paths": 7,
+      "matched_paths": 7,
+      "baseline_recall": 0.0986,
+      "missed_bucket_counts": {
+        "source": 48,
+        "test": 16
+      },
+      "artifact": "docs/research/rg-hits/django/t2_queryset.json"
+    },
+    {
+      "task_id": "django/t2_model",
+      "baseline_paths": 354,
+      "cited_paths": 17,
+      "matched_paths": 17,
+      "baseline_recall": 0.048,
+      "missed_bucket_counts": {
+        "source": 293,
+        "test": 44
+      },
+      "artifact": "docs/research/rg-hits/django/t2_model.json"
+    }
+  ]
+}
