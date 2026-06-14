@@ -15,7 +15,7 @@
 ### Session 2026-06-14
 
 - Q: What is the Phase 1 exit state? → A: Compact-3 (`symforge`, `symforge_edit`, `status`) is truthful on `main`; L1 single-step read/edit, L2 economics metadata, L3 P-FF bypass enforcement, L4 in-memory ledger; **29/36** golden rows replay as supported serve or P-FF bypass; **3 multi-hop rows deferred**.
-- Q: What gates define Phase 2 exit? → A: Binding docs require **H3, H4, H5** PASS on compact surface battery diff ([`docs/v8-gap-closure-plan.md`](../../docs/v8-gap-closure-plan.md) §7 Phase 2; [`docs/stel-architecture.md`](../../docs/stel-architecture.md) Phase 2 checklist).
+- Q: What gates define Phase 2 exit? → A: **Minimum exit** for this spec: **H3 + H4 + A-029** (PASS or documented P-T2 pivot) on compact surface. **H5** is required by the binding gap-closure plan §7 Phase 2 checklist and SHOULD PASS; if H5 FAILs, document rationale in the gate report and treat as spec-amendment / follow-up before claiming full Phase 2 exit per [`docs/v8-gap-closure-plan.md`](../../docs/v8-gap-closure-plan.md) and [`docs/stel-architecture.md`](../../docs/stel-architecture.md).
 - Q: Is calibration persistence in Phase 2? → A: **No** — observational calibration remains in-memory; durable ledger and EMA auto-tuning are Phase 3 boundaries unless explicitly scoped as research-only spikes.
 - Q: Is B-RESULTS in Phase 2? → A: **No** — `B-RESULTS` / RESULTS.md §8.7 requires pinned `results-v8-8.0-baseline.json` at **8.0 tag** (A-024); Phase 2 may produce candidate battery artifacts but not claim §8.7 closure.
 

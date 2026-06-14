@@ -31,7 +31,7 @@ cargo test stel:: -- --test-threads=1
 Confirm golden classification shows **3 deferred multi-hop** rows (Phase 2 entry state):
 
 ```bash
-cargo test --test stel_golden_replay golden_corpus_classifies_three_multi_hop_as_deferred -- --test-threads=1
+cargo test --test stel_golden_replay golden_corpus_classification_lists_deferred_rows_explicitly -- --test-threads=1
 ```
 
 ## 2. Implementation branch (when approved)

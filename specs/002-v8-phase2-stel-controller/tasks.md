@@ -13,17 +13,17 @@
 
 ---
 
-## Phase 0: Spec & Review (current)
+## P2-S0: Spec & Review (current)
 
 - [x] T001 Record Spec Kit inputs in `docs/research/phase2-evidence-index.md` (spec, plan, contract paths)
 - [ ] T002 Reviewer sign-off on `specs/002-v8-phase2-stel-controller/spec.md` (independent from implementer)
 - [ ] T003 Open milestone branch `cursor/v8-phase2-stel-controller` from green `main`
 
-**Checkpoint**: Spec approved; branch created; Phase 1 CI green on branch base.
+**Checkpoint**: Spec approved; branch created; v8 Phase 1 CI green on branch base.
 
 ---
 
-## Phase 1: Multi-Hop L1 + Executor (US1) — P2-S1 / P2-S2
+## P2-S1 / P2-S2: Multi-Hop L1 + Executor (US1)
 
 - [ ] T010 [US1] Extend `StelPlan` / types for ordered multi-step plans in `src/stel/types.rs`
 - [ ] T011 [US1] Implement multi-hop routing in `src/stel/planner.rs` for three golden row patterns
@@ -37,7 +37,7 @@
 
 ---
 
-## Phase 2: L2 Admission Hardening (US2) — P2-S3
+## P2-S3: L2 Admission Hardening (US2)
 
 - [ ] T020 [US2] Implement `cache_hit` decision path in `src/stel/controller.rs` (session target match)
 - [ ] T021 [US2] Implement `degrade` path with degrade_flags (outline_only, token caps) per stel-schema
@@ -50,7 +50,7 @@
 
 ---
 
-## Phase 3: Battery Gates H3/H4/H5 (US3) — P2-S4
+## P2-S4: Battery Gates H3/H4/H5 (US3)
 
 - [ ] T030 [US3] Ensure sf-bench row writer populates STEL extension fields per contract
 - [ ] T031 [US3] Run compact-surface battery; save candidate results JSON (operator path)
@@ -63,7 +63,7 @@
 
 ---
 
-## Phase 4: A-029 Spike (US4) — P2-S5
+## P2-S5: A-029 Spike (US4)
 
 - [ ] T040 [US4] Create `docs/research/A-029-t2-spike.md` with method and repos
 - [ ] T041 [US4] Run T2 spike on tokio + django reference tasks (compact surface)
@@ -74,7 +74,7 @@
 
 ---
 
-## Phase 5: Assumptions, Docs, Exit (US5) — P2-S6
+## P2-S6: Assumptions, Docs, Exit (US5)
 
 - [ ] T050 [P] [US5] Update `docs/stel-assumptions.md` verdicts A-008..A-014, A-029
 - [ ] T051 [US5] Create `docs/phase2-stel-checkpoint.md` with exit record per contract
