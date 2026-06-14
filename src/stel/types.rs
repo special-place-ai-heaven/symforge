@@ -279,6 +279,12 @@ pub struct StelLedgerEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equivalence: Option<Value>,
     pub route_confidence: RouteConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pff_bypass: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degrade_flags: Vec<String>,
 }
 
 /// Per `(tool, intent_bucket)` calibration feedback (L4 → L2).

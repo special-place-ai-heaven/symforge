@@ -13,7 +13,9 @@ pub const TUNING_REVIEW_MIN_EVENTS: usize = 5;
 pub struct StelCalibrationSummary {
     pub total_events: usize,
     pub serve_count: usize,
+    pub degrade_count: usize,
     pub bypass_count: usize,
+    pub cache_hit_count: usize,
     pub pff_bypass_count: usize,
     pub legacy_executed_count: usize,
     pub total_schema_tokens: u64,
@@ -29,7 +31,9 @@ pub fn summarize_calibration(events: &[StelLedgerEvent]) -> StelCalibrationSumma
     let mut summary = StelCalibrationSummary {
         total_events: events.len(),
         serve_count: 0,
+        degrade_count: 0,
         bypass_count: 0,
+        cache_hit_count: 0,
         pff_bypass_count: 0,
         legacy_executed_count: 0,
         total_schema_tokens: 0,
@@ -43,13 +47,13 @@ pub fn summarize_calibration(events: &[StelLedgerEvent]) -> StelCalibrationSumma
     for event in events {
         match event.decision {
             AdmissionDecision::Serve => summary.serve_count += 1,
-            AdmissionDecision::Bypass => {
-                summary.bypass_count += 1;
-                if event.tools_called.is_empty() {
-                    summary.pff_bypass_count += 1;
-                }
-            }
+            AdmissionDecision::Degrade => summary.degrade_count += 1,
+            AdmissionDecision::CacheHit => summary.cache_hit_count += 1,
+            AdmissionDecision::Bypass => summary.bypass_count += 1,
             _ => {}
+        }
+        if event.pff_bypass == Some(true) {
+            summary.pff_bypass_count += 1;
         }
         if !event.tools_called.is_empty() {
             summary.legacy_executed_count += 1;
@@ -83,7 +87,9 @@ pub fn format_calibration_section(summary: &StelCalibrationSummary) -> String {
         "── calibration (observational) ──".to_string(),
         format!("events: {}", summary.total_events),
         format!("serve: {}", summary.serve_count),
+        format!("degrade: {}", summary.degrade_count),
         format!("bypass: {}", summary.bypass_count),
+        format!("cache_hit: {}", summary.cache_hit_count),
         format!("pff_bypass: {}", summary.pff_bypass_count),
         format!("legacy_executed: {}", summary.legacy_executed_count),
         format!("schema_tokens: {}", summary.total_schema_tokens),
@@ -172,7 +178,9 @@ mod tests {
         let summary = summarize_calibration(&[]);
         assert_eq!(summary.total_events, 0);
         assert_eq!(summary.serve_count, 0);
+        assert_eq!(summary.degrade_count, 0);
         assert_eq!(summary.bypass_count, 0);
+        assert_eq!(summary.cache_hit_count, 0);
         assert_eq!(summary.pff_bypass_count, 0);
         assert_eq!(summary.legacy_executed_count, 0);
         assert_eq!(summary.total_schema_tokens, 0);
@@ -229,6 +237,8 @@ mod tests {
         let section = format_calibration_section(&summary);
         assert!(section.contains("── calibration (observational) ──"));
         assert!(section.contains("serve: 1"));
+        assert!(section.contains("degrade: 0"));
+        assert!(section.contains("cache_hit: 0"));
         assert!(section.contains("legacy_executed: 1"));
         assert!(section.contains("tuning:"));
     }
