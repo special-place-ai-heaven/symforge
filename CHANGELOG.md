@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.24.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.23.0...v7.24.0) (2026-06-14)
+
+
+### Features
+
+* **stel:** harden Phase 2 L2 admission states ([f7b32fe](https://github.com/special-place-ai-heaven/symforge/commit/f7b32fe435d0c470cf77915f20a943d381968097))
+
 ## [7.23.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.22.0...v7.23.0) (2026-06-14)
 
 
