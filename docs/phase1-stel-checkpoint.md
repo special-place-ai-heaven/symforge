@@ -1,10 +1,25 @@
 # Phase 1 STEL checkpoint (compact-3 surface truthful)
 
-**Branch:** `v8/stel-architecture`  
-**Checkpoint commit:** `df89308` — *Add Phase 1 guarded symforge_edit apply for single-symbol replace*  
-**Status:** Phase 1 **L1–L4 on compact `symforge` and preview-and-apply `symforge_edit`**, plus compact `status` and observational calibration. **Compact-3 is fully truthful at the MCP surface level** — all three advertised tools have real handlers.
+**Status:** **Phase 1 closed — compact-3 shipped on `main`.**  
+**Main tip (source of truth):** `66742f1` — *fix(test): align hook and sidecar tests with savings footer format*  
+**Feature merge:** `29a39f3` — PR #300 (*feat(stel): implement Phase 1 compact-3 surface*)
 
-This document captures implementation state after the guarded `symforge_edit` apply slice (`df89308`). It does **not** change runtime behavior.
+Phase 1 delivers **L1–L4 on compact `symforge` and preview-and-apply `symforge_edit`**, plus compact `status` and observational calibration. **Compact-3 is fully truthful at the MCP surface level** — all three advertised tools have real handlers.
+
+This document captures implementation state after merge and post-merge repair. It does **not** change runtime behavior.
+
+---
+
+## Main repair commits (post-merge)
+
+After PR #300 merged, `main` needed two repair commits before Release CI went green again:
+
+| Commit | Summary |
+|--------|---------|
+| `d4fcd0a` | `fix(ci): align STEL tools with allow lists and test fixtures` — STEL tools in client allow lists; lib test fixtures for small-file policy; conformance expected-tool drift; STEL integration test env isolation; `symforge_edit` `idempotent_hint` metadata |
+| `66742f1` | `fix(test): align hook and sidecar tests with savings footer format` — hook/sidecar assertions and contract goldens aligned to competent-manual savings footer |
+
+**CI note:** Failed runs on `29a39f3` (release commit-subject validation on merge range) and `d4fcd0a` (hook/sidecar test drift) are **stale**. Release / `verify-main-push` passed on `66742f1` (~12m28s).
 
 ---
 
@@ -17,9 +32,8 @@ This document captures implementation state after the guarded `symforge_edit` ap
 | Phase 1 golden replay closure | `b2c0d6a` | One-step golden planner mismatches closed (29 serve rows) |
 | Preview-only edit checkpoint | `cabd978` | Preview-only `symforge_edit` handler (dry_run default) |
 | Guarded apply semantics spec | `56072ce` | Normative guarded apply contract in [`stel-schema.md`](stel-schema.md) |
-| Phase 1 tip (this checkpoint) | `df89308` | Guarded `symforge_edit` apply (`apply: true`, single-file single-symbol) |
-
-**Deferred (not blocking this checkpoint):** `B-RESULTS` — RESULTS.md §8.7 post-8.0 baseline only.
+| Phase 1 feature tip (pre-merge) | `df89308` | Guarded `symforge_edit` apply (`apply: true`, single-file single-symbol) |
+| Phase 1 on main (post-repair) | `66742f1` | Compact-3 shipped; CI green |
 
 ---
 
@@ -48,7 +62,7 @@ Prior: `07b42a8` Phase 0 GO · `08f7d14` evidence anchor (pre-implementation).
 
 ---
 
-## What is complete
+## What is complete (shipped on main)
 
 ### S2 — Schema scaffolding
 
@@ -220,7 +234,7 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 ---
 
-## Explicitly out of scope at this checkpoint
+## Explicitly deferred (Phase 1 closed; not shipped)
 
 | Item | Status |
 |------|--------|
@@ -233,11 +247,11 @@ Golden corpus has **36 rows** partitioned by `classify_golden_corpus()`:
 
 ---
 
-## Guarded apply semantics (implemented — `df89308`)
+## Guarded apply semantics (shipped — `df89308` on main via PR #300)
 
 **Normative contract:** [`stel-schema.md`](stel-schema.md) — sections **`StelEditRequest`** and **`Guarded apply semantics`**.
 
-Shipped behavior (`df89308`):
+Shipped behavior:
 
 | Requirement | Status |
 |-------------|--------|
@@ -255,11 +269,16 @@ Shipped behavior (`df89308`):
 
 ---
 
-## Suggested next boundaries (risk order)
+## Phase 2 entry (recommended order)
 
-1. **Multi-hop routing** — replay the three `chain: multi` golden rows; larger planner + runtime expansion (optional — strong Phase 1 milestone already reached without this)
-2. **Calibration persistence** — durable ledger + optional auto-tuning gate (still no silent L2 changes)
-3. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists
+Phase 1 is **closed**. Do not expand runtime scope on `main` without a new milestone branch.
+
+1. **Spec Kit — Phase 2 feature spec** — controller maturity, H3/H4 gates, A-029 spike, explicit boundaries for calibration persistence and B-RESULTS (plan only).
+2. **First implementation slice — multi-hop routing** — replay the three `chain: multi` golden rows; smallest product follow-up that closes the last Phase 1 golden deferrals.
+3. **Calibration persistence** — durable ledger; still no silent L2 changes.
+4. **`B-RESULTS` / §8.7** — operator-triggered after 8.0 tag baseline exists.
+
+See [stel-architecture.md](stel-architecture.md) Phase 2 checklist and [v8-gap-closure-plan.md](v8-gap-closure-plan.md) for the full milestone map.
 
 ---
 
