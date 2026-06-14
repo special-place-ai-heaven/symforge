@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **Planning only — all tasks pending spec approval and milestone branch creation.** Do not implement on `main` without explicit Phase 2 milestone.
+**Status**: **T002 GO recorded** — milestone branch `cursor/v8-phase2-stel-controller` authorized; P2-S1/P2-S2 in progress.
 
 ## Format: `[ID] [P?] [Story] Description`
 

@@ -1,6 +1,6 @@
 # Phase 2 STEL evidence index
 
-**Status**: Spec Kit planning — **no implementation**
+**Status**: T002 GO — Phase 2 implementation authorized on `cursor/v8-phase2-stel-controller`
 
 **Created**: 2026-06-14
 

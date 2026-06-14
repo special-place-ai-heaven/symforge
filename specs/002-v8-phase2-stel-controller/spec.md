@@ -4,7 +4,7 @@
 
 **Created**: 2026-06-14
 
-**Status**: Draft — planning only; **no implementation in this feature**
+**Status**: Approved (T002 GO) — implementation on `cursor/v8-phase2-stel-controller`
 
 **Baseline**: Phase 1 compact-3 shipped on `main` at **`66742f1`** ([`docs/phase1-stel-checkpoint.md`](../../docs/phase1-stel-checkpoint.md))
 
