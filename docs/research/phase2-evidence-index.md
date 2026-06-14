@@ -1,6 +1,6 @@
 # Phase 2 STEL evidence index
 
-**Status:** P2-S5 A-029 T2 spike complete — **PIVOT** (0/4 T2 equiv); H3/H4/H5 PASS preserved (2026-06-14)
+**Status:** **Phase 2 exit — PASS** (H3/H4/H5 PASS; A-029 PIVOT documented) — 2026-06-14
 
 **Created**: 2026-06-14
 
@@ -20,9 +20,12 @@
 ## Baseline
 
 - Phase 1 shipped: [`phase1-stel-checkpoint.md`](../phase1-stel-checkpoint.md)
-- Phase 2 Slice 1 merged: `3d64b96` (multi-hop golden closure)
+- Phase 2 Slice 1 merged: multi-hop golden closure
 - Phase 2 Slice 2 merged: PR #306 / `896840f` (L2 admission hardening)
-- Phase 2 Slice 4.1 merged: PR #309 / H3 remediation on `records/t8_explore`
+- Phase 2 Slice 3 merged: PR #308 / `b1f6019` (H3/H4/H5 gate harness)
+- Phase 2 Slice 4 merged: PR #309 / `c56f669` (H3 remediation)
+- Phase 2 Slice 5 merged: PR #311 / `a63be80` (A-029 PIVOT / P-T2)
+- **Phase 2 exit:** [`phase2-stel-checkpoint.md`](../phase2-stel-checkpoint.md)
 
 ## T002 spec reviewer sign-off
 
@@ -37,6 +40,7 @@
 
 | Slot | Path | Status |
 |------|------|--------|
+| **Phase 2 checkpoint** | [`phase2-stel-checkpoint.md`](../phase2-stel-checkpoint.md) | **COMPLETE** — exit PASS; A-029 PIVOT |
 | Gate report (curated) | [`phase2-gate-report.md`](./phase2-gate-report.md) | **COMPLETE** — H3/H4/H5 PASS |
 | Gate report (generated) | [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md) | **COMPLETE** — compare-results script output |
 | Candidate battery JSON | [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json) | **COMPLETE** — 36/36 rows, STEL fields |
@@ -45,12 +49,12 @@
 | Gate computation (Rust) | [`src/stel/gates.rs`](../../src/stel/gates.rs) | **COMPLETE** |
 | Gate test fixtures | [`tests/fixtures/phase2-gate/`](../../tests/fixtures/phase2-gate/) | **COMPLETE** |
 | Gate integration tests | [`tests/stel_battery_gates.rs`](../../tests/stel_battery_gates.rs) | **COMPLETE** |
-| A-029 spike | [`A-029-t2-spike.md`](./A-029-t2-spike.md) | **COMPLETE** — PIVOT (0/4 T2 equiv; P-T2 registered) |
+| A-029 spike | [`A-029-t2-spike.md`](./A-029-t2-spike.md) | **COMPLETE** — PIVOT (0/4 T2 equiv; P-T2) |
 | A-029 results JSON | [`a029-t2-results.json`](./a029-t2-results.json) | **COMPLETE** |
 | A-029 spike script | [`scripts/a029-t2-spike.cjs`](../../scripts/a029-t2-spike.cjs) | **COMPLETE** |
 | A-029 verdict (Rust) | [`src/stel/a029.rs`](../../src/stel/a029.rs) | **COMPLETE** |
-| Phase 2 checkpoint | `docs/phase2-stel-checkpoint.md` | NOT STARTED (P2-S6) |
-| Exit record | per gate evidence contract | IN_PROGRESS |
+| Assumption register | [`stel-assumptions.md`](../stel-assumptions.md) | **COMPLETE** — A-008..A-014, A-029 updated |
+| Exit record | per gate evidence contract | **COMPLETE** — see checkpoint |
 
 ## P2-S4 gate commands (operator)
 
@@ -77,9 +81,19 @@ Curated reviewer narrative lives in [`phase2-gate-report.md`](./phase2-gate-repo
 
 `cargo test --test stel_golden_replay` may fail corpus-gated rows when `tests/fixtures/phase0-corpus/*` is missing or differs from the pinned clone content (empty index / not-found outcomes). This reproduces at the P2-S4 parent commit (`896840f`) and is **not caused by P2-S4** (gate code + ledger metadata only). Checked-in gate fixtures (`tests/fixtures/phase2-gate/`) and compare-results math remain deterministic; multi-hop replay against checked-in `tests/fixtures/stel_multi_hop/` passes in CI.
 
+## Phase 2 exit summary
+
+| Item | Result |
+|------|--------|
+| H3 / H4 / H5 | **PASS** |
+| A-029 | **PIVOT** (0/4 T2 equiv) |
+| P-T2 | T2 reference tasks bypass-only until 8.1 program |
+| H6 eligibility | **Not claimed** |
+| ~71-token H3 margin | `records/t8_explore` — noted in gate report |
+
 ## Deferred from Phase 2 (explicit)
 
 - Calibration / ledger persistence → Phase 3
 - B-RESULTS / RESULTS.md §8.7 → post–8.0 tag (A-024)
-- H6/H7/H8 PASS → Phase 3–4
-- A-029 T2 spike → **PIVOT** (P-T2); see [`A-029-t2-spike.md`](./A-029-t2-spike.md)
+- H6/H7/H8 PASS → Phase 3–4 / 8.1
+- T2 index-recall remediation → 8.1 program (not Phase 2 runtime)

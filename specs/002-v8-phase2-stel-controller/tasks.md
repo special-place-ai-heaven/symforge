@@ -4,7 +4,7 @@
 
 **Prerequisites**: [plan.md](./plan.md) (required), [spec.md](./spec.md) (required), [research.md](./research.md), [data-model.md](./data-model.md), [contracts/phase2-gate-evidence-contract.md](./contracts/phase2-gate-evidence-contract.md)
 
-**Status**: **P2-S5 A-029 spike** — PIVOT (0/4 T2 equiv; P-T2 registered); H3/H4/H5 preserved.
+**Status**: **P2-S6 exit docs** — Phase 2 exit record PASS; A-029 PIVOT documented.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -76,12 +76,12 @@
 
 ## P2-S6: Assumptions, Docs, Exit (US5)
 
-- [ ] T050 [P] [US5] Update `docs/stel-assumptions.md` verdicts A-008..A-014, A-029
-- [ ] T051 [US5] Create `docs/phase2-stel-checkpoint.md` with exit record per contract
-- [ ] T052 [US5] Scope audit: confirm no persistence, B-RESULTS, or 8.0 baseline pin in PR
-- [ ] T053 [US5] Merge milestone branch to `main` after reviewer gate sign-off
+- [x] T050 [P] [US5] Update `docs/stel-assumptions.md` verdicts A-008..A-014, A-029
+- [x] T051 [US5] Create `docs/phase2-stel-checkpoint.md` with exit record per contract
+- [x] T052 [US5] Scope audit: confirm no persistence, B-RESULTS, or 8.0 baseline pin in PR — documented in checkpoint
+- [ ] T053 [US5] Merge milestone branch to `main` after reviewer gate sign-off — **P2-S6 PR pending**
 
-**Checkpoint**: Phase 2 exit record PASS; main CI green.
+**Checkpoint**: Phase 2 exit record PASS; main CI green after P2-S6 merge.
 
 ---
 
