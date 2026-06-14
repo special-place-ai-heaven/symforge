@@ -14,6 +14,10 @@ pub const COMPACT_SERVE_EXPLORE_OVERHEAD_TOKENS: u32 = 250;
 /// Max explore tool tokens on compact `symforge` serve so full response stays within H3 window.
 pub const COMPACT_SERVE_EXPLORE_MAX_TOKENS: u32 =
     H3_EXPLORE_MANUAL_TOKENS.saturating_sub(COMPACT_SERVE_EXPLORE_OVERHEAD_TOKENS);
+/// TX-01 / FM-CAP: compact serve `find_references` file budget (schema max).
+pub const COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT: u32 = 100;
+/// TX-01: per-file hit budget on compact serve trace (handler default when unset).
+pub const COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE: u32 = 10;
 use super::planner::confidence_label;
 use super::types::{
     AdmissionDecision, StelBypassBody, StelCacheBody, StelDecision, StelPlan, StelPlanStep,
@@ -172,19 +176,31 @@ pub fn apply_compact_serve_caps(plan: &StelPlan, decision: &StelDecision) -> Ste
     }
     let mut capped = plan.clone();
     for step in &mut capped.steps {
-        if step.tool != "explore" {
-            continue;
-        }
         let Some(args) = step.args.as_object_mut() else {
             continue;
         };
-        let cap = u64::from(COMPACT_SERVE_EXPLORE_MAX_TOKENS);
-        let capped_val = args
-            .get("max_tokens")
-            .and_then(|value| value.as_u64())
-            .map(|value| value.min(cap))
-            .unwrap_or(cap);
-        args.insert("max_tokens".to_string(), serde_json::json!(capped_val));
+        match step.tool.as_str() {
+            "explore" => {
+                let cap = u64::from(COMPACT_SERVE_EXPLORE_MAX_TOKENS);
+                let capped_val = args
+                    .get("max_tokens")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value.min(cap))
+                    .unwrap_or(cap);
+                args.insert("max_tokens".to_string(), serde_json::json!(capped_val));
+            }
+            "find_references" => {
+                args.insert(
+                    "limit".to_string(),
+                    serde_json::json!(COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT),
+                );
+                args.insert(
+                    "max_per_file".to_string(),
+                    serde_json::json!(COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE),
+                );
+            }
+            _ => {}
+        }
     }
     capped
 }
@@ -522,6 +538,83 @@ mod tests {
             args["max_tokens"],
             serde_json::json!(COMPACT_SERVE_EXPLORE_MAX_TOKENS)
         );
+    }
+
+    #[test]
+    fn apply_compact_serve_caps_find_references_tx01_file_limit() {
+        use crate::stel::types::{
+            AdmissionDecision, IntentBucket, RouteConfidence, StelDecision, StelPlan, StelPlanStep,
+        };
+        let plan = StelPlan {
+            plan_id: "serve-refs".to_string(),
+            intent: IntentBucket::Trace,
+            confidence: RouteConfidence::Exact,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "find_references".to_string(),
+                args: serde_json::json!({ "name": "spawn", "compact": true }),
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let decision = StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Serve,
+            decision_reason: "test".to_string(),
+            effective_max_tokens: None,
+            degrade_flags: vec![],
+            steps: Some(plan.steps.clone()),
+            bypass: None,
+            cache: None,
+        };
+        let capped = apply_compact_serve_caps(&plan, &decision);
+        let args = capped.steps[0].args.as_object().expect("object args");
+        assert_eq!(
+            args["limit"],
+            serde_json::json!(COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT)
+        );
+        assert_eq!(
+            args["max_per_file"],
+            serde_json::json!(COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE)
+        );
+    }
+
+    #[test]
+    fn apply_compact_serve_caps_skips_find_references_on_non_serve() {
+        use crate::stel::types::{
+            AdmissionDecision, IntentBucket, RouteConfidence, StelDecision, StelPlan, StelPlanStep,
+        };
+        let plan = StelPlan {
+            plan_id: "bypass-refs".to_string(),
+            intent: IntentBucket::Trace,
+            confidence: RouteConfidence::Exact,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "find_references".to_string(),
+                args: serde_json::json!({ "name": "spawn", "compact": true }),
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![],
+            }],
+            suggested_followup: None,
+        };
+        let decision = StelDecision {
+            plan_id: plan.plan_id.clone(),
+            decision: AdmissionDecision::Bypass,
+            decision_reason: "test".to_string(),
+            effective_max_tokens: None,
+            degrade_flags: vec![],
+            steps: None,
+            bypass: None,
+            cache: None,
+        };
+        let capped = apply_compact_serve_caps(&plan, &decision);
+        let args = capped.steps[0].args.as_object().expect("object args");
+        assert!(args.get("limit").is_none());
     }
 
     #[test]

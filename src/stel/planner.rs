@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 
 use crate::protocol::smart_query;
 
+use super::executor::{
+    COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT, COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE,
+};
 use super::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest};
 
 struct PlannedStep {
@@ -511,6 +514,8 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
         "find_references" => json!({
             "name": request.symbol.clone().unwrap_or_else(|| request.query.trim().to_string()),
             "compact": true,
+            "limit": COMPACT_SERVE_FIND_REFERENCES_FILE_LIMIT,
+            "max_per_file": COMPACT_SERVE_FIND_REFERENCES_MAX_PER_FILE,
         }),
         "find_dependents" => {
             json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) })
