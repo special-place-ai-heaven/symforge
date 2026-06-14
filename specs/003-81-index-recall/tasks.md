@@ -62,26 +62,26 @@ Do **not** require or imply adding `A029Verdict::Partial` unless a later impleme
 
 ### T2.1a — Crosswalk (before taxonomy)
 
-- [ ] T010 [US1] Review Phase 2 → 8.1 handoff: A-029 PIVOT, P-T2, deferred recall work — record in `docs/research/81-t2-crosswalk.md`
-- [ ] T011 [P] [US1] Crosswalk golden T2 rows (`docs/fixtures/routes.golden.jsonl` `*/t4_refs`) vs A-029 external tasks (`tests/fixtures/a029-t2/tasks.jsonl`); document ID mapping and policy scope in `docs/research/81-t2-crosswalk.md`
-- [ ] T012 [P] [US1] Crosswalk index ref pipeline touchpoints (`src/live_index/query.rs`, parsing, discovery) to §6.1 hypothesis classes — link only, no code changes — in `docs/research/81-t2-crosswalk.md`
+- [x] T010 [US1] Review Phase 2 → 8.1 handoff: A-029 PIVOT, P-T2, deferred recall work — record in [`docs/research/A-029-t2-task-crosswalk.md`](../../docs/research/A-029-t2-task-crosswalk.md)
+- [x] T011 [P] [US1] Crosswalk golden T2 rows (`docs/fixtures/routes.golden.jsonl` `*/t4_refs`) vs A-029 external tasks (`tests/fixtures/a029-t2/tasks.jsonl`); document ID mapping and policy scope in [`docs/research/A-029-t2-task-crosswalk.md`](../../docs/research/A-029-t2-task-crosswalk.md)
+- [x] T012 [P] [US1] Crosswalk index ref pipeline touchpoints (`src/live_index/query.rs`, parsing, discovery) to §6.1 hypothesis classes — link only, no code changes — in [`docs/research/A-029-t2-task-crosswalk.md`](../../docs/research/A-029-t2-task-crosswalk.md)
 
 **Checkpoint**: Crosswalk doc complete; maps program scope to existing artifacts.
 
 ### T2.1b — rg-baseline inventory (before taxonomy)
 
-- [ ] T013 [US2] Clone tokio + django corpora per [`tests/fixtures/a029-t2/README.md`](../../tests/fixtures/a029-t2/README.md); record SHAs in `docs/research/81-t2-rg-baseline-inventory.md`
-- [ ] T014 [US2] For each of 4 T2 tasks, capture rg baseline file sets (same rules as [`scripts/a029-t2-spike.cjs`](../../scripts/a029-t2-spike.cjs) `baselineReferencePaths`): path counts, extension breakdown, top missing-path prefixes — in `docs/research/81-t2-rg-baseline-inventory.md`
-- [ ] T015 [P] [US2] For each task, run compact `find_references` (or document read-only query export) and record cited-path sets vs rg baseline — **measurement only**, no index fixes — in `docs/research/81-t2-rg-baseline-inventory.md`
-- [ ] T016 [US2] Compute per-task recall table (baseline_paths, matched_paths, recall %) and diff “rg-only” paths into candidate buckets (markdown, benches, tests, imports, other) in `docs/research/81-t2-rg-baseline-inventory.md`
+- [x] T013 [US2] Clone tokio + django corpora per [`tests/fixtures/a029-t2/README.md`](../../tests/fixtures/a029-t2/README.md); record SHAs in [`docs/research/rg-hits/`](../../docs/research/rg-hits/) per-task JSON (`corpus_sha`)
+- [x] T014 [US2] For each of 4 T2 tasks, capture rg baseline file sets (same rules as [`scripts/a029-t2-spike.cjs`](../../scripts/a029-t2-spike.cjs) `baselineReferencePaths`): path counts, extension breakdown, top missing-path prefixes — in [`docs/research/rg-hits/<task_id>.json`](../../docs/research/rg-hits/) + [`docs/research/rg-hits/summary.json`](../../docs/research/rg-hits/summary.json)
+- [x] T015 [P] [US2] For each task, run compact `find_references` (measurement only) and record cited-path sets vs rg baseline — in per-task rg-hits JSON (via [`scripts/a029-t21-rg-inventory.cjs`](../../scripts/a029-t21-rg-inventory.cjs))
+- [x] T016 [US2] Compute per-task recall table and diff rg-only paths into buckets (markdown, benches, tests, etc.) — `baseline_bucket_counts`, `missed_bucket_counts` in rg-hits JSON; summaries in [`A-029-tokio-recall-spike.md`](../../docs/research/A-029-tokio-recall-spike.md) and [`A-029-django-recall-spike.md`](../../docs/research/A-029-django-recall-spike.md)
 
 **Checkpoint**: rg-baseline inventory complete for all 4 tasks; reproducible commands recorded.
 
 ### T2.1c — Gap taxonomy & reviewer sign-off (before implementation)
 
-- [ ] T017 [US3] Draft gap taxonomy doc: root-cause class → evidence row → proposed fix surface (parser / indexer / query) → acceptance test — in `docs/research/81-t2-gap-taxonomy.md`
-- [ ] T018 [P] [US3] Map each taxonomy row to §6.1 hypothesis (markdown, benches, cross-file text) with estimated recall lift; flag out-of-scope or P-T2-only rows explicitly
-- [ ] T019 [US3] **GATE** Independent taxonomy reviewer sign-off (GO / NO-GO) in `docs/research/81-t2-taxonomy-review-signoff.md` — must cite T010–T018 artifacts; **NO-GO blocks all T2.2/T2.3 implementation**
+- [x] T017 [US3] Draft gap taxonomy doc: root-cause class → evidence row → proposed fix surface → acceptance test — in [`docs/research/A-029-gap-taxonomy.md`](../../docs/research/A-029-gap-taxonomy.md)
+- [x] T018 [P] [US3] Map each taxonomy row to §6.1 hypothesis with estimated recall lift; flag out-of-scope or P-T2-only rows — in [`docs/research/A-029-gap-taxonomy.md`](../../docs/research/A-029-gap-taxonomy.md)
+- [x] T019 [US3] **GATE** Independent taxonomy reviewer sign-off — **GO** in [`docs/research/81-index-recall-taxonomy-signoff.md`](../../docs/research/81-index-recall-taxonomy-signoff.md) (cleanup #1–#3 applied pre-merge)
 
 **Checkpoint**: Taxonomy accepted by independent reviewer. **Stop rule:** Any T2.2/T2.3 task touching `src/**` before T019 GO is out of scope.
 
