@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.25.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.24.1...v7.25.0) (2026-06-14)
+
+
+### Features
+
+* **stel:** raise compact reference cap for TX-01 ([830ad8f](https://github.com/special-place-ai-heaven/symforge/commit/830ad8f44787d01273ea0e70600fb5c8df86f4cc)), closes [#315](https://github.com/special-place-ai-heaven/symforge/issues/315)
+
 ## [7.24.1](https://github.com/special-place-ai-heaven/symforge/compare/v7.24.0...v7.24.1) (2026-06-14)
 
 
