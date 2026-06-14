@@ -15,12 +15,15 @@ pub const S4_EXIT_ROW_IDS: [&str; 5] = [
     "compression/t5_dependents",
 ];
 
-/// Multi-hop rows deferred until L1 supports chained plans.
-pub const DEFERRED_MULTI_HOP_ROW_IDS: [&str; 3] = [
+/// Multi-hop golden rows closed in Phase 2 (formerly deferred at Phase 1 exit).
+pub const MULTI_HOP_GOLDEN_ROW_IDS: [&str; 3] = [
     "cfg-if/multi_search_symbol",
     "records/multi_context_refs",
     "is-plain/multi_files_content",
 ];
+
+/// Back-compat alias — prefer [`MULTI_HOP_GOLDEN_ROW_IDS`].
+pub const DEFERRED_MULTI_HOP_ROW_IDS: [&str; 3] = MULTI_HOP_GOLDEN_ROW_IDS;
 
 /// Relative path to the canonical golden corpus from the repo root.
 pub const GOLDEN_ROUTES_FIXTURE: &str = "docs/fixtures/routes.golden.jsonl";
@@ -94,15 +97,9 @@ pub fn request_for_golden_row(row: &GoldenRouteRow) -> StelRequest {
 
 /// Classify one golden row without mutating runtime behavior.
 pub fn classify_golden_row(row: &GoldenRouteRow) -> GoldenReplayCategory {
-    if row.chain.as_deref() == Some("multi") || row.must_call.len() > 1 {
-        return GoldenReplayCategory::DeferredMultiHop;
-    }
-
-    let request = request_for_golden_row(row);
-    let plan = build_plan(&request);
-    let planned_tool = plan.steps[0].tool.clone();
-
     if row.expected_decision == AdmissionDecision::Bypass {
+        let request = request_for_golden_row(row);
+        let plan = build_plan(&request);
         let decision = evaluate_plan(&request, &plan);
         if decision.decision == AdmissionDecision::Bypass && decision.bypass.is_some() {
             return GoldenReplayCategory::SupportedPffBypass;
@@ -113,16 +110,23 @@ pub fn classify_golden_row(row: &GoldenRouteRow) -> GoldenReplayCategory {
         };
     }
 
-    let expected_tool = row
-        .must_call
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "?".to_string());
-    if planned_tool != expected_tool {
+    let request = request_for_golden_row(row);
+    let plan = build_plan(&request);
+    let planned_tools: Vec<String> = plan.steps.iter().map(|step| step.tool.clone()).collect();
+
+    if planned_tools.len() != row.must_call.len() {
         return GoldenReplayCategory::DeferredPlannerMismatch {
-            expected: expected_tool,
-            planned: planned_tool,
+            expected: row.must_call.join(" → "),
+            planned: planned_tools.join(" → "),
         };
+    }
+    for (planned, expected) in planned_tools.iter().zip(row.must_call.iter()) {
+        if planned != expected {
+            return GoldenReplayCategory::DeferredPlannerMismatch {
+                expected: expected.clone(),
+                planned: planned.clone(),
+            };
+        }
     }
 
     let decision = evaluate_plan(&request, &plan);
@@ -380,12 +384,20 @@ mod tests {
         assert_eq!(rows.len(), 36, "golden fixture must contain 36 rows");
         let classification = classify_golden_corpus(&rows);
         assert_eq!(classification.row_count(), 36);
-        let mut expected_multi: Vec<String> = DEFERRED_MULTI_HOP_ROW_IDS
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect();
-        expected_multi.sort();
-        assert_eq!(classification.deferred_multi_hop, expected_multi);
+        assert!(
+            classification.deferred_multi_hop.is_empty(),
+            "Phase 2 closes multi-hop deferrals: {:?}",
+            classification.deferred_multi_hop
+        );
+        for id in MULTI_HOP_GOLDEN_ROW_IDS {
+            assert!(
+                classification
+                    .supported_serve
+                    .iter()
+                    .any(|row_id| row_id == id),
+                "multi-hop row {id} must classify as supported serve"
+            );
+        }
         for id in S4_EXIT_ROW_IDS {
             assert!(
                 classification
@@ -433,6 +445,7 @@ mod tests {
         let rows = fixture_rows();
         let classification = classify_golden_corpus(&rows);
         let expected = [
+            "cfg-if/multi_search_symbol",
             "cfg-if/t1_search",
             "cfg-if/t2_context",
             "cfg-if/t3_symbols",
@@ -446,6 +459,7 @@ mod tests {
             "compression/t3_symbol",
             "compression/t4_refs",
             "compression/t5_dependents",
+            "is-plain/multi_files_content",
             "is-plain/t1_search",
             "is-plain/t2_context",
             "is-plain/t3_content",
@@ -454,6 +468,7 @@ mod tests {
             "is-plain/t6_refs",
             "is-plain/t7_files",
             "is-plain/t8_health",
+            "records/multi_context_refs",
             "records/t1_search",
             "records/t2_context",
             "records/t3_files",

@@ -7967,9 +7967,13 @@ impl SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
         use crate::stel::controller::{build_estimate, evaluate_plan};
-        use crate::stel::executor::{format_bypass_body, is_enforced_bypass};
+        use crate::stel::executor::{
+            ServedStepResult, format_bypass_body, format_multi_step_serve_body,
+            format_single_step_serve_body, is_enforced_bypass, route_tool_label, serve_step_failed,
+            tools_executed,
+        };
         use crate::stel::handler::{self, metrics_for_decision};
-        use crate::stel::planner::{build_plan, confidence_label, plan_summary_line};
+        use crate::stel::planner::{build_plan, plan_summary_line};
 
         let q = smart_query::strip_leading_articles(request.query.trim());
         if q.is_empty() {
@@ -8007,26 +8011,41 @@ impl SymForgeServer {
                 &body,
                 false,
                 &step.tool,
+                None,
             );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
         }
 
-        let tool_body = self
-            .dispatch_tool_for_tests(&step.tool, step.args.clone())
-            .await;
-        let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
-        let routing_meta = format!(
-            "Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
-            confidence_label(plan.confidence),
-            step.tool,
-            invocation,
-            plan.confidence_rationale,
-            decision.decision.as_str(),
-            decision.decision_reason,
-        );
-        let body = format!("{routing_meta}\n\n{tool_body}");
+        let mut step_results = Vec::new();
+        let mut outcome_class = OutcomeClass::Found;
+        for step in &plan.steps {
+            let tool_body = self
+                .dispatch_tool_for_tests(&step.tool, step.args.clone())
+                .await;
+            step_results.push(ServedStepResult {
+                tool: step.tool.clone(),
+                body: tool_body.clone(),
+            });
+            if serve_step_failed(&tool_body) {
+                outcome_class = if tool_body.starts_with("Index not loaded.") {
+                    OutcomeClass::InternalFailure
+                } else {
+                    OutcomeClass::InvalidRequest
+                };
+                break;
+            }
+        }
+
+        let body = if plan.steps.len() == 1 {
+            format_single_step_serve_body(&plan, &decision, &plan.steps[0], &step_results[0].body)
+        } else {
+            format_multi_step_serve_body(&plan, &decision, &step_results)
+        };
+        let tools = tools_executed(&step_results);
+        let route_label = route_tool_label(&tools);
+        let tools_called = if tools.len() > 1 { Some(tools) } else { None };
         let output = self.finalize_symforge_with_ledger(
             "symforge",
             request,
@@ -8035,19 +8054,12 @@ impl SymForgeServer {
             plan_summary,
             session_net,
             &body,
-            true,
-            &step.tool,
+            !step_results.is_empty(),
+            &route_label,
+            tools_called,
         );
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
-
-        let outcome_class = if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
-            OutcomeClass::InvalidRequest
-        } else if tool_body.starts_with("Index not loaded.") {
-            OutcomeClass::InternalFailure
-        } else {
-            OutcomeClass::Found
-        };
         statused_tool_result(output, outcome_class)
     }
 
@@ -8135,6 +8147,7 @@ impl SymForgeServer {
                         &body,
                         false,
                         "replace_symbol_body",
+                        None,
                     );
                     self.session_context
                         .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
@@ -8213,6 +8226,7 @@ impl SymForgeServer {
             &body,
             legacy_executed,
             &step.tool,
+            None,
         );
         self.session_context
             .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
@@ -8283,6 +8297,7 @@ impl SymForgeServer {
         body: &str,
         legacy_executed: bool,
         selected_tool: &str,
+        tools_called: Option<Vec<String>>,
     ) -> String {
         use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
         use crate::stel::ledger::{
@@ -8297,6 +8312,7 @@ impl SymForgeServer {
             decision,
             economics: &metrics.economics,
             selected_tool,
+            tools_called: tools_called.as_deref(),
             legacy_executed,
             output_body: body,
             surface,

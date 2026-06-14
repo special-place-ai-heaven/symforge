@@ -79,21 +79,22 @@ async fn replay_row(server: &SymForgeServer, row: &GoldenRouteRow) -> String {
 }
 
 #[test]
-fn golden_corpus_classification_lists_deferred_rows_explicitly() {
+fn golden_corpus_classification_has_zero_deferred_multi_hop() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let classification = stel::classify_golden_corpus(&rows);
     assert_eq!(classification.row_count(), rows.len());
-    assert_eq!(
-        classification.deferred_multi_hop.len(),
-        stel::DEFERRED_MULTI_HOP_ROW_IDS.len()
+    assert!(
+        classification.deferred_multi_hop.is_empty(),
+        "Phase 2 closes multi-hop deferrals: {:?}",
+        classification.deferred_multi_hop
     );
-    for id in stel::DEFERRED_MULTI_HOP_ROW_IDS {
+    for id in stel::MULTI_HOP_GOLDEN_ROW_IDS {
         assert!(
             classification
-                .deferred_multi_hop
+                .supported_serve
                 .iter()
                 .any(|row_id| row_id == id),
-            "multi-hop row {id} must be explicitly deferred"
+            "multi-hop row {id} must classify as supported serve"
         );
     }
     assert!(
@@ -150,6 +151,34 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let exit_rows = stel::s4_exit_rows(&rows);
     replay_serve_rows_grouped_by_corpus(&exit_rows).await;
+}
+
+#[tokio::test]
+async fn multi_hop_golden_rows_replay_on_compact_symforge() {
+    if !all_replay_corpora_available() {
+        eprintln!("skip multi_hop_golden_rows_replay: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
+    let multi_hop: Vec<_> = stel::MULTI_HOP_GOLDEN_ROW_IDS
+        .iter()
+        .map(|id| {
+            rows.iter()
+                .find(|row| row.id == *id)
+                .unwrap_or_else(|| panic!("golden corpus missing multi-hop row `{id}`"))
+        })
+        .filter(|row| corpus_available_for_row(row))
+        .collect();
+    assert_eq!(
+        multi_hop.len(),
+        stel::MULTI_HOP_GOLDEN_ROW_IDS.len(),
+        "all multi-hop golden rows must have pinned corpora"
+    );
+    replay_serve_rows_grouped_by_corpus(&multi_hop).await;
 }
 
 #[tokio::test]

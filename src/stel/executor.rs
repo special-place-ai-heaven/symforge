@@ -1,8 +1,16 @@
-//! STEL L3 enforcement — respect L2 admission for the smallest safe case (P-FF bypass).
+//! STEL L3 enforcement — respect L2 admission; in-process multi-step serve chain.
 
 use serde_json;
 
-use super::types::{AdmissionDecision, StelBypassBody, StelDecision};
+use super::planner::confidence_label;
+use super::types::{AdmissionDecision, StelBypassBody, StelDecision, StelPlan, StelPlanStep};
+
+/// Outcome of one in-process legacy tool dispatch during a multi-step serve chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServedStepResult {
+    pub tool: String,
+    pub body: String,
+}
 
 /// Whether L3 should skip legacy tool dispatch (P-FF bypass only in this slice).
 pub fn is_enforced_bypass(decision: &StelDecision) -> bool {
@@ -49,6 +57,90 @@ fn format_bypass_body_from(bypass: &StelBypassBody, decision_reason: &str) -> St
         bypass.predicted_symforge_tokens,
         path = bypass.path,
     )
+}
+
+/// Routing metadata for one planned step in a serve chain.
+pub fn format_serve_step_meta(
+    plan: &StelPlan,
+    step: &StelPlanStep,
+    step_index: usize,
+    decision: &StelDecision,
+) -> String {
+    let invocation = serde_json::to_string(&step.args).unwrap_or_else(|_| "{}".to_string());
+    let rationale = if step_index == 0 {
+        plan.confidence_rationale.as_str()
+    } else {
+        "multi-hop chain step"
+    };
+    format!(
+        "Step {}: Route confidence: {}\nChosen tool: {}\nInvocation: {}\nRationale: {}\nEconomics: {} ({})",
+        step_index + 1,
+        confidence_label(plan.confidence),
+        step.tool,
+        invocation,
+        rationale,
+        decision.decision.as_str(),
+        decision.decision_reason,
+    )
+}
+
+/// Single-step serve body (routing meta + tool output).
+pub fn format_single_step_serve_body(
+    plan: &StelPlan,
+    decision: &StelDecision,
+    step: &StelPlanStep,
+    tool_body: &str,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        format_serve_step_meta(plan, step, 0, decision),
+        tool_body
+    )
+}
+
+/// Multi-step serve body — fail-fast chain output with per-step routing metadata.
+pub fn format_multi_step_serve_body(
+    plan: &StelPlan,
+    decision: &StelDecision,
+    step_results: &[ServedStepResult],
+) -> String {
+    assert_eq!(
+        plan.steps.len(),
+        step_results.len(),
+        "step results must align with plan"
+    );
+    let mut sections = Vec::new();
+    for (index, result) in step_results.iter().enumerate() {
+        sections.push(format_serve_step_meta(
+            plan,
+            &plan.steps[index],
+            index,
+            decision,
+        ));
+        sections.push(String::new());
+        sections.push(result.body.clone());
+    }
+    sections.join("\n")
+}
+
+/// Tools executed during a serve chain (for ledger + battery extension).
+pub fn tools_executed(step_results: &[ServedStepResult]) -> Vec<String> {
+    step_results
+        .iter()
+        .map(|result| result.tool.clone())
+        .collect()
+}
+
+/// Compact route label for ledger metadata when multiple tools ran in-process.
+pub fn route_tool_label(tools: &[String]) -> String {
+    tools.join("+")
+}
+
+/// Whether a dispatched tool body indicates mid-chain failure (fail fast).
+pub fn serve_step_failed(tool_body: &str) -> bool {
+    tool_body.starts_with("Error:")
+        || tool_body.starts_with("Invalid")
+        || tool_body.starts_with("Index not loaded.")
 }
 
 #[cfg(test)]
@@ -100,5 +192,53 @@ mod tests {
         let decision = evaluate_plan(&request, &plan);
         assert_eq!(decision.decision, AdmissionDecision::Bypass);
         assert!(!is_enforced_bypass(&decision));
+    }
+
+    #[test]
+    fn multi_step_serve_body_lists_each_chosen_tool() {
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "multi".to_string(),
+            intent: IntentBucket::Find,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "multi-hop".to_string(),
+            steps: vec![
+                StelPlanStep {
+                    order: 1,
+                    tool: "search_symbols".to_string(),
+                    args: serde_json::json!({ "query": "cfg_if" }),
+                    est_response_tokens: 400,
+                    est_manual_tokens: 800,
+                    index_refs: vec![],
+                },
+                StelPlanStep {
+                    order: 2,
+                    tool: "get_symbol".to_string(),
+                    args: serde_json::json!({ "name": "cfg_if" }),
+                    est_response_tokens: 400,
+                    est_manual_tokens: 800,
+                    index_refs: vec![],
+                },
+            ],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let decision = evaluate_plan(&request, &plan);
+        let body = format_multi_step_serve_body(
+            &plan,
+            &decision,
+            &[
+                ServedStepResult {
+                    tool: "search_symbols".to_string(),
+                    body: "symbols".to_string(),
+                },
+                ServedStepResult {
+                    tool: "get_symbol".to_string(),
+                    body: "symbol body".to_string(),
+                },
+            ],
+        );
+        assert!(body.contains("Chosen tool: search_symbols"));
+        assert!(body.contains("Chosen tool: get_symbol"));
     }
 }

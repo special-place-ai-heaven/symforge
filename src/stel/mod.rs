@@ -6,12 +6,12 @@
 //! - **L0:** MCP compact surface (`symforge` | `symforge_edit` | `status`); production list via
 //!   [`surface_list::compact_surface_tools`]. Phase 0 harness relay + frozen schemas in
 //!   [`crate::protocol::surface_probe`].
-//! - **L1:** [`planner::build_plan`] — `StelRequest` → single-step [`StelPlan`].
+//! - **L1:** [`planner::build_plan`] — `StelRequest` → single- or multi-step [`StelPlan`].
 //! - **L2:** [`controller::evaluate_plan`] — economics → [`StelDecision`] / [`StelEstimate`].
-//! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch.
+//! - **L3:** [`executor::is_enforced_bypass`] — P-FF bypass skips legacy tool dispatch; multi-step in-process chain on `serve`.
 //! - **L4:** [`ledger::SessionLedger`] — in-memory [`StelLedgerEvent`] rows + envelope `ledger:` line.
 //!
-//! Deferred: calibration auto-tuning/persistence, multi-step plans, symforge_edit apply path.
+//! Deferred: calibration auto-tuning/persistence, symforge_edit apply path.
 
 pub mod calibration;
 pub mod controller;
@@ -44,14 +44,18 @@ pub use edit_planner::{
     EditValidationError, build_edit_plan, edit_plan_summary_line, validate_edit_request,
 };
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
-pub use executor::{format_bypass_body, is_enforced_bypass};
+pub use executor::{
+    ServedStepResult, format_bypass_body, format_multi_step_serve_body, format_serve_step_meta,
+    format_single_step_serve_body, is_enforced_bypass, route_tool_label, serve_step_failed,
+    tools_executed,
+};
 pub use golden_replay::{
     DEFERRED_MULTI_HOP_ROW_IDS, GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification,
-    GoldenReplayCategory, ReplayValidation, S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS,
-    classify_golden_corpus, classify_golden_row, corpus_for_row_id, corpus_marker_for_row_id,
-    load_golden_rows, parse_golden_rows, request_for_golden_row, s4_exit_rows, supported_pff_rows,
-    supported_serve_rows, validate_pff_replay_output, validate_s4_replay_output,
-    validate_serve_replay_output,
+    GoldenReplayCategory, MULTI_HOP_GOLDEN_ROW_IDS, ReplayValidation, S4_EXIT_ROW_IDS,
+    S4_REPLAY_CORPUS, classify_golden_corpus, classify_golden_row, corpus_for_row_id,
+    corpus_marker_for_row_id, load_golden_rows, parse_golden_rows, request_for_golden_row,
+    s4_exit_rows, supported_pff_rows, supported_serve_rows, validate_pff_replay_output,
+    validate_s4_replay_output, validate_serve_replay_output,
 };
 pub use handler::{
     DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,
