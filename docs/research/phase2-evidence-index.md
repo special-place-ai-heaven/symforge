@@ -1,6 +1,6 @@
 # Phase 2 STEL evidence index
 
-**Status:** P2-S4 battery gates — H4/H5 PASS; H3 FAIL documented (2026-06-14)
+**Status:** P2-S4 battery gates + H3 remediation — H3/H4/H5 PASS (2026-06-14)
 
 **Created**: 2026-06-14
 
@@ -21,7 +21,8 @@
 
 - Phase 1 shipped: [`phase1-stel-checkpoint.md`](../phase1-stel-checkpoint.md)
 - Phase 2 Slice 1 merged: `3d64b96` (multi-hop golden closure)
-- Phase 2 Slice 2 merged: PR #306 / `896840f` tip (L2 admission hardening)
+- Phase 2 Slice 2 merged: PR #306 / `896840f` (L2 admission hardening)
+- Phase 2 Slice 4 merged: PR #308 / `b1f6019` (battery gate evidence)
 
 ## T002 spec reviewer sign-off
 
@@ -36,7 +37,7 @@
 
 | Slot | Path | Status |
 |------|------|--------|
-| Gate report (curated) | [`phase2-gate-report.md`](./phase2-gate-report.md) | **COMPLETE** — H3 FAIL (1 row), H4/H5 PASS |
+| Gate report (curated) | [`phase2-gate-report.md`](./phase2-gate-report.md) | **COMPLETE** — H3/H4/H5 PASS |
 | Gate report (generated) | [`phase2-gate-report.generated.md`](./phase2-gate-report.generated.md) | **COMPLETE** — compare-results script output |
 | Candidate battery JSON | [`results-v8-phase2-candidate.json`](./results-v8-phase2-candidate.json) | **COMPLETE** — 36/36 rows, STEL fields |
 | Compare-results script | [`scripts/compare-results.cjs`](../../scripts/compare-results.cjs) | **COMPLETE** |

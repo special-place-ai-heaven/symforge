@@ -8013,11 +8013,11 @@ impl SymForgeServer {
         use crate::protocol::smart_query;
         use crate::stel::controller::{build_estimate, evaluate_plan_with_session};
         use crate::stel::executor::{
-            ServedStepResult, apply_degrade_to_plan, chain_failure_decision, format_bypass_body,
-            format_cache_hit_body, format_multi_step_serve_body,
-            format_partial_multi_step_serve_body, format_single_step_serve_body, is_degrade,
-            route_tool_label, serve_chain_outcome_class, serve_step_failed, serve_step_outcome,
-            should_skip_legacy_dispatch, tools_executed,
+            ServedStepResult, apply_compact_serve_caps, apply_degrade_to_plan,
+            chain_failure_decision, format_bypass_body, format_cache_hit_body,
+            format_multi_step_serve_body, format_partial_multi_step_serve_body,
+            format_single_step_serve_body, is_degrade, route_tool_label, serve_chain_outcome_class,
+            serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch, tools_executed,
         };
         use crate::stel::handler::{self, metrics_for_decision};
         use crate::stel::planner::{build_plan, plan_summary_line};
@@ -8071,6 +8071,8 @@ impl SymForgeServer {
 
         let exec_plan = if is_degrade(&decision) {
             apply_degrade_to_plan(&plan, &decision)
+        } else if decision.decision == crate::stel::AdmissionDecision::Serve {
+            apply_compact_serve_caps(&plan, &decision)
         } else {
             plan.clone()
         };
