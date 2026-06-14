@@ -45,17 +45,19 @@ pub use edit_planner::{
 };
 pub use envelope::{TrustEnvelopeInput, format_trust_envelope};
 pub use executor::{
-    ServedStepResult, format_bypass_body, format_multi_step_serve_body, format_serve_step_meta,
-    format_single_step_serve_body, is_enforced_bypass, route_tool_label, serve_step_failed,
-    tools_executed,
+    ServedStepResult, chain_failure_decision, extract_served_step_bodies, format_bypass_body,
+    format_multi_step_serve_body, format_partial_multi_step_serve_body, format_serve_step_meta,
+    format_single_step_serve_body, is_enforced_bypass, route_tool_label, serve_chain_outcome_class,
+    serve_step_failed, serve_step_outcome, tools_executed,
 };
 pub use golden_replay::{
     DEFERRED_MULTI_HOP_ROW_IDS, GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification,
-    GoldenReplayCategory, MULTI_HOP_GOLDEN_ROW_IDS, ReplayValidation, S4_EXIT_ROW_IDS,
-    S4_REPLAY_CORPUS, classify_golden_corpus, classify_golden_row, corpus_for_row_id,
-    corpus_marker_for_row_id, load_golden_rows, parse_golden_rows, request_for_golden_row,
-    s4_exit_rows, supported_pff_rows, supported_serve_rows, validate_pff_replay_output,
-    validate_s4_replay_output, validate_serve_replay_output,
+    GoldenReplayCategory, MULTI_HOP_GOLDEN_ROW_IDS, MULTI_HOP_REPLAY_CORPUS_ROOT, ReplayValidation,
+    S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS, classify_golden_corpus, classify_golden_row,
+    corpus_for_row_id, corpus_marker_for_row_id, load_golden_rows,
+    multi_hop_replay_corpus_for_row_id, multi_hop_replay_corpus_marker, parse_golden_rows,
+    request_for_golden_row, s4_exit_rows, supported_pff_rows, supported_serve_rows,
+    validate_pff_replay_output, validate_s4_replay_output, validate_serve_replay_output,
 };
 pub use handler::{
     DecisionEnvelopeMetrics, StubServeMetrics, envelope_for_decision, envelope_for_stub_serve,

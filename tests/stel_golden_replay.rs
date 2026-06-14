@@ -155,15 +155,11 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
 
 #[tokio::test]
 async fn multi_hop_golden_rows_replay_on_compact_symforge() {
-    if !all_replay_corpora_available() {
-        eprintln!("skip multi_hop_golden_rows_replay: missing corpora");
-        return;
-    }
-
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
+    let mut missing = Vec::new();
     let multi_hop: Vec<_> = stel::MULTI_HOP_GOLDEN_ROW_IDS
         .iter()
         .map(|id| {
@@ -171,14 +167,53 @@ async fn multi_hop_golden_rows_replay_on_compact_symforge() {
                 .find(|row| row.id == *id)
                 .unwrap_or_else(|| panic!("golden corpus missing multi-hop row `{id}`"))
         })
-        .filter(|row| corpus_available_for_row(row))
+        .filter(|row| {
+            let corpus = stel::multi_hop_replay_corpus_for_row_id(&row.id);
+            let marker = stel::multi_hop_replay_corpus_marker(&row.id);
+            let path = corpus_path(corpus).join(marker);
+            if path.is_file() {
+                true
+            } else {
+                missing.push(format!("{} (expected {})", row.id, path.display()));
+                false
+            }
+        })
         .collect();
+    assert!(
+        missing.is_empty(),
+        "multi-hop replay requires checked-in fixtures under tests/fixtures/stel_multi_hop/: {}",
+        missing.join(", ")
+    );
     assert_eq!(
         multi_hop.len(),
         stel::MULTI_HOP_GOLDEN_ROW_IDS.len(),
-        "all multi-hop golden rows must have pinned corpora"
+        "all multi-hop golden rows must replay"
     );
-    replay_serve_rows_grouped_by_corpus(&multi_hop).await;
+
+    let mut failures = Vec::new();
+    for row in multi_hop {
+        let corpus = stel::multi_hop_replay_corpus_for_row_id(&row.id);
+        let project = Path::new(corpus)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("replay");
+        let server = server_for_corpus(corpus, project);
+        let output = replay_row(&server, row).await;
+        let validation = stel::validate_serve_replay_output(row, &output);
+        if !validation.passed {
+            failures.push(format!(
+                "{}: {}",
+                validation.row_id,
+                validation.errors.join("; ")
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "multi-hop golden replay failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]

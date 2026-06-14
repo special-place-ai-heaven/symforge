@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use super::controller::evaluate_plan;
+use super::executor::{extract_served_step_bodies, serve_step_failed, serve_step_outcome};
 use super::planner::build_plan;
 use super::types::{AdmissionDecision, GoldenRouteRow, StelRequest};
 
@@ -58,6 +59,9 @@ impl GoldenCorpusClassification {
     }
 }
 
+/// Checked-in minimal corpora for CI-proof multi-hop golden replay (outside gitignored phase0 clones).
+pub const MULTI_HOP_REPLAY_CORPUS_ROOT: &str = "tests/fixtures/stel_multi_hop";
+
 /// Pinned corpus root for a golden row id.
 pub fn corpus_for_row_id(id: &str) -> &'static str {
     if id.starts_with("cfg-if/") {
@@ -70,6 +74,26 @@ pub fn corpus_for_row_id(id: &str) -> &'static str {
         "tests/fixtures/compression_ratio/rust"
     } else {
         panic!("golden row `{id}` has no pinned corpus mapping")
+    }
+}
+
+/// Deterministic checked-in corpus for Phase 2 multi-hop golden replay rows.
+pub fn multi_hop_replay_corpus_for_row_id(id: &str) -> &'static str {
+    match id {
+        "cfg-if/multi_search_symbol" => "tests/fixtures/stel_multi_hop/cfg-if-rust",
+        "records/multi_context_refs" => "tests/fixtures/stel_multi_hop/records-python",
+        "is-plain/multi_files_content" => "tests/fixtures/stel_multi_hop/is-plain-obj-ts",
+        _ => panic!("golden row `{id}` is not a multi-hop replay row"),
+    }
+}
+
+/// Marker file proving a multi-hop replay corpus is present on disk.
+pub fn multi_hop_replay_corpus_marker(id: &str) -> &'static str {
+    match id {
+        "cfg-if/multi_search_symbol" => "src/lib.rs",
+        "records/multi_context_refs" => "records.py",
+        "is-plain/multi_files_content" => "test.js",
+        _ => panic!("golden row `{id}` is not a multi-hop replay row"),
     }
 }
 
@@ -229,6 +253,9 @@ pub fn validate_serve_replay_output(row: &GoldenRouteRow, output: &str) -> Repla
     if !output.contains("decision: serve") {
         errors.push("envelope missing `decision: serve`".to_string());
     }
+    if output.contains("decision: reject") {
+        errors.push("envelope reports `decision: reject` for serve replay".to_string());
+    }
     if !output.contains("ledger: ") {
         errors.push("missing ledger metadata line (`ledger:`)".to_string());
     }
@@ -255,6 +282,24 @@ pub fn validate_serve_replay_output(row: &GoldenRouteRow, output: &str) -> Repla
     }
     if output.contains("symforge STEL handler requires SYMFORGE_SURFACE=compact") {
         errors.push("compact surface was not selected".to_string());
+    }
+
+    let step_bodies = extract_served_step_bodies(output);
+    if step_bodies.is_empty() {
+        errors.push("serve replay output missing per-step tool bodies".to_string());
+    }
+    for (tool, body) in &step_bodies {
+        if serve_step_failed(tool, body) {
+            errors.push(format!(
+                "step `{tool}` returned non-success outcome `{}`",
+                serve_step_outcome(tool, body).as_str()
+            ));
+        }
+    }
+    for expected in &row.must_call {
+        if !step_bodies.iter().any(|(tool, _)| tool == expected) {
+            errors.push(format!("missing executed step for `{expected}`"));
+        }
     }
 
     ReplayValidation {
@@ -348,6 +393,26 @@ mod tests {
             "── stel ──\ndecision: serve\nledger: {}\n──\n\nChosen tool: search_text\n\nresults";
         let validation = validate_serve_replay_output(&row, output);
         assert!(validation.passed, "{:?}", validation.errors);
+    }
+
+    #[test]
+    fn validate_rejects_failed_step_body() {
+        let row = GoldenRouteRow {
+            id: "cfg-if/multi_search_symbol".to_string(),
+            query: "search then fetch cfg_if body".to_string(),
+            intent: None,
+            must_call: vec!["search_symbols".to_string(), "get_symbol".to_string()],
+            must_not_call: vec![],
+            expected_decision: AdmissionDecision::Serve,
+            expected_equiv: Some(true),
+            chain: Some("multi".to_string()),
+            eligible_h6: Some(true),
+            notes: None,
+        };
+        let output = "── stel ──\ndecision: serve\nledger: {}\n──\n\nStep 1: Route confidence: inferred\nChosen tool: search_symbols\nInvocation: {}\nRationale: x\nEconomics: serve (ok)\n\nok\n\nStep 2: Route confidence: inferred\nChosen tool: get_symbol\nInvocation: {}\nRationale: y\nEconomics: serve (ok)\n\nFile not found: src/missing.rs";
+        let validation = validate_serve_replay_output(&row, output);
+        assert!(!validation.passed);
+        assert!(validation.errors.iter().any(|e| e.contains("get_symbol")));
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn plan_multi_hop_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
             ),
             planned(
                 "get_symbol",
-                json!({ "name": "cfg_if" }),
+                json!({ "path": "src/lib.rs", "name": "cfg_if" }),
                 IntentBucket::Read,
                 RouteConfidence::Inferred,
                 "multi-hop fetch symbol body",
