@@ -265,3 +265,78 @@ landed as a recall win (no posture change, honest negative result recorded).
   H6/H7/H8 claim, P-T2 partial unchanged. tokio/t2_spawn remains SYMFORGE-LESS /
   bypass-only until a live re-measure proves >= 35% AND a separate T2.4-style
   restoration sign-off is recorded.
+
+---
+
+## 9. Live re-measure result — spawn-ranking-residual FALSIFIED
+
+**Added:** 2026-06-16 (post-implementation live gate).
+
+The ranking lever proposed in Section 5 was implemented and then gated on the
+Section 7 live re-measure **before any commit**. The re-measure ran in a
+POSIX/WSL environment (the same shell class that produced the authoritative 252
+baseline; a Windows `cmd.exe` run of the spike collapses the rg baseline to 0
+due to literal-quote glob handling in `execSync` and is not a valid result).
+
+### Method
+
+- Linux release binary of the ranking branch built in WSL
+  (`CARGO_TARGET_DIR=target-wsl cargo build --release`).
+- Corpora cloned at the pinned SHAs: tokio `7892f60...`, django `f1440a75...`.
+- `node scripts/a029-t2-spike.cjs <linux-bin> <out>` run unmodified (the spike
+  script was **not** patched on this branch — its Windows-shell incompatibility
+  is a separate harness-portability concern, not a ranking change).
+
+### Result (raw artifact: gitignored `target/a029-t2-spawn-ranking-measure.json`)
+
+| Row | Before | After | Delta | Equivalence |
+|-----|--------|-------|-------|-------------|
+| `tokio/t2_spawn` | 87/252 (34.5%) | **87/252 (34.5%)** | **+0** | SYMFORGE-LESS (unchanged) |
+| `tokio/t2_block_on` | 100/141 (70.9%) | 100/141 (70.9%) | +0 | EQUIVALENT (held) |
+| `django/t2_model` | 100/354 (28.2%) | 100/354 (28.2%) | +0 | EQUIVALENT (held) |
+| `django/t2_queryset` | 19/71 (26.8%) | 19/71 (26.8%) | +0 | SYMFORGE-LESS (no regress) |
+
+Overall A-029/T2 remains **VALIDATED 2/4**. `tokio/t2_spawn` did not reach 89.
+
+### Conclusion
+
+**`spawn-ranking-residual` is FALSIFIED.** The +2 gap is **not** recoverable by
+the tested ranking lever. The unit tests proved the ordering *logic*
+(def-subtree promotion within the preserved test/non-test interleave), but live
+recall moved zero.
+
+Likely cause (consistent with the Section 4d caveat, now load-bearing): ranking
+can only reorder files that are **already candidate cited files** — i.e. files
+for which symforge extracted a structured `spawn` reference. Many of the 40
+"missed source" rg-baseline paths are **not** structured recoverable references:
+rg `\bspawn\b` counts the `fn spawn` *definition* token, doc-comment prose, and
+string literals, which symforge correctly does **not** emit as references. Those
+files were never in symforge's candidate set, so promotion has nothing to move
+past the cap. The residual gap is therefore **extraction-bound (and/or
+rg-baseline over-counting), not ranking-bound** — the opposite of this packet's
+Section 4 primary hypothesis.
+
+### Disposition
+
+- **TX-03 / FM-BENCH:** closed as a no-op by #326 evidence (Section 3).
+- **spawn-ranking-residual:** closed as a **measured negative**. No code retained
+  (the ranking implementation was reverted; the branch carries this docs
+  addendum only).
+- **No further ad hoc spawn changes** without one of:
+  1. a baseline-metric audit (does the rg `\bspawn\b` denominator over-count
+     definition-token / comment / string-literal non-references?), or
+  2. a deeper extraction evidence packet (which specific structured `spawn`
+     references symforge drops, proven recoverable).
+
+### v8.1.0 forward order (unchanged goal: full T2)
+
+1. Ledger this negative spawn result (this addendum).
+2. Next v8.1.0 progress target: **`django/t2_queryset`** (19/71, needs 25 = +6,
+   source-dominated / extraction-class, not yet exhausted) — evidence-first,
+   same rigor.
+3. Return to `tokio/t2_spawn` only with a new evidence packet or
+   baseline-metric audit, **not** with guesswork.
+
+**No posture change:** `routes.golden.jsonl` frozen, `tasks.jsonl` unchanged,
+`eligible_h6` unchanged, no H6/H7/H8 claim, P-T2 partial unchanged.
+`tokio/t2_spawn` remains SYMFORGE-LESS / bypass-only.
