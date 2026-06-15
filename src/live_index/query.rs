@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use crate::domain::index::FileClassification;
 use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolRecord};
 
 pub use super::context_bundle::{
@@ -1920,77 +1921,130 @@ impl LiveIndex {
         refs
     }
 
+    fn file_path_is_test(&self, file_path: &str) -> bool {
+        self.get_file(file_path)
+            .map(|file| file.classification.is_test)
+            .unwrap_or_else(|| FileClassification::for_code_path(file_path).is_test)
+    }
+
+    /// Interleave test and non-test file paths so compact `find_references` output
+    /// is not starved of `tests/**` hits by pure lexicographic ordering under file caps.
+    fn order_find_references_file_paths_fair(&self, paths: Vec<String>) -> Vec<String> {
+        let mut tests = Vec::new();
+        let mut non_tests = Vec::new();
+        for path in paths {
+            if self.file_path_is_test(&path) {
+                tests.push(path);
+            } else {
+                non_tests.push(path);
+            }
+        }
+        tests.sort();
+        non_tests.sort();
+
+        let mut out = Vec::with_capacity(tests.len() + non_tests.len());
+        let (mut test_idx, mut non_test_idx) = (0usize, 0usize);
+        while test_idx < tests.len() || non_test_idx < non_tests.len() {
+            if non_test_idx < non_tests.len() {
+                out.push(non_tests[non_test_idx].clone());
+                non_test_idx += 1;
+            }
+            if test_idx < tests.len() {
+                out.push(tests[test_idx].clone());
+                test_idx += 1;
+            }
+        }
+        out
+    }
+
     fn build_find_references_view(
         &self,
         refs: &[(&str, &ReferenceRecord)],
         total_limit: usize,
     ) -> FindReferencesView {
-        let mut by_file: std::collections::BTreeMap<String, Vec<ReferenceHitView>> =
-            std::collections::BTreeMap::new();
-
-        let mut built = 0usize;
+        let mut by_file: HashMap<String, Vec<&ReferenceRecord>> = HashMap::new();
         for (file_path, reference) in refs {
+            by_file
+                .entry((*file_path).to_string())
+                .or_default()
+                .push(*reference);
+        }
+        for file_refs in by_file.values_mut() {
+            file_refs.sort_by_key(|reference| (reference.line_range.0, reference.byte_range.0));
+        }
+
+        let total_files = by_file.len();
+        let ordered_paths =
+            self.order_find_references_file_paths_fair(by_file.keys().cloned().collect());
+
+        let mut files: Vec<ReferenceFileView> = Vec::new();
+        let mut built = 0usize;
+
+        for file_path in ordered_paths {
             if built >= total_limit {
                 break;
             }
-            let Some(file) = self.get_file(file_path) else {
+            let Some(file_refs) = by_file.get(&file_path) else {
+                continue;
+            };
+            let Some(file) = self.get_file(&file_path) else {
                 continue;
             };
             let content = String::from_utf8_lossy(&file.content);
             let content_lines: Vec<&str> = content.lines().collect();
-            let ref_line_0 = reference.line_range.0 as usize;
-            let ctx_start = ref_line_0.saturating_sub(1);
-            let ctx_end = if content_lines.is_empty() {
-                0
-            } else {
-                (ref_line_0 + 1).min(content_lines.len() - 1)
-            };
-            let enclosing_annotation = reference
-                .enclosing_symbol_index
-                .and_then(|idx| file.symbols.get(idx as usize))
-                .map(|sym| format!("  [in {} {}]", sym.kind, sym.name));
 
-            let context_lines = if content_lines.is_empty() {
-                Vec::new()
-            } else {
-                content_lines[ctx_start..=ctx_end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        let zero_based_line = ctx_start + i;
-                        ReferenceContextLineView {
-                            line_number: (zero_based_line + 1) as u32,
-                            text: (*line).to_string(),
-                            is_reference_line: zero_based_line == ref_line_0,
-                            enclosing_annotation: if zero_based_line == ref_line_0 {
-                                enclosing_annotation.clone()
-                            } else {
-                                None
-                            },
-                        }
-                    })
-                    .collect()
-            };
+            let mut hits = Vec::new();
+            for reference in file_refs {
+                if built >= total_limit {
+                    break;
+                }
+                let ref_line_0 = reference.line_range.0 as usize;
+                let ctx_start = ref_line_0.saturating_sub(1);
+                let ctx_end = if content_lines.is_empty() {
+                    0
+                } else {
+                    (ref_line_0 + 1).min(content_lines.len() - 1)
+                };
+                let enclosing_annotation = reference
+                    .enclosing_symbol_index
+                    .and_then(|idx| file.symbols.get(idx as usize))
+                    .map(|sym| format!("  [in {} {}]", sym.kind, sym.name));
 
-            by_file
-                .entry((*file_path).to_string())
-                .or_default()
-                .push(ReferenceHitView { context_lines });
-            built += 1;
+                let context_lines = if content_lines.is_empty() {
+                    Vec::new()
+                } else {
+                    content_lines[ctx_start..=ctx_end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            let zero_based_line = ctx_start + i;
+                            ReferenceContextLineView {
+                                line_number: (zero_based_line + 1) as u32,
+                                text: (*line).to_string(),
+                                is_reference_line: zero_based_line == ref_line_0,
+                                enclosing_annotation: if zero_based_line == ref_line_0 {
+                                    enclosing_annotation.clone()
+                                } else {
+                                    None
+                                },
+                            }
+                        })
+                        .collect()
+                };
+
+                hits.push(ReferenceHitView { context_lines });
+                built += 1;
+            }
+
+            if !hits.is_empty() {
+                files.push(ReferenceFileView { file_path, hits });
+            }
         }
 
-        let total_files = refs
-            .iter()
-            .map(|(f, _)| *f)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
         FindReferencesView {
             total_refs: refs.len(),
             total_files,
-            files: by_file
-                .into_iter()
-                .map(|(file_path, hits)| ReferenceFileView { file_path, hits })
-                .collect(),
+            files,
         }
     }
 
@@ -3902,6 +3956,45 @@ mod tests {
                 .unwrap_or("")
                 .contains("run")
         );
+    }
+
+    #[test]
+    fn test_capture_find_references_view_interleaves_test_files() {
+        let source_ref = make_file_with_refs_and_content(
+            "src/lib.rs",
+            LanguageId::Rust,
+            "pub fn target() {}\n",
+            vec![],
+            vec![],
+        );
+        let bench_ref = make_file_with_refs_and_content(
+            "benches/bench.rs",
+            LanguageId::Rust,
+            "fn bench() { target(); }\n",
+            vec![make_ref("target", None, ReferenceKind::Call, None, 0)],
+            vec![],
+        );
+        let test_ref = make_file_with_refs_and_content(
+            "tests/unit.rs",
+            LanguageId::Rust,
+            "fn test_target() { target(); }\n",
+            vec![make_ref("target", None, ReferenceKind::Call, None, 0)],
+            vec![],
+        );
+        let index = make_index(
+            vec![
+                ("src/lib.rs", source_ref),
+                ("benches/bench.rs", bench_ref),
+                ("tests/unit.rs", test_ref),
+            ],
+            false,
+        );
+
+        let view = index.capture_find_references_view("target", None, 200);
+
+        assert_eq!(view.files.len(), 2);
+        assert_eq!(view.files[0].file_path, "benches/bench.rs");
+        assert_eq!(view.files[1].file_path, "tests/unit.rs");
     }
 
     #[test]

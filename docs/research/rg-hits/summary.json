@@ -1,18 +1,17 @@
 {
-  "measuredAt": "2026-06-14T23:17:19.187Z",
-  "symforgeCommit": "830ad8f44787d01273ea0e70600fb5c8df86f4cc",
+  "measuredAt": "2026-06-15T11:53:33.580Z",
+  "symforgeCommit": "fe6c42fb26fadcd6cf3ee00294c15054f511c8ff",
   "run_symforge": true,
   "tasks": [
     {
       "task_id": "tokio/t2_spawn",
       "baseline_paths": 252,
       "cited_paths": 100,
-      "matched_paths": 83,
-      "baseline_recall": 0.3294,
+      "matched_paths": 87,
+      "baseline_recall": 0.3452,
       "missed_bucket_counts": {
-        "test": 124,
-        "source": 40,
-        "bench": 5
+        "test": 125,
+        "source": 40
       },
       "artifact": "docs/research/rg-hits/tokio/t2_spawn.json"
     },
@@ -23,8 +22,8 @@
       "matched_paths": 100,
       "baseline_recall": 0.7092,
       "missed_bucket_counts": {
-        "test": 28,
-        "source": 13
+        "source": 13,
+        "test": 28
       },
       "artifact": "docs/research/rg-hits/tokio/t2_block_on.json"
     },
@@ -47,8 +46,8 @@
       "matched_paths": 100,
       "baseline_recall": 0.2825,
       "missed_bucket_counts": {
-        "source": 215,
-        "test": 39
+        "source": 210,
+        "test": 44
       },
       "artifact": "docs/research/rg-hits/django/t2_model.json"
     }
