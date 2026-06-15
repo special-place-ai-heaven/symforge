@@ -105,3 +105,9 @@ node scripts/a029-t21-rg-inventory.cjs "$(pwd)/target/debug/symforge"
 ```
 
 Corpus SHAs: see `corpus_sha` in each rg-hits JSON.
+
+## Live eval follow-up (2026-06-16)
+
+| Artifact | Path | Maps to |
+|----------|------|---------|
+| Cross-repo MCP battery (7.27.0) | [`live-eval-2026-06-16.md`](./live-eval-2026-06-16.md) | SF-LIVE-002/003 → T2 recall; SF-LIVE-001 → dependents contract |
