@@ -251,6 +251,27 @@ pub(crate) fn symforge_edit_apply_write_mode(output: &str) -> &'static str {
     }
 }
 
+/// Whether a `symforge_edit` body reports an internal failure (as opposed to an
+/// invalid request, classified separately by the caller).
+///
+/// `apply` gates the apply-only failure sentinels (`Write mode: failed` from
+/// `stel::edit_apply::format_apply_metadata`, and `: edit safety blocked` from
+/// [`format_capability_warning`]) so a dry-run preview is never misclassified
+/// as a failed write. `Index not loaded.` is unconditional because the index is
+/// unavailable for previews and applies alike. `tool_body` is the trust/result
+/// envelope text; `full_body` is the complete summary carrying apply metadata.
+pub(crate) fn symforge_edit_internal_failure(
+    tool_body: &str,
+    apply: bool,
+    full_body: &str,
+) -> bool {
+    if tool_body.starts_with("Index not loaded.") {
+        return true;
+    }
+    apply
+        && (full_body.contains("Write mode: failed") || tool_body.contains(": edit safety blocked"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +339,51 @@ mod tests {
         );
         assert!(!edit_output_bytes_committed(&blocked));
         assert_eq!(symforge_edit_apply_write_mode(&blocked), "failed");
+    }
+
+    #[test]
+    fn symforge_edit_internal_failure_gates_apply_only_sentinels() {
+        // Index-unavailable is unconditional: a failure for preview and apply alike.
+        assert!(symforge_edit_internal_failure(
+            "Index not loaded.",
+            false,
+            "Index not loaded."
+        ));
+        assert!(symforge_edit_internal_failure(
+            "Index not loaded.",
+            true,
+            "Index not loaded."
+        ));
+
+        // `Write mode: failed` only counts as a failure on an apply, never a preview.
+        let failed_apply = "Write mode: failed\nChanged file: src/a.rs";
+        assert!(symforge_edit_internal_failure("ok", true, failed_apply));
+        assert!(!symforge_edit_internal_failure("ok", false, failed_apply));
+
+        // `: edit safety blocked` is likewise apply-gated.
+        let blocked = format_capability_warning(
+            "replace_symbol_body",
+            "html",
+            "structural-edit-safe",
+            "text-edit-safe",
+            "use edit_within_symbol",
+        );
+        assert!(symforge_edit_internal_failure(&blocked, true, &blocked));
+        assert!(!symforge_edit_internal_failure(&blocked, false, &blocked));
+
+        // A clean committed apply is not an internal failure.
+        let committed = format!(
+            "{}\nWrite mode: committed",
+            format_edit_envelope(
+                EditSafetyMode::StructuralEditSafe,
+                EditSourceAuthority::DiskRefreshed,
+                EditWriteSemantics::AtomicWriteAndReindex,
+                "src/a.rs:1",
+            )
+        );
+        assert!(!symforge_edit_internal_failure(
+            &committed, true, &committed
+        ));
     }
 
     #[test]

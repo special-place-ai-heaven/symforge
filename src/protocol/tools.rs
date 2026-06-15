@@ -8312,13 +8312,10 @@ impl SymForgeServer {
         apply: bool,
         full_body: &str,
     ) -> OutcomeClass {
+        use super::edit_format::symforge_edit_internal_failure;
         if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
-        } else if tool_body.starts_with("Index not loaded.")
-            || (apply
-                && (full_body.contains("Write mode: failed")
-                    || tool_body.contains(": edit safety blocked")))
-        {
+        } else if symforge_edit_internal_failure(tool_body, apply, full_body) {
             OutcomeClass::InternalFailure
         } else {
             OutcomeClass::Found
