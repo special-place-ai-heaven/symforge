@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.27.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.26.0...v7.27.0) (2026-06-15)
+
+
+### Features
+
+* **index:** TX-04 test-path recall for T2 reference tasks ([5bbde13](https://github.com/special-place-ai-heaven/symforge/commit/5bbde13182a6ab4daa3fb52c33c040194353285f))
+* **index:** TX-04 test-path recall via fair ordering and test xref ([ed0fbc6](https://github.com/special-place-ai-heaven/symforge/commit/ed0fbc6cf656ade035e05d144b87e3b95de96b05))
+
 ## [7.26.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.25.0...v7.26.0) (2026-06-15)
 
 
