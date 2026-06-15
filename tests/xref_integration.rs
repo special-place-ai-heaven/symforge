@@ -19,6 +19,7 @@
 ///   test_find_dependents_returns_importers  → TOOL-10
 ///   test_context_bundle_under_100ms         → TOOL-11 (roadmap success criterion 4)
 ///   test_find_references_formatter_output   → TOOL-09
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -159,6 +160,30 @@ def check(obj):
             .iter()
             .map(|(p, r)| (p, &r.kind))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_python_test_path_model_recall() {
+    let models_py = read_fixture("a029-t2/django/tests/basic/models.py");
+    let migrations_py = "from django.db import migrations\n\nclass Migration(migrations.Migration):\n    operations = [migrations.RenameField('Model', 'old', 'new')]\n";
+    let (_dir, shared) = build_index(&[
+        ("tests/basic/models.py", models_py.as_str()),
+        ("tests/migrations/test_ops.py", migrations_py),
+    ]);
+    let index = shared.read();
+
+    let refs = index.find_references_for_name("Model", None, false);
+    let paths: HashSet<_> = refs.iter().map(|(path, _)| *path).collect();
+    assert!(
+        paths.contains("tests/basic/models.py"),
+        "models.Model inheritance in tests/** should index, paths: {:?}",
+        paths
+    );
+    assert!(
+        paths.contains("tests/migrations/test_ops.py"),
+        "string migration Model arg should index, paths: {:?}",
+        paths
     );
 }
 

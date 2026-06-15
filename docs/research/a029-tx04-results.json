@@ -1,0 +1,82 @@
+{
+  "measuredAt": "2026-06-15T11:52:24.992Z",
+  "surface": "compact",
+  "method": "symforge compact + rg baseline file recall",
+  "baselineCommit": "fe6c42fb26fadcd6cf3ee00294c15054f511c8ff",
+  "rows": [
+    {
+      "id": "django/t2_model",
+      "repo": "django",
+      "query": "references to Model",
+      "symbol": "Model",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "EQUIVALENT",
+      "baseline_paths": 354,
+      "matched_paths": 100,
+      "baseline_recall": 0.2825,
+      "min_baseline_recall": 0.25,
+      "chain_failed": false,
+      "diagnostics": "recall=28.2% matched 100/354 rg files"
+    },
+    {
+      "id": "django/t2_queryset",
+      "repo": "django",
+      "query": "who references QuerySet",
+      "symbol": "QuerySet",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "SYMFORGE-LESS",
+      "baseline_paths": 71,
+      "matched_paths": 19,
+      "baseline_recall": 0.2676,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=26.8% need >=35%; tools=find_references"
+    },
+    {
+      "id": "tokio/t2_block_on",
+      "repo": "tokio",
+      "query": "references to block_on",
+      "symbol": "block_on",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "EQUIVALENT",
+      "baseline_paths": 141,
+      "matched_paths": 100,
+      "baseline_recall": 0.7092,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=70.9% matched 100/141 rg files"
+    },
+    {
+      "id": "tokio/t2_spawn",
+      "repo": "tokio",
+      "query": "who references spawn",
+      "symbol": "spawn",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "SYMFORGE-LESS",
+      "baseline_paths": 252,
+      "matched_paths": 87,
+      "baseline_recall": 0.3452,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=34.5% need >=35%; tools=find_references"
+    }
+  ],
+  "t2_equiv_pass": 2,
+  "t2_tasks_total": 4,
+  "verdict": "PASS",
+  "pivot_policy": null,
+  "skippedTasks": [],
+  "notes": "A-029 T2 spike PASS: >=2/4 reference tasks achieved sidecar-parity recall threshold."
+}

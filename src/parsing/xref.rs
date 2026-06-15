@@ -92,6 +92,9 @@ const PYTHON_XREF_QUERY: &str = r#"
 ; Attribute types in annotations: models.QuerySet
 (type (attribute attribute: (identifier) @ref.type))
 
+; Attribute chains: models.Model.__hash__
+(attribute object: (attribute attribute: (identifier) @ref.type))
+
 ; Subscript with attribute base (legacy grammar)
 (type (subscript value: (attribute attribute: (identifier) @ref.type)))
 (subscript value: (attribute attribute: (identifier) @ref.type))
@@ -113,6 +116,10 @@ const PYTHON_XREF_QUERY: &str = r#"
 const PYTHON_VALUE_TYPE_IDENT_QUERY: &str = r#"
 (argument_list (identifier) @ref.value)
 (argument_list (attribute attribute: (identifier) @ref.value_attr))
+"#;
+
+const PYTHON_STRING_TYPE_QUERY: &str = r#"
+(argument_list (string) @ref.string)
 "#;
 
 const JS_XREF_QUERY: &str = r#"
@@ -418,6 +425,7 @@ static RUST_CONST_DEF_QUERY_C: OnceLock<Query> = OnceLock::new();
 static RUST_VALUE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
 static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
 static PYTHON_VALUE_TYPE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
+static PYTHON_STRING_TYPE_QUERY_C: OnceLock<Query> = OnceLock::new();
 static JS_QUERY: OnceLock<Query> = OnceLock::new();
 static TS_QUERY: OnceLock<Query> = OnceLock::new();
 // A tree-sitter Query binds to a specific Language's node-kind IDs. The TSX
@@ -462,6 +470,12 @@ fn python_value_type_ident_query(lang: &Language) -> &'static Query {
     PYTHON_VALUE_TYPE_IDENT_QUERY_C.get_or_init(|| {
         Query::new(lang, PYTHON_VALUE_TYPE_IDENT_QUERY)
             .expect("valid python value-type ident query")
+    })
+}
+
+fn python_string_type_query(lang: &Language) -> &'static Query {
+    PYTHON_STRING_TYPE_QUERY_C.get_or_init(|| {
+        Query::new(lang, PYTHON_STRING_TYPE_QUERY).expect("valid python string-type query")
     })
 }
 
@@ -754,6 +768,83 @@ fn extract_python_value_refs(
             enclosing_symbol_index: None,
         });
         emitted_ranges.insert(range);
+    }
+
+    out
+}
+
+fn python_string_type_name(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })?;
+    let unquoted = unquoted.trim();
+    if unquoted.is_empty() {
+        return None;
+    }
+    if python_name_looks_like_type(unquoted) {
+        return Some((unquoted.to_string(), None));
+    }
+    if let Some((prefix, name)) = unquoted.rsplit_once('.')
+        && python_name_looks_like_type(name)
+    {
+        return Some((name.to_string(), Some(format!("{prefix}.{name}"))));
+    }
+    None
+}
+
+/// Resolve class-name tokens in string call arguments (migration labels, mock.patch paths).
+fn extract_python_string_type_refs(
+    root: &Node,
+    source: &str,
+    ts_language: &Language,
+    existing: &[ReferenceRecord],
+) -> Vec<ReferenceRecord> {
+    let source_bytes = source.as_bytes();
+    let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
+    let string_query = python_string_type_query(ts_language);
+    let string_capture_names = string_query.capture_names();
+    let mut out: Vec<ReferenceRecord> = Vec::new();
+    let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(string_query, *root, source_bytes);
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        for capture in m.captures {
+            if string_capture_names[capture.index as usize] != "ref.string" {
+                continue;
+            }
+            let node = capture.node;
+            let range = (node.start_byte() as u32, node.end_byte() as u32);
+            if existing_ranges.contains(&range) || emitted_ranges.contains(&range) {
+                continue;
+            }
+            let Ok(text) = node.utf8_text(source_bytes) else {
+                continue;
+            };
+            let Some((name, qualified_name)) = python_string_type_name(text) else {
+                continue;
+            };
+            let start = node.start_position();
+            let end = node.end_position();
+            out.push(ReferenceRecord {
+                name,
+                qualified_name,
+                kind: ReferenceKind::ValueUse,
+                byte_range: range,
+                line_range: (start.row as u32, end.row as u32),
+                enclosing_symbol_index: None,
+            });
+            emitted_ranges.insert(range);
+        }
     }
 
     out
@@ -1336,6 +1427,8 @@ pub fn extract_references(
     if *language == LanguageId::Python {
         let value_refs = extract_python_value_refs(root, source, &ts_language, &references);
         references.extend(value_refs);
+        let string_refs = extract_python_string_type_refs(root, source, &ts_language, &references);
+        references.extend(string_refs);
     }
 
     (references, alias_map)
@@ -1955,6 +2048,45 @@ fn helper(n: usize) {
             has_ref(&refs, "Model", ReferenceKind::ValueUse),
             "refs: {:?}",
             refs
+        );
+    }
+
+    #[test]
+    fn test_python_model_attribute_chain() {
+        let (refs, _) = parse_and_extract("__hash__ = models.Model.__hash__", LanguageId::Python);
+        assert!(
+            has_ref(&refs, "Model", ReferenceKind::TypeUsage),
+            "refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_python_string_model_migration_arg() {
+        let (refs, _) = parse_and_extract(
+            "migrations.RenameField(\"Model\", \"old\", \"new\")",
+            LanguageId::Python,
+        );
+        assert!(
+            has_ref(&refs, "Model", ReferenceKind::ValueUse),
+            "refs: {:?}",
+            refs
+        );
+    }
+
+    #[test]
+    fn test_python_mock_patch_dotted_model_string() {
+        let (refs, _) =
+            parse_and_extract("mock.patch(\"django.db.models.Model\")", LanguageId::Python);
+        let model_ref = refs.iter().find(|r| r.name == "Model");
+        assert!(
+            model_ref.is_some(),
+            "mock.patch dotted path should surface Model, refs: {:?}",
+            refs
+        );
+        assert_eq!(
+            model_ref.unwrap().qualified_name.as_deref(),
+            Some("django.db.models.Model")
         );
     }
 
