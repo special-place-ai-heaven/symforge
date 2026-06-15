@@ -198,6 +198,59 @@ pub(crate) fn format_batch_summary(results: &[String], file_count: usize) -> Str
     out
 }
 
+const WRITE_SEMANTICS_LINE_PREFIX: &str = "Write semantics: ";
+
+/// Parse the normative `Write semantics:` envelope line from legacy edit tool output.
+pub(crate) fn parse_write_semantics_from_output(output: &str) -> Option<EditWriteSemantics> {
+    output.lines().find_map(|line| {
+        let label = line.strip_prefix(WRITE_SEMANTICS_LINE_PREFIX)?.trim();
+        Some(match label {
+            "dry run (no writes)" => EditWriteSemantics::DryRunNoWrites,
+            "atomic write + reindex" => EditWriteSemantics::AtomicWriteAndReindex,
+            "transactional write + rollback + reindex" => {
+                EditWriteSemantics::TransactionalWriteRollbackAndReindex
+            }
+            _ => return None,
+        })
+    })
+}
+
+fn edit_output_is_error(output: &str) -> bool {
+    output.starts_with("Error:")
+        || output.starts_with("Invalid")
+        || output.contains(": edit safety blocked")
+        || output.starts_with("Index not loaded.")
+        || output.starts_with("Index is loading")
+        || output.starts_with("Index degraded:")
+        || output.starts_with("File not found:")
+        || output.starts_with("Symbol not found:")
+}
+
+/// Whether legacy edit output indicates a committed write (not dry-run preview).
+pub(crate) fn edit_output_bytes_committed(output: &str) -> bool {
+    if edit_output_is_error(output) {
+        return false;
+    }
+    matches!(
+        parse_write_semantics_from_output(output),
+        Some(EditWriteSemantics::AtomicWriteAndReindex)
+            | Some(EditWriteSemantics::TransactionalWriteRollbackAndReindex)
+    )
+}
+
+/// Write mode for compact `symforge_edit` apply metadata (`committed` / `dry_run` / `failed`).
+pub(crate) fn symforge_edit_apply_write_mode(output: &str) -> &'static str {
+    if edit_output_is_error(output) {
+        return "failed";
+    }
+    match parse_write_semantics_from_output(output) {
+        Some(EditWriteSemantics::DryRunNoWrites) => "dry_run",
+        Some(EditWriteSemantics::AtomicWriteAndReindex)
+        | Some(EditWriteSemantics::TransactionalWriteRollbackAndReindex) => "committed",
+        None => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +283,55 @@ mod tests {
         assert!(result.contains("Required safety: structural-edit-safe"));
         assert!(result.contains("Available safety: text-edit-safe"));
         assert!(result.contains("Language: html"));
+    }
+
+    #[test]
+    fn edit_output_bytes_committed_uses_write_semantics_not_summary_wording() {
+        let envelope = format_edit_envelope(
+            EditSafetyMode::StructuralEditSafe,
+            EditSourceAuthority::DiskRefreshed,
+            EditWriteSemantics::AtomicWriteAndReindex,
+            "src/lib.rs:1",
+        );
+        let committed = format!("{envelope}\nsrc/lib.rs — updated function `foo` (10 → 12 bytes)");
+        assert!(edit_output_bytes_committed(&committed));
+        assert_eq!(symforge_edit_apply_write_mode(&committed), "committed");
+
+        let dry = format!(
+            "{}\n[DRY RUN] Would replace `foo` in src/lib.rs",
+            format_edit_envelope(
+                EditSafetyMode::StructuralEditSafe,
+                EditSourceAuthority::DiskRefreshed,
+                EditWriteSemantics::DryRunNoWrites,
+                "src/lib.rs:1",
+            )
+        );
+        assert!(!edit_output_bytes_committed(&dry));
+        assert_eq!(symforge_edit_apply_write_mode(&dry), "dry_run");
+
+        let blocked = format_capability_warning(
+            "replace_symbol_body",
+            "html",
+            "structural-edit-safe",
+            "text-edit-safe",
+            "use edit_within_symbol",
+        );
+        assert!(!edit_output_bytes_committed(&blocked));
+        assert_eq!(symforge_edit_apply_write_mode(&blocked), "failed");
+    }
+
+    #[test]
+    fn parse_write_semantics_from_output_reads_envelope_line() {
+        let output = format_edit_envelope(
+            EditSafetyMode::StructuralEditSafe,
+            EditSourceAuthority::CurrentIndex,
+            EditWriteSemantics::TransactionalWriteRollbackAndReindex,
+            "src/a.rs:3",
+        );
+        assert_eq!(
+            parse_write_semantics_from_output(&output),
+            Some(EditWriteSemantics::TransactionalWriteRollbackAndReindex)
+        );
     }
 
     #[test]

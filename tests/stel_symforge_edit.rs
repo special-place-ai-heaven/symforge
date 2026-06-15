@@ -74,6 +74,15 @@ async fn dispatch_symforge_edit(server: &SymForgeServer, request: &StelEditReque
     tool_result_text(&dispatch_symforge_edit_result(server, request).await).to_string()
 }
 
+fn ledger_meta_from_output(output: &str) -> symforge::stel::LedgerEnvelopeMeta {
+    let ledger_json = output
+        .lines()
+        .find(|line| line.starts_with("ledger: "))
+        .expect("ledger line in envelope")
+        .trim_start_matches("ledger: ");
+    serde_json::from_str(ledger_json).expect("ledger json")
+}
+
 #[tokio::test]
 async fn symforge_edit_rejects_non_compact_surface() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
@@ -289,14 +298,14 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
     )
     .await;
 
-    for needle in [
-        "── stel ──",
-        "already applied",
-        "Write mode: already_applied",
-        "ledger:",
-    ] {
+    for needle in ["already applied", "Write mode: already_applied", "ledger:"] {
         assert!(output.contains(needle), "missing `{needle}` in:\n{output}");
     }
+    let meta = ledger_meta_from_output(&output);
+    assert!(
+        !meta.legacy_executed,
+        "already-applied must not count as committed write"
+    );
     assert_eq!(before, std::fs::read(&file_path).unwrap());
 }
 
@@ -343,11 +352,15 @@ async fn symforge_edit_preview_then_apply_writes_once() {
         "Write mode: committed",
         "Byte range:",
         "Line range:",
-        "replaced",
         "Write semantics: atomic write + reindex",
     ] {
         assert!(apply.contains(needle), "missing `{needle}` in:\n{apply}");
     }
+    let meta = ledger_meta_from_output(&apply);
+    assert!(
+        meta.legacy_executed,
+        "successful apply must record legacy_executed from write-semantics envelope"
+    );
     let on_disk = std::fs::read_to_string(&file_path).unwrap();
     assert!(on_disk.contains("new"), "disk after apply: {on_disk}");
     assert!(!on_disk.contains("old"), "disk after apply: {on_disk}");
