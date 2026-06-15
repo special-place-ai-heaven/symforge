@@ -49,7 +49,7 @@ Store records in this file (human) and optionally `docs/stel-assumptions.json` (
 | **0 baseline** | Phase 0 **exits** when A-001..A-004 validated (measurement harness trustworthy) |
 | **0 L0 choice** | A-019 validated (compact-3 vs meta-tool — **before** locking Phase 1 tools) |
 | **1 types + L0** | A-005, A-025 validated (compact schema ≤5kB including edit) |
-| **2 L1 + L2** | A-008..A-014 evidence recorded (PARTIAL/VALIDATED/OPEN); A-029 spike complete (PIVOT/P-T2) |
+| **2 L1 + L2** | A-008..A-014 evidence recorded (PARTIAL/VALIDATED/OPEN); A-029 spike complete (VALIDATED 2/4; P-T2 partial) |
 | **3 executor + 8.0** | A-015..A-016 validated |
 | **4 quality + deploy + 8.1** | 8.0.0 shipped; A-020..A-022 validated |
 
@@ -127,7 +127,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | **A-026** | **H4** uses **`session_net_accepted`** (accepted serve rows only); `session_net_all36` reported separately | RESULTS.md §8.2 + compare-results.js | **OPEN** |
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |
 | **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **VALIDATED** |
-| **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | [`research/A-029-t2-spike.md`](research/A-029-t2-spike.md) | **PIVOT** (0/4 equiv; P-T2 registered 2026-06-14) |
+| **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | [`research/A-029-t24-restoration-signoff.md`](research/A-029-t24-restoration-signoff.md) | **VALIDATED** (2/4 equiv post-TX-04; P-T2 **partial** — 2 serve-eligible, 2 bypass-only; 2026-06-15) |
 | **A-031** | Phase 0.12 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-031-rmcp-spike.md` | **OPEN** |
 | **A-032** | Full-file review tasks use policy **P-FF** (bypass, `eligible_h6=false`) | 4 rows in `routes.golden.jsonl` | **OPEN** |
 
@@ -166,7 +166,7 @@ Updated by [speckit.implement](../specs/002-v8-phase2-stel-controller/tasks.md) 
 | **A-012** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md), [`research/phase2-gate-report.md`](research/phase2-gate-report.md) | **PARTIAL** | Serve-only H3 scope; H3 PASS; two-hop completion not shipped |
 | **A-013** | [`tests/stel_l2_admission.rs`](../tests/stel_l2_admission.rs) | **VALIDATED** | cache_hit admission + tests |
 | **A-014** | [`src/stel/executor.rs`](../src/stel/executor.rs) degrade caps | **OPEN** | Degrade shipped; T3-large battery deferred |
-| **A-029** | [`research/A-029-t2-spike.md`](research/A-029-t2-spike.md) | **PIVOT** | 0/4 T2 equiv; P-T2 bypass-only; `eligible_h6=false` when policy lands |
+| **A-029** | [`research/A-029-t24-restoration-signoff.md`](research/A-029-t24-restoration-signoff.md) | **VALIDATED** | 2/4 T2 equiv post-TX-04; P-T2 partial — `tokio/t2_block_on` + `django/t2_model` serve-eligible (`eligible_h6=true`), `tokio/t2_spawn` + `django/t2_queryset` bypass-only |
 
 ## When an assumption is invalidated
 
@@ -208,6 +208,20 @@ failure: 0/4 T2 equivalence on tokio+django (rg baseline recall 5–14% vs index
 research: docs/research/A-029-t2-spike.md; scripts/a029-t2-spike.cjs
 conclusion: PIVOT — register P-T2 bypass-only for T2 reference tasks; eligible_h6=false; 8.1 index-recall program
 resume: Phase 3 executor + 8.1 T2/T3 quality program — not Phase 2 runtime masking
+```
+
+#### A-029 — T2 reference parity, post-TX-04 resolution (2026-06-15)
+
+```text
+assumption_id: A-029
+result: VALIDATED — 2/4 T2 equivalence after TX-01/TX-02/TX-04 remediation (was 0/4 at Phase 2)
+evidence: docs/research/A-029-t2-replay.json (matches a029-tx04-results.json); T2.4 sign-off GO
+rows: tokio/t2_block_on EQUIVALENT 70.9% and django/t2_model EQUIVALENT 28.2% (>=25%) → serve, eligible_h6=true;
+      tokio/t2_spawn SYMFORGE-LESS 34.5% (<35%) and django/t2_queryset SYMFORGE-LESS 26.8% (<35%) → bypass, eligible_h6=false
+policy: P-T2 becomes PARTIAL — row-level, not blanket. Non-equivalent rows remain bypass-only.
+scope: row-level posture recorded in tests/fixtures/a029-t2/tasks.jsonl (external fixture home);
+       docs/fixtures/routes.golden.jsonl (frozen 36-row in-repo corpus) unchanged.
+non-claims: no H6/H7/H8 gate PASS; not full T2 closure (2/4 != 4/4); TX-03 bench deferred
 ```
 
 ---

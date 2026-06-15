@@ -10,10 +10,33 @@
 
 | Field | Value |
 |-------|-------|
-| **Reviewer** | _Independent reviewer (not evidence producer)_ |
-| **Evidence producer** | Cloud agent — T2.4 proposal packet |
-| **Date** | _Pending_ |
-| **Decision** | **PENDING** |
+| **Reviewer** | Independent reviewer (not evidence producer) |
+| **Evidence producer** | Cloud agent — T2.4 proposal packet (#321) |
+| **Date** | 2026-06-15 |
+| **Decision** | **GO** — row-level restoration authorized (retargeted; see note below) |
+
+## Implementation note — restoration retarget (2026-06-15)
+
+During restoration the authorized target was changed from
+[`docs/fixtures/routes.golden.jsonl`](../../docs/fixtures/routes.golden.jsonl) to
+[`tests/fixtures/a029-t2/tasks.jsonl`](../../tests/fixtures/a029-t2/tasks.jsonl).
+
+**Reason:** `routes.golden.jsonl` is the frozen 36-row **in-repo sf-bench** golden
+corpus. Its rows are pinned to local corpora (`cfg-if/`, `records/`, `is-plain/`,
+`compression/`) via `corpus_for_row_id` in [`src/stel/golden_replay.rs`](../../src/stel/golden_replay.rs),
+and the row count is asserted at exactly 36 in three guards
+(`scripts/validate-routes-golden.cjs`, `src/stel/golden_replay.rs` tests, and
+`tests/stel_golden_replay.rs` / `tests/stel_l3_enforcement.rs` which panic on any
+unmapped id). Adding external `tokio/`/`django/` rows there would require `src/**`
+runtime/test changes and break those guards — outside the authorized scope.
+
+`tokio`/`django` are **external A-029 reference fixtures**, so their row-level
+serve/eligibility posture is correctly recorded in `tests/fixtures/a029-t2/tasks.jsonl`
+(their data home). `routes.golden.jsonl` is intentionally left **unchanged**.
+
+This retarget does not alter the row-level decision: only the two EQUIVALENT rows
+(`tokio/t2_block_on`, `django/t2_model`) move to `serve` + `eligible_h6=true`; the two
+SYMFORGE-LESS rows remain `bypass` + `eligible_h6=false`.
 
 ## Replay summary (binding inputs)
 
@@ -33,9 +56,9 @@
 
 ## Exact proposed changes (after reviewer GO only)
 
-**Target file:** [`docs/fixtures/routes.golden.jsonl`](../../docs/fixtures/routes.golden.jsonl)
+**Target file (retargeted):** [`tests/fixtures/a029-t2/tasks.jsonl`](../../tests/fixtures/a029-t2/tasks.jsonl) — see [Implementation note](#implementation-note--restoration-retarget-2026-06-15). `docs/fixtures/routes.golden.jsonl` is **unchanged**.
 
-**Current state:** No external T2 rows present (36 in-repo rows only). Restoration commit would **add four** T2 reference rows sourced from [`tests/fixtures/a029-t2/tasks.jsonl`](../../tests/fixtures/a029-t2/tasks.jsonl).
+**Current state:** The four external A-029 T2 tasks already exist in `tests/fixtures/a029-t2/tasks.jsonl`. The restoration commit **adds row-level posture fields** (`expected_decision`, `expected_equiv`, `eligible_h6`) to those existing rows; the two EQUIVALENT rows become serve-eligible, the two SYMFORGE-LESS rows stay bypass-only.
 
 ### Rows proposed for serve + H6 eligibility
 
@@ -72,32 +95,43 @@
 
 ## Reviewer checklist
 
-- [ ] Replay evidence valid — [`A-029-t2-replay.json`](./A-029-t2-replay.json) matches [`a029-tx04-results.json`](./a029-tx04-results.json) row data
-- [ ] **2/4 threshold met** — machine verdict PASS confirmed
-- [ ] **Row-level restoration only** — equiv rows proposed individually; no blanket 4/4 lift
-- [ ] **Non-equivalent rows remain bypass-only** — `tokio/t2_spawn`, `django/t2_queryset` stay P-T2
-- [ ] **No H6/H7/H8 claim** — restoration adjusts eligible denominator only; no gate pass asserted
-- [ ] **No runtime changes** in proposal packet; restoration commit limited to golden + assumption/docs
-- [ ] In-repo `t4_refs` rows not conflated with external A-029 T2 tasks
-- [ ] TX-01/TX-02/TX-04 remediation commits referenced and merged on `main`
+- [x] Replay evidence valid — [`A-029-t2-replay.json`](./A-029-t2-replay.json) matches [`a029-tx04-results.json`](./a029-tx04-results.json) row data
+- [x] **2/4 threshold met** — machine verdict PASS confirmed
+- [x] **Row-level restoration only** — equiv rows restored individually; no blanket 4/4 lift
+- [x] **Non-equivalent rows remain bypass-only** — `tokio/t2_spawn`, `django/t2_queryset` stay P-T2
+- [x] **No H6/H7/H8 claim** — restoration adjusts eligible denominator only; no gate pass asserted
+- [x] **No runtime changes** — restoration limited to external fixture + assumption/docs (routes.golden.jsonl unchanged)
+- [x] In-repo `t4_refs` rows not conflated with external A-029 T2 tasks
+- [x] TX-01/TX-02/TX-04 remediation commits referenced and merged on `main`
 
 ## Sign-off record (fill on review)
 
 ```yaml
-decision: PENDING  # GO | NO-GO
-reviewer: ""
-date: ""
-comments: ""
-restoration_commit_authorized: false
+decision: GO  # GO | NO-GO
+reviewer: "Independent reviewer (not evidence producer)"
+date: "2026-06-15"
+comments: "2/4 EQUIVALENT confirmed; replay matches a029-tx04-results.json; row-level scope upheld. Restoration retargeted from routes.golden.jsonl to tests/fixtures/a029-t2/tasks.jsonl (see implementation note)."
+restoration_commit_authorized: true
 ```
 
 **GO** authorizes a **separate** restoration PR implementing the table above.
 **NO-GO** retains full P-T2 bypass on all four T2 rows; program exit may still record VALIDATED measurement without golden edits.
 
-## Scope attestation (this proposal packet)
+## Scope attestation
+
+**Proposal packet (#321, merged `ce7da6f`):**
 
 - [x] Evidence / proposal / sign-off docs only
 - [x] No `src/**` diff
 - [x] No golden row edits
 - [x] No `eligible_h6` data changes on `main`
-- [x] Decision remains **PENDING**
+- [x] Decision recorded **PENDING** at merge
+
+**Restoration commit (this branch, after GO):**
+
+- [x] No `src/**` runtime changes
+- [x] `docs/fixtures/routes.golden.jsonl` unchanged (frozen 36-row in-repo corpus)
+- [x] Row-level eligibility recorded in `tests/fixtures/a029-t2/tasks.jsonl` (external fixture)
+- [x] Only the two EQUIVALENT rows restored to serve + `eligible_h6=true`
+- [x] Two SYMFORGE-LESS rows remain bypass-only (`eligible_h6=false`)
+- [x] No H6/H7/H8 PASS claim; no TX-03 bench; no compact MCP tool changes
