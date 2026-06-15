@@ -138,6 +138,30 @@ def run():
     );
 }
 
+#[test]
+fn test_python_django_model_xref_extraction() {
+    let models_py = r#"from django.db import models
+
+class Permission(models.Model):
+    name = models.CharField(max_length=50)
+
+def check(obj):
+    return isinstance(obj, models.Model)
+"#;
+    let (_dir, shared) = build_index(&[("models.py", models_py)]);
+    let index = shared.read();
+
+    let model_refs = index.find_references_for_name("Model", None, false);
+    assert!(
+        model_refs.len() >= 2,
+        "should find Model in inheritance and isinstance, got: {:?}",
+        model_refs
+            .iter()
+            .map(|(p, r)| (p, &r.kind))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // XREF-01, XREF-02: Ruby multi-file xref extraction (coverage backfill)
 //

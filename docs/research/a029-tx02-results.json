@@ -1,0 +1,82 @@
+{
+  "measuredAt": "2026-06-14T23:16:43.598Z",
+  "surface": "compact",
+  "method": "symforge compact + rg baseline file recall",
+  "baselineCommit": "830ad8f44787d01273ea0e70600fb5c8df86f4cc",
+  "rows": [
+    {
+      "id": "django/t2_model",
+      "repo": "django",
+      "query": "references to Model",
+      "symbol": "Model",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "SYMFORGE-LESS",
+      "baseline_paths": 354,
+      "matched_paths": 64,
+      "baseline_recall": 0.1808,
+      "min_baseline_recall": 0.25,
+      "chain_failed": false,
+      "diagnostics": "recall=18.1% need >=25%; tools=find_references"
+    },
+    {
+      "id": "django/t2_queryset",
+      "repo": "django",
+      "query": "who references QuerySet",
+      "symbol": "QuerySet",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "SYMFORGE-LESS",
+      "baseline_paths": 71,
+      "matched_paths": 19,
+      "baseline_recall": 0.2676,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=26.8% need >=35%; tools=find_references"
+    },
+    {
+      "id": "tokio/t2_block_on",
+      "repo": "tokio",
+      "query": "references to block_on",
+      "symbol": "block_on",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "EQUIVALENT",
+      "baseline_paths": 141,
+      "matched_paths": 100,
+      "baseline_recall": 0.7092,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=70.9% matched 100/141 rg files"
+    },
+    {
+      "id": "tokio/t2_spawn",
+      "repo": "tokio",
+      "query": "who references spawn",
+      "symbol": "spawn",
+      "decision": "serve",
+      "tools_called": [
+        "find_references"
+      ],
+      "equivalence": "SYMFORGE-LESS",
+      "baseline_paths": 252,
+      "matched_paths": 83,
+      "baseline_recall": 0.3294,
+      "min_baseline_recall": 0.35,
+      "chain_failed": false,
+      "diagnostics": "recall=32.9% need >=35%; tools=find_references"
+    }
+  ],
+  "t2_equiv_pass": 1,
+  "t2_tasks_total": 4,
+  "verdict": "PIVOT",
+  "pivot_policy": "P-T2 bypass-only for reference tasks (grep envelope; eligible_h6=false)",
+  "skippedTasks": [],
+  "notes": "A-029 T2 spike PIVOT: register P-T2 bypass-only policy for reference tasks; adjust H6 denominator."
+}
