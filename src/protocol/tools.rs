@@ -8280,22 +8280,14 @@ impl SymForgeServer {
         );
         let mut body = format!("{routing_meta}\n\n{tool_body}");
         if apply && let Some(symbol) = resolved_symbol.as_ref() {
-            let write_mode = if tool_body.contains("replaced") {
-                "committed"
-            } else if tool_body.contains("[DRY RUN]") {
-                "dry_run"
-            } else {
-                "failed"
-            };
+            let write_mode = super::edit_format::symforge_edit_apply_write_mode(&tool_body);
             body = format!(
                 "{routing_meta}\n\n{}\n\n{tool_body}",
                 format_apply_metadata(symbol, write_mode)
             );
         }
 
-        let legacy_executed = apply
-            && tool_body.contains("replaced")
-            && tool_body.contains("Write semantics: atomic write + reindex");
+        let legacy_executed = apply && super::edit_format::edit_output_bytes_committed(&tool_body);
         let output = self.finalize_symforge_with_ledger(
             "symforge_edit",
             &crate::stel::StelRequest::default(),
