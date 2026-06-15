@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.26.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.25.0...v7.26.0) (2026-06-15)
+
+
+### Features
+
+* **xref:** TX-02 Python structured-reference recall for django T2 ([c955fc1](https://github.com/special-place-ai-heaven/symforge/commit/c955fc1c13e4e57c650595da7dd3d1cf00146cff))
+* **xref:** TX-02 structured-reference recall for django T2 ([eb60a4b](https://github.com/special-place-ai-heaven/symforge/commit/eb60a4b7a69a01a8f0ab28e87115793218cd14a9))
+
 ## [7.25.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.24.1...v7.25.0) (2026-06-14)
 
 
