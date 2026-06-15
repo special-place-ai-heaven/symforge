@@ -31,6 +31,32 @@ _None filed by producer. Reviewer may add blockers below._
 
 ---
 
-## Milestone exit (T058 — deferred)
+## Milestone exit (T058)
 
-Exit summary and merge sign-off belong to **T2.4** slice, not this PR.
+| Field | Value |
+|-------|-------|
+| **Document** | [`81-index-recall-exit-summary.md`](./81-index-recall-exit-summary.md) |
+| **Decision** | **CLOSED** — VALIDATED 2/4, P-T2 partial |
+| **Date** | 2026-06-15 |
+
+**Program closed at VALIDATED 2/4.** Post-TX-04 replay reached 2/4 T2
+equivalence (machine PASS). T2.4 sign-off **GO**
+([`A-029-t24-restoration-signoff.md`](./A-029-t24-restoration-signoff.md));
+row-level restoration landed in **#322**, retargeted to the external A-029
+fixture [`tests/fixtures/a029-t2/tasks.jsonl`](../../tests/fixtures/a029-t2/tasks.jsonl)
+(`routes.golden.jsonl` remains the frozen 36-row in-repo golden corpus, unchanged).
+Main CI green after #322.
+
+### P-T2 partial posture
+
+- Serve-eligible (`eligible_h6=true`): `tokio/t2_block_on`, `django/t2_model`
+- Bypass-only (`eligible_h6=false`): `tokio/t2_spawn`, `django/t2_queryset`
+
+### Closure checklist
+
+- [x] Exit summary moved from pending/blocked → **CLOSED**
+- [x] VALIDATED 2/4 recorded; P-T2 partial (2 serve-eligible, 2 bypass-only)
+- [x] Restoration landed in #322; retarget to `tests/fixtures/a029-t2/tasks.jsonl` documented
+- [x] `routes.golden.jsonl` intentionally unchanged (frozen 36-row corpus)
+- [x] TX-03 bench deferred / not required for this closure
+- [x] **No H6/H7/H8 PASS claim**; no B-RESULTS / persistence / EMA→L2 / T3 / deploy work
