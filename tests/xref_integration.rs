@@ -165,10 +165,15 @@ def check(obj):
 
 #[test]
 fn test_python_test_path_model_recall() {
-    let models_py = read_fixture("a029-t2/django/tests/basic/models.py");
+    // Inline minimal corpus so this stays deterministic in a clean checkout:
+    // the A-029 `tests/fixtures/a029-t2/django/**` corpus is gitignored and
+    // cloned on demand, so it is absent in CI. These snippets reproduce the
+    // TX-04 test-path xref patterns (inheritance, attribute chain, dotted mock
+    // path) without depending on the external corpus.
+    let models_py = "from django.db import models\nfrom unittest import mock\n\n\nclass Author(models.Model):\n    __hash__ = models.Model.__hash__\n\n\n@mock.patch(\"django.db.models.Model\")\ndef test_patched(_m):\n    pass\n";
     let migrations_py = "from django.db import migrations\n\nclass Migration(migrations.Migration):\n    operations = [migrations.RenameField('Model', 'old', 'new')]\n";
     let (_dir, shared) = build_index(&[
-        ("tests/basic/models.py", models_py.as_str()),
+        ("tests/basic/models.py", models_py),
         ("tests/migrations/test_ops.py", migrations_py),
     ]);
     let index = shared.read();
