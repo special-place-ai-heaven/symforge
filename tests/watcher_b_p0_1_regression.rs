@@ -28,6 +28,11 @@ impl McpClient {
             .env("SYMFORGE_NO_DAEMON", "1")
             .env("SYMFORGE_RECONCILE_INTERVAL", "0")
             .env("SYMFORGE_HOME", home)
+            // This regression test drives the legacy index_folder tool through
+            // the real MCP binary. Compact is now the default surface (v8 P1-A),
+            // so index_folder is gated unless we pin the documented full-surface
+            // opt-out; health_compact stays valid on either surface.
+            .env("SYMFORGE_SURFACE", "full")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
