@@ -1,10 +1,34 @@
 # Spec Kit Agent Brief — Feature 007: Intelligence Pattern Ports (SoulForge → SymForge)
 
-**Purpose:** Single contextual entry point for a [GitHub Spec Kit](https://github.com/github/spec-kit) agent running the SymForge SDD workflow. Read this file **in full** before executing any `/speckit-*` command.
+**Claude Code:** paste `/goal` + the block below (or: `/goal Execute §0 in docs/speckit/007-intelligence-pattern-ports-agent-brief.md`).
+
+## 0. /goal — paste this block
+
+```text
+/goal Run Spec Kit SDD for SymForge feature 007 (Intelligence Pattern Ports) until specs/007-intelligence-pattern-ports is implemented, CI passes, and PR-ready — on branch 007-intelligence-pattern-ports only, without 004/005 bleed, Soul Map ports, or commits unless I ask.
+
+Context: SymForge = Rust MCP code-intelligence (LiveIndex + STEL). Dir: E:\project\symforge. READ FIRST: docs/speckit/007-intelligence-pattern-ports-agent-brief.md (all §). Spec Kit 0.10.2 via .claude/skills/speckit-*/. Branch must stay 007-intelligence-pattern-ports (git branch --show-current). Parallel 004/005 WIP is in E:\project\symforge-review — do not touch. Use SymForge MCP (index_folder, search_symbols, search_text, get_file_context, get_repo_map) before raw src/ reads. 006=admin GUI (reserved).
+
+Success (all true): (1) branch 007-intelligence-pattern-ports only (2) constitution.md filled, no placeholders (3) specs/007-intelligence-pattern-ports/: spec, plan, tasks, research, data-model, contracts/, quickstart, checklists (4) brief §6 clarifications in spec.md (5) P1: post-edit impact footer + orientation doctrine (6) P2 per tasks: ranked compact map, STEL find fusion, impact intent (7) CI: fmt --check, check, clippy -D warnings, test --all-targets -- --test-threads=1, build --release (8) .specify/feature.json → 007 spec dir.
+
+Constraints: brief reject list — no SQLite Soul Map, grep intercept, terminal-agent features, 004 duplication. No edits to src/server/, src/cli/harness*, specs/004*, specs/005*. Frecency invariant; embed G-045. No commits unless I ask.
+
+Workflow: 0 confirm branch + read brief → 1 /speckit-constitution → 2 specify → 3 clarify → 4 plan → 5 tasks → 6 implement (detail prompts in brief §13).
+
+Rules: plan first; work autonomously (brief §6 defaults); self-verify CI; SymForge for inspection; mark tasks [x]; stay on 007 scope.
+
+Deliver: criteria checklist, files changed, verify commands, decisions, deferrals.
+
+Begin: confirm branch, read brief end-to-end, output plan, start /speckit-constitution.
+```
+
+---
+
+**Purpose:** Single contextual entry point for a [GitHub Spec Kit](https://github.com/github/spec-kit) agent. Read this file **in full** (§1+) before executing any `/speckit-*` command.
 
 **Status:** Research complete · Spec not yet created · **Do not implement until `004-v8-operator-serve` spine is merged or explicitly waived**
 
-**Branch (mandatory):** All Spec Kit work and implementation for this feature happen **only** on `007-intelligence-pattern-ports`. Do not commit 007 artifacts to `main`, `review/v8-004-operator-serve`, or any other branch. Open a PR from `007-intelligence-pattern-ports` → `main` when done.
+**Branch (mandatory):** All work on `007-intelligence-pattern-ports` only (`E:\project\symforge`). Parallel 004/005: `E:\project\symforge-review`. PR → `main` when done.
 
 ---
 
