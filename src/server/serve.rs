@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::auth::{AuthConfig, AuthLayerState};
-use super::{ServerRuntime, mcp_http};
+use super::api_keys::ApiKeyStore;
+use super::auth::{AuthConfig, AuthLayerState, OriginLayerState};
+use super::{ServerRuntime, admin, mcp_http};
 use crate::live_index::{LiveIndex, SharedIndex};
 use crate::protocol::SymForgeServer;
 use crate::sidecar::governor::RequestGovernor;
@@ -223,7 +224,30 @@ fn build_serve_runtime(
     // observes exactly the rows the dispatcher wrote — surviving restart.
     let runtime_store = ledger_store.map(|store| (*store).clone());
 
-    ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store)
+    // 006 G-039: open the hashed product API-key store under the same data dir.
+    // On failure it degrades to `Disabled` (bootstrap --api-key still works).
+    // Shared by Arc into both the auth layer (minted keys authenticate at /mcp)
+    // and the admin /api/v1/keys handlers.
+    let key_store: Option<Arc<ApiKeyStore>> =
+        repo_root
+            .as_ref()
+            .and_then(|root| match crate::paths::ensure_symforge_dir(root) {
+                Ok(dir) => Some(Arc::new(ApiKeyStore::open(&dir))),
+                Err(error) => {
+                    tracing::warn!(
+                        root = %root.display(),
+                        %error,
+                        "could not ensure symforge data dir; API-key store unavailable"
+                    );
+                    None
+                }
+            });
+
+    let mut runtime = ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store);
+    if let Some(store) = key_store {
+        runtime = runtime.with_key_store(store);
+    }
+    runtime
 }
 
 /// `symforge serve` entrypoint (US1 — `/mcp` over Streamable HTTP).
@@ -265,15 +289,28 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .local_addr()
         .map_err(|source| ServeError::Bind { addr, source })?;
 
-    // Build the /mcp router and layer Bearer auth in front (one enforcement
-    // point — secure-default rule lives on AuthConfig/AuthLayerState).
-    // REVIEW P1-B: loopback-no-key is open MCP to any local process / browser
-    // `fetch` (Origin not gated; only Host/DNS-rebind is via rmcp allowed_hosts).
-    // Set `with_allowed_origins` for browser-facing binds and/or require a key
-    // even on loopback in production. Deferred.
+    // Build the /mcp router plus the /admin + /api/v1 router (006), merge them,
+    // and layer Bearer auth + Origin gating in front (one enforcement point —
+    // secure-default rule lives on AuthConfig/AuthLayerState; P1-B Origin gating
+    // lives on OriginLayerState). Layer order: the Bearer auth runs first
+    // (outermost), then the Origin gate, then the routed handler.
     let mcp_router = mcp_http::build_mcp_router(&runtime, local_addr);
-    let auth_state = AuthLayerState::new(auth, is_loopback);
-    let app = super::apply_bearer_auth(mcp_router, auth_state);
+    let admin_router = admin::build_admin_router(&runtime);
+    let merged = mcp_router.merge(admin_router);
+
+    // Origin gate (P1-B): reject arbitrary cross-origin browser fetches against
+    // the browser-facing surface; non-browser API clients send no Origin and are
+    // unaffected. Allowed origins are the server's own bound address + loopback
+    // aliases.
+    let origin_state = OriginLayerState::from_bind_addr(local_addr);
+    let gated = super::apply_origin_gate(merged, origin_state);
+
+    // Bearer auth: the bootstrap --api-key OR any active minted key (G-039).
+    let mut auth_state = AuthLayerState::new(auth, is_loopback);
+    if let Some(store) = runtime.key_store() {
+        auth_state = auth_state.with_key_store(Arc::clone(store));
+    }
+    let app = super::apply_bearer_auth(gated, auth_state);
 
     // Attach URL to stdout (the operator copies this into a second client).
     let attach_url = format!(

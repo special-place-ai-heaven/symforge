@@ -13,6 +13,8 @@
 //! US1/T013-T016 ([`mcp_http`]); the full live `tool_router` parity battery is
 //! finalized in US1/T018.
 
+pub mod admin;
+pub mod api_keys;
 pub mod auth;
 pub mod mcp_http;
 pub mod serve;
@@ -24,7 +26,11 @@ use crate::protocol::SymForgeServer;
 use crate::sidecar::governor::RequestGovernor;
 use crate::stel::ledger_store::StelLedgerStore;
 
-pub use auth::{AuthConfig, AuthLayerState, AuthStartupError, apply_bearer_auth};
+pub use api_keys::{ApiKeyRecord, ApiKeyStore, MintedKey};
+pub use auth::{
+    AuthConfig, AuthLayerState, AuthStartupError, OriginLayerState, apply_bearer_auth,
+    apply_origin_gate,
+};
 
 /// The single transport-agnostic owner of request-serving state.
 ///
@@ -45,6 +51,15 @@ pub struct ServerRuntime {
     /// (US3/T029). When `Some`, it may itself be [`StelLedgerStore::Disabled`]
     /// if the DB could not open (FR-011) — serving continues regardless.
     ledger_store: Option<StelLedgerStore>,
+    /// Hashed product API-key store (G-039), shared with the auth layer and the
+    /// admin `/api/v1/keys` handlers. `None` until opened by `serve::run`; when
+    /// `Some` it may be [`ApiKeyStore::Disabled`] (DB unavailable) and the
+    /// bootstrap `--api-key` still authenticates.
+    key_store: Option<Arc<ApiKeyStore>>,
+    /// Process-start instant for uptime telemetry (`/api/v1/system`).
+    started_at: std::time::Instant,
+    /// Human-readable project name for telemetry / dashboard headers.
+    project_name: String,
 }
 
 impl ServerRuntime {
@@ -60,13 +75,40 @@ impl ServerRuntime {
         auth: AuthConfig,
         ledger_store: Option<StelLedgerStore>,
     ) -> Self {
+        let project_name = protocol.project_name.clone();
         Self {
             index,
             protocol,
             governor,
             auth,
             ledger_store,
+            key_store: None,
+            started_at: std::time::Instant::now(),
+            project_name,
         }
+    }
+
+    /// Attach a hashed product API-key store (G-039). Shared (by `Arc`) with the
+    /// auth layer (so minted keys authenticate at `/mcp`) and the admin
+    /// `/api/v1/keys` handlers. Consumes and returns `self` (builder style).
+    pub fn with_key_store(mut self, key_store: Arc<ApiKeyStore>) -> Self {
+        self.key_store = Some(key_store);
+        self
+    }
+
+    /// Access the hashed API-key store, if one was opened.
+    pub fn key_store(&self) -> Option<&Arc<ApiKeyStore>> {
+        self.key_store.as_ref()
+    }
+
+    /// Process uptime since the runtime was built (for `/api/v1/system`).
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Human-readable project name for telemetry / dashboard headers.
+    pub fn project_name(&self) -> &str {
+        &self.project_name
     }
 
     /// Access the shared index.

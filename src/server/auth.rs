@@ -66,19 +66,51 @@ impl AuthConfig {
 
 /// Shared state for the [`require_bearer`] middleware.
 ///
-/// Carries the resolved [`AuthConfig`] and whether the bind is loopback, so the
-/// middleware can apply the exact secure-default rule
+/// Carries the resolved [`AuthConfig`], whether the bind is loopback, and an
+/// optional hashed [`ApiKeyStore`] so a presented Bearer token can be verified
+/// against **either** the bootstrap `--api-key` **or** any active minted key
+/// (G-039). The middleware applies the exact secure-default rule
 /// ([`AuthConfig::requires_auth`]) without re-deriving it per request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthLayerState {
     auth: AuthConfig,
     is_loopback: bool,
+    /// Optional hashed product key store. When present, a Bearer token that is
+    /// not the bootstrap key is additionally checked against every active
+    /// minted key. `None` (or [`ApiKeyStore::Disabled`]) falls back to the
+    /// bootstrap key only.
+    key_store: Option<std::sync::Arc<super::api_keys::ApiKeyStore>>,
 }
 
 impl AuthLayerState {
     /// Build the layer state from a resolved auth config and the bind's loopback flag.
     pub fn new(auth: AuthConfig, is_loopback: bool) -> Self {
-        Self { auth, is_loopback }
+        Self {
+            auth,
+            is_loopback,
+            key_store: None,
+        }
+    }
+
+    /// Attach a hashed product key store so minted keys also authenticate.
+    pub fn with_key_store(
+        mut self,
+        key_store: std::sync::Arc<super::api_keys::ApiKeyStore>,
+    ) -> Self {
+        self.key_store = Some(key_store);
+        self
+    }
+
+    /// Verify a presented Bearer token against the bootstrap key first, then
+    /// (if configured) the hashed minted-key store. Constant-time on each path.
+    fn verify_token(&self, token: &str) -> bool {
+        if self.auth.verify(token) {
+            return true;
+        }
+        match &self.key_store {
+            Some(store) => store.verify(token),
+            None => false,
+        }
     }
 }
 
@@ -126,7 +158,10 @@ pub async fn require_bearer(
         .and_then(parse_bearer);
 
     match presented {
-        Some(token) if state.auth.verify(token) => next.run(request).await,
+        // Verify against the bootstrap key first, then the hashed minted-key
+        // store (G-039): a minted key authenticates at /mcp, a revoked key does
+        // not (the store's `verify` excludes revoked keys).
+        Some(token) if state.verify_token(token) => next.run(request).await,
         _ => (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: missing or invalid Bearer token",
@@ -143,6 +178,98 @@ pub async fn require_bearer(
 #[cfg(feature = "server")]
 pub fn apply_bearer_auth(router: axum::Router, state: AuthLayerState) -> axum::Router {
     router.layer(axum::middleware::from_fn_with_state(state, require_bearer))
+}
+
+// ---------------------------------------------------------------------------
+// Origin gating (review finding P1-B) for the browser-facing surface
+// ---------------------------------------------------------------------------
+
+/// Shared state for the [`require_allowed_origin`] middleware.
+///
+/// Carries the server's own origin (`scheme://host:port`) plus any additional
+/// explicitly-allowed origins. The browser admin UI is served from the same
+/// host:port it calls, so same-origin requests are allowed; a cross-origin
+/// browser `fetch` (whose `Origin` is the attacker's page) is rejected. Non-
+/// browser clients (curl/reqwest/the MCP client) send **no** `Origin` header
+/// and are unaffected — Origin gating targets browser cross-origin only.
+#[derive(Debug, Clone)]
+pub struct OriginLayerState {
+    allowed: std::sync::Arc<Vec<String>>,
+}
+
+impl OriginLayerState {
+    /// Build from the server's own bound address. Allows `http://<host>:<port>`
+    /// and, for loopback, the common `localhost`/`127.0.0.1`/`[::1]` aliases of
+    /// that same port (a browser may use any of them for the same local server).
+    pub fn from_bind_addr(addr: std::net::SocketAddr) -> Self {
+        let port = addr.port();
+        let mut allowed = vec![
+            format!("http://{}", addr),
+            format!("http://{}:{}", addr.ip(), port),
+        ];
+        if addr.ip().is_loopback() {
+            for host in ["localhost", "127.0.0.1", "[::1]"] {
+                allowed.push(format!("http://{host}:{port}"));
+            }
+        }
+        Self {
+            allowed: std::sync::Arc::new(allowed),
+        }
+    }
+
+    /// Build from an explicit allow-list (test/config seam).
+    pub fn from_allowed(allowed: Vec<String>) -> Self {
+        Self {
+            allowed: std::sync::Arc::new(allowed),
+        }
+    }
+
+    /// Whether a presented `Origin` header value is allowed.
+    fn permits(&self, origin: &str) -> bool {
+        let origin = origin.trim();
+        self.allowed.iter().any(|a| a.eq_ignore_ascii_case(origin))
+    }
+}
+
+/// axum middleware enforcing the Origin allow-list for browser-facing routes.
+///
+/// * A request with **no** `Origin` header passes through (non-browser client).
+/// * A request whose `Origin` is in the allow-list passes through (same-origin
+///   browser `fetch` / navigation).
+/// * Any other `Origin` is rejected with `403 Forbidden` — closing P1-B so a
+///   malicious web page cannot drive the local admin API via cross-origin
+///   `fetch`.
+#[cfg(feature = "server")]
+pub async fn require_allowed_origin(
+    axum::extract::State(state): axum::extract::State<OriginLayerState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::http::header::ORIGIN;
+    use axum::response::IntoResponse;
+
+    match request.headers().get(ORIGIN) {
+        // No Origin header: a non-browser API client (curl/reqwest/MCP). Allowed.
+        None => next.run(request).await,
+        Some(value) => match value.to_str() {
+            Ok(origin) if state.permits(origin) => next.run(request).await,
+            _ => (
+                StatusCode::FORBIDDEN,
+                "Forbidden: cross-origin request rejected (Origin not allowed)",
+            )
+                .into_response(),
+        },
+    }
+}
+
+/// Apply the [`require_allowed_origin`] middleware to a router with the given state.
+#[cfg(feature = "server")]
+pub fn apply_origin_gate(router: axum::Router, state: OriginLayerState) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        state,
+        require_allowed_origin,
+    ))
 }
 
 /// Startup-time auth policy violation.
@@ -298,6 +425,66 @@ mod tests {
         assert_eq!(parse_bearer("Bearer "), None);
         assert_eq!(parse_bearer("Bearer    "), None);
         assert_eq!(parse_bearer(""), None);
+    }
+
+    // T004: Origin gating (P1-B).
+
+    #[test]
+    fn origin_gate_permits_same_origin_and_loopback_aliases() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let state = OriginLayerState::from_bind_addr(addr);
+        assert!(state.permits("http://127.0.0.1:8787"));
+        assert!(state.permits("http://localhost:8787"));
+        assert!(state.permits("http://[::1]:8787"));
+    }
+
+    #[test]
+    fn origin_gate_rejects_foreign_origin() {
+        let addr: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let state = OriginLayerState::from_bind_addr(addr);
+        assert!(!state.permits("http://evil.example.com"));
+        assert!(!state.permits("http://127.0.0.1:9999"));
+        assert!(!state.permits("https://127.0.0.1:8787"));
+    }
+
+    #[test]
+    fn origin_gate_explicit_allow_list() {
+        let state = OriginLayerState::from_allowed(vec!["http://allowed.test".to_string()]);
+        assert!(state.permits("http://allowed.test"));
+        assert!(state.permits("HTTP://ALLOWED.TEST"));
+        assert!(!state.permits("http://other.test"));
+    }
+
+    // T004: minted-key verification through the layer state.
+
+    #[test]
+    fn layer_state_verifies_bootstrap_and_minted_keys() {
+        let store = std::sync::Arc::new(
+            super::super::api_keys::ApiKeyStore::open_in_memory().expect("store"),
+        );
+        let minted = store.mint("agent").expect("mint");
+        let state = AuthLayerState::new(AuthConfig::new(Some("boot".to_string())), true)
+            .with_key_store(std::sync::Arc::clone(&store));
+
+        // Bootstrap key verifies.
+        assert!(state.verify_token("boot"));
+        // Minted key verifies.
+        assert!(state.verify_token(&minted.raw_secret));
+        // Wrong key fails.
+        assert!(!state.verify_token("nope"));
+
+        // Revoked minted key stops verifying.
+        store.revoke(minted.record.id).expect("revoke");
+        assert!(!state.verify_token(&minted.raw_secret));
+        // Bootstrap still works.
+        assert!(state.verify_token("boot"));
+    }
+
+    #[test]
+    fn layer_state_without_store_uses_bootstrap_only() {
+        let state = AuthLayerState::new(AuthConfig::new(Some("boot".to_string())), true);
+        assert!(state.verify_token("boot"));
+        assert!(!state.verify_token("anything-else"));
     }
 
     #[test]

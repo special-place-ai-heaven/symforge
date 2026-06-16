@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SymForge Admin</title>
+  <link rel="stylesheet" href="/admin/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>SymForge Admin</h1>
+    <span id="project-name" class="project">&hellip;</span>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-view="dashboard">Dashboard</button>
+    <button class="tab" data-view="keys">API Keys</button>
+    <button class="tab" data-view="diagnostics">Diagnostics</button>
+  </nav>
+
+  <main>
+    <!-- Dashboard view (US1) -->
+    <section id="view-dashboard" class="view active">
+      <h2>Economics</h2>
+      <div id="economics" class="cards">
+        <p class="loading">Loading economics&hellip;</p>
+      </div>
+
+      <h2>Active surface</h2>
+      <div id="surface" class="cards">
+        <p class="loading">Loading surface&hellip;</p>
+      </div>
+
+      <h2>Attached harnesses</h2>
+      <div id="harness" class="cards">
+        <p class="loading">Loading harness status&hellip;</p>
+      </div>
+    </section>
+
+    <!-- Keys view (US2) -->
+    <section id="view-keys" class="view">
+      <h2>API keys</h2>
+      <form id="mint-form" class="mint-form">
+        <input type="text" id="mint-label" placeholder="Label (e.g. ci-runner)" />
+        <button type="submit">Mint key</button>
+      </form>
+      <div id="mint-result" class="mint-result hidden"></div>
+      <table id="keys-table" class="keys-table">
+        <thead>
+          <tr><th>Label</th><th>Fingerprint</th><th>Created</th><th>Status</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="keys-body">
+          <tr><td colspan="5" class="loading">Loading keys&hellip;</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Diagnostics view (US3) -->
+    <section id="view-diagnostics" class="view">
+      <h2>System</h2>
+      <div id="system" class="cards">
+        <p class="loading">Loading system telemetry&hellip;</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <button id="refresh" type="button">Refresh</button>
+    <span id="status-line" class="status-line"></span>
+  </footer>
+
+  <script src="/admin/app.js"></script>
+</body>
+</html>
