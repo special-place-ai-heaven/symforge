@@ -51,6 +51,10 @@ impl Default for ServeArgs {
 
 /// Resolve the effective API key: `--api-key` wins, else `--api-key-env` (read
 /// from the environment), else `None`.
+// REVIEW P2-E: an inline `--api-key` is visible in process listings (`ps` /
+// Task Manager). Warn when `--api-key` is used, refuse an inline key on a
+// non-loopback bind, and document `--api-key-env` as the only production path.
+// Deferred.
 pub fn resolve_api_key(api_key: Option<&str>, api_key_env: Option<&str>) -> Option<String> {
     if let Some(key) = api_key
         && !key.is_empty()
@@ -209,6 +213,9 @@ fn build_serve_runtime(
         protocol = protocol.with_stel_ledger_store(Arc::clone(store));
     }
     let protocol = Arc::new(protocol);
+    // REVIEW P2-F: governor is created + stored but not yet consulted on the HTTP
+    // `/mcp` dispatch path (no concurrency cap enforced); wire it via dispatch/
+    // axum middleware or remove the dead field. Deferred.
     let governor = Arc::new(RequestGovernor::new());
 
     // The runtime holds a clone of the same underlying store (the `Sqlite`
@@ -226,8 +233,9 @@ fn build_serve_runtime(
 /// loads the project index, builds the [`ServerRuntime`] (the same shared
 /// `SymForgeServer` stdio uses — no logic fork), mounts the `/mcp` Streamable
 /// HTTP router with the Bearer auth layer in front, prints the attach URL to
-/// stdout, and runs one long-lived server until SIGINT/SIGTERM with graceful
-/// shutdown (mirroring `sidecar::server::spawn_sidecar`).
+/// stdout, and runs one long-lived server until a shutdown signal arrives with
+/// graceful drain: SIGINT (Ctrl+C) on all platforms, plus SIGTERM on Unix so the
+/// server drains under Docker/K8s/systemd (P2-B).
 pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     let api_key = resolve_api_key(args.api_key.as_deref(), args.api_key_env.as_deref());
     let auth = AuthConfig::new(api_key);
@@ -247,6 +255,9 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // Load the shared index, then bind. Load before bind so an index failure does
     // not leave a half-open listener.
     let (index, repo_root) = load_serve_index()?;
+    // Keep a copy for the onboarding state path (the original is moved into the
+    // runtime builder below).
+    let onboarding_root = repo_root.clone();
     let runtime = build_serve_runtime(index, repo_root, auth.clone());
 
     let listener = bind_listener(addr).map_err(|source| ServeError::Bind { addr, source })?;
@@ -256,17 +267,37 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
 
     // Build the /mcp router and layer Bearer auth in front (one enforcement
     // point — secure-default rule lives on AuthConfig/AuthLayerState).
+    // REVIEW P1-B: loopback-no-key is open MCP to any local process / browser
+    // `fetch` (Origin not gated; only Host/DNS-rebind is via rmcp allowed_hosts).
+    // Set `with_allowed_origins` for browser-facing binds and/or require a key
+    // even on loopback in production. Deferred.
     let mcp_router = mcp_http::build_mcp_router(&runtime, local_addr);
     let auth_state = AuthLayerState::new(auth, is_loopback);
     let app = super::apply_bearer_auth(mcp_router, auth_state);
 
     // Attach URL to stdout (the operator copies this into a second client).
-    println!(
+    let attach_url = format!(
         "http://{host}:{port}{path}",
         host = local_addr.ip(),
         port = local_addr.port(),
         path = mcp_http::MCP_PATH,
     );
+    println!("{attach_url}");
+
+    // First-run / post-update onboarding banner (FR-009). Best-effort: a state
+    // read/write failure never affects serve. Shows once per build version, and
+    // only when anchored to a project data dir (no root => skip silently).
+    if let Some(root) = onboarding_root.as_ref() {
+        let state_path = crate::cli::onboarding::state_path(root);
+        let mut sink = crate::cli::onboarding::StderrSink;
+        crate::cli::onboarding::maybe_show_banner(
+            &state_path,
+            env!("CARGO_PKG_VERSION"),
+            &attach_url,
+            &mut sink,
+        );
+    }
+
     tracing::info!(
         addr = %local_addr,
         auth = if runtime.auth().requires_auth(is_loopback) { "required" } else { "loopback-open" },
@@ -274,9 +305,33 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         mcp_http::MCP_PATH
     );
 
-    // Graceful shutdown on Ctrl+C / SIGTERM (mirrors spawn_sidecar's signal wiring).
+    // Graceful shutdown (P2-B). On Unix, drain on either SIGINT (Ctrl+C) or
+    // SIGTERM (the signal Docker/K8s/systemd send to stop a container/unit) so
+    // the server actually drains under orchestration instead of being killed.
+    // On Windows, only Ctrl+C is available.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            // If SIGTERM cannot be registered, fall back to Ctrl+C only rather
+            // than failing the serve loop.
+            let mut sigterm = signal(SignalKind::terminate()).ok();
+            match sigterm.as_mut() {
+                Some(term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         tracing::info!("shutdown signal received, stopping operator server");
     };
 

@@ -11,8 +11,11 @@
 //! Plan 03 wires these into main.rs and handles the top-level dispatch.
 
 pub mod analytics;
+pub mod harness;
+pub mod harness_apply;
 pub mod hook;
 pub mod init;
+pub mod onboarding;
 pub mod serve;
 pub mod trust;
 pub mod update;
@@ -45,6 +48,26 @@ pub enum Commands {
         /// Client to configure
         #[arg(long, value_enum, default_value_t = InitClient::All)]
         client: InitClient,
+
+        /// Scan known MCP harness configs and report per-client SymForge attach
+        /// status instead of running the stdio install. Non-destructive: with
+        /// `--scan` alone (no `--apply`) nothing is written.
+        #[arg(long)]
+        scan: bool,
+
+        /// With `--scan`, write/refresh the SymForge HTTP attach entry into each
+        /// discovered config (backup-then-atomic-write). Requires
+        /// `--serve-url`. Without `--apply`, `--scan` is a dry-run preview.
+        #[arg(long, requires = "scan")]
+        apply: bool,
+
+        /// The `symforge serve` attach URL to write (e.g. `http://127.0.0.1:8787/mcp`).
+        #[arg(long, requires = "scan")]
+        serve_url: Option<String>,
+
+        /// The Bearer key for the attach URL (omit for a keyless loopback serve).
+        #[arg(long, requires = "serve_url")]
+        serve_key: Option<String>,
     },
     /// Run the shared local daemon that tracks project and session state
     Daemon,
@@ -108,7 +131,7 @@ mod tests {
         let cli = Cli::parse_from(["symforge", "init"]);
 
         match cli.command {
-            Some(Commands::Init { client }) => assert_eq!(client, InitClient::All),
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::All),
             _ => panic!("expected init command"),
         }
     }
@@ -118,7 +141,7 @@ mod tests {
         let cli = Cli::parse_from(["symforge", "init", "--client", "codex"]);
 
         match cli.command {
-            Some(Commands::Init { client }) => assert_eq!(client, InitClient::Codex),
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::Codex),
             _ => panic!("expected init command"),
         }
     }
@@ -128,7 +151,7 @@ mod tests {
         let cli = Cli::parse_from(["symforge", "init", "--client", "gemini"]);
 
         match cli.command {
-            Some(Commands::Init { client }) => assert_eq!(client, InitClient::Gemini),
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::Gemini),
             _ => panic!("expected init command"),
         }
     }
@@ -138,7 +161,7 @@ mod tests {
         let cli = Cli::parse_from(["symforge", "init", "--client", "kilo-code"]);
 
         match cli.command {
-            Some(Commands::Init { client }) => assert_eq!(client, InitClient::KiloCode),
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::KiloCode),
             _ => panic!("expected init command"),
         }
     }
@@ -148,7 +171,7 @@ mod tests {
         let cli = Cli::parse_from(["symforge", "init", "--client", "kilo"]);
 
         match cli.command {
-            Some(Commands::Init { client }) => assert_eq!(client, InitClient::KiloCode),
+            Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::KiloCode),
             _ => panic!("expected init command"),
         }
     }

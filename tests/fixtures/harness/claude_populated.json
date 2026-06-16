@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "some-other-server": {
+      "command": "/usr/local/bin/other",
+      "args": ["--flag"]
+    }
+  },
+  "numStartups": 7,
+  "tipsHistory": {}
+}

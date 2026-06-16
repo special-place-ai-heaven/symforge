@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "broken": {
+      "command": "/usr/local/bin/broken",
+      "args": ["--flag",
+    }
+  }

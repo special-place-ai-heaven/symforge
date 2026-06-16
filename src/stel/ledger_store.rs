@@ -293,7 +293,11 @@ impl SqliteStelLedgerStore {
 
     /// Idempotent schema migration. Safe to call multiple times.
     pub fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("stel ledger mutex poisoned");
+        // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
+        // panicked) must degrade, not crash the operator server. Recover the
+        // inner guard so the ledger keeps serving instead of propagating the
+        // poison as a panic on every subsequent lock.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(SCHEMA_V1)
             .context("applying stel ledger schema v1")?;
         conn.execute(
@@ -305,7 +309,11 @@ impl SqliteStelLedgerStore {
     }
 
     pub fn schema_version(&self) -> Result<u32> {
-        let conn = self.conn.lock().expect("stel ledger mutex poisoned");
+        // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
+        // panicked) must degrade, not crash the operator server. Recover the
+        // inner guard so the ledger keeps serving instead of propagating the
+        // poison as a panic on every subsequent lock.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let value: Option<String> = conn
             .query_row(
                 "SELECT value FROM stel_ledger_meta WHERE key = ?1",
@@ -317,6 +325,11 @@ impl SqliteStelLedgerStore {
     }
 
     /// Insert one [`StelLedgerEvent`] row into `stel_ledger_events`.
+    // REVIEW P2-C: this is a blocking `std::sync::Mutex<Connection>` INSERT under
+    // a busy-timeout, called from the async MCP tool path; under contention it can
+    // stall the tokio worker. Move to `spawn_blocking` / a dedicated writer thread
+    // / a bounded background writer so the request path stays non-blocking.
+    // Deferred.
     pub fn record(&self, event: &StelLedgerEvent) -> Result<i64> {
         let tools_json =
             serde_json::to_string(&event.tools_called).unwrap_or_else(|_| "[]".to_string());
@@ -339,7 +352,11 @@ impl SqliteStelLedgerStore {
         );
         let degrade_flags_json = bounded_text(&degrade_json, MAX_DEGRADE_FLAGS_JSON_BYTES);
 
-        let conn = self.conn.lock().expect("stel ledger mutex poisoned");
+        // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
+        // panicked) must degrade, not crash the operator server. Recover the
+        // inner guard so the ledger keeps serving instead of propagating the
+        // poison as a panic on every subsequent lock.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO stel_ledger_events (
                 ts_ms,
@@ -386,7 +403,11 @@ impl SqliteStelLedgerStore {
 
     /// Return the `limit` most-recent rows ordered by descending id.
     pub fn recent(&self, limit: usize) -> Result<Vec<StoredLedgerRecord>> {
-        let conn = self.conn.lock().expect("stel ledger mutex poisoned");
+        // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
+        // panicked) must degrade, not crash the operator server. Recover the
+        // inner guard so the ledger keeps serving instead of propagating the
+        // poison as a panic on every subsequent lock.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT
                 id,
@@ -435,7 +456,11 @@ impl SqliteStelLedgerStore {
 
     /// Aggregate summary: total events, total net_vs_manual, accepted count, unique sessions.
     pub fn summary(&self) -> Result<LedgerSummary> {
-        let conn = self.conn.lock().expect("stel ledger mutex poisoned");
+        // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
+        // panicked) must degrade, not crash the operator server. Recover the
+        // inner guard so the ledger keeps serving instead of propagating the
+        // poison as a panic on every subsequent lock.
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         let total_events: i64 =
             conn.query_row("SELECT COUNT(*) FROM stel_ledger_events", [], |r| r.get(0))?;

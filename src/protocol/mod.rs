@@ -764,6 +764,29 @@ impl ServerHandler for SymForgeServer {
         async move { self.read_resource_uri(&uri).await }
     }
 
+    /// MCP `tools/call` dispatch with a central compact-surface gate (P1-A).
+    ///
+    /// The `#[tool_handler]` macro only generates `call_tool` when the impl block
+    /// does not already define one; by providing this method we replace the
+    /// generated body while preserving its exact router delegation. The added
+    /// gate enforces [`FR-008`] at dispatch (not just at `tools/list`): when the
+    /// active surface is [`SurfaceProfile::Compact`], a `tools/call` for any tool
+    /// name NOT in the advertised compact-3 set
+    /// ([`crate::stel::surface::COMPACT_TOOL_NAMES`]) is rejected with an MCP
+    /// `InvalidRequest` error. Full and Meta surfaces are unaffected, so the
+    /// documented `SYMFORGE_SURFACE=full` opt-out still reaches every legacy
+    /// tool. This is shared by both transports because stdio and the HTTP `/mcp`
+    /// serve path dispatch through the same `ServerHandler::call_tool`.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        surface_probe::enforce_compact_surface(request.name.as_ref())?;
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,

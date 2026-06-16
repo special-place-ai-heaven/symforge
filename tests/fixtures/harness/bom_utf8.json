@@ -1,0 +1,8 @@
+﻿{
+  "mcpServers": {
+    "bommed": {
+      "command": "/usr/local/bin/bommed",
+      "args": []
+    }
+  }
+}

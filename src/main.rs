@@ -138,7 +138,19 @@ fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse_from(args);
     match cli.command {
         Some(cli::Commands::Analytics { command }) => cli::analytics::run_analytics(&command),
-        Some(cli::Commands::Init { client }) => cli::init::run_init(client),
+        Some(cli::Commands::Init {
+            client,
+            scan,
+            apply,
+            serve_url,
+            serve_key,
+        }) => {
+            if scan {
+                cli::init::run_scan(apply, serve_url, serve_key)
+            } else {
+                cli::init::run_init(client)
+            }
+        }
         Some(cli::Commands::Daemon) => run_daemon(),
         Some(cli::Commands::Serve(args)) => run_serve(args),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),

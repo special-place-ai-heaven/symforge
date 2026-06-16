@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "symforge": {
+      "type": "http",
+      "url": "http://127.0.0.1:9999/mcp",
+      "headers": {
+        "Authorization": "Bearer sf_old_stale_key"
+      }
+    },
+    "some-other-server": {
+      "command": "/usr/local/bin/other",
+      "args": ["--flag"]
+    }
+  }
+}

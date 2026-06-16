@@ -85,7 +85,10 @@ impl InitPaths {
     }
 }
 
-fn claude_desktop_config_path(home: &std::path::Path, windows_appdata: Option<PathBuf>) -> PathBuf {
+pub(crate) fn claude_desktop_config_path(
+    home: &std::path::Path,
+    windows_appdata: Option<PathBuf>,
+) -> PathBuf {
     // Claude Desktop config path varies by platform:
     // - Windows: %APPDATA%\Claude\claude_desktop_config.json
     // - macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
@@ -124,6 +127,111 @@ pub fn run_init(client: InitClient) -> anyhow::Result<()> {
     let paths = InitPaths::from_current_environment(&home, &working_dir);
 
     run_init_with_paths(client, paths, &home, &working_dir, &binary_path)
+}
+
+/// Entry point for `symforge init --scan [--apply --serve-url <url> [--serve-key <key>]]`.
+///
+/// Default (`--scan` alone) is non-destructive: it scans the known MCP harness
+/// configs and reports each client's SymForge attach status (and, when a serve
+/// URL is supplied, the dry-run plan). With `--apply` it backs up and writes the
+/// HTTP attach entry into each config. Reuses the client-path knowledge in this
+/// module via [`crate::cli::harness::HarnessRegistry`].
+pub fn run_scan(
+    apply: bool,
+    serve_url: Option<String>,
+    serve_key: Option<String>,
+) -> anyhow::Result<()> {
+    use crate::cli::harness::{AttachEntry, HarnessRegistry, HarnessState};
+    use crate::cli::harness_apply::{self, ApplyOutcome, PlannedAction};
+
+    let registry = HarnessRegistry::known()?;
+
+    // The attach entry is only meaningful when a serve URL is supplied. For a
+    // bare `--scan` with no URL, report installed-status only (the comparison
+    // target is an empty URL, which simply distinguishes present-vs-absent).
+    let entry = AttachEntry::new(serve_url.clone().unwrap_or_default(), serve_key.clone());
+
+    if apply {
+        let url = serve_url.as_deref().filter(|u| !u.is_empty());
+        if url.is_none() {
+            anyhow::bail!(
+                "`init --scan --apply` requires `--serve-url <url>` (the running `symforge serve` attach URL)"
+            );
+        }
+
+        let plan = harness_apply::plan(&registry, &entry);
+        eprintln!("Applying SymForge attach entry to discovered harnesses:");
+        let outcomes = harness_apply::apply(&plan);
+        for outcome in &outcomes {
+            match outcome {
+                ApplyOutcome::Wrote {
+                    id,
+                    config_path,
+                    backup,
+                } => {
+                    let where_backup = backup
+                        .as_ref()
+                        .map(|b| format!(" (backup: {})", b.backup.display()))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  [written] {} -> {}{}",
+                        id.display_name(),
+                        config_path.display(),
+                        where_backup
+                    );
+                }
+                ApplyOutcome::Skipped { id, reason } => {
+                    eprintln!("  [skipped] {} ({reason})", id.display_name());
+                }
+                ApplyOutcome::Failed { id, reason } => {
+                    eprintln!("  [error]   {} ({reason})", id.display_name());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Report-only (scan / dry-run preview).
+    if serve_url.is_some() {
+        let plan = harness_apply::plan(&registry, &entry);
+        eprintln!("Dry-run plan (no files modified). Re-run with --apply to write:");
+        for change in &plan.changes {
+            let action = match &change.action {
+                PlannedAction::Add => "would add".to_string(),
+                PlannedAction::Refresh => "would refresh".to_string(),
+                PlannedAction::Skip(reason) => format!("skip ({reason})"),
+                PlannedAction::Error(reason) => format!("error ({reason})"),
+            };
+            eprintln!(
+                "  {} - {action} - {}",
+                change.id.display_name(),
+                change.config_path.display()
+            );
+        }
+    } else {
+        eprintln!("SymForge harness scan (report only):");
+        for status in registry.scan(&entry) {
+            let label = match &status.state {
+                HarnessState::NotInstalled => "not installed".to_string(),
+                HarnessState::Absent => "no SymForge entry".to_string(),
+                HarnessState::PresentCurrent => "SymForge entry present".to_string(),
+                HarnessState::PresentStale => {
+                    "SymForge entry present (different URL/key)".to_string()
+                }
+                HarnessState::Malformed(why) => format!("config does not parse: {why}"),
+            };
+            eprintln!(
+                "  {} - {label} - {}",
+                status.id.display_name(),
+                status.config_path.display()
+            );
+        }
+        eprintln!(
+            "Pass --serve-url <url> [--serve-key <key>] to preview, then add --apply to write."
+        );
+    }
+
+    Ok(())
 }
 
 /// Testable core for `symforge init` with injected paths.
@@ -267,7 +375,7 @@ fn run_init_with_paths(
 /// line 1 column 1", which aborts `symforge init --client all` against real
 /// user configs. Stripping at the read boundary keeps every parser working;
 /// the merged file is rewritten without the BOM.
-fn read_config_text(path: &std::path::Path) -> anyhow::Result<String> {
+pub(crate) fn read_config_text(path: &std::path::Path) -> anyhow::Result<String> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(match text.strip_prefix('\u{feff}') {

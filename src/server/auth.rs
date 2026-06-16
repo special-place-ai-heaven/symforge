@@ -165,8 +165,16 @@ pub enum AuthStartupError {
 /// against the obvious vectors below.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold the length difference in first so unequal-length inputs can never
-    // compare equal regardless of content.
-    let mut diff: u8 = (a.len() ^ b.len()) as u8 | ((a.len() ^ b.len()) >> 8) as u8;
+    // compare equal regardless of content. Fold *every* byte of the `usize`
+    // XOR into the accumulator (P2-A): a plain `as u8` cast truncates, so length
+    // pairs whose difference is a multiple of 256 (e.g. 256 vs 0) would zero the
+    // length term and only the content loop would guard them. Folding all bytes
+    // means any non-zero length difference sets `diff`.
+    let len_xor = a.len() ^ b.len();
+    let mut diff: u8 = 0;
+    for shift in (0..usize::BITS).step_by(8) {
+        diff |= (len_xor >> shift) as u8;
+    }
     let n = a.len().max(b.len());
     for i in 0..n {
         // Out-of-range reads are replaced by 0; because `diff` already carries
@@ -201,6 +209,27 @@ mod tests {
         assert!(!constant_time_eq(b"", b"key"));
         // A prefix must not pass for a longer configured key.
         assert!(!constant_time_eq(b"sf_demo_key_long", b"sf_demo_key"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_diff_multiple_of_256() {
+        // P2-A regression: a truncating `as u8` length fold would zero the
+        // length term for length pairs differing by a multiple of 256. The
+        // bytes that overlap are identical here, so only the length fold can
+        // reject. Lengths 0 vs 256 and 256 vs 512 both differ by 256.
+        let empty: &[u8] = b"";
+        let block_256 = vec![b'a'; 256];
+        let block_512 = vec![b'a'; 512];
+        assert!(
+            !constant_time_eq(empty, &block_256),
+            "0 vs 256 (diff 256) must reject despite identical overlapping bytes"
+        );
+        assert!(
+            !constant_time_eq(&block_256, &block_512),
+            "256 vs 512 (diff 256) must reject"
+        );
+        // Sanity: equal 256-byte blocks still pass.
+        assert!(constant_time_eq(&block_256, &vec![b'a'; 256]));
     }
 
     // T007/T008: key-set behavior.

@@ -1,4 +1,6 @@
-//! US2 / T021 conformance: the default `tools/list` surface is compact-3.
+//! US2 / T021 conformance: the default `tools/list` surface is compact-3, and
+//! the compact surface is ENFORCED at `tools/call`, not just hidden from
+//! `tools/list` (P1-A).
 //!
 //! With `SYMFORGE_SURFACE` unset, `surface_profile_from_env` resolves to
 //! `Compact` and the advertised tool list is exactly the three compact tools
@@ -6,11 +8,16 @@
 //! legacy (32-tool) surface is returned — the documented backward-compatible
 //! opt-out (FR-008/FR-009, SC-004).
 //!
-//! These cases drive `surface_profile_from_env` and the `tools/list` builder
-//! (`list_tools_for_profile`) directly to avoid binding a network transport.
-//! `SYMFORGE_SURFACE` is process-global, so the cases serialize on the shared
-//! `COMPACT_ENV_LOCK` and save/restore the variable via RAII guards to prevent
-//! cross-test env bleed (the suite already runs `--test-threads=1`).
+//! These cases drive the PRODUCTION list source (`compact_surface_tools`, the
+//! same vec the real `SymForgeServer::list_tools` returns on the compact
+//! surface) and the PRODUCTION dispatch gate (`enforce_compact_surface`, the
+//! exact function the production `ServerHandler::call_tool` calls before routing
+//! — shared by stdio and the HTTP `/mcp` path). They avoid binding a network
+//! transport while still exercising the real code, so the test cannot pass while
+//! prod schemas or enforcement diverge. `SYMFORGE_SURFACE` is process-global, so
+//! the cases serialize on the shared `COMPACT_ENV_LOCK` and save/restore the
+//! variable via RAII guards to prevent cross-test env bleed (the suite already
+//! runs `--test-threads=1`).
 
 #[path = "support/stel_surface_env.rs"]
 mod stel_surface_env;
@@ -18,11 +25,17 @@ mod stel_surface_env;
 use std::collections::BTreeSet;
 
 use symforge::protocol::surface_probe::{
-    SurfaceProfile, list_tools_for_profile, surface_profile_from_env,
+    SurfaceProfile, enforce_compact_surface, list_tools_for_profile, surface_profile_from_env,
 };
+use symforge::stel::{COMPACT_TOOL_NAMES, compact_surface_tools};
 
-/// Canonical compact-3 surface names (mirrors `stel::COMPACT_TOOL_NAMES`).
-const COMPACT_TOOL_NAMES: [&str; 3] = ["symforge", "symforge_edit", "status"];
+/// Names from the PRODUCTION compact `tools/list` source (`compact_surface_tools`).
+fn production_compact_names() -> BTreeSet<String> {
+    compact_surface_tools()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
 
 fn advertised_names(profile: SurfaceProfile) -> BTreeSet<String> {
     list_tools_for_profile(profile)
@@ -43,11 +56,12 @@ async fn unset_surface_resolves_compact_and_advertises_three_tools() {
         "unset SYMFORGE_SURFACE must resolve to the compact-3 default"
     );
 
-    let names = advertised_names(profile);
+    // Assert through the PRODUCTION list source, not the measurement probe.
+    let names = production_compact_names();
     let expected: BTreeSet<String> = COMPACT_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
     assert_eq!(
         names, expected,
-        "default tools/list must advertise exactly the compact-3 surface"
+        "production compact tools/list must advertise exactly the compact-3 surface"
     );
     assert_eq!(
         names.len(),
@@ -83,4 +97,69 @@ async fn surface_full_resolves_full_and_advertises_legacy_surface() {
         names.contains("get_symbol"),
         "legacy full surface must advertise the legacy read tools"
     );
+}
+
+/// P1-A: on the compact default, `tools/call` for a legacy tool is REJECTED by
+/// the production dispatch gate — hiding it from `tools/list` is not enough.
+#[tokio::test]
+async fn compact_default_rejects_legacy_tool_call_at_dispatch() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::clear_symforge_surface();
+
+    assert_eq!(
+        surface_profile_from_env(),
+        SurfaceProfile::Compact,
+        "unset SYMFORGE_SURFACE must resolve to the compact default"
+    );
+
+    // A representative legacy tool that is hidden from compact `tools/list`.
+    let rejected = enforce_compact_surface("search_text");
+    let err = rejected.expect_err(
+        "compact default must REJECT a legacy `tools/call` at dispatch, not just hide it from \
+         tools/list",
+    );
+    assert!(
+        err.message.contains("compact surface"),
+        "rejection must name the compact-surface policy; got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("SYMFORGE_SURFACE=full"),
+        "rejection must point at the documented opt-out; got: {}",
+        err.message
+    );
+
+    // The three advertised compact tools are NOT gated.
+    for name in COMPACT_TOOL_NAMES {
+        assert!(
+            enforce_compact_surface(name).is_ok(),
+            "advertised compact tool `{name}` must be allowed on the compact surface"
+        );
+    }
+}
+
+/// P1-A: with `SYMFORGE_SURFACE=full`, the same legacy `tools/call` is ALLOWED —
+/// the gate must not block the documented backward-compatible opt-out.
+#[tokio::test]
+async fn full_surface_allows_legacy_tool_call_at_dispatch() {
+    let _serialize = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full");
+
+    assert_eq!(
+        surface_profile_from_env(),
+        SurfaceProfile::Full,
+        "SYMFORGE_SURFACE=full must resolve to the full surface"
+    );
+
+    assert!(
+        enforce_compact_surface("search_text").is_ok(),
+        "full surface must allow legacy `tools/call` (the documented opt-out)"
+    );
+    // Compact facades are still callable on full (handlers gate them internally).
+    for name in COMPACT_TOOL_NAMES {
+        assert!(
+            enforce_compact_surface(name).is_ok(),
+            "tool `{name}` must not be dispatch-gated on the full surface"
+        );
+    }
 }
