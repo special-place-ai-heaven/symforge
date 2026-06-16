@@ -144,6 +144,55 @@ button.action {
   color: var(--ok);
 }
 
+/* AAP integration panel (008). The panel reuses the .card grid; a few cards
+   carry semantic state classes (drift warning / ok / unknown) and long paths
+   wrap. The preset snippets render as labelled, copy-able code blocks. */
+.aap-panel .card.drift-warning {
+  border-color: var(--error);
+  flex-basis: 100%;
+}
+.aap-panel .card.drift-warning .card-value { color: var(--error); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.drift-ok .card-value { color: var(--ok); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.drift-unknown .card-value { color: var(--muted); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.path-cell {
+  flex-basis: 100%;
+}
+.aap-panel .card.path-cell .card-value {
+  font-size: 0.9rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.snippet {
+  flex-basis: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+}
+.snippet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.snippet-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.snippet-copy { margin-right: 0; }
+.snippet-code {
+  margin: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem;
+  color: var(--ok);
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
 .footer {
   display: flex;
   align-items: center;

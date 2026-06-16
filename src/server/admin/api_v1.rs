@@ -31,6 +31,7 @@ use crate::protocol::surface_probe::{
     SurfaceProfile, list_tools_for_profile, surface_profile_from_env,
 };
 use crate::server::ServerRuntime;
+use crate::server::aap::{AapDetection, AapPresets, EmbedPinComparison, IntegrationMode};
 
 // ---------------------------------------------------------------------------
 // View DTOs (T005)
@@ -229,6 +230,133 @@ impl SystemSnapshot {
     }
 }
 
+/// AAP integration presets projection for the panel (US2). The embed snippet is
+/// always present for a detected AAP; the serve-URL snippet is `null` unless a
+/// `serve` attach URL is available.
+#[derive(Debug, Clone, Serialize)]
+pub struct AapPresetsView {
+    /// The embed `Cargo.toml` snippet (path dep + `features=["embed"]`).
+    pub embed_snippet: String,
+    /// The serve-URL MCP registration preset, or `null` when serve is inactive.
+    pub serve_url_snippet: Option<String>,
+}
+
+impl From<AapPresets> for AapPresetsView {
+    fn from(p: AapPresets) -> Self {
+        Self {
+            embed_snippet: p.embed_snippet,
+            serve_url_snippet: p.serve_url_snippet,
+        }
+    }
+}
+
+/// AAP operator panel projection (008 US1). Reports the sibling-AAP detection
+/// state, the integration mode, the embed-pin drift comparison (pinned vs the
+/// running crate version), any AAP-indexed roots, and the integration presets.
+///
+/// Not-detected is a first-class clean state: `detected = false`, `root = null`,
+/// `mode = "none"`, `drift = "pin_unknown"` (the panel shows an empty-state, not
+/// an error — spec edge case + SC-002). Detection is **read-only** against the
+/// sibling checkout; no real AAP checkout is mutated.
+#[derive(Debug, Clone, Serialize)]
+pub struct AapView {
+    /// Whether a sibling AAP checkout was detected.
+    pub detected: bool,
+    /// The resolved AAP root path when detected; `null` otherwise.
+    pub root: Option<String>,
+    /// How the root was resolved (`"env"` | `"sibling"`); `null` when not detected.
+    pub source: Option<String>,
+    /// Integration mode label: `"embed"` | `"mcp_url"` | `"both"` | `"none"`.
+    pub mode: String,
+    /// AAP's pinned `symforge` version from its `Cargo.lock`; `null` when unknown
+    /// (lock missing/unparseable/no symforge package).
+    pub pinned_version: Option<String>,
+    /// The running SymForge crate version (always present).
+    pub running_version: String,
+    /// Drift comparison label: `"drift"` | `"match"` | `"pin_unknown"`.
+    pub drift: String,
+    /// Whether the pin has drifted from the running crate (the panel warns iff true).
+    pub drifted: bool,
+    /// AAP-indexed project roots, when discoverable. Empty when none are known
+    /// (no false data — the panel shows an empty list, never fabricated roots).
+    pub indexed_roots: Vec<String>,
+    /// One-click integration presets (embed snippet always; serve-URL when active).
+    pub presets: AapPresetsView,
+}
+
+impl AapView {
+    /// Build the AAP panel view from the running server's detection + serve state.
+    ///
+    /// Resolves the sibling AAP checkout (read-only), compares its embed pin to
+    /// the running crate, classifies the integration mode, and assembles the
+    /// presets. The serve-URL preset uses the runtime's bootstrap key + the
+    /// documented default attach URL (the admin API only runs inside an active
+    /// `serve`, so the serve path is available here).
+    pub fn from_runtime(runtime: &ServerRuntime) -> Self {
+        let detection = AapDetection::resolve();
+        // The admin API only runs inside an active `serve` (the request reached
+        // this handler over the serve HTTP listener), so the serve-URL path IS
+        // available here.
+        let bearer = runtime.auth().api_key.clone();
+        Self::from_parts(&detection, true, bearer.as_deref())
+    }
+
+    /// Build from an explicit detection result, serve-active flag, and Bearer key
+    /// (test seam: fixtures drive detection + serve state without depending on the
+    /// host's real sibling layout or a running serve).
+    ///
+    /// `serve_active` decouples the serve path from detection: the integration
+    /// mode is `both` only when AAP is detected AND serve is active, and the
+    /// serve-URL preset is offered under the same condition (US2 / SC-003). The
+    /// embed snippet is host-independent and always present.
+    pub fn from_parts(detection: &AapDetection, serve_active: bool, bearer: Option<&str>) -> Self {
+        // Embed-pin comparison: only meaningful for a detected root; otherwise
+        // it is `pin_unknown` against the running crate (no false drift).
+        let comparison = match detection.root.as_deref() {
+            Some(root) => EmbedPinComparison::for_root(root),
+            None => EmbedPinComparison::evaluate(None, crate::server::aap::running_version()),
+        };
+
+        // The serve-URL preset is offered only when serve is active AND AAP is
+        // detected; the embed snippet is always present. Use the documented
+        // default attach URL shape (same default the harness view uses).
+        let attach_url = format!(
+            "http://{}{}",
+            crate::server::serve::DEFAULT_LISTEN,
+            crate::server::mcp_http::MCP_PATH
+        );
+        let offer_serve = detection.detected && serve_active;
+        let presets = AapPresets::build(offer_serve.then_some((attach_url.as_str(), bearer)));
+
+        let mode = IntegrationMode::classify(detection.detected, serve_active);
+
+        Self {
+            detected: detection.detected,
+            root: detection.root.as_ref().map(|p| p.display().to_string()),
+            source: detection.source.map(|s| s.label().to_string()),
+            mode: mode.label().to_string(),
+            pinned_version: comparison.pinned_version().map(str::to_string),
+            running_version: comparison.running_version().to_string(),
+            drift: comparison.label().to_string(),
+            drifted: comparison.is_drift(),
+            indexed_roots: aap_indexed_roots(detection),
+            presets: presets.into(),
+        }
+    }
+}
+
+/// Discover AAP-indexed project roots (read-only). Today this surfaces the
+/// detected AAP root itself when present (the sibling checkout AAP indexes);
+/// richer backend-reported roots are a future extension (E4). Returns an empty
+/// list when nothing is known — never fabricated data (SC-002).
+fn aap_indexed_roots(detection: &AapDetection) -> Vec<String> {
+    detection
+        .root
+        .as_ref()
+        .map(|p| vec![p.display().to_string()])
+        .unwrap_or_default()
+}
+
 /// API-key record projection for `/api/v1/keys` (never carries a raw secret).
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyRecordView {
@@ -317,6 +445,17 @@ pub async fn get_harness(State(runtime): State<ServerRuntime>) -> Json<HarnessSt
 /// `GET /api/v1/system` — process/index telemetry (FR-005).
 pub async fn get_system(State(runtime): State<ServerRuntime>) -> Json<SystemSnapshot> {
     Json(SystemSnapshot::from_runtime(&runtime))
+}
+
+/// `GET /api/v1/aap` — AAP operator panel projection (008 US1 / FR-003).
+///
+/// Reports the sibling-AAP detection state, integration mode, embed-pin drift
+/// comparison, AAP-indexed roots, and the integration presets. Detection is
+/// **read-only** against the sibling checkout — no real AAP checkout is mutated.
+/// Not-detected is a clean state (not an error); the panel renders an empty
+/// state. Behind the same shared auth + Origin layer as every other handler.
+pub async fn get_aap(State(runtime): State<ServerRuntime>) -> Json<AapView> {
+    Json(AapView::from_runtime(&runtime))
 }
 
 /// `GET /api/v1/keys` — list keys (never raw; FR-004).

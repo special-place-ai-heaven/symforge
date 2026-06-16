@@ -150,6 +150,89 @@ function td(text, cls) {
   return cell;
 }
 
+// --- AAP integration panel (008 US1 + US2) ---
+
+// A labelled, copy-to-clipboard code block for an integration preset snippet.
+function snippetBlock(label, code) {
+  const wrap = document.createElement("div");
+  wrap.className = "snippet";
+  const head = document.createElement("div");
+  head.className = "snippet-head";
+  const l = document.createElement("span");
+  l.className = "snippet-label";
+  l.textContent = label;
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "action snippet-copy";
+  copy.textContent = "Copy";
+  copy.addEventListener("click", function () {
+    const done = function () { copy.textContent = "Copied"; setTimeout(function () { copy.textContent = "Copy"; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(done, function () { setStatus("Copy failed; select manually.", true); });
+    } else {
+      // Fallback: select the text so the operator can copy manually.
+      done();
+    }
+  });
+  head.appendChild(l);
+  head.appendChild(copy);
+  const pre = document.createElement("pre");
+  pre.className = "snippet-code";
+  pre.textContent = code;
+  wrap.appendChild(head);
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+async function loadAap() {
+  const el = document.getElementById("aap");
+  try {
+    const resp = await api("/aap");
+    const data = await resp.json();
+    el.innerHTML = "";
+    if (!data.detected) {
+      // Clean empty state — not an error (SC-002). The rest of the dashboard is
+      // unaffected.
+      note(el, "AAP not detected (no sibling checkout or AAP_ROOT).", "empty");
+      return;
+    }
+    // Detection + mode + drift cards.
+    el.appendChild(card("Detected", "yes (" + (data.source || "?") + ")"));
+    el.appendChild(card("Root", data.root || "(unknown)", "path-cell"));
+    el.appendChild(card("Mode", data.mode));
+    el.appendChild(card("Pinned version", data.pinned_version || "(pin unknown)"));
+    el.appendChild(card("Running version", data.running_version));
+    // Drift warning is raised iff the pin has actually drifted (no false positive
+    // for pin_unknown).
+    if (data.drifted) {
+      el.appendChild(card(
+        "Drift",
+        "WARNING: AAP pins " + data.pinned_version + " but the running crate is " + data.running_version + " — re-pin AAP's embed dependency.",
+        "drift-warning"
+      ));
+    } else if (data.drift === "match") {
+      el.appendChild(card("Drift", "none (pin matches running)", "drift-ok"));
+    } else {
+      el.appendChild(card("Drift", "pin unknown (no false warning)", "drift-unknown"));
+    }
+    if (data.indexed_roots && data.indexed_roots.length) {
+      el.appendChild(card("Indexed roots", data.indexed_roots.join(", "), "path-cell"));
+    }
+    // Presets (US2): the embed snippet is always present for a detected AAP; the
+    // serve-URL preset only when serve is active.
+    if (data.presets) {
+      if (data.presets.embed_snippet) {
+        el.appendChild(snippetBlock("Embed (Cargo.toml)", data.presets.embed_snippet));
+      }
+      if (data.presets.serve_url_snippet) {
+        el.appendChild(snippetBlock("Serve URL (MCP registration)", data.presets.serve_url_snippet));
+      }
+    }
+  } catch (e) {
+    note(el, "Failed to load AAP status.", "unavailable");
+  }
+}
+
 // --- Keys ---
 
 async function loadKeys() {
@@ -279,6 +362,7 @@ async function refreshAll() {
     loadEconomics(),
     loadSurface(),
     loadHarness(),
+    loadAap(),
     loadKeys(),
     loadSystem(),
   ]);

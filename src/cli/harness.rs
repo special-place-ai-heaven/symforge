@@ -382,6 +382,133 @@ fn apply_toml(existing_text: Option<&str>, entry: &AttachEntry) -> anyhow::Resul
     Ok(doc.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// AAP-typed harness target (008 US3 / FR-005)
+// ---------------------------------------------------------------------------
+//
+// AAP is NOT a generic MCP-client JSON file: it consumes SymForge through the
+// library **embed path** (`symforge = { path = "../symforge", features =
+// ["embed"] }`) and only optionally through an HTTP MCP attach. The harness hub
+// therefore surfaces AAP as its own distinct entry (not mis-scanned as a
+// Cursor/Claude JSON) with AAP-appropriate presets, and a write to AAP's config
+// must NEVER overwrite the embed path dependency with a stdio-spawn config.
+//
+// All of this is `server`-gated; the `embed` build compiles none of it
+// (G-045 invariant preserved) — it depends on `crate::server::aap`.
+
+/// The integration preset offered for an AAP target.
+///
+/// `EmbedOnly` is the default (AAP links SymForge as a path dep); `Http` is the
+/// optional secondary path (register the running `serve` URL in AAP's MCP
+/// settings). Neither is ever a stdio-spawn config for the embed dep.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AapPresetChoice {
+    /// The default: AAP consumes SymForge via the embed path dependency. No MCP
+    /// client config is written; the operator copies the Cargo.toml snippet.
+    EmbedOnly,
+    /// The optional secondary path: register the running `serve` URL as an HTTP
+    /// MCP server in AAP's settings (an attach entry, NOT a stdio spawn).
+    Http,
+}
+
+#[cfg(feature = "server")]
+impl AapPresetChoice {
+    /// Stable label for diagnostics / the panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            AapPresetChoice::EmbedOnly => "embed_only",
+            AapPresetChoice::Http => "http",
+        }
+    }
+}
+
+/// A distinct, AAP-typed harness target — surfaced separately from the generic
+/// MCP-client scan so AAP is never mis-handled as a Cursor/Claude JSON file
+/// (FR-005 / SC-004).
+///
+/// Carries the AAP detection result, the canonical embed path dependency (the
+/// dep that must never be overwritten), and the available presets (embed-only
+/// default, HTTP optional only when a serve attach URL is available).
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AapHarnessTarget {
+    /// Whether a sibling AAP checkout was detected.
+    pub detected: bool,
+    /// The resolved AAP root when detected; `None` otherwise.
+    pub root: Option<PathBuf>,
+    /// How the root was resolved (`env` | `sibling`); `None` when not detected.
+    pub source: Option<&'static str>,
+    /// The canonical embed path dependency snippet — the line that must NEVER be
+    /// replaced by a stdio-spawn config (FR-004 / SC-003).
+    pub embed_path_dep: String,
+    /// The presets offered for this target. `EmbedOnly` is always present for a
+    /// detected AAP; `Http` is included only when a serve attach URL is available.
+    pub presets: Vec<AapPresetChoice>,
+}
+
+#[cfg(feature = "server")]
+impl AapHarnessTarget {
+    /// True when the target offers the HTTP (serve-URL) preset in addition to the
+    /// embed-only default.
+    pub fn offers_http(&self) -> bool {
+        self.presets.contains(&AapPresetChoice::Http)
+    }
+
+    /// True when the embed path dep is preserved (never a stdio-spawn config).
+    /// The embed dep is, by construction, a Cargo path dependency — this guards
+    /// that invariant against a future regression.
+    pub fn embed_dep_is_path_not_stdio(&self) -> bool {
+        let dep = &self.embed_path_dep;
+        dep.contains("path =")
+            && dep.contains("features = [\"embed\"]")
+            && !dep.contains("command")
+            && !dep.contains("stdio")
+            && !dep.contains("args")
+    }
+}
+
+/// Resolve the AAP harness target for the current process.
+///
+/// Detection precedence matches [`crate::server::aap::AapDetection`] (`AAP_ROOT`
+/// env, then the conventional sibling). `serve_attach` carries `Some(url)` only
+/// when a `serve` attach URL is available — then the HTTP preset is offered in
+/// addition to the always-present embed-only default; otherwise embed-only.
+#[cfg(feature = "server")]
+pub fn aap_target(serve_attach: Option<&str>) -> AapHarnessTarget {
+    aap_target_from(&crate::server::aap::AapDetection::resolve(), serve_attach)
+}
+
+/// Build the AAP harness target from an explicit detection result (test seam:
+/// fixtures drive detection without depending on the host's real sibling).
+///
+/// The embed path dep is the canonical [`crate::server::aap::embed_cargo_snippet`]
+/// (a path dep with `features=["embed"]`) — never a stdio config. The HTTP preset
+/// is offered only when `serve_attach` is present.
+#[cfg(feature = "server")]
+pub fn aap_target_from(
+    detection: &crate::server::aap::AapDetection,
+    serve_attach: Option<&str>,
+) -> AapHarnessTarget {
+    // The embed-only preset is always offered for a detected AAP; HTTP only when
+    // a serve attach URL is available. For a not-detected AAP no presets apply.
+    let mut presets = Vec::new();
+    if detection.detected {
+        presets.push(AapPresetChoice::EmbedOnly);
+        if serve_attach.is_some_and(|u| !u.is_empty()) {
+            presets.push(AapPresetChoice::Http);
+        }
+    }
+
+    AapHarnessTarget {
+        detected: detection.detected,
+        root: detection.root.clone(),
+        source: detection.source.map(|s| s.label()),
+        embed_path_dep: crate::server::aap::embed_cargo_snippet(),
+        presets,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

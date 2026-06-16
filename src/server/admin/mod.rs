@@ -111,6 +111,7 @@ pub fn build_admin_router(runtime: &ServerRuntime) -> Router {
         .route("/api/v1/surface", get(api_v1::get_surface))
         .route("/api/v1/harness", get(api_v1::get_harness))
         .route("/api/v1/system", get(api_v1::get_system))
+        .route("/api/v1/aap", get(api_v1::get_aap))
         .route(
             "/api/v1/keys",
             get(api_v1::list_keys).post(api_v1::mint_key),
@@ -131,7 +132,9 @@ mod tests {
         assert!(INDEX_HTML.contains("/admin/app.js"));
         assert!(INDEX_HTML.contains("/admin/style.css"));
         assert!(!STYLE_CSS.is_empty());
-        for endpoint in ["/summary", "/surface", "/harness", "/system", "/keys"] {
+        for endpoint in [
+            "/summary", "/surface", "/harness", "/system", "/aap", "/keys",
+        ] {
             assert!(
                 APP_JS.contains(endpoint),
                 "app.js must reference {endpoint}"

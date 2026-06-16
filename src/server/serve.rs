@@ -373,13 +373,31 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // First-run / post-update onboarding banner (FR-009). Best-effort: a state
     // read/write failure never affects serve. Shows once per build version, and
     // only when anchored to a project data dir (no root => skip silently).
+    //
+    // When a sibling AAP checkout is detected (008 US3 / FR-006), the banner also
+    // surfaces the operator `/admin` panel URL and the AAP embed path dependency
+    // (the AAP-native integration route). Detection is read-only.
     if let Some(root) = onboarding_root.as_ref() {
         let state_path = crate::cli::onboarding::state_path(root);
         let mut sink = crate::cli::onboarding::StderrSink;
-        crate::cli::onboarding::maybe_show_banner(
+        let detection = crate::server::aap::AapDetection::resolve();
+        let aap_banner = detection.detected.then(|| {
+            let admin_url = format!(
+                "http://{host}:{port}{path}",
+                host = local_addr.ip(),
+                port = local_addr.port(),
+                path = crate::server::admin::ADMIN_PATH,
+            );
+            crate::cli::onboarding::AapBanner {
+                admin_url,
+                embed_path_dep: crate::server::aap::embed_cargo_snippet(),
+            }
+        });
+        crate::cli::onboarding::maybe_show_banner_with_aap(
             &state_path,
             env!("CARGO_PKG_VERSION"),
             &attach_url,
+            aap_banner.as_ref(),
             &mut sink,
         );
     }

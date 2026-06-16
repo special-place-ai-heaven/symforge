@@ -13,6 +13,7 @@
 //! US1/T013-T016 ([`mcp_http`]); the full live `tool_router` parity battery is
 //! finalized in US1/T018.
 
+pub mod aap;
 pub mod admin;
 pub mod api_keys;
 pub mod auth;

@@ -93,12 +93,30 @@ pub fn maybe_show_banner(
     attach_url: &str,
     sink: &mut impl OnboardingSink,
 ) -> bool {
+    maybe_show_banner_with_aap(state_path, current_version, attach_url, None, sink)
+}
+
+/// AAP-aware onboarding banner (008 US3 / FR-006). Identical to
+/// [`maybe_show_banner`] but, when `aap` is `Some`, the rendered banner also
+/// mentions the operator `/admin` panel URL and the AAP **embed path**
+/// dependency so an AAP user sees the AAP-native integration route, not just the
+/// generic MCP attach.
+///
+/// `aap` is `None` (no AAP detected) → identical output to [`maybe_show_banner`].
+/// The shown-once-per-version state machine is unchanged.
+pub fn maybe_show_banner_with_aap(
+    state_path: &Path,
+    current_version: &str,
+    attach_url: &str,
+    aap: Option<&AapBanner>,
+    sink: &mut impl OnboardingSink,
+) -> bool {
     let state = OnboardingState::load(state_path);
     if !state.should_show(current_version) {
         return false;
     }
 
-    render_banner(current_version, attach_url, sink);
+    render_banner(current_version, attach_url, aap, sink);
 
     let next = OnboardingState {
         last_shown_version: Some(current_version.to_string()),
@@ -110,13 +128,39 @@ pub fn maybe_show_banner(
     true
 }
 
-fn render_banner(version: &str, attach_url: &str, sink: &mut impl OnboardingSink) {
+/// AAP-detection context for the onboarding banner. Carries the operator
+/// `/admin` panel URL and the AAP embed path dependency snippet so the banner
+/// can surface the AAP-native integration route (FR-006). Plain strings (no
+/// `server`-feature dependency) so onboarding stays feature-agnostic and
+/// testable; the `serve` caller fills these from `crate::server::aap`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AapBanner {
+    /// The operator admin panel URL (e.g. `http://127.0.0.1:8787/admin`).
+    pub admin_url: String,
+    /// The AAP embed path dependency snippet
+    /// (`symforge = { path = "../symforge", features = ["embed"] }`).
+    pub embed_path_dep: String,
+}
+
+fn render_banner(
+    version: &str,
+    attach_url: &str,
+    aap: Option<&AapBanner>,
+    sink: &mut impl OnboardingSink,
+) {
     sink.line("");
     sink.line(&format!("SymForge {version} is ready."));
     sink.line(&format!(
         "  Attach an MCP client to this server: {attach_url}"
     ));
     sink.line("  Auto-configure your harnesses:  symforge init --scan");
+    if let Some(aap) = aap {
+        // AAP detected: surface the AAP-native route — the operator panel and the
+        // embed path dependency (the way AAP consumes SymForge), not just the
+        // generic MCP attach (FR-006).
+        sink.line(&format!("  AAP detected. Operator panel: {}", aap.admin_url));
+        sink.line(&format!("  AAP embed dependency:  {}", aap.embed_path_dep));
+    }
     sink.offer_open(attach_url);
     sink.line("");
 }
@@ -190,5 +234,63 @@ mod tests {
             "http://x/mcp",
             &mut sink2
         ));
+    }
+
+    // --- AAP-aware banner (008 US3 / FR-006) ---
+
+    #[test]
+    fn aap_banner_mentions_admin_and_embed_path_when_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onboarding.json");
+        let aap = AapBanner {
+            admin_url: "http://127.0.0.1:8787/admin".to_string(),
+            embed_path_dep: "symforge = { path = \"../symforge\", features = [\"embed\"] }"
+                .to_string(),
+        };
+
+        let mut sink = RecordingSink::default();
+        assert!(maybe_show_banner_with_aap(
+            &path,
+            "1.0.0",
+            "http://x/mcp",
+            Some(&aap),
+            &mut sink
+        ));
+        let text = sink.lines.join("\n");
+        // FR-006: both /admin and the AAP embed path are mentioned.
+        assert!(
+            text.contains("/admin"),
+            "AAP banner must mention the operator /admin panel: {text}"
+        );
+        assert!(
+            text.contains("path = \"../symforge\"") && text.contains("features = [\"embed\"]"),
+            "AAP banner must mention the embed path dependency: {text}"
+        );
+    }
+
+    #[test]
+    fn banner_without_aap_omits_admin_and_embed_path() {
+        // When AAP is NOT detected the banner is unchanged — no /admin or embed
+        // path lines (the generic MCP attach is the only route surfaced).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("onboarding.json");
+
+        let mut sink = RecordingSink::default();
+        assert!(maybe_show_banner_with_aap(
+            &path,
+            "1.0.0",
+            "http://x/mcp",
+            None,
+            &mut sink
+        ));
+        let text = sink.lines.join("\n");
+        assert!(
+            !text.contains("/admin"),
+            "non-AAP banner must NOT mention /admin: {text}"
+        );
+        assert!(
+            !text.contains("embed"),
+            "non-AAP banner must NOT mention the embed path: {text}"
+        );
     }
 }
