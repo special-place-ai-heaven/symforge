@@ -87,6 +87,14 @@ pub struct SymForgeServer {
     /// Bounded analytics queue. Disabled by default until an explicit local
     /// analytics configuration installs an enabled recorder.
     pub(crate) analytics_recorder: Arc<RwLock<crate::analytics::AnalyticsRecorder>>,
+    /// Durable STEL L4 economics ledger (US3). `None` on stdio/embed (no
+    /// persistence); `Some` only when `serve::run` wires the opened store in.
+    /// The same `Arc` is shared with `ServerRuntime` so there is exactly one
+    /// durable ledger path (no economics double-count). When `Some` it may be
+    /// [`crate::stel::ledger_store::StelLedgerStore::Disabled`] if the DB could
+    /// not open — write-through then degrades to a logged no-op (FR-011).
+    #[cfg(feature = "server")]
+    pub(crate) stel_ledger_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
 }
 
 fn default_analytics_db_path(repo_root: Option<&Path>) -> PathBuf {
@@ -136,6 +144,8 @@ impl SymForgeServer {
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
+            #[cfg(feature = "server")]
+            stel_ledger_store: None,
         }
     }
 
@@ -161,7 +171,69 @@ impl SymForgeServer {
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
+            #[cfg(feature = "server")]
+            stel_ledger_store: None,
         }
+    }
+
+    /// Attach a durable STEL economics ledger store to this server (US3/T028).
+    ///
+    /// Builder-style; consumed by `server::serve::build_serve_runtime` so the
+    /// same `Arc<StelLedgerStore>` is shared with `ServerRuntime`. This is the
+    /// single durable ledger path — the in-memory `SessionLedger` write and the
+    /// durable write-through both happen in `finalize_symforge_with_ledger`, so
+    /// no economics row is counted twice.
+    #[cfg(feature = "server")]
+    pub fn with_stel_ledger_store(
+        mut self,
+        store: Arc<crate::stel::ledger_store::StelLedgerStore>,
+    ) -> Self {
+        self.stel_ledger_store = Some(store);
+        self
+    }
+
+    /// Write one finalized ledger event through to the durable store (US3/T028).
+    ///
+    /// Called from `finalize_symforge_with_ledger` AFTER the in-memory
+    /// `SessionLedger` push. The durable write degrades to a logged no-op on a
+    /// store error and never fails the request (FR-011): `StelLedgerStore::record`
+    /// no-ops when `Disabled` and logs-and-continues on an insert error. On
+    /// stdio/embed builds (`server` feature off) this is a compile-time no-op.
+    #[cfg(feature = "server")]
+    fn persist_ledger_event_durably(&self, event: &crate::stel::types::StelLedgerEvent) {
+        if let Some(store) = self.stel_ledger_store.as_ref() {
+            store.record(event);
+        }
+    }
+
+    #[cfg(not(feature = "server"))]
+    #[inline]
+    fn persist_ledger_event_durably(&self, _event: &crate::stel::types::StelLedgerEvent) {}
+
+    /// Durable-ledger summary for the `status` tool (US3/T029 restart-survival).
+    ///
+    /// Reads `summary()` from the wired durable store. Returns `None` when no
+    /// store is attached (stdio) or the store is `Disabled`. On stdio/embed
+    /// builds (`server` feature off) this is a compile-time `None`.
+    #[cfg(feature = "server")]
+    fn durable_ledger_summary_for_status(
+        &self,
+    ) -> Option<crate::stel::status::DurableLedgerSummary> {
+        let store = self.stel_ledger_store.as_ref()?;
+        let summary = store.summary()?;
+        Some(crate::stel::status::DurableLedgerSummary {
+            total_events: summary.total_events,
+            total_net_vs_manual: summary.total_net_vs_manual,
+            session_count: summary.session_count,
+        })
+    }
+
+    #[cfg(not(feature = "server"))]
+    #[inline]
+    fn durable_ledger_summary_for_status(
+        &self,
+    ) -> Option<crate::stel::status::DurableLedgerSummary> {
+        None
     }
 
     /// Accessor for tests.

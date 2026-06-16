@@ -6,7 +6,8 @@ use rmcp::{serve_server, transport};
 use std::ffi::OsString;
 use symforge::live_index::persist;
 use symforge::{
-    cli, daemon, discovery, live_index, observability, protocol, sidecar, version_registry, watcher,
+    cli, daemon, discovery, live_index, observability, protocol, server, sidecar, version_registry,
+    watcher,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +140,7 @@ fn main() -> anyhow::Result<()> {
         Some(cli::Commands::Analytics { command }) => cli::analytics::run_analytics(&command),
         Some(cli::Commands::Init { client }) => cli::init::run_init(client),
         Some(cli::Commands::Daemon) => run_daemon(),
+        Some(cli::Commands::Serve(args)) => run_serve(args),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
         Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
         Some(cli::Commands::Update) => cli::update::run_update(),
@@ -158,6 +160,35 @@ fn run_daemon() -> anyhow::Result<()> {
             observability::init_tracing()?;
             daemon::run_daemon_until_shutdown("127.0.0.1").await
         })
+}
+
+fn run_serve(args: cli::serve::ServeCliArgs) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        observability::init_tracing()?;
+        // Secure-startup checks (key resolution, loopback, refuse-to-start) run
+        // inside `server::serve::run` before any bind; on a permitted config it
+        // mounts `/mcp` and runs until shutdown. Map only the tracing-init error
+        // to anyhow here; the serve result stays a typed `ServeError` so
+        // refuse-to-start can map to exit code 2 below.
+        Ok::<Result<(), server::serve::ServeError>, anyhow::Error>(
+            server::serve::run(args.into_serve_args()).await,
+        )
+    })?;
+
+    match result {
+        Ok(()) => Ok(()),
+        // Secure-default refuse-to-start is exit code 2 (cli-serve contract):
+        // distinct from a generic failure so operators/CI can detect a refused
+        // bind specifically. Print the cause, then exit 2 directly.
+        Err(server::serve::ServeError::Startup(err)) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+        Err(other) => Err(anyhow::Error::from(other)),
+    }
 }
 
 fn run_mcp_server() -> anyhow::Result<()> {

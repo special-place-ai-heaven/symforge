@@ -6,8 +6,11 @@ mod stel_surface_env;
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
+use symforge::stel::ledger_store::StelLedgerStore;
 use symforge::stel::{self, AdmissionDecision, GoldenRouteRow};
 
 fn repo_root() -> PathBuf {
@@ -50,6 +53,33 @@ fn server_for_corpus(relative: &str, project: &str) -> SymForgeServer {
         Some(root),
         None,
     )
+}
+
+/// Build a corpus server with an in-memory durable [`StelLedgerStore`] wired in
+/// (US3/T028). Returns the shared store handle so the test can read it back and
+/// assert the durable write-through. The same `Arc` is held by the server, so
+/// this is exactly the path `build_serve_runtime` uses on `/mcp`.
+fn server_for_corpus_with_store(
+    relative: &str,
+    project: &str,
+    session_id: &str,
+) -> (SymForgeServer, Arc<StelLedgerStore>) {
+    let root = corpus_path(relative);
+    let shared = LiveIndex::load(&root).unwrap_or_else(|error| {
+        panic!("index {}: {error}", root.display());
+    });
+    let store = Arc::new(StelLedgerStore::open_in_memory(session_id).expect("in-memory store"));
+    let server = SymForgeServer::new(
+        shared,
+        project.to_string(),
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            symforge::watcher::WatcherInfo::default(),
+        )),
+        Some(root),
+        None,
+    )
+    .with_stel_ledger_store(Arc::clone(&store));
+    (server, store)
 }
 
 async fn replay_row(server: &SymForgeServer, row: &GoldenRouteRow) -> String {
@@ -138,4 +168,70 @@ async fn pff_row_records_ledger_without_legacy_execution() {
     let event = server.stel_ledger().lock().last().expect("ledger event");
     assert_eq!(event.decision, AdmissionDecision::Bypass);
     assert!(event.tools_called.is_empty());
+}
+
+#[tokio::test]
+async fn serve_invocation_writes_through_to_durable_store() {
+    // US3/T028+T029: a serve invocation on a server with a wired durable store
+    // persists the event through to SQLite (write-through, off the in-memory
+    // path) AND the store's summary() observes the row (the read path the
+    // `status` tool surfaces). One ledger path: exactly one durable row per
+    // invocation, matching the single in-memory event.
+    if !corpora_available() {
+        eprintln!("skip serve_invocation_writes_through_to_durable_store: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let (server, store) =
+        server_for_corpus_with_store(stel::S4_REPLAY_CORPUS, "cfg-if-rust", "serve-writethrough");
+
+    // Durable store starts empty.
+    assert_eq!(store.summary().expect("summary").total_events, 0);
+
+    let _output = replay_row(&server, row).await;
+
+    // In-memory ledger recorded exactly one event...
+    assert_eq!(server.stel_ledger().lock().len(), 1);
+    // ...and the durable store has exactly one matching row (no double-count).
+    let summary = store
+        .summary()
+        .expect("durable summary after write-through");
+    assert_eq!(
+        summary.total_events, 1,
+        "durable store must hold exactly one row after one serve invocation"
+    );
+    assert_eq!(summary.session_count, 1);
+
+    let recent = store.recent(10).expect("recent durable rows");
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].decision, "serve");
+    assert_eq!(recent[0].session_id, "serve-writethrough");
+    assert_eq!(recent[0].tools_called_json, r#"["find_references"]"#);
+}
+
+#[tokio::test]
+async fn serve_without_durable_store_keeps_in_memory_ledger_only() {
+    // Stdio-shaped server (no durable store): in-memory ledger still records,
+    // and there is simply no durable sink. Guards against the write-through
+    // accidentally becoming load-bearing for the in-memory path.
+    if !corpora_available() {
+        eprintln!("skip serve_without_durable_store_keeps_in_memory_ledger_only: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "cfg-if-rust");
+
+    let _output = replay_row(&server, row).await;
+
+    assert_eq!(server.stel_ledger().lock().len(), 1);
 }

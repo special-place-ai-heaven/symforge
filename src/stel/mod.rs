@@ -24,6 +24,8 @@ pub mod gates;
 pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
+#[cfg(feature = "server")]
+pub mod ledger_store;
 pub mod planner;
 pub mod status;
 pub mod surface;

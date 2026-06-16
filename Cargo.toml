@@ -50,7 +50,7 @@ sha2 = "0.11"
 parking_lot = "0.12"
 rayon = "1.10"
 schemars = "1"
-rmcp = { version = "1.1.0", features = ["transport-io"], optional = true }
+rmcp = { version = "1.1.0", features = ["transport-io", "transport-streamable-http-server"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Maintained libyaml-lineage YAML backend. The previous `serde_yml 0.0.13` fork

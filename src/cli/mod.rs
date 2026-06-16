@@ -13,6 +13,7 @@
 pub mod analytics;
 pub mod hook;
 pub mod init;
+pub mod serve;
 pub mod trust;
 pub mod update;
 pub mod version;
@@ -47,6 +48,8 @@ pub enum Commands {
     },
     /// Run the shared local daemon that tracks project and session state
     Daemon,
+    /// Serve the MCP surface over Streamable HTTP at `/mcp` (operator server)
+    Serve(serve::ServeCliArgs),
     /// Hook subcommands called by Claude Code (PostToolUse / SessionStart / UserPromptSubmit)
     Hook {
         #[command(subcommand)]
@@ -157,6 +160,41 @@ mod tests {
         match cli.command {
             Some(Commands::Daemon) => {}
             _ => panic!("expected daemon command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_command_parses_with_defaults() {
+        let cli = Cli::parse_from(["symforge", "serve"]);
+
+        match cli.command {
+            Some(Commands::Serve(args)) => {
+                assert_eq!(args.listen, "127.0.0.1:8787");
+                assert_eq!(args.api_key, None);
+                assert_eq!(args.api_key_env, None);
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_command_parses_flags() {
+        let cli = Cli::parse_from([
+            "symforge",
+            "serve",
+            "--listen",
+            "0.0.0.0:9000",
+            "--api-key-env",
+            "SYMFORGE_KEY",
+        ]);
+
+        match cli.command {
+            Some(Commands::Serve(args)) => {
+                assert_eq!(args.listen, "0.0.0.0:9000");
+                assert_eq!(args.api_key, None);
+                assert_eq!(args.api_key_env.as_deref(), Some("SYMFORGE_KEY"));
+            }
+            _ => panic!("expected serve command"),
         }
     }
 

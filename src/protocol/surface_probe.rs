@@ -23,13 +23,16 @@ pub enum SurfaceProfile {
 }
 
 pub fn surface_profile_from_env() -> SurfaceProfile {
+    // Default surface is compact-3 (v8 cutover, US2/FR-008). `SYMFORGE_SURFACE=full`
+    // is the documented backward-compatible opt-out that restores the legacy
+    // 32-tool surface; `meta` and `compact` keep their explicit meanings.
     match std::env::var("SYMFORGE_SURFACE")
         .ok()
         .map(|v| v.to_ascii_lowercase())
     {
-        Some(ref s) if s == "compact" => SurfaceProfile::Compact,
+        Some(ref s) if s == "full" => SurfaceProfile::Full,
         Some(ref s) if s == "meta" => SurfaceProfile::Meta,
-        _ => SurfaceProfile::Full,
+        _ => SurfaceProfile::Compact,
     }
 }
 
