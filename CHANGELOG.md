@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.29.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.28.0...v7.29.0) (2026-06-16)
+
+
+### Features
+
+* **server:** 006 admin GUI — /admin + /api/v1, hashed API-key store, Origin gating ([11b4c8b](https://github.com/special-place-ai-heaven/symforge/commit/11b4c8b3d1382e7c2329fde9b7925c40107a18f7))
+
 ## [7.28.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.27.0...v7.28.0) (2026-06-16)
 
 
