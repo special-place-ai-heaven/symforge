@@ -88,6 +88,16 @@ th, td {
 }
 th { color: var(--muted); font-weight: 500; }
 
+/* Horizontal scroll container for tables (006 mobile overflow fix). On wide
+   screens it is invisible (table fits, nothing scrolls); on narrow viewports
+   long content scrolls *within* the container instead of widening the page. */
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 .mint-form { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
 .mint-form input {
   flex: 1;
@@ -145,3 +155,18 @@ button.action {
 .status-line { color: var(--muted); font-size: 0.8rem; }
 .status-line.error { color: var(--error); }
 .hidden { display: none; }
+
+/* Mobile (<=480px): keep body.scrollWidth <= viewport (006 overflow fix).
+   Long, unbreakable config paths in the harness table are the overflow source,
+   so let them wrap; reduce main padding; let cards flex full-width. The
+   .table-scroll container also bounds any residual table width. Desktop layout
+   is untouched (these rules only apply at <=480px). */
+@media (max-width: 480px) {
+  main { padding: 1rem 0.75rem; }
+  .card { min-width: 0; flex: 1 1 100%; }
+  .harness-table .path-cell {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  th, td { padding: 0.45rem 0.5rem; }
+}

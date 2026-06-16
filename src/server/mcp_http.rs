@@ -44,9 +44,55 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 
 use super::ServerRuntime;
 use crate::protocol::SymForgeServer;
+use crate::sidecar::governor::RequestGovernor;
 
 /// The mount path for the MCP Streamable HTTP surface.
 pub const MCP_PATH: &str = "/mcp";
+
+/// axum middleware bounding concurrent `/mcp` requests via the [`RequestGovernor`]
+/// (P2-F). The `/mcp` transport (rmcp's `StreamableHttpService`) does not flow
+/// through [`ServerRuntime::dispatch_tool_call`], so the governor is wired in at
+/// the HTTP boundary instead: each inbound request acquires one concurrency
+/// permit before the transport handler runs, and the permit is released when the
+/// request completes (the permit guard is dropped at the end of this function).
+///
+/// This bounds concurrent operator clients to the governor's `max_concurrency`
+/// (default 16). When the server is saturated and no permit frees within the
+/// governor's queue timeout, the request is shed with `503 Service Unavailable`
+/// + `Retry-After`, rather than queueing unboundedly on a tokio worker.
+#[cfg(feature = "server")]
+async fn govern_mcp_concurrency(
+    axum::extract::State(governor): axum::extract::State<Arc<RequestGovernor>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    match governor.acquire_request_slot().await {
+        Ok(_permit) => {
+            // Permit held for the whole request; dropped when this scope ends,
+            // releasing capacity for a queued client.
+            next.run(request).await
+        }
+        Err(_busy) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "Service Unavailable: operator server at capacity, retry shortly",
+        )
+            .into_response(),
+    }
+}
+
+/// Apply the [`govern_mcp_concurrency`] middleware to a router, bounding
+/// concurrent requests via the shared [`RequestGovernor`].
+#[cfg(feature = "server")]
+pub fn apply_governor(router: Router, governor: Arc<RequestGovernor>) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        governor,
+        govern_mcp_concurrency,
+    ))
+}
 
 /// Build the `StreamableHttpService` that serves the MCP surface.
 ///
@@ -104,10 +150,17 @@ fn host_allow_list(bind_host: &str) -> Vec<String> {
 /// allow-list. The returned router has **no** auth layer; [`super::auth`]'s
 /// middleware is layered on by [`super::serve::run`] so the secure-default rule
 /// is enforced in one place, in front of `/mcp`.
+///
+/// P2-F: the route is wrapped with [`apply_governor`] so the shared
+/// [`RequestGovernor`] bounds concurrent `/mcp` clients (acquire one permit per
+/// request, release on completion). The governor layer is innermost here so it
+/// only guards `/mcp` (not `/admin`); the auth + Origin layers are added later by
+/// `serve::run` and run in front of it.
 pub fn build_mcp_router(runtime: &ServerRuntime, bind_addr: SocketAddr) -> Router {
     let bind_host = bind_addr.ip().to_string();
     let service = build_mcp_service(runtime, &bind_host);
-    Router::new().route(MCP_PATH, any_service(service))
+    let router = Router::new().route(MCP_PATH, any_service(service));
+    apply_governor(router, Arc::clone(runtime.governor()))
 }
 
 #[cfg(test)]

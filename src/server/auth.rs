@@ -280,6 +280,14 @@ pub enum AuthStartupError {
         "refusing to bind a non-loopback address without an API key: pass --api-key or --api-key-env (a routable bind must be authenticated)"
     )]
     NonLoopbackWithoutKey,
+    /// An inline `--api-key` was passed while binding a routable (non-loopback)
+    /// address. The inline key is visible in process listings (`ps` / Task
+    /// Manager); a network bind must source the key from the environment
+    /// (P2-E).
+    #[error(
+        "refusing an inline --api-key on a non-loopback bind: the key would be visible in process listings (ps / Task Manager). Use --api-key-env <VAR> for a network bind (inline --api-key is allowed only on loopback)"
+    )]
+    InlineKeyOnNonLoopback,
 }
 
 /// Constant-time byte-slice equality.

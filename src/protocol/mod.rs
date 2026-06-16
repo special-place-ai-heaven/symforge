@@ -199,10 +199,41 @@ impl SymForgeServer {
     /// store error and never fails the request (FR-011): `StelLedgerStore::record`
     /// no-ops when `Disabled` and logs-and-continues on an insert error. On
     /// stdio/embed builds (`server` feature off) this is a compile-time no-op.
+    ///
+    /// P2-C (resolved — non-blocking durable write): `StelLedgerStore::record`
+    /// takes a `std::sync::Mutex<Connection>` and runs a sync INSERT under an
+    /// up-to-5000ms busy-timeout. Running that inline on the tokio worker serving
+    /// `/mcp` could stall concurrent HTTP clients. So when a tokio runtime is
+    /// present we offload the blocking write onto `spawn_blocking` (the store is
+    /// behind `Arc`, the event is cloned), and the request task returns without
+    /// waiting on the DB lock. The in-memory `SessionLedger` push stays
+    /// synchronous/immediate in `finalize_symforge_with_ledger`; only this
+    /// durable write moves off the hot path. When no runtime is present (sync
+    /// tests / embed call sites) we record synchronously so events are never
+    /// lost. Either way `record` degrades silently on store error.
     #[cfg(feature = "server")]
     fn persist_ledger_event_durably(&self, event: &crate::stel::types::StelLedgerEvent) {
-        if let Some(store) = self.stel_ledger_store.as_ref() {
-            store.record(event);
+        let Some(store) = self.stel_ledger_store.as_ref() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Offload the blocking SQLite write off the request task so the
+                // DB lock / busy-timeout never stalls the tokio worker serving
+                // MCP. Fire-and-forget: the durable write is best-effort and
+                // degrades silently inside `record` on any store error.
+                let store = Arc::clone(store);
+                let event = event.clone();
+                handle.spawn_blocking(move || {
+                    store.record(&event);
+                });
+            }
+            Err(_) => {
+                // No tokio runtime (sync test / embed context): record inline so
+                // events are never dropped. There is no async worker to protect
+                // here, so blocking is acceptable.
+                store.record(event);
+            }
         }
     }
 

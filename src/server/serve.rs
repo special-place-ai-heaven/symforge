@@ -52,10 +52,6 @@ impl Default for ServeArgs {
 
 /// Resolve the effective API key: `--api-key` wins, else `--api-key-env` (read
 /// from the environment), else `None`.
-// REVIEW P2-E: an inline `--api-key` is visible in process listings (`ps` /
-// Task Manager). Warn when `--api-key` is used, refuse an inline key on a
-// non-loopback bind, and document `--api-key-env` as the only production path.
-// Deferred.
 pub fn resolve_api_key(api_key: Option<&str>, api_key_env: Option<&str>) -> Option<String> {
     if let Some(key) = api_key
         && !key.is_empty()
@@ -71,7 +67,53 @@ pub fn resolve_api_key(api_key: Option<&str>, api_key_env: Option<&str>) -> Opti
     None
 }
 
+/// Enforce the inline-`--api-key` source policy (P2-E).
+///
+/// An inline `--api-key` is visible in process listings (`ps` / Windows Task
+/// Manager / `/proc/<pid>/cmdline`), so it is a secret-leak vector on a routable
+/// bind. This applies two rules, mirroring the secure-default refuse-to-start
+/// rule but for the *key source* rather than the key's presence:
+///
+/// 1. **Warn** whenever a non-empty inline `--api-key` is used (any bind),
+///    recommending `--api-key-env <VAR>` which keeps the secret out of argv.
+/// 2. **Refuse** an inline `--api-key` on a **non-loopback** (network) bind:
+///    a routable bind must source the key from the environment. Loopback binds
+///    may still accept an inline key for local convenience.
+///
+/// `is_loopback` is computed by the caller from the parsed bind address. The
+/// warning is emitted via `tracing::warn!` AND to stderr so an operator running
+/// without a tracing subscriber still sees it. Returns
+/// [`AuthStartupError::InlineKeyOnNonLoopback`] on a refused config so `run`
+/// exits before binding.
+pub fn enforce_api_key_source_policy(
+    api_key: Option<&str>,
+    is_loopback: bool,
+) -> Result<(), super::auth::AuthStartupError> {
+    let inline_present = matches!(api_key, Some(key) if !key.is_empty());
+    if !inline_present {
+        return Ok(());
+    }
+
+    if !is_loopback {
+        // Routable bind + inline key: refuse before binding. The operator must
+        // pass --api-key-env so the secret never lands in argv.
+        return Err(super::auth::AuthStartupError::InlineKeyOnNonLoopback);
+    }
+
+    // Loopback + inline key: allowed, but warn — inline keys are visible in
+    // process listings even locally; --api-key-env is the recommended path.
+    let msg = "WARNING: --api-key was passed inline; it is visible in process listings \
+        (ps / Task Manager). Prefer --api-key-env <VAR> so the secret stays out of argv.";
+    tracing::warn!("{msg}");
+    eprintln!("{msg}");
+    Ok(())
+}
+
 /// Whether a parsed bind address is loopback (`127.0.0.0/8` or `::1`).
+// REVIEW P3-D (deferred): `IpAddr::is_loopback()` is `false` for an IPv4-mapped
+// IPv6 loopback (`[::ffff:127.0.0.1]`). This is currently safe — with a key it
+// binds (fine); without a key it refuses (secure default). Optional future fix:
+// normalize an IPv4-mapped loopback to its IPv4 form before the policy check.
 pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
@@ -214,9 +256,11 @@ fn build_serve_runtime(
         protocol = protocol.with_stel_ledger_store(Arc::clone(store));
     }
     let protocol = Arc::new(protocol);
-    // REVIEW P2-F: governor is created + stored but not yet consulted on the HTTP
-    // `/mcp` dispatch path (no concurrency cap enforced); wire it via dispatch/
-    // axum middleware or remove the dead field. Deferred.
+    // P2-F (resolved): the governor is now consulted on the `/mcp` HTTP path.
+    // `mcp_http::build_mcp_router` wraps the route with `apply_governor`, which
+    // acquires one concurrency permit per request from this shared governor and
+    // releases it on completion — bounding concurrent operator clients to
+    // `max_concurrency` (queued/shed with 503 beyond that). No longer dead.
     let governor = Arc::new(RequestGovernor::new());
 
     // The runtime holds a clone of the same underlying store (the `Sqlite`
@@ -272,6 +316,11 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
             source,
         })?;
     let is_loopback = is_loopback_addr(&addr);
+
+    // P2-E: enforce the inline-key source policy before binding — warn on any
+    // inline --api-key (recommend --api-key-env), and refuse an inline key on a
+    // non-loopback bind (the secret would be visible in process listings).
+    enforce_api_key_source_policy(args.api_key.as_deref(), is_loopback)?;
 
     // Secure default (G-033): refuse a routable bind with no key before binding.
     auth.refuse_to_start(is_loopback)?;
@@ -436,6 +485,51 @@ mod tests {
         assert_eq!(resolve_api_key(None, None), None);
         // Empty inline key is treated as unset.
         assert_eq!(resolve_api_key(Some(""), None), None);
+    }
+
+    #[test]
+    fn inline_key_on_loopback_is_allowed_with_warning() {
+        // P2-E: an inline key on loopback is permitted (warns, does not refuse).
+        assert!(enforce_api_key_source_policy(Some("k"), true).is_ok());
+    }
+
+    #[test]
+    fn inline_key_on_non_loopback_is_refused() {
+        // P2-E: an inline key on a routable bind is refused (argv leak vector).
+        let err = enforce_api_key_source_policy(Some("k"), false)
+            .expect_err("inline key on non-loopback must refuse");
+        assert_eq!(
+            err,
+            super::super::auth::AuthStartupError::InlineKeyOnNonLoopback
+        );
+    }
+
+    #[test]
+    fn no_inline_key_passes_policy_on_any_bind() {
+        // No inline key: policy is a no-op regardless of bind (env/none handled
+        // by the secure-default refuse-to-start rule, not this source policy).
+        assert!(enforce_api_key_source_policy(None, true).is_ok());
+        assert!(enforce_api_key_source_policy(None, false).is_ok());
+        // Empty inline key is treated as "not provided".
+        assert!(enforce_api_key_source_policy(Some(""), false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_refuses_inline_key_on_non_loopback() {
+        // P2-E end-to-end: a routable bind WITH an inline key still refuses to
+        // start (before binding) because the key would leak via argv.
+        let args = ServeArgs {
+            listen: "0.0.0.0:8787".to_string(),
+            api_key: Some("inline-secret".to_string()),
+            api_key_env: None,
+        };
+        let err = run(args)
+            .await
+            .expect_err("non-loopback + inline key must refuse");
+        assert!(matches!(
+            err,
+            ServeError::Startup(super::super::auth::AuthStartupError::InlineKeyOnNonLoopback)
+        ));
     }
 
     #[test]

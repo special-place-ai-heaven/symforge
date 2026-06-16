@@ -36,6 +36,10 @@ pub const SYMFORGE_STEL_LEDGER_DB_PATH: &str = ".symforge/stel-ledger.db";
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const META_SCHEMA_VERSION: &str = "schema_version";
 
+// REVIEW P3-B (deferred): `stel_ledger_events` grows unbounded — no TTL, prune,
+// or capped-table retention. Future fix: TTL/archival or a capped table, plus
+// documented operator maintenance.
+
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS stel_ledger_meta (
     key   TEXT PRIMARY KEY,
@@ -292,6 +296,10 @@ impl SqliteStelLedgerStore {
     }
 
     /// Idempotent schema migration. Safe to call multiple times.
+    // REVIEW P3-A (deferred): no forward-compat guard. Opening a DB whose
+    // `schema_version > CURRENT_SCHEMA_VERSION` re-applies v1 DDL and downgrades
+    // the recorded version. Future fix: if `schema_version > CURRENT` then
+    // degrade to Disabled / refuse to migrate down rather than clobber.
     pub fn migrate(&self) -> Result<()> {
         // P2-D / FR-011 "never panic": a poisoned mutex (a prior holder
         // panicked) must degrade, not crash the operator server. Recover the
@@ -325,11 +333,13 @@ impl SqliteStelLedgerStore {
     }
 
     /// Insert one [`StelLedgerEvent`] row into `stel_ledger_events`.
-    // REVIEW P2-C: this is a blocking `std::sync::Mutex<Connection>` INSERT under
-    // a busy-timeout, called from the async MCP tool path; under contention it can
-    // stall the tokio worker. Move to `spawn_blocking` / a dedicated writer thread
-    // / a bounded background writer so the request path stays non-blocking.
-    // Deferred.
+    ///
+    /// P2-C (resolved): this performs a blocking `std::sync::Mutex<Connection>`
+    /// INSERT under a busy-timeout. It must never be awaited inline on the async
+    /// MCP tool path. The caller — `SymForgeServer::persist_ledger_event_durably`
+    /// — offloads this onto `tokio::task::spawn_blocking` when a runtime is
+    /// present, so the request task never blocks on the DB lock/busy-timeout.
+    /// Callers without a runtime (sync tests / embed) invoke it directly.
     pub fn record(&self, event: &StelLedgerEvent) -> Result<i64> {
         let tools_json =
             serde_json::to_string(&event.tools_called).unwrap_or_else(|_| "[]".to_string());

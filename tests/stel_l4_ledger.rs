@@ -104,6 +104,21 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
         .unwrap_or_else(|| panic!("missing golden row {id}"))
 }
 
+/// P2-C: the durable ledger write is now offloaded onto `spawn_blocking`, so it
+/// lands *eventually* (asynchronously) rather than synchronously inline on the
+/// request path. Poll the durable store's `total_events` until it reaches
+/// `expected` or the deadline elapses. Returns the observed count.
+async fn await_durable_events(store: &Arc<StelLedgerStore>, expected: u64) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let total = store.summary().map(|s| s.total_events).unwrap_or(0);
+        if total >= expected || std::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 fn ledger_meta_line(output: &str) -> &str {
     output
         .lines()
@@ -195,9 +210,16 @@ async fn serve_invocation_writes_through_to_durable_store() {
 
     let _output = replay_row(&server, row).await;
 
-    // In-memory ledger recorded exactly one event...
+    // In-memory ledger recorded exactly one event synchronously/immediately...
     assert_eq!(server.stel_ledger().lock().len(), 1);
-    // ...and the durable store has exactly one matching row (no double-count).
+    // ...and the durable store eventually holds exactly one matching row. P2-C:
+    // the durable write is now offloaded onto `spawn_blocking`, so it lands
+    // asynchronously (off the request path) rather than inline — poll for it.
+    let total = await_durable_events(&store, 1).await;
+    assert_eq!(
+        total, 1,
+        "durable store must hold exactly one row after one serve invocation (write-through landed)"
+    );
     let summary = store
         .summary()
         .expect("durable summary after write-through");
@@ -212,6 +234,57 @@ async fn serve_invocation_writes_through_to_durable_store() {
     assert_eq!(recent[0].decision, "serve");
     assert_eq!(recent[0].session_id, "serve-writethrough");
     assert_eq!(recent[0].tools_called_json, r#"["find_references"]"#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_write_is_offloaded_off_the_request_path() {
+    // P2-C: the durable SQLite write (sync INSERT under a 5000ms busy-timeout)
+    // must not block the request task. After the request returns, the in-memory
+    // `SessionLedger` push is observed *immediately* (synchronous on the hot
+    // path), while the durable row lands *eventually* (offloaded onto
+    // `spawn_blocking`). This test asserts both halves of that contract:
+    //   1. request path completes and the in-memory event is already present;
+    //   2. the durable event is not lost — it shows up after a bounded poll.
+    if !corpora_available() {
+        eprintln!("skip durable_write_is_offloaded_off_the_request_path: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let (server, store) =
+        server_for_corpus_with_store(stel::S4_REPLAY_CORPUS, "cfg-if-rust", "offload-nonblock");
+
+    let request_started = std::time::Instant::now();
+    let _output = replay_row(&server, row).await;
+    let request_elapsed = request_started.elapsed();
+
+    // The in-memory push is synchronous: it is already visible the instant the
+    // request returns, with no dependency on the durable write completing.
+    assert_eq!(
+        server.stel_ledger().lock().len(),
+        1,
+        "in-memory ledger push must be synchronous/immediate on the request path"
+    );
+
+    // The request path itself must not have waited on the durable write. The
+    // durable write is best-effort and fire-and-forget; the request returning
+    // far below the 5000ms busy-timeout demonstrates it was not awaited inline.
+    assert!(
+        request_elapsed < std::time::Duration::from_secs(2),
+        "request path returned in {request_elapsed:?}; must not block on the durable DB write"
+    );
+
+    // The durable write still lands (eventually) — events are never lost on
+    // normal operation.
+    let total = await_durable_events(&store, 1).await;
+    assert_eq!(
+        total, 1,
+        "durable write must still land after being offloaded off the request path"
+    );
 }
 
 #[tokio::test]

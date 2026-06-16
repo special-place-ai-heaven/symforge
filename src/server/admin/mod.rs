@@ -68,6 +68,26 @@ async fn serve_style_css() -> impl IntoResponse {
     )
 }
 
+/// Inline SVG favicon (006 cosmetic): a small "SF" mark on the accent color.
+/// Embedded so `GET /favicon.ico` (and the explicit `/admin/favicon.svg` link in
+/// `index.html`) return `200` instead of the lone `404` console error. SVG is a
+/// valid favicon format in modern browsers and needs no binary asset / build
+/// step (matches the no-npm, `include_str!`-only asset policy).
+#[cfg(feature = "server")]
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#4ea1ff"/><text x="16" y="22" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="700" text-anchor="middle" fill="#06101e">SF</text></svg>"##;
+
+#[cfg(feature = "server")]
+async fn serve_favicon() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
+    )
+}
+
 /// Build the combined `/admin` (embedded UI) + `/api/v1/*` (JSON) router with
 /// the [`ServerRuntime`] as state.
 ///
@@ -82,6 +102,10 @@ pub fn build_admin_router(runtime: &ServerRuntime) -> Router {
         .route("/admin/", get(serve_index))
         .route("/admin/app.js", get(serve_app_js))
         .route("/admin/style.css", get(serve_style_css))
+        // Favicon (006 cosmetic): both the explicit link target and the bare
+        // `/favicon.ico` the browser requests by default — kills the lone 404.
+        .route("/admin/favicon.svg", get(serve_favicon))
+        .route("/favicon.ico", get(serve_favicon))
         // Versioned JSON API.
         .route("/api/v1/summary", get(api_v1::get_summary))
         .route("/api/v1/surface", get(api_v1::get_surface))
@@ -113,5 +137,40 @@ mod tests {
                 "app.js must reference {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn favicon_asset_present_and_linked() {
+        // 006 cosmetic: a real favicon kills the lone /favicon.ico 404. The SVG
+        // must be non-empty valid markup and the HTML must link it.
+        assert!(FAVICON_SVG.contains("<svg"));
+        assert!(FAVICON_SVG.contains("</svg>"));
+        assert!(
+            INDEX_HTML.contains("/admin/favicon.svg"),
+            "index.html must link the favicon"
+        );
+    }
+
+    #[test]
+    fn mobile_overflow_guards_present_in_assets() {
+        // 006 cosmetic: the mobile overflow fix relies on a horizontal scroll
+        // container + a <=480px wrap rule + the path cell class. Guard them so a
+        // future asset edit cannot silently regress the narrow-viewport layout.
+        assert!(
+            STYLE_CSS.contains(".table-scroll"),
+            "style.css must define the horizontal scroll container"
+        );
+        assert!(
+            STYLE_CSS.contains("max-width: 480px"),
+            "style.css must carry the <=480px mobile media query"
+        );
+        assert!(
+            APP_JS.contains("table-scroll"),
+            "app.js must wrap the harness table in a scroll container"
+        );
+        assert!(
+            APP_JS.contains("path-cell"),
+            "app.js must tag the config path cell for wrapping"
+        );
     }
 }

@@ -127,19 +127,26 @@ async function loadHarness() {
       const tr = document.createElement("tr");
       tr.appendChild(td(entry.name));
       tr.appendChild(td(entry.state.replace(/_/g, " ")));
-      tr.appendChild(td(entry.config_path));
+      tr.appendChild(td(entry.config_path, "path-cell"));
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
-    el.appendChild(table);
+    // Wrap in a horizontal scroll container so long config paths scroll within
+    // the card instead of widening the page on narrow viewports (006 mobile
+    // overflow fix); desktop is unaffected (the table still fills its width).
+    const scroll = document.createElement("div");
+    scroll.className = "table-scroll";
+    scroll.appendChild(table);
+    el.appendChild(scroll);
   } catch (e) {
     note(el, "Failed to load harness status.", "unavailable");
   }
 }
 
-function td(text) {
+function td(text, cls) {
   const cell = document.createElement("td");
   cell.textContent = text;
+  if (cls) cell.className = cls;
   return cell;
 }
 
