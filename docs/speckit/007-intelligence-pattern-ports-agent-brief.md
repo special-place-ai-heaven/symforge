@@ -4,6 +4,8 @@
 
 **Status:** Research complete · Spec not yet created · **Do not implement until `004-v8-operator-serve` spine is merged or explicitly waived**
 
+**Branch (mandatory):** All Spec Kit work and implementation for this feature happen **only** on `007-intelligence-pattern-ports`. Do not commit 007 artifacts to `main`, `review/v8-004-operator-serve`, or any other branch. Open a PR from `007-intelligence-pattern-ports` → `main` when done.
+
 ---
 
 ## 1. Spec Kit setup in this repo
@@ -24,6 +26,21 @@
 ---
 
 ## 2. Mandatory workflow order
+
+### Step 0 — Dedicated branch (before anything else)
+
+```powershell
+cd E:\project\symforge
+git fetch origin main
+git checkout main
+git pull origin main
+git checkout -b 007-intelligence-pattern-ports   # skip if already on this branch
+git branch --show-current   # MUST print: 007-intelligence-pattern-ports
+```
+
+If you are on `review/v8-004-operator-serve` or any other branch, **stop** and switch. Stash unrelated WIP first; do not mix 005 harness or 004 serve changes into 007 commits.
+
+### Steps 1–6 — Spec Kit SDD
 
 Run in this sequence. Do not skip constitution or clarify unless the operator explicitly waives them.
 
@@ -338,7 +355,8 @@ Verification: agent brief §11. Update tasks.md [X] as you go.
 ## 14. Agent checklist before starting
 
 - [ ] Read this entire brief
-- [ ] Confirm branch base (`main` after 004 merge, or active review branch)
+- [ ] On branch `007-intelligence-pattern-ports` only (`git branch --show-current`)
+- [ ] Branch based on `main` (includes this brief @ `docs/speckit/007-intelligence-pattern-ports-agent-brief.md`)
 - [ ] Run `create-new-feature.ps1` or verify `specs/007-intelligence-pattern-ports/` exists
 - [ ] Update `.specify/feature.json` to point at 007 when specify completes
 - [ ] Do not copy SoulForge source code — patterns only
