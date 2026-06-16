@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.30.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.29.0...v7.30.0) (2026-06-16)
+
+
+### Features
+
+* **server:** close 004 review P2-C/P2-E/P2-F + 006 cosmetics ([6800640](https://github.com/special-place-ai-heaven/symforge/commit/680064013ff2d56beaf2d3e6397949bc3c7fbcc8))
+
 ## [7.29.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.28.0...v7.29.0) (2026-06-16)
 
 
