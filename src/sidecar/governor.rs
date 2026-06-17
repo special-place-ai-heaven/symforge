@@ -244,6 +244,55 @@ impl RequestGovernor {
         self.semaphore.available_permits()
     }
 
+    /// Acquire one concurrency permit at a transport boundary (P2-F).
+    ///
+    /// The `/mcp` Streamable-HTTP route is served by rmcp's transport, not by
+    /// [`Self::execute`] (which is tool-name-keyed and wraps a future). To bound
+    /// concurrent operator clients without forking the rmcp dispatch, the HTTP
+    /// layer acquires one owned permit here for the lifetime of each request and
+    /// drops it when the request completes — a small acquire/release around the
+    /// shared dispatch. Each `/mcp` request costs one permit (the governor's
+    /// `Light` weight), so up to [`Self::max_concurrency`] requests run at once
+    /// and the rest queue.
+    ///
+    /// Honors the same queue timeout as [`Self::execute`]: if no permit becomes
+    /// available within `queue_timeout`, returns [`GovernorError::QueueTimeout`]
+    /// so the caller can shed load (HTTP `503`) instead of blocking unboundedly.
+    /// The returned [`tokio::sync::OwnedSemaphorePermit`] releases the permit on
+    /// drop. Counts toward the governor's submitted/queue-rejected stats so the
+    /// HTTP boundary is observable alongside tool dispatch.
+    pub async fn acquire_request_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, GovernorError> {
+        self.stats.total_submitted.fetch_add(1, Ordering::Relaxed);
+        match tokio::time::timeout(
+            self.queue_timeout,
+            Arc::clone(&self.semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_closed)) => {
+                self.stats
+                    .total_queue_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(GovernorError::SemaphoreClosed)
+            }
+            Err(_elapsed) => {
+                self.stats
+                    .total_queue_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(GovernorError::QueueTimeout {
+                    request_id: RequestId(0),
+                    tool: "/mcp".to_string(),
+                    waited: self.queue_timeout,
+                    weight: ToolWeight::Light,
+                    in_flight: self.active_count(),
+                })
+            }
+        }
+    }
+
     /// Snapshot of governor state including all in-flight requests.
     pub fn snapshot(&self) -> GovernorSnapshot {
         let now = Instant::now();
@@ -751,5 +800,39 @@ mod tests {
         }
 
         assert_eq!(gov.snapshot().total_completed, 3);
+    }
+
+    #[tokio::test]
+    async fn acquire_request_slot_bounds_concurrency_and_sheds_when_full() {
+        // P2-F: the `/mcp` HTTP boundary acquires one permit per request via
+        // `acquire_request_slot`. With a single-permit governor and a tiny queue
+        // timeout, a second concurrent acquire (while the first permit is held)
+        // is shed with QueueTimeout — proving concurrent clients are bounded.
+        let gov = Arc::new(RequestGovernor::with_config(
+            1,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        ));
+
+        let held = gov
+            .acquire_request_slot()
+            .await
+            .expect("first slot acquires");
+        assert_eq!(gov.available_permits(), 0, "permit is held");
+
+        // Second acquire finds no capacity and times out (shed → 503).
+        let shed = gov.acquire_request_slot().await;
+        assert!(
+            matches!(shed, Err(GovernorError::QueueTimeout { .. })),
+            "saturated governor must shed the second request, got {shed:?}"
+        );
+
+        // Releasing the held permit frees capacity for the next request.
+        drop(held);
+        let next = gov.acquire_request_slot().await;
+        assert!(next.is_ok(), "permit re-acquirable after release");
+        assert_eq!(gov.available_permits(), 0);
+        drop(next);
+        assert_eq!(gov.available_permits(), 1, "permit released on drop");
     }
 }

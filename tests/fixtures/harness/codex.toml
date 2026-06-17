@@ -1,0 +1,6 @@
+# Codex CLI config (TOML). MCP servers live under [mcp_servers.<name>].
+model = "gpt-5"
+
+[mcp_servers.other-tool]
+command = "/usr/local/bin/other-tool"
+startup_timeout_sec = 30

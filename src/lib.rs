@@ -42,6 +42,9 @@ pub mod path_shadow;
 pub(crate) mod process_util;
 #[cfg(feature = "server")]
 pub mod protocol;
+// Transport-agnostic operator server spine (v8): `symforge serve` over /mcp.
+#[cfg(feature = "server")]
+pub mod server;
 #[cfg(feature = "server")]
 pub mod sidecar;
 #[cfg(feature = "server")]

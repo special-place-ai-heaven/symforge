@@ -8532,7 +8532,10 @@ impl SymForgeServer {
             guard.symbol_count(),
             &ledger,
             self.session_context.snapshot().total_tokens,
-        );
+        )
+        // US3/T029: surface the durable ledger summary so restart-survival is
+        // observable from `status` (no-op None on stdio/embed).
+        .with_durable_ledger(self.durable_ledger_summary_for_status());
         let body = crate::stel::format_stel_status(&params.0, &ctx);
         statused_tool_result(body, OutcomeClass::Found)
     }
@@ -8570,6 +8573,11 @@ impl SymForgeServer {
             surface,
         });
         self.stel_ledger.lock().push(event.clone());
+        // US3/T028: durable write-through after the in-memory push. Single
+        // ledger path (no double-count); degrades to a logged no-op on a store
+        // error and never fails the request (FR-011). Compile-time no-op on
+        // stdio/embed builds where no durable store is wired.
+        self.persist_ledger_event_durably(&event);
         let ledger_line = format_ledger_envelope_line(&event, &meta);
         finalize_symforge_output(metrics, ledger_line, body)
     }

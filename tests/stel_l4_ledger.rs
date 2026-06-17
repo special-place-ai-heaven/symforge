@@ -6,8 +6,11 @@ mod stel_surface_env;
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
+use symforge::stel::ledger_store::StelLedgerStore;
 use symforge::stel::{self, AdmissionDecision, GoldenRouteRow};
 
 fn repo_root() -> PathBuf {
@@ -52,6 +55,33 @@ fn server_for_corpus(relative: &str, project: &str) -> SymForgeServer {
     )
 }
 
+/// Build a corpus server with an in-memory durable [`StelLedgerStore`] wired in
+/// (US3/T028). Returns the shared store handle so the test can read it back and
+/// assert the durable write-through. The same `Arc` is held by the server, so
+/// this is exactly the path `build_serve_runtime` uses on `/mcp`.
+fn server_for_corpus_with_store(
+    relative: &str,
+    project: &str,
+    session_id: &str,
+) -> (SymForgeServer, Arc<StelLedgerStore>) {
+    let root = corpus_path(relative);
+    let shared = LiveIndex::load(&root).unwrap_or_else(|error| {
+        panic!("index {}: {error}", root.display());
+    });
+    let store = Arc::new(StelLedgerStore::open_in_memory(session_id).expect("in-memory store"));
+    let server = SymForgeServer::new(
+        shared,
+        project.to_string(),
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            symforge::watcher::WatcherInfo::default(),
+        )),
+        Some(root),
+        None,
+    )
+    .with_stel_ledger_store(Arc::clone(&store));
+    (server, store)
+}
+
 async fn replay_row(server: &SymForgeServer, row: &GoldenRouteRow) -> String {
     let request = row.to_request();
     let params = serde_json::to_value(stel::SymforgeCallInput {
@@ -72,6 +102,21 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
     rows.iter()
         .find(|row| row.id == id)
         .unwrap_or_else(|| panic!("missing golden row {id}"))
+}
+
+/// P2-C: the durable ledger write is now offloaded onto `spawn_blocking`, so it
+/// lands *eventually* (asynchronously) rather than synchronously inline on the
+/// request path. Poll the durable store's `total_events` until it reaches
+/// `expected` or the deadline elapses. Returns the observed count.
+async fn await_durable_events(store: &Arc<StelLedgerStore>, expected: u64) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let total = store.summary().map(|s| s.total_events).unwrap_or(0);
+        if total >= expected || std::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn ledger_meta_line(output: &str) -> &str {
@@ -138,4 +183,128 @@ async fn pff_row_records_ledger_without_legacy_execution() {
     let event = server.stel_ledger().lock().last().expect("ledger event");
     assert_eq!(event.decision, AdmissionDecision::Bypass);
     assert!(event.tools_called.is_empty());
+}
+
+#[tokio::test]
+async fn serve_invocation_writes_through_to_durable_store() {
+    // US3/T028+T029: a serve invocation on a server with a wired durable store
+    // persists the event through to SQLite (write-through, off the in-memory
+    // path) AND the store's summary() observes the row (the read path the
+    // `status` tool surfaces). One ledger path: exactly one durable row per
+    // invocation, matching the single in-memory event.
+    if !corpora_available() {
+        eprintln!("skip serve_invocation_writes_through_to_durable_store: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let (server, store) =
+        server_for_corpus_with_store(stel::S4_REPLAY_CORPUS, "cfg-if-rust", "serve-writethrough");
+
+    // Durable store starts empty.
+    assert_eq!(store.summary().expect("summary").total_events, 0);
+
+    let _output = replay_row(&server, row).await;
+
+    // In-memory ledger recorded exactly one event synchronously/immediately...
+    assert_eq!(server.stel_ledger().lock().len(), 1);
+    // ...and the durable store eventually holds exactly one matching row. P2-C:
+    // the durable write is now offloaded onto `spawn_blocking`, so it lands
+    // asynchronously (off the request path) rather than inline — poll for it.
+    let total = await_durable_events(&store, 1).await;
+    assert_eq!(
+        total, 1,
+        "durable store must hold exactly one row after one serve invocation (write-through landed)"
+    );
+    let summary = store
+        .summary()
+        .expect("durable summary after write-through");
+    assert_eq!(
+        summary.total_events, 1,
+        "durable store must hold exactly one row after one serve invocation"
+    );
+    assert_eq!(summary.session_count, 1);
+
+    let recent = store.recent(10).expect("recent durable rows");
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].decision, "serve");
+    assert_eq!(recent[0].session_id, "serve-writethrough");
+    assert_eq!(recent[0].tools_called_json, r#"["find_references"]"#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_write_is_offloaded_off_the_request_path() {
+    // P2-C: the durable SQLite write (sync INSERT under a 5000ms busy-timeout)
+    // must not block the request task. After the request returns, the in-memory
+    // `SessionLedger` push is observed *immediately* (synchronous on the hot
+    // path), while the durable row lands *eventually* (offloaded onto
+    // `spawn_blocking`). This test asserts both halves of that contract:
+    //   1. request path completes and the in-memory event is already present;
+    //   2. the durable event is not lost — it shows up after a bounded poll.
+    if !corpora_available() {
+        eprintln!("skip durable_write_is_offloaded_off_the_request_path: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let (server, store) =
+        server_for_corpus_with_store(stel::S4_REPLAY_CORPUS, "cfg-if-rust", "offload-nonblock");
+
+    let request_started = std::time::Instant::now();
+    let _output = replay_row(&server, row).await;
+    let request_elapsed = request_started.elapsed();
+
+    // The in-memory push is synchronous: it is already visible the instant the
+    // request returns, with no dependency on the durable write completing.
+    assert_eq!(
+        server.stel_ledger().lock().len(),
+        1,
+        "in-memory ledger push must be synchronous/immediate on the request path"
+    );
+
+    // The request path itself must not have waited on the durable write. The
+    // durable write is best-effort and fire-and-forget; the request returning
+    // far below the 5000ms busy-timeout demonstrates it was not awaited inline.
+    assert!(
+        request_elapsed < std::time::Duration::from_secs(2),
+        "request path returned in {request_elapsed:?}; must not block on the durable DB write"
+    );
+
+    // The durable write still lands (eventually) — events are never lost on
+    // normal operation.
+    let total = await_durable_events(&store, 1).await;
+    assert_eq!(
+        total, 1,
+        "durable write must still land after being offloaded off the request path"
+    );
+}
+
+#[tokio::test]
+async fn serve_without_durable_store_keeps_in_memory_ledger_only() {
+    // Stdio-shaped server (no durable store): in-memory ledger still records,
+    // and there is simply no durable sink. Guards against the write-through
+    // accidentally becoming load-bearing for the in-memory path.
+    if !corpora_available() {
+        eprintln!("skip serve_without_durable_store_keeps_in_memory_ledger_only: missing corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    let row = row_by_id(&rows, "cfg-if/t4_refs");
+    let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "cfg-if-rust");
+
+    let _output = replay_row(&server, row).await;
+
+    assert_eq!(server.stel_ledger().lock().len(), 1);
 }

@@ -132,14 +132,32 @@ Status: **OPEN** until artifact linked in [`stel-assumptions.md`](stel-assumptio
 
 | ID | Gap | Closure action | Artifact | Pass | Pivot | Kill |
 |----|-----|----------------|----------|------|-------|------|
-| **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | O1,O4 pass | — | **8.1 blocked** |
+| **G-037** | No operator web UI | Phase 4.7: admin SPA + `/api/v1/*` on `symforge serve` | [`v8-admin-ui.md`](v8-admin-ui.md) | O1,O4 pass | — | **CLOSED (006)** |
 | **G-038** | No STEL ledger SQLite | Phase 3 L4: `stel_ledger_events` migration | schema + store | dashboard + H4 query | export JSON only | **8.1 blocked** |
-| **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | O3,O7 pass | — | **8.1 blocked** |
+| **G-039** | No product API-key store | Hashed keys in server DB; rotate via admin | `server.db` + admin API | O3,O7 pass | — | **CLOSED (006)** |
 | **G-040** | No first-run / post-update onboarding | CLI URL banner + browser open + wizard | onboarding in server DB | O2,O3 pass | — | **8.1 blocked** |
 | **G-041** | No harness scan + config apply | `HarnessRegistry`; scan/apply API + CLI `--scan` | `src/harness/` | O5–O8 pass | — | **8.1 blocked** |
-| **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | O4 pass | — | **8.1 blocked** |
+| **G-042** | No ops telemetry in admin UI | System resources + symforge/harness PIDs | `/api/v1/system` | O4 pass | — | **CLOSED (006)** |
 
 Detail: [`v8-admin-ui.md`](v8-admin-ui.md) — **O1–O8 required for 8.1.0 tag**. Depends on **G-020**, **G-034**, **G-033**.
+
+**006 admin GUI closure (2026-06-16, branch `review/v8-004-operator-serve`):**
+- **G-037 CLOSED** — `symforge serve` now mounts an embedded vanilla admin UI at
+  `/admin` and a versioned JSON API at `/api/v1/{summary,surface,harness,system,keys}`
+  on the same process/port, behind the `004` Bearer auth + a new Origin gate.
+  (`src/server/admin/`, `tests/admin_api_v1.rs`, `tests/admin_render.rs`.)
+- **G-039 CLOSED** — hashed `ApiKeyStore` (`src/server/api_keys.rs`,
+  `.symforge/api-keys.db`): mint (raw shown once, SHA-256 hash-only persist),
+  list (no raw), rotate, revoke; minted keys authenticate at `/mcp`, revoked
+  keys are rejected. (`tests/api_keys_store.rs`.) Per-harness scoped issuance
+  (O7) beyond mint/rotate/revoke is a later phase.
+- **G-042 CLOSED** — `/api/v1/system` returns real PID / uptime / active sessions
+  / indexed projects / index telemetry (std-only; host RAM/CPU deferred per
+  `specs/006-v8-admin-gui/research.md` D1). (`tests/admin_system.rs`.)
+- O1/O4 satisfied for the dashboard + diagnostics + key-management subset; O2/O3
+  (wizard, URL banner, browser-open) and O5/O6/O8 (harness apply hub) remain in
+  phases 4.8/4.9. Also closes review finding **P1-B** (Origin gating) for the
+  browser surface. Evidence: `specs/006-v8-admin-gui/validation.md`.
 
 ### 3.8 AAP embed integration (Agent Army Professionals)
 

@@ -1,0 +1,3 @@
+# AAP-shaped fixture: a directory that exists (so detection sees the root) but
+# has NO Cargo.lock. The embed-pin comparison must report PinUnknown without
+# crashing (spec edge case: lock missing/unparseable -> "detected, pin unknown").

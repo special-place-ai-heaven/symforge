@@ -1,0 +1,221 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181b22;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #8b93a7;
+  --accent: #4ea1ff;
+  --warn: #ffb454;
+  --error: #ff6b6b;
+  --ok: #5ad17f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.9rem 1.25rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { margin: 0; font-size: 1.15rem; }
+.project { color: var(--muted); font-size: 0.9rem; }
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.6rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+main { padding: 1.25rem; max-width: 1000px; margin: 0 auto; }
+
+.view { display: none; }
+.view.active { display: block; }
+
+h2 {
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 1.5rem 0 0.6rem;
+}
+
+.cards { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  min-width: 140px;
+}
+.card-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; }
+.card-value { font-size: 1.4rem; font-weight: 600; margin-top: 0.2rem; }
+
+.tool-list { color: var(--muted); font-size: 0.8rem; flex-basis: 100%; }
+
+.loading { color: var(--muted); }
+.note { color: var(--muted); }
+.empty { color: var(--muted); font-style: italic; }
+.unavailable { color: var(--warn); }
+
+table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+th, td {
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+th { color: var(--muted); font-weight: 500; }
+
+/* Horizontal scroll container for tables (006 mobile overflow fix). On wide
+   screens it is invisible (table fits, nothing scrolls); on narrow viewports
+   long content scrolls *within* the container instead of widening the page. */
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mint-form { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+.mint-form input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+}
+button {
+  background: var(--accent);
+  color: #06101e;
+  border: none;
+  border-radius: 6px;
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+button.action {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  margin-right: 0.4rem;
+  font-weight: 500;
+  padding: 0.3rem 0.6rem;
+}
+
+.mint-result {
+  background: var(--panel);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  margin-bottom: 0.9rem;
+}
+.mint-result.hidden { display: none; }
+.secret-warn { color: var(--warn); margin: 0 0 0.5rem; font-size: 0.85rem; }
+.secret {
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem;
+  word-break: break-all;
+  color: var(--ok);
+}
+
+/* AAP integration panel (008). The panel reuses the .card grid; a few cards
+   carry semantic state classes (drift warning / ok / unknown) and long paths
+   wrap. The preset snippets render as labelled, copy-able code blocks. */
+.aap-panel .card.drift-warning {
+  border-color: var(--error);
+  flex-basis: 100%;
+}
+.aap-panel .card.drift-warning .card-value { color: var(--error); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.drift-ok .card-value { color: var(--ok); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.drift-unknown .card-value { color: var(--muted); font-size: 0.95rem; font-weight: 500; }
+.aap-panel .card.path-cell {
+  flex-basis: 100%;
+}
+.aap-panel .card.path-cell .card-value {
+  font-size: 0.9rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.snippet {
+  flex-basis: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+}
+.snippet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.snippet-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.snippet-copy { margin-right: 0; }
+.snippet-code {
+  margin: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem;
+  color: var(--ok);
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.8rem 1.25rem;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+.status-line { color: var(--muted); font-size: 0.8rem; }
+.status-line.error { color: var(--error); }
+.hidden { display: none; }
+
+/* Mobile (<=480px): keep body.scrollWidth <= viewport (006 overflow fix).
+   Long, unbreakable config paths in the harness table are the overflow source,
+   so let them wrap; reduce main padding; let cards flex full-width. The
+   .table-scroll container also bounds any residual table width. Desktop layout
+   is untouched (these rules only apply at <=480px). */
+@media (max-width: 480px) {
+  main { padding: 1rem 0.75rem; }
+  .card { min-width: 0; flex: 1 1 100%; }
+  .harness-table .path-cell {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  th, td { padding: 0.45rem 0.5rem; }
+}

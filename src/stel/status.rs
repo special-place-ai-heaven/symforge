@@ -15,6 +15,19 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 pub const DEFERRED_ITEMS: &str =
     "b_results,calibration_auto_tune,ledger_persistence,multi_step_planner";
 
+/// Restart-survival view of the durable STEL ledger store (US3/T029).
+///
+/// A feature-independent POD so [`StelStatusContext`] (compiled on stdio/embed
+/// too) never has to name the server-only `ledger_store` types. The server-only
+/// `status` read populates it from `StelLedgerStore::summary()`; `None` means
+/// no durable store is wired (stdio/embed) or the store is `Disabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableLedgerSummary {
+    pub total_events: u64,
+    pub total_net_vs_manual: i64,
+    pub session_count: u64,
+}
+
 /// Inputs collected from the live server when formatting a status response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StelStatusContext<'a> {
@@ -29,6 +42,9 @@ pub struct StelStatusContext<'a> {
     pub last_ledger_decision: Option<String>,
     pub last_ledger_route: Option<String>,
     pub calibration: StelCalibrationSummary,
+    /// Durable ledger summary (restart-survival, US3/T029). `None` on
+    /// stdio/embed or when the durable store is `Disabled`.
+    pub durable_ledger: Option<DurableLedgerSummary>,
 }
 
 impl<'a> StelStatusContext<'a> {
@@ -60,7 +76,18 @@ impl<'a> StelStatusContext<'a> {
             last_ledger_decision,
             last_ledger_route,
             calibration,
+            durable_ledger: None,
         }
+    }
+
+    /// Attach a durable-ledger summary (US3/T029 restart-survival view).
+    ///
+    /// Builder-style so the in-memory `from_server` constructor stays unchanged
+    /// for stdio/embed callers; the server-only `status` read calls this with
+    /// the opened store's `summary()`.
+    pub fn with_durable_ledger(mut self, summary: Option<DurableLedgerSummary>) -> Self {
+        self.durable_ledger = summary;
+        self
     }
 }
 
@@ -114,6 +141,17 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
             extra.push("last_ledger_route: none".to_string());
         }
     }
+    match &ctx.durable_ledger {
+        Some(summary) => {
+            extra.push(format!(
+                "durable_ledger: events={} net_vs_manual={} sessions={}",
+                summary.total_events, summary.total_net_vs_manual, summary.session_count
+            ));
+        }
+        None => {
+            extra.push("durable_ledger: unavailable".to_string());
+        }
+    }
     extra.push(format_calibration_section(&ctx.calibration));
     // Insert full-only lines before the closing banner.
     if let Some(pos) = body.rfind("\n──\n") {
@@ -143,6 +181,7 @@ mod tests {
             last_ledger_decision: Some("serve".to_string()),
             last_ledger_route: Some("search_text".to_string()),
             calibration: summarize_calibration(&[]),
+            durable_ledger: None,
         }
     }
 
@@ -194,6 +233,42 @@ mod tests {
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
         }
+    }
+
+    #[test]
+    fn full_status_renders_durable_ledger_summary_when_present() {
+        // US3/T029: when a durable store summary is attached, the full status
+        // body surfaces the restart-survival line with concrete totals.
+        let ctx = sample_context().with_durable_ledger(Some(DurableLedgerSummary {
+            total_events: 7,
+            total_net_vs_manual: 4200,
+            session_count: 3,
+        }));
+        let body = format_stel_status(
+            &StelStatusRequest {
+                detail: Some(StelStatusDetail::Full),
+            },
+            &ctx,
+        );
+        assert!(
+            body.contains("durable_ledger: events=7 net_vs_manual=4200 sessions=3"),
+            "durable ledger summary line missing in:\n{body}"
+        );
+    }
+
+    #[test]
+    fn full_status_reports_durable_ledger_unavailable_when_absent() {
+        // No durable store wired (stdio/embed) -> honest "unavailable".
+        let body = format_stel_status(
+            &StelStatusRequest {
+                detail: Some(StelStatusDetail::Full),
+            },
+            &sample_context(),
+        );
+        assert!(
+            body.contains("durable_ledger: unavailable"),
+            "expected durable_ledger unavailable line in:\n{body}"
+        );
     }
 
     #[test]

@@ -26,6 +26,28 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.30.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.29.0...v7.30.0) (2026-06-16)
+
+
+### Features
+
+* **server:** close 004 review P2-C/P2-E/P2-F + 006 cosmetics ([6800640](https://github.com/special-place-ai-heaven/symforge/commit/680064013ff2d56beaf2d3e6397949bc3c7fbcc8))
+
+## [7.29.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.28.0...v7.29.0) (2026-06-16)
+
+
+### Features
+
+* **server:** 006 admin GUI — /admin + /api/v1, hashed API-key store, Origin gating ([11b4c8b](https://github.com/special-place-ai-heaven/symforge/commit/11b4c8b3d1382e7c2329fde9b7925c40107a18f7))
+
+## [7.28.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.27.0...v7.28.0) (2026-06-16)
+
+
+### Features
+
+* **server:** 004 P1-A compact-surface enforcement + P2 hardening; feat(cli): 005 harness onboarding ([b7b543c](https://github.com/special-place-ai-heaven/symforge/commit/b7b543cba6613e024734de5bd55f0fc2b4826913))
+* **server:** v8 operator server spine (004 — US1/US2/US3) ([dff4bb1](https://github.com/special-place-ai-heaven/symforge/commit/dff4bb11309e48a3ae85f1c06316f407fe5afe67))
+
 ## [7.27.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.26.0...v7.27.0) (2026-06-15)
 
 

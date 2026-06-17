@@ -21,6 +21,17 @@ impl EnvVarGuard {
         }
         Self { key, previous }
     }
+
+    // Only the surface-default conformance binary clears the var; other test
+    // binaries include this shared module but use `set` exclusively.
+    #[allow(dead_code)]
+    pub fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -38,4 +49,9 @@ impl Drop for EnvVarGuard {
 
 pub fn set_symforge_surface(value: &str) -> EnvVarGuard {
     EnvVarGuard::set("SYMFORGE_SURFACE", value)
+}
+
+#[allow(dead_code)]
+pub fn clear_symforge_surface() -> EnvVarGuard {
+    EnvVarGuard::unset("SYMFORGE_SURFACE")
 }
