@@ -21,14 +21,31 @@ pub const DEFERRED_ITEMS: &str = "b_results,calibration_auto_tune,multi_step_pla
 /// Restart-survival view of the durable STEL ledger store (US3/T029).
 ///
 /// A feature-independent POD so [`StelStatusContext`] (compiled on stdio/embed
-/// too) never has to name the server-only `ledger_store` types. The server-only
-/// `status` read populates it from `StelLedgerStore::summary()`; `None` means
-/// no durable store is wired (stdio/embed) or the store is `Disabled`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// too) never has to name the server-only `ledger_store` types.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableLedgerSummary {
     pub total_events: u64,
     pub total_net_vs_manual: i64,
     pub session_count: u64,
+}
+
+/// Reported state of the durable-ledger subsystem on the `status` surface
+/// (data-model E4, N-3 / TR-17 / FR-008).
+///
+/// A feature-independent POD mirror of
+/// [`crate::stel::ledger_store::LedgerSubsystemState`] plus the `Unavailable`
+/// case (no store wired in this build/surface). Distinguishing `Disabled` from
+/// `Unavailable` is the whole point: a wired-but-failing store must never read
+/// identically to a never-configured one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableLedgerState {
+    /// Durable store open and a summary query succeeded (serve mode).
+    Durable(DurableLedgerSummary),
+    /// Store configured/attempted but not serving — carries the reason so the
+    /// operator can tell "broken" from "off" (N-3).
+    Disabled { reason: String },
+    /// No durable store wired into this build/surface (stdio/embed).
+    Unavailable,
 }
 
 /// Inputs collected from the live server when formatting a status response.
@@ -45,9 +62,10 @@ pub struct StelStatusContext<'a> {
     pub last_ledger_decision: Option<String>,
     pub last_ledger_route: Option<String>,
     pub calibration: StelCalibrationSummary,
-    /// Durable ledger summary (restart-survival, US3/T029). `None` on
-    /// stdio/embed or when the durable store is `Disabled`.
-    pub durable_ledger: Option<DurableLedgerSummary>,
+    /// Durable-ledger subsystem state (restart-survival, US3/T029; N-3 FR-008).
+    /// `Unavailable` on stdio/embed (no store wired); `Disabled { reason }` when
+    /// a wired store failed to open or its query failed; `Durable` otherwise.
+    pub durable_ledger: DurableLedgerState,
 }
 
 impl<'a> StelStatusContext<'a> {
@@ -79,17 +97,18 @@ impl<'a> StelStatusContext<'a> {
             last_ledger_decision,
             last_ledger_route,
             calibration,
-            durable_ledger: None,
+            durable_ledger: DurableLedgerState::Unavailable,
         }
     }
 
-    /// Attach a durable-ledger summary (US3/T029 restart-survival view).
+    /// Attach the durable-ledger subsystem state (US3/T029 restart-survival view;
+    /// N-3 FR-008).
     ///
     /// Builder-style so the in-memory `from_server` constructor stays unchanged
-    /// for stdio/embed callers; the server-only `status` read calls this with
-    /// the opened store's `summary()`.
-    pub fn with_durable_ledger(mut self, summary: Option<DurableLedgerSummary>) -> Self {
-        self.durable_ledger = summary;
+    /// for stdio/embed callers (which default to `Unavailable`); the server-only
+    /// `status` read calls this with the opened store's `subsystem_state()`.
+    pub fn with_durable_ledger(mut self, state: DurableLedgerState) -> Self {
+        self.durable_ledger = state;
         self
     }
 }
@@ -152,13 +171,18 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
         }
     }
     match &ctx.durable_ledger {
-        Some(summary) => {
+        DurableLedgerState::Durable(summary) => {
             extra.push(format!(
                 "durable_ledger: events={} net_vs_manual={} sessions={}",
                 summary.total_events, summary.total_net_vs_manual, summary.session_count
             ));
         }
-        None => {
+        // N-3 / FR-008: a wired-but-failing store is reported distinctly from a
+        // never-configured one, carrying the reason.
+        DurableLedgerState::Disabled { reason } => {
+            extra.push(format!("durable_ledger: disabled ({reason})"));
+        }
+        DurableLedgerState::Unavailable => {
             extra.push("durable_ledger: unavailable".to_string());
         }
     }
@@ -191,7 +215,7 @@ mod tests {
             last_ledger_decision: Some("serve".to_string()),
             last_ledger_route: Some("search_text".to_string()),
             calibration: summarize_calibration(&[]),
-            durable_ledger: None,
+            durable_ledger: DurableLedgerState::Unavailable,
         }
     }
 
@@ -259,11 +283,13 @@ mod tests {
     fn full_status_renders_durable_ledger_summary_when_present() {
         // US3/T029: when a durable store summary is attached, the full status
         // body surfaces the restart-survival line with concrete totals.
-        let ctx = sample_context().with_durable_ledger(Some(DurableLedgerSummary {
-            total_events: 7,
-            total_net_vs_manual: 4200,
-            session_count: 3,
-        }));
+        let ctx = sample_context().with_durable_ledger(DurableLedgerState::Durable(
+            DurableLedgerSummary {
+                total_events: 7,
+                total_net_vs_manual: 4200,
+                session_count: 3,
+            },
+        ));
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
@@ -288,6 +314,30 @@ mod tests {
         assert!(
             body.contains("durable_ledger: unavailable"),
             "expected durable_ledger unavailable line in:\n{body}"
+        );
+    }
+
+    #[test]
+    fn full_status_reports_disabled_distinct_from_unavailable() {
+        // N-3 / FR-008 (surface side): a wired-but-failing store reads as
+        // `disabled (reason)`, which is textually distinct from `unavailable`.
+        let ctx = sample_context().with_durable_ledger(DurableLedgerState::Disabled {
+            reason: "summary query failed: no such table".to_string(),
+        });
+        let body = format_stel_status(
+            &StelStatusRequest {
+                detail: Some(StelStatusDetail::Full),
+            },
+            &ctx,
+        );
+        assert!(
+            body.contains("durable_ledger: disabled (summary query failed: no such table)"),
+            "expected durable_ledger disabled(reason) line in:\n{body}"
+        );
+        // The disabled line must NOT collapse to the unavailable wording.
+        assert!(
+            !body.contains("durable_ledger: unavailable"),
+            "a disabled (broken) store must not read as unavailable (off):\n{body}"
         );
     }
 

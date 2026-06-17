@@ -360,30 +360,49 @@ impl SymForgeServer {
     #[inline]
     fn persist_ledger_event_durably(&self, _event: &crate::stel::types::StelLedgerEvent) {}
 
-    /// Durable-ledger summary for the `status` tool (US3/T029 restart-survival).
+    /// Durable-ledger subsystem state for the `status` tool (US3/T029
+    /// restart-survival; N-3 / TR-17 / FR-008).
     ///
-    /// Reads `summary()` from the wired durable store. Returns `None` when no
-    /// store is attached (stdio) or the store is `Disabled`. On stdio/embed
-    /// builds (`server` feature off) this is a compile-time `None`.
+    /// Maps the wired durable store's [`subsystem_state`] onto the
+    /// feature-independent surface enum. Reports `Unavailable` when no store is
+    /// attached (stdio), `Disabled { reason }` for a wired-but-failing store
+    /// (open failed at startup or live query failed — N-3, never swallowed), and
+    /// `Durable` otherwise. On stdio/embed builds (`server` feature off) this is
+    /// a compile-time `Unavailable`.
+    ///
+    /// Reachability note (honest scope of N-3/FR-008): a durable store is wired
+    /// only by `server::serve::run` (the operator `/mcp` surface). The daemon
+    /// per-session runtime and the stdio local-fallback server leave
+    /// `stel_ledger_store: None`, so over the daemon-proxy `status` path this is
+    /// structurally `Unavailable` — truthfully so (no durable store is attached
+    /// there). The `Durable` vs `Disabled { reason }` distinction is observable
+    /// on the `serve` surface, where a store is actually attached.
+    ///
+    /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
     #[cfg(feature = "server")]
-    fn durable_ledger_summary_for_status(
-        &self,
-    ) -> Option<crate::stel::status::DurableLedgerSummary> {
-        let store = self.stel_ledger_store.as_ref()?;
-        let summary = store.summary()?;
-        Some(crate::stel::status::DurableLedgerSummary {
-            total_events: summary.total_events,
-            total_net_vs_manual: summary.total_net_vs_manual,
-            session_count: summary.session_count,
-        })
+    fn durable_ledger_summary_for_status(&self) -> crate::stel::status::DurableLedgerState {
+        use crate::stel::ledger_store::LedgerSubsystemState;
+        use crate::stel::status::{DurableLedgerState, DurableLedgerSummary};
+
+        let Some(store) = self.stel_ledger_store.as_ref() else {
+            return DurableLedgerState::Unavailable;
+        };
+        match store.subsystem_state() {
+            LedgerSubsystemState::Durable { summary } => {
+                DurableLedgerState::Durable(DurableLedgerSummary {
+                    total_events: summary.total_events,
+                    total_net_vs_manual: summary.total_net_vs_manual,
+                    session_count: summary.session_count,
+                })
+            }
+            LedgerSubsystemState::Disabled { reason } => DurableLedgerState::Disabled { reason },
+        }
     }
 
     #[cfg(not(feature = "server"))]
     #[inline]
-    fn durable_ledger_summary_for_status(
-        &self,
-    ) -> Option<crate::stel::status::DurableLedgerSummary> {
-        None
+    fn durable_ledger_summary_for_status(&self) -> crate::stel::status::DurableLedgerState {
+        crate::stel::status::DurableLedgerState::Unavailable
     }
 
     /// Accessor for tests.

@@ -2959,8 +2959,17 @@ fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
 /// a `version=` token is present in EVERY mode (regression:
 /// `test_runtime_status_includes_binary_version_in_every_mode`). Returns the raw
 /// token (e.g. `"7.18.1"`) or `None` when no such token is present.
+///
+/// The `status` body (TR-01 proxy path) does NOT carry `version=`; it emits the
+/// daemon binary version as `symforge_version: X` (status.rs). Accept that token
+/// form too, so the staleness guard fires when `status` is proxied to a stale
+/// daemon — not only when `health` is. Health is unaffected: its body always
+/// carries `version=` (the regression above), so it takes the first branch.
 fn extract_runtime_version(health_output: &str) -> Option<&str> {
-    let after = health_output.split("version=").nth(1)?;
+    let after = health_output
+        .split("version=")
+        .nth(1)
+        .or_else(|| health_output.split("symforge_version: ").nth(1))?;
     // The version token runs until the next field separator, whitespace, or EOL.
     let token = after
         .split(['|', ' ', '\n', '\r', '\t'])
@@ -8539,6 +8548,44 @@ impl SymForgeServer {
             ));
         }
 
+        // TR-01 (FR-006/007): in the default daemon-proxy topology this front-end
+        // server's `self.index` is EMPTY — the populated index lives in the warm
+        // daemon that serves real queries. So `status` MUST report the daemon's
+        // index, exactly like `health`/`health_compact` do, or it lies about a
+        // working system. Proxy to the daemon first; only fall through to the
+        // local `self.index` when there is no daemon (embed/local) or the daemon
+        // is unreachable (degraded fallback, where `ensure_local_index` has
+        // populated `self.index`).
+        if let Some(result) = self.proxy_tool_call("status", &params.0).await {
+            // Mirror `health`: warn loudly if the daemon we proxied to runs an
+            // older binary than this front-end.
+            let body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
+            return statused_tool_result(body, OutcomeClass::Found);
+        }
+
+        let body = self.render_stel_status_body(&params.0);
+        statused_tool_result(body, OutcomeClass::Found)
+    }
+
+    /// Render the `status` body from THIS server's own index, ledger, and
+    /// durable store — no proxy, no surface-env gate.
+    ///
+    /// This is the single rendering path shared by three callers:
+    ///   - the front-end local/degraded fallback (when no daemon is reachable),
+    ///   - the embed/local build (the server IS the index), and
+    ///   - the daemon-side `status` dispatch arm
+    ///     ([`Self::status_for_daemon_session`]), where `self.index` is the
+    ///     POPULATED served index.
+    ///
+    /// Because the daemon process owns the warm index, calling this on the
+    /// daemon side yields the same readiness/counts the queries actually use —
+    /// the TR-01 fix (FR-006). The surface-env gate stays on the front-end
+    /// `status_stel_tool` entry point only; the daemon renders whatever the
+    /// proxied request asks for.
+    pub(crate) fn render_stel_status_body(
+        &self,
+        request: &crate::stel::StelStatusRequest,
+    ) -> String {
         let guard = self.index.read();
         let ledger = self.stel_ledger.lock();
         let ctx = crate::stel::StelStatusContext::from_server(
@@ -8550,11 +8597,26 @@ impl SymForgeServer {
             &ledger,
             self.session_context.snapshot().total_tokens,
         )
-        // US3/T029: surface the durable ledger summary so restart-survival is
-        // observable from `status` (no-op None on stdio/embed).
+        // US3/T029: surface the durable ledger subsystem state so
+        // restart-survival is observable from `status` (Unavailable on
+        // stdio/embed; Disabled{reason} for a wired-but-failing store — N-3).
         .with_durable_ledger(self.durable_ledger_summary_for_status());
-        let body = crate::stel::format_stel_status(&params.0, &ctx);
-        statused_tool_result(body, OutcomeClass::Found)
+        crate::stel::format_stel_status(request, &ctx)
+    }
+
+    /// Daemon-side `status` entry point (TR-01 / FR-006).
+    ///
+    /// Reached via the `"status"` arm in `daemon::execute_tool_call` when the
+    /// front-end proxies `status` to the warm daemon. The daemon server owns the
+    /// POPULATED index, so this renders truthful readiness + counts. It does NOT
+    /// re-apply the `SYMFORGE_SURFACE=compact` env gate (that gate is the
+    /// front-end's concern; the daemon serves the proxied request) and it does
+    /// not re-proxy (the daemon server has no `daemon_client`).
+    pub(crate) fn status_for_daemon_session(
+        &self,
+        request: &crate::stel::StelStatusRequest,
+    ) -> String {
+        self.render_stel_status_body(request)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9090,6 +9152,31 @@ mod tests {
         let proxied = proxied_health_with_version("7.17.2");
         assert_eq!(super::extract_runtime_version(&proxied), Some("7.17.2"));
         assert_eq!(super::extract_runtime_version("no version here"), None);
+    }
+
+    #[test]
+    fn extract_runtime_version_pulls_token_from_status_body() {
+        // TR-01: the `status` body uses `symforge_version: X`, not `version=X`.
+        // The extractor must read that form so the staleness guard is not a
+        // structural no-op on the status proxy path.
+        let status_body =
+            "── stel status ──\nsurface: compact\nsymforge_version: 7.17.2\nindex_ready: true\n──";
+        assert_eq!(super::extract_runtime_version(status_body), Some("7.17.2"));
+    }
+
+    #[test]
+    fn daemon_staleness_warning_fires_on_status_body_for_older_daemon() {
+        // TR-01: an older daemon answering a proxied `status` call must trigger
+        // the same loud skew warning `health` gets (the comment in
+        // `status_stel_tool` is now true, not aspirational).
+        let status_body =
+            "── stel status ──\nsurface: compact\nsymforge_version: 7.17.2\nindex_ready: true\n──"
+                .to_string();
+        let out = super::append_daemon_staleness_warning(status_body, "7.18.1");
+        assert!(
+            out.contains("Daemon serving stale code"),
+            "older daemon serving `status` must trigger the staleness warning; got: {out}"
+        );
     }
 
     fn make_symbol_with_bytes(

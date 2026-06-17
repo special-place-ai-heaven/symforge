@@ -2432,6 +2432,13 @@ async fn execute_tool_call(
         "checkpoint_now" => Ok(server
             .checkpoint_now(Parameters(decode_params::<CheckpointNowInput>(params)?))
             .await),
+        // TR-01 / FR-006: the front-end `status` tool proxies here so the readout
+        // reflects the DAEMON's populated index (the one that actually serves
+        // queries), not the empty front-end index. `status_for_daemon_session`
+        // renders from this daemon server's own index/ledger/durable store and
+        // does not re-apply the surface-env gate (the front-end owns that).
+        "status" => Ok(server
+            .status_for_daemon_session(&decode_params::<crate::stel::StelStatusRequest>(params)?)),
         other => anyhow::bail!("unknown tool '{other}'"),
     }
 }
@@ -4284,6 +4291,146 @@ mod tests {
         assert!(
             !outline.contains("old.rs"),
             "rebound session should no longer point at old root: {outline}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+    }
+
+    /// T016 / TR-01 / FR-006 / FR-007 (SC-002): in the default daemon-proxy
+    /// topology the front-end `status` readout MUST reflect the DAEMON's
+    /// populated index (the one that actually serves queries) — never the empty
+    /// front-end `self.index`.
+    ///
+    /// This drives the REAL proxy path end-to-end:
+    ///   1. spawn a daemon, open a session, build a `new_daemon_proxy`
+    ///      front-end server (the exact shape `run_remote_mcp_server_async`
+    ///      constructs for an MCP client);
+    ///   2. index the project through the proxy so the DAEMON's index is warm;
+    ///   3. run a real query (`search_symbols`) through the proxy and confirm it
+    ///      serves the indexed symbol from the daemon;
+    ///   4. call `status` through the front-end and assert the readout reports
+    ///      `index_ready: true` with a non-zero `index_files` count.
+    ///
+    /// The test also asserts the front-end's OWN `self.index` stays EMPTY,
+    /// proving `status` did not read it. This is the air-tight form of the bug:
+    /// pre-fix, step 4 failed two ways — the daemon had no `status` dispatch arm
+    /// (`unknown tool 'status'`) and the front-end read its empty index
+    /// (`index_ready: false`, `index_files: 0`). Post-fix it reports the served
+    /// index.
+    ///
+    /// Coverage limits (honest): this exercises the in-process front-end →
+    /// daemon HTTP proxy on loopback, which is the production topology's data
+    /// path. It does NOT exercise the OS desktop launcher / CWD discovery
+    /// (TR-03, a separate phase) nor a cross-binary version skew; those remain
+    /// for live-verify against a built 8.0.0 binary.
+    #[tokio::test]
+    async fn test_status_index_matches_daemon_proxy_after_symforge_serve() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        // `status_stel_tool`'s front-end entry gate requires the compact surface.
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "compact");
+
+        // A project with one real Rust symbol so the daemon index is non-empty
+        // and a query can demonstrably serve from it.
+        let project = project_dir("symforge-status-proxy");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn served_symbol() -> u32 { 42 }\n",
+        )
+        .expect("write source");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "status-proxy".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        // The exact front-end an MCP client gets: empty self.index, proxying to
+        // the warm daemon.
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Index the project through the proxy → populates the DAEMON's index.
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project.path().display().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon proxy index_folder must succeed, got: {indexed}"
+        );
+
+        // Run a real query through the proxy: it must serve the indexed symbol
+        // from the warm daemon index (so a successful query is established).
+        // Build the input from JSON so this stays robust to optional-field
+        // additions on `SearchSymbolsInput`.
+        let search_input = serde_json::from_value(serde_json::json!({
+            "query": "served_symbol"
+        }))
+        .expect("search_symbols input");
+        let query = server.search_symbols(Parameters(search_input)).await;
+        assert!(
+            query.contains("served_symbol"),
+            "proxied query must serve the indexed symbol from the warm daemon, got: {query}"
+        );
+
+        // Now read `status` through the front-end. With the TR-01 fix it proxies
+        // to the daemon and reports the SERVED index.
+        let status_result = server
+            .status_stel_tool(Parameters(crate::stel::StelStatusRequest::default()))
+            .await
+            .expect("status dispatch");
+        let serialized = serde_json::to_value(&status_result).expect("serialize status result");
+        let status_body = serialized["content"][0]["text"]
+            .as_str()
+            .expect("status result text")
+            .to_string();
+
+        assert!(
+            status_body.contains("index_ready: true"),
+            "status must report the served daemon index as ready (FR-006), got:\n{status_body}"
+        );
+        // A successful query implies non-zero counts — the index_files line must
+        // not be zero (SC-002).
+        assert!(
+            !status_body.contains("index_files: 0"),
+            "status must report non-zero index_files for the served index (SC-002), got:\n{status_body}"
+        );
+        assert!(
+            status_body.contains("index_files: 1\n"),
+            "status must report exactly the single indexed file from the daemon, got:\n{status_body}"
+        );
+
+        // Air-tight: the front-end's OWN index stayed empty; `status` reported
+        // the daemon's index, not this one. This is what was broken pre-fix.
+        assert_eq!(
+            server.index().published_state().file_count,
+            0,
+            "front-end self.index must remain empty — status must source from the daemon"
         );
 
         let _ = handle.shutdown_tx.send(());

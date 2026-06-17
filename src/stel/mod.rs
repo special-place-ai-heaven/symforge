@@ -87,7 +87,8 @@ pub use ledger::{
 };
 pub use planner::{build_plan, confidence_label, is_find_fusion_plan, plan_summary_line};
 pub use status::{
-    DEFERRED_ITEMS, PHASE0_EVIDENCE_COMMIT, PHASE0_GO_COMMIT, StelStatusContext, format_stel_status,
+    DEFERRED_ITEMS, DurableLedgerState, DurableLedgerSummary, PHASE0_EVIDENCE_COMMIT,
+    PHASE0_GO_COMMIT, StelStatusContext, format_stel_status,
 };
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{

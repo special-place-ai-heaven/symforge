@@ -1,3 +1,8 @@
+// Server-only integration test: depends on `#[cfg(feature = "server")]`
+// surface machinery. Gating the whole file keeps
+// `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! US2 / T021 conformance: the default `tools/list` surface is compact-3, and
 //! the compact surface is ENFORCED at `tools/call`, not just hidden from
 //! `tools/list` (P1-A).

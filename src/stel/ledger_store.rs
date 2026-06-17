@@ -164,6 +164,27 @@ pub enum LedgerStoreStatus {
     },
 }
 
+/// Runtime state of the durable-ledger subsystem, computed at status-read time
+/// (data-model E4, N-3 / TR-17 / FR-008).
+///
+/// Distinguishes a wired-but-failing store from one that was never configured.
+/// A plain `Option<LedgerSummary>` (as `summary()` returns) collapses both into
+/// `None`; this enum keeps them distinct so `status` can report the truth.
+///
+/// `Unavailable` is *not* a variant here: it means "no store wired into this
+/// build/surface" and is represented at the server boundary by the absence of a
+/// store (`Option::None`). `subsystem_state()` is only called on a present store
+/// and therefore only ever yields `Durable` or `Disabled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerSubsystemState {
+    /// The durable store is open and a summary query succeeded (serve mode).
+    Durable { summary: LedgerSummary },
+    /// The store is configured/attempted but not serving — open failed at
+    /// startup (the `Disabled` variant) or a live summary query failed. Carries
+    /// the reason so the operator can tell "broken" from "off".
+    Disabled { reason: String },
+}
+
 // ---------------------------------------------------------------------------
 // StelLedgerStore — public enum
 // ---------------------------------------------------------------------------
@@ -223,11 +244,38 @@ impl StelLedgerStore {
         }
     }
 
-    /// Return aggregate summary. Returns `None` when `Disabled`.
+    /// Return aggregate summary. Returns `None` when `Disabled` OR when a live
+    /// summary query fails.
+    ///
+    /// N-3: this `Option` API collapses "off" and "broken" into `None`. It is
+    /// retained for the admin DTO ([`crate::server::admin`]) which has its own
+    /// None handling. The `status` tool MUST use [`Self::subsystem_state`]
+    /// instead, which preserves the open-error and distinguishes the two states
+    /// (FR-008, data-model E4).
     pub fn summary(&self) -> Option<LedgerSummary> {
         match self {
             Self::Disabled => None,
             Self::Sqlite(store) => store.summary().ok(),
+        }
+    }
+
+    /// Compute the durable-ledger subsystem state for the `status` surface
+    /// (N-3 / TR-17 / FR-008). Unlike [`Self::summary`], a failed summary query
+    /// on a wired store is reported as [`LedgerSubsystemState::Disabled`] with
+    /// the error reason — never swallowed into the same shape as a never-opened
+    /// store. The server reports "no store wired" by NOT calling this (the store
+    /// is `Option::None` at the boundary).
+    pub fn subsystem_state(&self) -> LedgerSubsystemState {
+        match self {
+            Self::Disabled => LedgerSubsystemState::Disabled {
+                reason: "failed to open at startup (see server logs)".to_string(),
+            },
+            Self::Sqlite(store) => match store.summary() {
+                Ok(summary) => LedgerSubsystemState::Durable { summary },
+                Err(err) => LedgerSubsystemState::Disabled {
+                    reason: format!("summary query failed: {err}"),
+                },
+            },
         }
     }
 
@@ -624,6 +672,73 @@ mod tests {
         assert!(
             summary.is_none(),
             "Disabled store summary must return None (unavailable)"
+        );
+    }
+
+    /// T017 / N-3 / TR-17 / FR-008: a wired-but-FAILING durable store must report
+    /// a state distinct from a never-configured one. Before the fix both
+    /// collapsed to `summary() == None`.
+    ///
+    /// After the fix, the never-configured `Disabled` variant reports
+    /// `Disabled { reason }` whose reason names the startup open-failure; a
+    /// `Sqlite` store whose live query fails reports `Disabled { reason }` whose
+    /// reason names the query failure; and a healthy `Sqlite` store reports
+    /// `Durable { .. }`. The server maps "no store wired at all" to `Unavailable`
+    /// by not calling this method (the store is `Option::None` at the server
+    /// boundary), so the three surface states (Durable, Disabled-with-reason,
+    /// Unavailable) are all distinct.
+    #[test]
+    fn subsystem_state_distinguishes_broken_from_off_and_healthy() {
+        // Healthy wired store -> Durable with a real summary.
+        let healthy = StelLedgerStore::open_in_memory("sess-healthy").expect("healthy store");
+        healthy.record(&sample_event("p-healthy"));
+        match healthy.subsystem_state() {
+            LedgerSubsystemState::Durable { summary } => {
+                assert_eq!(
+                    summary.total_events, 1,
+                    "healthy store must report its rows"
+                );
+            }
+            other => panic!("healthy Sqlite store must be Durable, got {other:?}"),
+        }
+
+        // Never-configured store (open failed at startup) -> Disabled(reason).
+        let off = StelLedgerStore::Disabled;
+        let off_state = off.subsystem_state();
+        let off_reason = match &off_state {
+            LedgerSubsystemState::Disabled { reason } => reason.clone(),
+            other => panic!("Disabled variant must be Disabled(reason), got {other:?}"),
+        };
+        assert!(
+            off_reason.contains("open"),
+            "never-configured reason must name the startup open-failure: {off_reason}"
+        );
+
+        // Wired-but-failing store: drop the events table under the lock so the
+        // next summary query errors, simulating a corrupt/failed durable store.
+        let broken = StelLedgerStore::open_in_memory("sess-broken").expect("broken store");
+        if let StelLedgerStore::Sqlite(store) = &broken {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE stel_ledger_events;")
+                .expect("drop events table");
+        } else {
+            panic!("open_in_memory must yield a Sqlite store");
+        }
+        let broken_state = broken.subsystem_state();
+        let broken_reason = match &broken_state {
+            LedgerSubsystemState::Disabled { reason } => reason.clone(),
+            other => panic!("a wired-but-failing store must be Disabled(reason), got {other:?}"),
+        };
+        assert!(
+            broken_reason.contains("query failed"),
+            "broken reason must name the failed live query: {broken_reason}"
+        );
+
+        // The two Disabled reasons are DISTINCT — "broken" never reads identical
+        // to "off". This is the FR-008 invariant.
+        assert_ne!(
+            off_reason, broken_reason,
+            "wired-but-failing store must not report identically to a never-configured one"
         );
     }
 

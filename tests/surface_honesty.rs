@@ -1,3 +1,8 @@
+// Server-only integration test: depends on `#[cfg(feature = "server")]` `stel`
+// machinery. Gating the whole file keeps
+// `--no-default-features --features embed --all-targets` compiling.
+#![cfg(feature = "server")]
+
 //! Surface-honesty regression (010 US1 / T007, SC-001).
 //!
 //! Renders the two highest-traffic LLM-facing surfaces — the `symforge` trust
