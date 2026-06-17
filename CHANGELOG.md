@@ -26,6 +26,23 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.31.0...v8.0.0) (2026-06-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* operator/CLI/onboarding surface changed (serve IP/API, compact-3 default, install/init, harness reconfig). The embed facade is unchanged and semver-stable.
+
+### Bug Fixes
+
+* **server,stel:** ledger drain (P2-3), loopback normalize (P3-8), honest fusion-empty status (P3-7) ([e494fe4](https://github.com/special-place-ai-heaven/symforge/commit/e494fe4eccc8041f90d1fb919c0c4b00a1002f7f))
+* **server:** load admin GUI under a key (P2-1); redact AAP preset secret (P2-5) ([c9193d5](https://github.com/special-place-ai-heaven/symforge/commit/c9193d53aa9e8d15c56e3075f20a33fb971e87c8))
+
+
+### Miscellaneous Chores
+
+* release v8.0.0 ([8fd2742](https://github.com/special-place-ai-heaven/symforge/commit/8fd2742860f736a127f4bba3eb0c700add7ead64))
+
 ## [7.31.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.30.0...v7.31.0) (2026-06-17)
 
 
