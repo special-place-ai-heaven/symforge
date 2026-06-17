@@ -151,6 +151,12 @@ pub async fn require_bearer(
         return next.run(request).await;
     }
 
+    // P2-1: let the browser load admin HTML/JS/CSS without a Bearer header; the
+    // panel prompts for the key and sends it on `/api/v1/*` fetches only.
+    if super::admin::is_admin_public_static_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
     let presented = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)

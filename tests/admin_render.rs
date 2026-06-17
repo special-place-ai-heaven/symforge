@@ -101,14 +101,14 @@ impl TestServer {
     }
 }
 
-async fn start(runtime: ServerRuntime) -> TestServer {
+async fn start(runtime: ServerRuntime, auth: AuthConfig, is_loopback: bool) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let admin = build_admin_router(&runtime);
     let gated = apply_origin_gate(admin, OriginLayerState::from_bind_addr(addr));
-    let app = apply_bearer_auth(gated, AuthLayerState::new(AuthConfig::new(None), true));
+    let app = apply_bearer_auth(gated, AuthLayerState::new(auth, is_loopback));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let join = tokio::spawn(async move {
         let shutdown = async {
@@ -125,10 +125,17 @@ async fn start(runtime: ServerRuntime) -> TestServer {
     }
 }
 
+const KEYED_LOOPBACK_KEY: &str = "sf_admin_render_key";
+
+async fn start_keyed_loopback(runtime: ServerRuntime) -> TestServer {
+    let auth = AuthConfig::new(Some(KEYED_LOOPBACK_KEY.to_string()));
+    start(runtime, auth, true).await
+}
+
 #[tokio::test]
 async fn admin_page_references_endpoints_and_summary_has_real_values() {
     let store = seeded_ledger(210, 4);
-    let server = start(runtime(store)).await;
+    let server = start(runtime(store), AuthConfig::new(None), true).await;
     let client = reqwest::Client::new();
 
     // (1) The served HTML references the JS + CSS the browser will load.
@@ -177,6 +184,52 @@ async fn admin_page_references_endpoints_and_summary_has_real_values() {
     assert_eq!(summary["available"], true);
     assert_eq!(summary["total_events"], 4);
     assert_eq!(summary["total_net_vs_manual"], 840); // 4 * 210
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn keyed_loopback_admin_static_assets_load_without_bearer_api_stays_gated() {
+    // P2-1 / P3-10: with --api-key on loopback, HTML/JS load without Bearer; API
+    // routes still require the key.
+    let store = seeded_ledger(100, 1);
+    let server = start_keyed_loopback(runtime(store)).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/admin", "/admin/app.js", "/admin/style.css"] {
+        let resp = client
+            .get(server.url(path))
+            .send()
+            .await
+            .unwrap_or_else(|_| panic!("request {path}"));
+        assert!(
+            resp.status().is_success(),
+            "keyed loopback static {path} must load without Bearer, got {}",
+            resp.status()
+        );
+    }
+
+    let summary_unauth = client
+        .get(server.url("/api/v1/summary"))
+        .send()
+        .await
+        .expect("summary without bearer");
+    assert_eq!(
+        summary_unauth.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "API must stay gated when a key is configured"
+    );
+
+    let summary_auth = client
+        .get(server.url("/api/v1/summary"))
+        .header("Authorization", format!("Bearer {KEYED_LOOPBACK_KEY}"))
+        .send()
+        .await
+        .expect("summary with bearer");
+    assert!(
+        summary_auth.status().is_success(),
+        "authenticated API must succeed"
+    );
 
     server.shutdown().await;
 }

@@ -289,9 +289,8 @@ impl AapView {
     ///
     /// Resolves the sibling AAP checkout (read-only), compares its embed pin to
     /// the running crate, classifies the integration mode, and assembles the
-    /// presets. The serve-URL preset uses the runtime's bootstrap key + the
-    /// documented default attach URL (the admin API only runs inside an active
-    /// `serve`, so the serve path is available here).
+    /// presets. The serve-URL preset uses a redacted `<API_KEY>` placeholder when
+    /// a bootstrap key is configured (P2-5), never the real secret.
     pub fn from_runtime(runtime: &ServerRuntime) -> Self {
         let detection = AapDetection::resolve();
         // The admin API only runs inside an active `serve` (the request reached
@@ -326,7 +325,7 @@ impl AapView {
             crate::server::mcp_http::MCP_PATH
         );
         let offer_serve = detection.detected && serve_active;
-        let presets = AapPresets::build(offer_serve.then_some((attach_url.as_str(), bearer)));
+        let presets = AapPresets::build_for_admin_panel(offer_serve, &attach_url, bearer.is_some());
 
         let mode = IntegrationMode::classify(detection.detected, serve_active);
 
@@ -636,5 +635,29 @@ mod tests {
             "raw secret must not leak"
         );
         assert!(json.contains("fingerprint"));
+    }
+
+    #[test]
+    fn aap_view_serve_preset_redacts_bootstrap_key() {
+        use crate::server::aap::{ADMIN_SERVE_KEY_PLACEHOLDER, AapDetection, DetectionSource};
+
+        let detection = AapDetection {
+            detected: true,
+            root: Some(std::path::PathBuf::from("/tmp/aap")),
+            source: Some(DetectionSource::EnvVar),
+        };
+        let view = AapView::from_parts(&detection, true, Some("bootstrap-secret-never-echo"));
+        let serve = view
+            .presets
+            .serve_url_snippet
+            .expect("serve preset when detected + serve active");
+        assert!(
+            serve.contains(ADMIN_SERVE_KEY_PLACEHOLDER),
+            "preset must use placeholder: {serve}"
+        );
+        assert!(
+            !serve.contains("bootstrap-secret-never-echo"),
+            "bootstrap secret must not appear in JSON: {serve}"
+        );
     }
 }

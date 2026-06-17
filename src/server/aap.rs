@@ -326,6 +326,10 @@ pub fn embed_cargo_snippet() -> String {
 /// settings (the optional secondary path). Only meaningful when `serve` is
 /// active — callers pass `Some` only then (so the panel offers it conditionally).
 ///
+/// Placeholder for the bootstrap Bearer secret in admin-panel presets (P2-5).
+/// The real key is never echoed in `/api/v1/aap` JSON — operators paste their key.
+pub const ADMIN_SERVE_KEY_PLACEHOLDER: &str = "<API_KEY>";
+
 /// Produces a JSON `mcpServers.symforge` HTTP entry (the same attach shape the
 /// 005 harness writes), carrying the attach URL and, when present, the Bearer
 /// key. This is an MCP-client registration, NOT a replacement for the embed dep:
@@ -340,6 +344,16 @@ pub fn serve_url_preset(attach_url: &str, key: Option<&str>) -> String {
     }
     let doc = serde_json::json!({ "mcpServers": { "symforge": server } });
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Serve-URL preset for the admin panel: when a bootstrap key is configured,
+/// emit [`ADMIN_SERVE_KEY_PLACEHOLDER`] instead of the real secret (P2-5).
+pub fn serve_url_preset_for_admin(attach_url: &str, bootstrap_key_configured: bool) -> String {
+    if bootstrap_key_configured {
+        serve_url_preset(attach_url, Some(ADMIN_SERVE_KEY_PLACEHOLDER))
+    } else {
+        serve_url_preset(attach_url, None)
+    }
 }
 
 /// The AAP integration presets surfaced in the panel.
@@ -362,6 +376,21 @@ impl AapPresets {
         Self {
             embed_snippet: embed_cargo_snippet(),
             serve_url_snippet: serve.map(|(url, key)| serve_url_preset(url, key)),
+        }
+    }
+
+    /// Build presets for `/api/v1/aap`: embed snippet always; serve-URL preset
+    /// only when `serve_active`, with a redacted Authorization placeholder when
+    /// a bootstrap key is configured (never echo the real secret — P2-5).
+    pub fn build_for_admin_panel(
+        serve_active: bool,
+        attach_url: &str,
+        bootstrap_key_configured: bool,
+    ) -> Self {
+        Self {
+            embed_snippet: embed_cargo_snippet(),
+            serve_url_snippet: serve_active
+                .then(|| serve_url_preset_for_admin(attach_url, bootstrap_key_configured)),
         }
     }
 }
@@ -566,6 +595,17 @@ version = "1.0.0"
         let preset2 = serve_url_preset("http://127.0.0.1:8787/mcp", Some(""));
         let v2: serde_json::Value = serde_json::from_str(&preset2).unwrap();
         assert!(v2["mcpServers"]["symforge"]["headers"].is_null());
+    }
+
+    #[test]
+    fn serve_url_preset_for_admin_redacts_bootstrap_key() {
+        let preset = serve_url_preset_for_admin("http://127.0.0.1:8787/mcp", true);
+        let v: serde_json::Value = serde_json::from_str(&preset).unwrap();
+        assert_eq!(
+            v["mcpServers"]["symforge"]["headers"]["Authorization"],
+            "Bearer <API_KEY>"
+        );
+        assert!(!preset.contains("sf_real_secret"));
     }
 
     #[test]

@@ -339,10 +339,11 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .map_err(|source| ServeError::Bind { addr, source })?;
 
     // Build the /mcp router plus the /admin + /api/v1 router (006), merge them,
-    // and layer Bearer auth + Origin gating in front (one enforcement point —
-    // secure-default rule lives on AuthConfig/AuthLayerState; P1-B Origin gating
-    // lives on OriginLayerState). Layer order: the Bearer auth runs first
-    // (outermost), then the Origin gate, then the routed handler.
+    // and layer Bearer auth + Origin gating in front (secure-default rule on
+    // AuthConfig/AuthLayerState; P1-B Origin on OriginLayerState). Bearer auth
+    // skips read-only admin static assets so the GUI loads when a key is set
+    // (P2-1); `/api/v1/*` and `/mcp` remain gated. Layer order: Bearer outermost,
+    // then Origin, then the handler.
     let mcp_router = mcp_http::build_mcp_router(&runtime, local_addr);
     let admin_router = admin::build_admin_router(&runtime);
     let merged = mcp_router.merge(admin_router);

@@ -9,8 +9,10 @@
 //!
 //! [`build_admin_router`] returns the combined `/admin` + `/api/v1` router with
 //! the [`ServerRuntime`] as axum state. [`crate::server::serve::run`] mounts it
-//! alongside `/mcp` and layers the shared Bearer-auth + Origin-gate in front
-//! (one enforcement point — FR-002 / FR-007 / GATE-1).
+//! alongside `/mcp` and layers Origin gating + Bearer auth in front. Read-only
+//! admin static assets ([`is_admin_public_static_path`]) skip Bearer so a
+//! browser can load HTML/JS/CSS and then prompt for the key; `/api/v1/*` and
+//! `/mcp` stay gated (P2-1).
 
 #[cfg(feature = "server")]
 pub mod api_v1;
@@ -29,6 +31,22 @@ use super::ServerRuntime;
 
 /// Mount path for the admin UI.
 pub const ADMIN_PATH: &str = "/admin";
+
+/// Whether `path` is a read-only admin static asset that may load without Bearer
+/// auth so the browser can render the panel and collect the key client-side.
+/// JSON API routes (`/api/v1/*`) and `/mcp` are never public.
+#[cfg(feature = "server")]
+pub fn is_admin_public_static_path(path: &str) -> bool {
+    matches!(
+        path,
+        ADMIN_PATH
+            | "/admin/"
+            | "/admin/app.js"
+            | "/admin/style.css"
+            | "/admin/favicon.svg"
+            | "/favicon.ico"
+    )
+}
 
 // Embedded assets (compiled into the binary; no filesystem dependency at runtime).
 #[cfg(feature = "server")]
@@ -124,6 +142,14 @@ pub fn build_admin_router(runtime: &ServerRuntime) -> Router {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_static_paths_cover_admin_assets_not_api() {
+        assert!(is_admin_public_static_path("/admin"));
+        assert!(is_admin_public_static_path("/admin/app.js"));
+        assert!(!is_admin_public_static_path("/api/v1/summary"));
+        assert!(!is_admin_public_static_path("/mcp"));
+    }
 
     #[test]
     fn embedded_assets_are_non_empty_and_reference_endpoints() {
