@@ -23,6 +23,12 @@ spine rules govern every change:
    **relabel ≠ validate**: a label change never promotes an OPEN assumption to
    VALIDATED.
 
+## Clarifications
+
+### Session 2026-06-17
+
+- Q: Phase E (economics) — does 010 ground the estimator now (real behavior change) or ship only the honest heuristic label and defer grounding? → A: Ground now. 010 wires the existing byte-grounded estimator into the planner so predictions vary with real request/result size and the adaptive economics branches (degrade/bypass) become reachable; the honest heuristic label (US1) remains the interim floor for any figure not yet grounded, but grounding is in-scope for this feature, not deferred. US5's acceptance scenarios (predictions differ by size; a non-serve branch reachable) are binding for 010.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Every reported number/label is honest (Priority: P1)
@@ -217,7 +223,7 @@ unproven assumption.
 
 **Economics grounding (US5)**
 
-- **FR-014**: Economics predictions MUST be derived from real request/result size so that predictions vary with the work, and the adaptive economics outcomes are reachable for appropriate requests — OR, until grounded, every economics figure MUST be labeled heuristic (FR-001) and the adaptive behavior described as not-yet-active.
+- **FR-014**: Economics predictions MUST be derived from real request/result size so that predictions vary with the work, and the adaptive economics outcomes (degrade/bypass) MUST be reachable for appropriate requests. Grounding is in-scope for this feature (clarified 2026-06-17, ground-now). The honest heuristic label (FR-001) is the interim floor for any figure not yet grounded, never a substitute for delivering grounding in 010.
 - **FR-015**: Any equivalence/accuracy figure presented as measured MUST be backed by an actual assertion in the test corpus, or be removed.
 
 **Public record & enforced honesty (US6)**
