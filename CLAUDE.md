@@ -57,5 +57,5 @@ When merging tools A into B:
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/007-intelligence-pattern-ports/plan.md
+at specs/010-v8-trust-remediation/plan.md
 <!-- SPECKIT END -->
