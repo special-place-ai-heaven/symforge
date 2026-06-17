@@ -53,3 +53,9 @@ When merging tools A into B:
 5. Remove A from `SYMFORGE_TOOL_NAMES` in `src/cli/init.rs`
 6. Update cross-reference descriptions in other tools
 7. Update tests: add new field initializers, add mode-specific tests
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+at specs/007-intelligence-pattern-ports/plan.md
+<!-- SPECKIT END -->
