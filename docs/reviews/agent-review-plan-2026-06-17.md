@@ -1,6 +1,6 @@
 # SymForge — Agent-Orchestrated Internal Review Plan
 
-**Target:** post-007-merge `origin/main` (all 00X items). **Shared context:** every agent reads [`full-codebase-review-prompt-2026-06-17.md`](./full-codebase-review-prompt-2026-06-17.md) first (module map, focus areas, finding format, known-deferred P3s). **Run from:** the dedicated `E:\project\symforge-review-main` worktree (refreshed to the merged `origin/main`).
+**Target:** post-007-merge `origin/main` (all 00X items). **Shared context:** every agent reads [`full-codebase-review-prompt-2026-06-17.md`](./full-codebase-review-prompt-2026-06-17.md) first (module map, focus areas, finding format, known-deferred P3s) AND [`007-review-focus-2026-06-17.md`](./007-review-focus-2026-06-17.md) (the 007 ports + invariants, since 007 merged after the panel was first scoped). **Run from:** the dedicated `E:\project\symforge-review-main` worktree (refreshed to the merged `origin/main`).
 
 This is the **internal** review track (our specialist agents). It complements the **external** cross-model LLM pass (same prompt, opposing model). Two independent eyes.
 

@@ -1,6 +1,8 @@
 # SymForge — Full Codebase Review Brief (external LLM reviewer)
 
-**Repo:** `symforge` (Rust MCP code-intelligence server) · **Target ref:** `origin/main` (currently `77ee6f9`, released 7.30.0) · **Date:** 2026-06-17
+**Repo:** `symforge` (Rust MCP code-intelligence server) · **Target ref:** `origin/main` (currently `39a5eef`, released 7.31.0 — all 00X merged) · **Date:** 2026-06-17
+
+> **Feature 007 (Intelligence Pattern Ports)** merged after this brief was written — review it with the author-supplied focus + invariants in [`007-review-focus-2026-06-17.md`](./007-review-focus-2026-06-17.md).
 
 You are a senior Rust + security + systems reviewer. Review the **entire codebase**, but spend your budget where risk concentrates (the ranked focus areas below). Your job is to find **real, verifiable** problems — bugs, security holes, gaps, fragile/mediocre code, performance traps, and design issues — and report them so a maintainer can act. Quality over quantity: a few confirmed P0/P1 findings beat fifty speculative nits. **Verify claims against the code; do not pad with false positives.**
 
@@ -42,6 +44,7 @@ A Rust server that indexes source repos (tree-sitter parsers) and exposes symbol
 | **Sidecar / daemon** | `src/sidecar/*`, `src/daemon.rs` | legacy hook HTTP, daemon proxy, governor | MEDIUM |
 | **Embed contract** | `src/embed.rs`, `Cargo.toml` features | semver-public facade; must stay axum/rmcp-free | HIGH (invariant) |
 | **Analytics** | `src/analytics/store.rs` | rusqlite analytics (pattern the STEL ledger mirrors) | LOW-MEDIUM |
+| **007 intelligence ports** | `src/protocol/{format,edit_tools,edit_plan,prompts,tools,smart_query}.rs`, `src/sidecar/handlers.rs`, `src/stel/planner.rs` | impact footer, orientation doctrine, ranked compact map, STEL find-fusion, edit_plan co-change | **HIGH** — see [`007-review-focus`](./007-review-focus-2026-06-17.md) |
 
 ## 3. Priority focus areas (ranked) + specific questions
 
