@@ -78,6 +78,14 @@ pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValida
     if let Some(key) = &request.idempotency_key {
         args["idempotency_key"] = serde_json::json!(key);
     }
+    // TR-06 / FR-009: forward the optimistic-concurrency guard so it reaches
+    // the write path. Dropping it here was the bug — the pre-flight checked it
+    // but the actual write never saw it, leaving a TOCTOU window. The write
+    // path (`replace_symbol_body` -> `guarded_atomic_write_file`) re-verifies
+    // it against the bytes actually being written.
+    if let Some(if_match) = &request.if_match {
+        args["if_match"] = serde_json::json!(if_match);
+    }
     Ok(StelPlan {
         plan_id: edit_plan_id(request),
         intent: IntentBucket::Edit,
@@ -185,5 +193,42 @@ mod tests {
         })
         .expect("valid edit request");
         assert_eq!(plan.steps[0].args["dry_run"], false);
+    }
+
+    #[test]
+    fn build_edit_plan_forwards_if_match() {
+        // TR-06 / FR-009: the optimistic-concurrency guard must reach the
+        // write tool's args, not be dropped at planning (the original bug).
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            if_match: Some("fn helper() { old }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        })
+        .expect("valid edit request");
+        assert_eq!(
+            plan.steps[0].args["if_match"], "fn helper() { old }",
+            "if_match must be forwarded into the replace_symbol_body plan args"
+        );
+    }
+
+    #[test]
+    fn build_edit_plan_omits_if_match_when_absent() {
+        // Without an `if_match`, the plan args must not carry the key at all so
+        // the write path stays on the unguarded (presence-off) fast path.
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        })
+        .expect("valid edit request");
+        assert!(
+            plan.steps[0].args.get("if_match").is_none(),
+            "absent if_match must not appear in plan args"
+        );
     }
 }

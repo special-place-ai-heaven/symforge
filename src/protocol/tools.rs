@@ -10668,6 +10668,7 @@ mod tests {
             new_body: "fn target() {\n    let x = 42;\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -15439,6 +15440,7 @@ mod tests {
                     new_body: "fn present() {\n    println!(\"new\");\n}".to_string(),
                     dry_run: Some(false),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15463,6 +15465,7 @@ mod tests {
                     new_body: "fn present() {\n    println!(\"planned\");\n}".to_string(),
                     dry_run: Some(true),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15485,6 +15488,7 @@ mod tests {
                     new_body: "fn missing_symbol() {}".to_string(),
                     dry_run: Some(false),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15504,6 +15508,7 @@ mod tests {
                     new_body: "fn duplicate() { changed(); }".to_string(),
                     dry_run: Some(false),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15552,6 +15557,7 @@ mod tests {
                     new_body: "fn present() { changed(); }".to_string(),
                     dry_run: Some(false),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -15608,6 +15614,7 @@ mod tests {
                     new_body: "fn present() {\n    println!(\"new\");\n}".to_string(),
                     dry_run: Some(true),
                     idempotency_key: None,
+                    if_match: None,
                     working_directory: None,
                 }))
                 .await,
@@ -20577,6 +20584,7 @@ mod tests {
             new_body: "fn hello() {\n    println!(\"HELLO\");\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20628,6 +20636,7 @@ mod tests {
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20667,6 +20676,7 @@ mod tests {
                     .to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20705,6 +20715,7 @@ mod tests {
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20741,6 +20752,7 @@ mod tests {
             new_body: "pub fn add(a: i32, b: i32) -> i32 {\n    a.saturating_add(b)\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20791,6 +20803,7 @@ mod tests {
                 .to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20830,6 +20843,7 @@ mod tests {
             new_body: "export function legacy(): number {\n    return 2;\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20864,6 +20878,7 @@ mod tests {
             new_body: "pub fn legacy() -> i32 {\n    2\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20900,6 +20915,7 @@ mod tests {
             new_body: "fn inner() {\n    new_body();\n}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -20926,6 +20942,7 @@ mod tests {
             new_body: "fn foo() {}".to_string(),
             dry_run: None,
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -21119,6 +21136,7 @@ mod tests {
             new_body: "fn hello() {\n    println!(\"new body\");\n}".to_string(),
             dry_run: Some(true),
             idempotency_key: None,
+            if_match: None,
             working_directory: None,
         };
         let result = server.replace_symbol_body(Parameters(input)).await;
@@ -21167,6 +21185,7 @@ mod tests {
                 new_body: "fn foo() { new }".to_string(),
                 dry_run: Some(true),
                 idempotency_key: None,
+                if_match: None,
                 working_directory: None,
             }))
             .await;
@@ -22840,4 +22859,154 @@ mod tests {
     // Frecency bump/no-bump wiring is verified end-to-end against a real
     // `FrecencyStore` on a tempdir in `tests/frecency_ranking.rs`. That suite
     // is the canonical home for those assertions.
+
+    // -----------------------------------------------------------------------
+    // TR-06 / FR-009 / FR-010 — if_match guarded apply rejects a concurrent
+    // on-disk change (T022). Lives here as a crate unit test because the
+    // deterministic interleave hook (`edit::install_write_interleave_hook`) is
+    // `#[cfg(test)] pub(crate)` and is unreachable from an integration test.
+    // -----------------------------------------------------------------------
+
+    /// What this test injects and proves (honest scope):
+    ///
+    /// - INJECTS: a `#[cfg(test)]` interleave hook installed at the guarded
+    ///   write site (`edit::guarded_atomic_write_file`). The hook fires once,
+    ///   strictly BEFORE the write-time on-disk re-read, and overwrites the
+    ///   target file with a third, divergent body — simulating a concurrent
+    ///   writer landing inside the previously-unguarded TOCTOU window. No
+    ///   sleeps, no extra threads: the interleave is deterministic.
+    /// - PROVES: with `if_match` set to the body the agent last saw, the
+    ///   apply is REJECTED (no write), the on-disk content is the concurrent
+    ///   change (NOT the agent's stale edit), and the response does NOT claim
+    ///   a successful guarded apply (outcome != Found; no committed write
+    ///   semantics; ledger `legacy_executed=false` via the failed write mode).
+    /// - DOES NOT PROVE: atomicity against a *truly external* OS process. The
+    ///   hook stands in for a concurrent writer that lands between the re-read
+    ///   and the rename only because we control the exact interleave point;
+    ///   the production guard re-reads disk microseconds before the rename
+    ///   with no `.await` between, which closes the wide pre-flight→write
+    ///   window but is not an OS file lock (see `guarded_atomic_write_file`).
+    #[tokio::test]
+    async fn symforge_edit_if_match_rejected_after_concurrent_disk_change() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let file_path = dir.path().join("src/lib.rs");
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        // A concurrent writer lands inside the guarded window: overwrite the
+        // file with a third, divergent body. Captured path keeps the closure
+        // `'static`. The guard drops at end of scope, uninstalling the hook.
+        let concurrent_body = "fn target() { concurrent_change }\n";
+        let race_path = file_path.clone();
+        let _hook = crate::protocol::edit::install_write_interleave_hook(move || {
+            std::fs::write(&race_path, concurrent_body)
+                .expect("concurrent writer should overwrite target");
+        });
+
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            // if_match is the body the agent last saw (the original) — it
+            // matched at pre-flight, then the on-disk body diverged.
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        };
+
+        let result = server
+            .symforge_edit_facade_tool(Parameters(request))
+            .await
+            .expect("symforge_edit dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let output = tool_result_text(&serialized);
+
+        // Rejected: failed write mode, never a successful guarded apply.
+        assert!(
+            output.contains("guarded apply rejected"),
+            "expected guarded-apply rejection:\n{output}"
+        );
+        assert!(
+            !output.contains("Write semantics: atomic write + reindex"),
+            "rejected apply must NOT report a committed write:\n{output}"
+        );
+        // FR-010: outcome must not be Found (no false success).
+        assert_ne!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::Found.as_str()),
+            "rejected guarded apply must not classify as Found:\n{output}"
+        );
+        // Ledger must not record a committed write.
+        let ledger_line = output
+            .lines()
+            .find(|line| line.starts_with("ledger: "))
+            .expect("ledger line present");
+        let ledger: crate::stel::LedgerEnvelopeMeta =
+            serde_json::from_str(ledger_line.trim_start_matches("ledger: ")).expect("ledger json");
+        assert!(
+            !ledger.legacy_executed,
+            "rejected guarded apply must not record legacy_executed:\n{output}"
+        );
+
+        // US3 AC-1: the divergent on-disk content is left intact — the
+        // concurrent change survives, the agent's stale edit never landed.
+        let on_disk = std::fs::read_to_string(&file_path).expect("read file after reject");
+        assert_eq!(
+            on_disk, concurrent_body,
+            "the concurrent change must be preserved (no silent clobber)"
+        );
+        assert!(
+            !on_disk.contains("agent_edit"),
+            "the agent's stale edit must NOT have been written:\n{on_disk}"
+        );
+    }
+
+    /// Negative control for T022: the identical guarded-apply flow with NO
+    /// concurrent change succeeds and the result matches the requested edit.
+    #[tokio::test]
+    async fn symforge_edit_if_match_succeeds_without_concurrent_change() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let file_path = dir.path().join("src/lib.rs");
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        // No interleave hook installed: the on-disk body never diverges.
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        };
+
+        let result = server
+            .symforge_edit_facade_tool(Parameters(request))
+            .await
+            .expect("symforge_edit dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let output = tool_result_text(&serialized);
+
+        assert!(
+            output.contains("Write semantics: atomic write + reindex"),
+            "negative control must commit the write:\n{output}"
+        );
+        assert!(
+            !output.contains("guarded apply rejected"),
+            "negative control must not be rejected:\n{output}"
+        );
+        let on_disk = std::fs::read_to_string(&file_path).expect("read file after apply");
+        assert!(
+            on_disk.contains("agent_edit"),
+            "negative control must apply the requested edit:\n{on_disk}"
+        );
+        assert!(
+            !on_disk.contains("old"),
+            "negative control must replace the old body:\n{on_disk}"
+        );
+    }
 }

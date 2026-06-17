@@ -115,6 +115,15 @@ pub fn format_already_applied_body(resolved: &ResolvedEditSymbol) -> String {
     )
 }
 
+/// PRE-FLIGHT index-vs-disk consistency check only (N-6, TR-06 boundary).
+///
+/// This confirms the index snapshot still matches disk at pre-flight time,
+/// under the `index.read()` guard in [`run_pre_apply_gates`]. It is NOT the
+/// write-time `if_match` guard: the read lock is released long before the
+/// actual splice + write, so this check alone leaves a TOCTOU window. The
+/// real optimistic-concurrency guarantee is the write-time re-read in
+/// `protocol::edit::guarded_atomic_write_file`, which re-verifies the bytes
+/// actually being written. Do not advertise this function as a write guard.
 fn verify_index_matches_disk(
     file: &IndexedFile,
     abs_path: &Path,

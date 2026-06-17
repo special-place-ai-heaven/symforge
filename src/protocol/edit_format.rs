@@ -1,3 +1,14 @@
+/// Failed-apply sentinel emitted on a committed-write failure (`apply:true`).
+///
+/// This is the single source of truth for the token coupling the PRODUCERS of
+/// a failed apply (`stel::edit_apply::format_apply_metadata` with
+/// `write_mode = "failed"`, and the guarded-apply rejection in
+/// `protocol::edit_tools`) to the CONSUMER that classifies honesty outcomes
+/// ([`symforge_edit_internal_failure`] -> `OutcomeClass::InternalFailure`).
+/// Centralized so the classification is not coupled by a loose string literal
+/// duplicated across files. The exact wording/behavior is unchanged.
+pub(crate) const WRITE_MODE_FAILED_SENTINEL: &str = "Write mode: failed";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EditSafetyMode {
     StructuralEditSafe,
@@ -269,7 +280,8 @@ pub(crate) fn symforge_edit_internal_failure(
         return true;
     }
     apply
-        && (full_body.contains("Write mode: failed") || tool_body.contains(": edit safety blocked"))
+        && (full_body.contains(WRITE_MODE_FAILED_SENTINEL)
+            || tool_body.contains(": edit safety blocked"))
 }
 
 #[cfg(test)]

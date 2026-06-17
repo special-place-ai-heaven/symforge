@@ -673,8 +673,46 @@ impl SymForgeServer {
         let indented = edit::apply_indentation(normalized_str, &indent, line_ending);
         let new_content =
             edit::apply_splice(&file.content, (line_start, sym.byte_range.1), &indented);
-        let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
-            Ok(report) => report,
+        // TR-06 / FR-009 (design D1): re-verify the `if_match` guard against the
+        // bytes ACTUALLY on disk, in the same per-path-locked critical section
+        // as the write. `file.content` is the exact base the splice in
+        // `new_content` was computed against (the index snapshot for a
+        // pass-through edit, or the rebased worktree target). If the caller
+        // supplied `if_match` and the on-disk bytes diverged from that base
+        // after their read, a concurrent writer changed the file: reject without
+        // writing so the concurrent change is preserved — and report a failed
+        // guarded apply, never a success (FR-010). The kept STEL pre-flight
+        // (`run_pre_apply_gates`) still fails fast; THIS is the actual guarantee
+        // at the write.
+        //
+        // EXACT-BYTE comparison (`base == disk`) is correct here ONLY because
+        // the compact `if_match` path never reroutes: `StelEditRequest` carries
+        // no `working_directory`, so `resolved_path` is always the indexed file
+        // and `file.content` is its exact (line-ending-preserving) bytes. If
+        // `if_match` is ever plumbed through a worktree reroute, the base would
+        // be a rebased target whose line endings may differ, and this guard MUST
+        // then reconcile with `edit::line_ending_insensitive_eq` like
+        // `guard_batch_reroute_divergence` does — an exact-byte compare would
+        // spuriously reject on a pure CRLF/LF difference.
+        let write_report = match edit::guarded_atomic_write_file(
+            &resolved_path,
+            &file.content,
+            &new_content,
+            params.0.if_match.as_deref(),
+        ) {
+            Ok(edit::GuardedWriteOutcome::Written(report)) => report,
+            Ok(edit::GuardedWriteOutcome::Rejected) => {
+                let output = format!(
+                    "{} — guarded apply rejected: on-disk body of `{}` in {} \
+                     changed since if_match was captured; the concurrent change was left intact \
+                     and nothing was written. Re-read the symbol and retry.",
+                    edit_format::WRITE_MODE_FAILED_SENTINEL,
+                    params.0.name,
+                    params.0.path
+                );
+                fail_mutation_replay(&idempotency, &output);
+                return output;
+            }
             Err(e) => {
                 let output = format!("Error writing {}: {e}", params.0.path);
                 fail_mutation_replay(&idempotency, &output);
@@ -1453,6 +1491,15 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn batch_edit(&self, params: Parameters<edit::BatchEditInput>) -> String {
+        // N-6 (TR-06 boundary): the batch path carries NO `if_match`
+        // optimistic-concurrency guard. `BatchEditInput` has no `if_match`
+        // field and this executor performs no write-time guard re-read, so it
+        // has the same TOCTOU window the single-symbol path closes. This is
+        // intentionally NOT plumbed here (single-symbol fix lands first); if
+        // `if_match` is ever extended to batch, it MUST re-verify at the write
+        // like `guarded_atomic_write_file`, never become a silent false-safety
+        // control. `guard_batch_reroute_divergence` (edit.rs) is a separate,
+        // reroute-only divergence check — not an `if_match` write guard.
         if let Some(result) = self.proxy_tool_call("batch_edit", &params.0).await {
             return result;
         }
@@ -1550,6 +1597,9 @@ impl SymForgeServer {
         )
     )]
     pub(crate) async fn batch_rename(&self, params: Parameters<edit::BatchRenameInput>) -> String {
+        // N-6 (TR-06 boundary): no `if_match` guard on the batch path (same
+        // TOCTOU window as batch_edit if extended). See the note on
+        // `batch_edit`. Not plumbed here by design.
         if let Some(result) = self.proxy_tool_call("batch_rename", &params.0).await {
             return result;
         }
@@ -1651,6 +1701,9 @@ impl SymForgeServer {
     }
 
     pub(crate) async fn batch_insert(&self, params: Parameters<edit::BatchInsertInput>) -> String {
+        // N-6 (TR-06 boundary): no `if_match` guard on the batch path (same
+        // TOCTOU window as batch_edit if extended). See the note on
+        // `batch_edit`. Not plumbed here by design.
         if let Some(result) = self.proxy_tool_call("batch_insert", &params.0).await {
             return result;
         }

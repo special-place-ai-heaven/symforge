@@ -149,17 +149,17 @@ intact, no false "guarded apply succeeded"; negative control succeeds.
 
 ### Tests for User Story 3
 
-- [ ] T022 [P] [US3] Add the named regression `symforge_edit_if_match_rejected_after_concurrent_disk_change` in `tests/edit_safety.rs` using a **deterministic injected interleave point** (test hook between guard-read and write, NOT a sleep) (TR-06, SC-003); include the negative control.
+- [X] T022 [P] [US3] deterministic injected-interleave regression `symforge_edit_if_match_rejected_after_concurrent_disk_change` (+ negative control) — DONE; proven to fail pre-fix (worktree test). PLUS a REAL two-thread concurrency regression `symforge_edit_concurrent_same_file_apply_never_clobbers` (200 rounds, Barrier-aligned) + distinct-files control — the actual US3 AC-1 proof, fails without the per-path lock.
 
 ### Implementation for User Story 3
 
-- [ ] T023 [US3] Add an `if_match` field to `ReplaceSymbolBodyInput` in `src/protocol/edit_tools.rs` (~570-676) (TR-06).
-- [ ] T024 [US3] Thread `if_match` through the edit planner so it is not dropped in `src/protocol/edit_planner.rs` (~72) (TR-06).
-- [ ] T025 [US3] Re-verify the guard against the bytes actually written, in the same critical section as the splice + `atomic_write`; reject on divergence in `src/protocol/edit_apply.rs` (~73-91) and `src/protocol/edit.rs` (~1160) (FR-009, D1).
-- [ ] T026 [P] [US3] Honest response + N-6 boundary: claim a guarded apply only when enforced at write; mark the batch path "no if_match (same TOCTOU if extended)" and keep `verify_index_matches_disk` labeled pre-flight-only (FR-010, N-6); ensure the tee backup is not called transactional rollback.
-- [ ] T027 [US3] Run the per-phase gate; confirm T022 passes (both reject + negative control). Commit Phase C.
+- [X] T023 [US3] `if_match: Option<String>` `#[serde(default)]` on `ReplaceSymbolBodyInput` (edit.rs) — DONE.
+- [X] T024 [US3] `build_edit_plan` forwards `if_match` into plan args (edit_planner.rs) + unit tests — DONE (was dropped before).
+- [X] T025 [US3] `guarded_atomic_write_file` re-verifies on-disk bytes vs base + rejects, under a **process-global per-path mutex** (canonical-path key) spanning re-read→rename so concurrent in-process writers serialize (BLOCKER fix) — DONE (FR-009, D1).
+- [X] T026 [P] [US3] rejection returns `Write mode: failed` → InternalFailure/legacy_executed=false (no false success, FR-010); `REJECTION` sentinel const shared producer↔classifier; N-6 batch comments + `verify_index_matches_disk` pre-flight-only doc; tee never called rollback — DONE.
+- [X] T027 [US3] full gate green; code-reviewer (logic: SHIP) + security-reviewer (found concurrency BLOCKER) → fixed (per-path lock) + re-verified; should-fixes (symlink TOCTOU, value-vs-flag doc, CRLF/reroute note) + nits done. Commit Phase C.
 
-**Checkpoint**: US1+US2+US3 — the three real-bug/keystone P1s done.
+**Checkpoint**: US1+US2+US3 — the three real-bug/keystone P1s done. ✅ Residual (honest): per-path lock serializes in-process writers; external OS editor + Windows transient rename-denial documented.
 
 ---
 

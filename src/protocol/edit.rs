@@ -174,6 +174,184 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8]) -> std::io::Result<
     Ok(AtomicWriteReport { tee_snapshot })
 }
 
+/// Outcome of a write-time `if_match` guard check (TR-06 / FR-009).
+///
+/// `Rejected` means the on-disk bytes diverged from the base the splice was
+/// computed against AFTER the caller's read, so the guarded apply is refused
+/// and NOTHING is written — the divergent on-disk content is left intact.
+pub(crate) enum GuardedWriteOutcome {
+    /// The write committed; carries the atomic-write report for the response.
+    Written(AtomicWriteReport),
+    /// The guard rejected the write; the on-disk content is unchanged.
+    Rejected,
+}
+
+/// Test-only interleave hook for the TR-06 regression test.
+///
+/// Installed by the concurrent-change test to simulate a writer that lands
+/// inside the guarded window: it fires INSIDE [`guarded_atomic_write_file`],
+/// strictly BEFORE the write-time on-disk re-read, so the subsequent re-read
+/// observes the injected divergence deterministically (no sleep, no extra
+/// thread). It is compiled out of release builds.
+#[cfg(test)]
+mod write_interleave {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard that uninstalls the hook on drop so tests cannot leak it
+    /// across the thread-local into a sibling test on the same thread.
+    pub(crate) struct InterleaveGuard;
+
+    impl Drop for InterleaveGuard {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Install a callback fired at the next guarded-write interleave point.
+    ///
+    /// The hook is consumed on first fire (see [`fire`]), so it runs at most
+    /// once per `install` — a second guarded write on the same thread does not
+    /// re-trigger it. This keeps the T022 interleave deterministic: exactly one
+    /// simulated concurrent write lands in the guarded window.
+    pub(crate) fn install(hook: impl Fn() + 'static) -> InterleaveGuard {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        InterleaveGuard
+    }
+
+    /// Fire the installed hook if one is present, consuming it so it fires at
+    /// most once. Called from the guarded write path before the on-disk
+    /// re-read. `take()` removes the hook before invoking it so a re-entrant or
+    /// subsequent guarded write does not fire it again.
+    pub(crate) fn fire() {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use write_interleave::install as install_write_interleave_hook;
+
+/// Process-global registry of per-path write locks (TR-06 / FR-009, design D1).
+///
+/// Each distinct target file maps to one `Arc<Mutex<()>>`; [`lock_for_path`]
+/// hands out the same mutex for every write to that path so the
+/// re-read → rename critical section in [`guarded_atomic_write_file`] is
+/// serialized PER FILE — unrelated files never contend. `std::sync::Mutex` is
+/// deliberate: the guarded write runs in sync / `spawn_blocking` context and
+/// holds NO `.await` across the lock, so a tokio mutex would be both wrong
+/// (cannot be held across the blocking rename without an async runtime) and
+/// unnecessary.
+///
+/// Memory: the map is never evicted. It is keyed by canonical path, so its
+/// size is bounded by the number of distinct files ever written in the
+/// process — i.e. the repo's file count. That is acceptable; deliberately not
+/// GC'd to keep the lock identity stable for the process lifetime.
+static PATH_WRITE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+/// Return the process-global write lock for `key`, creating it on first use.
+///
+/// `key` MUST be a canonicalized path (see [`guarded_atomic_write_file`]) so
+/// symlink / relative / `.`-segment variants of the same file all map to a
+/// single lock and cannot race each other.
+fn lock_for_path(key: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let map =
+        PATH_WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().expect("path write-lock map poisoned");
+    std::sync::Arc::clone(
+        guard
+            .entry(key.to_path_buf())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(()))),
+    )
+}
+
+/// Atomic write with a write-time `if_match` optimistic-concurrency guard
+/// (TR-06 / FR-009, design D1).
+///
+/// `base` is the exact byte image the splice in `new_content` was computed
+/// against (the index snapshot, or the rebased worktree target). The entire
+/// re-read → rename critical section runs under a process-global per-path
+/// mutex ([`lock_for_path`], keyed by the canonical path), so two in-process
+/// writers targeting the SAME file are serialized: the second blocks until the
+/// first's rename commits, then — if it supplied `if_match` — its re-read sees
+/// the first's committed bytes (`on_disk != base`) and the apply is REJECTED
+/// with no write, preserving the concurrent change (US3 AC-1).
+///
+/// The per-path lock is taken for EVERY write through this function, including
+/// the `if_match: None` case. That is intentional: if an unguarded write could
+/// slip between a guarded writer's re-read and its rename, the guarded writer
+/// would still clobber it. The re-read/compare itself stays gated on
+/// `if_match.is_some()` (an unguarded write keeps today's last-writer-wins
+/// semantics), but the LOCK is unconditional so the critical section is never
+/// interleaved by another in-process write to the same path.
+///
+/// HONESTY / SCOPE: the per-path mutex serializes ALL in-process writes to a
+/// given path, so two concurrent same-file applies through SymForge cannot
+/// clobber each other. It is NOT an OS-level file lock: a truly external,
+/// non-SymForge process writing the file between the re-read and the rename is
+/// outside this lock and is not serialized by it. For SymForge's own
+/// multi-agent workflow — every writer funnels through the same in-process
+/// server — the clobber is closed on every surface (in-process facade, daemon,
+/// serve). The residual is the external-editor case only.
+pub(crate) fn guarded_atomic_write_file(
+    path: &Path,
+    base: &[u8],
+    new_content: &[u8],
+    if_match: Option<&str>,
+) -> std::io::Result<GuardedWriteOutcome> {
+    // Pin the path once: canonicalize so symlink / relative variants resolve to
+    // the same lock key AND so the re-read and the write operate on the same
+    // resolved path (mitigates symlink TOCTOU on the re-read). Fall back to the
+    // caller's path if canonicalize fails (e.g. parent dir not yet canonical on
+    // some platforms); the lock map then keys on the non-canonical path, which
+    // is still consistent within the process for that exact path value.
+    // Symlink assumption: the canonical key collapses symlink aliases to one
+    // lock, so concurrent SymForge writers cannot race through different aliases
+    // of the same file.
+    let pinned = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    // Acquire the per-path lock and HOLD it across BOTH the on-disk re-read and
+    // the atomic rename. `_write_lock` lives to the end of the function, so the
+    // whole critical section is serialized against any other in-process write to
+    // this path. No `.await` exists in this function — the std mutex is correct.
+    let lock = lock_for_path(&pinned);
+    let _write_lock = lock.lock().expect("per-path write lock poisoned");
+
+    // Deterministic test interleave point: a concurrent writer "lands" here,
+    // strictly before the on-disk re-read below (no-op in release). It fires
+    // INSIDE the lock by design — the T022 hook simulates a writer that already
+    // committed before this writer entered the critical section.
+    #[cfg(test)]
+    write_interleave::fire();
+
+    if if_match.is_some() {
+        // Re-read the bytes actually on disk right now and compare to the
+        // base image the splice was computed against. Divergence => a writer
+        // changed the file after the caller's read; reject without writing.
+        // Re-read via the pinned (canonical) path so we compare the same file
+        // we are about to write.
+        match std::fs::read(&pinned) {
+            Ok(on_disk) => {
+                if on_disk.as_slice() != base {
+                    return Ok(GuardedWriteOutcome::Rejected);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    atomic_write_file(path, new_content).map(GuardedWriteOutcome::Written)
+}
+
 pub(crate) fn format_tee_snapshot_suffix(report: &AtomicWriteReport) -> String {
     report
         .tee_snapshot
@@ -1180,6 +1358,22 @@ pub struct ReplaceSymbolBodyInput {
     /// Optional replay guard for committed mutations. Dry runs do not reserve or replay.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Optimistic-concurrency guard (TR-06 / FR-009). Threaded from
+    /// `StelEditRequest.if_match` through the edit planner.
+    ///
+    /// At THIS (write) layer the field is a PRESENCE-triggered change-detection
+    /// guard, NOT a value comparison: the write path does not compare this
+    /// STRING against anything. Its presence (`Some`) turns on the write-time
+    /// re-read in `guarded_atomic_write_file`, which compares the whole-file
+    /// `base` (the bytes the splice was computed against) to the bytes actually
+    /// on disk and rejects the apply on divergence. The VALUE match
+    /// (`if_match == current_symbol_body`) is the STEL pre-flight's
+    /// responsibility (`run_pre_apply_gates`); `base == disk` is the stronger
+    /// splice-integrity invariant enforced here. On divergence the apply is
+    /// rejected without writing — a concurrent change between the caller's read
+    /// and this write is never silently clobbered.
+    #[serde(default)]
+    pub if_match: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the
     /// `worktree-awareness` feature hook to redirect the write into the
     /// matching git worktree. Omit to preserve today's behaviour (write to
@@ -5777,5 +5971,205 @@ fn uses_it() { Widget::default(); }
         // Empty body — nothing to detect.
         assert!(!body_starts_with_doc_comment(""));
         assert!(!body_starts_with_doc_comment("\n\n   \n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TR-06 / FR-009 / US3 AC-1 — REAL concurrency regression (the BLOCKER).
+    //
+    // Two real OS threads each perform a guarded write (`if_match` set) to the
+    // SAME file, from the same `base`, racing — aligned by a `Barrier` (never a
+    // sleep). The per-path mutex in `guarded_atomic_write_file` serializes their
+    // re-read → rename critical section, so the loser's re-read observes the
+    // winner's committed bytes (`on_disk != base`) and is REJECTED with no
+    // write. The invariant proved here, and the thing that DISTINGUISHES the
+    // locked build from the unlocked one, is:
+    //
+    //   * NEVER two committed writes in a round (no clobber), and
+    //   * the on-disk file is always a WHOLE writer's body (the single winner's
+    //     edit, or `base` if the winner's rename transiently failed) — never a
+    //     torn mix, and never a REJECTED writer's body (no false success).
+    //
+    // WITHOUT the per-path lock this test FAILS: both threads read `base ==
+    // disk` (PASS) and both rename, so BOTH return `Written` — a double-commit /
+    // silent clobber (the exact TR-06 bug). Verified by temporarily disabling
+    // the lock (`double_commits > 0` in that build). With the lock, a round has
+    // at most one `Written` and zero double-commits across all rounds.
+    //
+    // WINDOWS NOTE: `tempfile::persist` (MoveFileExW + MOVEFILE_REPLACE_EXISTING)
+    // can transiently return ERROR_ACCESS_DENIED when two threads rename over
+    // the same target back-to-back, EVEN when fully serialized — the OS briefly
+    // holds the just-replaced target handle. That is an OS-level write failure,
+    // NOT a clobber: the writer that hit it committed NOTHING. The test treats
+    // an `Err` as a no-commit outcome (so it is robust on Windows) and still
+    // asserts the real safety invariant: at most one commit, no torn file, no
+    // false success. The loser-rejected count is also asserted to be > 0 across
+    // the run, proving the lock is actually forcing rejections (not merely that
+    // renames happen to fail).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn symforge_edit_concurrent_same_file_apply_never_clobbers() {
+        use std::sync::{Arc, Barrier};
+
+        enum WriterResult {
+            Committed,
+            Rejected,
+            /// OS-level write failure (e.g. Windows transient rename denial).
+            /// NOT a clobber — nothing was written by this writer.
+            WriteErr,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended.rs");
+
+        let base = b"fn target() { base }\n".to_vec();
+        let body_a = b"fn target() { writer_a }\n".to_vec();
+        let body_b = b"fn target() { writer_b }\n".to_vec();
+
+        const ROUNDS: usize = 200;
+
+        // Aggregate evidence across the whole run.
+        let mut double_commits = 0usize; // must stay 0 with the lock
+        let mut rejections = 0usize; // must be > 0 — proves the lock forces rejects
+
+        for round in 0..ROUNDS {
+            // Reset to the shared base so both writers race from the same image.
+            std::fs::write(&path, &base).expect("reset to base");
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let spawn_writer = |new_content: Vec<u8>| {
+                let path = path.clone();
+                let base = base.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Align both threads immediately before entering the guarded
+                    // write so the re-read/rename windows overlap maximally.
+                    barrier.wait();
+                    match guarded_atomic_write_file(&path, &base, &new_content, Some("guard")) {
+                        Ok(GuardedWriteOutcome::Written(_)) => WriterResult::Committed,
+                        Ok(GuardedWriteOutcome::Rejected) => WriterResult::Rejected,
+                        Err(_) => WriterResult::WriteErr,
+                    }
+                })
+            };
+
+            let handle_a = spawn_writer(body_a.clone());
+            let handle_b = spawn_writer(body_b.clone());
+
+            let result_a = handle_a.join().expect("writer A thread panicked");
+            let result_b = handle_b.join().expect("writer B thread panicked");
+
+            let committed_a = matches!(result_a, WriterResult::Committed);
+            let committed_b = matches!(result_b, WriterResult::Committed);
+            let rejected_a = matches!(result_a, WriterResult::Rejected);
+            let rejected_b = matches!(result_b, WriterResult::Rejected);
+
+            // CORE SAFETY INVARIANT (fails WITHOUT the lock): never two commits
+            // in a round. Two `Committed` is the TR-06 silent clobber.
+            if committed_a && committed_b {
+                double_commits += 1;
+            }
+            assert!(
+                !(committed_a && committed_b),
+                "round {round}: both writers committed — TR-06 clobber (the lock is not \
+                 serializing the re-read → rename critical section)"
+            );
+
+            rejections += usize::from(rejected_a) + usize::from(rejected_b);
+
+            // The on-disk file is always a WHOLE writer's body, never torn and
+            // never a REJECTED writer's body (no false success). It equals the
+            // single committed writer's body, or `base` if neither committed
+            // (both transiently failed — a no-op, not a clobber).
+            let on_disk = std::fs::read(&path).expect("read final on-disk content");
+            let expected_winner: Option<&Vec<u8>> = if committed_a {
+                Some(&body_a)
+            } else if committed_b {
+                Some(&body_b)
+            } else {
+                None
+            };
+            match expected_winner {
+                Some(winner) => {
+                    assert_eq!(
+                        on_disk, *winner,
+                        "round {round}: on-disk content must equal the single committed \
+                         writer's edit verbatim (no torn file)"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        on_disk, base,
+                        "round {round}: with no commit, on-disk must remain the base"
+                    );
+                }
+            }
+            // A rejected writer's body must NEVER be on disk.
+            if rejected_a {
+                assert_ne!(
+                    on_disk, body_a,
+                    "round {round}: writer A was rejected — its body must not be on disk"
+                );
+            }
+            if rejected_b {
+                assert_ne!(
+                    on_disk, body_b,
+                    "round {round}: writer B was rejected — its body must not be on disk"
+                );
+            }
+        }
+
+        assert_eq!(
+            double_commits, 0,
+            "no round may double-commit; saw {double_commits} clobbers (the per-path lock \
+             is the only thing preventing this)"
+        );
+        // The lock must actually be forcing the loser to reject on a real race.
+        // If renames merely failed instead of serializing, rejections would be 0.
+        assert!(
+            rejections > 0,
+            "expected the per-path lock to force at least one loser rejection across \
+             {ROUNDS} rounds; saw 0 (the race may not be contending)"
+        );
+    }
+
+    // Negative control: distinct files never contend, so two guarded writes to
+    // DIFFERENT paths both commit — the per-path lock keys on the file, it is
+    // not a global write bottleneck.
+    #[test]
+    fn guarded_writes_to_distinct_files_both_commit() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.rs");
+        let path_b = dir.path().join("b.rs");
+        let base = b"fn t() { base }\n".to_vec();
+        std::fs::write(&path_a, &base).unwrap();
+        std::fs::write(&path_b, &base).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |path: std::path::PathBuf, body: Vec<u8>| {
+            let base = base.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                guarded_atomic_write_file(&path, &base, &body, Some("guard"))
+                    .expect("guarded write must not error")
+            })
+        };
+
+        let h_a = spawn(path_a.clone(), b"fn t() { a }\n".to_vec());
+        let h_b = spawn(path_b.clone(), b"fn t() { b }\n".to_vec());
+        let out_a = h_a.join().unwrap();
+        let out_b = h_b.join().unwrap();
+
+        assert!(
+            matches!(out_a, GuardedWriteOutcome::Written(_)),
+            "distinct-file write A must commit"
+        );
+        assert!(
+            matches!(out_b, GuardedWriteOutcome::Written(_)),
+            "distinct-file write B must commit"
+        );
     }
 }
