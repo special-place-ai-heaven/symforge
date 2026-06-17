@@ -3531,7 +3531,11 @@ impl SymForgeServer {
                             "search_text (find text/patterns)",
                             "diff_symbols (review changes)",
                         ]);
-                        format!("{result}{hint}")
+                        let doctrine = "\nDoctrine: the map orients; the tools prove. \
+                             Completeness: ranked and truncated by result cap - absence \
+                             from the map is not absence from the repo; confirm with \
+                             search_symbols / search_text before concluding something is missing.";
+                        format!("{result}{hint}{doctrine}")
                     }
                     Err(StatusCode::NOT_FOUND) => "Repository map unavailable.".to_string(),
                     Err(StatusCode::INTERNAL_SERVER_ERROR) => {
@@ -5304,6 +5308,105 @@ impl SymForgeServer {
         // tools via EditHook). See wiki `[[SymForge Frecency-Weighted File
         // Ranking]]` §"Search tools deliberately do NOT bump".
         result
+    }
+
+    /// Resolve the co-change anchor for a fused-find `search_files` step.
+    ///
+    /// US4 find fusion: the STEL planner is index-free, so it emits the
+    /// `search_files` path step with `rank_by="path+cochange"` but NO
+    /// `anchor_path`. Anchor resolution belongs where the index lives — here.
+    ///
+    /// The path matcher reads a multi-word query as `component…/basename`, so a
+    /// fuzzy bag of words whose trailing token is not a file basename (e.g.
+    /// `"stel planner find"`) yields no path candidates. To stay robust to token
+    /// order we try the full query first, then each individual token, and take
+    /// the first top Tier-1 path hit. `search_files`'s own
+    /// `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate still decides whether
+    /// the boost applies, so a weak anchor degrades to pure path ranking with no
+    /// special-casing. Returns `None` when nothing path-like matches.
+    ///
+    /// Reads only the index path view (never `get_*`), so this stays on the
+    /// frecency-neutral discovery surface.
+    pub(crate) fn resolve_find_fusion_cochange_anchor(&self, query: &str) -> Option<String> {
+        let guard = self.index.read();
+        let top_hit = |q: &str| -> Option<String> {
+            match guard.capture_search_files_view(q, 5, None, None) {
+                SearchFilesView::Found { hits, .. } => hits
+                    .into_iter()
+                    .find(|hit| hit.tier != SearchFilesTier::MetadataOnly)
+                    .map(|hit| hit.path),
+                _ => None,
+            }
+        };
+        if let Some(hit) = top_hit(query) {
+            return Some(hit);
+        }
+        query
+            .split_whitespace()
+            .filter(|tok| tok.chars().any(char::is_alphanumeric))
+            .find_map(top_hit)
+    }
+
+    /// Inject the resolved co-change anchor into a fused-find `search_files` step.
+    ///
+    /// Recognizes the find-fusion path step by its exact emitted shape
+    /// (`tool == "search_files"` AND `rank_by == "path+cochange"` AND no
+    /// `anchor_path`) — the only planner route that emits that shape.
+    ///
+    /// When an anchor resolves, the path step is retargeted to that anchor:
+    /// `query` becomes the anchor path and `anchor_path` is set, so the path
+    /// side surfaces the best-matching file PLUS its boosted co-change partners
+    /// (the broad multi-file listing is already carried by the fusion's
+    /// `search_text` step). The `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename`
+    /// gate inside `search_files` still decides whether the boost actually
+    /// applies. When no anchor resolves, `rank_by` is dropped so the step runs
+    /// as plain path ranking on the original query (graceful
+    /// co-change-unavailable degradation). Every other step is unchanged.
+    fn inject_find_fusion_cochange_anchor(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> serde_json::Value {
+        let is_fusion_path_step = tool == "search_files"
+            && args.get("rank_by").and_then(serde_json::Value::as_str) == Some("path+cochange")
+            && args.get("anchor_path").is_none();
+        if !is_fusion_path_step {
+            return args.clone();
+        }
+        let query = args
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let mut args = args.clone();
+        let Some(map) = args.as_object_mut() else {
+            return args;
+        };
+        match self.resolve_find_fusion_cochange_anchor(query) {
+            Some(anchor) => {
+                // Retarget the path side to the anchor's basename STEM. The stem
+                // names the anchor's own basename, so the anchor clears the
+                // `CO_CHANGE_ANCHOR_CONFIDENCE_FLOOR=basename` gate (via the
+                // SF-006 stem-equals-basename anchor promotion), while files
+                // that share the stem prefix (a common co-change-partner naming
+                // pattern) remain candidates the boost can promote. Falls back
+                // to the full anchor path when it has no usable stem.
+                let path_query = std::path::Path::new(&anchor)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| stem.len() >= 3)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| anchor.clone());
+                map.insert("query".to_string(), serde_json::Value::String(path_query));
+                map.insert("anchor_path".to_string(), serde_json::Value::String(anchor));
+            }
+            None => {
+                // No path-like anchor → pure path ranking on the original query.
+                // Drop the co-change request so search_files does not emit a
+                // fallback-evidence note for a speculative request.
+                map.remove("rank_by");
+            }
+        }
+        args
     }
 
     fn project_id_for_root(root: &Path) -> String {
@@ -7919,7 +8022,8 @@ impl SymForgeServer {
         }
         let guard = self.index.read();
         loading_guard!(guard);
-        let output = crate::protocol::edit_plan::plan_edit(&guard, &params.0.target);
+        let temporal = self.index.git_temporal();
+        let output = crate::protocol::edit_plan::plan_edit(&guard, &temporal, &params.0.target);
         self.session_context.record_summary_output(
             "edit_plan",
             (output.len() / 4).min(u32::MAX as usize) as u32,
@@ -8077,22 +8181,38 @@ impl SymForgeServer {
             plan.clone()
         };
 
+        // US4 find fusion is a UNION of independent surfaces (path + name), not
+        // a dependent chain: an empty surface (NotFound/EmptyResult) is a valid
+        // partial result, not a fatal failure. For fusion plans we therefore
+        // only abort on a genuine error (InternalFailure/InvalidRequest); a
+        // dependent chain keeps its existing fail-fast on any non-success.
+        let is_fusion_union = crate::stel::is_find_fusion_plan(&exec_plan);
         let mut step_results = Vec::new();
         let mut outcome_class = OutcomeClass::Found;
         let mut chain_failed = false;
         for step in &exec_plan.steps {
-            let tool_body = self
-                .dispatch_tool_for_tests(&step.tool, step.args.clone())
-                .await;
+            // The plan-only planner emits the path step with
+            // `rank_by="path+cochange"` and no anchor (it has no index). Resolve
+            // and inject the co-change anchor here, where the index lives. A
+            // weak/absent anchor degrades to pure path ranking with no error.
+            let step_args = self.inject_find_fusion_cochange_anchor(&step.tool, &step.args);
+            let tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
             step_results.push(ServedStepResult {
                 tool: step.tool.clone(),
                 body: tool_body.clone(),
             });
             if serve_step_failed(&step.tool, &tool_body) {
-                outcome_class =
-                    serve_chain_outcome_class(serve_step_outcome(&step.tool, &tool_body));
-                chain_failed = true;
-                break;
+                let step_outcome = serve_step_outcome(&step.tool, &tool_body);
+                let fatal = !is_fusion_union
+                    || matches!(
+                        step_outcome,
+                        OutcomeClass::InternalFailure | OutcomeClass::InvalidRequest
+                    );
+                if fatal {
+                    outcome_class = serve_chain_outcome_class(step_outcome);
+                    chain_failed = true;
+                    break;
+                }
             }
         }
 
@@ -8106,7 +8226,7 @@ impl SymForgeServer {
         }
 
         let chain_failure_note = chain_failed.then(|| effective_decision.decision_reason.clone());
-        let body = if exec_plan.steps.len() == 1 {
+        let mut body = if exec_plan.steps.len() == 1 {
             format_single_step_serve_body(
                 &plan,
                 &effective_decision,
@@ -8123,6 +8243,20 @@ impl SymForgeServer {
         } else {
             format_multi_step_serve_body(&plan, &effective_decision, &step_results)
         };
+
+        // US5/FR-012: the impact intent plans a single `find_dependents` step
+        // (dependents only). Chain co-change partners into the SAME envelope by
+        // reusing the `analyze_file_impact` co-change flow (`git_temporal()` +
+        // `format::co_changes_result_view`) — no second index, no fork. Only the
+        // single-step success path is augmented; a failed/empty dependents step
+        // keeps its own diagnostics.
+        if plan.intent == crate::stel::IntentBucket::Impact
+            && !chain_failed
+            && exec_plan.steps.len() == 1
+        {
+            self.append_impact_intent_cochanges(&mut body, &exec_plan.steps[0].args);
+        }
+
         let tools = tools_executed(&step_results);
         let route_label = route_tool_label(&tools);
         let tools_called = if tools.len() > 1 { Some(tools) } else { None };
@@ -8141,6 +8275,55 @@ impl SymForgeServer {
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
         statused_tool_result(output, outcome_class)
+    }
+
+    /// Append git co-change partners to the impact-intent envelope.
+    ///
+    /// The impact intent (`symforge intent=impact`) plans a single
+    /// `find_dependents` step, which reports the file dependency graph but no
+    /// co-change data. This chains co-change partners into the SAME response
+    /// envelope using the same sources `analyze_file_impact` uses — the
+    /// lock-free `git_temporal()` snapshot on the shared handle and
+    /// `format::co_changes_result_view` — so dependents and co-changes arrive
+    /// together without a second index or a forked formatter.
+    ///
+    /// Gating mirrors `analyze_file_impact`: when temporal is not `Ready` or the
+    /// path has no git history we surface a short, non-fatal note rather than a
+    /// placeholder block. `args` is the executed `find_dependents` step args,
+    /// whose `path` field is the impact target.
+    fn append_impact_intent_cochanges(&self, body: &mut String, args: &serde_json::Value) {
+        const IMPACT_INTENT_COCHANGE_LIMIT: usize = 5;
+
+        let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
+            return;
+        };
+
+        let temporal = self.index.git_temporal();
+        match temporal.state {
+            crate::live_index::git_temporal::GitTemporalState::Ready => {
+                let normalized = path.replace('\\', "/");
+                match temporal.files.get(&normalized) {
+                    Some(history) => {
+                        body.push_str("\n\n");
+                        body.push_str(&format::co_changes_result_view(
+                            &normalized,
+                            history,
+                            IMPACT_INTENT_COCHANGE_LIMIT,
+                        ));
+                    }
+                    None => {
+                        body.push_str("\n\nNo git co-change data found for this file.");
+                    }
+                }
+            }
+            crate::live_index::git_temporal::GitTemporalState::Pending
+            | crate::live_index::git_temporal::GitTemporalState::Computing => {
+                body.push_str("\n\nGit temporal data is still loading. Co-changes unavailable.");
+            }
+            crate::live_index::git_temporal::GitTemporalState::Unavailable(ref reason) => {
+                body.push_str(&format!("\n\nGit temporal data unavailable: {reason}"));
+            }
+        }
     }
 
     #[tool(

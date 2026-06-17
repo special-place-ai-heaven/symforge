@@ -278,6 +278,25 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
         );
     }
 
+    // --- Multi-term fuzzy find (US4): a bare `find ` verb followed by a
+    // multi-token subject that named no precise symbol/file/kind above (those
+    // precise `find struct …`/`find file …`/`locate …` prefixes were handled
+    // earlier). These are the queries the STEL planner fuses across the path
+    // AND symbol surfaces; classifying them as a code search (a frecency-safe
+    // search_* surface) reaches that fused route instead of falling through to
+    // broad Explore. Requires the explicit find verb, so conceptual queries
+    // like "error handling patterns" (no verb) still classify as Explore. ---
+    if let Some(subject) = strip_prefix_phrase(&lower, &["find "])
+        && is_multi_term_find_subject(subject)
+    {
+        return (
+            QueryIntent::SearchCode {
+                pattern: clean_symbol_name(subject, q),
+            },
+            false,
+        );
+    }
+
     // --- Heuristic: looks like a file path (contains / or common extensions) ---
     if looks_like_path(q) {
         return (
@@ -589,6 +608,22 @@ fn extract_kind_hint(name: &str) -> (Option<String>, &str) {
 /// Preserve original casing from the user's query for the matched portion.
 fn clean_symbol_name(lower_match: &str, original: &str) -> String {
     clean_symbol_and_optional_path(lower_match, original).0
+}
+
+/// True when a bare-`find` subject is multi-term and fuzzy: >= 2 whitespace
+/// tokens and no path/scope syntax. Mirrors the planner's
+/// `is_multi_term_fuzzy_find` gate so smart_query and the STEL planner agree on
+/// which queries fuse across surfaces.
+fn is_multi_term_find_subject(subject: &str) -> bool {
+    let subject = subject.trim();
+    if subject.contains('/') || subject.contains('\\') {
+        return false;
+    }
+    subject
+        .split_whitespace()
+        .filter(|tok| tok.chars().any(char::is_alphanumeric))
+        .count()
+        >= 2
 }
 
 fn clean_symbol_and_optional_path(lower_match: &str, original: &str) -> (String, Option<String>) {
@@ -1089,6 +1124,61 @@ mod tests {
         match classify_intent("error handling patterns") {
             QueryIntent::Explore { query } => assert_eq!(query, "error handling patterns"),
             other => panic!("Expected Explore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_multi_term_find_verb_routes_to_search_code() {
+        // US4: a bare find/locate verb with a multi-token subject that named no
+        // precise symbol/file/kind reaches a frecency-safe search surface
+        // (search_text) — the route the STEL planner fuses — instead of broad
+        // Explore.
+        for (query, expected_pattern) in [
+            ("find stel planner route", "stel planner route"),
+            ("find token economics layer", "token economics layer"),
+        ] {
+            let (intent, matched) = classify_intent_with_match(query);
+            match intent {
+                QueryIntent::SearchCode { pattern } => {
+                    assert_eq!(pattern, expected_pattern, "subject for {query:?}");
+                    assert_eq!(
+                        route_tool_name(&QueryIntent::SearchCode { pattern }),
+                        "search_text"
+                    );
+                }
+                other => panic!("expected SearchCode for {query:?}, got {other:?}"),
+            }
+            // Heuristic, not an explicit single-target phrase.
+            assert!(
+                !matched,
+                "{query:?} should be inferred, not an exact phrase"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_conceptual_multi_word_stays_explore() {
+        // A multi-word query WITHOUT a find/locate verb is conceptual: it must
+        // remain Explore, so the fusion gate never hijacks guidance queries.
+        for query in ["error handling patterns", "how to use the planner"] {
+            match classify_intent(query) {
+                QueryIntent::Explore { .. } => {}
+                other => panic!("expected Explore for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_precise_find_phrases_unchanged_by_multi_term_branch() {
+        // The multi-term branch sits AFTER the precise find prefixes, so
+        // `find struct X` / `find file X` keep their exact routes.
+        match classify_intent("find struct LiveIndex") {
+            QueryIntent::FindSymbol { name, .. } => assert_eq!(name, "LiveIndex"),
+            other => panic!("expected FindSymbol, got {other:?}"),
+        }
+        match classify_intent("find file tools.rs") {
+            QueryIntent::FindFile { hint } => assert_eq!(hint, "tools.rs"),
+            other => panic!("expected FindFile, got {other:?}"),
         }
     }
 

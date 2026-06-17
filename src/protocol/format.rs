@@ -5607,6 +5607,109 @@ pub fn co_changes_result_view(
     lines.join("\n")
 }
 
+/// Compute the impact summary for a just-edited path: the distinct dependent
+/// **file** count and the top-K co-change partner paths.
+///
+/// - Dependents use `capture_find_dependents_view(path).files.len()` — the count
+///   of distinct importing/referencing files (matching the `find_dependents`
+///   tool), NOT the raw per-reference count which double-counts a file that holds
+///   multiple references.
+/// - Co-changes are present only when `temporal.state` is `Ready` and the edited
+///   path has a non-empty strong `co_changes` list; otherwise the returned vector
+///   is empty (degrading the footer to `[impact: N dependents]`). The path is
+///   forward-slash normalized before the temporal lookup to match the temporal
+///   index key space.
+///
+/// `temporal` is passed in (rather than read off `index`) because the git
+/// temporal snapshot lives on the shared index handle, not the `LiveIndex` read
+/// snapshot. The caller (`append_impact_footer`) holds the handle and supplies
+/// both sources.
+pub fn edit_impact_summary(
+    index: &LiveIndex,
+    temporal: &crate::live_index::git_temporal::GitTemporalIndex,
+    path: &str,
+) -> (usize, Vec<String>) {
+    const COCHANGE_LIMIT: usize = 3;
+
+    let deps = index.capture_find_dependents_view(path).files.len();
+
+    let normalized = path.replace('\\', "/");
+    let cochanges = if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready {
+        temporal
+            .files
+            .get(&normalized)
+            .filter(|history| !history.co_changes.is_empty())
+            .map(|history| {
+                history
+                    .co_changes
+                    .iter()
+                    .take(COCHANGE_LIMIT)
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    (deps, cochanges)
+}
+
+/// Substrings that `classify_edit_output` (src/protocol/edit_tools.rs) treats as
+/// failure / dry-run sentinels via `.contains(...)`. The three `_tool` wrappers
+/// re-classify the FULL edit body — footer included — so a co-change partner
+/// path that embeds one of these (e.g. `src/unavailable.rs`) would flip a
+/// successful edit to a failure. Any partner whose path contains one of these is
+/// elided from the footer. Keep in sync with `classify_edit_output`'s `.contains`
+/// checks (only substring checks matter here; `starts_with` sentinels cannot be
+/// triggered by a suffix footer).
+const FOOTER_SENTINEL_SUBSTRINGS: &[&str] = &[
+    "unavailable",
+    "still loading",
+    "no repository root configured",
+    "Write failed",
+    "ROLLBACK INCOMPLETE",
+    "File disappeared:",
+    "byte range",
+    "Session stale",
+    "Ambiguous:",
+    "Symbol not found:",
+    "File not indexed:",
+    "path escapes repo root",
+    "Path containment error",
+    "Path resolution error",
+    "[DRY RUN]",
+    "Write semantics: dry run (no writes)",
+];
+
+/// Render the success-only post-edit impact footer.
+///
+/// `[impact: N dependents]` when `cochanges` is empty, otherwise
+/// `[impact: N dependents · cochanges: a, b, c]` (partners joined with `, `).
+/// The static text avoids every `classify_edit_output` sentinel substring, and
+/// any co-change partner path that would itself embed a sentinel is filtered out
+/// (see `FOOTER_SENTINEL_SUBSTRINGS`) so appending the footer to a successful
+/// edit body can never flip the outcome class.
+pub fn impact_footer(deps: usize, cochanges: &[String]) -> String {
+    let safe: Vec<&str> = cochanges
+        .iter()
+        .map(String::as_str)
+        .filter(|partner| {
+            !FOOTER_SENTINEL_SUBSTRINGS
+                .iter()
+                .any(|sentinel| partner.contains(sentinel))
+        })
+        .collect();
+    if safe.is_empty() {
+        format!("[impact: {deps} dependents]")
+    } else {
+        format!(
+            "[impact: {deps} dependents \u{00b7} cochanges: {}]",
+            safe.join(", ")
+        )
+    }
+}
+
 /// Format symbol-level diff between two git refs.
 pub fn diff_symbols_result_view(
     base: &str,
@@ -5901,6 +6004,35 @@ pub(crate) fn extract_declaration_name(line: &str) -> Option<String> {
 #[cfg(test)]
 mod sfb15_tests {
     use super::*;
+
+    #[test]
+    fn impact_footer_elides_partner_paths_carrying_classifier_sentinels() {
+        // A co-change partner whose path embeds a `classify_edit_output`
+        // `.contains` sentinel (here `unavailable`) must NOT leak into the
+        // footer, or the three `_tool` wrappers would re-classify a successful
+        // destructive edit as a failure.
+        let footer = impact_footer(
+            2,
+            &[
+                "src/unavailable.rs".to_string(),
+                "src/protocol/format.rs".to_string(),
+            ],
+        );
+        assert!(
+            !footer.contains("unavailable"),
+            "footer must not carry a sentinel-bearing partner path: {footer}"
+        );
+        assert!(
+            footer.contains("src/protocol/format.rs"),
+            "safe partner should remain: {footer}"
+        );
+        assert!(footer.starts_with("[impact: 2 dependents"));
+
+        // When every partner is sentinel-bearing, the cochanges clause is
+        // dropped entirely, degrading to the dependents-only form.
+        let all_filtered = impact_footer(3, &["build/unavailable_state.rs".to_string()]);
+        assert_eq!(all_filtered, "[impact: 3 dependents]");
+    }
 
     #[test]
     fn explore_result_view_filters_weak_trivial_symbols_and_doc_only_patterns() {

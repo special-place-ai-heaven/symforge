@@ -461,6 +461,27 @@ impl SymForgeServer {
         None // No capability restriction
     }
 
+    /// Append the success-only post-edit impact footer for `path` to `output`.
+    ///
+    /// Mirrors `append_project_config_trust_suffix`: a single leading newline then
+    /// the footer text. Computes the distinct dependent file count and (when git
+    /// temporal data is `Ready`) the top co-change partners via
+    /// `format::edit_impact_summary`. The dependents come from the read snapshot
+    /// (`self.index.read()` → `&LiveIndex`) and the co-changes from the lock-free
+    /// temporal snapshot on the shared handle (`self.index.git_temporal()`). If the
+    /// index is not `Ready` (loading/empty), nothing is appended — the footer is
+    /// best-effort and never blocks a successful edit response.
+    fn append_impact_footer(&self, output: &mut String, path: &str) {
+        let guard = self.index.read();
+        if !matches!(guard.index_state(), IndexState::Ready) {
+            return;
+        }
+        let temporal = self.index.git_temporal();
+        let (deps, cochanges) = format::edit_impact_summary(&guard, &temporal, path);
+        output.push('\n');
+        output.push_str(&format::impact_footer(deps, &cochanges));
+    }
+
     /// Replace a symbol's entire definition with new source code. The index resolves the symbol's
     /// byte range server-side — no need to read the file first. Content is auto-indented to match
     /// the original symbol's indentation level.
@@ -717,6 +738,7 @@ impl SymForgeServer {
             &resolved_target,
         ));
         append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
+        self.append_impact_footer(&mut result, &params.0.path);
         complete_mutation_replay(&idempotency, &mut result);
         result
     }
@@ -907,6 +929,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        self.append_impact_footer(&mut out, &params.0.path);
         complete_mutation_replay(&idempotency, &mut out);
         out
     }
@@ -1087,6 +1110,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        self.append_impact_footer(&mut out, &params.0.path);
         complete_mutation_replay(&idempotency, &mut out);
         out
     }
@@ -1385,6 +1409,7 @@ impl SymForgeServer {
         ));
         out.push_str(&edit::format_tee_snapshot_suffix(&write_report));
         append_project_config_trust_suffix(&mut out, project_config_trust_suffix.as_deref());
+        self.append_impact_footer(&mut out, &params.0.path);
         complete_mutation_replay(&idempotency, &mut out);
         out
     }
@@ -1500,6 +1525,9 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                if let Some(primary) = params.0.edits.first() {
+                    self.append_impact_footer(&mut result, &primary.path);
+                }
                 complete_mutation_replay(&idempotency, &mut result);
                 result
             }
@@ -1576,6 +1604,7 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                self.append_impact_footer(&mut result, &params.0.path);
                 complete_mutation_replay(&idempotency, &mut result);
                 result
             }
@@ -1684,6 +1713,9 @@ impl SymForgeServer {
                     &mut result,
                     project_config_trust_suffix.as_deref(),
                 );
+                if let Some(primary) = params.0.targets.first() {
+                    self.append_impact_footer(&mut result, &primary.path);
+                }
                 complete_mutation_replay(&idempotency, &mut result);
                 result
             }

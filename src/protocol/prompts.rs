@@ -275,6 +275,8 @@ fn build_architecture_map_instructions(project_name: &str, area: Option<&str>) -
          \n\
          ### Step 1: Get the Big Picture\n\
          - Read the repo map resource (attached) for directory structure and key types\n\
+         - Doctrine: the map orients; the tools prove. Treat the repo map as a ranked starting point, not an inventory.\n\
+         - Absence from the map is not absence from the repo - confirm with `search_symbols` / `search_text` before concluding something is missing.\n\
          - Call `get_repo_map(detail=\"tree\", depth=2)` to see the file tree with symbol counts\n\
          - Identify the top-level modules/crates/packages\n\
          \n\
@@ -352,6 +354,8 @@ fn build_onboard_instructions(project_name: &str, area: Option<&str>) -> String 
          \n\
          ### Step 1: Project Overview (2 minutes)\n\
          - Read the repo map resource (attached) for structure and languages\n\
+         - Doctrine: the map orients; the tools prove. Treat the repo map as a ranked starting point, not an inventory.\n\
+         - Absence from the map is not absence from the repo - confirm with `search_symbols` / `search_text` before concluding something is missing.\n\
          - Call `get_repo_map(detail=\"tree\", depth=2)` to see directory layout\n\
          - Identify: What language? How many modules? What's the entry point?\n\
          \n\
@@ -543,6 +547,44 @@ mod tests {
                     if link.uri.contains("symforge://file/context")
             )),
             "symforge-review prompt should link file context"
+        );
+    }
+
+    #[test]
+    fn test_onboard_instructions_embed_orientation_doctrine() {
+        let body = build_onboard_instructions("prompt_project", None);
+        // Statement 1: the map orients; the tools prove.
+        assert!(
+            body.contains("map orients"),
+            "onboarding instructions must embed the 'map orients' doctrine: {body}"
+        );
+        // Statement 2: absence from the map is not absence from the repo.
+        assert!(
+            body.contains("not absence from the repo"),
+            "onboarding instructions must embed the 'not absence' doctrine: {body}"
+        );
+        assert!(
+            body.contains("search_symbols") && body.contains("search_text"),
+            "onboarding doctrine must point at search_symbols / search_text: {body}"
+        );
+    }
+
+    #[test]
+    fn test_architecture_map_instructions_embed_orientation_doctrine() {
+        let body = build_architecture_map_instructions("prompt_project", None);
+        // Statement 1: the map orients; the tools prove.
+        assert!(
+            body.contains("map orients"),
+            "architecture instructions must embed the 'map orients' doctrine: {body}"
+        );
+        // Statement 2: absence from the map is not absence from the repo.
+        assert!(
+            body.contains("not absence from the repo"),
+            "architecture instructions must embed the 'not absence' doctrine: {body}"
+        );
+        assert!(
+            body.contains("search_symbols") && body.contains("search_text"),
+            "architecture doctrine must point at search_symbols / search_text: {body}"
         );
     }
 }

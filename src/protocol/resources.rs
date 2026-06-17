@@ -561,6 +561,16 @@ mod tests {
             other => panic!("expected text resource, got {other:?}"),
         };
         assert!(text.contains("Index: 1 files, 1 symbols"));
+        // Orientation doctrine must ride the compact map footer into the
+        // symforge://repo/map resource body (delegates to get_repo_map compact).
+        assert!(
+            text.contains("map orients"),
+            "repo map resource must embed the 'map orients' doctrine: {text}"
+        );
+        assert!(
+            text.contains("not absence from the repo"),
+            "repo map resource must embed the 'not absence' doctrine: {text}"
+        );
     }
 
     #[tokio::test]
