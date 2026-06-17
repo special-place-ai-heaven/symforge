@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [7.31.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.30.0...v7.31.0) (2026-06-17)
+
+
+### Features
+
+* **aap:** 008 AAP operator panel + presets (G-044) ([77ee6f9](https://github.com/special-place-ai-heaven/symforge/commit/77ee6f93f94d9adfcd4440a36b6da66a498a60d3))
+* **intelligence:** port four LiveIndex+STEL intelligence patterns ([f7ff882](https://github.com/special-place-ai-heaven/symforge/commit/f7ff8823888ef2d060cf3838d0a5d7f110d11ebc))
+
 ## [7.30.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.29.0...v7.30.0) (2026-06-16)
 
 
