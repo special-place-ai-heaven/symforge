@@ -126,7 +126,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | **A-025** | `symforge_edit` JSON Schema ≤ **1,500 B**; else merge into `symforge` with `intent=edit` | Measured `list_tools` bytes | **OPEN** |
 | **A-026** | **H4** uses **`session_net_accepted`** (accepted serve rows only); `session_net_all36` reported separately | RESULTS.md §8.2 + compare-results.js | **OPEN** |
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |
-| **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **OPEN** (demoted 2026-06-17, TR-13/N-7: false VALIDATED — `expected_equiv` is write-only dead data; golden replay grades route SHAPE only and the "accuracy" tests are tautologies, so the claim "not route shape alone" is not yet true) |
+| **A-028** | Golden rows grade route SHAPE + L2 decision (NOT equivalence) | routes.golden.jsonl schema | **OPEN** (demoted 2026-06-17, TR-13/N-7: false VALIDATED. Resolution 2026-06-17 (010 Phase E): `expected_equiv` was write-only dead data — golden replay grades route SHAPE + L2 decision only, never equivalence — so the field was **removed** from the struct and fixture rather than left implying a measurement that never ran. The claim "not route shape alone" stays OPEN: there is no runtime equivalence oracle; equivalence remains an offline-only signal (A-029 bench), not graded by this corpus. Removal is the honest fix, not a promotion to VALIDATED.) |
 | **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | [`research/A-029-t24-restoration-signoff.md`](research/A-029-t24-restoration-signoff.md) | **VALIDATED** (2/4 equiv post-TX-04; P-T2 **partial** — 2 serve-eligible, 2 bypass-only; 2026-06-15) |
 | **A-031** | Phase 0.12 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-031-rmcp-spike.md` | **OPEN** |
 | **A-032** | Full-file review tasks use policy **P-FF** (bypass, `eligible_h6=false`) | 4 rows in `routes.golden.jsonl` | **OPEN** |
@@ -150,7 +150,7 @@ Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index
 | **A-025** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Edit schema ≤1,500 B |
 | **A-026** | [`research/G-005-compare-results-preflight.md`](research/G-005-compare-results-preflight.md) | **PARTIAL** | H1/H7 in-repo preflight |
 | **A-027** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Harness ÷50 documented as non-product |
-| **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **OPEN** | 36 rows seeded with `expected_equiv`, but the field is write-only and replay grades route SHAPE only (TR-13/N-7) — not equivalence; demoted 2026-06-17 |
+| **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **OPEN** | replay grades route SHAPE + L2 decision only (TR-13/N-7) — not equivalence; write-only `expected_equiv` field removed 2026-06-17 (010 Phase E), no equivalence oracle exists; demoted 2026-06-17 |
 | **A-032** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **PARTIAL** | 4 P-FF rows seeded; battery enforcement §12B |
 
 ## Phase 2 evidence links (2026-06-14)

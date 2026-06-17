@@ -144,7 +144,6 @@ function equivalenceForRow(row, parsed, text) {
   if (parsed.decision === "degrade") return parsed.chainFailed ? "SYMFORGE-LESS" : "EQUIVALENT";
   if (parsed.chainFailed) return "SYMFORGE-LESS";
   if (row.expected_decision === "bypass") return "BYPASS";
-  if (row.expected_equiv === false) return "BYPASS";
   if (text.includes("── stel ──") && !parsed.chainFailed) return "EQUIVALENT";
   return "PENDING_REVIEW";
 }

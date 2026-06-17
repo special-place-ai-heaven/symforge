@@ -319,8 +319,12 @@ pub struct GoldenRouteRow {
     #[serde(default)]
     pub must_not_call: Vec<CoreToolName>,
     pub expected_decision: AdmissionDecision,
-    #[serde(default)]
-    pub expected_equiv: Option<bool>,
+    // TR-13 (010 FR-015): `expected_equiv` was write-only dead data — golden
+    // replay grades route SHAPE and L2 decision only, never equivalence, so the
+    // field implied a measurement that never ran (A-028 demoted to OPEN). There
+    // is no runtime equivalence oracle, so the honest fix is removal, not a
+    // tautological self-assertion. Equivalence remains an OPEN, offline-only
+    // signal (the A-029 bench fixtures), not something this corpus grades.
     #[serde(default)]
     pub chain: Option<String>,
     #[serde(default)]
@@ -416,7 +420,7 @@ mod tests {
 
     #[test]
     fn golden_route_row_deserializes_fixture_shape() {
-        let line = r#"{"id":"cfg-if/t4_refs","query":"who references cfg_if","must_call":["find_references"],"must_not_call":[],"expected_decision":"serve","expected_equiv":true,"chain":"single","eligible_h6":true,"notes":"T2 reference trace; reviewed"}"#;
+        let line = r#"{"id":"cfg-if/t4_refs","query":"who references cfg_if","must_call":["find_references"],"must_not_call":[],"expected_decision":"serve","chain":"single","eligible_h6":true,"notes":"T2 reference trace; reviewed"}"#;
         let row: GoldenRouteRow = serde_json::from_str(line).expect("parse golden row");
         assert_eq!(row.id, "cfg-if/t4_refs");
         assert_eq!(row.must_call, vec!["find_references".to_string()]);

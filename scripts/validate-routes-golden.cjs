@@ -5,13 +5,16 @@ const path = require("path");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const GOLDEN = path.join(REPO_ROOT, "docs/fixtures/routes.golden.jsonl");
+// TR-13 (010 FR-015): `expected_equiv` removed — it was write-only dead data
+// (golden replay grades route SHAPE + L2 decision only, never equivalence), so
+// requiring it implied a measurement that never ran. Equivalence is an offline
+// bench signal (a029-t2), not something this route corpus grades.
 const REQUIRED = [
   "id",
   "query",
   "must_call",
   "must_not_call",
   "expected_decision",
-  "expected_equiv",
   "chain",
   "eligible_h6",
   "notes",

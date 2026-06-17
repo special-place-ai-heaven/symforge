@@ -9,6 +9,9 @@ const path = require("path");
 const REPO_ROOT = path.resolve(__dirname, "..");
 const OUT = path.join(REPO_ROOT, "docs/fixtures/routes.golden.jsonl");
 
+// TR-13 (010 FR-015): `expected_equiv` removed — it was write-only dead data
+// (golden replay grades route SHAPE + L2 decision only, never equivalence).
+// Equivalence is an offline bench signal (a029-t2), not graded by this corpus.
 function row(spec) {
   return {
     id: spec.id,
@@ -16,7 +19,6 @@ function row(spec) {
     must_call: spec.must_call,
     must_not_call: spec.must_not_call || [],
     expected_decision: spec.expected_decision || "serve",
-    expected_equiv: spec.expected_equiv !== false,
     chain: spec.chain || "single",
     eligible_h6: spec.eligible_h6 !== false,
     notes: spec.notes,
@@ -67,7 +69,6 @@ const rows = [
     query: "review entire lib.rs for security",
     must_call: [],
     expected_decision: "bypass",
-    expected_equiv: false,
     eligible_h6: false,
     notes: "P-FF: whole-file review → bypass; reviewed",
   }),
@@ -76,7 +77,6 @@ const rows = [
     query: "audit full records.py line by line",
     must_call: [],
     expected_decision: "bypass",
-    expected_equiv: false,
     eligible_h6: false,
     notes: "P-FF bypass row",
   }),
@@ -85,7 +85,6 @@ const rows = [
     query: "read complete index.js for refactor",
     must_call: [],
     expected_decision: "bypass",
-    expected_equiv: false,
     eligible_h6: false,
     notes: "P-FF bypass row",
   }),
@@ -94,7 +93,6 @@ const rows = [
     query: "full file review service.rs",
     must_call: [],
     expected_decision: "bypass",
-    expected_equiv: false,
     eligible_h6: false,
     notes: "P-FF bypass row; reviewed",
   }),

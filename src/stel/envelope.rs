@@ -4,12 +4,16 @@ use super::types::AdmissionDecision;
 
 /// Inputs for the normative trust envelope block in `docs/stel-schema.md`.
 ///
-/// Honesty contract (010 US1): all token figures here are *estimates*
-/// (`response_tokens`/`predicted_tokens` are `chars/4` approximations;
-/// `est_net_vs_manual` is a heuristic prediction derived from the planner's
-/// `400/800` per-step constants, not a measured saving). The envelope text
-/// labels them accordingly. `session_tokens_served` is a monotonic gross
-/// running total of work performed this session, never a net of savings.
+/// Honesty contract (010 US1/US5): all token figures here are *estimates*, never
+/// measured token counts. `response_tokens`/`predicted_tokens` are `chars/4`
+/// approximations. `est_net_vs_manual` is a heuristic prediction: on a read whose
+/// real target byte size is known it is GROUNDED in those bytes (010 FR-014, the
+/// byte-grounded estimator), and on every other step it falls back to the
+/// planner's `400/800` per-step floor — either way it predicts from sizes, it
+/// does not measure the model's actual token usage, so it stays labeled
+/// `est.`/`heuristic` (grounding != measurement). `session_tokens_served` is a
+/// monotonic gross running total of work performed this session, never a net of
+/// savings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrustEnvelopeInput {
     /// e.g. `trace → find_references (exact)`
@@ -17,11 +21,12 @@ pub struct TrustEnvelopeInput {
     pub decision: AdmissionDecision,
     /// Estimated response tokens (`chars/4` approximation, not measured).
     pub response_tokens: u32,
-    /// Heuristic predicted net vs manual (from `400/800` constants, not measured).
+    /// Heuristic predicted net vs manual — grounded in the real target byte size
+    /// when known (010 FR-014), else the `400/800` per-step floor; never measured.
     pub est_net_vs_manual: i32,
     pub schema_tokens: u32,
     pub invoke_tokens: u32,
-    /// Heuristic predicted response tokens (planner constant, not measured).
+    /// Heuristic predicted response tokens (grounded-or-floor estimate, not measured).
     pub predicted_tokens: u32,
     pub predict_error_pct: f32,
     /// Monotonic gross total of tokens served this session (only ever grows;
@@ -47,9 +52,10 @@ fn decision_label(decision: AdmissionDecision) -> &'static str {
 /// does not measure real token counts, so presenting any of them as a measured
 /// saving would violate the 010 honesty contract (FR-001/FR-002).
 pub fn format_trust_envelope(input: &TrustEnvelopeInput) -> String {
-    // Heuristic predicted net vs a manual baseline (derived from the planner's
-    // `400/800` constants, never measured). Labeled `est.`; a negative
-    // prediction reads `more` not a positive "saved". On a `reject` SymForge
+    // Heuristic predicted net vs a manual baseline — grounded in the real target
+    // byte size when known (010 FR-014), else the planner's `400/800` floor;
+    // never a measured token count. Labeled `est.`; a negative prediction reads
+    // `more` not a positive "saved". On a `reject` SymForge
     // did NOT deliver a serve result, so a positive "fewer vs manual"
     // prediction would imply a saving that never happened (010 TR-11) — show
     // `n/a (rejected)` instead.

@@ -201,6 +201,107 @@ async fn cache_hit_dispatch_skips_legacy_tools_after_session_prefetch() {
     assert_eq!(event.cache_hit, Some(true));
 }
 
+/// T035 (SC-005, US5 AC-1) end-to-end: the SAME read operation over two real
+/// files of materially different size yields DIFFERENT live predicted figures.
+/// Proven through the production serve path (`build_plan` → index-aware
+/// grounding → L2 gate → envelope), not a hand-built plan.
+#[tokio::test]
+async fn grounded_predictions_differ_by_real_file_size_end_to_end() {
+    let small_corpus = "tests/fixtures/stel_multi_hop/is-plain-obj-ts"; // test.js ~134 B
+    let large_corpus = "tests/fixtures/compression_ratio/rust"; // service.rs ~2.2 KB
+    if !corpus_available(small_corpus, "test.js") || !corpus_available(large_corpus, "service.rs") {
+        eprintln!("skip grounded_predictions_differ: missing checked-in corpora");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let small_server = server_for_corpus(small_corpus, "ground-small");
+    let large_server = server_for_corpus(large_corpus, "ground-large");
+
+    let small = dispatch_symforge(
+        &small_server,
+        StelRequest {
+            query: "outline test.js".to_string(),
+            preview: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    let large = dispatch_symforge(
+        &large_server,
+        StelRequest {
+            query: "outline service.rs".to_string(),
+            preview: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The preview body is `envelope + "\n\n" + pretty-printed StelEstimate JSON`;
+    // the JSON object is the trailing block starting at the first `{`.
+    fn parse_preview_estimate(output: &str) -> serde_json::Value {
+        let json_start = output
+            .find('{')
+            .unwrap_or_else(|| panic!("preview output missing JSON estimate:\n{output}"));
+        serde_json::from_str(output[json_start..].trim())
+            .unwrap_or_else(|e| panic!("preview must be StelEstimate JSON: {e}\n{output}"))
+    }
+    let small_est = parse_preview_estimate(&small);
+    let large_est = parse_preview_estimate(&large);
+
+    let small_manual = small_est["predicted_manual_tokens"].as_i64().unwrap();
+    let large_manual = large_est["predicted_manual_tokens"].as_i64().unwrap();
+    assert_ne!(
+        small_manual, large_manual,
+        "grounded manual baseline must differ by real file size (small={small_manual} large={large_manual})"
+    );
+    assert!(
+        large_manual > small_manual,
+        "bigger file ⇒ bigger manual baseline (small={small_manual} large={large_manual})"
+    );
+}
+
+/// T036 (US5 AC-2, TR-04b, N-2) end-to-end: a read over a trivially small real
+/// file reaches the economics BYPASS branch on the LIVE serve path — the
+/// adaptive economics is no longer parked permanently in `serve` by the
+/// 400/800 constant. The tiny file's competent-manual baseline is below
+/// SymForge's fixed schema+invoke overhead, so the gate correctly tells the
+/// agent to host-read it directly.
+#[tokio::test]
+async fn grounded_small_file_reaches_bypass_end_to_end() {
+    let small_corpus = "tests/fixtures/stel_multi_hop/is-plain-obj-ts"; // test.js ~134 B
+    if !corpus_available(small_corpus, "test.js") {
+        eprintln!("skip grounded_small_file_reaches_bypass: missing checked-in corpus");
+        return;
+    }
+
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let server = server_for_corpus(small_corpus, "ground-bypass");
+    let output = dispatch_symforge(
+        &server,
+        StelRequest {
+            query: "outline test.js".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        output.contains("decision: bypass"),
+        "tiny real file must reach economics bypass on the live path:\n{output}"
+    );
+    assert!(
+        output.contains("did not execute a legacy tool"),
+        "economics bypass must instruct a host-read, not execute a tool:\n{output}"
+    );
+    let event = server.stel_ledger().lock().last().expect("ledger event");
+    assert_eq!(event.decision, AdmissionDecision::Bypass);
+}
+
 #[test]
 fn calibration_summary_counts_degrade_and_cache_hit() {
     use symforge::stel::ledger::{LedgerCaptureInput, capture_ledger};

@@ -5418,6 +5418,90 @@ impl SymForgeServer {
         args
     }
 
+    /// US5 economics grounding (010 FR-014, D2): stamp real target byte sizes onto
+    /// the plan steps so the L2 gate predicts from actual work instead of the
+    /// plan-only `400/800` constants. The plan-only planner has no index; the
+    /// index lives here, so this is where real sizes are resolved (mirrors
+    /// `inject_find_fusion_cochange_anchor`).
+    ///
+    /// Grounding is restricted to the **single-file read family** —
+    /// `get_file_context`, `get_file_content`, `get_symbol` — whose competent
+    /// manual baseline genuinely IS "read this one resolved file" (the model the
+    /// byte-grounded estimator captures). Listing/trace/search tools
+    /// (`find_references`, `find_dependents`, `search_*`, `explore`,
+    /// `get_repo_map`) are deliberately NOT grounded to a single file: their
+    /// manual equivalent is grep-then-window across MANY files, which a single
+    /// resolved definition byte length would badly *under*-state (wrongly pushing
+    /// an expensive trace toward bypass). Those steps keep the plan-only floor
+    /// (the documented interim estimate for figures not yet grounded, FR-001),
+    /// so grounding only ever *adds* honest single-file signal and never
+    /// fabricates or understates a baseline.
+    ///
+    /// For a grounded step it resolves the target file — `args["path"]` directly,
+    /// or the file a `get_symbol` `args["name"]` is defined in (single unambiguous
+    /// match only) — and records its `content.len()` as an [`IndexRef`].
+    /// Resolution is deterministic for a fixed index state (same query + same repo
+    /// ⇒ same sizes ⇒ same decision; Constitution IV).
+    fn ground_plan_economics(&self, plan: &mut crate::stel::StelPlan) {
+        let guard = self.index.read();
+        if !guard.is_ready() {
+            return;
+        }
+        for step in &mut plan.steps {
+            if !step.index_refs.is_empty() {
+                continue;
+            }
+            // Only single-file read tools have a "read this one file" manual
+            // baseline. Symbol-name resolution applies to `get_symbol` only;
+            // `find_references` shares the `name` arg but is a multi-file trace.
+            let resolve_symbol = step.tool == "get_symbol";
+            if !matches!(
+                step.tool.as_str(),
+                "get_file_context" | "get_file_content" | "get_symbol"
+            ) {
+                continue;
+            }
+            let resolved_path = step
+                .args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    if !resolve_symbol {
+                        return None;
+                    }
+                    // Resolve a path-less `get_symbol` step to the file the symbol
+                    // is defined in, but only when exactly one file defines it —
+                    // an ambiguous symbol has no single manual baseline, so we
+                    // leave it on the plan-only floor.
+                    let name = step
+                        .args
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())?;
+                    let candidates = symbol_candidate_paths(&guard, name);
+                    if candidates.len() == 1 {
+                        candidates.into_iter().next()
+                    } else {
+                        None
+                    }
+                });
+            let Some(path) = resolved_path else {
+                continue;
+            };
+            if let Some(file) = guard.capture_shared_file(&path) {
+                step.index_refs
+                    .push(crate::stel::controller::index_ref_for_target(
+                        path,
+                        file.content.len() as u64,
+                    ));
+            }
+        }
+    }
+
     fn project_id_for_root(root: &Path) -> String {
         let normalized = root.display().to_string().replace('\\', "/");
         let stable_path = if cfg!(windows) {
@@ -8152,7 +8236,13 @@ impl SymForgeServer {
                 .into_call_tool_result("query requires a non-empty question."));
         }
 
-        let plan = build_plan(request);
+        let mut plan = build_plan(request);
+        // US5 (010 FR-014, D2): ground the plan's economics in the real target
+        // byte sizes from the index before the L2 gate runs, so `predicted_net`
+        // varies with the actual work and the adaptive bypass/degrade branches
+        // become reachable (a tiny target's manual baseline falls below
+        // SymForge's fixed schema+invoke overhead → economics bypass).
+        self.ground_plan_economics(&mut plan);
         let decision = evaluate_plan_with_session(request, &plan, Some(&self.session_context));
         let step = plan
             .steps

@@ -2,10 +2,11 @@
 //!
 //! Phase 2 P2-S3: normative admission states (`serve | degrade | bypass | cache_hit`).
 
+use crate::protocol::format::{competent_manual_baseline_chars, estimate_tokens_from_chars};
 use crate::protocol::session::SessionContext;
 
 use super::types::{
-    AdmissionDecision, GoldenRouteRow, RouteConfidence, StelBypassBody, StelCacheBody,
+    AdmissionDecision, GoldenRouteRow, IndexRef, RouteConfidence, StelBypassBody, StelCacheBody,
     StelDecision, StelEstimate, StelPlan, StelPlanStep, StelRequest,
 };
 
@@ -19,6 +20,15 @@ pub const SERVE_MARGIN_TOKENS: i32 = 50;
 pub const DEGRADE_MARGIN_LOW_TOKENS: i32 = SERVE_MARGIN_TOKENS;
 /// Default capped response budget applied on degrade when request omits `max_tokens`.
 pub const DEGRADE_DEFAULT_MAX_TOKENS: u32 = 400;
+
+/// Numerator of the grounded structured-response fraction: SymForge's structured
+/// serve (symbol body / outline / windowed slice) is smaller than the competent
+/// windowed manual read it replaces. Calibrated conservatively at ~60% of the
+/// competent-manual baseline so a grounded response prediction never *over*-claims
+/// savings (a smaller predicted response would inflate `predicted_net`).
+const GROUNDED_RESPONSE_FRACTION_NUM: u64 = 3;
+/// Denominator of the grounded structured-response fraction (see numerator).
+const GROUNDED_RESPONSE_FRACTION_DEN: u64 = 5;
 
 /// Token economics breakdown for one planned invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,10 +340,31 @@ pub fn build_estimate(
 }
 
 /// Sum step estimates + compact surface overhead into a manual-vs-symforge comparison.
+///
+/// US5 grounding (010 FR-014, D2): when a step carries real [`IndexRef`] byte
+/// sizes (populated by the index-aware serve path before the gate), the
+/// per-step response/manual token estimates are derived from those real bytes
+/// via the byte-grounded estimator ([`competent_manual_baseline_chars`]) rather
+/// than the planner's `400/800` plan-only constants. This is why predictions now
+/// vary with the actual work and why the adaptive economics branches
+/// (`bypass`/`degrade`) become reachable for small/cheap inputs (a tiny file's
+/// manual baseline is below SymForge's fixed schema+invoke overhead, so
+/// `predicted_net` correctly goes non-positive). A step with no `index_refs`
+/// (plan-only callers, preview, unit fixtures) keeps the deterministic per-step
+/// `est_response_tokens`/`est_manual_tokens` floor unchanged. The result is still
+/// an *estimate* (predicted from real bytes, not a measured token count) — the
+/// envelope keeps the `est_`/`heuristic` label (relabel != measure).
 pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
-    let predicted_response_tokens: u32 =
-        plan.steps.iter().map(|step| step.est_response_tokens).sum();
-    let predicted_manual_tokens: u32 = plan.steps.iter().map(|step| step.est_manual_tokens).sum();
+    let (predicted_response_tokens, predicted_manual_tokens) = plan
+        .steps
+        .iter()
+        .map(grounded_step_tokens)
+        .fold((0u32, 0u32), |(resp, manual), (step_resp, step_manual)| {
+            (
+                resp.saturating_add(step_resp),
+                manual.saturating_add(step_manual),
+            )
+        });
     let predicted_symforge_tokens = predicted_response_tokens
         .saturating_add(COMPACT_SCHEMA_TOKENS)
         .saturating_add(COMPACT_INVOKE_TOKENS);
@@ -345,6 +376,54 @@ pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
         predicted_invoke_tokens: COMPACT_INVOKE_TOKENS,
         predicted_symforge_tokens,
         predicted_net_vs_manual,
+    }
+}
+
+/// Per-step `(predicted_response_tokens, predicted_manual_tokens)`.
+///
+/// Grounded path: when `step.index_refs` is non-empty the manual baseline is the
+/// competent windowed read of the real target bytes, and the predicted response
+/// is the structured-serve fraction of that baseline (SymForge's symbol/outline/
+/// slice is smaller than a windowed manual read). Falls back to the plan-only
+/// `est_*` constants when no real size is known (preserves determinism for
+/// plan-only callers and existing fixtures).
+fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
+    if step.index_refs.is_empty() {
+        return (step.est_response_tokens, step.est_manual_tokens);
+    }
+    let total_raw_chars: usize = step
+        .index_refs
+        .iter()
+        .map(|index_ref| index_ref.raw_chars as usize)
+        .sum();
+    grounded_tokens_from_raw_chars(total_raw_chars)
+}
+
+/// Map real target byte length to `(predicted_response_tokens, predicted_manual_tokens)`.
+///
+/// `manual` = competent windowed read of the real bytes (what a disciplined
+/// agent would read by hand); `response` = the structured-serve fraction of that
+/// baseline. Both flow through the existing byte-grounded estimator so there is a
+/// single source of truth for the manual baseline (no duplicate estimator).
+fn grounded_tokens_from_raw_chars(raw_chars: usize) -> (u32, u32) {
+    let manual_chars = competent_manual_baseline_chars(raw_chars);
+    let manual_tokens = estimate_tokens_from_chars(manual_chars);
+    let response_tokens = manual_tokens.saturating_mul(GROUNDED_RESPONSE_FRACTION_NUM)
+        / GROUNDED_RESPONSE_FRACTION_DEN;
+    (clamp_u32(response_tokens), clamp_u32(manual_tokens))
+}
+
+/// Saturating `u64` -> `u32` (token counts never legitimately exceed `u32::MAX`).
+fn clamp_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
+/// Build a grounded [`IndexRef`] for a resolved target. Used by the index-aware
+/// serve path to stamp real byte sizes onto plan steps before the L2 gate.
+pub fn index_ref_for_target(path: impl Into<String>, raw_chars: u64) -> IndexRef {
+    IndexRef {
+        path: path.into(),
+        raw_chars,
     }
 }
 
@@ -665,5 +744,138 @@ mod tests {
         let request = StelRequest::default();
         let decision = evaluate_plan(&request, &plan);
         assert_eq!(decision.decision, AdmissionDecision::Serve);
+    }
+
+    /// Build a single-step read plan grounded in a real target byte size.
+    fn grounded_read_plan(raw_chars: u64, confidence: RouteConfidence) -> StelPlan {
+        StelPlan {
+            plan_id: format!("grounded-{raw_chars}"),
+            intent: IntentBucket::Read,
+            confidence,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "get_file_context".to_string(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                // Plan-only floor that grounding must override when index_refs present.
+                est_response_tokens: 400,
+                est_manual_tokens: 800,
+                index_refs: vec![IndexRef {
+                    path: "src/lib.rs".to_string(),
+                    raw_chars,
+                }],
+            }],
+            suggested_followup: None,
+        }
+    }
+
+    /// T035 (SC-005, US5 AC-1): the same operation over a small and a large real
+    /// input yields DIFFERENT grounded predictions — never the pre-grounding
+    /// fixed constant. The prediction scales with the actual target byte length.
+    #[test]
+    fn grounded_predictions_vary_with_real_input_size() {
+        let small = estimate_economics(&grounded_read_plan(600, RouteConfidence::Inferred));
+        let large = estimate_economics(&grounded_read_plan(40_000, RouteConfidence::Inferred));
+
+        // Predictions are not the fixed 400/800-derived constant.
+        assert_ne!(
+            small.predicted_manual_tokens, large.predicted_manual_tokens,
+            "manual baseline must vary with real size"
+        );
+        assert_ne!(
+            small.predicted_net_vs_manual, large.predicted_net_vs_manual,
+            "predicted net must vary with real size"
+        );
+        // Larger input ⇒ larger manual baseline ⇒ a more favorable (higher) net.
+        assert!(
+            large.predicted_manual_tokens > small.predicted_manual_tokens,
+            "bigger file ⇒ bigger manual baseline (small={} large={})",
+            small.predicted_manual_tokens,
+            large.predicted_manual_tokens
+        );
+        assert!(
+            large.predicted_net_vs_manual > small.predicted_net_vs_manual,
+            "bigger file ⇒ higher predicted net (small={} large={})",
+            small.predicted_net_vs_manual,
+            large.predicted_net_vs_manual
+        );
+
+        // A step with NO index_refs keeps the deterministic plan-only floor
+        // (preserves determinism for plan-only callers / preview / fixtures).
+        let plan_only = StelPlan {
+            steps: vec![StelPlanStep {
+                index_refs: vec![],
+                ..grounded_read_plan(600, RouteConfidence::Inferred).steps[0].clone()
+            }],
+            ..grounded_read_plan(600, RouteConfidence::Inferred)
+        };
+        let floor = estimate_economics(&plan_only);
+        assert_eq!(floor.predicted_response_tokens, 400);
+        assert_eq!(floor.predicted_manual_tokens, 800);
+    }
+
+    /// T036 (US5 AC-2, TR-04b): a sufficiently small grounded request makes a
+    /// non-serve economics branch REACHABLE — a tiny file's competent-manual
+    /// baseline falls below SymForge's fixed schema+invoke overhead, so
+    /// `predicted_net <= 0` and the gate correctly BYPASSES (host-read is cheaper
+    /// than serving). This branch was unreachable while every step carried the
+    /// 400/800 constant (net was permanently ~275 ⇒ always serve).
+    #[test]
+    fn grounded_small_request_reaches_economics_bypass() {
+        // 180-char file: below the 200-char small-file threshold ⇒ manual
+        // baseline is the whole tiny file (~45 tokens), well under the 125-token
+        // schema+invoke floor ⇒ predicted_net is non-positive.
+        let tiny = grounded_read_plan(180, RouteConfidence::Inferred);
+        let economics = estimate_economics(&tiny);
+        assert!(
+            economics.predicted_net_vs_manual <= 0,
+            "tiny grounded request must predict non-positive net, got {}",
+            economics.predicted_net_vs_manual
+        );
+        let decision = evaluate_plan(&StelRequest::default(), &tiny);
+        assert_eq!(
+            decision.decision,
+            AdmissionDecision::Bypass,
+            "tiny grounded request must reach economics bypass: {}",
+            decision.decision_reason
+        );
+        assert!(
+            decision.bypass.is_some(),
+            "economics bypass must carry a host-read body"
+        );
+    }
+
+    /// T036 / N-2: a low-confidence Fallback route with a grounded marginal net
+    /// reaches the `mandatory_degrade` branch — the third dead branch the
+    /// constant kept unreachable. Low-confidence routes now get an economic
+    /// guardrail (degrade) instead of being served at full budget.
+    #[test]
+    fn grounded_fallback_marginal_reaches_mandatory_degrade() {
+        // Choose a raw size whose grounded net lands in (0, SERVE_MARGIN): a
+        // ~1600-char file ⇒ manual ~400 tokens, response ~240, net = 400 - (240+125)
+        // = 35 ⇒ 0 < 35 < 50 = SERVE_MARGIN. On a Fallback route that triggers
+        // mandatory_degrade (and economics_degrade), never serve, never bypass.
+        let plan = grounded_read_plan(1600, RouteConfidence::Fallback);
+        let economics = estimate_economics(&plan);
+        assert!(
+            economics.predicted_net_vs_manual > 0
+                && economics.predicted_net_vs_manual < SERVE_MARGIN_TOKENS,
+            "grounded net must be marginal (0 < net < {SERVE_MARGIN_TOKENS}), got {}",
+            economics.predicted_net_vs_manual
+        );
+        let decision = evaluate_plan(&StelRequest::default(), &plan);
+        assert_eq!(
+            decision.decision,
+            AdmissionDecision::Degrade,
+            "marginal fallback must degrade: {}",
+            decision.decision_reason
+        );
+        assert!(
+            decision
+                .degrade_flags
+                .contains(&"fallback_mandatory".to_string()),
+            "N-2: low-confidence fallback must carry the mandatory degrade guardrail: {:?}",
+            decision.degrade_flags
+        );
     }
 }

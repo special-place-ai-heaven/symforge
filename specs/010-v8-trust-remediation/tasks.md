@@ -199,17 +199,17 @@ non-serve branch is reachable for a small request; `expected_equiv` is asserted 
 
 ### Tests for User Story 5
 
-- [ ] T035 [P] [US5] Add a test asserting predictions vary with real file size (two materially different inputs ⟹ different predictions) in `tests/economics.rs` (SC-005, US5 AC-1).
-- [ ] T036 [P] [US5] Add a test asserting a non-serve economics branch (`degrade`/`bypass`/`mandatory_degrade`) is reachable for a small/cheap request (TR-04b, N-2, US5 AC-2).
+- [X] T035 [P] [US5] predictions vary with real size (600B→net −65, 40KB→net +275, plan-only→floor) in `controller.rs` units + `tests/stel_l2_admission.rs` e2e — DONE; fails pre-grounding (constant→275). (SC-005, US5 AC-1.)
+- [X] T036 [P] [US5] non-serve branch reachable: economics bypass (tiny file net≤0) + mandatory_degrade (Fallback marginal net 35∈(0,50)) — DONE (TR-04b, N-2, US5 AC-2). Both unreachable under the constant.
 
 ### Implementation for User Story 5
 
-- [ ] T037 [US5] Wire the existing estimator (`competent_manual_baseline_chars` / `saved_tokens_vs_competent_manual`, `src/protocol/format.rs` ~4925-5029) into the planner, replacing the `400/800` constants in `src/stel/planner.rs` (~44-55) (TR-04, D2).
-- [ ] T038 [US5] Make `index_refs`/`raw_chars` carry real values so `predicted_net` varies; verify the economics gate now routes on real input in `src/stel/controller.rs` (~40-135) (TR-04, TR-04b).
-- [ ] T039 [P] [US5] Assert-or-remove `expected_equiv`: either assert it in golden replay or delete the write-only dead data; purge any "95% trajectory" tautology claim in `src/stel/golden_replay.rs` (~244-310) and `src/stel/types.rs` (~313) (TR-13, FR-015).
-- [ ] T040 [US5] Run the per-phase gate + golden replay; confirm T035/T036 pass. Commit Phase E.
+- [X] T037 [US5] grounding reuses the EXISTING estimator (`competent_manual_baseline_chars`+`estimate_tokens_from_chars`); `estimate_economics` honors real `index_refs`; `ground_plan_economics` (tools.rs) reads live index + stamps real file bytes between build_plan and evaluate — DONE (TR-04, D2). No new estimator.
+- [X] T038 [US5] `index_refs` carry real `content.len()` so `predicted_net` varies; degrade/bypass/mandatory_degrade now route on real input. Grounding scoped to the single-file READ family (get_file_context/content/symbol); trace/search stay on the labeled floor (their baseline is grep-across-many-files — a single-file size would under-state and wrongly bypass). Justified, keeps golden routes stable.
+- [X] T039 [P] [US5] `expected_equiv` REMOVED (write-only, no runtime equivalence oracle) from struct/fixture/scripts/test-literals; A-028 stays OPEN (honest, not promoted); dead JS read removed (TR-13, FR-015).
+- [X] T040 [US5] full gate green; golden replay 6/6 + conformance unchanged (fixture decisions 32 serve/4 bypass byte-identical — only the dead key dropped, zero expected_decision fudged); code-reviewer APPROVE no blockers (read-family restriction verified honest, T035/T036 non-tautological). Commit Phase E.
 
-**Checkpoint**: economics is real (or honestly heuristic where a figure isn't yet grounded).
+**Checkpoint**: economics is real (grounded for single-file reads, honestly labeled heuristic-floor elsewhere). ✅
 
 ---
 
