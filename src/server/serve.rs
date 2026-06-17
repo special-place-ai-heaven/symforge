@@ -114,8 +114,20 @@ pub fn enforce_api_key_source_policy(
 // IPv6 loopback (`[::ffff:127.0.0.1]`). This is currently safe — with a key it
 // binds (fine); without a key it refuses (secure default). Optional future fix:
 // normalize an IPv4-mapped loopback to its IPv4 form before the policy check.
+/// Whether a parsed bind address is loopback (`127.0.0.0/8` or `::1`).
+///
+/// P3-D (resolved): an IPv4-mapped IPv6 loopback (`[::ffff:127.0.0.1]`) is
+/// normalized to its IPv4 form before the check, so it is correctly treated as
+/// loopback (matching operator intent) rather than as a routable bind.
 pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
-    addr.ip().is_loopback()
+    let ip = match addr.ip() {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        other => other,
+    };
+    ip.is_loopback()
 }
 
 /// Bind a [`tokio::net::TcpListener`] on `addr` with `SO_REUSEADDR`.
@@ -445,6 +457,16 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .await
         .map_err(|source| ServeError::Serve { source })?;
 
+    // P2-3: after the HTTP server drains, wait (bounded) for any durable ledger
+    // writes scheduled via `spawn_blocking` just before shutdown to finish, so
+    // the economics ledger does not lose events accepted at the very end. A
+    // stuck DB cannot hang shutdown — the drain times out and logs the residual.
+    runtime
+        .protocol()
+        .ledger_write_tracker()
+        .drain(std::time::Duration::from_secs(5))
+        .await;
+
     tracing::info!("operator server shut down cleanly");
     Ok(())
 }
@@ -561,6 +583,12 @@ mod tests {
             IpAddr::V6(Ipv6Addr::LOCALHOST),
             8787
         )));
+        // P3-D: an IPv4-mapped IPv6 loopback is normalized and treated as loopback.
+        assert!(is_loopback_addr(
+            &"[::ffff:127.0.0.1]:8787"
+                .parse()
+                .expect("v4-mapped loopback parses")
+        ));
         assert!(!is_loopback_addr(&SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             8787

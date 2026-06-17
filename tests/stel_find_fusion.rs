@@ -356,3 +356,50 @@ async fn fused_find_is_deterministic() {
         "identical repo state + query must yield identical result ordering"
     );
 }
+
+/// Run a find query and return the machine-readable `outcome_class` string from
+/// the result-status `_meta` (P3-7 asserts the fusion outcome metadata, not just
+/// the body text that `run_find` returns).
+async fn run_find_outcome(server: &SymForgeServer, query: &str) -> String {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+    let request = symforge::stel::StelRequest {
+        query: query.to_string(),
+        intent: None,
+        path: None,
+        symbol: None,
+        max_tokens: None,
+        preview: None,
+    };
+    let params: Value = serde_json::to_value(symforge::stel::SymforgeCallInput {
+        request,
+        probe_legacy_tool: None,
+        probe_legacy_args: None,
+    })
+    .expect("serialize symforge params");
+    let result = server
+        .dispatch_tool_result_for_tests("symforge", params)
+        .await
+        .expect("symforge dispatch");
+    let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+    serialized["_meta"]["symforge/result_status"]["outcome_class"]
+        .as_str()
+        .expect("outcome_class in result-status meta")
+        .to_string()
+}
+
+#[tokio::test]
+async fn fused_find_with_both_surfaces_empty_reports_empty_result() {
+    // P3-7: a multi-word find that fuses the path + name surfaces but matches
+    // NOTHING on either must report the machine-readable `empty_result` outcome,
+    // not a misleading `found`. Agents key on this status to know the union was
+    // genuinely empty (instead of wasting tokens parsing a "successful" empty
+    // envelope). Consistent with how plain search_text/search_files classify
+    // "No matches".
+    let fx = Fixture::new(&stel_planner_corpus());
+    let outcome = run_find_outcome(&fx.server, "zzqwx_nomatch_aaa bbqzx_nomatch_ccc").await;
+    assert_eq!(
+        outcome, "empty_result",
+        "both-empty fusion union must report empty_result, got: {outcome}"
+    );
+}

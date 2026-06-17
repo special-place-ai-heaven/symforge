@@ -8216,6 +8216,22 @@ impl SymForgeServer {
             }
         }
 
+        // P3-7: a find-fusion UNION where every surface came back empty/not-found
+        // is not a success — downgrade the outcome to EmptyResult so agents see an
+        // honest "no results" status instead of a misleading Found envelope. Only
+        // applies when no step hard-failed (fail-fast already set the class above).
+        if is_fusion_union && !chain_failed && !step_results.is_empty() {
+            let all_empty = step_results.iter().all(|r| {
+                matches!(
+                    serve_step_outcome(&r.tool, &r.body),
+                    OutcomeClass::EmptyResult | OutcomeClass::NotFound
+                )
+            });
+            if all_empty {
+                outcome_class = OutcomeClass::EmptyResult;
+            }
+        }
+
         let mut effective_decision = decision.clone();
         if chain_failed {
             let failed_index = step_results.len().saturating_sub(1);
