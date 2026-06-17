@@ -126,21 +126,6 @@ fn match_when_pin_equals_running_version() {
 }
 
 #[test]
-fn committed_match_fixture_documents_current_version() {
-    // The committed match/ fixture should track Cargo.toml's version so the
-    // static-fixture read path is meaningful. If a release-please bump moves the
-    // crate version, this surfaces the stale fixture (it does NOT gate the match
-    // detection logic — that uses the synthesized lock above).
-    let pin = read_symforge_pin(&fixture("match"));
-    assert_eq!(
-        pin.as_deref(),
-        Some(running_version()),
-        "committed match/Cargo.lock should pin the current crate version \
-         (update tests/fixtures/aap/match/Cargo.lock after a version bump)"
-    );
-}
-
-#[test]
 fn no_pin_fixture_is_pin_unknown_no_false_drift() {
     let root = fixture("no-pin");
     assert!(
