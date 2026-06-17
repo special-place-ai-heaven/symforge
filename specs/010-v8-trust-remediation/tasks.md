@@ -33,11 +33,43 @@ Single Rust crate `symforge`; sources under `src/`, tests under `tests/`, docs u
 
 **Purpose**: establish a green baseline and re-confirm anchors before touching code.
 
-- [ ] T001 Capture baseline green gate: run `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`, `cargo check --no-default-features --features embed`; record pass/fail in a scratch note. Kill any stray `symforge*` processes first.
-- [ ] T002 [P] Re-confirm the six T0 anchors against live `src/` (TR-01 `tools.rs` status_stel_tool + `daemon.rs`; TR-02 `format.rs`/`edit_apply.rs` dead-end strings + `loading_guard!` sites; TR-03 `cli/init.rs`/`main.rs` cold-start; TR-04 `stel/planner.rs` + `format.rs` estimator; TR-05 `stel/session.rs`/`envelope.rs`; TR-06 `protocol/edit_*`). Note any line drift in this tasks file.
-- [ ] T003 [P] Confirm `target/` is warm and stays warm for the whole campaign (no `cargo clean` until the end).
+- [ ] T001 Capture baseline green gate: run `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -- --test-threads=1`, `cargo build --release`, `cargo check --no-default-features --features embed`; record pass/fail in a scratch note. Do NOT blanket-kill `symforge*` (the user's live MCP is a global binary; cargo builds to `target/`, no conflict).
+- [X] T002 [P] Re-confirm anchors against live `src/` — DONE 2026-06-17 (45/45 verified, 0 line-drift; 5 divergences below).
+- [X] T003 [P] Confirm `target/` warm and stays warm (no `cargo clean` until campaign end). Confirmed.
 
-**Checkpoint**: baseline known-green; anchors verified live.
+**Checkpoint**: anchors verified live; baseline gate running (T001).
+
+### Live anchor notes (T002 result, 2026-06-17) — read before editing
+
+Current exact lines (no drift): `status_stel_tool` tools.rs:8524-8557 (reads `self.index` @8541);
+daemon match daemon.rs:2306-2435 (NO `status` arm → "unknown tool"); `ReplaceSymbolBodyInput`
+edit.rs:1160-1189 (no `if_match`); `StelEditRequest` types.rs:108-126 (HAS `if_match` @122);
+pre-flight `run_pre_apply_gates` edit_apply.rs:38-90 (if_match check @73-79 under index.read);
+planner 400/800 planner.rs:51-52; estimator format.rs:4930 / 5006; controller branches
+controller.rs:55-134 (bypass@58 net<=0, mandatory_degrade@75, economics_degrade@77, serve@125);
+`summary().ok()` ledger_store.rs:227-231; status literals status.rs:110-116 + DEFERRED_ITEMS@15-16;
+4 dead-end strings format.rs:4774, edit_apply.rs:48, tools.rs:6033, edit_tools.rs:23(macro);
+`loading_guard!` ~26 sites; wrapper init.rs:837 `cd /d %USERPROFILE%`, env:{} @761-765;
+`find_project_root` discovery/mod.rs:483-515; expected_equiv types.rs:313 (write-only/dead);
+A-005 OPEN@77 vs VALIDATED@146; A-009 VALIDATED@86; A-016 OPEN@103; A-028 VALIDATED@129;
+"32 canonical tools" README:24,328 AGENTS:125 CLAUDE:34; CI `.github/workflows/ci.yml` (rust job 55-79, embed 81-103).
+
+**Divergences that change implementation:**
+- **D-a (T014)**: A-005 self-contradicts itself (OPEN@77, VALIDATED@146) — single-source it.
+- **D-b (T023-T025)**: `if_match` is plumbed at L0 (`StelEditRequest`@122) + validated in pre-flight
+  under the read guard, but DROPPED by the planner (edit_planner.rs:72-80) before the legacy write,
+  and `ReplaceSymbolBodyInput` has no field; the write (tools.rs:519) never re-verifies → TOCTOU real.
+  Fix = thread field through to legacy input + re-verify at the write critical section (D1). The pre-flight
+  check stays but is NOT the guarantee.
+- **D-c (T018/T019)**: daemon has NO `status` arm; `status_stel_tool` reads the front-end `self.index`.
+  Add a daemon `status` arm + proxy the front-end read to it.
+- **D-d (T011)**: no `"pending"` literal; `CalibrationState` (types.rs:292-298) is rendered via
+  `format_calibration_section` (status.rs:155) from `src/stel/calibration.rs`. Relabel target is there;
+  first verify the EMA is never meaningfully updated (N-1 dead-seam claim) before labeling `deferred`/
+  `observational`. Keep the seam (Do-Not #7).
+- **D-e (T037/T038)**: controller.rs:55 ALREADY calls `estimate_economics` → the real estimator;
+  the planner just stamps 400/800 with `index_refs`/`raw_chars` inert. Grounding = feed real raw_chars
+  to the already-wired estimator (smaller than "wire a new path").
 
 ---
 
