@@ -224,17 +224,17 @@ OPEN-assumption capability, and passes honest OPEN-labeling.
 
 ### Tests for User Story 6
 
-- [ ] T041 [P] [US6] Add a test/lint asserting `docs/v8-capability-matrix.md` exists and every row has feature + proof state + assumption ID (FR-017).
-- [ ] T042 [P] [US6] Add a test for the honesty gate: a fixture surface claiming a capability whose assumption is OPEN ⟹ gate FAILS; an honest OPEN-labeled fixture ⟹ passes (FR-018, US6 AC-3).
+- [X] T041 [P] [US6] structural gate `t041_capability_matrix_is_structurally_well_formed` (tests/honesty_gate.rs) — DONE.
+- [X] T042 [P] [US6] bidirectional gate proof (a) Implemented+OPEN+no-artifact → FAIL, (b) same OPEN honestly Heuristic/Observational/Deferred → PASS, (c) VALIDATED-no-artifact → FAIL, (d) dangling ref → FAIL, (e) Implemented+VALIDATED / n/a+artifact → PASS — DONE (FR-018, US6 AC-3).
 
 ### Implementation for User Story 6
 
-- [ ] T043 [P] [US6] Publish `docs/v8-capability-matrix.md` (feature → assumption ID → Implemented/Heuristic/Observational/Deferred), framing A-017/A-011 as bet-under-test (TR-09, FR-017).
-- [ ] T044 [P] [US6] Update README.md (L24, L328), AGENTS.md (L125), CLAUDE.md (L34) to describe the compact-3 default with the 32-tool surface as a documented opt-out (TR-07, FR-016). Ship only AFTER Phase A (Do-Not #4).
-- [ ] T045 [US6] Implement the honesty CI gate (static parse + cross-reference: OPEN-assumption + validated-claim = FAIL; one-source-of-truth per number; VALIDATED requires artifact) as a `.github/workflows/` check (FR-018).
-- [ ] T046 [US6] Run the per-phase gate + the new honesty gate; confirm T041/T042 pass. Commit Phase F.
+- [X] T043 [P] [US6] `docs/v8-capability-matrix.md` published (Feature | Proof state | Assumption ID | Surface claim | Evidence), machine-parseable; A-017/A-011 framed bet-under-test; proof states traced to register + real tests (TR-09, FR-017).
+- [X] T044 [P] [US6] README (L24/L328 + the L144 Mermaid node), AGENTS.md, CLAUDE.md now describe compact-3 default + the **35-tool** (corrected from stale 32) full surface as a documented `SYMFORGE_SURFACE=full` opt-out (TR-07, FR-016). Verified count: EXPECTED_TOOLS=35, SYMFORGE_TOOL_NAMES=35.
+- [X] T045 [US6] honesty gate as a cargo test (`check_honesty(register, matrix) -> Result<(), Vec<Violation>>`, runs in CI's existing `cargo test`): FR-018 claim⇒proof, FR-004 VALIDATED⇒artifact, FR-017 single-source; conservative multi-table verdict aggregation; honest scope doc (structured records only). Real docs PASS.
+- [X] T046 [US6] full gate green + honesty_gate 7/7. Commit Phase F.
 
-**Checkpoint**: public record honest; regression of the honesty work is CI-blocked.
+**Checkpoint**: public record honest; regression of the honesty work is cargo-test-blocked in CI. ✅
 
 ---
 

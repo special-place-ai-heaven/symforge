@@ -122,7 +122,9 @@ Current v7.13.x recovery contract:
 The shipped v7.13.x MCP surface includes tools, resources, and prompts. Do not
 design for tools only.
 
-Current canonical `tools/list` exposes 32 tools, including `health_compact`:
+The **default** `tools/list` surface is compact-3: `symforge`, `symforge_edit`,
+`status`. The full **35-tool** surface below (including `health_compact`) is a
+documented opt-out via `SYMFORGE_SURFACE=full`:
 
 - Runtime and index: `health`, `health_compact`, `index_folder`,
   `checkpoint_now`, `analyze_file_impact`, `what_changed`, `diff_symbols`,

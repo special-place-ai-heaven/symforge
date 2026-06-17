@@ -31,7 +31,7 @@ release-please); inner commits are counted exactly once.
 
 ## Architecture
 
-Rust MCP server providing symbol-aware code navigation and editing tools. Current MCP `tools/list` exposes 32 canonical tools, including `health_compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
+Rust MCP server providing symbol-aware code navigation and editing tools. The **default** MCP `tools/list` surface is compact-3 (`symforge`, `symforge_edit`, `status`); the full **35-tool** surface (including `health_compact`) is a documented opt-out via `SYMFORGE_SURFACE=full`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests

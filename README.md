@@ -21,7 +21,7 @@
 
 SymForge is a local-first [MCP](https://modelcontextprotocol.io) server for AI coding agents. It gives an agent a fast, symbol-aware view of a repository so it can ask precise questions instead of reading whole files, running broad grep commands, or editing code with blind text replacement.
 
-It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and exposes **32 canonical MCP tools** plus resources and prompts for repo orientation, code reading, search, reference tracing, impact analysis, and structural edits.
+It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and by default exposes a **compact 3-tool MCP surface** (`symforge`, `symforge_edit`, `status`); the full **35-tool** surface is a documented opt-out via `SYMFORGE_SURFACE=full`. Either way it ships resources and prompts for repo orientation, code reading, search, reference tracing, impact analysis, and structural edits.
 
 > [!IMPORTANT]
 > SymForge is for **code intelligence and code editing**.
@@ -141,7 +141,7 @@ flowchart LR
     Local --> Snapshot[".symforge/index.bin<br/>(checkpointed, verified, quarantined)"]
     Snapshot --> Local
 
-    Local --> Tools["32 MCP tools<br/>resources + prompts<br/>trust envelopes"]
+    Local --> Tools["compact-3 default surface<br/>(35-tool full opt-out)<br/>resources + prompts<br/>trust envelopes"]
     Tools --> Client
 
     Tools --> Edits["structural edit engine"]
@@ -325,7 +325,7 @@ symforge update
 
 ## MCP Tools
 
-SymForge exposes **32 canonical tools** through MCP `tools/list`, grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
+By default SymForge exposes a **compact 3-tool surface** through MCP `tools/list` — `symforge` (read/search/navigate), `symforge_edit` (structural edits), and `status` (index health + honest economics). The full **35-tool** surface below is a documented opt-out: set `SYMFORGE_SURFACE=full` to advertise every tool individually. The tools are grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
 
 ### Orient
 
