@@ -452,16 +452,27 @@ Prepended to every `symforge` and `symforge_edit` body (text or structured). Par
 ── stel ──
 plan: trace → find_references (exact)
 decision: serve
-tokens: 420 served · 380 saved vs manual · schema 45 · invoke 80
-predicted: 400 · error: 5.0%
-session_net_vs_manual: +1240
-calibration: ok
+tokens: ~420 served (est. chars/4) · est. 380 fewer vs manual (heuristic) · schema 45 · invoke 80
+predicted: ~400 (heuristic) · error: 5.0%
+session_tokens_served: 1240
+calibration: deferred
 ──
 ```
 
+All token figures are estimates, never measured: `served`/`predicted` are
+`chars/4` approximations; the "fewer vs manual" figure is a heuristic
+prediction from the planner `400/800` constants (010 honesty contract,
+FR-001). `session_tokens_served` is a monotonic gross running total of tokens
+served this session — NOT a net of savings, so it carries no `+` sign and can
+only grow (FR-002, TR-05/TR-11). On a `reject` the per-call comparison reads
+`n/a (rejected)`. `calibration: deferred` because the auto-tuning seam
+(`CalibrationState`) is inert (N-1).
+
 Machine-readable mirror in JSON mode (future): `StelResponse { envelope, body }`.
 
-**Trust axiom:** `session_net_vs_manual` in envelope must match L4 aggregate within ±1% on same session.
+**Trust axiom (target, A-015 OPEN):** `session_tokens_served` is a gross
+counter today; matching it to an L4 net aggregate within ±1% remains an OPEN
+assumption (A-015), not a shipped guarantee.
 
 ---
 

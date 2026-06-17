@@ -74,7 +74,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
-| **A-005** | Compact 3-tool MCP surface ≤ **5,000 B** JSON schema | Implement stub `list_tools` filter; measure bytes (H1) | **OPEN** |
+| **A-005** | Compact 3-tool MCP surface ≤ **5,000 B** JSON schema | Measured `list_tools` bytes — [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) (891 B) | **VALIDATED** (single-sourced 2026-06-17, TR-16; caveat: measured against draft schema shapes) |
 | **A-006** | Hosts (Cursor) amortize schema across calls so per-call tax \< sf-bench ÷50 on long sessions | Host measurement or documented Cursor behavior; if false, bypass must account full schema | **OPEN** |
 | **A-007** | Models use ≤4 SymForge tools per session in practice | Analytics or client telemetry; else treat as hypothesis only | **OPEN** |
 
@@ -83,7 +83,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | ID | Assumption | Validation | Status |
 |----|------------|------------|--------|
 | **A-008** | `smart_query` + NL achieves ≥ **95%** trajectory pass on `routes.golden.jsonl` | Build golden file; replay via `symforge` | **PARTIAL** |
-| **A-009** | Multi-step internal chain (search→symbol) improves equivalence **without** increasing tokens vs single-hop | A/B on failing T1/T4 rows | **VALIDATED** |
+| **A-009** | Multi-step internal chain (search→symbol) improves equivalence **without** increasing tokens vs single-hop | A/B on failing T1/T4 rows | **PARTIAL** (demoted 2026-06-17, TR-12: multi-step plans DO execute, but routing is a 3-magic-string lookup and `multi_step_planner` is still listed deferred; no equivalence A/B artifact backs the "improves equivalence" claim) |
 | **A-010** | Structured `intent` bucket reduces fallback rate vs NL-only | A/B NL-only vs intent-hint on golden corpus | **OPEN** |
 
 ### Controller & economics
@@ -126,7 +126,7 @@ Status as of branch `v8/stel-architecture`. **Most are OPEN.**
 | **A-025** | `symforge_edit` JSON Schema ≤ **1,500 B**; else merge into `symforge` with `intent=edit` | Measured `list_tools` bytes | **OPEN** |
 | **A-026** | **H4** uses **`session_net_accepted`** (accepted serve rows only); `session_net_all36` reported separately | RESULTS.md §8.2 + compare-results.js | **OPEN** |
 | **A-027** | Battery schema divisor (**÷50**) is harness-only until **A-006** host-validated | Document in sf-bench spec; controller uses conservative max | **OPEN** |
-| **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **VALIDATED** |
+| **A-028** | Golden rows include **`expected_equiv`** and **`expected_decision`**, not route shape alone | routes.golden.jsonl schema | **OPEN** (demoted 2026-06-17, TR-13/N-7: false VALIDATED — `expected_equiv` is write-only dead data; golden replay grades route SHAPE only and the "accuracy" tests are tautologies, so the claim "not route shape alone" is not yet true) |
 | **A-029** | T2 spike: ≥**2/4** equiv on tokio+django **or** bypass-only policy registered for reference tasks | [`research/A-029-t24-restoration-signoff.md`](research/A-029-t24-restoration-signoff.md) | **VALIDATED** (2/4 equiv post-TX-04; P-T2 **partial** — 2 serve-eligible, 2 bypass-only; 2026-06-15) |
 | **A-031** | Phase 0.12 rmcp Streamable HTTP **compile spike** passes before Phase 4 code | `docs/research/A-031-rmcp-spike.md` | **OPEN** |
 | **A-032** | Full-file review tasks use policy **P-FF** (bypass, `eligible_h6=false`) | 4 rows in `routes.golden.jsonl` | **OPEN** |
@@ -150,7 +150,7 @@ Updated by [speckit.implement](../specs/001-v8-phase0-preflight/tasks.md). Index
 | **A-025** | [`research/A-005-schema-bytes-summary.md`](research/A-005-schema-bytes-summary.md) | **VALIDATED** | Edit schema ≤1,500 B |
 | **A-026** | [`research/G-005-compare-results-preflight.md`](research/G-005-compare-results-preflight.md) | **PARTIAL** | H1/H7 in-repo preflight |
 | **A-027** | [`research/A-006-host-schema.md`](research/A-006-host-schema.md) | **OPEN** | Harness ÷50 documented as non-product |
-| **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **VALIDATED** | 36 rows [`fixtures/routes.golden.jsonl`](fixtures/routes.golden.jsonl) |
+| **A-028** | [`research/A-028-golden-routes.md`](research/A-028-golden-routes.md) | **OPEN** | 36 rows seeded with `expected_equiv`, but the field is write-only and replay grades route SHAPE only (TR-13/N-7) — not equivalence; demoted 2026-06-17 |
 | **A-032** | [`research/A-012-bypass-policy.md`](research/A-012-bypass-policy.md) | **PARTIAL** | 4 P-FF rows seeded; battery enforcement §12B |
 
 ## Phase 2 evidence links (2026-06-14)

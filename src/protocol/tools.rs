@@ -8139,12 +8139,13 @@ impl SymForgeServer {
             .first()
             .expect("L1 planner always emits at least one step");
         let plan_summary = plan_summary_line(&plan);
-        let session_net = self.session_context.snapshot().total_tokens as i64;
+        let session_tokens_served = self.session_context.snapshot().total_tokens as i64;
 
         if request.preview == Some(true) {
             let estimate = build_estimate(request, &plan, &decision);
             let body = handler::format_preview_estimate(&estimate);
-            let metrics = metrics_for_decision(plan_summary, &decision, &plan, 0, session_net);
+            let metrics =
+                metrics_for_decision(plan_summary, &decision, &plan, 0, session_tokens_served);
             let envelope = handler::envelope_for_decision(&metrics);
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8162,7 +8163,7 @@ impl SymForgeServer {
                 &plan,
                 &decision,
                 plan_summary,
-                session_net,
+                session_tokens_served,
                 &body,
                 false,
                 &step.tool,
@@ -8282,7 +8283,7 @@ impl SymForgeServer {
             &plan,
             &effective_decision,
             plan_summary,
-            session_net,
+            session_tokens_served,
             &body,
             !step_results.is_empty(),
             &route_label,
@@ -8404,7 +8405,7 @@ impl SymForgeServer {
                     let plan = build_edit_plan(request).expect("validated edit request");
                     let decision = evaluate_edit_plan(&plan);
                     let plan_summary = edit_plan_summary_line(&plan);
-                    let session_net = self.session_context.snapshot().total_tokens as i64;
+                    let session_tokens_served = self.session_context.snapshot().total_tokens as i64;
                     let tool_body = format_already_applied_body(&symbol);
                     let routing_meta = format!(
                         "Mode: guarded apply (already applied)\n\
@@ -8422,7 +8423,7 @@ impl SymForgeServer {
                         &plan,
                         &decision,
                         plan_summary,
-                        session_net,
+                        session_tokens_served,
                         &body,
                         false,
                         "replace_symbol_body",
@@ -8452,7 +8453,7 @@ impl SymForgeServer {
             .first()
             .expect("edit planner always emits at least one step");
         let plan_summary = edit_plan_summary_line(&plan);
-        let session_net = self.session_context.snapshot().total_tokens as i64;
+        let session_tokens_served = self.session_context.snapshot().total_tokens as i64;
 
         let tool_body = self
             .dispatch_tool_for_tests(&step.tool, step.args.clone())
@@ -8493,7 +8494,7 @@ impl SymForgeServer {
             &plan,
             &decision,
             plan_summary,
-            session_net,
+            session_tokens_served,
             &body,
             legacy_executed,
             &step.tool,
@@ -8564,7 +8565,7 @@ impl SymForgeServer {
         plan: &crate::stel::StelPlan,
         decision: &crate::stel::StelDecision,
         plan_summary: String,
-        session_net: i64,
+        session_tokens_served: i64,
         body: &str,
         legacy_executed: bool,
         selected_tool: &str,
@@ -8576,8 +8577,13 @@ impl SymForgeServer {
         };
 
         let response_tokens = handler::estimate_tokens(body);
-        let metrics =
-            metrics_for_decision(plan_summary, decision, plan, response_tokens, session_net);
+        let metrics = metrics_for_decision(
+            plan_summary,
+            decision,
+            plan,
+            response_tokens,
+            session_tokens_served,
+        );
         let (event, meta) = capture_ledger(&LedgerCaptureInput {
             plan,
             decision,

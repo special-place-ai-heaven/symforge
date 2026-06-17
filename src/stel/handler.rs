@@ -4,7 +4,12 @@ use super::controller::{EconomicsBreakdown, build_estimate, estimate_economics};
 use super::envelope::{TrustEnvelopeInput, format_trust_envelope};
 use super::types::{AdmissionDecision, StelDecision, StelEstimate, StelPlan, StelRequest};
 
-/// Token estimate from UTF-8 body length (~4 chars per token).
+/// Estimated token count from UTF-8 body length (`chars/4` approximation).
+///
+/// This is NOT a measured token count — it is the coarse `len/4` heuristic.
+/// Every figure derived from it (envelope `served`, ledger `output_tokens`,
+/// session totals) is an estimate and MUST be surfaced as such, never as an
+/// exact/measured token count (010 N-4 / FR-001).
 pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 4).min(u32::MAX as usize) as u32
 }
@@ -21,7 +26,9 @@ pub struct DecisionEnvelopeMetrics {
     pub decision: AdmissionDecision,
     pub economics: EconomicsBreakdown,
     pub response_tokens: u32,
-    pub session_net_vs_manual: i64,
+    /// Monotonic gross total of tokens served this session (only ever grows;
+    /// NOT a net saving). Honest name per 010 FR-002 / TR-05.
+    pub session_tokens_served: i64,
     pub predict_error_pct: f32,
     pub ledger_line: Option<String>,
 }
@@ -35,13 +42,16 @@ pub fn envelope_for_decision(metrics: &DecisionEnvelopeMetrics) -> String {
         plan_summary: metrics.plan_summary.clone(),
         decision: metrics.decision,
         response_tokens: metrics.response_tokens,
-        net_vs_manual: metrics.economics.predicted_net_vs_manual,
+        est_net_vs_manual: metrics.economics.predicted_net_vs_manual,
         schema_tokens: metrics.economics.predicted_schema_tokens,
         invoke_tokens: metrics.economics.predicted_invoke_tokens,
         predicted_tokens: metrics.economics.predicted_response_tokens,
         predict_error_pct: metrics.predict_error_pct,
-        session_net_vs_manual: metrics.session_net_vs_manual,
-        calibration: "pending",
+        session_tokens_served: metrics.session_tokens_served,
+        // Auto-tuning calibration is permanently deferred (the `CalibrationState`
+        // seam is inert — N-1); honest label is `deferred`, never `pending`,
+        // which would imply transient/in-progress work (010 TR-10 / N-1).
+        calibration: "deferred",
         ledger_line: metrics.ledger_line.clone(),
     })
 }
@@ -57,7 +67,7 @@ pub fn metrics_for_decision(
     decision: &StelDecision,
     plan: &StelPlan,
     response_tokens: u32,
-    session_net_vs_manual: i64,
+    session_tokens_served: i64,
 ) -> DecisionEnvelopeMetrics {
     let economics = if decision.decision == AdmissionDecision::Bypass {
         decision
@@ -79,7 +89,7 @@ pub fn metrics_for_decision(
         decision: decision.decision,
         economics,
         response_tokens,
-        session_net_vs_manual,
+        session_tokens_served,
         predict_error_pct,
         ledger_line: None,
     }

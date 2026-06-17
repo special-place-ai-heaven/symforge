@@ -12,8 +12,11 @@ pub const PHASE0_GO_COMMIT: &str = "07b42a8";
 pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 
 /// Stable comma-separated deferred-work list (sorted for test stability).
-pub const DEFERRED_ITEMS: &str =
-    "b_results,calibration_auto_tune,ledger_persistence,multi_step_planner";
+///
+/// `ledger_persistence` was removed (010 FR-004): the durable SQLite ledger
+/// store DOES ship in serve mode, so listing it as deferred was false. The
+/// remaining items are genuinely not-yet-implemented seams.
+pub const DEFERRED_ITEMS: &str = "b_results,calibration_auto_tune,multi_step_planner";
 
 /// Restart-survival view of the durable STEL ledger store (US3/T029).
 ///
@@ -101,18 +104,25 @@ pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'
 }
 
 fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
+    // Honest static labels (010 US1 / TR-10). These describe the *static*
+    // truth that holds at compile time for this build — NOT a runtime liveness
+    // probe (live probing is Phase B / US2). `wired` = the layer/handler code
+    // path is compiled in and reachable; `l4_ledger: in_memory` = the L4 layer
+    // is the always-on in-memory cache (durable restart-survival state is
+    // reported separately under `detail: full`). The blanket `active` literal
+    // implied more than the surface can prove without probing.
     let lines = vec![
         "── stel status ──".to_string(),
         format!("surface: {}", ctx.surface),
         format!("symforge_version: {}", ctx.version),
         format!("phase0_go: {PHASE0_GO_COMMIT}"),
         format!("phase0_evidence: {PHASE0_EVIDENCE_COMMIT}"),
-        "l1_planner: active".to_string(),
-        "l2_economics: active".to_string(),
-        "l3_bypass: active".to_string(),
-        "l4_ledger: active".to_string(),
-        "handler_symforge: active".to_string(),
-        "handler_status: active".to_string(),
+        "l1_planner: wired".to_string(),
+        "l2_economics: wired".to_string(),
+        "l3_bypass: wired".to_string(),
+        "l4_ledger: in_memory".to_string(),
+        "handler_symforge: wired".to_string(),
+        "handler_status: wired".to_string(),
         "handler_symforge_edit: preview-and-apply".to_string(),
         format!("ledger_events: {}", ctx.ledger_events),
         format!("index_ready: {}", ctx.index_ready),
@@ -193,21 +203,31 @@ mod tests {
             "surface: compact",
             "phase0_go: 07b42a8",
             "phase0_evidence: 08f7d14",
-            "l1_planner: active",
-            "l2_economics: active",
-            "l3_bypass: active",
-            "l4_ledger: active",
-            "handler_symforge: active",
-            "handler_status: active",
+            "l1_planner: wired",
+            "l2_economics: wired",
+            "l3_bypass: wired",
+            "l4_ledger: in_memory",
+            "handler_symforge: wired",
+            "handler_status: wired",
             "handler_symforge_edit: preview-and-apply",
             "ledger_events: 2",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,calibration_auto_tune,ledger_persistence,multi_step_planner",
+            "deferred: b_results,calibration_auto_tune,multi_step_planner",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
         }
+        // Honest contract (010 TR-10): no blanket unconditional `active` literal
+        // and the stale `ledger_persistence` deferred item is gone.
+        assert!(
+            !body.contains(": active"),
+            "no subsystem may report a blanket `active` in:\n{body}"
+        );
+        assert!(
+            !body.contains("ledger_persistence"),
+            "ledger_persistence ships in serve mode; not deferred:\n{body}"
+        );
         assert!(
             !body.contains("── calibration (observational) ──"),
             "compact detail must not include calibration section"

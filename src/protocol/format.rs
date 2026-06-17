@@ -4992,6 +4992,11 @@ pub fn content_anchored_symbol_window(
     ))
 }
 
+/// Estimated tokens from a character count (`~chars/4` approximation).
+///
+/// Coarse heuristic, NOT a measured token count. Callers that surface the
+/// result to an agent label it as an estimate (the savings footer uses `~N
+/// tokens` framing) so no figure is presented as exact/measured (010 N-4).
 pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
     chars.div_ceil(4) as u64
 }

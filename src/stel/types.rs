@@ -288,6 +288,16 @@ pub struct StelLedgerEvent {
 }
 
 /// Per `(tool, intent_bucket)` calibration feedback (L4 → L2).
+///
+/// DEFERRED SEAM (010 N-1, intentionally inert). `ema_predict_error` and
+/// `fudge_multiplier` are neither updated from real ledger samples nor read
+/// back into the L2 controller anywhere today — auto-tuning is permanently
+/// deferred, not transient. The seam is preserved on purpose (ledger Do-Not #7)
+/// for the future adaptive-calibration work; the *observational* calibration
+/// summary that the `status` surface actually renders lives in
+/// `crate::stel::calibration::StelCalibrationSummary` (read-only, honest).
+/// Surfaces label this `deferred` (never `pending`, which would imply
+/// in-progress work). Do not delete or revive without grounding it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct CalibrationState {
     pub tool: CoreToolName,
