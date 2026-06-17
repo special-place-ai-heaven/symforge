@@ -24,6 +24,14 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     if let Some(steps) = plan_multi_hop_steps(request) {
         return build_plan_from_steps(request, steps);
     }
+    // US4 find fusion: a multi-word fuzzy find query that matches no explicit
+    // routing phrase fans out across BOTH the path/file matcher (with the gated
+    // co-change boost) and the symbol-name matcher, merged by the serve
+    // executor into one ranked envelope. Plan-only: this emits ordered steps;
+    // the search layer does the ranking/merging. See `find_fusion_steps`.
+    if let Some(steps) = find_fusion_steps(request) {
+        return build_plan_from_steps(request, steps);
+    }
     let step = plan_step(request);
     build_plan_from_steps(request, vec![step])
 }
@@ -150,6 +158,150 @@ fn plan_multi_hop_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
         ]);
     }
     None
+}
+
+/// Rationale marker (human-facing) for the path/file step of a fused find plan.
+/// The serve executor's co-change anchor injection recognizes the step by its
+/// `rank_by == "path+cochange"` argument, NOT by this string, so this text is
+/// presentation-only and safe to reword. Index-aware anchor resolution stays out
+/// of the plan-only planner.
+pub(crate) const FIND_FUSION_PATH_RATIONALE: &str = "find fusion: path/file ranking with co-change";
+
+/// Rationale marker for the symbol step of a fused find plan.
+const FIND_FUSION_SYMBOL_RATIONALE: &str = "find fusion: symbol-name ranking";
+
+/// US4 find fusion (plan-only). A multi-word, fuzzy find query that matched no
+/// explicit routing phrase fans out across two surfaces, merged by the serve
+/// executor into one ranked envelope (run as a UNION — an empty surface is not
+/// a chain failure; see `is_find_fusion_plan`):
+///   1. `search_files` (path/file ranking + gated co-change boost via
+///      `rank_by="path+cochange"`; the executor injects the resolved anchor).
+///      Uses the full query, whose token order the path matcher reads as
+///      `component…/basename`. Empty for a query whose trailing token is not a
+///      basename — that is fine; the path/name evidence still arrives via the
+///      term step below.
+///   2. `search_text` with OR `terms` over the tokenized query — the multi-term
+///      matcher that actually spans symbol NAMES (matching a definition line
+///      like `fn route_find`) and file CONTENT for ANY token, where the
+///      whole-query substring of `search_symbols` would miss a fuzzy bag of
+///      words. Frecency-neutral like every search_* surface.
+///
+/// Gating (preserves every golden route):
+///   - only fires when no explicit `route_with_query_patterns` phrase matched
+///     (so `find X class`, `locate X symbol`, `files named X`, … keep their
+///     single-step routes),
+///   - only for `Auto`/`Find` intent (an explicit non-find bucket is honored),
+///   - requires >= 2 fuzzy word tokens (a single token stays single-step so the
+///     existing symbol/path heuristics own it),
+///   - skips queries carrying path/scope syntax (`/`, file extensions) that the
+///     single-step file route already handles precisely.
+fn find_fusion_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
+    let bucket = request.intent.unwrap_or(IntentBucket::Auto);
+    if !matches!(bucket, IntentBucket::Auto | IntentBucket::Find) {
+        return None;
+    }
+    // An explicit routing phrase always wins — never override a precise route.
+    if route_with_query_patterns(request).is_some() {
+        return None;
+    }
+    let query = request.query.trim();
+    if !is_multi_term_fuzzy_find(query) {
+        return None;
+    }
+    let terms: Vec<&str> = query.split_whitespace().collect();
+
+    Some(vec![
+        planned(
+            "search_files",
+            json!({ "query": query, "rank_by": "path+cochange" }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            FIND_FUSION_PATH_RATIONALE,
+        ),
+        planned(
+            "search_text",
+            json!({ "terms": terms, "group_by": "symbol" }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            FIND_FUSION_SYMBOL_RATIONALE,
+        ),
+    ])
+}
+
+/// True when `query` is a multi-word, fuzzy find query suitable for fusion: at
+/// least two alphanumeric word tokens, no path/scope syntax, and no
+/// guidance/explore lead-in. Tokenization mirrors the path-side
+/// `tokenize_path_query` (split on whitespace, drop empties) so the planner's
+/// notion of "multi-term" matches what the ranker will see.
+fn is_multi_term_fuzzy_find(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    // Path/scope syntax is owned by the precise single-step file route.
+    if lower.contains('/') || lower.contains('\\') {
+        return false;
+    }
+    // Guidance / conceptual-explanation queries ("how to use X", "what is Y",
+    // "explain Z") are explore intent, not find — never fuse them. This keeps
+    // the golden `explore` rows (e.g. "how to use records ORM") routing to
+    // explore and mirrors smart_query's Understand/Explore lead-ins.
+    if is_guidance_query(&lower) {
+        return false;
+    }
+    let tokens: Vec<&str> = lower
+        .split_whitespace()
+        .filter(|tok| tok.chars().any(|ch| ch.is_alphanumeric()))
+        .collect();
+    if tokens.len() < 2 {
+        return false;
+    }
+    // A bare filename token (e.g. `foo.rs`) is a single-file lookup even when
+    // other words surround it; defer to the single-step heuristics in that case.
+    !tokens.iter().any(|tok| {
+        tok.contains('.')
+            && std::path::Path::new(tok)
+                .extension()
+                .is_some_and(|ext| !ext.is_empty())
+    })
+}
+
+/// True when `lower` (already lowercased) opens with a guidance / conceptual
+/// lead-in that signals explore intent rather than find. Mirrors smart_query's
+/// Understand/Explore prefixes plus the bare "how to" form that the golden
+/// `explore` rows use.
+fn is_guidance_query(lower: &str) -> bool {
+    const GUIDANCE_LEAD_INS: [&str; 12] = [
+        "how to ",
+        "how does ",
+        "how do ",
+        "how can ",
+        "explain ",
+        "understand ",
+        "describe ",
+        "what is ",
+        "what are ",
+        "why ",
+        "tell me about ",
+        "walk me through ",
+    ];
+    GUIDANCE_LEAD_INS
+        .iter()
+        .any(|lead_in| lower.starts_with(lead_in))
+}
+
+/// True when `plan` is a US4 find-fusion union (independent path + symbol
+/// surfaces), identified by the path step's `rank_by="path+cochange"` arg — the
+/// only planner route that emits it. The serve executor uses this to treat the
+/// fusion as a UNION (an empty surface is not a chain failure) rather than a
+/// dependent chain (where each step consumes the prior and an empty result is
+/// fatal).
+pub fn is_find_fusion_plan(plan: &StelPlan) -> bool {
+    plan.steps.iter().any(|step| {
+        step.tool == "search_files"
+            && step
+                .args
+                .get("rank_by")
+                .and_then(Value::as_str)
+                .is_some_and(|rank_by| rank_by == "path+cochange")
+    })
 }
 
 fn route_with_bucket(request: &StelRequest, bucket: IntentBucket) -> Option<PlannedStep> {
@@ -986,5 +1138,85 @@ mod tests {
             );
             assert_eq!(plan.steps.len(), 2, "{id} must be two-step plan");
         }
+    }
+
+    #[test]
+    fn multi_word_fuzzy_find_plans_fused_path_and_text_steps() {
+        // A multi-word fuzzy find with no explicit routing phrase fans out
+        // across the path/file matcher (with co-change) and the OR-term
+        // name/content matcher, as a two-step plan the executor merges.
+        let plan = build_plan(&StelRequest {
+            query: "stel planner find".to_string(),
+            ..Default::default()
+        });
+        let tools: Vec<&str> = plan.steps.iter().map(|s| s.tool.as_str()).collect();
+        assert_eq!(tools, vec!["search_files", "search_text"]);
+        assert_eq!(plan.intent, IntentBucket::Find);
+        // The path step requests the co-change boost (anchor injected later by
+        // the index-aware executor); the calibration marker the executor keys on.
+        assert_eq!(plan.steps[0].args["rank_by"], "path+cochange");
+        assert!(plan.steps[0].args.get("anchor_path").is_none());
+        // The name/content step uses OR terms over the tokenized query.
+        assert_eq!(
+            plan.steps[1].args["terms"],
+            json!(["stel", "planner", "find"])
+        );
+        assert!(
+            is_find_fusion_plan(&plan),
+            "plan must be a find-fusion union"
+        );
+    }
+
+    #[test]
+    fn explicit_find_phrases_keep_single_step_routes() {
+        // The fusion gate must never override a precise single-step route: every
+        // explicit find phrasing the golden corpus pins stays single-step.
+        for (query, expected) in [
+            ("find Database class", "search_text"),
+            ("find reconcile function", "search_text"),
+            ("locate cfg_if symbol", "search_symbols"),
+            ("files named records", "search_files"),
+            ("isPlainObject symbol", "search_symbols"),
+            ("find cfg_if macro usage", "search_text"),
+        ] {
+            let plan = build_plan(&StelRequest {
+                query: query.to_string(),
+                ..Default::default()
+            });
+            assert_eq!(plan.steps.len(), 1, "{query} must stay single-step");
+            assert_eq!(plan.steps[0].tool, expected, "{query} route");
+            assert!(!is_find_fusion_plan(&plan), "{query} must not fuse");
+        }
+    }
+
+    #[test]
+    fn guidance_and_single_token_queries_do_not_fuse() {
+        for query in [
+            "how to use records ORM", // golden explore row
+            "how does cfg_if work",
+            "what is the planner",
+            "planner", // single token
+        ] {
+            let plan = build_plan(&StelRequest {
+                query: query.to_string(),
+                ..Default::default()
+            });
+            assert!(
+                !is_find_fusion_plan(&plan),
+                "{query} must not be a find-fusion union"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_non_find_intent_is_not_overridden_by_fusion() {
+        // An explicit non-find bucket (e.g. Read) must be honored even for a
+        // multi-word query; fusion only owns Auto/Find.
+        let plan = build_plan(&StelRequest {
+            query: "stel planner find".to_string(),
+            intent: Some(IntentBucket::Read),
+            ..Default::default()
+        });
+        assert!(!is_find_fusion_plan(&plan), "explicit Read must not fuse");
     }
 }

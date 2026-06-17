@@ -3,10 +3,16 @@
 // file keeps `--no-default-features --features embed --all-targets` compiling.
 #![cfg(feature = "server")]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use symforge::live_index::LiveIndex;
+use symforge::live_index::git_temporal::{
+    CoChangeEntry, CommitSummary, GitFileHistory, GitTemporalIndex, GitTemporalState,
+    GitTemporalStats,
+};
 use symforge::protocol::edit_plan::plan_edit;
 use tempfile::TempDir;
 
@@ -25,6 +31,59 @@ fn build_index(source: &str) -> (TempDir, symforge::live_index::SharedIndex) {
     (dir, shared)
 }
 
+/// A temporal snapshot with no history — mirrors the harness default for a
+/// freshly-loaded tempdir index that has no real git data. `plan_edit` must omit
+/// the co-change line cleanly for this state (graceful-omission guard).
+fn empty_temporal() -> GitTemporalIndex {
+    GitTemporalIndex {
+        files: HashMap::new(),
+        stats: GitTemporalStats {
+            total_commits_analyzed: 0,
+            analysis_window_days: 90,
+            hotspots: vec![],
+            most_coupled: vec![],
+            computed_at: SystemTime::now(),
+            compute_duration: Duration::ZERO,
+        },
+        state: GitTemporalState::Unavailable("not a git repo".to_string()),
+    }
+}
+
+/// A `Ready` temporal seeded with a single strong co-change partner for `path`.
+fn ready_temporal_with_cochange(path: &str, partner: &str) -> GitTemporalIndex {
+    let history = GitFileHistory {
+        commit_count: 6,
+        churn_score: 0.8,
+        last_commit: CommitSummary {
+            hash: "abc1234".to_string(),
+            timestamp: "2026-06-01T12:00:00Z".to_string(),
+            author: "Tester".to_string(),
+            message_head: "touch lib".to_string(),
+            days_ago: 2.0,
+        },
+        contributors: vec![],
+        co_changes: vec![CoChangeEntry {
+            path: partner.to_string(),
+            coupling_score: 0.62,
+            shared_commits: 4,
+        }],
+        weak_co_changes: vec![],
+    };
+
+    GitTemporalIndex {
+        files: HashMap::from([(path.to_string(), history)]),
+        stats: GitTemporalStats {
+            total_commits_analyzed: 12,
+            analysis_window_days: 90,
+            hotspots: vec![],
+            most_coupled: vec![],
+            computed_at: SystemTime::now(),
+            compute_duration: Duration::ZERO,
+        },
+        state: GitTemporalState::Ready,
+    }
+}
+
 fn canonical_symbol_line(index: &LiveIndex, path: &str, name: &str) -> u32 {
     let detail = index
         .capture_symbol_detail_view(path)
@@ -37,8 +96,13 @@ fn canonical_symbol_line(index: &LiveIndex, path: &str, name: &str) -> u32 {
     symbol.line_range.0 + 1
 }
 
-fn assert_plan_line_matches_selector(index: &LiveIndex, name: &str, selector_line: u32) {
-    let plan = plan_edit(index, &format!("src/lib.rs::{name}"));
+fn assert_plan_line_matches_selector(
+    index: &LiveIndex,
+    temporal: &GitTemporalIndex,
+    name: &str,
+    selector_line: u32,
+) {
+    let plan = plan_edit(index, temporal, &format!("src/lib.rs::{name}"));
     let expected = format!("{name} in src/lib.rs (lines {selector_line}-");
     assert!(
         plan.contains(&expected),
@@ -87,6 +151,7 @@ impl Worker {
 
     let (_dir, shared) = build_index(source);
     let index = shared.read();
+    let temporal = empty_temporal();
 
     for (name, expected_line) in [
         ("documented_target", 10),
@@ -95,6 +160,51 @@ impl Worker {
     ] {
         let selector_line = canonical_symbol_line(&index, "src/lib.rs", name);
         assert_eq!(selector_line, expected_line);
-        assert_plan_line_matches_selector(&index, name, selector_line);
+        assert_plan_line_matches_selector(&index, &temporal, name, selector_line);
     }
+}
+
+/// T019(ii): with no/Unavailable temporal (the harness default), the symbol
+/// branch must NOT emit a `Co-change partners:` line — clean silent omission,
+/// no error, no empty/placeholder line — while existing assertions still hold.
+#[test]
+fn edit_plan_omits_co_change_line_when_temporal_unavailable() {
+    let source = "fn target() {}\n";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let plan = plan_edit(&index, &temporal, "src/lib.rs::target");
+
+    assert!(
+        plan.contains("target in src/lib.rs"),
+        "plan should still locate the target symbol:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Co-change partners:"),
+        "plan must omit the co-change line when temporal is Unavailable:\n{plan}"
+    );
+}
+
+/// T019(i): with a `Ready` temporal that has a strong co-change partner for the
+/// target's file, the symbol branch must emit a single `Co-change partners:`
+/// line listing the partner.
+#[test]
+fn edit_plan_emits_co_change_line_when_temporal_ready() {
+    let source = "fn target() {}\n";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = ready_temporal_with_cochange("src/lib.rs", "src/routes.rs");
+
+    let plan = plan_edit(&index, &temporal, "src/lib.rs::target");
+
+    assert!(
+        plan.contains("Co-change partners: src/routes.rs"),
+        "plan should emit the terse co-change line listing the partner:\n{plan}"
+    );
+    // Terse line: a single comma-joined list, no coupling scores or block header.
+    assert!(
+        !plan.contains("coupling:"),
+        "the plan_edit co-change line must be terse (no coupling scores):\n{plan}"
+    );
 }

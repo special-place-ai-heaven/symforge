@@ -473,6 +473,83 @@ async fn search_symbols_does_not_bump() {
     );
 }
 
+// ─── STEL find fusion is frecency-neutral (feature 007, US4 — the invariant) ──
+//
+// The fused find intent fans the multi-word query out across `search_files`
+// (path + co-change) and `search_text` (OR terms) — both discovery surfaces
+// that never bump — and resolves its co-change anchor from the index path view
+// only (never `get_*`). It MUST therefore bump frecency zero times. This is the
+// single most important invariant of the find-fusion port: only a test guards
+// against an accidental bump, since `frecency::bump` is infallible and silent.
+
+/// Sets `SYMFORGE_SURFACE=compact` (required to reach the STEL handler) and
+/// restores the previous value on drop, serialized by the same lock as
+/// `FlagGuard` so env mutation stays single-writer under `--test-threads=1`.
+#[allow(unsafe_code)] // test-only surface guard serializes env mutation.
+struct SurfaceGuard {
+    _flag: FlagGuard,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[allow(unsafe_code)] // test-only surface guard serializes env mutation.
+impl SurfaceGuard {
+    fn compact() -> Self {
+        let flag = FlagGuard::on();
+        let previous = std::env::var_os("SYMFORGE_SURFACE");
+        // SAFETY: --test-threads=1 + FlagGuard's lock serialize env mutation.
+        unsafe { std::env::set_var("SYMFORGE_SURFACE", "compact") };
+        Self {
+            _flag: flag,
+            previous,
+        }
+    }
+}
+
+#[allow(unsafe_code)] // test-only surface guard restores serialized env mutation.
+impl Drop for SurfaceGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            // SAFETY: see SurfaceGuard::compact.
+            Some(previous) => unsafe { std::env::set_var("SYMFORGE_SURFACE", previous) },
+            None => unsafe { std::env::remove_var("SYMFORGE_SURFACE") },
+        }
+    }
+}
+
+#[tokio::test]
+async fn symforge_find_intent_does_not_bump() {
+    let fx = Fixture::new(&[
+        ("src/stel/planner.rs", "pub fn route_find() {}\n"),
+        ("src/stel/executor.rs", "pub fn serve_find_step() {}\n"),
+    ]);
+    let _surface = SurfaceGuard::compact();
+
+    let request = symforge::stel::StelRequest {
+        query: "stel planner find".to_string(),
+        intent: None,
+        path: None,
+        symbol: None,
+        max_tokens: None,
+        preview: None,
+    };
+    let params = serde_json::to_value(symforge::stel::SymforgeCallInput {
+        request,
+        probe_legacy_tool: None,
+        probe_legacy_args: None,
+    })
+    .expect("serialize symforge params");
+    let _ = fx
+        .server
+        .dispatch_tool_result_for_tests("symforge", params)
+        .await
+        .expect("symforge dispatch");
+
+    assert!(
+        !fx.db_path().exists(),
+        "the fused find intent must not create a frecency database"
+    );
+}
+
 // ─── Decay (1 test) ─────────────────────────────────────────────────────────
 
 #[test]

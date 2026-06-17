@@ -76,7 +76,10 @@ fn embed_only_is_the_default_http_only_when_serve_active() {
 
     // A serve attach URL → embed-only PLUS the HTTP preset.
     let with_http = aap_target_from(&det, Some("http://127.0.0.1:8787/mcp"));
-    assert!(with_http.offers_http(), "HTTP preset offered with serve URL");
+    assert!(
+        with_http.offers_http(),
+        "HTTP preset offered with serve URL"
+    );
     assert!(
         with_http.presets.contains(&AapPresetChoice::EmbedOnly),
         "embed-only is still offered alongside HTTP"
@@ -96,7 +99,10 @@ fn embed_path_dep_is_never_a_stdio_spawn_config() {
         let target = aap_target_from(&det, serve);
         let dep = &target.embed_path_dep;
         assert!(dep.contains("path = \"../symforge\""), "path dep: {dep}");
-        assert!(dep.contains("features = [\"embed\"]"), "embed feature: {dep}");
+        assert!(
+            dep.contains("features = [\"embed\"]"),
+            "embed feature: {dep}"
+        );
         assert!(!dep.contains("command"), "never a stdio command: {dep}");
         assert!(!dep.contains("stdio"), "never stdio: {dep}");
         assert!(!dep.contains("args"), "never spawn args: {dep}");
@@ -109,7 +115,9 @@ fn not_detected_aap_yields_no_presets() {
     // A not-detected AAP (absent AAP_ROOT + no sibling) is a clean, typed,
     // empty target — no presets, no fabricated root.
     let det = AapDetection::resolve_with(
-        Some(std::ffi::OsString::from("/definitely/not/a/real/aap/root/008-us3")),
+        Some(std::ffi::OsString::from(
+            "/definitely/not/a/real/aap/root/008-us3",
+        )),
         None,
     );
     assert!(!det.detected);
@@ -139,7 +147,10 @@ fn aap_target_env_path_detects_fixture_root() {
     assert!(target.detected, "AAP_ROOT at a fixture must detect");
     assert_eq!(target.source, Some("env"));
     assert_eq!(target.root.as_deref(), Some(root.as_path()));
-    assert!(target.offers_http(), "serve URL present => HTTP preset offered");
+    assert!(
+        target.offers_http(),
+        "serve URL present => HTTP preset offered"
+    );
     assert!(target.embed_dep_is_path_not_stdio());
 
     #[allow(unsafe_code)] // test-only env restore under ENV_LOCK + --test-threads=1.

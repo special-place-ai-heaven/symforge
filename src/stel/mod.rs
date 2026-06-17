@@ -85,7 +85,7 @@ pub use ledger::{
     LedgerCaptureInput, LedgerEnvelopeMeta, SessionLedger, build_ledger_event, capture_ledger,
     format_ledger_envelope_line,
 };
-pub use planner::{build_plan, confidence_label, plan_summary_line};
+pub use planner::{build_plan, confidence_label, is_find_fusion_plan, plan_summary_line};
 pub use status::{
     DEFERRED_ITEMS, PHASE0_EVIDENCE_COMMIT, PHASE0_GO_COMMIT, StelStatusContext, format_stel_status,
 };

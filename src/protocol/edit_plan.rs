@@ -19,7 +19,17 @@ fn split_path_qualified_target(target: &str) -> Option<(&str, &str)> {
 ///
 /// Rendered symbol line ranges are one-based public selector lines. Internally
 /// `SymbolRecord::line_range` remains zero-based.
-pub fn plan_edit(index: &LiveIndex, target: &str) -> String {
+///
+/// `temporal` is the lock-free git temporal snapshot taken from the shared
+/// index handle (it does not live on the `LiveIndex` read snapshot). When it is
+/// `Ready` and the primary target file has strong co-change partners, the
+/// symbol branch emits a single terse `Co-change partners: a, b, c` line;
+/// otherwise nothing is emitted (clean silent omission, no placeholder).
+pub fn plan_edit(
+    index: &LiveIndex,
+    temporal: &crate::live_index::git_temporal::GitTemporalIndex,
+    target: &str,
+) -> String {
     let target = target.trim();
     let qualified_target = split_path_qualified_target(target);
     let symbol_target_name = qualified_target.map(|(_, name)| name).unwrap_or(target);
@@ -81,6 +91,20 @@ pub fn plan_edit(index: &LiveIndex, target: &str) -> String {
                 "⚠ HIGH IMPACT: >10 callers. Use batch_rename(dry_run=true) to preview."
                     .to_string(),
             );
+        }
+
+        // Terse co-change line for the primary target file. Reuses
+        // `format::edit_impact_summary` (Ready-gated, forward-slash normalized,
+        // strong co_changes only, top-K). When temporal is not Ready or the file
+        // has no strong co-change partners the partner list is empty and we push
+        // NOTHING — clean silent omission, no placeholder line (unlike
+        // `analyze_file_impact`, `plan_edit` stays terse).
+        if let Some((primary_path, _, _, _)) = symbol_hits.first() {
+            let (_, partners) =
+                crate::protocol::format::edit_impact_summary(index, temporal, primary_path);
+            if !partners.is_empty() {
+                lines.push(format!("Co-change partners: {}", partners.join(", ")));
+            }
         }
 
         lines.push("\nSuggested tool sequence:".to_string());

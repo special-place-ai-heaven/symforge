@@ -158,7 +158,10 @@ fn render_banner(
         // AAP detected: surface the AAP-native route — the operator panel and the
         // embed path dependency (the way AAP consumes SymForge), not just the
         // generic MCP attach (FR-006).
-        sink.line(&format!("  AAP detected. Operator panel: {}", aap.admin_url));
+        sink.line(&format!(
+            "  AAP detected. Operator panel: {}",
+            aap.admin_url
+        ));
         sink.line(&format!("  AAP embed dependency:  {}", aap.embed_path_dep));
     }
     sink.offer_open(attach_url);

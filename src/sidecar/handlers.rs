@@ -1596,12 +1596,85 @@ pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> 
             }
         }
         if !entry_points.is_empty() {
-            entry_points.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)));
+            // Importance ranking (feature 007, US3): rank entry-point lines by
+            // their containing file's importance rather than alphabetically.
+            //
+            // rank_key(file) = (dependent_count DESC, churn_score DESC,
+            //                   relative_path ASC, symbol_name ASC)
+            //
+            // The `relative_path ASC` key is the contract's deterministic
+            // tie-break; `symbol_name ASC` is the additional innermost key that
+            // keeps order stable when one file contributes several top-level
+            // types (multiple entry-point lines share a path). Identical index
+            // state therefore always yields identical order (FR-017).
+
+            // Distinct importing-file count, memoized per distinct entry-point
+            // path. The candidate set is bounded (only files with top-level
+            // types), so this is O(candidates × refs), never O(all_files²).
+            // Keyed by owned path so the memo does not borrow `entry_points`
+            // (which must stay mutably sortable/truncatable below).
+            let mut dep_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (_, _, path) in &entry_points {
+                if !dep_counts.contains_key(path) {
+                    let distinct: std::collections::HashSet<&str> = guard
+                        .find_dependents_for_file(path)
+                        .into_iter()
+                        .map(|(file_path, _)| file_path)
+                        .collect();
+                    dep_counts.insert(path.clone(), distinct.len());
+                }
+            }
+
+            // Churn from the lock-free temporal snapshot; 0.0 when temporal is
+            // not Ready or the file is absent (read-only — no frecency bump).
+            let temporal = state.index.git_temporal();
+            let churn_of = |path: &str| -> f32 {
+                if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready {
+                    temporal
+                        .files
+                        .get(path)
+                        .map(|history| history.churn_score)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                }
+            };
+
+            entry_points.sort_by(|a, b| {
+                let (a_kind, a_name, a_path) = a;
+                let (b_kind, b_name, b_path) = b;
+                let a_dep = dep_counts.get(a_path.as_str()).copied().unwrap_or(0);
+                let b_dep = dep_counts.get(b_path.as_str()).copied().unwrap_or(0);
+                // dependent_count DESC
+                b_dep
+                    .cmp(&a_dep)
+                    // churn_score DESC (f32 in [0,1], never NaN; Equal fallback
+                    // is harmless because the path/name keys below are total).
+                    .then_with(|| {
+                        churn_of(b_path)
+                            .partial_cmp(&churn_of(a_path))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    // relative_path ASC (deterministic tie-break)
+                    .then_with(|| a_path.cmp(b_path))
+                    // symbol_name ASC (stable order for multi-type files)
+                    .then_with(|| a_name.cmp(b_name))
+                    // kind ASC (final guard; identical (path,name) is unusual
+                    // but keeps the order total either way).
+                    .then_with(|| a_kind.cmp(b_kind))
+            });
             entry_points.truncate(15);
             lines.push(String::new());
             lines.push("Key types:".to_string());
             for (kind, name, path) in &entry_points {
-                lines.push(format!("  {kind} {name}  ({path})"));
+                // Annotate high-fan-in files: `(→N)` iff distinct dependents N>=2.
+                let dep_count = dep_counts.get(path.as_str()).copied().unwrap_or(0);
+                if dep_count >= 2 {
+                    lines.push(format!("  {kind} {name}  ({path}) (→{dep_count})"));
+                } else {
+                    lines.push(format!("  {kind} {name}  ({path})"));
+                }
             }
             if entry_points.len() == 15 {
                 lines.push("  ...".to_string());
