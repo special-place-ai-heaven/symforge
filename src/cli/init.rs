@@ -750,18 +750,51 @@ fn register_claude_desktop_mcp_server_with_home(
     let desktop_binary_path =
         desktop_binary_for_registration(std::path::Path::new(binary_path), home_dir)?;
     let desktop_binary_path_str = desktop_binary_path.display().to_string();
+
+    // Discover the operator's workspace at install time (TR-03 / FR-013). The
+    // `symforge init` process CWD is the project the operator is in, so
+    // `find_project_root` resolves the real workspace here — unlike cold start
+    // under Claude Desktop, whose CWD is `System32` (Windows) and is useless.
+    // We thread the discovered root into both the launcher CWD and the
+    // registered `env`, so the server indexes a populated workspace instead of
+    // binding an empty index and emitting the TR-02 dead-end.
+    let workspace_root = crate::discovery::find_project_root();
+    let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
+
     let command_path = if cfg!(windows) {
         // Generate a wrapper script that sets CWD before launching symforge.
-        let wrapper_path = create_desktop_wrapper_windows(&desktop_binary_path_str)?;
+        let wrapper_path = create_desktop_wrapper_windows(
+            &desktop_binary_path_str,
+            workspace_root_str.as_deref(),
+        )?;
         native_command_path(&wrapper_path)
     } else {
         native_command_path(&desktop_binary_path_str)
     };
 
+    // Write a proven env instead of `{}` (TR-03 / FR-013):
+    //  - SYMFORGE_SURFACE=compact makes the default surface explicit in the
+    //    registered config and surfaces the documented opt-out to operators.
+    //  - SYMFORGE_WORKSPACE_ROOT carries the discovered workspace so cold start
+    //    populates the index even when the launcher CWD is unusable. Only set
+    //    when a real root was discovered (the server validates it again at
+    //    startup via the same trust-boundary guard).
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "SYMFORGE_SURFACE".to_string(),
+        Value::String("compact".to_string()),
+    );
+    if let Some(root) = workspace_root_str.as_deref() {
+        env.insert(
+            crate::discovery::WORKSPACE_ROOT_ENV.to_string(),
+            Value::String(root.to_string()),
+        );
+    }
+
     config["mcpServers"]["symforge"] = json!({
         "command": command_path,
         "args": [],
-        "env": {}
+        "env": Value::Object(env)
     });
 
     let pretty = serde_json::to_string_pretty(&config)?;
@@ -821,9 +854,27 @@ fn comparable_path(path: &std::path::Path) -> String {
 
 /// Create a `.cmd` wrapper next to the symforge binary that sets CWD before launching it.
 ///
+/// Claude Desktop on Windows launches MCP servers with CWD = `C:\WINDOWS\System32`
+/// (a forbidden directory that crashes symforge with "Access is denied" on first
+/// write), so the wrapper MUST `cd` somewhere writable before launch. The CWD it
+/// chooses also drives cold-start root discovery (`find_project_root`):
+///
+///  - When init discovered a workspace root, the wrapper `cd`s into it. That
+///    directory is both writable (no crash) AND discoverable (cold start indexes
+///    the real workspace instead of the home dir — TR-03/FR-013).
+///  - When no workspace was discovered, the wrapper falls back to `%USERPROFILE%`
+///    — still writable (preserves the original System32-crash fix) but a
+///    forbidden root for indexing, so the index stays empty unless the registered
+///    `SYMFORGE_WORKSPACE_ROOT` env carries a root. This matches the pre-fix
+///    behavior for the no-workspace case (no regression) while the common
+///    "operator ran init from their project" case is now populated.
+///
 /// Returns the absolute path to the wrapper script.
 #[cfg(windows)]
-fn create_desktop_wrapper_windows(binary_path: &str) -> anyhow::Result<String> {
+fn create_desktop_wrapper_windows(
+    binary_path: &str,
+    workspace_root: Option<&str>,
+) -> anyhow::Result<String> {
     let bin_path = std::path::Path::new(binary_path);
     let wrapper_dir = bin_path
         .parent()
@@ -834,7 +885,11 @@ fn create_desktop_wrapper_windows(binary_path: &str) -> anyhow::Result<String> {
         .and_then(|name| name.to_str())
         .context("cannot determine symforge binary file name")?;
 
-    let script = format!("@echo off\r\ncd /d \"%USERPROFILE%\"\r\n\"%~dp0{binary_name}\" %*\r\n");
+    // `cd /d` into the discovered workspace (writable + indexable) when known,
+    // else fall back to the always-writable home dir to keep the System32-crash
+    // fix. Both are double-quoted; `cd /d` accepts a literal path verbatim.
+    let cd_target = workspace_root.unwrap_or("%USERPROFILE%");
+    let script = format!("@echo off\r\ncd /d \"{cd_target}\"\r\n\"%~dp0{binary_name}\" %*\r\n");
 
     std::fs::write(&wrapper_path, script)
         .with_context(|| format!("writing {}", wrapper_path.display()))?;
@@ -843,7 +898,10 @@ fn create_desktop_wrapper_windows(binary_path: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(not(windows))]
-fn create_desktop_wrapper_windows(_binary_path: &str) -> anyhow::Result<String> {
+fn create_desktop_wrapper_windows(
+    _binary_path: &str,
+    _workspace_root: Option<&str>,
+) -> anyhow::Result<String> {
     unreachable!("desktop wrapper is only created on Windows")
 }
 
@@ -2157,6 +2215,109 @@ env = { EXISTING_FLAG = "keep" }
             stable_bin_dir.join("symforge-desktop.cmd").exists(),
             "durable wrapper should be created next to the home binary"
         );
+        let _ = std::fs::remove_dir_all(&stable_bin_dir);
+    }
+
+    // T029 (TR-03 / FR-013): the generated wrapper `cd`s into the discovered
+    // workspace (writable + indexable), NOT the home dir, so cold-start
+    // `find_project_root` resolves the project and the index is populated.
+    #[cfg(windows)]
+    #[test]
+    fn test_desktop_wrapper_cds_to_discovered_workspace_not_home() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let binary = bin_dir.path().join("symforge.exe");
+        std::fs::write(&binary, "x").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_str = workspace.path().display().to_string();
+
+        let wrapper_path = create_desktop_wrapper_windows(
+            &binary.display().to_string(),
+            Some(workspace_str.as_str()),
+        )
+        .unwrap();
+        let script = std::fs::read_to_string(&wrapper_path).unwrap();
+
+        assert!(
+            script.contains(&format!("cd /d \"{workspace_str}\"")),
+            "wrapper must cd into the discovered workspace: {script}"
+        );
+        assert!(
+            !script.contains("%USERPROFILE%"),
+            "wrapper must NOT cd to %USERPROFILE% when a workspace was discovered \
+             (the TR-03 empty-index trap): {script}"
+        );
+    }
+
+    // T029: with NO discoverable workspace, the wrapper falls back to the
+    // always-writable home dir — preserving the original System32-crash fix and
+    // not regressing the no-workspace case.
+    #[cfg(windows)]
+    #[test]
+    fn test_desktop_wrapper_falls_back_to_home_without_workspace() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let binary = bin_dir.path().join("symforge.exe");
+        std::fs::write(&binary, "x").unwrap();
+
+        let wrapper_path =
+            create_desktop_wrapper_windows(&binary.display().to_string(), None).unwrap();
+        let script = std::fs::read_to_string(&wrapper_path).unwrap();
+
+        assert!(
+            script.contains("cd /d \"%USERPROFILE%\""),
+            "wrapper must fall back to %USERPROFILE% (writable) without a workspace: {script}"
+        );
+    }
+
+    // T029: init writes a proven `env` (not `{}`) — the surface is made explicit
+    // and the discovered workspace is threaded through so cold start indexes it.
+    #[test]
+    fn test_desktop_registration_writes_proven_env_with_surface_and_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let stable_bin_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("symforge-env-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stable_bin_dir);
+        std::fs::create_dir_all(&stable_bin_dir).unwrap();
+        let home_binary = stable_bin_dir.join(if cfg!(windows) {
+            "symforge.exe"
+        } else {
+            "symforge"
+        });
+        std::fs::write(&home_binary, "stable").unwrap();
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("claude_desktop_config.json");
+        register_claude_desktop_mcp_server_with_home(
+            &config_path,
+            &home_binary.display().to_string(),
+            home.path(),
+        )
+        .unwrap();
+
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let env = config["mcpServers"]["symforge"]["env"]
+            .as_object()
+            .expect("env must be a proven object, not empty `{}`");
+
+        assert_eq!(
+            env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
+            Some("compact"),
+            "registered env must make the default compact surface explicit: {env:?}"
+        );
+
+        // The test binary runs from the symforge repo (a git repo), so init
+        // discovers a real workspace root and threads it through.
+        let root = env
+            .get(crate::discovery::WORKSPACE_ROOT_ENV)
+            .and_then(Value::as_str)
+            .expect("registered env must carry the discovered workspace root");
+        assert!(
+            std::path::Path::new(root).is_dir(),
+            "the threaded workspace root must be an existing directory: {root}"
+        );
+
         let _ = std::fs::remove_dir_all(&stable_bin_dir);
     }
 

@@ -2688,10 +2688,38 @@ fn test_loading_guard_message() {
 }
 
 #[test]
-fn test_empty_guard_message() {
+fn test_empty_index_recovery_hint_is_surface_aware() {
+    use crate::protocol::surface_probe::SurfaceProfile;
+
+    // Full/Meta: index_folder is callable, so it may be named directly.
     assert_eq!(
-        empty_guard_message(),
+        empty_index_recovery_hint(SurfaceProfile::Full),
         "Index not loaded. Call index_folder to index a directory."
+    );
+    assert_eq!(
+        empty_index_recovery_hint(SurfaceProfile::Meta),
+        "Index not loaded. Call index_folder to index a directory."
+    );
+
+    // Compact (TR-02 / FR-012): index_folder is dispatch-gated, so the hint must
+    // NOT name it; it names only callable recovery (re-launch from root /
+    // documented opt-out).
+    let compact = empty_index_recovery_hint(SurfaceProfile::Compact);
+    assert!(
+        !compact.contains("Call index_folder"),
+        "compact hint must not name the gated index_folder tool: {compact}"
+    );
+    assert!(
+        !compact.contains("index_folder(path"),
+        "compact hint must not name index_folder as a callable form: {compact}"
+    );
+    assert!(
+        compact.contains("project root"),
+        "compact hint must name the re-launch-from-root recovery: {compact}"
+    );
+    assert!(
+        compact.contains("SYMFORGE_SURFACE=full"),
+        "compact hint must name the documented opt-out: {compact}"
     );
 }
 

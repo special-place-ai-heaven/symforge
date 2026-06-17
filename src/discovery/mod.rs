@@ -478,9 +478,31 @@ pub fn load_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     }
 }
 
+/// Environment override for the project root used by cold-start discovery.
+///
+/// Some launchers cannot give the server a useful working directory: Claude
+/// Desktop on Windows launches MCP servers with CWD = `C:\WINDOWS\System32`
+/// (forbidden), so the wrapper historically `cd`'d to `%USERPROFILE%` — also
+/// forbidden — leaving `find_project_root` with no discoverable root and binding
+/// an empty index (TR-03). `symforge init` discovers the operator's workspace at
+/// install time and writes it into the registered MCP `env` under this key, so
+/// cold start indexes the real workspace instead of the home directory.
+pub const WORKSPACE_ROOT_ENV: &str = "SYMFORGE_WORKSPACE_ROOT";
+
 /// Walk upward from the current working directory, looking for a `.git` directory.
 /// Returns `None` if no git root is found and the cwd is a forbidden directory.
+///
+/// A non-empty `SYMFORGE_WORKSPACE_ROOT` env var takes priority over CWD-based
+/// discovery (TR-03): it is the workspace `symforge init` resolved at install
+/// time, threaded through to a launcher whose CWD is otherwise useless. It is
+/// still validated through the SAME `is_forbidden_root` guard as CWD discovery,
+/// so the override can never widen the trust boundary — a missing, non-directory,
+/// or sensitive/broad path is ignored and discovery falls back to CWD.
 pub fn find_project_root() -> Option<PathBuf> {
+    if let Some(root) = workspace_root_env_override() {
+        return Some(root);
+    }
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Try to find a git root first (scoped by repo boundary), BUT run the same
@@ -512,6 +534,37 @@ pub fn find_project_root() -> Option<PathBuf> {
     } else {
         Some(cwd)
     }
+}
+
+/// Resolve and validate the `SYMFORGE_WORKSPACE_ROOT` cold-start override.
+///
+/// Returns `Some(root)` only when the env var is set to a non-empty path that
+/// exists, is a directory, and passes the SAME `is_forbidden_root` guard used by
+/// CWD-based discovery — so the override can never index a sensitive or overly
+/// broad tree. Any failure logs and returns `None`, letting `find_project_root`
+/// fall back to its normal CWD walk (the override is a hint, never a bypass).
+fn workspace_root_env_override() -> Option<PathBuf> {
+    let raw = std::env::var(WORKSPACE_ROOT_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(trimmed);
+    if !candidate.is_dir() {
+        tracing::warn!(
+            path = %candidate.display(),
+            "ignoring {WORKSPACE_ROOT_ENV}: not an existing directory"
+        );
+        return None;
+    }
+    if is_forbidden_root(&candidate) {
+        tracing::warn!(
+            path = %candidate.display(),
+            "ignoring {WORKSPACE_ROOT_ENV}: directory is too broad (home dir, drive root, or system path)"
+        );
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Returns `true` if `path` is a directory that should never be auto-indexed
@@ -2013,6 +2066,88 @@ mod tests {
             )));
             // `..` popping past the root yields no match (not a panic / false true).
             assert!(!is_wsl_windows_container_path(Path::new("/mnt/c/../..")));
+        }
+    }
+
+    /// TR-03 / FR-013: the `SYMFORGE_WORKSPACE_ROOT` cold-start override is
+    /// honored for a real directory and rejected (via the shared trust-boundary
+    /// guard) for a sensitive/broad one — it can never widen what is auto-indexed.
+    mod workspace_root_override {
+        use super::*;
+        use std::ffi::OsString;
+        use std::sync::Mutex;
+
+        // Serializes env mutation; `SYMFORGE_WORKSPACE_ROOT` is process-global.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct RootEnvGuard {
+            prev: Option<OsString>,
+        }
+
+        #[allow(unsafe_code)] // test-only env guard; mutation serialized by ENV_LOCK.
+        impl RootEnvGuard {
+            fn set(value: Option<&str>) -> Self {
+                let prev = std::env::var_os(WORKSPACE_ROOT_ENV);
+                // SAFETY: serialized by ENV_LOCK held by the caller.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(WORKSPACE_ROOT_ENV, v),
+                        None => std::env::remove_var(WORKSPACE_ROOT_ENV),
+                    }
+                }
+                Self { prev }
+            }
+        }
+
+        #[allow(unsafe_code)] // test-only env guard; restores serialized state.
+        impl Drop for RootEnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: serialized by ENV_LOCK.
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(WORKSPACE_ROOT_ENV, v),
+                        None => std::env::remove_var(WORKSPACE_ROOT_ENV),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn honors_a_real_workspace_directory() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let workspace = TempDir::new().unwrap();
+            let _guard = RootEnvGuard::set(Some(&workspace.path().display().to_string()));
+
+            let resolved = workspace_root_env_override().expect("real dir must resolve");
+            let resolved = resolved.canonicalize().unwrap_or(resolved);
+            let expected = workspace.path().canonicalize().unwrap();
+            assert_eq!(resolved, expected);
+        }
+
+        #[test]
+        fn ignores_empty_and_missing_paths() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _empty = RootEnvGuard::set(Some("   "));
+            assert!(workspace_root_env_override().is_none());
+
+            let _missing = RootEnvGuard::set(Some("/no/such/symforge/workspace/xyzzy"));
+            assert!(workspace_root_env_override().is_none());
+
+            let _unset = RootEnvGuard::set(None);
+            assert!(workspace_root_env_override().is_none());
+        }
+
+        #[test]
+        fn rejects_a_forbidden_home_dir_override() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let Some(home) = home_dir() else {
+                return; // no home dir in this environment; nothing to assert
+            };
+            let _guard = RootEnvGuard::set(Some(&home.display().to_string()));
+            assert!(
+                workspace_root_env_override().is_none(),
+                "the forbidden home dir must be rejected by the shared trust-boundary guard"
+            );
         }
     }
 }

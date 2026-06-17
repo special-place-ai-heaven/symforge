@@ -47,6 +47,7 @@ use crate::live_index::{
     SearchFilesResolveView, SearchFilesTier, SearchFilesView, SnapshotVerifyState,
     SymbolDetailView, TypeDependencyView, WhatChangedTimestampView, search,
 };
+use crate::protocol::surface_probe::{SurfaceProfile, surface_profile_from_env};
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
 const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
@@ -4769,9 +4770,43 @@ pub fn loading_guard_message() -> String {
     "Index is loading... try again shortly.".to_string()
 }
 
-/// "Index not loaded. Call index_folder to index a directory."
+/// Surface-aware empty-index recovery hint (TR-02 / N-5 / FR-011, FR-012).
+///
+/// Every empty-index / "not loaded" error an agent can reach must name ONLY a
+/// recovery action that is callable on the agent's *active* surface. The compact
+/// surface forbids `index_folder` (it is not one of the compact-3 tools); naming
+/// it there sends the agent into an unrecoverable loop — told to call a tool its
+/// surface rejects at dispatch. This single function is the one source of truth
+/// for that message, computed from the **active** [`SurfaceProfile`], never a
+/// fixed string.
+///
+/// - [`SurfaceProfile::Compact`]: names only callable recovery — re-launch from
+///   the project root (so cold-start discovery populates the index), or the
+///   documented `SYMFORGE_SURFACE=full` opt-out. MUST NOT mention `index_folder`
+///   or any other gated capability.
+/// - [`SurfaceProfile::Full`] / [`SurfaceProfile::Meta`]: `index_folder` is
+///   callable, so the hint may name it directly.
+pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
+    match profile {
+        SurfaceProfile::Compact => "Index not loaded. Re-launch SymForge from your project \
+             root so the workspace is indexed on startup, or set SYMFORGE_SURFACE=full for the \
+             full tool surface."
+            .to_string(),
+        SurfaceProfile::Full | SurfaceProfile::Meta => {
+            "Index not loaded. Call index_folder to index a directory.".to_string()
+        }
+    }
+}
+
+/// Empty-index guard message computed from the live `SYMFORGE_SURFACE` profile.
+///
+/// Thin wrapper over [`empty_index_recovery_hint`] that resolves the active
+/// surface via [`surface_profile_from_env`]. Existing guard sites and the
+/// `loading_guard!` macro call this so the emitted message is always surface-
+/// aware without each site having to thread the profile by hand (N-5: one
+/// function, no residual hardcoded "Call index_folder" on a compact path).
 pub fn empty_guard_message() -> String {
-    "Index not loaded. Call index_folder to index a directory.".to_string()
+    empty_index_recovery_hint(surface_profile_from_env())
 }
 
 /// Format a "Token Savings (this session)" section from a `StatsSnapshot`.

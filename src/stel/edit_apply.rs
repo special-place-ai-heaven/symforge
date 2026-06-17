@@ -44,9 +44,16 @@ pub fn run_pre_apply_gates(
     match guard.index_state() {
         IndexState::Ready => {}
         IndexState::Empty => {
-            return Err(EditValidationError::new(
-                "Index not loaded; call index_folder before symforge_edit apply",
-            ));
+            // Surface-aware recovery (TR-02 / FR-012): never name `index_folder`
+            // on the compact surface, where `symforge_edit` is reachable but
+            // `index_folder` is dispatch-gated. The hint is computed from the
+            // active surface, never a fixed string.
+            let hint = crate::protocol::format::empty_index_recovery_hint(
+                crate::protocol::surface_probe::surface_profile_from_env(),
+            );
+            return Err(EditValidationError::new(format!(
+                "{hint} (symforge_edit apply requires a loaded index)"
+            )));
         }
         IndexState::Loading => {
             return Err(EditValidationError::new(

@@ -6039,8 +6039,19 @@ impl SymForgeServer {
                 .map(str::trim)
                 .is_some_and(|git_ref| !git_ref.is_empty());
         if params.0.since.is_none() && !requested_git_mode && effective_repo_root.is_none() {
-            return "No repo root attached; call index_folder(path=...) or pass since=..."
-                .to_string();
+            // Surface-aware recovery (TR-02 / FR-012): `index_folder` is gated on
+            // the compact surface, so name only callable recovery there. `since=`
+            // is always valid and is offered on every surface.
+            let attach = match crate::protocol::surface_probe::surface_profile_from_env() {
+                crate::protocol::surface_probe::SurfaceProfile::Compact => {
+                    "re-launch SymForge from your project root"
+                }
+                crate::protocol::surface_probe::SurfaceProfile::Full
+                | crate::protocol::surface_probe::SurfaceProfile::Meta => {
+                    "call index_folder(path=...)"
+                }
+            };
+            return format!("No repo root attached; {attach} or pass since=...");
         }
         let mode = match determine_what_changed_mode(&params.0, effective_repo_root.is_some()) {
             Ok(mode) => mode,
@@ -14981,10 +14992,28 @@ mod tests {
                 max_tokens: None,
             }))
             .await;
+        // Surface-aware guidance (TR-02 / FR-012): `since=` is always offered;
+        // `index_folder` is named only on the full/meta surface where it is
+        // callable, never on the compact surface where it is dispatch-gated.
         assert!(
-            result.contains("No repo root attached; call index_folder(path=...) or pass since=..."),
+            result.contains("No repo root attached;"),
             "missing repo root should return actionable guidance: {result}"
         );
+        assert!(
+            result.contains("pass since=..."),
+            "guidance must always offer the surface-neutral `since=` recovery: {result}"
+        );
+        match crate::protocol::surface_probe::surface_profile_from_env() {
+            crate::protocol::surface_probe::SurfaceProfile::Compact => assert!(
+                !result.contains("index_folder"),
+                "compact guidance must not name the gated index_folder tool: {result}"
+            ),
+            crate::protocol::surface_probe::SurfaceProfile::Full
+            | crate::protocol::surface_probe::SurfaceProfile::Meta => assert!(
+                result.contains("call index_folder(path=...)"),
+                "full/meta guidance may name index_folder: {result}"
+            ),
+        }
     }
 
     #[tokio::test]

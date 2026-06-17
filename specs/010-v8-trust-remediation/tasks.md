@@ -174,18 +174,18 @@ root (not `%USERPROFILE%`).
 
 ### Tests for User Story 4
 
-- [ ] T028 [P] [US4] Add the named regression `compact_surface_index_not_loaded_message_never_mentions_blocked_tools` in `tests/recovery.rs`: on the compact profile, assert no empty-index message names a gated tool (TR-02, SC-004).
-- [ ] T029 [P] [US4] Add a test that the cold-start root discovery resolves the project workspace, not the home dir (TR-03).
+- [X] T028 [P] [US4] `compact_surface_index_not_loaded_message_never_mentions_blocked_tools` (tests/recovery.rs) — DONE; fails pre-fix; denylist hardened to a representative gated-tool set (not just index_folder).
+- [X] T029 [P] [US4] cold-start root discovery: `SYMFORGE_WORKSPACE_ROOT` override honored for a real dir, rejected for forbidden/home/missing (TR-03) — DONE.
 
 ### Implementation for User Story 4
 
-- [ ] T030 [US4] Add a single surface-aware `empty_index_recovery_hint(profile)` in `src/protocol/format.rs` (~4774) that never names a gated tool (compact: re-launch from root / documented opt-out; full: may name `index_folder`) (TR-02, D4).
-- [ ] T031 [US4] Route all 4 dead-end strings + the `loading_guard!` sites through `empty_index_recovery_hint` in `src/protocol/format.rs`, `edit_apply.rs` (~48), `tools.rs` (~6033), `edit_tools.rs` (~263) (N-5, FR-012).
-- [ ] T032 [US4] Fix the desktop wrapper so it does not `cd /d "%USERPROFILE%"` before launch in `src/cli/init.rs` (~837) so `find_project_root()` discovers the workspace (TR-03).
-- [ ] T033 [US4] Write a proven init `env` (root / `SYMFORGE_SURFACE` / auto-index hint) instead of `env:{}` in `src/cli/init.rs` (~761); verify `find_project_root()` in `src/main.rs` (~217-248) populates the index (TR-03, FR-013).
-- [ ] T034 [US4] Run the per-phase gate; confirm T028/T029 pass. Commit Phase D.
+- [X] T030 [US4] surface-aware `empty_index_recovery_hint(profile)` in `format.rs` (compact: re-launch from root / `SYMFORGE_SURFACE=full`; full: may name index_folder) — DONE (TR-02, D4).
+- [X] T031 [US4] all 4 dead-end strings + the ~26-site `loading_guard!` macro routed through it (`empty_guard_message` delegates surface-aware); `edit_apply`, `what_changed`, `EditError::SessionStale` made surface-aware — DONE (N-5, FR-012). Left `health`'s index_folder mention (full-surface-only, correct).
+- [X] T032 [US4] desktop wrapper cds to the discovered workspace (fallback %USERPROFILE% only when none — preserves the System32-crash fix) in `cli/init.rs` (TR-03).
+- [X] T033 [US4] init writes proven env (`SYMFORGE_SURFACE=compact` + `SYMFORGE_WORKSPACE_ROOT=<root>`); new `find_project_root` override (validated through `is_forbidden_root`) consumes it (TR-03, FR-013). Both env vars verified against consumers.
+- [X] T034 [US4] full gate green (3002 passed, embed green); code-reviewer: no Critical/Warnings, trust-boundary override provably narrows-or-equals scope. Commit Phase D.
 
-**Checkpoint**: cold start recovers; no dead-end loop.
+**Checkpoint**: cold start recovers; no dead-end loop. ✅ Live-Desktop end-to-end is the one documented dogfood gap (Phase H).
 
 ---
 

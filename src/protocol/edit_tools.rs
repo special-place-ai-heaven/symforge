@@ -260,8 +260,31 @@ fn failed_batch_operation_statuses(
 pub(crate) enum EditError {
     #[error("Error: file not found at {path}")]
     PathNotFound { path: std::path::PathBuf },
-    #[error("Error: session stale at {path} — call index_folder to refresh repo_root")]
-    SessionStale { path: std::path::PathBuf },
+    #[error("Error: session stale at {path} — {recovery}")]
+    SessionStale {
+        path: std::path::PathBuf,
+        recovery: String,
+    },
+}
+
+/// Surface-aware recovery clause for a stale edit session (TR-02 / FR-012).
+///
+/// "Refresh repo_root" maps to `index_folder` on the full surface, but that tool
+/// is dispatch-gated on the compact surface (`symforge_edit` is reachable there,
+/// `index_folder` is not). Computed from the active surface so the message never
+/// names a forbidden capability.
+fn session_stale_recovery() -> String {
+    match crate::protocol::surface_probe::surface_profile_from_env() {
+        crate::protocol::surface_probe::SurfaceProfile::Compact => {
+            "re-launch SymForge from your project root to refresh repo_root, or set \
+             SYMFORGE_SURFACE=full for the full tool surface"
+                .to_string()
+        }
+        crate::protocol::surface_probe::SurfaceProfile::Full
+        | crate::protocol::surface_probe::SurfaceProfile::Meta => {
+            "call index_folder to refresh repo_root".to_string()
+        }
+    }
 }
 
 fn edit_capability_label(
@@ -297,7 +320,13 @@ pub(crate) fn prepare_exact_path_for_edit(
                 return Err(format!("{}", EditError::PathNotFound { path: abs_path }));
             }
             watcher::FreshenResult::GenerationMismatch => {
-                return Err(format!("{}", EditError::SessionStale { path: abs_path }));
+                return Err(format!(
+                    "{}",
+                    EditError::SessionStale {
+                        path: abs_path,
+                        recovery: session_stale_recovery(),
+                    }
+                ));
             }
         };
     Ok((abs_path, source_authority))
@@ -332,7 +361,13 @@ pub(super) fn prepare_batch_paths_for_edit(
                 );
             }
             watcher::FreshenResult::GenerationMismatch => {
-                return Err(format!("{}", EditError::SessionStale { path: abs_path }));
+                return Err(format!(
+                    "{}",
+                    EditError::SessionStale {
+                        path: abs_path,
+                        recovery: session_stale_recovery(),
+                    }
+                ));
             }
         }
     }
