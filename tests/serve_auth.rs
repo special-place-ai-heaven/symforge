@@ -123,6 +123,7 @@ async fn post_tools_list(url: &str, bearer: Option<&str>) -> reqwest::StatusCode
 async fn non_loopback_without_key_refuses_to_start() {
     let args = ServeArgs {
         listen: "0.0.0.0:8787".to_string(),
+        explicit_listen: true,
         api_key: None,
         api_key_env: None,
     };

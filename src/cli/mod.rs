@@ -10,13 +10,18 @@
 //!
 //! Plan 03 wires these into main.rs and handles the top-level dispatch.
 
+pub mod admin;
 pub mod analytics;
+pub mod browser;
 pub mod harness;
 pub mod harness_apply;
+pub mod harness_command;
 pub mod hook;
 pub mod init;
 pub mod onboarding;
+pub mod operator_profile;
 pub mod serve;
+pub mod setup;
 pub mod trust;
 pub mod update;
 pub mod version;
@@ -73,6 +78,10 @@ pub enum Commands {
     Daemon,
     /// Serve the MCP surface over Streamable HTTP at `/mcp` (operator server)
     Serve(serve::ServeCliArgs),
+    /// Guided operator setup wizard: scan harnesses, configure, start the dashboard
+    Setup(setup::SetupCliArgs),
+    /// Open (or start + open) the running operator dashboard
+    Admin(admin::AdminCliArgs),
     /// Hook subcommands called by Claude Code (PostToolUse / SessionStart / UserPromptSubmit)
     Hook {
         #[command(subcommand)]
@@ -192,7 +201,9 @@ mod tests {
 
         match cli.command {
             Some(Commands::Serve(args)) => {
-                assert_eq!(args.listen, "127.0.0.1:8787");
+                // No --listen: `listen` is `None` so the US1 free-port fallback
+                // applies (prefer the default, else an OS-assigned free port).
+                assert_eq!(args.listen, None);
                 assert_eq!(args.api_key, None);
                 assert_eq!(args.api_key_env, None);
             }
@@ -213,7 +224,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Serve(args)) => {
-                assert_eq!(args.listen, "0.0.0.0:9000");
+                assert_eq!(args.listen.as_deref(), Some("0.0.0.0:9000"));
                 assert_eq!(args.api_key, None);
                 assert_eq!(args.api_key_env.as_deref(), Some("SYMFORGE_KEY"));
             }
@@ -327,6 +338,59 @@ mod tests {
         match cli.command {
             Some(Commands::Update) => {}
             _ => panic!("expected update command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_parses_with_defaults() {
+        let cli = Cli::parse_from(["symforge", "setup"]);
+
+        match cli.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.non_interactive);
+                assert_eq!(args.installation_type, None);
+                assert_eq!(args.port, None);
+                assert!(args.harnesses.is_empty());
+                assert!(!args.yes);
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_parses_flags() {
+        let cli = Cli::parse_from([
+            "symforge",
+            "setup",
+            "--non-interactive",
+            "--installation-type",
+            "both",
+            "--port",
+            "8787",
+            "--harnesses",
+            "claude,codex",
+            "--yes",
+        ]);
+
+        match cli.command {
+            Some(Commands::Setup(args)) => {
+                assert!(args.non_interactive);
+                assert_eq!(args.installation_type, Some(setup::InstallationType::Both));
+                assert_eq!(args.port, Some(8787));
+                assert_eq!(args.harnesses, vec!["claude", "codex"]);
+                assert!(args.yes);
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    fn test_admin_command_parses_with_defaults() {
+        let cli = Cli::parse_from(["symforge", "admin"]);
+
+        match cli.command {
+            Some(Commands::Admin(args)) => assert!(!args.no_open),
+            _ => panic!("expected admin command"),
         }
     }
 }

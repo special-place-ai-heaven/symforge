@@ -33,6 +33,14 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 pub struct ServeArgs {
     /// `HOST:PORT` to bind. `PORT=0` requests an OS-assigned port.
     pub listen: String,
+    /// Whether the operator explicitly supplied `--listen` (US1, FR-002/003).
+    ///
+    /// `false` means `listen` is the historical default ([`DEFAULT_LISTEN`]):
+    /// serve prefers it but, if occupied, falls back to an OS-assigned free port
+    /// rather than failing (no dead second listener). `true` means the operator
+    /// chose the address, so it is honored exactly and an occupied port fails
+    /// loudly (no silent substitution).
+    pub explicit_listen: bool,
     /// Inline API key (`--api-key`).
     pub api_key: Option<String>,
     /// Name of an env var holding the API key (`--api-key-env`); used only when
@@ -44,6 +52,7 @@ impl Default for ServeArgs {
     fn default() -> Self {
         Self {
             listen: DEFAULT_LISTEN.to_string(),
+            explicit_listen: false,
             api_key: None,
             api_key_env: None,
         }
@@ -151,6 +160,53 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
     socket.listen(1024)?;
     let std_listener: std::net::TcpListener = socket.into();
     tokio::net::TcpListener::from_std(std_listener)
+}
+
+/// Bind a verified-free listener, preferring `preferred` (US1, D1).
+///
+/// The race-free free-port primitive: when `preferred` is `Some`, attempt to
+/// bind it via [`bind_listener`]; on success return that live listener. On a
+/// bind failure (e.g. the port is occupied), or when `preferred` is `None`,
+/// bind `127.0.0.1:0` and let the OS assign an ephemeral free port — binding
+/// `:0` is atomic, so the returned listener is guaranteed-free with no
+/// check-then-bind TOCTOU gap. The caller serves directly on the returned
+/// listener, so the reported URL == the bound URL (FR-020).
+///
+/// This is the production path: it never drops and rebinds, so there is no
+/// window for another process to steal the chosen port. The thin
+/// [`probe_free_port`] wrapper exists for the decision-logic unit tests and
+/// callers that only need the resolved address.
+pub fn probe_free_listener(
+    preferred: Option<SocketAddr>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    if let Some(addr) = preferred
+        && let Ok(listener) = bind_listener(addr)
+    {
+        return Ok(listener);
+    }
+    // No preference, or the preferred port was occupied: bind an OS-assigned
+    // ephemeral port (atomic — never a dead second listener on a busy port).
+    let ephemeral: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+    bind_listener(ephemeral)
+}
+
+/// Resolve a verified-free [`SocketAddr`], preferring `preferred` (US1, D1).
+///
+/// Wraps [`probe_free_listener`]: tries `preferred` via a real bind, else binds
+/// `127.0.0.1:0` for an OS-assigned port, and returns the listener's
+/// `local_addr()`. The probe listener is dropped before returning, leaving a
+/// small rebind window — a second process could, in principle, grab the freed
+/// port between this call and the caller's rebind. Production serve uses
+/// [`probe_free_listener`] (which threads the live listener through, eliminating
+/// the window); this address-returning form is for callers that only need the
+/// decision (e.g. a "suggested free port" in the setup wizard) and the unit
+/// tests asserting the selection logic without holding a listener.
+///
+/// Signature per `contracts/free-port.md` / T005.
+pub fn probe_free_port(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
+    let listener = probe_free_listener(preferred)?;
+    listener.local_addr()
 }
 
 /// Error returned by [`run`] before/while binding the operator server.
@@ -345,7 +401,16 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     let onboarding_root = repo_root.clone();
     let runtime = build_serve_runtime(index, repo_root, auth.clone());
 
-    let listener = bind_listener(addr).map_err(|source| ServeError::Bind { addr, source })?;
+    // US1 (FR-001/002/003): an explicit operator-chosen `--listen` is honored
+    // exactly — an occupied port fails loudly (no substitution). The default
+    // address (no `--listen`) prefers `DEFAULT_LISTEN` but, if occupied, falls
+    // back to an OS-assigned free port via `probe_free_listener` (which threads
+    // the live listener through — no rebind window, no dead second listener).
+    let listener = if args.explicit_listen {
+        bind_listener(addr).map_err(|source| ServeError::Bind { addr, source })?
+    } else {
+        probe_free_listener(Some(addr)).map_err(|source| ServeError::Bind { addr, source })?
+    };
     let local_addr = listener
         .local_addr()
         .map_err(|source| ServeError::Bind { addr, source })?;
@@ -561,6 +626,7 @@ mod tests {
         // start (before binding) because the key would leak via argv.
         let args = ServeArgs {
             listen: "0.0.0.0:8787".to_string(),
+            explicit_listen: true,
             api_key: Some("inline-secret".to_string()),
             api_key_env: None,
         };
@@ -603,6 +669,7 @@ mod tests {
     async fn run_refuses_non_loopback_without_key() {
         let args = ServeArgs {
             listen: "0.0.0.0:8787".to_string(),
+            explicit_listen: true,
             api_key: None,
             api_key_env: None,
         };
@@ -616,6 +683,7 @@ mod tests {
     async fn run_rejects_unparseable_listen() {
         let args = ServeArgs {
             listen: "not-an-address".to_string(),
+            explicit_listen: true,
             api_key: Some("k".to_string()),
             api_key_env: None,
         };
@@ -630,5 +698,82 @@ mod tests {
         let local = listener.local_addr().expect("local_addr");
         assert!(local.ip().is_loopback());
         assert_ne!(local.port(), 0, "OS must assign a concrete port");
+    }
+
+    #[tokio::test]
+    async fn probe_free_port_uses_preferred_when_free() {
+        // Reserve an OS-assigned port, then free it, so we have a known-free
+        // address to prefer. probe_free_port must return exactly that port.
+        let scratch = bind_listener("127.0.0.1:0".parse().unwrap()).expect("scratch bind");
+        let preferred = scratch.local_addr().expect("local_addr");
+        drop(scratch);
+
+        let chosen = probe_free_port(Some(preferred)).expect("probe a free preferred port");
+        assert_eq!(
+            chosen, preferred,
+            "a free preferred port is honored exactly"
+        );
+    }
+
+    /// Occupy a loopback port with an **exclusive** listener (plain `std` bind,
+    /// no `SO_REUSEADDR`) — the honest reproduction of a real squatter
+    /// (`wslrelay`/another service). A `bind_listener` (which sets `SO_REUSEADDR`)
+    /// on this same port then fails: on Windows two sockets only share a port if
+    /// BOTH set `SO_REUSEADDR`, and on Linux `SO_REUSEADDR` does not let a second
+    /// socket bind an actively listening port. Using a `bind_listener` occupier
+    /// here would (wrongly) let the probe *share* the port and never fall back.
+    fn occupy_exclusive() -> (std::net::TcpListener, SocketAddr) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("exclusive occupy a loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn probe_free_port_falls_back_when_preferred_occupied() {
+        // Occupy a port exclusively, then prefer it: probe must fall back to a
+        // DIFFERENT, OS-assigned free loopback port (never the occupied, never :0).
+        let (occupied_listener, occupied) = occupy_exclusive();
+
+        let chosen = probe_free_port(Some(occupied)).expect("probe falls back to a free port");
+        assert_ne!(
+            chosen.port(),
+            occupied.port(),
+            "must not pick the occupied port"
+        );
+        assert_ne!(chosen.port(), 0, "must resolve a concrete OS-assigned port");
+        assert!(chosen.ip().is_loopback(), "fallback stays on loopback");
+
+        // The fallback address is genuinely bindable (verified-free).
+        let rebind = bind_listener(chosen).expect("the chosen fallback port is free");
+        drop(rebind);
+        drop(occupied_listener);
+    }
+
+    #[tokio::test]
+    async fn probe_free_listener_threads_a_live_listener() {
+        // The production primitive returns a live, serving-capable listener with
+        // no rebind window. Occupy the preferred port exclusively and confirm the
+        // returned listener is on a different, concrete port.
+        let (occupied_listener, occupied) = occupy_exclusive();
+
+        let listener = probe_free_listener(Some(occupied)).expect("probe a live fallback listener");
+        let local = listener.local_addr().expect("local_addr");
+        assert_ne!(
+            local.port(),
+            occupied.port(),
+            "fell back off the occupied port"
+        );
+        assert_ne!(local.port(), 0, "concrete OS-assigned port");
+        drop(listener);
+        drop(occupied_listener);
+    }
+
+    #[tokio::test]
+    async fn probe_free_port_none_preference_binds_ephemeral() {
+        // No preference: bind an OS-assigned ephemeral loopback port.
+        let chosen = probe_free_port(None).expect("probe with no preference");
+        assert!(chosen.ip().is_loopback());
+        assert_ne!(chosen.port(), 0, "OS must assign a concrete port");
     }
 }

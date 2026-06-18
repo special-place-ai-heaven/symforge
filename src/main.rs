@@ -141,6 +141,8 @@ fn main() -> anyhow::Result<()> {
         }
         Some(cli::Commands::Daemon) => run_daemon(),
         Some(cli::Commands::Serve(args)) => run_serve(args),
+        Some(cli::Commands::Setup(args)) => cli::setup::run(args),
+        Some(cli::Commands::Admin(args)) => cli::admin::run(args),
         Some(cli::Commands::Hook { subcommand }) => cli::hook::run_hook(subcommand.as_ref()),
         Some(cli::Commands::Trust { subcommand }) => cli::trust::run_trust(&subcommand),
         Some(cli::Commands::Update) => cli::update::run_update(),

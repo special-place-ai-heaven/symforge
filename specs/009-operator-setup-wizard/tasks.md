@@ -28,11 +28,11 @@ MCP prompt in `src/protocol/prompts.rs`, tests under `tests/`. All 009 code `#[c
 
 ## Phase 1: Setup
 
-- [ ] T001 Capture baseline green gate (fmt/check/clippy/test/build --release/embed) via terminal-commander; kill stray procs first (do NOT blanket-kill a running symforge).
-- [ ] T002 [P] Add `Commands::Setup(SetupCliArgs)` and `Commands::Admin(AdminCliArgs)` variants to `src/cli/mod.rs` (`Commands` enum) + dispatch stubs in `src/main.rs` (return "not yet implemented") so the surface compiles; gate behind `#[cfg(feature = "server")]`.
-- [ ] T003 [P] Create module skeletons: `src/cli/setup.rs`, `src/cli/admin.rs`, `src/cli/operator_profile.rs`, `src/cli/browser.rs`, `src/cli/harness_command.rs` (empty `pub fn run`/types, server-gated), and register them in `src/cli/mod.rs`.
+- [X] T001 Baseline green (main@90f896c FF'd green; 009 added only docs). Gates run via Bash (terminal-commander daemon was unavailable mid-session).
+- [X] T002 [P] `Commands::Setup`/`Commands::Admin` variants + main.rs dispatch — DONE (matched the structural `cfg(server)` gating at lib.rs:26-47; no redundant per-item cfg).
+- [X] T003 [P] module skeletons (setup/admin/operator_profile/browser/harness_command), stubs bail loudly — DONE.
 
-**Checkpoint**: surface compiles green; embed unaffected.
+**Checkpoint**: surface compiles green; embed unaffected. ✅
 
 ---
 
@@ -45,14 +45,14 @@ OS-assigned); explicit-occupied fails loudly; reported URL == bound URL.
 to the reported URL succeeds, no dead listener; 8787 free → binds 8787; explicit-occupied → loud error.
 
 ### Tests for US1
-- [ ] T004 [P] [US1] Add `serve_binds_free_port_when_default_occupied` (tests/serve_port.rs): occupy 8787, start serve no-addr, assert a different reachable bound port + GET to the reported URL succeeds + no non-serving listener (SC-003); control (8787 free → 8787); explicit-occupied → loud conflict. Fails pre-fix.
+- [X] T004 [P] [US1] `tests/serve_port.rs` regression — DONE: occupy with an EXCLUSIVE listener (SO_REUSEADDR false-repro caught), probe falls back, starts a real axum server + reqwest GET→200 (reachable, SC-003/FR-020); control (8787-free→8787); explicit-occupied→loud error. Fails pre-fix.
 
 ### Implementation for US1
-- [ ] T005 [US1] Add `probe_free_port(preferred: Option<SocketAddr>) -> io::Result<SocketAddr>` in `src/server/serve.rs` (reuse `bind_listener`): try preferred via real bind; on failure bind `127.0.0.1:0` and return the OS-assigned address (D1, contracts/free-port.md).
-- [ ] T006 [US1] Wire the no-explicit-address serve path (`serve::run`, default `DEFAULT_LISTEN`) through `probe_free_port`; keep explicit-address occupied → loud error (no substitution, FR-002/003); print the exact bound URL (FR-001/020).
-- [ ] T007 [US1] Per-phase gate via terminal-commander; confirm T004 passes. Commit Phase US1.
+- [X] T005 [US1] `probe_free_listener` (zero-TOCTOU, returns the live listener) + `probe_free_port` (addr form, documented small window) in `src/server/serve.rs` — DONE (D1).
+- [X] T006 [US1] `ServeCliArgs.listen: Option<String>` + `explicit_listen` carries intent: default→probe(prefer 8787 else :0); explicit→bind exactly, loud on occupied (FR-002/003); reported URL == bound URL — DONE.
+- [X] T007 [US1] full gate green (test 90 ok/0 fail, clippy/fmt/embed clean, build --release). Commit Phase US1.
 
-**Checkpoint**: US1 shippable alone — the real port bug fixed.
+**Checkpoint**: US1 shippable alone — the real 8787 port bug fixed. ✅
 
 ---
 
