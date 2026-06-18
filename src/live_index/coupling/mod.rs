@@ -78,7 +78,7 @@ impl AnchorKey {
 }
 
 fn normalize_path(s: &str) -> String {
-    s.replace('\\', "/")
+    crate::paths::normalize_repo_path(s)
 }
 
 #[cfg(test)]

@@ -76,18 +76,6 @@ fn startup_plan(
     }
 }
 
-fn checkpoint_interval_from_value(value: Option<&str>) -> Option<std::time::Duration> {
-    persist::checkpoint_interval_from_value(value)
-}
-
-fn checkpoint_interval_from_env() -> Option<std::time::Duration> {
-    checkpoint_interval_from_value(
-        std::env::var(persist::CHECKPOINT_INTERVAL_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
 fn spawn_periodic_checkpoint(
     index: live_index::SharedIndex,
     root: std::path::PathBuf,
@@ -401,7 +389,7 @@ async fn run_local_mcp_server_async(
     }
 
     let periodic_checkpoint = watcher_root.as_ref().and_then(|root| {
-        checkpoint_interval_from_env().map(|interval| {
+        persist::checkpoint_interval_from_env().map(|interval| {
             tracing::info!(
                 interval_secs = interval.as_secs(),
                 env = persist::CHECKPOINT_INTERVAL_ENV,
@@ -468,11 +456,11 @@ async fn run_local_mcp_server_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupIndexLogView, StartupPlan, checkpoint_interval_from_value, local_empty_reason,
-        startup_index_log_view, startup_plan,
+        StartupIndexLogView, StartupPlan, local_empty_reason, startup_index_log_view, startup_plan,
     };
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+    use symforge::live_index::persist::checkpoint_interval_from_value;
     use symforge::live_index::{
         IndexLoadSource, PublishedIndexState, PublishedIndexStatus, SnapshotVerifyState,
     };

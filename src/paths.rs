@@ -41,6 +41,17 @@ pub fn os_tagged_runtime_file_name(stem: &str, ext: &str) -> String {
     format!("{stem}.{tag}.{ext}", tag = os_runtime_tag())
 }
 
+/// Normalize a repo-relative path to forward-slash form so Windows and Unix
+/// key the same row / anchor. This is the shared core of the per-subsystem
+/// normalizers (coupling anchors, git-temporal ledger paths, frecency rows):
+/// it only swaps `\` for `/`. Callers that additionally strip a `./` prefix or
+/// lowercase keep that extra step at their own site — this helper deliberately
+/// does NOT, so it stays a drop-in for the bare `replace('\\', "/")` pattern.
+#[must_use]
+pub fn normalize_repo_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Resolve the canonical symforge data directory under `base`.
 pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
     base.join(SYMFORGE_DIR_NAME)

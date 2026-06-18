@@ -619,14 +619,6 @@ impl FileContentOptions {
             ),
         }
     }
-
-    pub fn exact_lines(
-        path: impl Into<String>,
-        start_line: Option<u32>,
-        end_line: Option<u32>,
-    ) -> Self {
-        Self::for_explicit_path_read(path, start_line, end_line)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -736,7 +736,7 @@ fn parse_numstat_line(line: &str) -> Option<String> {
 
 #[cfg(test)]
 fn normalize_git_path(path: &str) -> String {
-    path.replace('\\', "/")
+    crate::paths::normalize_repo_path(path)
 }
 
 #[cfg(test)]

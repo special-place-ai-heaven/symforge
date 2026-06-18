@@ -338,22 +338,18 @@ impl AapView {
             running_version: comparison.running_version().to_string(),
             drift: comparison.label().to_string(),
             drifted: comparison.is_drift(),
-            indexed_roots: aap_indexed_roots(detection),
+            // AAP-indexed roots (read-only): surface the detected AAP root itself
+            // when present (the sibling checkout AAP indexes); richer backend-
+            // reported roots are a future extension (E4). Empty when nothing is
+            // known — never fabricated data (SC-002).
+            indexed_roots: detection
+                .root
+                .as_ref()
+                .map(|p| vec![p.display().to_string()])
+                .unwrap_or_default(),
             presets: presets.into(),
         }
     }
-}
-
-/// Discover AAP-indexed project roots (read-only). Today this surfaces the
-/// detected AAP root itself when present (the sibling checkout AAP indexes);
-/// richer backend-reported roots are a future extension (E4). Returns an empty
-/// list when nothing is known — never fabricated data (SC-002).
-fn aap_indexed_roots(detection: &AapDetection) -> Vec<String> {
-    detection
-        .root
-        .as_ref()
-        .map(|p| vec![p.display().to_string()])
-        .unwrap_or_default()
 }
 
 /// API-key record projection for `/api/v1/keys` (never carries a raw secret).

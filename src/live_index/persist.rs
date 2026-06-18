@@ -58,7 +58,7 @@ pub struct IndexedFileSnapshot {
     pub references: Vec<ReferenceRecord>,
     pub alias_map: HashMap<String, String>,
     /// Seconds since UNIX epoch of the file's last modification time at index time.
-    /// Used by stat_check_files for mtime comparison.
+    /// Used by `stat_check_files_from_view` for mtime comparison.
     pub mtime_secs: u64,
 }
 
@@ -436,15 +436,6 @@ pub fn snapshot_to_live_index(snapshot: IndexSnapshot, project_root: &Path) -> L
 /// Compares `byte_len` and `mtime_secs` stored in the snapshot against current
 /// filesystem metadata. Files with differing size or mtime are in `changed`.
 /// Files with `ENOENT` go to `deleted`. Files on disk not in the index go to `new_files`.
-pub fn stat_check_files(
-    index: &LiveIndex,
-    snapshot_mtimes: &HashMap<String, u64>,
-    root: &Path,
-) -> StatCheckResult {
-    let verify_view = capture_verify_view(index);
-    stat_check_files_from_view(&verify_view, snapshot_mtimes, root)
-}
-
 fn stat_check_files_from_view(
     verify_view: &VerifyIndexView,
     snapshot_mtimes: &HashMap<String, u64>,
@@ -514,11 +505,6 @@ fn stat_check_files_from_view(
 ///
 /// Returns paths of files whose on-disk content hash differs from the index.
 /// Default: 10% (pass 0.10).
-pub fn spot_verify_sample(index: &LiveIndex, root: &Path, sample_pct: f64) -> Vec<String> {
-    let verify_view = capture_verify_view(index);
-    spot_verify_sample_from_view(&verify_view, root, sample_pct)
-}
-
 fn spot_verify_sample_from_view(
     verify_view: &VerifyIndexView,
     root: &Path,
@@ -1731,7 +1717,7 @@ mod tests {
         );
     }
 
-    // ── stat_check_files tests ────────────────────────────────────────────────
+    // ── stat_check_files_from_view tests ──────────────────────────────────────
 
     #[test]
     fn test_stat_check_identifies_changed_file_by_size() {
@@ -1792,7 +1778,7 @@ mod tests {
         let mut mtimes: HashMap<String, u64> = HashMap::new();
         mtimes.insert("a.rs".to_string(), mtime);
 
-        let result = stat_check_files(&index, &mtimes, tmp.path());
+        let result = stat_check_files_from_view(&capture_verify_view(&index), &mtimes, tmp.path());
         assert!(
             result.changed.contains(&"a.rs".to_string()),
             "changed by size mismatch"
@@ -1846,7 +1832,8 @@ mod tests {
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
 
-        let result = stat_check_files(&index, &HashMap::new(), tmp.path());
+        let result =
+            stat_check_files_from_view(&capture_verify_view(&index), &HashMap::new(), tmp.path());
         assert!(
             result.deleted.contains(&"ghost.rs".to_string()),
             "missing file should be in deleted"
@@ -1862,7 +1849,8 @@ mod tests {
         // Empty index
         let index = make_live_index_with_files(vec![]);
 
-        let result = stat_check_files(&index, &HashMap::new(), tmp.path());
+        let result =
+            stat_check_files_from_view(&capture_verify_view(&index), &HashMap::new(), tmp.path());
         assert!(
             result.new_files.contains(&"new.rs".to_string()),
             "new file should be detected"
@@ -1920,7 +1908,8 @@ mod tests {
         index.rebuild_path_indices();
 
         // Sample 100% to ensure the file is included
-        let mismatches = spot_verify_sample(&index, tmp.path(), 1.0);
+        let mismatches =
+            spot_verify_sample_from_view(&capture_verify_view(&index), tmp.path(), 1.0);
         assert!(
             mismatches.contains(&"a.rs".to_string()),
             "hash mismatch should be detected"
@@ -1976,7 +1965,8 @@ mod tests {
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
 
-        let mismatches = spot_verify_sample(&index, tmp.path(), 1.0);
+        let mismatches =
+            spot_verify_sample_from_view(&capture_verify_view(&index), tmp.path(), 1.0);
         assert!(mismatches.is_empty(), "no mismatch when hash is current");
     }
 
@@ -1984,7 +1974,8 @@ mod tests {
     fn test_spot_verify_empty_index_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let index = make_live_index_with_files(vec![]);
-        let mismatches = spot_verify_sample(&index, tmp.path(), 0.10);
+        let mismatches =
+            spot_verify_sample_from_view(&capture_verify_view(&index), tmp.path(), 0.10);
         assert!(mismatches.is_empty(), "empty index returns empty vec");
     }
 

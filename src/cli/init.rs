@@ -53,14 +53,6 @@ impl InitPaths {
         )
     }
 
-    fn from_home_and_working_dir(home: &std::path::Path, working_dir: &std::path::Path) -> Self {
-        Self::from_home_working_dir_and_desktop_config(
-            home,
-            working_dir,
-            claude_desktop_config_path(home, None),
-        )
-    }
-
     fn from_home_working_dir_and_desktop_config(
         home: &std::path::Path,
         working_dir: &std::path::Path,
@@ -241,7 +233,14 @@ pub fn run_init_with_context(
     working_dir: &std::path::Path,
     binary_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let paths = InitPaths::from_home_and_working_dir(home_dir, working_dir);
+    // Injected-path construction (tests + non-prod callers): use the home-relative
+    // Claude Desktop config path, never the host's real APPDATA, so paths stay
+    // deterministic. Production wiring uses `from_current_environment`.
+    let paths = InitPaths::from_home_working_dir_and_desktop_config(
+        home_dir,
+        working_dir,
+        claude_desktop_config_path(home_dir, None),
+    );
 
     run_init_with_paths(client, paths, home_dir, working_dir, binary_path)
 }

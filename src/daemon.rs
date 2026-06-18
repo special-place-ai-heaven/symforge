@@ -46,19 +46,10 @@ use crate::watcher::{self, WatcherInfo};
 const LEGACY_DAEMON_PORT_FILE: &str = "daemon.port";
 const LEGACY_DAEMON_PID_FILE: &str = "daemon.pid";
 // Lock files are transient and never read across the upgrade boundary, so the legacy
-// name is only needed by the test-only cleanup helper.
+// name is only needed by the test-only cleanup helper and the test-only assertions
+// that write/read the legacy un-tagged names.
 #[cfg(test)]
 const LEGACY_DAEMON_START_LOCK_FILE: &str = "daemon.starting";
-
-// Back-compat aliases for in-crate tests that write/assert the legacy un-tagged names.
-// Production read paths fall back to these, so such tests keep passing; production WRITE
-// paths use the OS-tagged names via the *_file_name() helpers above.
-#[cfg(test)]
-const DAEMON_PORT_FILE: &str = LEGACY_DAEMON_PORT_FILE;
-#[cfg(test)]
-const DAEMON_PID_FILE: &str = LEGACY_DAEMON_PID_FILE;
-#[cfg(test)]
-const DAEMON_START_LOCK_FILE: &str = LEGACY_DAEMON_START_LOCK_FILE;
 
 fn daemon_port_file_name() -> String {
     crate::paths::os_tagged_runtime_file_name("daemon", "port")
@@ -3270,14 +3261,14 @@ mod tests {
         assert!(!final_health.executable_path.is_empty());
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PID_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PID_FILE)).await;
         assert!(
-            !daemon_home.path().join(DAEMON_PORT_FILE).exists(),
+            !daemon_home.path().join(LEGACY_DAEMON_PORT_FILE).exists(),
             "daemon port file should be removed on shutdown"
         );
         assert!(
-            !daemon_home.path().join(DAEMON_PID_FILE).exists(),
+            !daemon_home.path().join(LEGACY_DAEMON_PID_FILE).exists(),
             "daemon pid file should be removed on shutdown"
         );
     }
@@ -3452,7 +3443,7 @@ mod tests {
             .expect("authorized close status");
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -3552,7 +3543,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -3715,7 +3706,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     /// SF-007 regression: `checkpoint_now` must forward to the daemon in
@@ -3793,7 +3784,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -3804,8 +3795,11 @@ mod tests {
 
         let health = DaemonState::new().health();
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
-        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), port.to_string())
-            .expect("write daemon port");
+        std::fs::write(
+            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            port.to_string(),
+        )
+        .expect("write daemon port");
 
         let identity = current_daemon_identity();
         let selected = daemon_port_if_compatible(&identity)
@@ -3832,8 +3826,11 @@ mod tests {
             pid: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
-        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), port.to_string())
-            .expect("write daemon port");
+        std::fs::write(
+            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            port.to_string(),
+        )
+        .expect("write daemon port");
 
         let identity = current_daemon_identity();
         let selected = daemon_port_if_compatible(&identity)
@@ -3897,10 +3894,13 @@ mod tests {
             pid: Some(child_pid),
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
-        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), port.to_string())
-            .expect("write daemon port");
         std::fs::write(
-            daemon_home.path().join(DAEMON_PID_FILE),
+            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            port.to_string(),
+        )
+        .expect("write daemon port");
+        std::fs::write(
+            daemon_home.path().join(LEGACY_DAEMON_PID_FILE),
             child_pid.to_string(),
         )
         .expect("write daemon pid");
@@ -3934,15 +3934,18 @@ mod tests {
             pid: None,
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
-        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), port.to_string())
-            .expect("write daemon port");
+        std::fs::write(
+            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            port.to_string(),
+        )
+        .expect("write daemon port");
 
         stop_incompatible_recorded_daemon(&current_daemon_identity())
             .await
             .expect("stop incompatible daemon");
 
         assert!(
-            !daemon_home.path().join(DAEMON_PORT_FILE).exists(),
+            !daemon_home.path().join(LEGACY_DAEMON_PORT_FILE).exists(),
             "incompatible daemon port file should be cleared"
         );
 
@@ -4000,7 +4003,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4066,7 +4069,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4121,7 +4124,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4189,7 +4192,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4294,7 +4297,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     /// T016 / TR-01 / FR-006 / FR-007 (SC-002): in the default daemon-proxy
@@ -4434,7 +4437,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     /// Regression: a daemon-proxy `index_folder` switch must invalidate any
@@ -4554,7 +4557,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4667,7 +4670,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     #[tokio::test]
@@ -4727,7 +4730,7 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
     // -----------------------------------------------------------------
@@ -5012,9 +5015,9 @@ mod tests {
         // and that it doesn't panic — actual file removal is best-effort.
         let dir = TempDir::new().expect("temp dir");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", dir.path());
-        let port_file = dir.path().join(DAEMON_PORT_FILE);
-        let pid_file = dir.path().join(DAEMON_PID_FILE);
-        let lock_file = dir.path().join(DAEMON_START_LOCK_FILE);
+        let port_file = dir.path().join(LEGACY_DAEMON_PORT_FILE);
+        let pid_file = dir.path().join(LEGACY_DAEMON_PID_FILE);
+        let lock_file = dir.path().join(LEGACY_DAEMON_START_LOCK_FILE);
 
         std::fs::write(&port_file, "12345").expect("write port");
         std::fs::write(&pid_file, "99999").expect("write pid");
@@ -5033,9 +5036,9 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let port_file = daemon_home.path().join(DAEMON_PORT_FILE);
-        let pid_file = daemon_home.path().join(DAEMON_PID_FILE);
-        let lock_file = daemon_home.path().join(DAEMON_START_LOCK_FILE);
+        let port_file = daemon_home.path().join(LEGACY_DAEMON_PORT_FILE);
+        let pid_file = daemon_home.path().join(LEGACY_DAEMON_PID_FILE);
+        let lock_file = daemon_home.path().join(LEGACY_DAEMON_START_LOCK_FILE);
 
         std::fs::write(&port_file, "12345").expect("write port");
         std::fs::write(&pid_file, "99999").expect("write pid");
@@ -5057,8 +5060,11 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        std::fs::write(daemon_home.path().join(DAEMON_PORT_FILE), "not-a-port")
-            .expect("write corrupt port");
+        std::fs::write(
+            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            "not-a-port",
+        )
+        .expect("write corrupt port");
 
         let identity = current_daemon_identity();
         let selected = daemon_port_if_compatible(&identity)

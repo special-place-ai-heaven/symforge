@@ -479,19 +479,6 @@ impl SymForgeServer {
         }
     }
 
-    /// Record token savings from any MCP tool that replaces raw file reads.
-    pub(crate) fn record_tool_savings(&self, estimated_raw_tokens: u64, output_tokens: u64) {
-        if let Some(ref stats) = self.token_stats {
-            let saved = estimated_raw_tokens.saturating_sub(output_tokens);
-            stats
-                .read_saved_tokens
-                .fetch_add(saved, std::sync::atomic::Ordering::Relaxed);
-            stats
-                .read_fires
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     /// Record token savings from a named MCP tool, tracking per-tool breakdown.
     pub(crate) fn record_tool_savings_named(
         &self,

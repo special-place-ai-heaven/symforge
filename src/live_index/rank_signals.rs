@@ -313,8 +313,16 @@ fn registry() -> &'static RwLock<Vec<Box<dyn RankSignal>>> {
     })
 }
 
-/// Append a `RankSignal` to the process-wide registry. Feature tentacles call
-/// this at their own initialization time; the registry never empties.
+/// Append a `RankSignal` to the process-wide registry — the public **extension
+/// seam** for the search ranker. The default signals (`PathMatchSignal`,
+/// `CoChangeSignal`) already run in production via [`combine`]; this is how a
+/// feature tentacle or embedder contributes an additional signal to the
+/// weighted-sum fusion. It has no in-tree production caller yet (only the fusion
+/// tests exercise it) — that is a vision-aligned seam awaiting its first
+/// contributor, NOT dead code. Keep it public; do not gate it to tests.
+///
+// ponytail: extension seam, no prod caller yet. Wire a real signal here (e.g. a
+// recency or import-graph signal) when one earns its weight; do not delete.
 pub fn register(signal: Box<dyn RankSignal>) {
     let mut guard = registry().write().expect("rank_signals registry poisoned");
     guard.push(signal);

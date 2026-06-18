@@ -9131,7 +9131,8 @@ impl SymForgeServer {
             params.0.language.as_deref(),
             code_only,
         );
-        self.record_tool_savings(
+        self.record_tool_savings_named(
+            "diff_symbols",
             format::estimate_tokens_from_chars(format::estimate_listing_baseline_chars(
                 output.len(),
             )),
