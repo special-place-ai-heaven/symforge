@@ -196,7 +196,8 @@ pub fn start_operator_server(
 /// probe listener is dropped before returning, so the same documented small
 /// rebind window as `serve::probe_free_port` applies — closed in practice by the
 /// `SO_REUSEADDR` rebind inside `serve::run` plus the step-3 reachability gate.
-fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
+/// Select a verified-free loopback address (pub for setup wizard reuse).
+pub(crate) fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
     if let Some(addr) = preferred
         && let Ok(listener) = std::net::TcpListener::bind(addr)
     {

@@ -10,9 +10,21 @@
 //! and the `SetupSink` seam land in later phases (T009/T014-T019).
 
 use std::io::{BufRead, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
+use anyhow::Context;
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+use crate::cli::admin::{
+    operator_server_reachable, start_operator_server, ServerSessionDescriptor,
+};
+use crate::cli::browser::{BrowserOpener, OsBrowserOpener};
+use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
+use crate::cli::harness_apply::{self, ApplyOutcome, PlannedAction};
+use crate::cli::operator_profile::{AuthPosture, OperatorSetupProfile};
+use crate::server::serve::DEFAULT_LISTEN;
 
 /// Which parts of SymForge a setup run configures.
 ///
@@ -187,74 +199,104 @@ impl SetupContext {
 
     /// Where [`OperatorSetupProfile`] is stored (`<project>/.symforge/`).
     pub fn project_base(&self) -> std::path::PathBuf {
-        crate::discovery::find_project_root()
-            .unwrap_or_else(|| self.working_dir.clone())
+        self.working_dir.clone()
     }
 
-    fn registry(&self) -> HarnessRegistry {
+    /// The harness registry resolved against this context's home + working dir.
+    /// Fixture seam: tests build the context over a TempDir so the wizard scans
+    /// fixture configs, never the real operator's (FR-018).
+    pub fn registry(&self) -> HarnessRegistry {
         HarnessRegistry::known_with(&self.home, &self.working_dir)
     }
 }
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+/// The result of one wizard run, returned for caller messaging and test
+/// assertions (FR-017: every effect is observable without scraping stderr).
+///
+/// Production [`run`] discards it after the sink has already narrated each step;
+/// tests inspect it to assert outcomes deterministically — the apply results,
+/// the reachable server descriptor, the persisted profile — over fixtures.
+#[derive(Debug)]
+pub struct WizardOutcome {
+    /// The installation type the wizard actually ran with.
+    pub installation_type: InstallationType,
+    /// The running operator server (started or reused) for a server mode; always
+    /// reachable when present (FR-020). `None` for in-harness-only or a decline.
+    pub session: Option<ServerSessionDescriptor>,
+    /// `true` when a server mode reused an already-reachable server instead of
+    /// starting a second one (FR-013 idempotency / SC-004).
+    pub reused_server: bool,
+    /// Per-harness apply outcomes (empty unless `installation_type == Both`).
+    pub harness_outcomes: Vec<ApplyOutcome>,
+    /// The browser-open outcome for the dashboard, if a server was reported.
+    pub browser_outcome: Option<crate::cli::browser::BrowserOpenOutcome>,
+    /// The profile persisted by this run (FR-012). On a decline this carries the
+    /// would-be choices but was NOT written to disk (`cancelled == true`).
+    pub profile: OperatorSetupProfile,
+    /// `true` when the operator declined the restated plan; nothing was changed.
+    pub cancelled: bool,
+}
 
-use crate::cli::admin::{
-    operator_server_reachable, start_operator_server, ServerSessionDescriptor,
-};
-use crate::cli::browser::{BrowserOpener, OsBrowserOpener};
-use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
-use crate::cli::harness_apply::{self, ApplyOutcome, PlannedAction};
-use crate::cli::operator_profile::{AuthPosture, OperatorSetupProfile};
-use crate::server::serve::DEFAULT_LISTEN;
-
-use super::operator_profile;
-
-/// Entry point for `symforge setup`.
+/// Entry point for `symforge setup`. Wires the real seams (stderr sink, OS
+/// browser, live home/cwd) into [`run_wizard`] and discards the outcome — the
+/// sink has already narrated every step to the operator.
 pub fn run(args: SetupCliArgs) -> anyhow::Result<()> {
     let ctx = SetupContext::from_env()?;
     if args.non_interactive {
+        // Non-interactive answers are pre-supplied (FR-014); `--yes` is the
+        // scripted confirmation, so no terminal read occurs.
         let mut sink = ScriptedSetupSink::new([], args.yes);
         let browser = crate::cli::browser::NoopBrowserOpener::default();
-        run_with(args, &ctx, &mut sink, &browser)
+        run_wizard(args, &ctx, &mut sink, &browser)?;
     } else {
         let mut sink = StderrSetupSink;
         let browser = OsBrowserOpener;
-        run_with(args, &ctx, &mut sink, &browser)
+        run_wizard(args, &ctx, &mut sink, &browser)?;
     }
+    Ok(())
 }
 
-/// Testable wizard core: all terminal and browser I/O via seams (FR-017).
-pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
+/// Testable wizard core: scan -> choose -> restate/confirm -> apply -> serve ->
+/// open -> persist, with every terminal / browser / process effect behind a
+/// seam (FR-017). Tests call this directly with a [`ScriptedSetupSink`], a
+/// [`crate::cli::browser::NoopBrowserOpener`], and a TempDir-backed
+/// [`SetupContext`], then assert on the returned [`WizardOutcome`] — no real
+/// terminal, no real browser, and (apart from a deliberate loopback bind) no
+/// network (FR-014/FR-018).
+pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
     args: SetupCliArgs,
     ctx: &SetupContext,
     sink: &mut S,
     browser: &B,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WizardOutcome> {
     let registry = ctx.registry();
     let project_base = ctx.project_base();
     let existing_profile = OperatorSetupProfile::load(&project_base);
 
+    // --- Step 1: scan (read-only, FR-004) -----------------------------------
     let suggested_port = suggest_free_port(args.port)?;
     sink.status(&format!(
         "SymForge setup — OS: {} — suggested port: {suggested_port}",
         std::env::consts::OS
     ));
-
     for status in scan_harness_summary(&registry, None) {
         sink.status(&status);
     }
 
+    // Report (read-only) whether a remembered server is already up (FR-004/013).
     let remembered = existing_profile.as_ref().map(|p| p.port);
+    let mut remembered_reachable: Option<SocketAddr> = None;
     if let Some(port) = remembered {
         let addr = loopback_addr(port);
         if operator_server_reachable(addr, Duration::from_millis(500)) {
+            remembered_reachable = Some(addr);
             sink.status(&format!(
-                "Operator server already reachable on {addr} (profile port {port})"
+                "Operator server already reachable on {addr} (profile port {port}) — will reuse"
             ));
         }
     }
 
+    // --- Step 2: choose (FR-005/006) ----------------------------------------
     let installation_type = resolve_installation_type(&args, sink)?;
     let selected_ids = resolve_harness_ids(&args, &registry);
     let bind_port = args.port.unwrap_or(suggested_port);
@@ -266,6 +308,11 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
     );
     let needs_harness_http = installation_type == InstallationType::Both;
 
+    // --- Step 3: restate + confirm (FR-008) ---------------------------------
+    // The confirm always routes through the sink so a non-interactive run uses
+    // the pre-supplied (scripted) answer and the restate is recorded for
+    // assertion. `--yes` short-circuits the prompt for scripts; an interactive
+    // decline exits having changed nothing.
     let action_plan = build_action_plan(
         installation_type,
         &selected_ids,
@@ -273,14 +320,27 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         needs_server,
         needs_harness_http,
     );
-    if !args.yes && !args.non_interactive {
-        if !sink.confirm(&action_plan) {
-            sink.status("Setup cancelled — no changes made.");
-            return Ok(());
-        }
-    } else if !args.yes && args.non_interactive {
-        anyhow::bail!("non-interactive setup requires `--yes` to confirm the action plan");
-    } else if !args.non_interactive {
+    if !args.yes && !sink.confirm(&action_plan) {
+        sink.status("Setup cancelled — no changes made.");
+        let profile = OperatorSetupProfile::new(
+            installation_type,
+            bind_port,
+            AuthPosture::LoopbackNoKey,
+            &selected_ids,
+            now_epoch_ms(),
+        );
+        return Ok(WizardOutcome {
+            installation_type,
+            session: None,
+            reused_server: false,
+            harness_outcomes: Vec::new(),
+            browser_outcome: None,
+            profile,
+            cancelled: true,
+        });
+    }
+    if args.yes {
+        // Still surface the plan even when auto-confirming (FR-008 visibility).
         sink.status(&action_plan);
     }
 
@@ -290,16 +350,23 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         );
     }
 
+    // --- Step 5: server mode (FR-007/010/011/013) ---------------------------
     let mut session: Option<ServerSessionDescriptor> = None;
+    let mut reused_server = false;
     if needs_server {
-        if let Some(port) = remembered {
-            let addr = loopback_addr(port);
-            if operator_server_reachable(addr, Duration::from_millis(500)) {
-                session = Some(ServerSessionDescriptor::for_addr(addr, true));
-            }
+        if let Some(addr) = remembered_reachable {
+            // FR-013: reuse the already-running server; never start a second one.
+            session = Some(ServerSessionDescriptor::for_addr(addr, true));
+            reused_server = true;
+            sink.status(&format!("Reusing running operator server on {addr}"));
         }
         if session.is_none() {
             sink.status(&format!("Starting operator server on {bind_addr}…"));
+            // FR-007: a loopback bind requires no key — `AuthConfig::refuse_to_start`
+            // permits a keyless loopback serve. A routable bind would require a key
+            // sourced from the env (api_key_env), never an inline key; serve::run
+            // enforces refuse-to-start for any non-loopback address regardless.
+            // This slice binds loopback only, so no key is passed.
             session = Some(start_operator_server(
                 Some(bind_addr),
                 None,
@@ -312,10 +379,12 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         sink.status(&format!("Attach:    {}", desc.attach_url));
     }
 
+    // --- Step 4: apply harness attach entries (FR-009) ----------------------
+    let mut harness_outcomes = Vec::new();
     if needs_harness_http {
-        let desc = session.as_ref().context(
-            "internal error: harness HTTP attach requires a running operator server",
-        )?;
+        let desc = session
+            .as_ref()
+            .context("internal error: harness HTTP attach requires a running operator server")?;
         let attach_entry = AttachEntry::new(desc.attach_url.clone(), None);
         let subset = registry_subset(&registry, &selected_ids);
         let plan = harness_apply::plan(&subset, &attach_entry);
@@ -325,17 +394,11 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
                 PlannedAction::Add => "add",
                 PlannedAction::Refresh => "refresh",
                 PlannedAction::Skip(reason) => {
-                    sink.status(&format!(
-                        "  [skip] {} ({reason})",
-                        change.id.display_name()
-                    ));
+                    sink.status(&format!("  [skip] {} ({reason})", change.id.display_name()));
                     continue;
                 }
                 PlannedAction::Error(reason) => {
-                    sink.status(&format!(
-                        "  [error] {} ({reason})",
-                        change.id.display_name()
-                    ));
+                    sink.status(&format!("  [error] {} ({reason})", change.id.display_name()));
                     continue;
                 }
             };
@@ -345,7 +408,8 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
                 change.config_path.display()
             ));
         }
-        for outcome in harness_apply::apply(&plan) {
+        harness_outcomes = harness_apply::apply(&plan);
+        for outcome in &harness_outcomes {
             match outcome {
                 ApplyOutcome::Wrote {
                     id,
@@ -372,6 +436,7 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         }
     }
 
+    // --- Step 6: persist (FR-012) -------------------------------------------
     let bound_port = session
         .as_ref()
         .map(|s| s.bound_addr.port())
@@ -387,16 +452,24 @@ pub fn run_with<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         .save(&project_base)
         .context("could not persist operator setup profile")?;
 
+    // --- Step 5b: offer to open the dashboard (FR-011) ----------------------
+    let mut browser_outcome = None;
     if let Some(desc) = &session {
         let outcome = browser.open_url(&desc.dashboard_url);
-        sink.status(&format!(
-            "Browser: {:?} — open {}",
-            outcome, desc.dashboard_url
-        ));
+        sink.status(&format!("Browser: {outcome:?} — open {}", desc.dashboard_url));
+        browser_outcome = Some(outcome);
     }
 
     sink.status("Setup complete.");
-    Ok(())
+    Ok(WizardOutcome {
+        installation_type,
+        session,
+        reused_server,
+        harness_outcomes,
+        browser_outcome,
+        profile,
+        cancelled: false,
+    })
 }
 
 fn now_epoch_ms() -> i64 {
@@ -414,7 +487,7 @@ fn suggest_free_port(preferred: Option<u16>) -> anyhow::Result<u16> {
     let preferred_addr = preferred
         .map(loopback_addr)
         .or_else(|| DEFAULT_LISTEN.parse().ok());
-    let addr = crate::cli::admin::select_free_addr_std_for_setup(preferred_addr)
+    let addr = crate::cli::admin::select_free_addr_std(preferred_addr)
         .map_err(|e| anyhow::anyhow!("could not find a free operator-server port: {e}"))?;
     Ok(addr.port())
 }
@@ -445,7 +518,10 @@ fn format_harness_state(state: &HarnessState) -> &'static str {
     }
 }
 
-fn resolve_installation_type(args: &SetupCliArgs, sink: &mut dyn SetupSink) -> anyhow::Result<InstallationType> {
+fn resolve_installation_type<S: SetupSink + ?Sized>(
+    args: &SetupCliArgs,
+    sink: &mut S,
+) -> anyhow::Result<InstallationType> {
     if let Some(t) = args.installation_type {
         return Ok(t);
     }
@@ -499,11 +575,10 @@ fn harness_id_from_slug(slug: &str) -> Option<HarnessId> {
 }
 
 fn registry_subset(registry: &HarnessRegistry, ids: &[HarnessId]) -> HarnessRegistry {
-    let id_set: std::collections::HashSet<_> = ids.iter().copied().collect();
     let targets = registry
         .targets()
         .iter()
-        .filter(|t| id_set.contains(&t.id))
+        .filter(|t| ids.contains(&t.id))
         .cloned()
         .collect();
     HarnessRegistry::from_targets(targets)
@@ -516,7 +591,10 @@ fn build_action_plan(
     needs_server: bool,
     needs_harness_http: bool,
 ) -> String {
-    let mut lines = vec![format!("Planned actions ({installation_type:?}):")];
+    let mut lines = vec![format!(
+        "Planned actions ({}):",
+        installation_type_label(installation_type)
+    )];
     if needs_server {
         lines.push(format!("  • start operator server on {bind_addr}"));
     }
@@ -532,6 +610,14 @@ fn build_action_plan(
         lines.push("  • no server; use `symforge init` for stdio MCP clients".to_string());
     }
     lines.join("\n")
+}
+
+fn installation_type_label(t: InstallationType) -> &'static str {
+    match t {
+        InstallationType::InHarness => "in-harness",
+        InstallationType::Server => "server",
+        InstallationType::Both => "both",
+    }
 }
 
 #[cfg(test)]
@@ -582,5 +668,120 @@ mod tests {
         );
         let parsed: InstallationType = serde_json::from_str("\"server\"").unwrap();
         assert_eq!(parsed, InstallationType::Server);
+    }
+
+    #[test]
+    fn non_interactive_setup_configures_fixture_and_persists_profile() {
+        use crate::cli::browser::NoopBrowserOpener;
+        use crate::cli::harness::{HarnessFormat, HarnessTarget, SYMFORGE_SERVER_NAME};
+        use crate::cli::harness_apply::{plan, PlannedAction};
+        use crate::cli::admin::operator_server_reachable;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let project = tempfile::tempdir().expect("temp project");
+        let cfg = home.path().join(".claude.json");
+        std::fs::write(&cfg, "{}\n").expect("fixture harness config");
+
+        let ctx = SetupContext {
+            home: home.path().to_path_buf(),
+            working_dir: project.path().to_path_buf(),
+        };
+
+        let mut sink = ScriptedSetupSink::new([], true);
+        let browser = NoopBrowserOpener::default();
+
+        let outcome = run_wizard(
+            SetupCliArgs {
+                non_interactive: true,
+                installation_type: Some(InstallationType::Both),
+                port: None,
+                harnesses: vec!["claude".into()],
+                yes: true,
+            },
+            &ctx,
+            &mut sink,
+            &browser,
+        )
+        .expect("setup should succeed");
+
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.installation_type, InstallationType::Both);
+
+        assert!(
+            sink.statuses.iter().any(|l| l.contains("Claude Code")),
+            "scan must list harnesses: {:?}",
+            sink.statuses
+        );
+
+        let profile = OperatorSetupProfile::load(project.path()).expect("profile persisted");
+        assert_eq!(profile.installation_type, InstallationType::Both);
+        assert!(profile.port > 0);
+        assert_eq!(profile.harnesses, vec!["claude"]);
+
+        let after = std::fs::read_to_string(&cfg).expect("config exists");
+        assert!(after.contains(SYMFORGE_SERVER_NAME));
+
+        // The reported attach URL comes straight off the reachable descriptor.
+        let session = outcome.session.as_ref().expect("server started");
+        assert!(session.reachable);
+        let attach_url = session.attach_url.clone();
+        assert!(attach_url.contains("/mcp"));
+
+        assert!(
+            operator_server_reachable(session.bound_addr, Duration::from_millis(500)),
+            "server must be reachable on reported port"
+        );
+        assert_eq!(browser.opened_urls().len(), 1);
+
+        let entry = AttachEntry::new(attach_url, None);
+        let reg = HarnessRegistry::from_targets(vec![HarnessTarget {
+            id: HarnessId::ClaudeCode,
+            config_path: cfg,
+            format: HarnessFormat::Json,
+        }]);
+        let p2 = plan(&reg, &entry);
+        assert!(matches!(p2.changes[0].action, PlannedAction::Skip(_)));
+    }
+
+    #[test]
+    fn non_interactive_decline_writes_nothing_and_is_not_an_error() {
+        use crate::cli::browser::NoopBrowserOpener;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let project = tempfile::tempdir().expect("temp project");
+        let cfg = home.path().join(".claude.json");
+        let original = "{\n  \"mcpServers\": {}\n}\n";
+        std::fs::write(&cfg, original).expect("fixture");
+
+        let ctx = SetupContext {
+            home: home.path().to_path_buf(),
+            working_dir: project.path().to_path_buf(),
+        };
+        // No `--yes`: the scripted confirm answer (false) declines the plan.
+        let mut sink = ScriptedSetupSink::new([], false);
+        let browser = NoopBrowserOpener::default();
+
+        let outcome = run_wizard(
+            SetupCliArgs {
+                non_interactive: true,
+                installation_type: Some(InstallationType::Both),
+                port: None,
+                harnesses: vec!["claude".into()],
+                yes: false,
+            },
+            &ctx,
+            &mut sink,
+            &browser,
+        )
+        .expect("a decline is a clean no-op, not an error");
+
+        // Declined: nothing applied, no server, no profile, config untouched.
+        assert!(outcome.cancelled);
+        assert!(outcome.session.is_none());
+        assert!(outcome.harness_outcomes.is_empty());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        assert!(OperatorSetupProfile::load(project.path()).is_none());
+        // The restate was still presented before the decline (FR-008).
+        assert_eq!(sink.confirmations.len(), 1);
     }
 }
