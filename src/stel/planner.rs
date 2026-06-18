@@ -24,6 +24,14 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     if let Some(steps) = plan_multi_hop_steps(request) {
         return build_plan_from_steps(request, steps);
     }
+    // A caller that supplies a bare-identifier `symbol` clearly wants THAT
+    // symbol, not a full-text search over the natural-language `query`. Honor it
+    // for find/auto intent (the buckets that would otherwise run a query-side
+    // text search and ignore `symbol` entirely), but never override an explicit
+    // routing phrase that already won — those single-step golden routes stand.
+    if let Some(step) = symbol_lookup_step(request) {
+        return build_plan_from_steps(request, vec![step]);
+    }
     // US4 find fusion: a multi-word fuzzy find query that matches no explicit
     // routing phrase fans out across BOTH the path/file matcher (with the gated
     // co-change boost) and the symbol-name matcher, merged by the serve
@@ -34,6 +42,101 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     }
     let step = plan_step(request);
     build_plan_from_steps(request, vec![step])
+}
+
+/// Facade-boundary contract check for the `symbol` field. When a caller drops a
+/// natural-language phrase into `symbol` (e.g. `"how status updates flow"`), the
+/// legacy symbol tools would pass it verbatim as a tool `name` and return a
+/// misleading `Symbol not found: <whole sentence>`. Detect prose up front and
+/// return a one-line CORRECTIVE message naming the contract, so the agent
+/// self-corrects instead of chasing a phantom not-found. Returns `None` when
+/// `symbol` is absent or is a plausible bare identifier (the valid case).
+pub fn symbol_contract_violation(request: &StelRequest) -> Option<String> {
+    let symbol = request.symbol.as_deref()?.trim();
+    if symbol.is_empty() || is_bare_identifier(symbol) {
+        return None;
+    }
+    Some(format!(
+        "`symbol` must be a bare identifier like `is_fresh`, not prose (got `{symbol}`); \
+         put a phrase in `query=` instead and use `symbol=` only for an exact symbol name."
+    ))
+}
+
+/// True when `candidate` is a plausible bare code identifier — a single token of
+/// identifier characters (`A–Z a–z 0–9 _`), optionally path-qualified with `::`
+/// or `.` (e.g. `is_fresh`, `LiveIndex`, `mod::Type`, `obj.method`). Rejects
+/// prose: anything with whitespace, an empty string, a leading digit, or
+/// non-identifier punctuation. Used by the facade to tell a real symbol name
+/// from a natural-language sentence dropped into the `symbol` slot.
+pub(crate) fn is_bare_identifier(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // Strip qualifier separators; every remaining segment must be a non-empty
+    // identifier whose first char is a letter or underscore.
+    let segments: Vec<&str> = candidate
+        .split("::")
+        .flat_map(|seg| seg.split('.'))
+        .collect();
+    if segments.iter().any(|seg| seg.is_empty()) {
+        return false;
+    }
+    segments.iter().all(|seg| {
+        let mut chars = seg.chars();
+        let first = match chars.next() {
+            Some(c) => c,
+            None => return false,
+        };
+        (first.is_ascii_alphabetic() || first == '_')
+            && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// US-symbol-routing: a bare-identifier `symbol` for find/auto intent routes
+/// straight to a symbol lookup rather than letting the query-side text search
+/// own the route. Returns `None` (deferring to the existing pipeline) when:
+///   - no `symbol` was supplied, or it is prose (the prose case is rejected with
+///     a corrective error at the facade boundary, before planning), or
+///   - the intent is an explicit non-find/non-auto bucket (that bucket already
+///     consumes `symbol` where it makes sense — e.g. `route_trace`), or
+///   - an explicit routing phrase in the query already won (its precise
+///     single-step golden route must stand).
+///
+/// When it fires it prefers `get_symbol` (the caller named an exact symbol and,
+/// with a `path`, we can fetch its body directly) and otherwise `search_symbols`
+/// (name-ranked symbol discovery), never a full-text search over the prose query.
+fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
+    let symbol = request.symbol.as_deref()?.trim();
+    if !is_bare_identifier(symbol) {
+        return None;
+    }
+    let bucket = request.intent.unwrap_or(IntentBucket::Auto);
+    if !matches!(bucket, IntentBucket::Auto | IntentBucket::Find) {
+        return None;
+    }
+    // An explicit routing phrase in the query is a precise signal that outranks a
+    // bare `symbol` hint — never override a pinned golden route.
+    if route_with_query_patterns(request).is_some() {
+        return None;
+    }
+    if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(planned(
+            "get_symbol",
+            json!({ "path": path, "name": symbol }),
+            IntentBucket::Read,
+            RouteConfidence::Inferred,
+            "explicit symbol + path lookup",
+        ))
+    } else {
+        Some(planned(
+            "search_symbols",
+            json!({ "query": symbol }),
+            IntentBucket::Find,
+            RouteConfidence::Inferred,
+            "explicit symbol lookup",
+        ))
+    }
 }
 
 fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> StelPlan {
@@ -1280,5 +1383,134 @@ mod tests {
             ..Default::default()
         });
         assert!(!is_find_fusion_plan(&plan), "explicit Read must not fuse");
+    }
+
+    #[test]
+    fn is_bare_identifier_accepts_names_rejects_prose() {
+        for ok in [
+            "is_fresh",
+            "LiveIndex",
+            "_private",
+            "mod::Type",
+            "obj.method",
+            "a1_b2",
+        ] {
+            assert!(is_bare_identifier(ok), "{ok} should be a bare identifier");
+        }
+        for bad in [
+            "how status updates flow",
+            "is fresh",
+            "",
+            "   ",
+            "1leading_digit",
+            "has-dash",
+            "trailing::",
+            "double..dot",
+        ] {
+            assert!(
+                !is_bare_identifier(bad),
+                "{bad:?} must not be an identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_symbol_routes_to_symbol_lookup_for_find_intent() {
+        // BUG 1: a bare-identifier `symbol` alongside a prose `query` for find
+        // intent must route to a SYMBOL lookup, not a full-text search over the
+        // query. With no path it is search_symbols on the symbol token.
+        let plan = build_plan(&StelRequest {
+            query: "where is the daemon freshness check that returns is_fresh".to_string(),
+            intent: Some(IntentBucket::Find),
+            symbol: Some("is_fresh".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "search_symbols");
+        assert_eq!(plan.steps[0].args["query"], "is_fresh");
+    }
+
+    #[test]
+    fn bare_symbol_routes_to_symbol_lookup_for_auto_intent() {
+        // Auto intent (no explicit bucket) must honor a bare `symbol` too.
+        let plan = build_plan(&StelRequest {
+            query: "a long natural language question about freshness".to_string(),
+            symbol: Some("is_fresh".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "search_symbols");
+        assert_eq!(plan.steps[0].args["query"], "is_fresh");
+    }
+
+    #[test]
+    fn bare_symbol_with_path_routes_to_get_symbol() {
+        // With both a bare `symbol` and a `path`, fetch the symbol body directly.
+        let plan = build_plan(&StelRequest {
+            query: "show me freshness".to_string(),
+            intent: Some(IntentBucket::Auto),
+            symbol: Some("is_fresh".to_string()),
+            path: Some("src/daemon.rs".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "get_symbol");
+        assert_eq!(plan.steps[0].args["name"], "is_fresh");
+        assert_eq!(plan.steps[0].args["path"], "src/daemon.rs");
+    }
+
+    #[test]
+    fn bare_symbol_does_not_override_explicit_routing_phrase() {
+        // The symbol gate must never override a pinned golden route: an explicit
+        // reference phrasing keeps its find_references route even with `symbol`.
+        let plan = build_plan(&StelRequest {
+            query: "who references cfg_if".to_string(),
+            intent: Some(IntentBucket::Find),
+            symbol: Some("is_fresh".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "find_references");
+    }
+
+    #[test]
+    fn explicit_trace_intent_keeps_symbol_in_route_trace() {
+        // An explicit non-find/non-auto bucket (Trace) must not be hijacked by
+        // the symbol gate; route_trace still consumes `symbol` as the ref name.
+        let plan = build_plan(&StelRequest {
+            query: "trace the callers".to_string(),
+            intent: Some(IntentBucket::Trace),
+            symbol: Some("is_fresh".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "find_references");
+        assert_eq!(plan.steps[0].args["name"], "is_fresh");
+    }
+
+    #[test]
+    fn prose_symbol_yields_corrective_contract_violation() {
+        // BUG 2: prose in `symbol` must be caught at the facade boundary with a
+        // corrective message, not dispatched as a tool `name`.
+        let request = StelRequest {
+            query: "trace how status updates flow".to_string(),
+            intent: Some(IntentBucket::Trace),
+            symbol: Some("how status updates flow".to_string()),
+            ..Default::default()
+        };
+        let message = symbol_contract_violation(&request).expect("prose symbol must be rejected");
+        assert!(
+            message.contains("bare identifier"),
+            "message names the contract: {message}"
+        );
+        assert!(
+            !message.contains("Symbol not found"),
+            "message must be corrective, not a misleading not-found: {message}"
+        );
+    }
+
+    #[test]
+    fn bare_identifier_symbol_has_no_contract_violation() {
+        let request = StelRequest {
+            query: "trace it".to_string(),
+            symbol: Some("update_status".to_string()),
+            ..Default::default()
+        };
+        assert!(symbol_contract_violation(&request).is_none());
     }
 }

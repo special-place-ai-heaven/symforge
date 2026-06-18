@@ -47,7 +47,7 @@ cargo check --no-default-features --features embed
 | 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | TODO |
 | 006 | Edit `body` contract docs + dedent-normalize the splice (kills compounding indent) | P1 | S/M | — | DONE |
 | 007 | Read-facade routing — NL-`find` OR-explosion (stopword filter on fusion terms) | P1 | S | — | DONE |
-| 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` path precision | P1 | M | — | TODO |
+| 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` N-defs disclosure | P1 | M | — | DONE |
 | 008a | Operator port range 8000-8999/5000-5999, never ephemeral (corporate networks) | P2 | S | — | DONE |
 | 008b | Persistent shared-server lifecycle (start-or-attach, last-client shutdown) + `/symforge-admin` command file install | P2 | L | — | TODO |
 | 009b | Edit economics grounding (body bytes; preview echoes body, apply footer-only) | P2 | M | — | DONE |
