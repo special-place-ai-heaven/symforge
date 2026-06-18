@@ -106,6 +106,7 @@ pub enum InitClient {
     Gemini,
     #[value(name = "kilo-code", alias = "kilo")]
     KiloCode,
+    Cursor,
     All,
 }
 

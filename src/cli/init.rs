@@ -41,6 +41,7 @@ struct InitPaths {
     gemini_trusted_folders: PathBuf,
     kilo_vscode_config: PathBuf,
     kilo_rules_guidance: PathBuf,
+    cursor_config: PathBuf,
 }
 
 impl InitPaths {
@@ -73,6 +74,7 @@ impl InitPaths {
                 .join(".kilocode")
                 .join("rules")
                 .join("symforge.md"),
+            cursor_config: home.join(".cursor").join("mcp.json"),
         }
     }
 }
@@ -347,6 +349,14 @@ fn run_init_with_paths(
         eprintln!(
             "Kilo Code guidance written to {}",
             paths.kilo_rules_guidance.display()
+        );
+    }
+
+    if matches!(client, InitClient::Cursor | InitClient::All) {
+        register_cursor_mcp_server(&paths.cursor_config, &binary_path_str)?;
+        eprintln!(
+            "Cursor MCP server registered in {}",
+            paths.cursor_config.display()
         );
     }
 
@@ -1118,6 +1128,74 @@ pub fn register_kilo_mcp_server(
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(kilo_config_path, pretty)
         .with_context(|| format!("writing {}", kilo_config_path.display()))?;
+    Ok(())
+}
+
+/// Register symforge as an MCP server in Cursor's global `~/.cursor/mcp.json`.
+///
+/// Cursor launches MCP servers from a fixed `cwd` (commonly the user's home),
+/// so a cold `find_project_root` resolves nothing and the server binds an empty
+/// index — the home-cwd "Index not loaded" trap. Like Claude Desktop, we
+/// discover the operator's workspace at install time (the `symforge init` CWD is
+/// the project the operator is in) and thread it into BOTH the per-server `cwd`
+/// (Cursor honors a `cwd` field) and `SYMFORGE_WORKSPACE_ROOT`, so cold start
+/// indexes a real workspace regardless of how Cursor launches the process. Only
+/// the `symforge` entry is touched; the rest of the file is preserved.
+pub fn register_cursor_mcp_server(
+    cursor_config_path: &std::path::Path,
+    binary_path: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = cursor_config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let mut config: Value = if cursor_config_path.exists() {
+        let config_json = read_config_text(cursor_config_path)?;
+        serde_json::from_str(&config_json)
+            .with_context(|| format!("parsing {}", cursor_config_path.display()))?
+    } else {
+        json!({})
+    };
+
+    if !config["mcpServers"].is_object() {
+        config["mcpServers"] = json!({});
+    }
+
+    let command_path = native_command_path(binary_path);
+
+    // Discover the operator's workspace at install time (same rationale as
+    // Claude Desktop registration); thread it into env + cwd below.
+    let workspace_root = crate::discovery::find_project_root();
+    let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "SYMFORGE_SURFACE".to_string(),
+        Value::String("compact".to_string()),
+    );
+    if let Some(root) = workspace_root_str.as_deref() {
+        env.insert(
+            crate::discovery::WORKSPACE_ROOT_ENV.to_string(),
+            Value::String(root.to_string()),
+        );
+    }
+
+    let mut server = json!({
+        "command": command_path,
+        "args": [],
+        "env": Value::Object(env),
+    });
+    // Cursor honors a per-server `cwd`; point it at the discovered workspace so
+    // the launch CWD is the project, not the home directory.
+    if let Some(root) = workspace_root_str.as_deref() {
+        server["cwd"] = Value::String(root.to_string());
+    }
+    config["mcpServers"]["symforge"] = server;
+
+    let pretty = serde_json::to_string_pretty(&config)?;
+    std::fs::write(cursor_config_path, pretty)
+        .with_context(|| format!("writing {}", cursor_config_path.display()))?;
     Ok(())
 }
 
@@ -2218,6 +2296,54 @@ env = { EXISTING_FLAG = "keep" }
             "durable wrapper should be created next to the home binary"
         );
         let _ = std::fs::remove_dir_all(&stable_bin_dir);
+    }
+
+    // Plan 001 (home-cwd disease): `symforge init --client cursor` registers
+    // symforge in Cursor's global mcp.json with a proven env pinning the compact
+    // surface; and when a workspace is discoverable it threads both
+    // SYMFORGE_WORKSPACE_ROOT and a per-server `cwd`, so Cursor never launches
+    // into the empty-index home-cwd trap. Only the `symforge` server is touched.
+    #[test]
+    fn test_cursor_registration_writes_proven_env_and_cwd() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("mcp.json");
+        let binary = if cfg!(windows) {
+            "C:\\bin\\symforge.exe"
+        } else {
+            "/usr/bin/symforge"
+        };
+        register_cursor_mcp_server(&config_path, binary).unwrap();
+
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let server = &config["mcpServers"]["symforge"];
+        assert!(
+            server["command"].as_str().is_some_and(|c| !c.is_empty()),
+            "cursor server must carry a command: {server}"
+        );
+        assert!(server["args"].is_array(), "cursor server must carry args");
+        let env = server["env"]
+            .as_object()
+            .expect("cursor env must be a proven object, not absent");
+        assert_eq!(
+            env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
+            Some("compact"),
+            "cursor env must pin the compact surface: {server}"
+        );
+        // The init test process runs inside the symforge git repo, so
+        // find_project_root resolves a workspace; when it does, the per-server
+        // `cwd` must equal the SYMFORGE_WORKSPACE_ROOT env (the home-cwd fix —
+        // both point at the discovered workspace).
+        if let Some(root) = env
+            .get(crate::discovery::WORKSPACE_ROOT_ENV)
+            .and_then(Value::as_str)
+        {
+            assert_eq!(
+                server["cwd"].as_str(),
+                Some(root),
+                "cursor cwd must match the workspace-root env when discovered: {server}"
+            );
+        }
     }
 
     // T029 (TR-03 / FR-013): the generated wrapper `cd`s into the discovered
