@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.1.0...v8.2.0) (2026-06-18)
+
+
+### Features
+
+* **cli,protocol:** 009 US3 in-harness admin command + symforge-admin affordance ([1e24584](https://github.com/special-place-ai-heaven/symforge/commit/1e24584d2847603c7313678a000836f56ba4d637))
+* **cli,server:** 009 scaffold + US1 collision-free serve port ([77e8035](https://github.com/special-place-ai-heaven/symforge/commit/77e80353c7a4e317feb20962b90be5092899adbb))
+* **cli:** 009 Phase 3 foundational seams (profile + sinks + serve-start) ([718ad6e](https://github.com/special-place-ai-heaven/symforge/commit/718ad6ee7bbd9cccbd6f3d91578d0a524dee1935))
+* **cli:** 009 US2 guided setup wizard (run_wizard + WizardOutcome) ([1dabf7e](https://github.com/special-place-ai-heaven/symforge/commit/1dabf7e0394a6134e6fad4f5795e1931b40d4c86))
+
+
+### Bug Fixes
+
+* **cli:** generous serve-start deadline (009) — fix CI flake + prod give-up ([46666b6](https://github.com/special-place-ai-heaven/symforge/commit/46666b68bad05a821302a99eaae010c32f84a65a))
+
 ## [8.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.0.0...v8.1.0) (2026-06-18)
 
 
