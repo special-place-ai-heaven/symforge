@@ -633,7 +633,12 @@ mod tests {
     #[test]
     fn session_cache_hit_for_prefetched_symbol() {
         let session = SessionContext::new();
-        session.record_symbol("src/lib.rs", "cfg_if", 128);
+        session.record_symbol_fetch(
+            "src/lib.rs",
+            "cfg_if",
+            crate::protocol::session::hash_symbol_params(None, None, None),
+            128,
+        );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
             intent: IntentBucket::Read,

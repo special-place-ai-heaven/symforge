@@ -266,5 +266,5 @@ Do not default to broad raw file reads for source-code inspection when SymForge 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs\001-v8-phase0-preflight\plan.md
+at specs/011-ccr-output-compression/plan.md
 <!-- SPECKIT END -->

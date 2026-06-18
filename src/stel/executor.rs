@@ -445,7 +445,12 @@ mod tests {
         use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
 
         let session = SessionContext::new();
-        session.record_symbol("src/lib.rs", "cfg_if", 96);
+        session.record_symbol_fetch(
+            "src/lib.rs",
+            "cfg_if",
+            crate::protocol::session::hash_symbol_params(None, None, None),
+            96,
+        );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
             intent: IntentBucket::Read,
