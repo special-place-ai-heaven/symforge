@@ -2,6 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::controller::index_ref_for_target;
 use super::types::{IntentBucket, RouteConfidence, StelEditRequest, StelPlan, StelPlanStep};
 
 /// Validation failure before an edit plan can be built.
@@ -95,9 +96,20 @@ pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValida
             order: 1,
             tool: "replace_symbol_body".to_string(),
             args,
+            // Plan-only floor retained for any caller that ignores `index_refs`;
+            // the grounded edit path (`grounded_step_tokens`) overrides both with
+            // body-byte-scaled figures whenever the IndexRef below is present.
             est_response_tokens: 520,
             est_manual_tokens: 900,
-            index_refs: vec![],
+            // Plan 009b edit-economics grounding: the new symbol source (`body`) is fully
+            // known at plan time, so its byte length is the real input the edit's
+            // response/manual baselines scale with. Stamping it as the step's
+            // IndexRef routes the edit through the SAME byte-grounded estimator the
+            // READ tools use (no parallel estimator), replacing the flat 520/900
+            // floor with figures that move with edit size. The on-disk OLD span is
+            // not resolved at plan time (resolution happens later, on apply), so the
+            // new-body length is the best plan-time proxy for the edited span.
+            index_refs: vec![index_ref_for_target(path.to_string(), body.len() as u64)],
         }],
         suggested_followup: None,
     })

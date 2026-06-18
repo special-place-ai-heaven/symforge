@@ -48,7 +48,9 @@ cargo check --no-default-features --features embed
 | 007 | Read-facade routing — NL-`find` OR-explosion (stopword filter on fusion terms) | P1 | S | — | DONE |
 | 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` path precision | P1 | M | — | TODO |
 | 008 | Operator server lifecycle (persistent shared, last-client shutdown) + 8k/5k port range + `/symforge-admin` command file | P2 | L | — | TODO |
-| 009 | Edit economics grounding (body/span bytes) + `SYMFORGE_STEL_VERBOSE` default-compact envelope + wire `CalibrationState` loop | P2 | M/L | — | TODO |
+| 009b | Edit economics grounding (body bytes; preview echoes body, apply footer-only) | P2 | M | — | DONE |
+| 009a | `SYMFORGE_STEL_VERBOSE` default-compact envelope (cut per-call ledger noise) | P2 | M | — | TODO |
+| 009c | Wire the `CalibrationState` auto-tune loop (self-correct predictions from the ledger) | P2 | L | 009b | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (reason) | REJECTED (rationale).
 
