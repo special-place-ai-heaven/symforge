@@ -208,7 +208,7 @@ fn find_fusion_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
     if !is_multi_term_fuzzy_find(query) {
         return None;
     }
-    let terms: Vec<&str> = query.split_whitespace().collect();
+    let terms = significant_find_terms(query);
 
     Some(vec![
         planned(
@@ -226,6 +226,34 @@ fn find_fusion_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
             FIND_FUSION_SYMBOL_RATIONALE,
         ),
     ])
+}
+
+/// Ubiquitous English glue words dropped from a fuzzy find's OR `terms`. Matched
+/// as bare OR literals they explode a natural-language query into hundreds of
+/// doc hits (every file containing "the"/"and" matches). Code identifiers are
+/// never stopwords, so this trims only prose connective tissue. Lowercase.
+const FIND_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "the", "or", "of", "to", "in", "on", "for", "is", "are", "be", "by", "it",
+    "its", "as", "at", "with", "from", "how", "what", "why", "when", "where", "that", "this",
+    "these", "those", "into", "over", "via", "do", "does", "we", "our", "you", "your",
+];
+
+/// The significant OR terms for a fuzzy find's `search_text` step: whitespace
+/// tokens with alphanumeric content, minus [`FIND_STOPWORDS`]. Falls back to all
+/// tokens when filtering would leave nothing (a query made entirely of
+/// stopwords), so the step never sends an empty `terms`. (Plan 007: NL finds
+/// were OR-exploding because every stopword became a bare literal.)
+fn significant_find_terms(query: &str) -> Vec<&str> {
+    let all: Vec<&str> = query.split_whitespace().collect();
+    let filtered: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|tok| {
+            tok.chars().any(|c| c.is_alphanumeric())
+                && !FIND_STOPWORDS.contains(&tok.to_ascii_lowercase().as_str())
+        })
+        .collect();
+    if filtered.is_empty() { all } else { filtered }
 }
 
 /// True when `query` is a multi-word, fuzzy find query suitable for fusion: at
@@ -1030,6 +1058,40 @@ mod tests {
                 "query: {query}"
             );
         }
+    }
+
+    #[test]
+    fn find_fusion_drops_stopwords_from_or_terms() {
+        // Plan 007: a natural-language multi-word find must not OR-match
+        // stopwords ("and", "its", "over") — bare OR literals explode the
+        // result set into hundreds of doc hits. The fusion search_text step
+        // should carry only the significant terms.
+        let plan = build_plan(&StelRequest {
+            query: "daemon freshness check and reports its version over IPC".to_string(),
+            intent: Some(IntentBucket::Find),
+            ..Default::default()
+        });
+        let text_step = plan
+            .steps
+            .iter()
+            .find(|s| s.tool == "search_text")
+            .expect("a fuzzy multi-term find fuses a search_text step");
+        let terms: Vec<String> = text_step.args["terms"]
+            .as_array()
+            .expect("the fusion search_text step carries an OR `terms` array")
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        for stop in ["and", "its", "over"] {
+            assert!(
+                !terms.iter().any(|t| t.eq_ignore_ascii_case(stop)),
+                "stopword {stop:?} must be filtered from fusion terms: {terms:?}"
+            );
+        }
+        assert!(
+            terms.iter().any(|t| t == "daemon") && terms.iter().any(|t| t == "freshness"),
+            "significant terms must survive the filter: {terms:?}"
+        );
     }
 
     #[test]

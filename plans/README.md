@@ -45,7 +45,8 @@ cargo check --no-default-features --features embed
 | 004 | `search_text` completeness honesty — name filtered/capped omissions (+ exhaustive mode) | P1 | M | — | TODO |
 | 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | TODO |
 | 006 | Edit `body` contract docs + dedent-normalize the splice (kills compounding indent) | P1 | S/M | — | DONE |
-| 007 | Read-facade routing — NL-`find` OR-explosion, `symbol=` routing, prose-in-symbol, `find_references` path precision | P1 | M | — | TODO |
+| 007 | Read-facade routing — NL-`find` OR-explosion (stopword filter on fusion terms) | P1 | S | — | DONE |
+| 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` path precision | P1 | M | — | TODO |
 | 008 | Operator server lifecycle (persistent shared, last-client shutdown) + 8k/5k port range + `/symforge-admin` command file | P2 | L | — | TODO |
 | 009 | Edit economics grounding (body/span bytes) + `SYMFORGE_STEL_VERBOSE` default-compact envelope + wire `CalibrationState` loop | P2 | M/L | — | TODO |
 
