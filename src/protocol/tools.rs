@@ -39,7 +39,8 @@ use super::edit_tools::{EditError, prepare_batch_paths_for_edit, prepare_exact_p
 pub(crate) use super::read_tools::lenient_option_vec;
 pub use super::read_tools::{
     FindDependentsInput, GetFileContentInput, GetFileContextInput, GetRepoMapInput,
-    GetSymbolContextInput, GetSymbolInput, InspectMatchInput, SymbolTarget, TraceSymbolInput,
+    GetSymbolContextInput, GetSymbolInput, InspectMatchInput, SymbolTarget, SymforgeRetrieveInput,
+    TraceSymbolInput,
 };
 pub(crate) use super::read_tools::{
     ValidateFileSyntaxInput, encode_include_tests_marker, file_content_options_from_input,
@@ -3287,6 +3288,21 @@ impl SymForgeServer {
         }
 
         // Single mode: path + name
+        let force_refresh = params.0.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_symbol_params(
+            params.0.kind.as_deref(),
+            params.0.symbol_line,
+            params.0.max_tokens,
+        );
+        if let Some(meta) = self.session_context.try_symbol_cache_hit(
+            &params.0.path,
+            &params.0.name,
+            params_hash,
+            force_refresh,
+        ) {
+            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+        }
+
         let file = {
             let guard = self.index.read();
             loading_guard!(guard);
@@ -3363,16 +3379,40 @@ impl SymForgeServer {
                     )),
                     (output.len() / 4) as u64,
                 );
-                self.session_context.record_symbol(
+                let tokens = (output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::Symbol,
+                        &params.0.path,
+                        &params.0.name,
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
+                self.session_context.record_symbol_fetch(
                     &params.0.path,
                     &params.0.name,
-                    (output.len() / 4) as u32,
+                    params_hash,
+                    tokens,
                 );
                 // Frecency bump — commitment tool, single-symbol happy path.
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                format::enforce_token_budget(output, Some(max_tokens))
+                let mut final_output =
+                    format::enforce_token_budget(output, Some(max_tokens));
+                if force_refresh
+                    && let Some(prior) = prior_dedup
+                {
+                    final_output = format::append_dedup_hint_footer(
+                        final_output,
+                        "symbol",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
+                final_output
             }
             None => {
                 let suggestions = {
@@ -3574,6 +3614,18 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
         }
+        let force_refresh = params.0.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_file_context_params(
+            params.0.max_tokens,
+            params.0.sections.as_deref(),
+        );
+        if let Some(meta) = self.session_context.try_file_context_cache_hit(
+            &params.0.path,
+            params_hash,
+            force_refresh,
+        ) {
+            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+        }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
         // deliberately admitted as metadata-only (e.g. package-lock.json) or
         // hard-skipped. Return an actionable "not indexed" message pointing at
@@ -3686,10 +3738,31 @@ impl SymForgeServer {
                 };
                 let body = format!("{result}{hint}");
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let output =
+                let mut output =
                     format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
+                let tokens = (output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::FileContext,
+                        &params.0.path,
+                        "",
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
                 self.session_context
-                    .record_listed_file(&params.0.path, (output.len() / 4) as u32);
+                    .record_file_context_fetch(&params.0.path, params_hash, tokens);
+                self.session_context
+                    .record_listed_file(&params.0.path, tokens);
+                if let Some(prior) = prior_dedup {
+                    output = format::append_dedup_hint_footer(
+                        output,
+                        "file context",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
                 // Frecency bump — commitment tool. Reached only on the happy
                 // path after a successful outline fetch; collection policy is
                 // resolved inside bump_frecency. See wiki `[[SymForge Frecency-Weighted
@@ -4425,7 +4498,7 @@ impl SymForgeServer {
                 "search_text",
                 (result.len() / 4).min(u32::MAX as usize) as u32,
             );
-            return format::enforce_token_budget(result, params.0.max_tokens);
+            return self.apply_ccr_budget("search_text", result, params.0.max_tokens);
         }
 
         let mut options = match search_text_options_from_input(&params.0) {
@@ -4603,7 +4676,7 @@ impl SymForgeServer {
         // (hot files get searched more, which would bump them more, which
         // would rank them higher still). See wiki `[[SymForge Frecency-
         // Weighted File Ranking]]` §"Search tools deliberately do NOT bump".
-        format::enforce_token_budget(result, params.0.max_tokens)
+        self.apply_ccr_budget("search_text", result, params.0.max_tokens)
     }
 
     /// Internal: trace_symbol logic, called by get_symbol_context when sections are provided.
@@ -6449,6 +6522,18 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
+        let force_refresh = input.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_value(
+            &serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(meta) = self.session_context.try_file_content_cache_hit(
+            &input.path,
+            params_hash,
+            force_refresh,
+        ) {
+            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+        }
+
         let options = match file_content_options_from_input(&input) {
             Ok(options) => options,
             Err(message) => return message,
@@ -6484,20 +6569,33 @@ impl SymForgeServer {
                     )),
                     (output.len() / 4) as u64,
                 );
-                self.session_context
-                    .record_file(&input.path, (output.len() / 4) as u32);
-                // Frecency bump — commitment tool. Indexed-file branch;
-                // collection policy is resolved inside bump_frecency. See wiki
-                // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
-                self.bump_frecency(&[PathBuf::from(&input.path)]);
-                // NUL-byte guard: append an honest warning (after the byte cap so
-                // truncation can never drop it) when the file content contains
-                // literal 0x00 bytes that render invisibly. See
-                // `format::append_nul_byte_warning`.
                 let capped =
                     format::cap_file_content_output(format!("{}{}", mode_annotation, output));
                 let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
-                format::enforce_token_budget(with_warning, max_tokens)
+                let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
+                let tokens = (final_output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::FileContent,
+                        &input.path,
+                        "",
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
+                self.session_context
+                    .record_file_content_fetch(&input.path, params_hash, tokens);
+                self.bump_frecency(&[PathBuf::from(&input.path)]);
+                if let Some(prior) = prior_dedup {
+                    final_output = format::append_dedup_hint_footer(
+                        final_output,
+                        "file",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
+                final_output
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -8768,6 +8866,24 @@ impl SymForgeServer {
     }
 
     #[tool(
+        description = "Retrieve full tool output previously stored by CCR compression. Pass the hash from a search or discovery footer.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn symforge_retrieve(
+        &self,
+        params: Parameters<SymforgeRetrieveInput>,
+    ) -> String {
+        let hash = params.0.hash.trim().to_lowercase();
+        if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
+        }
+        match self.ccr_store.lock().get(&hash) {
+            Some(blob) => blob.formatted_bytes.clone(),
+            None => format!("CCR retrieve: unknown or expired hash '{hash}'"),
+        }
+    }
+
+    #[tool(
         description = "Show what symbols and files have been fetched this session. Returns a context inventory with token counts. Use to track your context budget and avoid re-fetching content you already have.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -9695,6 +9811,7 @@ mod tests {
             offset: None,
             limit: None,
             max_tokens: None,
+            force_refresh: None,
         }
     }
 
@@ -9707,6 +9824,7 @@ mod tests {
             targets: None,
             estimate: None,
             max_tokens: None,
+            force_refresh: None,
         }
     }
 
@@ -9884,6 +10002,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -9963,6 +10082,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -10000,6 +10120,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/main.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -10024,6 +10145,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // Should return source body or not-found message — not a guard message
@@ -10239,6 +10361,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10301,6 +10424,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10356,6 +10480,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -10469,6 +10594,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "package-lock.json".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10525,6 +10651,7 @@ mod tests {
                 .get_file_context(Parameters(super::GetFileContextInput {
                     path: path.to_string(),
                     max_tokens: None,
+                force_refresh: None,
                     sections: None,
                     estimate: None,
                 }))
@@ -10554,6 +10681,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "does/not/exist.tcl".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10735,6 +10863,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "totally/absent/file.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10952,6 +11081,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: None,
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -10970,6 +11100,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: None,
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -11007,6 +11138,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.py".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -11052,6 +11184,7 @@ mod tests {
                     max_tokens: Some(2000),
                     sections: None,
                     estimate: None,
+                    force_refresh: None,
                 }))
                 .await;
 
@@ -11814,6 +11947,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "scratch/impact_case.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -11908,6 +12042,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/lib.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -14806,6 +14941,7 @@ mod tests {
                 }]),
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -14839,6 +14975,7 @@ mod tests {
                 }]),
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -15177,6 +15314,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -15210,6 +15348,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16237,6 +16376,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: Some(8),
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -16276,6 +16416,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16309,6 +16450,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "line 2\nline 3");
@@ -16339,6 +16481,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: line 2\n3: line 3");
@@ -16369,6 +16512,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "src/lib.rs [lines 2-3]\n2: line 2\n3: line 3");
@@ -16399,6 +16543,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "2: line 2\n3: line 3\n4: line 4");
@@ -16429,6 +16574,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // Should succeed (not reject) — header is now allowed with around_line.
@@ -16467,6 +16613,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16500,6 +16647,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: TODO first\n3: line 3");
@@ -16530,6 +16678,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16563,6 +16712,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "Chunk 3 out of range for src/lib.rs (2 chunks)");
@@ -16593,6 +16743,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "No matches for 'needle' in src/lib.rs");
@@ -16623,6 +16774,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "3: line 3\n4: TODO second\n5: line 5");
@@ -16653,6 +16805,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16695,6 +16848,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16742,6 +16896,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16784,6 +16939,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: fn connect() {}\n3: line 3");
@@ -16821,6 +16977,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16861,6 +17018,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "3: fn connect() {}");
@@ -16895,6 +17053,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16928,6 +17087,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16961,6 +17121,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16994,6 +17155,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17027,6 +17189,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17060,6 +17223,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17099,6 +17263,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17132,6 +17297,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=symbol requires around_symbol");
@@ -17162,6 +17328,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17199,6 +17366,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17236,6 +17404,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17269,6 +17438,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode 'search' is not yet implemented");
@@ -17303,6 +17473,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17340,6 +17511,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17373,6 +17545,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17406,6 +17579,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=match requires around_match");
@@ -17436,6 +17610,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17469,6 +17644,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17502,6 +17678,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=chunk requires chunk_index");
@@ -17532,6 +17709,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17565,6 +17743,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17649,6 +17828,7 @@ mod tests {
             offset,
             limit,
             max_tokens: None,
+                force_refresh: None,
         }
     }
 
@@ -17776,6 +17956,7 @@ mod tests {
                 offset: Some(1),
                 limit: Some(2),
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // offset=1 → start_line=2, limit=2 → end_line=3
@@ -17807,6 +17988,7 @@ mod tests {
                 offset: Some(1),
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(

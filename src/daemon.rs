@@ -33,6 +33,7 @@ use crate::protocol::tools::{
     InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
     SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
 };
+use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
 
@@ -2417,6 +2418,9 @@ async fn execute_tool_call(
             .investigation_suggest(Parameters(decode_params::<InvestigationInput>(params)?))
             .await),
         "context_inventory" => Ok(server.context_inventory().await),
+        "symforge_retrieve" => Ok(server
+            .symforge_retrieve(Parameters(decode_params::<SymforgeRetrieveInput>(params)?))
+            .await),
         "ask" => Ok(server
             .ask(Parameters(decode_params::<SmartQueryInput>(params)?))
             .await),

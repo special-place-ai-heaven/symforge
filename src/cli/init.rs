@@ -459,6 +459,7 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__edit_plan",
     "mcp__symforge__context_inventory",
     "mcp__symforge__investigation_suggest",
+    "mcp__symforge__symforge_retrieve",
     "mcp__symforge__status",
     "mcp__symforge__symforge",
     "mcp__symforge__symforge_edit",
