@@ -2702,8 +2702,10 @@ fn test_empty_index_recovery_hint_is_surface_aware() {
     );
 
     // Compact (TR-02 / FR-012): index_folder is dispatch-gated, so the hint must
-    // NOT name it; it names only callable recovery (re-launch from root /
-    // documented opt-out).
+    // NOT name it, and it must NOT tell an LLM to "re-launch" (it cannot). It
+    // names only operator-actionable recovery that works from a cold / home-cwd
+    // start — SYMFORGE_WORKSPACE_ROOT or `symforge init` — plus the documented
+    // full-surface opt-out.
     let compact = empty_index_recovery_hint(SurfaceProfile::Compact);
     assert!(
         !compact.contains("Call index_folder"),
@@ -2714,12 +2716,26 @@ fn test_empty_index_recovery_hint_is_surface_aware() {
         "compact hint must not name index_folder as a callable form: {compact}"
     );
     assert!(
-        compact.contains("project root"),
-        "compact hint must name the re-launch-from-root recovery: {compact}"
+        compact.contains("SYMFORGE_WORKSPACE_ROOT"),
+        "compact hint must name the workspace-root env recovery: {compact}"
+    );
+    assert!(
+        compact.contains("symforge init"),
+        "compact hint must name the `symforge init` recovery: {compact}"
+    );
+    assert!(
+        !compact.to_lowercase().contains("re-launch"),
+        "compact hint must not tell an LLM to re-launch (it cannot): {compact}"
     );
     assert!(
         compact.contains("SYMFORGE_SURFACE=full"),
         "compact hint must name the documented opt-out: {compact}"
+    );
+    // The `Index not loaded.` prefix is load-bearing: edit/search/golden-replay
+    // classifiers detect the empty-index guard by it.
+    assert!(
+        compact.starts_with("Index not loaded."),
+        "compact hint must keep the classifier prefix: {compact}"
     );
 }
 

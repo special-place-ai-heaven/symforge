@@ -6230,7 +6230,7 @@ impl SymForgeServer {
             // is always valid and is offered on every surface.
             let attach = match crate::protocol::surface_probe::surface_profile_from_env() {
                 crate::protocol::surface_probe::SurfaceProfile::Compact => {
-                    "re-launch SymForge from your project root"
+                    "set SYMFORGE_WORKSPACE_ROOT (or run `symforge init`) and reconnect"
                 }
                 crate::protocol::surface_probe::SurfaceProfile::Full
                 | crate::protocol::surface_probe::SurfaceProfile::Meta => {

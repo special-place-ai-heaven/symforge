@@ -40,7 +40,8 @@ cargo check --no-default-features --features embed
 |------|-------|----------|--------|------------|--------|
 | 001 | Add Cursor (home-cwd harnesses) to `symforge init` + write `SYMFORGE_WORKSPACE_ROOT` | P0 | M | — | DONE |
 | 002 | cwd-independent workspace resolution via MCP `roots` capability | P0 | L | — | TODO |
-| 003 | LLM-callable index/reindex on the compact surface + honest empty-index recovery hint | P0 | M | — | TODO |
+| 003 | Honest empty-index + no-repo-root recovery hints (no LLM-unactionable "re-launch") | P0 | S | — | DONE |
+| 003b | LLM-callable index/reindex trigger on the compact surface (folded into 002 index-loading) | P0 | M | 002 | TODO |
 | 004 | `search_text` completeness honesty — name filtered/capped omissions (+ exhaustive mode) | P1 | M | — | TODO |
 | 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | TODO |
 | 006 | Edit `body` contract docs + dedent-normalize the splice (kills compounding indent) | P1 | S/M | — | DONE |
