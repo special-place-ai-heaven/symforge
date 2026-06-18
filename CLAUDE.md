@@ -57,5 +57,5 @@ When merging tools A into B:
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/010-v8-trust-remediation/plan.md
+at specs/009-operator-setup-wizard/plan.md
 <!-- SPECKIT END -->
