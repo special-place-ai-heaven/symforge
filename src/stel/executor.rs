@@ -116,24 +116,18 @@ pub fn format_cache_hit_body(decision: &StelDecision) -> String {
 }
 
 fn format_cache_hit_body_from(cache: &StelCacheBody, decision_reason: &str) -> String {
-    let json = serde_json::to_string_pretty(cache).expect("StelCacheBody serializes");
-    let target = if cache.name.is_empty() {
-        format!("file `{}`", cache.path)
-    } else {
-        format!("symbol `{}` in `{}`", cache.name, cache.path)
+    let meta = crate::protocol::session::SessionCacheHitMeta {
+        kind: if cache.kind == "symbol" {
+            "symbol"
+        } else {
+            "file"
+        },
+        path: cache.path.clone(),
+        name: cache.name.clone(),
+        prior_tokens: cache.prior_tokens,
+        session_age_secs: cache.session_age_secs,
     };
-    format!(
-        "Decision: cache_hit\n\
-         Economics: cache_hit ({decision_reason})\n\
-         Session cache: {} {target} (prior_tokens={}, session_age_secs={})\n\
-         \n\
-         SymForge did not re-execute a legacy tool for this request.\n\
-         Reuse the content already loaded in this session.\n\
-         \n\
-         --- cache payload ---\n\
-         {json}",
-        cache.kind, cache.prior_tokens, cache.session_age_secs,
-    )
+    crate::protocol::format::format_session_cache_hit_body(&meta, decision_reason)
 }
 
 /// Apply L2 degrade caps to a plan before L3 dispatch.
@@ -451,7 +445,12 @@ mod tests {
         use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
 
         let session = SessionContext::new();
-        session.record_symbol("src/lib.rs", "cfg_if", 96);
+        session.record_symbol_fetch(
+            "src/lib.rs",
+            "cfg_if",
+            crate::protocol::session::hash_symbol_params(None, None, None),
+            96,
+        );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
             intent: IntentBucket::Read,
@@ -473,7 +472,7 @@ mod tests {
         assert!(should_skip_legacy_dispatch(&decision));
         let body = format_cache_hit_body(&decision);
         assert!(body.contains("Decision: cache_hit"));
-        assert!(body.contains("did not re-execute a legacy tool"));
+        assert!(body.contains("did not re-execute the read"));
     }
 
     #[test]

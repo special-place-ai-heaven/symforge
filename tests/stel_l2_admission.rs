@@ -122,7 +122,12 @@ fn l2_controller_covers_all_four_admission_states() {
     assert!(!degrade.degrade_flags.is_empty());
 
     let session = SessionContext::new();
-    session.record_symbol("src/lib.rs", "cfg_if", 128);
+    session.record_symbol_fetch(
+        "src/lib.rs",
+        "cfg_if",
+        symforge::protocol::session::hash_symbol_params(None, None, None),
+        128,
+    );
     let cache_plan = StelPlan {
         plan_id: "cache".to_string(),
         intent: IntentBucket::Read,
@@ -192,7 +197,7 @@ async fn cache_hit_dispatch_skips_legacy_tools_after_session_prefetch() {
         second.contains("decision: cache_hit"),
         "repeat should cache_hit:\n{second}"
     );
-    assert!(second.contains("did not re-execute a legacy tool"));
+    assert!(second.contains("did not re-execute the read"));
     assert!(!second.contains("Chosen tool: get_symbol"));
 
     let event = server.stel_ledger().lock().last().expect("ledger event");
@@ -322,7 +327,12 @@ fn calibration_summary_counts_degrade_and_cache_hit() {
     });
 
     let session = SessionContext::new();
-    session.record_symbol("src/lib.rs", "cfg_if", 128);
+    session.record_symbol_fetch(
+        "src/lib.rs",
+        "cfg_if",
+        symforge::protocol::session::hash_symbol_params(None, None, None),
+        128,
+    );
     let cache_plan = StelPlan {
         plan_id: "cache".to_string(),
         intent: IntentBucket::Read,

@@ -39,7 +39,8 @@ use super::edit_tools::{EditError, prepare_batch_paths_for_edit, prepare_exact_p
 pub(crate) use super::read_tools::lenient_option_vec;
 pub use super::read_tools::{
     FindDependentsInput, GetFileContentInput, GetFileContextInput, GetRepoMapInput,
-    GetSymbolContextInput, GetSymbolInput, InspectMatchInput, SymbolTarget, TraceSymbolInput,
+    GetSymbolContextInput, GetSymbolInput, InspectMatchInput, SymbolTarget, SymforgeRetrieveInput,
+    TraceSymbolInput,
 };
 pub(crate) use super::read_tools::{
     ValidateFileSyntaxInput, encode_include_tests_marker, file_content_options_from_input,
@@ -2886,6 +2887,33 @@ fn render_search_text_output(
     rendered
 }
 
+fn search_text_compaction_query(query: Option<&str>, terms: Option<&[String]>) -> String {
+    if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
+        return q.to_string();
+    }
+    terms
+        .map(|items| {
+            items
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn maybe_compact_text_search_result(
+    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
+    query: &str,
+) {
+    if query.trim().is_empty() {
+        return;
+    }
+    if let Ok(text) = result {
+        crate::protocol::ccr::compact_text_search_result(text, query);
+    }
+}
+
 fn resolve_text_search_enclosing_symbols(
     index: &LiveIndex,
     result: &mut Result<search::TextSearchResult, search::TextSearchError>,
@@ -3287,6 +3315,21 @@ impl SymForgeServer {
         }
 
         // Single mode: path + name
+        let force_refresh = params.0.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_symbol_params(
+            params.0.kind.as_deref(),
+            params.0.symbol_line,
+            params.0.max_tokens,
+        );
+        if let Some(meta) = self.session_context.try_symbol_cache_hit(
+            &params.0.path,
+            &params.0.name,
+            params_hash,
+            force_refresh,
+        ) {
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
+        }
+
         let file = {
             let guard = self.index.read();
             loading_guard!(guard);
@@ -3363,16 +3406,37 @@ impl SymForgeServer {
                     )),
                     (output.len() / 4) as u64,
                 );
-                self.session_context.record_symbol(
+                let tokens = (output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::Symbol,
+                        &params.0.path,
+                        &params.0.name,
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
+                self.session_context.record_symbol_fetch(
                     &params.0.path,
                     &params.0.name,
-                    (output.len() / 4) as u32,
+                    params_hash,
+                    tokens,
                 );
                 // Frecency bump — commitment tool, single-symbol happy path.
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                format::enforce_token_budget(output, Some(max_tokens))
+                let mut final_output = format::enforce_token_budget(output, Some(max_tokens));
+                if force_refresh && let Some(prior) = prior_dedup {
+                    final_output = format::append_dedup_hint_footer(
+                        final_output,
+                        "symbol",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
+                final_output
             }
             None => {
                 let suggestions = {
@@ -3390,7 +3454,7 @@ impl SymForgeServer {
     /// counts and language tags — supports path and depth params for subtree browsing.
     /// NOT for file details (use get_file_context) or finding symbols (use search_symbols).
     #[tool(
-        description = "Start here for project orientation and the first code-reading pass before any broad raw file read. Returns a structural overview of the repository. Modes: (1) default/compact: ~500 token overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline of every file — warning: large output. (3) detail='tree': browsable file tree with per-file symbol counts and language tags — supports path and depth params for subtree browsing. NOT for file details (use get_file_context) or finding symbols (use search_symbols).",
+        description = "Start here for project orientation and the first code-reading pass before any broad raw file read. Returns a structural overview of the repository. Modes: (1) default/compact: ~500 token overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline of every file — warning: large output; may CCR-compress with symforge_retrieve hash when over max_tokens. (3) detail='tree': browsable file tree with per-file symbol counts and language tags — supports path and depth params for subtree browsing. NOT for file details (use get_file_context) or finding symbols (use search_symbols).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_repo_map(&self, params: Parameters<GetRepoMapInput>) -> String {
@@ -3558,7 +3622,11 @@ impl SymForgeServer {
             "get_repo_map",
             (output.len() / 4).min(u32::MAX as usize) as u32,
         );
-        format::enforce_token_budget(output, params.0.max_tokens)
+        if detail == "full" {
+            self.apply_ccr_budget("get_repo_map", output, params.0.max_tokens)
+        } else {
+            format::enforce_token_budget(output, params.0.max_tokens)
+        }
     }
 
     /// Rich file summary: symbol outline, imports, consumers, references, and git activity.
@@ -3573,6 +3641,18 @@ impl SymForgeServer {
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
+        }
+        let force_refresh = params.0.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_file_context_params(
+            params.0.max_tokens,
+            params.0.sections.as_deref(),
+        );
+        if let Some(meta) = self.session_context.try_file_context_cache_hit(
+            &params.0.path,
+            params_hash,
+            force_refresh,
+        ) {
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
         }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
         // deliberately admitted as metadata-only (e.g. package-lock.json) or
@@ -3686,10 +3766,31 @@ impl SymForgeServer {
                 };
                 let body = format!("{result}{hint}");
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let output =
+                let mut output =
                     format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
+                let tokens = (output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::FileContext,
+                        &params.0.path,
+                        "",
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
                 self.session_context
-                    .record_listed_file(&params.0.path, (output.len() / 4) as u32);
+                    .record_file_context_fetch(&params.0.path, params_hash, tokens);
+                self.session_context
+                    .record_listed_file(&params.0.path, tokens);
+                if let Some(prior) = prior_dedup {
+                    output = format::append_dedup_hint_footer(
+                        output,
+                        "file context",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
                 // Frecency bump — commitment tool. Reached only on the happy
                 // path after a successful outline fetch; collection policy is
                 // resolved inside bump_frecency. See wiki `[[SymForge Frecency-Weighted
@@ -4150,7 +4251,7 @@ impl SymForgeServer {
     /// NOT for text content search (use search_text). NOT for file path search (use search_files).
     #[tool(
         name = "search_symbols",
-        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. NOT for text content search (use search_text). NOT for file path search (use search_files).",
+        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. Large result sets may CCR-compress; use symforge_retrieve with the footer hash for the full ranked list. NOT for text content search (use search_text). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_symbols_tool(
@@ -4343,10 +4444,7 @@ impl SymForgeServer {
         // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
         // §"Search tools deliberately do NOT bump" for the positive-feedback-
         // loop rationale.
-        format::enforce_token_budget(
-            output,
-            Some(format::resolve_read_max_tokens(params.0.max_tokens, 4000)),
-        )
+        self.apply_ccr_budget("search_symbols", output, params.0.max_tokens)
     }
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
     /// follow_refs=true to inline callers. Set structural=true to match AST patterns using
@@ -4354,7 +4452,7 @@ impl SymForgeServer {
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
         name = "search_text",
-        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
+        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). Matches are ranked and capped per file; large output may CCR-compress with symforge_retrieve hash. NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_text_tool(
@@ -4403,6 +4501,7 @@ impl SymForgeServer {
                 params.0.include_vendor.unwrap_or(false),
                 params.0.include_personal_tooling.unwrap_or(false),
             );
+            maybe_compact_text_search_result(&mut result, pattern);
             let output = render_search_text_output(
                 self,
                 result,
@@ -4425,7 +4524,7 @@ impl SymForgeServer {
                 "search_text",
                 (result.len() / 4).min(u32::MAX as usize) as u32,
             );
-            return format::enforce_token_budget(result, params.0.max_tokens);
+            return self.apply_ccr_budget("search_text", result, params.0.max_tokens);
         }
 
         let mut options = match search_text_options_from_input(&params.0) {
@@ -4571,11 +4670,14 @@ impl SymForgeServer {
                         "search_text",
                         (output.len() / 4).min(u32::MAX as usize) as u32,
                     );
-                    return output;
+                    return self.apply_ccr_budget("search_text", output, params.0.max_tokens);
                 }
             }
         }
 
+        let compaction_query =
+            search_text_compaction_query(params.0.query.as_deref(), params.0.terms.as_deref());
+        maybe_compact_text_search_result(&mut result, &compaction_query);
         let output = render_search_text_output(
             self,
             result,
@@ -4603,7 +4705,7 @@ impl SymForgeServer {
         // (hot files get searched more, which would bump them more, which
         // would rank them higher still). See wiki `[[SymForge Frecency-
         // Weighted File Ranking]]` §"Search tools deliberately do NOT bump".
-        format::enforce_token_budget(result, params.0.max_tokens)
+        self.apply_ccr_budget("search_text", result, params.0.max_tokens)
     }
 
     /// Internal: trace_symbol logic, called by get_symbol_context when sections are provided.
@@ -6449,6 +6551,17 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
+        let force_refresh = input.force_refresh == Some(true);
+        let params_hash = crate::protocol::session::hash_value(
+            &serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
+        );
+        if let Some(meta) =
+            self.session_context
+                .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
+        {
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
+        }
+
         let options = match file_content_options_from_input(&input) {
             Ok(options) => options,
             Err(message) => return message,
@@ -6484,20 +6597,33 @@ impl SymForgeServer {
                     )),
                     (output.len() / 4) as u64,
                 );
-                self.session_context
-                    .record_file(&input.path, (output.len() / 4) as u32);
-                // Frecency bump — commitment tool. Indexed-file branch;
-                // collection policy is resolved inside bump_frecency. See wiki
-                // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
-                self.bump_frecency(&[PathBuf::from(&input.path)]);
-                // NUL-byte guard: append an honest warning (after the byte cap so
-                // truncation can never drop it) when the file content contains
-                // literal 0x00 bytes that render invisibly. See
-                // `format::append_nul_byte_warning`.
                 let capped =
                     format::cap_file_content_output(format!("{}{}", mode_annotation, output));
                 let with_warning = format::append_nul_byte_warning(capped, &file.as_ref().content);
-                format::enforce_token_budget(with_warning, max_tokens)
+                let mut final_output = format::enforce_token_budget(with_warning, max_tokens);
+                let tokens = (final_output.len() / 4) as u32;
+                let prior_dedup = if force_refresh {
+                    self.session_context.prior_fetch_for_dedup(
+                        crate::protocol::session::FetchKind::FileContent,
+                        &input.path,
+                        "",
+                        params_hash,
+                    )
+                } else {
+                    None
+                };
+                self.session_context
+                    .record_file_content_fetch(&input.path, params_hash, tokens);
+                self.bump_frecency(&[PathBuf::from(&input.path)]);
+                if let Some(prior) = prior_dedup {
+                    final_output = format::append_dedup_hint_footer(
+                        final_output,
+                        "file",
+                        prior.fetched_at.elapsed().as_secs(),
+                        prior.approx_tokens,
+                    );
+                }
+                final_output
             }
             None => {
                 // Not in index — try raw disk read for non-source files
@@ -6643,7 +6769,7 @@ impl SymForgeServer {
     /// NOT for full refactoring context (use get_symbol_context with sections=[...]).
     #[tool(
         name = "find_references",
-        description = "Find all references or implementations for a symbol. Modes: (1) default/references: call sites, imports, type usages grouped by file - set compact=true for ~60-75% smaller output. (2) mode='implementations': find trait/interface implementors bidirectionally - set direction='trait'/'type'/'auto'. Use when you need 'who calls this?' or 'who implements this?' NOT for file-level dependencies (use find_dependents). NOT for full refactoring context (use get_symbol_context with sections=[...]).",
+        description = "Find all references or implementations for a symbol. Modes: (1) default/references: call sites, imports, type usages grouped by file - set compact=true for ~60-75% smaller output. (2) mode='implementations': find trait/interface implementors bidirectionally - set direction='trait'/'type'/'auto'. Use when you need 'who calls this?' or 'who implements this?' Large output may CCR-compress; use symforge_retrieve with the footer hash. NOT for file-level dependencies (use find_dependents). NOT for full refactoring context (use get_symbol_context with sections=[...]).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn find_references_tool(
@@ -6865,7 +6991,7 @@ impl SymForgeServer {
                     Some(envelope) => format!("{envelope}\n\n{output}"),
                     None => output,
                 };
-                format::enforce_token_budget(result, params.0.max_tokens)
+                self.apply_ccr_budget("find_references", result, params.0.max_tokens)
             }
             Err(error) => error,
         }
@@ -7381,7 +7507,7 @@ impl SymForgeServer {
     /// dependency chains (~3000 tokens). NOT for finding a specific symbol by name
     /// (use search_symbols). NOT for text content search (use search_text).
     #[tool(
-        description = "Use this when you have a concept or topic but not a specific file or symbol name. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
+        description = "Use this when you have a concept or topic but not a specific file or symbol name. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). Large output may CCR-compress; use symforge_retrieve with the footer hash. NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
@@ -8057,7 +8183,7 @@ impl SymForgeServer {
         );
         self.session_context
             .record_summary_output("explore", (output.len() / 4).min(u32::MAX as usize) as u32);
-        format::enforce_token_budget(output, params.0.max_tokens)
+        self.apply_ccr_budget("explore", output, params.0.max_tokens)
     }
 
     #[tool(
@@ -8768,6 +8894,24 @@ impl SymForgeServer {
     }
 
     #[tool(
+        description = "Retrieve full tool output previously stored by CCR compression. Pass the hash from a search or discovery footer.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn symforge_retrieve(
+        &self,
+        params: Parameters<SymforgeRetrieveInput>,
+    ) -> String {
+        let hash = params.0.hash.trim().to_lowercase();
+        if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
+        }
+        match self.ccr_store.lock().retrieve(&hash) {
+            Some(body) => body,
+            None => format!("CCR retrieve: unknown or expired hash '{hash}'"),
+        }
+    }
+
+    #[tool(
         description = "Show what symbols and files have been fetched this session. Returns a context inventory with token counts. Use to track your context budget and avoid re-fetching content you already have.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -8779,7 +8923,8 @@ impl SymForgeServer {
             return result;
         }
         let snap = self.session_context.snapshot();
-        crate::protocol::session::format_context_inventory(&snap)
+        let ccr = self.compression_economics();
+        crate::protocol::session::format_context_inventory(&snap, ccr)
     }
 
     #[tool(
@@ -9695,6 +9840,7 @@ mod tests {
             offset: None,
             limit: None,
             max_tokens: None,
+            force_refresh: None,
         }
     }
 
@@ -9707,6 +9853,7 @@ mod tests {
             targets: None,
             estimate: None,
             max_tokens: None,
+            force_refresh: None,
         }
     }
 
@@ -9884,6 +10031,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -9963,6 +10111,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -10000,6 +10149,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/main.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -10024,6 +10174,7 @@ mod tests {
                 targets: None,
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // Should return source body or not-found message — not a guard message
@@ -10239,6 +10390,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10301,6 +10453,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10356,6 +10509,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -10469,6 +10623,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "package-lock.json".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10525,6 +10680,7 @@ mod tests {
                 .get_file_context(Parameters(super::GetFileContextInput {
                     path: path.to_string(),
                     max_tokens: None,
+                    force_refresh: None,
                     sections: None,
                     estimate: None,
                 }))
@@ -10554,6 +10710,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "does/not/exist.tcl".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10735,6 +10892,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "totally/absent/file.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -10952,6 +11110,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: None,
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -10970,6 +11129,7 @@ mod tests {
                 max_tokens: Some(2000),
                 sections: None,
                 estimate: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -11007,6 +11167,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/target.py".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: None,
                 estimate: None,
             }))
@@ -11052,6 +11213,7 @@ mod tests {
                     max_tokens: Some(2000),
                     sections: None,
                     estimate: None,
+                    force_refresh: None,
                 }))
                 .await;
 
@@ -11814,6 +11976,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "scratch/impact_case.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -11908,6 +12071,7 @@ mod tests {
             .get_file_context(Parameters(super::GetFileContextInput {
                 path: "src/lib.rs".to_string(),
                 max_tokens: None,
+                force_refresh: None,
                 sections: Some(vec!["outline".to_string()]),
                 estimate: None,
             }))
@@ -14806,6 +14970,7 @@ mod tests {
                 }]),
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -14839,6 +15004,7 @@ mod tests {
                 }]),
                 estimate: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -15177,6 +15343,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -15210,6 +15377,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16237,6 +16405,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: Some(8),
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -16276,6 +16445,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16309,6 +16479,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "line 2\nline 3");
@@ -16339,6 +16510,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: line 2\n3: line 3");
@@ -16369,6 +16541,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "src/lib.rs [lines 2-3]\n2: line 2\n3: line 3");
@@ -16399,6 +16572,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "2: line 2\n3: line 3\n4: line 4");
@@ -16429,6 +16603,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // Should succeed (not reject) — header is now allowed with around_line.
@@ -16467,6 +16642,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16500,6 +16676,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: TODO first\n3: line 3");
@@ -16530,6 +16707,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16563,6 +16741,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "Chunk 3 out of range for src/lib.rs (2 chunks)");
@@ -16593,6 +16772,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "No matches for 'needle' in src/lib.rs");
@@ -16623,6 +16803,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "3: line 3\n4: TODO second\n5: line 5");
@@ -16653,6 +16834,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16695,6 +16877,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16742,6 +16925,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
 
@@ -16784,6 +16968,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "1: line 1\n2: fn connect() {}\n3: line 3");
@@ -16821,6 +17006,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16861,6 +17047,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "3: fn connect() {}");
@@ -16895,6 +17082,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16928,6 +17116,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16961,6 +17150,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -16994,6 +17184,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17027,6 +17218,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17060,6 +17252,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17099,6 +17292,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17132,6 +17326,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=symbol requires around_symbol");
@@ -17162,6 +17357,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17199,6 +17395,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17236,6 +17433,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17269,6 +17467,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode 'search' is not yet implemented");
@@ -17303,6 +17502,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17340,6 +17540,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17373,6 +17574,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17406,6 +17608,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=match requires around_match");
@@ -17436,6 +17639,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17469,6 +17673,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(
@@ -17502,6 +17707,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert_eq!(result, "mode=chunk requires chunk_index");
@@ -17532,6 +17738,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17565,6 +17772,7 @@ mod tests {
                 offset: None,
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(
@@ -17649,6 +17857,7 @@ mod tests {
             offset,
             limit,
             max_tokens: None,
+            force_refresh: None,
         }
     }
 
@@ -17776,6 +17985,7 @@ mod tests {
                 offset: Some(1),
                 limit: Some(2),
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         // offset=1 → start_line=2, limit=2 → end_line=3
@@ -17807,6 +18017,7 @@ mod tests {
                 offset: Some(1),
                 limit: None,
                 max_tokens: None,
+                force_refresh: None,
             }))
             .await;
         assert!(

@@ -5085,6 +5085,50 @@ pub fn compact_savings_footer(response_chars: usize, raw_chars: usize) -> String
     format!("\n\n{}", parts.join("; "))
 }
 
+/// Session repeat-read cache-hit body (011 US1). Shared by full tools and STEL.
+pub fn format_session_cache_hit_body(
+    meta: &crate::protocol::session::SessionCacheHitMeta,
+    decision_reason: &str,
+) -> String {
+    let cache = serde_json::json!({
+        "kind": meta.kind,
+        "path": meta.path,
+        "name": meta.name,
+        "prior_tokens": meta.prior_tokens,
+        "session_age_secs": meta.session_age_secs,
+    });
+    let json = serde_json::to_string_pretty(&cache).expect("cache payload serializes");
+    let target = if meta.name.is_empty() {
+        format!("file `{}`", meta.path)
+    } else {
+        format!("symbol `{}` in `{}`", meta.name, meta.path)
+    };
+    format!(
+        "Decision: cache_hit\n\
+         Economics: cache_hit ({decision_reason})\n\
+         Session cache: {} {target} (prior_tokens={}, session_age_secs={})\n\
+         \n\
+         SymForge did not re-execute the read for this request.\n\
+         Reuse the content already loaded in this session, or pass force_refresh=true.\n\
+         \n\
+         --- cache payload ---\n\
+         {json}",
+        meta.kind, meta.prior_tokens, meta.session_age_secs,
+    )
+}
+
+/// Dedup hint when agent forces a re-fetch of content already in session (011 US4).
+pub fn append_dedup_hint_footer(
+    output: String,
+    kind: &str,
+    age_secs: u64,
+    approx_tokens: u32,
+) -> String {
+    format!(
+        "{output}\n\n[session: same {kind} fetched {age_secs}s ago (~{approx_tokens} est tokens); reuse prior unless content changed]"
+    )
+}
+
 /// Format a "Hook Adoption (current session)" section from hook-time workflow counters.
 pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
     if snap.is_empty() {

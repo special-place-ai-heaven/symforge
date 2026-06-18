@@ -187,45 +187,15 @@ fn decision_from_cache_hit(
 
 fn detect_session_cache_hit(plan: &StelPlan, session: &SessionContext) -> Option<StelCacheBody> {
     let step = plan.steps.first()?;
-    let age = session.session_age_secs();
-    match step.tool.as_str() {
-        "get_symbol" => {
-            let name = step.args.get("name")?.as_str()?.trim();
-            if name.is_empty() {
-                return None;
-            }
-            let path = step
-                .args
-                .get("path")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .trim();
-            if !path.is_empty() && session.has_symbol(path, name) {
-                return Some(StelCacheBody {
-                    kind: "symbol".to_string(),
-                    path: path.to_string(),
-                    name: name.to_string(),
-                    prior_tokens: session.symbol_prior_tokens(path, name).unwrap_or(0),
-                    session_age_secs: age,
-                });
-            }
-            None
-        }
-        "get_file_context" | "get_file_content" => {
-            let path = step.args.get("path")?.as_str()?.trim();
-            if path.is_empty() || !session.has_file(path) {
-                return None;
-            }
-            Some(StelCacheBody {
-                kind: "file".to_string(),
-                path: path.to_string(),
-                name: String::new(),
-                prior_tokens: session.file_prior_tokens(path).unwrap_or(0),
-                session_age_secs: age,
-            })
-        }
-        _ => None,
-    }
+    session
+        .try_cache_hit_from_stel_step(&step.tool, &step.args)
+        .map(|meta| StelCacheBody {
+            kind: meta.kind.to_string(),
+            path: meta.path,
+            name: meta.name,
+            prior_tokens: meta.prior_tokens,
+            session_age_secs: meta.session_age_secs,
+        })
 }
 
 fn economics_bypass_body(plan: &StelPlan, economics: &EconomicsBreakdown) -> StelBypassBody {
@@ -663,7 +633,12 @@ mod tests {
     #[test]
     fn session_cache_hit_for_prefetched_symbol() {
         let session = SessionContext::new();
-        session.record_symbol("src/lib.rs", "cfg_if", 128);
+        session.record_symbol_fetch(
+            "src/lib.rs",
+            "cfg_if",
+            crate::protocol::session::hash_symbol_params(None, None, None),
+            128,
+        );
         let plan = StelPlan {
             plan_id: "cache".to_string(),
             intent: IntentBucket::Read,

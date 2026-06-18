@@ -26,6 +26,7 @@ use crate::protocol::edit::{
     BatchEditInput, BatchInsertInput, BatchRenameInput, DeleteSymbolInput, EditWithinSymbolInput,
     InsertSymbolInput, ReplaceSymbolBodyInput,
 };
+use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::protocol::tools::{
     AnalyzeFileImpactInput, CheckpointNowInput, DiffSymbolsInput, EditPlanInput, ExploreInput,
     FindDependentsInput, FindReferencesInput, GetFileContentInput, GetFileContextInput,
@@ -2417,6 +2418,9 @@ async fn execute_tool_call(
             .investigation_suggest(Parameters(decode_params::<InvestigationInput>(params)?))
             .await),
         "context_inventory" => Ok(server.context_inventory().await),
+        "symforge_retrieve" => Ok(server
+            .symforge_retrieve(Parameters(decode_params::<SymforgeRetrieveInput>(params)?))
+            .await),
         "ask" => Ok(server
             .ask(Parameters(decode_params::<SmartQueryInput>(params)?))
             .await),

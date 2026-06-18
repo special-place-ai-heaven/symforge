@@ -1,3 +1,4 @@
+pub mod ccr;
 pub mod conventions;
 pub(crate) mod edit;
 pub(crate) mod edit_format;
@@ -177,6 +178,8 @@ pub struct SymForgeServer {
     pub(crate) daemon_degraded: Arc<AtomicBool>,
     /// Session context tracking: records what the LLM has fetched this session.
     pub(crate) session_context: Arc<session::SessionContext>,
+    /// Per-session CCR blob store for reversible bulk compression (011).
+    pub(crate) ccr_store: Arc<Mutex<ccr::CcrStore>>,
     /// In-memory STEL L4 ledger for compact `symforge` invocations (no persistence yet).
     pub(crate) stel_ledger: Arc<Mutex<crate::stel::ledger::SessionLedger>>,
     /// Tracks edit-tool calls that omitted `working_directory` while the
@@ -245,6 +248,7 @@ impl SymForgeServer {
             daemon_client: None,
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
@@ -274,6 +278,7 @@ impl SymForgeServer {
             daemon_client: Some(Arc::new(tokio::sync::RwLock::new(daemon_client))),
             daemon_degraded: Arc::new(AtomicBool::new(false)),
             session_context: Arc::new(session::SessionContext::new()),
+            ccr_store: Arc::new(Mutex::new(ccr::CcrStore::new())),
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
@@ -496,6 +501,50 @@ impl SymForgeServer {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stats.record_tool_tokens(tool_name, output_tokens, saved);
         }
+    }
+
+    /// Apply token budget with CCR offload for eligible discovery tools (011).
+    pub(crate) fn apply_ccr_budget(
+        &self,
+        tool_name: &str,
+        result: String,
+        max_tokens: Option<u64>,
+    ) -> String {
+        let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
+        let Some(tokens) = budget else {
+            return result;
+        };
+        if ccr::profile_for_tool(tool_name).is_some_and(|p| p.ccr_eligible)
+            && result.len() > tokens as usize * 4
+        {
+            let summary = format::enforce_token_budget(result.clone(), Some(tokens));
+            let mut store = self.ccr_store.lock();
+            return ccr::apply_ccr_overflow(&mut store, tool_name, summary, result, tokens);
+        }
+        format::enforce_token_budget(result, budget)
+    }
+
+    pub(crate) fn format_read_cache_hit(
+        &self,
+        meta: &crate::protocol::session::SessionCacheHitMeta,
+        reason: &str,
+    ) -> String {
+        self.session_context.record_cache_hit();
+        format::format_session_cache_hit_body(meta, reason)
+    }
+
+    pub(crate) fn compression_economics(&self) -> crate::protocol::ccr::CcrEconomics {
+        self.ccr_store.lock().economics()
+    }
+
+    pub fn session_compression_heuristic(
+        &self,
+    ) -> crate::protocol::ccr::SessionCompressionHeuristic {
+        let cache_hits = self.session_context.snapshot().cache_hit_count;
+        crate::protocol::ccr::SessionCompressionHeuristic::from_parts(
+            cache_hits,
+            self.compression_economics(),
+        )
     }
 
     pub(crate) fn record_tool_completion(
@@ -778,6 +827,7 @@ impl SymForgeServer {
             "explore" => call!(explore, tools::ExploreInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),
             "context_inventory" => self.context_inventory().await,
+            "symforge_retrieve" => call!(symforge_retrieve, read_tools::SymforgeRetrieveInput),
             "health" => call!(health, tools::HealthInput),
             "health_compact" => self.health_compact().await,
             "conventions" => self.conventions().await,
