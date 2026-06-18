@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use crate::live_index::search::{TextLineMatch, TextSearchResult};
+
+const SEARCH_LINES_PER_FILE: usize = 10;
+const SEARCH_MAX_FILES: usize = 20;
+
 /// Per-tool output shaping rules (011).
 #[derive(Clone, Copy, Debug)]
 pub struct ToolOutputProfile {
@@ -153,6 +158,114 @@ pub fn apply_ccr_overflow(
     )
 }
 
+fn line_is_error_severity(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["error", "fatal", "panic", "exception", "failed"]
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+fn score_line_match(line_match: &TextLineMatch, query: &str) -> i32 {
+    let query_lower = query.to_ascii_lowercase();
+    let mut score = 0;
+    if line_is_error_severity(&line_match.line) {
+        score += 5;
+    }
+    if !query_lower.is_empty() && line_match.line.to_ascii_lowercase().contains(&query_lower) {
+        score += 3;
+    }
+    if let Some(sym) = &line_match.enclosing_symbol
+        && sym.name.to_ascii_lowercase().contains(&query_lower)
+    {
+        score += 2;
+    }
+    score
+}
+
+/// Rank and cap search_text matches: preserve error-severity lines (US3).
+pub fn compact_text_search_result(result: &mut TextSearchResult, query: &str) {
+    let mut omitted = 0usize;
+    let mut file_scores: Vec<(usize, i32)> = result
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let best = file
+                .matches
+                .iter()
+                .map(|m| score_line_match(m, query))
+                .max()
+                .unwrap_or(0);
+            (index, best)
+        })
+        .collect();
+    file_scores.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let keep_file_indices: std::collections::HashSet<usize> = file_scores
+        .iter()
+        .take(SEARCH_MAX_FILES)
+        .map(|(index, _)| *index)
+        .collect();
+
+    let mut kept_files = Vec::new();
+    for (index, mut file) in result.files.drain(..).enumerate() {
+        if !keep_file_indices.contains(&index) {
+            omitted = omitted.saturating_add(file.matches.len());
+            continue;
+        }
+        omitted = omitted.saturating_add(cap_file_matches(&mut file.matches, query));
+        if !file.matches.is_empty() {
+            kept_files.push(file);
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    result.files = kept_files;
+    result.overflow_count = result.overflow_count.saturating_add(omitted);
+}
+
+fn cap_file_matches(matches: &mut Vec<TextLineMatch>, query: &str) -> usize {
+    if matches.is_empty() {
+        return 0;
+    }
+    let before = matches.len();
+    let mut ranked: Vec<(usize, i32, bool)> = matches
+        .iter()
+        .enumerate()
+        .map(|(index, m)| (index, score_line_match(m, query), line_is_error_severity(&m.line)))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut keep = vec![false; matches.len()];
+    for (index, _, is_error) in &ranked {
+        if *is_error {
+            keep[*index] = true;
+        }
+    }
+    let mut non_error_kept = 0usize;
+    for (index, _, is_error) in ranked {
+        if is_error {
+            continue;
+        }
+        if non_error_kept >= SEARCH_LINES_PER_FILE {
+            break;
+        }
+        if !keep[index] {
+            keep[index] = true;
+            non_error_kept += 1;
+        }
+    }
+
+    let capped: Vec<_> = matches
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, m)| keep[index].then_some(m))
+        .collect();
+    let after = capped.len();
+    *matches = capped;
+    before.saturating_sub(after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +284,50 @@ mod tests {
             .expect("handle");
         let blob = store.get(handle).expect("blob");
         assert_eq!(blob.formatted_bytes, full);
+    }
+
+    #[test]
+    fn compact_text_search_preserves_error_lines() {
+        use crate::live_index::search::TextFileMatches;
+
+        let mut result = TextSearchResult {
+            label: "test".to_string(),
+            total_matches: 52,
+            files: vec![TextFileMatches {
+                path: "src/log.rs".to_string(),
+                matches: (0..50)
+                    .map(|i| TextLineMatch {
+                        line_number: i + 1,
+                        line: format!("info line {i}"),
+                        enclosing_symbol: None,
+                    })
+                    .chain([
+                        TextLineMatch {
+                            line_number: 51,
+                            line: "ERROR: disk full".to_string(),
+                            enclosing_symbol: None,
+                        },
+                        TextLineMatch {
+                            line_number: 52,
+                            line: "ERROR: retry failed".to_string(),
+                            enclosing_symbol: None,
+                        },
+                    ])
+                    .collect(),
+                rendered_lines: None,
+                callers: None,
+            }],
+            suppressed_by_noise: 0,
+            overflow_count: 0,
+        };
+        compact_text_search_result(&mut result, "disk");
+        let lines: Vec<_> = result.files[0]
+            .matches
+            .iter()
+            .map(|m| m.line.as_str())
+            .collect();
+        assert!(lines.iter().any(|l| l.contains("ERROR: disk")));
+        assert!(lines.iter().any(|l| l.contains("ERROR: retry")));
+        assert!(result.overflow_count > 0);
     }
 }

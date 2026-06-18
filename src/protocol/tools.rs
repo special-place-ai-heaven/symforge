@@ -2887,6 +2887,33 @@ fn render_search_text_output(
     rendered
 }
 
+fn search_text_compaction_query(query: Option<&str>, terms: Option<&[String]>) -> String {
+    if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
+        return q.to_string();
+    }
+    terms
+        .map(|items| {
+            items
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn maybe_compact_text_search_result(
+    result: &mut Result<search::TextSearchResult, search::TextSearchError>,
+    query: &str,
+) {
+    if query.trim().is_empty() {
+        return;
+    }
+    if let Ok(text) = result {
+        crate::protocol::ccr::compact_text_search_result(text, query);
+    }
+}
+
 fn resolve_text_search_enclosing_symbols(
     index: &LiveIndex,
     result: &mut Result<search::TextSearchResult, search::TextSearchError>,
@@ -3598,7 +3625,11 @@ impl SymForgeServer {
             "get_repo_map",
             (output.len() / 4).min(u32::MAX as usize) as u32,
         );
-        format::enforce_token_budget(output, params.0.max_tokens)
+        if detail == "full" {
+            self.apply_ccr_budget("get_repo_map", output, params.0.max_tokens)
+        } else {
+            format::enforce_token_budget(output, params.0.max_tokens)
+        }
     }
 
     /// Rich file summary: symbol outline, imports, consumers, references, and git activity.
@@ -4416,10 +4447,7 @@ impl SymForgeServer {
         // tool. See wiki `[[SymForge Frecency-Weighted File Ranking]]`
         // §"Search tools deliberately do NOT bump" for the positive-feedback-
         // loop rationale.
-        format::enforce_token_budget(
-            output,
-            Some(format::resolve_read_max_tokens(params.0.max_tokens, 4000)),
-        )
+        self.apply_ccr_budget("search_symbols", output, params.0.max_tokens)
     }
     /// Shows matches with enclosing symbol context. Use group_by='symbol' to deduplicate,
     /// follow_refs=true to inline callers. Set structural=true to match AST patterns using
@@ -4476,6 +4504,7 @@ impl SymForgeServer {
                 params.0.include_vendor.unwrap_or(false),
                 params.0.include_personal_tooling.unwrap_or(false),
             );
+            maybe_compact_text_search_result(&mut result, pattern);
             let output = render_search_text_output(
                 self,
                 result,
@@ -4644,11 +4673,16 @@ impl SymForgeServer {
                         "search_text",
                         (output.len() / 4).min(u32::MAX as usize) as u32,
                     );
-                    return output;
+                    return self.apply_ccr_budget("search_text", output, params.0.max_tokens);
                 }
             }
         }
 
+        let compaction_query = search_text_compaction_query(
+            params.0.query.as_deref(),
+            params.0.terms.as_deref(),
+        );
+        maybe_compact_text_search_result(&mut result, &compaction_query);
         let output = render_search_text_output(
             self,
             result,
@@ -6963,7 +6997,7 @@ impl SymForgeServer {
                     Some(envelope) => format!("{envelope}\n\n{output}"),
                     None => output,
                 };
-                format::enforce_token_budget(result, params.0.max_tokens)
+                self.apply_ccr_budget("find_references", result, params.0.max_tokens)
             }
             Err(error) => error,
         }
@@ -8155,7 +8189,7 @@ impl SymForgeServer {
         );
         self.session_context
             .record_summary_output("explore", (output.len() / 4).min(u32::MAX as usize) as u32);
-        format::enforce_token_budget(output, params.0.max_tokens)
+        self.apply_ccr_budget("explore", output, params.0.max_tokens)
     }
 
     #[tool(
