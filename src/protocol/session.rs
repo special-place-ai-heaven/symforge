@@ -1,9 +1,44 @@
 //! Session context tracking: records what the LLM has fetched this session
-//! to enable deduplication hints and context inventory.
+//! to enable deduplication hints, cache-hit short-circuits, and context inventory.
 
 use parking_lot::Mutex;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
+
+/// Kind of read recorded for session cache-hit keys (011).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum FetchKind {
+    FileContext,
+    Symbol,
+    FileContent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct FetchKey {
+    kind: FetchKind,
+    path: String,
+    symbol: String,
+    params_hash: u64,
+}
+
+/// Prior successful read metadata for cache-hit and dedup hints.
+#[derive(Clone, Debug)]
+pub struct SessionFetchRecord {
+    pub approx_tokens: u32,
+    pub fetched_at: Instant,
+}
+
+/// Metadata for a session cache-hit response body.
+#[derive(Clone, Debug)]
+pub struct SessionCacheHitMeta {
+    pub kind: &'static str,
+    pub path: String,
+    pub name: String,
+    pub prior_tokens: u32,
+    pub session_age_secs: u64,
+}
 
 /// Tracks what symbols and files have been served to the LLM this session.
 pub struct SessionContext {
@@ -21,6 +56,8 @@ struct SessionInner {
     listed_files: HashMap<String, u32>,
     /// Aggregate outputs that consumed context without mapping cleanly to one file/symbol.
     summary_outputs: HashMap<String, u32>,
+    /// Parameter-aware fetch records for cache-hit (011).
+    detailed_fetches: HashMap<FetchKey, SessionFetchRecord>,
     /// Total tokens served this session
     total_tokens: u64,
     /// Session start time
@@ -51,9 +88,10 @@ impl SessionContext {
                 fetched_symbols: HashMap::new(),
                 listed_symbols: HashMap::new(),
                 fetched_files: HashMap::new(),
-                listed_files: HashMap::new(),
-                summary_outputs: HashMap::new(),
-                total_tokens: 0,
+            listed_files: HashMap::new(),
+            summary_outputs: HashMap::new(),
+            detailed_fetches: HashMap::new(),
+            total_tokens: 0,
                 started_at: Instant::now(),
             }),
         }
@@ -138,6 +176,174 @@ impl SessionContext {
         self.inner.lock().started_at.elapsed().as_secs()
     }
 
+    fn try_cache_hit(
+        &self,
+        kind: FetchKind,
+        path: &str,
+        symbol: &str,
+        params_hash: u64,
+        force_refresh: bool,
+    ) -> Option<SessionCacheHitMeta> {
+        if force_refresh {
+            return None;
+        }
+        let inner = self.inner.lock();
+        let key = FetchKey {
+            kind,
+            path: path.to_string(),
+            symbol: symbol.to_string(),
+            params_hash,
+        };
+        let record = inner.detailed_fetches.get(&key)?;
+        let (kind_label, name) = match kind {
+            FetchKind::Symbol => ("symbol", symbol.to_string()),
+            FetchKind::FileContext | FetchKind::FileContent => ("file", String::new()),
+        };
+        Some(SessionCacheHitMeta {
+            kind: kind_label,
+            path: path.to_string(),
+            name,
+            prior_tokens: record.approx_tokens,
+            session_age_secs: inner.started_at.elapsed().as_secs(),
+        })
+    }
+
+    fn record_detailed_fetch(
+        &self,
+        kind: FetchKind,
+        path: &str,
+        symbol: &str,
+        params_hash: u64,
+        tokens: u32,
+    ) {
+        let mut inner = self.inner.lock();
+        let key = FetchKey {
+            kind,
+            path: path.to_string(),
+            symbol: symbol.to_string(),
+            params_hash,
+        };
+        inner.detailed_fetches.insert(
+            key,
+            SessionFetchRecord {
+                approx_tokens: tokens,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Prior fetch for dedup hint when `force_refresh` re-serves content.
+    pub fn prior_fetch_for_dedup(
+        &self,
+        kind: FetchKind,
+        path: &str,
+        symbol: &str,
+        params_hash: u64,
+    ) -> Option<SessionFetchRecord> {
+        let inner = self.inner.lock();
+        inner.detailed_fetches.get(&FetchKey {
+            kind,
+            path: path.to_string(),
+            symbol: symbol.to_string(),
+            params_hash,
+        }).cloned()
+    }
+
+    pub fn try_symbol_cache_hit(
+        &self,
+        path: &str,
+        name: &str,
+        params_hash: u64,
+        force_refresh: bool,
+    ) -> Option<SessionCacheHitMeta> {
+        self.try_cache_hit(FetchKind::Symbol, path, name, params_hash, force_refresh)
+    }
+
+    pub fn try_file_context_cache_hit(
+        &self,
+        path: &str,
+        params_hash: u64,
+        force_refresh: bool,
+    ) -> Option<SessionCacheHitMeta> {
+        self.try_cache_hit(FetchKind::FileContext, path, "", params_hash, force_refresh)
+    }
+
+    pub fn try_file_content_cache_hit(
+        &self,
+        path: &str,
+        params_hash: u64,
+        force_refresh: bool,
+    ) -> Option<SessionCacheHitMeta> {
+        self.try_cache_hit(FetchKind::FileContent, path, "", params_hash, force_refresh)
+    }
+
+    pub fn record_symbol_fetch(
+        &self,
+        path: &str,
+        name: &str,
+        params_hash: u64,
+        tokens: u32,
+    ) {
+        self.record_symbol(path, name, tokens);
+        self.record_detailed_fetch(FetchKind::Symbol, path, name, params_hash, tokens);
+    }
+
+    pub fn record_file_context_fetch(&self, path: &str, params_hash: u64, tokens: u32) {
+        self.record_detailed_fetch(FetchKind::FileContext, path, "", params_hash, tokens);
+    }
+
+    pub fn record_file_content_fetch(&self, path: &str, params_hash: u64, tokens: u32) {
+        self.record_file(path, tokens);
+        self.record_detailed_fetch(FetchKind::FileContent, path, "", params_hash, tokens);
+    }
+
+    /// STEL compact-step cache lookup using JSON args.
+    pub fn try_cache_hit_from_stel_step(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Option<SessionCacheHitMeta> {
+        let force_refresh = args
+            .get("force_refresh")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match tool {
+            "get_symbol" => {
+                let name = args.get("name")?.as_str()?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if path.is_empty() {
+                    return None;
+                }
+                let hash = hash_symbol_params_json(args);
+                self.try_symbol_cache_hit(path, name, hash, force_refresh)
+            }
+            "get_file_context" | "get_file_content" => {
+                let path = args.get("path")?.as_str()?.trim();
+                if path.is_empty() {
+                    return None;
+                }
+                let hash = if tool == "get_file_context" {
+                    hash_file_context_params_json(args)
+                } else {
+                    hash_file_content_params_json(args)
+                };
+                if tool == "get_file_context" {
+                    self.try_file_context_cache_hit(path, hash, force_refresh)
+                } else {
+                    self.try_file_content_cache_hit(path, hash, force_refresh)
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Take a snapshot for display.
     pub fn snapshot(&self) -> SessionSnapshot {
         let inner = self.inner.lock();
@@ -186,6 +392,53 @@ impl SessionContext {
             duration_secs: inner.started_at.elapsed().as_secs(),
         }
     }
+}
+
+pub fn hash_value(value: &serde_json::Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+pub fn hash_file_context_params(
+    max_tokens: Option<u64>,
+    sections: Option<&[String]>,
+) -> u64 {
+    hash_value(&serde_json::json!({
+        "max_tokens": max_tokens,
+        "sections": sections,
+    }))
+}
+
+pub fn hash_file_context_params_json(args: &serde_json::Value) -> u64 {
+    hash_value(&serde_json::json!({
+        "max_tokens": args.get("max_tokens"),
+        "sections": args.get("sections"),
+    }))
+}
+
+pub fn hash_symbol_params_json(args: &serde_json::Value) -> u64 {
+    hash_value(&serde_json::json!({
+        "kind": args.get("kind"),
+        "symbol_line": args.get("symbol_line"),
+        "max_tokens": args.get("max_tokens"),
+    }))
+}
+
+pub fn hash_symbol_params(
+    kind: Option<&str>,
+    symbol_line: Option<u32>,
+    max_tokens: Option<u64>,
+) -> u64 {
+    hash_value(&serde_json::json!({
+        "kind": kind,
+        "symbol_line": symbol_line,
+        "max_tokens": max_tokens,
+    }))
+}
+
+pub fn hash_file_content_params_json(args: &serde_json::Value) -> u64 {
+    hash_value(args)
 }
 
 /// Format the session context inventory for display.

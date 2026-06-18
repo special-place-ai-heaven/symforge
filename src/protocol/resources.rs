@@ -188,6 +188,7 @@ impl SymForgeServer {
                     max_tokens,
                     sections: None,
                     estimate: None,
+                    force_refresh: None,
                 }))
                 .await
             }
@@ -221,6 +222,7 @@ impl SymForgeServer {
                     offset: None,
                     limit: None,
                     max_tokens: None,
+                    force_refresh: None,
                 }))
                 .await
             }
@@ -233,6 +235,7 @@ impl SymForgeServer {
                     targets: None,
                     estimate: None,
                     max_tokens: None,
+                    force_refresh: None,
                 }))
                 .await
             }

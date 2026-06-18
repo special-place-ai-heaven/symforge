@@ -282,6 +282,9 @@ pub struct GetSymbolInput {
     /// Optional maximum token budget for the response (~1000 default when unset).
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// When true, bypass session cache-hit and return a fresh payload.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub force_refresh: Option<bool>,
 }
 
 /// A single target in a `get_symbols` batch request.
@@ -368,9 +371,18 @@ pub struct GetFileContentInput {
     /// Optional maximum token budget for the response.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// When true, bypass session cache-hit and return a fresh payload.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub force_refresh: Option<bool>,
 }
 
-/// Input for `validate_file_syntax`.
+/// Input for `symforge_retrieve` (CCR full output recovery, 011).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct SymforgeRetrieveInput {
+    /// 12-character hex handle from a CCR footer.
+    pub hash: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct ValidateFileSyntaxInput {
     pub path: String,
@@ -449,6 +461,9 @@ pub struct GetFileContextInput {
     /// When true, return an approximate token cost estimate instead of actual content.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub estimate: Option<bool>,
+    /// When true, bypass session cache-hit and return a fresh payload.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub force_refresh: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for GetFileContextInput {
@@ -464,6 +479,8 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
             include_tests: bool,
             #[serde(default, deserialize_with = "lenient_bool")]
             estimate: Option<bool>,
+            #[serde(default, deserialize_with = "lenient_bool")]
+            force_refresh: Option<bool>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -472,6 +489,7 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
             max_tokens: raw.max_tokens,
             sections: encode_include_tests_marker(raw.sections, raw.include_tests),
             estimate: raw.estimate,
+            force_refresh: raw.force_refresh,
         })
     }
 }
