@@ -82,10 +82,18 @@ After US1+US2 land:
 ```powershell
 cargo test --test persist_compression_ratio -- --test-threads=1
 cargo test frecency -- --test-threads=1
+cargo test --test ccr_economics -- --test-threads=1
 cargo check --no-default-features --features embed
 ```
 
 **Pass**: SC-005 + Principle VI embed isolation.
+
+## Transport parity (T040)
+
+CCR and session cache-hit run through the same `SymForgeServer` handlers on stdio
+and `serve` — no transport-specific compression fork. Manual smoke: repeat
+`get_symbol` on stdio MCP, then the same call via serve `/mcp` in one session;
+both should return `Decision: cache_hit` on the second call.
 
 ## Headroom reference (optional)
 

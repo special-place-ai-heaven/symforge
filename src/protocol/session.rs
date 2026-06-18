@@ -58,6 +58,8 @@ struct SessionInner {
     summary_outputs: HashMap<String, u32>,
     /// Parameter-aware fetch records for cache-hit (011).
     detailed_fetches: HashMap<FetchKey, SessionFetchRecord>,
+    /// Read-path cache-hit short-circuits (011 US5).
+    cache_hit_count: u32,
     /// Total tokens served this session
     total_tokens: u64,
     /// Session start time
@@ -71,6 +73,7 @@ pub struct SessionSnapshot {
     pub fetched_files: Vec<(String, u32)>,           // (path, tokens)
     pub listed_files: Vec<(String, u32)>,            // (path, tokens)
     pub summary_outputs: Vec<(String, u32)>,         // (label, tokens)
+    pub cache_hit_count: u32,
     pub total_tokens: u64,
     pub duration_secs: u64,
 }
@@ -91,6 +94,7 @@ impl SessionContext {
                 listed_files: HashMap::new(),
                 summary_outputs: HashMap::new(),
                 detailed_fetches: HashMap::new(),
+                cache_hit_count: 0,
                 total_tokens: 0,
                 started_at: Instant::now(),
             }),
@@ -133,6 +137,12 @@ impl SessionContext {
         }
         inner.listed_files.insert(path.to_string(), tokens);
         inner.total_tokens += tokens as u64;
+    }
+
+    /// Record a read-path session cache-hit short-circuit (011 US5).
+    pub fn record_cache_hit(&self) {
+        let mut inner = self.inner.lock();
+        inner.cache_hit_count = inner.cache_hit_count.saturating_add(1);
     }
 
     /// Record a summary/search-style output that consumed context without mapping to one item.
@@ -385,6 +395,7 @@ impl SessionContext {
             fetched_files,
             listed_files,
             summary_outputs,
+            cache_hit_count: inner.cache_hit_count,
             total_tokens: inner.total_tokens,
             duration_secs: inner.started_at.elapsed().as_secs(),
         }
@@ -436,7 +447,10 @@ pub fn hash_file_content_params_json(args: &serde_json::Value) -> u64 {
 }
 
 /// Format the session context inventory for display.
-pub fn format_context_inventory(snap: &SessionSnapshot) -> String {
+pub fn format_context_inventory(
+    snap: &SessionSnapshot,
+    ccr: crate::protocol::ccr::CcrEconomics,
+) -> String {
     let minutes = snap.duration_secs / 60;
     let total_items = snap.fetched_symbols.len()
         + snap.fetched_files.len()
@@ -529,6 +543,15 @@ pub fn format_context_inventory(snap: &SessionSnapshot) -> String {
         }
     }
 
+    if snap.cache_hit_count > 0 || ccr.offloads > 0 || ccr.retrieves > 0 {
+        lines.push(String::new());
+        lines.push("Compression economics (heuristic estimates, 011):".to_string());
+        lines.push(format!("  cache_hits: {}", snap.cache_hit_count));
+        lines.push(format!("  ccr_offloads: {}", ccr.offloads));
+        lines.push(format!("  ccr_bytes_stored: {}", ccr.bytes_stored));
+        lines.push(format!("  ccr_bytes_retrieved: {}", ccr.bytes_retrieved));
+    }
+
     lines.join("\n")
 }
 
@@ -584,7 +607,7 @@ mod tests {
         ctx.record_file("src/main.rs", 1000);
         ctx.record_summary_output("explore", 75);
         let snap = ctx.snapshot();
-        let output = format_context_inventory(&snap);
+        let output = format_context_inventory(&snap, crate::protocol::ccr::CcrEconomics::default());
         assert!(output.contains("LiveIndex"));
         assert!(output.contains("SearchHit"));
         assert!(output.contains("src/overview.rs"));

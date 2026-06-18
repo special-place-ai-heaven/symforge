@@ -68,6 +68,35 @@ pub struct CcrBlob {
     pub created_at: Instant,
 }
 
+/// Per-session CCR economics counters (011 US5, heuristic).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct CcrEconomics {
+    pub offloads: u32,
+    pub bytes_stored: u64,
+    pub retrieves: u32,
+    pub bytes_retrieved: u64,
+}
+
+/// Combined session compression counters for economics surfaces (011 US5).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct SessionCompressionHeuristic {
+    pub cache_hits: u32,
+    pub ccr_offloads: u32,
+    pub ccr_bytes_stored: u64,
+    pub ccr_bytes_retrieved: u64,
+}
+
+impl SessionCompressionHeuristic {
+    pub fn from_parts(cache_hits: u32, ccr: CcrEconomics) -> Self {
+        Self {
+            cache_hits,
+            ccr_offloads: ccr.offloads,
+            ccr_bytes_stored: ccr.bytes_stored,
+            ccr_bytes_retrieved: ccr.bytes_retrieved,
+        }
+    }
+}
+
 /// Per-session CCR blob store.
 #[derive(Debug, Default)]
 pub struct CcrStore {
@@ -75,6 +104,7 @@ pub struct CcrStore {
     total_bytes: usize,
     max_bytes: usize,
     max_entries: usize,
+    economics: CcrEconomics,
 }
 
 impl CcrStore {
@@ -84,6 +114,7 @@ impl CcrStore {
             total_bytes: 0,
             max_bytes: 32 * 1024 * 1024,
             max_entries: 256,
+            economics: CcrEconomics::default(),
         }
     }
 
@@ -107,7 +138,22 @@ impl CcrStore {
                 created_at: Instant::now(),
             },
         );
+        self.economics.offloads = self.economics.offloads.saturating_add(1);
+        self.economics.bytes_stored = self.economics.bytes_stored.saturating_add(byte_len as u64);
         handle
+    }
+
+    pub fn economics(&self) -> CcrEconomics {
+        self.economics
+    }
+
+    /// Fetch blob and record retrieve bytes (US5).
+    pub fn retrieve(&mut self, handle: &str) -> Option<String> {
+        let blob = self.blobs.get(handle)?;
+        let bytes = blob.formatted_bytes.len() as u64;
+        self.economics.retrieves = self.economics.retrieves.saturating_add(1);
+        self.economics.bytes_retrieved = self.economics.bytes_retrieved.saturating_add(bytes);
+        Some(blob.formatted_bytes.clone())
     }
 
     pub fn get(&self, handle: &str) -> Option<&CcrBlob> {
@@ -290,6 +336,13 @@ mod tests {
             .expect("handle");
         let blob = store.get(handle).expect("blob");
         assert_eq!(blob.formatted_bytes, full);
+        let econ = store.economics();
+        assert_eq!(econ.offloads, 1);
+        assert!(econ.bytes_stored > 0);
+        let retrieved = store.retrieve(handle).expect("retrieve");
+        assert_eq!(retrieved, full);
+        assert_eq!(store.economics().retrieves, 1);
+        assert_eq!(store.economics().bytes_retrieved, econ.bytes_stored);
     }
 
     #[test]

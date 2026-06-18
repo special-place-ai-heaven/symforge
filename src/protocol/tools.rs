@@ -3327,7 +3327,7 @@ impl SymForgeServer {
             params_hash,
             force_refresh,
         ) {
-            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
         }
 
         let file = {
@@ -3652,7 +3652,7 @@ impl SymForgeServer {
             params_hash,
             force_refresh,
         ) {
-            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
         }
         // Honest Tier-2/Tier-3 response: the path may EXIST on disk but be
         // deliberately admitted as metadata-only (e.g. package-lock.json) or
@@ -6559,7 +6559,7 @@ impl SymForgeServer {
             self.session_context
                 .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
         {
-            return format::format_session_cache_hit_body(&meta, "session_repeat_read");
+            return self.format_read_cache_hit(&meta, "session_repeat_read");
         }
 
         let options = match file_content_options_from_input(&input) {
@@ -8905,8 +8905,8 @@ impl SymForgeServer {
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
         }
-        match self.ccr_store.lock().get(&hash) {
-            Some(blob) => blob.formatted_bytes.clone(),
+        match self.ccr_store.lock().retrieve(&hash) {
+            Some(body) => body,
             None => format!("CCR retrieve: unknown or expired hash '{hash}'"),
         }
     }
@@ -8923,7 +8923,8 @@ impl SymForgeServer {
             return result;
         }
         let snap = self.session_context.snapshot();
-        crate::protocol::session::format_context_inventory(&snap)
+        let ccr = self.compression_economics();
+        crate::protocol::session::format_context_inventory(&snap, ccr)
     }
 
     #[tool(

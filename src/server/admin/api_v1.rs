@@ -37,6 +37,27 @@ use crate::server::aap::{AapDetection, AapPresets, EmbedPinComparison, Integrati
 // View DTOs (T005)
 // ---------------------------------------------------------------------------
 
+/// In-memory session compression counters (011 US5, heuristic — not durable ledger).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompressionHeuristicView {
+    pub cache_hits: u32,
+    pub ccr_offloads: u32,
+    pub ccr_bytes_stored: u64,
+    pub ccr_bytes_retrieved: u64,
+}
+
+impl CompressionHeuristicView {
+    pub fn from_runtime(runtime: &ServerRuntime) -> Self {
+        let h = runtime.protocol().session_compression_heuristic();
+        Self {
+            cache_hits: h.cache_hits,
+            ccr_offloads: h.ccr_offloads,
+            ccr_bytes_stored: h.ccr_bytes_stored,
+            ccr_bytes_retrieved: h.ccr_bytes_retrieved,
+        }
+    }
+}
+
 /// Economics summary projection. When the durable ledger is unavailable
 /// (`Disabled`/not opened), `available` is `false` and the numeric fields are
 /// `null` — the UI renders an explicit "unavailable" state, never fake zeros
@@ -53,11 +74,14 @@ pub struct LedgerSummaryView {
     pub accepted_count: Option<u64>,
     /// Distinct sessions observed. `None` when unavailable.
     pub session_count: Option<u64>,
+    /// Per-session compression heuristic counters (011 US5).
+    pub compression_heuristic: CompressionHeuristicView,
 }
 
 impl LedgerSummaryView {
     /// Build from the runtime's optional ledger store.
     pub fn from_runtime(runtime: &ServerRuntime) -> Self {
+        let compression_heuristic = CompressionHeuristicView::from_runtime(runtime);
         match runtime.ledger_store().and_then(|s| s.summary()) {
             Some(summary) => Self {
                 available: true,
@@ -65,6 +89,7 @@ impl LedgerSummaryView {
                 total_net_vs_manual: Some(summary.total_net_vs_manual),
                 accepted_count: Some(summary.accepted_count),
                 session_count: Some(summary.session_count),
+                compression_heuristic,
             },
             None => Self {
                 available: false,
@@ -72,6 +97,7 @@ impl LedgerSummaryView {
                 total_net_vs_manual: None,
                 accepted_count: None,
                 session_count: None,
+                compression_heuristic,
             },
         }
     }
@@ -602,6 +628,15 @@ mod tests {
         assert!(view.available);
         assert_eq!(view.total_events, Some(1));
         assert_eq!(view.total_net_vs_manual, Some(210));
+        assert_eq!(view.compression_heuristic.cache_hits, 0);
+    }
+
+    #[test]
+    fn ledger_view_includes_compression_heuristic_from_protocol() {
+        let runtime = runtime_with_ledger(None);
+        let view = LedgerSummaryView::from_runtime(&runtime);
+        assert_eq!(view.compression_heuristic.cache_hits, 0);
+        assert_eq!(view.compression_heuristic.ccr_offloads, 0);
     }
 
     #[test]

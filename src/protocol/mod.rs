@@ -524,6 +524,29 @@ impl SymForgeServer {
         format::enforce_token_budget(result, budget)
     }
 
+    pub(crate) fn format_read_cache_hit(
+        &self,
+        meta: &crate::protocol::session::SessionCacheHitMeta,
+        reason: &str,
+    ) -> String {
+        self.session_context.record_cache_hit();
+        format::format_session_cache_hit_body(meta, reason)
+    }
+
+    pub(crate) fn compression_economics(&self) -> crate::protocol::ccr::CcrEconomics {
+        self.ccr_store.lock().economics()
+    }
+
+    pub fn session_compression_heuristic(
+        &self,
+    ) -> crate::protocol::ccr::SessionCompressionHeuristic {
+        let cache_hits = self.session_context.snapshot().cache_hit_count;
+        crate::protocol::ccr::SessionCompressionHeuristic::from_parts(
+            cache_hits,
+            self.compression_economics(),
+        )
+    }
+
     pub(crate) fn record_tool_completion(
         &self,
         tool_name: &'static str,
