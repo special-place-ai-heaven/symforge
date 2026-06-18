@@ -191,23 +191,37 @@ pub fn start_operator_server(
 /// but with a plain `std::net::TcpListener` so it is callable from a synchronous
 /// CLI context (the caller of [`start_operator_server`] has no ambient runtime).
 ///
-/// Attempts to bind `preferred`; on success returns that address, on failure (the
-/// port is occupied) binds `127.0.0.1:0` for an OS-assigned ephemeral port. The
-/// probe listener is dropped before returning, so the same documented small
-/// rebind window as `serve::probe_free_port` applies — closed in practice by the
-/// `SO_REUSEADDR` rebind inside `serve::run` plus the step-3 reachability gate.
-/// Select a verified-free loopback address (pub for setup wizard reuse).
+/// Attempts to bind `preferred` (when non-zero); on success returns that address,
+/// on failure (the port is occupied) binds the first free
+/// [`serve::operator_port_candidates`] port (8000-8999 then 5000-5999) — never an
+/// OS-assigned ephemeral port, which corporate networks block (the 61850
+/// problem). An explicit `:0` `preferred` is honored verbatim. The probe listener
+/// is dropped before returning, so the same documented small rebind window as
+/// `serve::probe_free_port` applies — closed in practice by the `SO_REUSEADDR`
+/// rebind inside `serve::run` plus the step-3 reachability gate. Pub(crate) for
+/// setup wizard reuse.
 pub(crate) fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
-    if let Some(addr) = preferred
-        && let Ok(listener) = std::net::TcpListener::bind(addr)
-    {
-        let local = listener.local_addr()?;
-        // `:0` was requested explicitly via `preferred` → resolve the concrete port.
-        return Ok(local);
+    if let Some(addr) = preferred {
+        // `:0` requested explicitly → resolve the concrete OS-assigned port.
+        if addr.port() == 0 {
+            return std::net::TcpListener::bind(addr)?.local_addr();
+        }
+        if let Ok(listener) = std::net::TcpListener::bind(addr) {
+            return listener.local_addr();
+        }
     }
-    let ephemeral: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let listener = std::net::TcpListener::bind(ephemeral)?;
-    listener.local_addr()
+    // Preferred occupied / no preference: first free operator port in the
+    // corporate-friendly ranges, never an OS ephemeral port.
+    for port in crate::server::serve::operator_port_candidates() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        if let Ok(listener) = std::net::TcpListener::bind(addr) {
+            return listener.local_addr();
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "no free operator port available in 8000-8999 or 5000-5999",
+    ))
 }
 
 /// Flags for `symforge admin` (see `contracts/admin-cli.md`).
