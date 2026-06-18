@@ -1,5 +1,5 @@
-pub mod conventions;
 pub mod ccr;
+pub mod conventions;
 pub(crate) mod edit;
 pub(crate) mod edit_format;
 pub mod edit_hooks;

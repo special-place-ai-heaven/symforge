@@ -197,7 +197,7 @@ async fn cache_hit_dispatch_skips_legacy_tools_after_session_prefetch() {
         second.contains("decision: cache_hit"),
         "repeat should cache_hit:\n{second}"
     );
-    assert!(second.contains("did not re-execute a legacy tool"));
+    assert!(second.contains("did not re-execute the read"));
     assert!(!second.contains("Chosen tool: get_symbol"));
 
     let event = server.stel_ledger().lock().last().expect("ledger event");

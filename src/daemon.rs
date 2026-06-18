@@ -26,6 +26,7 @@ use crate::protocol::edit::{
     BatchEditInput, BatchInsertInput, BatchRenameInput, DeleteSymbolInput, EditWithinSymbolInput,
     InsertSymbolInput, ReplaceSymbolBodyInput,
 };
+use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::protocol::tools::{
     AnalyzeFileImpactInput, CheckpointNowInput, DiffSymbolsInput, EditPlanInput, ExploreInput,
     FindDependentsInput, FindReferencesInput, GetFileContentInput, GetFileContextInput,
@@ -33,7 +34,6 @@ use crate::protocol::tools::{
     InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
     SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
 };
-use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
 

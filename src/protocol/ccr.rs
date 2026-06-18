@@ -232,7 +232,13 @@ fn cap_file_matches(matches: &mut Vec<TextLineMatch>, query: &str) -> usize {
     let mut ranked: Vec<(usize, i32, bool)> = matches
         .iter()
         .enumerate()
-        .map(|(index, m)| (index, score_line_match(m, query), line_is_error_severity(&m.line)))
+        .map(|(index, m)| {
+            (
+                index,
+                score_line_match(m, query),
+                line_is_error_severity(&m.line),
+            )
+        })
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 

@@ -472,7 +472,7 @@ mod tests {
         assert!(should_skip_legacy_dispatch(&decision));
         let body = format_cache_hit_body(&decision);
         assert!(body.contains("Decision: cache_hit"));
-        assert!(body.contains("did not re-execute a legacy tool"));
+        assert!(body.contains("did not re-execute the read"));
     }
 
     #[test]

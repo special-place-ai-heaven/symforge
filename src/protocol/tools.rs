@@ -3427,11 +3427,8 @@ impl SymForgeServer {
                 // Collection policy is resolved inside bump_frecency. See wiki
                 // `[[SymForge Frecency-Weighted File Ranking]]` §"Bump hooks".
                 self.bump_frecency(&[PathBuf::from(&params.0.path)]);
-                let mut final_output =
-                    format::enforce_token_budget(output, Some(max_tokens));
-                if force_refresh
-                    && let Some(prior) = prior_dedup
-                {
+                let mut final_output = format::enforce_token_budget(output, Some(max_tokens));
+                if force_refresh && let Some(prior) = prior_dedup {
                     final_output = format::append_dedup_hint_footer(
                         final_output,
                         "symbol",
@@ -3457,7 +3454,7 @@ impl SymForgeServer {
     /// counts and language tags — supports path and depth params for subtree browsing.
     /// NOT for file details (use get_file_context) or finding symbols (use search_symbols).
     #[tool(
-        description = "Start here for project orientation and the first code-reading pass before any broad raw file read. Returns a structural overview of the repository. Modes: (1) default/compact: ~500 token overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline of every file — warning: large output. (3) detail='tree': browsable file tree with per-file symbol counts and language tags — supports path and depth params for subtree browsing. NOT for file details (use get_file_context) or finding symbols (use search_symbols).",
+        description = "Start here for project orientation and the first code-reading pass before any broad raw file read. Returns a structural overview of the repository. Modes: (1) default/compact: ~500 token overview with file count, languages, and directory tree. (2) detail='full': complete symbol outline of every file — warning: large output; may CCR-compress with symforge_retrieve hash when over max_tokens. (3) detail='tree': browsable file tree with per-file symbol counts and language tags — supports path and depth params for subtree browsing. NOT for file details (use get_file_context) or finding symbols (use search_symbols).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_repo_map(&self, params: Parameters<GetRepoMapInput>) -> String {
@@ -4254,7 +4251,7 @@ impl SymForgeServer {
     /// NOT for text content search (use search_text). NOT for file path search (use search_files).
     #[tool(
         name = "search_symbols",
-        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. NOT for text content search (use search_text). NOT for file path search (use search_files).",
+        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. Large result sets may CCR-compress; use symforge_retrieve with the footer hash for the full ranked list. NOT for text content search (use search_text). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_symbols_tool(
@@ -4455,7 +4452,7 @@ impl SymForgeServer {
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
         name = "search_text",
-        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
+        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). Matches are ranked and capped per file; large output may CCR-compress with symforge_retrieve hash. NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_text_tool(
@@ -4678,10 +4675,8 @@ impl SymForgeServer {
             }
         }
 
-        let compaction_query = search_text_compaction_query(
-            params.0.query.as_deref(),
-            params.0.terms.as_deref(),
-        );
+        let compaction_query =
+            search_text_compaction_query(params.0.query.as_deref(), params.0.terms.as_deref());
         maybe_compact_text_search_result(&mut result, &compaction_query);
         let output = render_search_text_output(
             self,
@@ -6560,11 +6555,10 @@ impl SymForgeServer {
         let params_hash = crate::protocol::session::hash_value(
             &serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
         );
-        if let Some(meta) = self.session_context.try_file_content_cache_hit(
-            &input.path,
-            params_hash,
-            force_refresh,
-        ) {
+        if let Some(meta) =
+            self.session_context
+                .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
+        {
             return format::format_session_cache_hit_body(&meta, "session_repeat_read");
         }
 
@@ -6775,7 +6769,7 @@ impl SymForgeServer {
     /// NOT for full refactoring context (use get_symbol_context with sections=[...]).
     #[tool(
         name = "find_references",
-        description = "Find all references or implementations for a symbol. Modes: (1) default/references: call sites, imports, type usages grouped by file - set compact=true for ~60-75% smaller output. (2) mode='implementations': find trait/interface implementors bidirectionally - set direction='trait'/'type'/'auto'. Use when you need 'who calls this?' or 'who implements this?' NOT for file-level dependencies (use find_dependents). NOT for full refactoring context (use get_symbol_context with sections=[...]).",
+        description = "Find all references or implementations for a symbol. Modes: (1) default/references: call sites, imports, type usages grouped by file - set compact=true for ~60-75% smaller output. (2) mode='implementations': find trait/interface implementors bidirectionally - set direction='trait'/'type'/'auto'. Use when you need 'who calls this?' or 'who implements this?' Large output may CCR-compress; use symforge_retrieve with the footer hash. NOT for file-level dependencies (use find_dependents). NOT for full refactoring context (use get_symbol_context with sections=[...]).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn find_references_tool(
@@ -7513,7 +7507,7 @@ impl SymForgeServer {
     /// dependency chains (~3000 tokens). NOT for finding a specific symbol by name
     /// (use search_symbols). NOT for text content search (use search_text).
     #[tool(
-        description = "Use this when you have a concept or topic but not a specific file or symbol name. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
+        description = "Use this when you have a concept or topic but not a specific file or symbol name. Accepts a natural-language concept and returns related symbols, patterns, and files. Set depth=2 for signatures and callers of top symbols (~1500 tokens). Set depth=3 for implementations and type dependency chains (~3000 tokens). Large output may CCR-compress; use symforge_retrieve with the footer hash. NOT for finding a specific symbol by name (use search_symbols). NOT for text content search (use search_text).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
@@ -10685,7 +10679,7 @@ mod tests {
                 .get_file_context(Parameters(super::GetFileContextInput {
                     path: path.to_string(),
                     max_tokens: None,
-                force_refresh: None,
+                    force_refresh: None,
                     sections: None,
                     estimate: None,
                 }))
@@ -17862,7 +17856,7 @@ mod tests {
             offset,
             limit,
             max_tokens: None,
-                force_refresh: None,
+            force_refresh: None,
         }
     }
 

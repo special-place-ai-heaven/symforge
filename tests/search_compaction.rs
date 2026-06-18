@@ -85,10 +85,7 @@ async fn search_text_compaction_caps_many_files() {
         None,
     );
     let out = server
-        .dispatch_tool_for_tests(
-            "search_text",
-            json!({ "query": "match_me", "limit": 500 }),
-        )
+        .dispatch_tool_for_tests("search_text", json!({ "query": "match_me", "limit": 500 }))
         .await;
     let file_headers = out.matches("file_").count();
     assert!(

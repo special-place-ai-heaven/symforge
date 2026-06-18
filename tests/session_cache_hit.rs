@@ -2,8 +2,8 @@
 
 use serde_json::json;
 use symforge::live_index::LiveIndex;
-use symforge::protocol::session::hash_symbol_params;
 use symforge::protocol::SymForgeServer;
+use symforge::protocol::session::hash_symbol_params;
 
 fn server_for_fixture() -> SymForgeServer {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -61,12 +61,17 @@ async fn get_symbol_repeat_returns_cache_hit() {
 fn session_detailed_fetch_drives_stel_cache_hit() {
     use symforge::protocol::session::SessionContext;
     use symforge::stel::{
-        evaluate_plan_with_session, AdmissionDecision, IntentBucket, RouteConfidence, StelPlan,
-        StelPlanStep, StelRequest,
+        AdmissionDecision, IntentBucket, RouteConfidence, StelPlan, StelPlanStep, StelRequest,
+        evaluate_plan_with_session,
     };
 
     let session = SessionContext::new();
-    session.record_symbol_fetch("src/lib.rs", "foo", hash_symbol_params(None, None, None), 200);
+    session.record_symbol_fetch(
+        "src/lib.rs",
+        "foo",
+        hash_symbol_params(None, None, None),
+        200,
+    );
     let plan = StelPlan {
         plan_id: "t".to_string(),
         intent: IntentBucket::Read,

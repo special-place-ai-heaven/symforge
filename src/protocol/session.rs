@@ -2,8 +2,8 @@
 //! to enable deduplication hints, cache-hit short-circuits, and context inventory.
 
 use parking_lot::Mutex;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -88,10 +88,10 @@ impl SessionContext {
                 fetched_symbols: HashMap::new(),
                 listed_symbols: HashMap::new(),
                 fetched_files: HashMap::new(),
-            listed_files: HashMap::new(),
-            summary_outputs: HashMap::new(),
-            detailed_fetches: HashMap::new(),
-            total_tokens: 0,
+                listed_files: HashMap::new(),
+                summary_outputs: HashMap::new(),
+                detailed_fetches: HashMap::new(),
+                total_tokens: 0,
                 started_at: Instant::now(),
             }),
         }
@@ -241,12 +241,15 @@ impl SessionContext {
         params_hash: u64,
     ) -> Option<SessionFetchRecord> {
         let inner = self.inner.lock();
-        inner.detailed_fetches.get(&FetchKey {
-            kind,
-            path: path.to_string(),
-            symbol: symbol.to_string(),
-            params_hash,
-        }).cloned()
+        inner
+            .detailed_fetches
+            .get(&FetchKey {
+                kind,
+                path: path.to_string(),
+                symbol: symbol.to_string(),
+                params_hash,
+            })
+            .cloned()
     }
 
     pub fn try_symbol_cache_hit(
@@ -277,13 +280,7 @@ impl SessionContext {
         self.try_cache_hit(FetchKind::FileContent, path, "", params_hash, force_refresh)
     }
 
-    pub fn record_symbol_fetch(
-        &self,
-        path: &str,
-        name: &str,
-        params_hash: u64,
-        tokens: u32,
-    ) {
+    pub fn record_symbol_fetch(&self, path: &str, name: &str, params_hash: u64, tokens: u32) {
         self.record_symbol(path, name, tokens);
         self.record_detailed_fetch(FetchKind::Symbol, path, name, params_hash, tokens);
     }
@@ -400,10 +397,7 @@ pub fn hash_value(value: &serde_json::Value) -> u64 {
     hasher.finish()
 }
 
-pub fn hash_file_context_params(
-    max_tokens: Option<u64>,
-    sections: Option<&[String]>,
-) -> u64 {
+pub fn hash_file_context_params(max_tokens: Option<u64>, sections: Option<&[String]>) -> u64 {
     hash_value(&serde_json::json!({
         "max_tokens": max_tokens,
         "sections": sections,
