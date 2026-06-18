@@ -18,7 +18,8 @@ use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::admin::{
-    ServerSessionDescriptor, operator_server_reachable, start_operator_server,
+    ADMIN_SERVE_START_DEADLINE, ServerSessionDescriptor, operator_server_reachable,
+    start_operator_server,
 };
 use crate::cli::browser::{BrowserOpener, OsBrowserOpener};
 use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
@@ -371,7 +372,7 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
                 Some(bind_addr),
                 None,
                 None,
-                Duration::from_secs(15),
+                ADMIN_SERVE_START_DEADLINE,
             )?);
         }
         let desc = session.as_ref().expect("session started or reused");

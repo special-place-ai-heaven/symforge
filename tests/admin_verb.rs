@@ -34,7 +34,10 @@ fn loopback(port: u16) -> SocketAddr {
 fn admin_reuses_running_server_on_profile_port() {
     // Start a real loopback server, then write a profile pointing at its port.
     let preferred = loopback(0);
-    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
+    // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
+    // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
+    // this is a generous upper bound, not the expected wait (warm start = seconds).
+    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(60))
         .expect("operator server should come up");
     let running_port = running.bound_addr.port();
 
@@ -120,7 +123,10 @@ fn admin_starts_server_when_none_running_and_persists_port() {
 #[test]
 fn admin_no_open_skips_browser_but_still_reports_url() {
     let preferred = loopback(0);
-    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
+    // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
+    // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
+    // this is a generous upper bound, not the expected wait (warm start = seconds).
+    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(60))
         .expect("operator server should come up");
 
     let project = tempfile::tempdir().expect("temp project");

@@ -242,8 +242,14 @@ pub struct AdminOutcome {
 const ADMIN_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long a fresh serve-start may take to become reachable before the admin
-/// verb gives up.
-const ADMIN_SERVE_START_DEADLINE: Duration = Duration::from_secs(15);
+/// verb gives up. Generous on purpose: `serve::run` loads the workspace index on
+/// startup, which on a large repo and/or a cold or heavily-loaded machine (e.g. a
+/// CI runner) can legitimately exceed 15s — giving up early would be a false
+/// "server failed to start" while it was merely still indexing. 60s is a ceiling
+/// for pathological cases, not the expected wait (a warm start is seconds). Shared
+/// by the setup wizard and the in-lib serve-start tests so there is one source of
+/// truth for "how long a real serve may take to come up".
+pub(crate) const ADMIN_SERVE_START_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Entry point for `symforge admin`. Wires the live home/cwd context and the OS
 /// browser into [`run_admin`] and discards the outcome — the function already
@@ -437,7 +443,7 @@ mod tests {
         // loopback open), then confirm both the start helper's descriptor and a
         // standalone reachability probe agree it is serving.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let desc = start_operator_server(Some(preferred), None, None, Duration::from_secs(10))
+        let desc = start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
             .expect("operator server should become reachable");
 
         assert!(desc.reachable);
@@ -478,8 +484,9 @@ mod tests {
     fn run_admin_reuses_running_server_on_profile_port() {
         // A real server is running; the profile points at its port.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
-            .expect("operator server should come up");
+        let running =
+            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
+                .expect("operator server should come up");
         let running_port = running.bound_addr.port();
 
         let project = tempfile::tempdir().expect("temp project");
@@ -543,8 +550,9 @@ mod tests {
     #[test]
     fn run_admin_no_open_does_not_open_browser() {
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
-            .expect("operator server should come up");
+        let running =
+            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
+                .expect("operator server should come up");
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
