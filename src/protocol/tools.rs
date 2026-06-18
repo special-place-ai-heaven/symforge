@@ -8581,7 +8581,7 @@ impl SymForgeServer {
 
     #[tool(
         name = "symforge_edit",
-        description = "STEL structural edit facade — symbol-aware edits with economics gate; preview by default, apply:true commits.",
+        description = "STEL structural edit facade — replace a whole symbol's source by name. `body` is the FULL item source (signature + body, not just the inner block); pass it flush-left — the tool re-columns it to the symbol's indentation, so an already-indented body is not doubled. Leading doc-comments/attributes outside the symbol range are preserved unless `body` itself begins with a doc-comment. Preview by default; apply:true commits; if_match guards against a concurrent edit.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

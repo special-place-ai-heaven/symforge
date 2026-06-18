@@ -110,6 +110,12 @@ pub struct StelEditRequest {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// New source for the whole symbol: the FULL item (signature + body), not
+    /// just the inner block. Pass it flush-left — the editor re-columns it to
+    /// the symbol's indentation, so an already-indented body is NOT doubled.
+    /// Leading doc-comments / attributes outside the symbol's range are
+    /// preserved unless `body` itself begins with a doc-comment (then they are
+    /// replaced). Omit `apply` (or set it false) to get a preview, not a write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

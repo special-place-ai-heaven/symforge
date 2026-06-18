@@ -762,12 +762,52 @@ pub(crate) fn detect_indentation(content: &[u8], byte_offset: u32) -> Vec<u8> {
     content[line_start..line_start + indent_end].to_vec()
 }
 
-/// Prefix each non-empty line of `text` with `indent`, using the given line ending.
+/// The longest leading-whitespace prefix common to every line of `lines` that
+/// has non-whitespace content (blank / whitespace-only lines are ignored). This
+/// is the body's uniform base indent — empty when any content line is already
+/// flush-left (the normal case). Mirrors the prefix `textwrap.dedent` strips.
+fn common_leading_whitespace<'a>(lines: &[&'a str]) -> &'a str {
+    let mut common: Option<&'a str> = None;
+    for raw in lines {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let ws = &line[..line.len() - line.trim_start().len()];
+        common = Some(match common {
+            None => ws,
+            Some(prev) => {
+                let max = prev.len().min(ws.len());
+                let (pb, wb) = (prev.as_bytes(), ws.as_bytes());
+                let mut end = 0;
+                while end < max && pb[end] == wb[end] {
+                    end += 1;
+                }
+                &prev[..end]
+            }
+        });
+        if common == Some("") {
+            break;
+        }
+    }
+    common.unwrap_or("")
+}
+
+/// Re-column `text` to `indent`: strip the body's uniform base indent, then
+/// prefix each non-empty line with `indent`, using the given line ending.
+///
+/// Stripping the common base indent first means a body the caller pasted at
+/// some other column (e.g. an 8-space chat-context indent) is re-columned to
+/// exactly the symbol's `indent` rather than COMPOUNDING to base+indent. When
+/// the body is already flush-left (its first content line has no leading
+/// whitespace — the normal case) the base is empty and this is a pure prefix,
+/// so existing callers are unaffected.
 pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEnding) -> Vec<u8> {
     let mut result = Vec::new();
     // Use split('\n') instead of lines() so that trailing newlines produce a trailing
     // empty element, preserving them. str::lines() silently strips all trailing newlines.
     let parts: Vec<&str> = text.split('\n').collect();
+    let base = common_leading_whitespace(&parts);
     for (i, line) in parts.iter().enumerate() {
         // Strip '\r' left behind by split('\n') on CRLF input; re-emit via line_ending.
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -775,8 +815,10 @@ pub(crate) fn apply_indentation(text: &str, indent: &[u8], line_ending: LineEndi
             result.extend_from_slice(line_ending.as_bytes());
         }
         if !line.is_empty() {
+            // Dedent the uniform base, then apply the symbol's column.
+            let dedented = line.strip_prefix(base).unwrap_or(line);
             result.extend_from_slice(indent);
-            result.extend_from_slice(line.as_bytes());
+            result.extend_from_slice(dedented.as_bytes());
         }
     }
     result
@@ -3695,6 +3737,32 @@ mod tests {
     fn test_apply_indentation_empty_indent_is_identity() {
         let result = apply_indentation("fn foo() {}", b"", LineEnding::Lf);
         assert_eq!(result, b"fn foo() {}");
+    }
+
+    // Plan 006 (compounding-indent fix): a body pasted at a uniform 8-space
+    // base indent must NOT compound with the symbol's 4-space column — it
+    // re-columns to exactly 4. Without the dedent this produced 12 under an
+    // 8-space brace (the dogfood report).
+    #[test]
+    fn test_apply_indentation_dedents_uniform_base_indent() {
+        let body = "        fn foo() {\n            bar();\n        }";
+        let result = apply_indentation(body, b"    ", LineEnding::Lf);
+        assert_eq!(
+            std::str::from_utf8(&result).unwrap(),
+            "    fn foo() {\n        bar();\n    }"
+        );
+    }
+
+    // A flush-left body (first content line at column 0) has an empty common
+    // base, so the dedent is a no-op and relative inner indentation is kept.
+    #[test]
+    fn test_apply_indentation_flush_left_body_unchanged_by_dedent() {
+        let body = "fn foo() {\n    bar();\n}";
+        let result = apply_indentation(body, b"        ", LineEnding::Lf);
+        assert_eq!(
+            std::str::from_utf8(&result).unwrap(),
+            "        fn foo() {\n            bar();\n        }"
+        );
     }
 
     // -- insert helpers --
