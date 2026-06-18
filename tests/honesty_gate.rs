@@ -158,6 +158,28 @@ impl std::fmt::Display for Violation {
     }
 }
 
+impl Violation {
+    /// A malformed-honesty-record violation: a row that should be a structured
+    /// record but cannot be parsed. These fail loudly rather than silently skip.
+    fn parse(detail: String) -> Violation {
+        Violation {
+            rule: "PARSE",
+            detail,
+        }
+    }
+}
+
+/// Return `Ok(value)` when no violations were collected, else `Err(violations)`.
+/// Used by the parsers and the gate so a single run reports *all* problems
+/// (no short-circuit) yet still threads a value through on success.
+fn ok_or_violations<T>(value: T, violations: Vec<Violation>) -> Result<T, Vec<Violation>> {
+    if violations.is_empty() {
+        Ok(value)
+    } else {
+        Err(violations)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parsing helpers (std-only; no new dependency)
 // ---------------------------------------------------------------------------
@@ -167,15 +189,11 @@ impl std::fmt::Display for Violation {
 /// are dropped. Returns `None` for lines that are not table rows.
 fn table_cells(line: &str) -> Option<Vec<String>> {
     let trimmed = line.trim();
-    if !trimmed.starts_with('|') {
-        return None;
-    }
-    // Strip the leading and trailing pipe, then split on the interior pipes.
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or(trimmed.strip_prefix('|').unwrap_or(trimmed));
+    // Strip exactly one leading pipe (the row must have one) and at most one
+    // trailing pipe, then split on the interior pipes. Stripping exactly one
+    // pipe per side preserves an empty boundary cell (`|| ... |`) as empty.
+    let inner = trimmed.strip_prefix('|')?;
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
     let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
     Some(cells)
 }
@@ -301,12 +319,9 @@ fn parse_register(text: &str) -> Result<BTreeMap<String, RegisterEntry>, Vec<Vio
             // A row that looks like an assumption row (bare ID in cell 0) but
             // carries no parseable verdict is a malformed honesty record. Fail
             // loudly rather than silently skipping.
-            violations.push(Violation {
-                rule: "PARSE",
-                detail: format!(
-                    "register row for {id} has no parseable verdict (OPEN/PARTIAL/VALIDATED/INVALIDATED): {line}"
-                ),
-            });
+            violations.push(Violation::parse(format!(
+                "register row for {id} has no parseable verdict (OPEN/PARTIAL/VALIDATED/INVALIDATED): {line}"
+            )));
             continue;
         };
 
@@ -325,11 +340,7 @@ fn parse_register(text: &str) -> Result<BTreeMap<String, RegisterEntry>, Vec<Vio
             });
     }
 
-    if violations.is_empty() {
-        Ok(map)
-    } else {
-        Err(violations)
-    }
+    ok_or_violations(map, violations)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,25 +385,19 @@ fn parse_matrix(text: &str) -> Result<Vec<MatrixRow>, Vec<Violation>> {
         // A data row. It must have the expected column count; a malformed row
         // (wrong arity) is a broken honesty record -> fail loudly.
         if cells.len() != header_cols {
-            violations.push(Violation {
-                rule: "PARSE",
-                detail: format!(
-                    "matrix row has {} cells, expected {header_cols}: {line}",
-                    cells.len()
-                ),
-            });
+            violations.push(Violation::parse(format!(
+                "matrix row has {} cells, expected {header_cols}: {line}",
+                cells.len()
+            )));
             continue;
         }
 
         let feature = cells[0].clone();
         let Some(proof_state) = ProofState::parse(&cells[1]) else {
-            violations.push(Violation {
-                rule: "PARSE",
-                detail: format!(
-                    "matrix row '{feature}' has unrecognized proof state: {}",
-                    cells[1]
-                ),
-            });
+            violations.push(Violation::parse(format!(
+                "matrix row '{feature}' has unrecognized proof state: {}",
+                cells[1]
+            )));
             continue;
         };
         let id_cell = &cells[2];
@@ -400,12 +405,9 @@ fn parse_matrix(text: &str) -> Result<Vec<MatrixRow>, Vec<Violation>> {
         let assumption_ids = extract_assumption_ids(id_cell);
         // A row must reference at least one assumption OR be explicitly n/a.
         if assumption_ids.is_empty() && !is_na {
-            violations.push(Violation {
-                rule: "PARSE",
-                detail: format!(
-                    "matrix row '{feature}' Assumption ID cell is neither an A-NNN nor n/a: {id_cell}"
-                ),
-            });
+            violations.push(Violation::parse(format!(
+                "matrix row '{feature}' Assumption ID cell is neither an A-NNN nor n/a: {id_cell}"
+            )));
             continue;
         }
         let evidence_cell = &cells[header_cols - 1];
@@ -421,17 +423,12 @@ fn parse_matrix(text: &str) -> Result<Vec<MatrixRow>, Vec<Violation>> {
     }
 
     if !in_table {
-        violations.push(Violation {
-            rule: "PARSE",
-            detail: "capability matrix table (Feature | Proof state | ...) not found".to_string(),
-        });
+        violations.push(Violation::parse(
+            "capability matrix table (Feature | Proof state | ...) not found".to_string(),
+        ));
     }
 
-    if violations.is_empty() {
-        Ok(rows)
-    } else {
-        Err(violations)
-    }
+    ok_or_violations(rows, violations)
 }
 
 // ---------------------------------------------------------------------------
@@ -541,11 +538,7 @@ fn check_honesty(register_text: &str, matrix_text: &str) -> Result<(), Vec<Viola
         });
     }
 
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations)
-    }
+    ok_or_violations((), violations)
 }
 
 // ---------------------------------------------------------------------------

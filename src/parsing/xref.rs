@@ -446,6 +446,16 @@ static PHP_QUERY: OnceLock<Query> = OnceLock::new();
 static SWIFT_QUERY: OnceLock<Query> = OnceLock::new();
 static PERL_QUERY: OnceLock<Query> = OnceLock::new();
 
+// ponytail: these ~17 per-language query getters look like collapsible
+// boilerplate (audit 2026-06-17, Tier 4a). A `OnceLock<Query>`-table collapse was
+// implemented and fully verified (all 21 langs byte-identical, 3016 tests green)
+// and then REJECTED 2026-06-18: it saved ~0 production lines, the 17-arm dispatch
+// match is irreducible regardless, and it traded "a language cannot be mis-bound"
+// (robust by construction) for "a language is mis-bound if the slot/enum order
+// ever drifts" (guarded only by a test). For load-bearing symbol resolution —
+// where a wrong query silently corrupts xref and breaks LLM trust — the explicit,
+// impossible-to-misalign form is the superior one. Do NOT collapse without a
+// reason that outweighs that trade.
 fn rust_query(lang: &Language) -> &'static Query {
     RUST_QUERY.get_or_init(|| Query::new(lang, RUST_XREF_QUERY).expect("valid rust xref query"))
 }

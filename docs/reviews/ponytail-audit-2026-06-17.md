@@ -206,7 +206,8 @@ green after the pass (3014 tests, fmt/clippy/build/embed).
 | T2 `local_empty_reason` / `StartupPlan` / `StartupIndexLogView` `[audit wrong]` | **KEPT** — multi-caller / typed-and-tested state seams. |
 | T3 path-normalize ×3 | **DEDUPED** — one shared `paths::normalize_repo_path`; the `rank_signals` variant that also trims `./` was deliberately left distinct (real behavioral difference). |
 | T3 `RankCtx::default` | **NO-OP** — already delegates to `empty()`. |
-| T4 xref query table, honesty_gate shrink | **PENDING** — own gated changes, in progress. |
+| T4a xref query table | **EVALUATED → REJECTED** — the collapse was implemented + fully verified (21 langs byte-identical, 3016 tests green) then reverted: ~0 production-line saving, the 17-arm dispatch is irreducible anyway, and it traded "a language cannot be mis-bound" (robust by construction) for a test-guarded slot/enum ordering. For load-bearing xref, the explicit form is superior. `ponytail:` marker left at `xref.rs:449` recording the decision. |
+| T4b `honesty_gate.rs` shrink | **DONE (−7, clarity win)** — 3 genuine parser tightenings (`table_cells` strip chain linearized, `ok_or_violations` + `Violation::parse` helpers). The audit's −120 was only reachable via a `parse_register`/`parse_matrix` row-iterator merge that would bury the gate's parse subtleties — correctly NOT forced. All 7 gate cases + real-docs pass, semantics identical, readability improved. |
 
 **Net applied:** the genuine dedup/dead-code cuts (no seam removed); **6 audit
 findings corrected as false positives or seams** (kept). This is the seam rule in
