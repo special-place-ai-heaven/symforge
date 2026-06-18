@@ -44,7 +44,7 @@ cargo check --no-default-features --features embed
 | 003b | LLM-callable index/reindex trigger on the compact surface (folded into 002 index-loading) | P0 | M | 002 | TODO |
 | 004 | `search_text`/`search_files` completeness honesty — disclose hidden/dotdir exclusion | P1 | S | — | DONE |
 | 004b | Index `.github` (coverage; reverses the tested `.hidden(true)` determinism invariant) + same disclosure on `find_references`/`what_changed`/coupling labels | P1 | M | — | TODO |
-| 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | TODO |
+| 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | DONE |
 | 006 | Edit `body` contract docs + dedent-normalize the splice (kills compounding indent) | P1 | S/M | — | DONE |
 | 007 | Read-facade routing — NL-`find` OR-explosion (stopword filter on fusion terms) | P1 | S | — | DONE |
 | 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` N-defs disclosure | P1 | M | — | DONE |

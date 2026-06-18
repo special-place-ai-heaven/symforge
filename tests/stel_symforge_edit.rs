@@ -436,6 +436,199 @@ async fn symforge_edit_rejects_absolute_and_scheme_paths() {
 }
 
 #[tokio::test]
+async fn symforge_edit_insert_after_preview_then_apply_adds_new_symbol() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let original = "fn anchor() { 1 }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let server = server_for_repo(dir.path(), "edit-insert-after");
+
+    // Preview routes to insert_symbol and writes nothing.
+    let preview = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("anchor".to_string()),
+            body: Some("fn added() { 2 }".to_string()),
+            op: Some(symforge::stel::StelEditOp::InsertAfter),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        preview.contains("Chosen tool: insert_symbol"),
+        "insert preview must route to insert_symbol:\n{preview}"
+    );
+    assert!(preview.contains("[DRY RUN]"), "preview:\n{preview}");
+    assert!(
+        !std::fs::read_to_string(&file_path)
+            .unwrap()
+            .contains("added"),
+        "preview must not write"
+    );
+
+    // Apply commits the insert through the facade — no native file tool.
+    let apply = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("anchor".to_string()),
+            body: Some("fn added() { 2 }".to_string()),
+            op: Some(symforge::stel::StelEditOp::InsertAfter),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        apply.contains("Chosen tool: insert_symbol"),
+        "insert apply must route to insert_symbol:\n{apply}"
+    );
+    let meta = ledger_meta_from_output(&apply);
+    assert!(meta.legacy_executed, "insert apply must commit:\n{apply}");
+    let on_disk = std::fs::read_to_string(&file_path).unwrap();
+    assert!(on_disk.contains("fn anchor()"), "disk: {on_disk}");
+    assert!(on_disk.contains("fn added()"), "disk: {on_disk}");
+}
+
+#[tokio::test]
+async fn symforge_edit_edit_within_amends_import_inside_module() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    // A file-level `use` is NOT an indexed symbol in Rust, but a `use` inside a
+    // `mod` block IS reachable via edit_within scoped to the enclosing module.
+    let original = "mod inner {\n    use a::b;\n    pub fn helper() {}\n}\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let server = server_for_repo(dir.path(), "edit-within-import");
+
+    let apply = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("inner".to_string()),
+            old_text: Some("use a::b;".to_string()),
+            new_text: Some("use a::{b, c};".to_string()),
+            op: Some(symforge::stel::StelEditOp::EditWithin),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        apply.contains("Chosen tool: edit_within_symbol"),
+        "within apply must route to edit_within_symbol:\n{apply}"
+    );
+    let meta = ledger_meta_from_output(&apply);
+    assert!(meta.legacy_executed, "within apply must commit:\n{apply}");
+    let on_disk = std::fs::read_to_string(&file_path).unwrap();
+    assert!(
+        on_disk.contains("use a::{b, c};"),
+        "import not amended:\n{on_disk}"
+    );
+    assert!(!on_disk.contains("use a::b;"), "stale import:\n{on_disk}");
+}
+
+#[tokio::test]
+async fn symforge_edit_completes_full_refactor_through_facade_only() {
+    // KEYSTONE: a realistic refactor completed ENTIRELY through symforge_edit —
+    // insert a new method after an anchor, amend an import via a within-symbol
+    // edit, and replace a body — each routing to the right internal tool and
+    // committing, with NO native file-tool fallback.
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let original = "\
+mod imports {
+    use crate::a;
+    pub fn touch() {}
+}
+
+fn anchor() { 1 }
+";
+    let (dir, file_path) = temp_rust_repo(original);
+    let server = server_for_repo(dir.path(), "edit-full-refactor");
+
+    // Step 1: insert a NEW method after the `anchor` symbol.
+    let insert = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("anchor".to_string()),
+            body: Some("fn appended() { 99 }".to_string()),
+            op: Some(symforge::stel::StelEditOp::InsertAfter),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        insert.contains("Chosen tool: insert_symbol"),
+        "step 1 routing:\n{insert}"
+    );
+    assert!(
+        ledger_meta_from_output(&insert).legacy_executed,
+        "step 1 must commit:\n{insert}"
+    );
+
+    // Step 2: amend the import inside `mod imports` via a within-symbol edit.
+    let within = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("imports".to_string()),
+            old_text: Some("use crate::a;".to_string()),
+            new_text: Some("use crate::{a, b};".to_string()),
+            op: Some(symforge::stel::StelEditOp::EditWithin),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        within.contains("Chosen tool: edit_within_symbol"),
+        "step 2 routing:\n{within}"
+    );
+    assert!(
+        ledger_meta_from_output(&within).legacy_executed,
+        "step 2 must commit:\n{within}"
+    );
+
+    // Step 3: replace the body of the `anchor` symbol (default op).
+    let replace = dispatch_symforge_edit(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("anchor".to_string()),
+            body: Some("fn anchor() { 2 }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        replace.contains("Chosen tool: replace_symbol_body"),
+        "step 3 routing:\n{replace}"
+    );
+    assert!(
+        ledger_meta_from_output(&replace).legacy_executed,
+        "step 3 must commit:\n{replace}"
+    );
+
+    // All three edits landed on disk via the facade only.
+    let on_disk = std::fs::read_to_string(&file_path).unwrap();
+    assert!(
+        on_disk.contains("fn appended() { 99 }"),
+        "insert:\n{on_disk}"
+    );
+    assert!(on_disk.contains("use crate::{a, b};"), "within:\n{on_disk}");
+    assert!(on_disk.contains("fn anchor() { 2 }"), "replace:\n{on_disk}");
+    assert!(!on_disk.contains("fn anchor() { 1 }"), "stale:\n{on_disk}");
+    assert!(!on_disk.contains("use crate::a;"), "stale:\n{on_disk}");
+}
+
+#[tokio::test]
 async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");

@@ -110,16 +110,22 @@ pub struct StelEditRequest {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
-    /// New source for the whole symbol: the FULL item (signature + body), not
-    /// just the inner block. Pass it flush-left — the editor re-columns it to
-    /// the symbol's indentation, so an already-indented body is NOT doubled.
-    /// Leading doc-comments / attributes outside the symbol's range are
-    /// preserved unless `body` itself begins with a doc-comment (then they are
-    /// replaced). Omit `apply` (or set it false) to get a preview, not a write.
+    /// New source. For replace: the FULL item (signature + body), flush-left
+    /// (re-columned to the symbol's indent, not doubled). For insert: the new
+    /// symbol's source. Omit/false `apply` previews instead of writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<StelEditIntent>,
+    /// insert/edit_within use symbol as anchor/scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<StelEditOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_all: Option<bool>,
     /// When true, commit a validated single-symbol edit. Default / omitted = preview dry_run only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply: Option<bool>,
@@ -136,6 +142,36 @@ pub struct StelEditRequest {
 #[serde(rename_all = "snake_case")]
 pub enum StelEditIntent {
     Edit,
+}
+
+// Structural operation selector for `symforge_edit`.
+//
+// Routes the compact facade to one of the existing internal edit tools:
+// `Replace` -> `replace_symbol_body` (default; preserves replace-only callers),
+// `InsertBefore` / `InsertAfter` -> `insert_symbol`, `EditWithin` ->
+// `edit_within_symbol`. The default lets an omitted `op` stay byte-identical to
+// the original replace-only schema and behavior. NOTE: kept as a plain comment,
+// not a doc comment, so schemars does not emit a `$defs` description that would
+// inflate the A-025 schema budget (`symforge_edit` schema must stay <= 1500 B).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StelEditOp {
+    #[default]
+    Replace,
+    InsertBefore,
+    InsertAfter,
+    EditWithin,
+}
+
+impl StelEditOp {
+    /// The legacy internal tool this op routes to.
+    pub const fn legacy_tool(self) -> &'static str {
+        match self {
+            Self::Replace => "replace_symbol_body",
+            Self::InsertBefore | Self::InsertAfter => "insert_symbol",
+            Self::EditWithin => "edit_within_symbol",
+        }
+    }
 }
 
 /// Detail level for the `status` compact-surface tool.

@@ -365,7 +365,17 @@ fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
         .iter()
         .map(|index_ref| index_ref.raw_chars as usize)
         .sum();
-    if step.tool == "replace_symbol_body" {
+    // All compact `symforge_edit` ops carry the NEW-content byte length as their
+    // IndexRef (`build_edit_plan`): the replacement body, the inserted symbol
+    // source, or the within-symbol replacement text. They share the edit response
+    // model (preview echoes the new content + footer; apply echoes only a footer),
+    // so route every edit tool through the same grounded edit estimator rather
+    // than the read fraction. Keeping them on `grounded_edit_tokens` keeps
+    // insert/within predictions honest and byte-scaled, not flat-floored.
+    if matches!(
+        step.tool.as_str(),
+        "replace_symbol_body" | "insert_symbol" | "edit_within_symbol"
+    ) {
         return grounded_edit_tokens(step, total_raw_chars);
     }
     grounded_tokens_from_raw_chars(total_raw_chars)
