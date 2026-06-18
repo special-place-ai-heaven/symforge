@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.3.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.2.0...v8.3.0) (2026-06-18)
+
+
+### Features
+
+* **011:** search compaction and CCR on bulk discovery tools (US2/US3) ([762697f](https://github.com/special-place-ai-heaven/symforge/commit/762697fa346ff3fe31a26f55daa5413432a5682d))
+* **011:** session cache-hit records and shared formatters (US1) ([5e26d44](https://github.com/special-place-ai-heaven/symforge/commit/5e26d44cc0476b1affc0f50eaa6e02a72ba5bf22))
+* **011:** session compression economics counters (US5) ([be996f8](https://github.com/special-place-ai-heaven/symforge/commit/be996f8ddbb4fb1b0bca4daa3e51f081cf84bec5))
+* **011:** wire read cache-hit, CCR store, and symforge_retrieve (US1/US2) ([d61b09e](https://github.com/special-place-ai-heaven/symforge/commit/d61b09eb5b7e7d2cea5d972d5668c5de52344018))
+
+
+### Bug Fixes
+
+* **011:** align allow lists and STEL cache-hit tests with symforge_retrieve ([a74fe35](https://github.com/special-place-ai-heaven/symforge/commit/a74fe35e23a2b752044664f3c3a32a282bdb937c))
+
 ## [8.2.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.1.0...v8.2.0) (2026-06-18)
 
 
