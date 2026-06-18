@@ -50,7 +50,8 @@ cargo check --no-default-features --features embed
 | 007b | Read-facade routing — `symbol=` routing, prose-in-symbol corrective error, `find_references` path precision | P1 | M | — | TODO |
 | 008 | Operator server lifecycle (persistent shared, last-client shutdown) + 8k/5k port range + `/symforge-admin` command file | P2 | L | — | TODO |
 | 009b | Edit economics grounding (body bytes; preview echoes body, apply footer-only) | P2 | M | — | DONE |
-| 009a | `SYMFORGE_STEL_VERBOSE` default-compact envelope (cut per-call ledger noise) | P2 | M | — | TODO |
+| 009a | Opt-in `SYMFORGE_STEL_COMPACT` one-line envelope (cut per-call ledger noise) | P2 | S | — | DONE |
+| 009a-default | Make compact the *default* envelope (ripples ~10 honesty-surface test files + schema) | P2 | M | 009a | TODO |
 | 009c | Wire the `CalibrationState` auto-tune loop (self-correct predictions from the ledger) | P2 | L | 009b | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (reason) | REJECTED (rationale).
