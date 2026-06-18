@@ -39,7 +39,7 @@ cargo check --no-default-features --features embed
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Add Cursor (home-cwd harnesses) to `symforge init` + write `SYMFORGE_WORKSPACE_ROOT` | P0 | M | — | DONE |
-| 002 | cwd-independent workspace resolution via MCP `roots` capability | P0 | L | — | TODO |
+| 002 | cwd-independent workspace resolution via MCP `roots` capability | P0 | L | — | DONE |
 | 003 | Honest empty-index + no-repo-root recovery hints (no LLM-unactionable "re-launch") | P0 | S | — | DONE |
 | 003b | LLM-callable index/reindex trigger on the compact surface (folded into 002 index-loading) | P0 | M | 002 | TODO |
 | 004 | `search_text`/`search_files` completeness honesty — disclose hidden/dotdir exclusion | P1 | S | — | DONE |
