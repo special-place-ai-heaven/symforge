@@ -351,7 +351,7 @@ fn decay_score(hit_count: i64, now_ts: i64, last_ts: i64) -> f64 {
 /// Normalize paths to forward-slash form so Windows and Unix key the same row.
 /// Mirrors the pattern in `src/git.rs::collect_diff_paths`.
 fn normalize_path(p: &Path) -> String {
-    crate::paths::normalize_repo_path(&p.to_string_lossy())
+    p.to_string_lossy().replace('\\', "/")
 }
 
 // ---------------------------------------------------------------------------
