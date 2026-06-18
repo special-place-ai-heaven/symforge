@@ -42,7 +42,8 @@ cargo check --no-default-features --features embed
 | 002 | cwd-independent workspace resolution via MCP `roots` capability | P0 | L | — | TODO |
 | 003 | Honest empty-index + no-repo-root recovery hints (no LLM-unactionable "re-launch") | P0 | S | — | DONE |
 | 003b | LLM-callable index/reindex trigger on the compact surface (folded into 002 index-loading) | P0 | M | 002 | TODO |
-| 004 | `search_text` completeness honesty — name filtered/capped omissions (+ exhaustive mode) | P1 | M | — | TODO |
+| 004 | `search_text`/`search_files` completeness honesty — disclose hidden/dotdir exclusion | P1 | S | — | DONE |
+| 004b | Index `.github` (coverage; reverses the tested `.hidden(true)` determinism invariant) + same disclosure on `find_references`/`what_changed`/coupling labels | P1 | M | — | TODO |
 | 005 | Compact-edit completeness — insert + within-symbol on the `symforge_edit` facade | P1 | M | — | TODO |
 | 006 | Edit `body` contract docs + dedent-normalize the splice (kills compounding indent) | P1 | S/M | — | DONE |
 | 007 | Read-facade routing — NL-`find` OR-explosion (stopword filter on fusion terms) | P1 | S | — | DONE |

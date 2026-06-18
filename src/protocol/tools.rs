@@ -877,10 +877,17 @@ fn context_bundle_completeness_label(
 }
 
 fn search_completeness_label(overflow_count: usize, suppressed_by_noise: usize) -> String {
+    // Honesty (trust): the index is built by a discovery walk with the `ignore`
+    // crate default `.hidden(true)`, so hidden / dotdir paths (`.github/`,
+    // `.gitlab-ci.yml`, …) are NOT indexed and never appear in results. A bare
+    // "full" claim would mislead an agent into trusting the file count as
+    // exhaustive (the dogfood report: `search_text` silently omitted
+    // `.github/workflows/release-please.yml` that ripgrep found). Qualify the
+    // claim so the agent knows to use a raw grep for hidden paths.
     let mut parts = vec![if overflow_count > 0 {
         format!("truncated by result cap ({overflow_count} more omitted)")
     } else {
-        "full for current scope".to_string()
+        "full for indexed scope (hidden/dotdir paths not indexed — grep those)".to_string()
     }];
     if suppressed_by_noise > 0 {
         if suppressed_by_noise > search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP {
