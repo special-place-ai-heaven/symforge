@@ -18,7 +18,7 @@ use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::admin::{
-    operator_server_reachable, start_operator_server, ServerSessionDescriptor,
+    ServerSessionDescriptor, operator_server_reachable, start_operator_server,
 };
 use crate::cli::browser::{BrowserOpener, OsBrowserOpener};
 use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
@@ -398,7 +398,10 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
                     continue;
                 }
                 PlannedAction::Error(reason) => {
-                    sink.status(&format!("  [error] {} ({reason})", change.id.display_name()));
+                    sink.status(&format!(
+                        "  [error] {} ({reason})",
+                        change.id.display_name()
+                    ));
                     continue;
                 }
             };
@@ -456,7 +459,10 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
     let mut browser_outcome = None;
     if let Some(desc) = &session {
         let outcome = browser.open_url(&desc.dashboard_url);
-        sink.status(&format!("Browser: {outcome:?} — open {}", desc.dashboard_url));
+        sink.status(&format!(
+            "Browser: {outcome:?} — open {}",
+            desc.dashboard_url
+        ));
         browser_outcome = Some(outcome);
     }
 
@@ -493,7 +499,9 @@ fn suggest_free_port(preferred: Option<u16>) -> anyhow::Result<u16> {
 }
 
 fn scan_harness_summary(registry: &HarnessRegistry, attach: Option<&AttachEntry>) -> Vec<String> {
-    let entry = attach.cloned().unwrap_or_else(|| AttachEntry::new("", None));
+    let entry = attach
+        .cloned()
+        .unwrap_or_else(|| AttachEntry::new("", None));
     registry
         .scan(&entry)
         .into_iter()
@@ -672,10 +680,10 @@ mod tests {
 
     #[test]
     fn non_interactive_setup_configures_fixture_and_persists_profile() {
+        use crate::cli::admin::operator_server_reachable;
         use crate::cli::browser::NoopBrowserOpener;
         use crate::cli::harness::{HarnessFormat, HarnessTarget, SYMFORGE_SERVER_NAME};
-        use crate::cli::harness_apply::{plan, PlannedAction};
-        use crate::cli::admin::operator_server_reachable;
+        use crate::cli::harness_apply::{PlannedAction, plan};
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");

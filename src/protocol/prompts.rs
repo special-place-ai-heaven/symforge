@@ -49,6 +49,9 @@ pub struct DebugPromptInput {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct AdminPromptInput {}
+
 #[prompt_router(vis = "pub(crate)")]
 impl SymForgeServer {
     #[prompt(
@@ -223,6 +226,94 @@ impl SymForgeServer {
 
         GetPromptResult::new(messages)
             .with_description("Debug a problem using SymForge call tracing and impact analysis.")
+    }
+
+    #[prompt(
+        name = "symforge-admin",
+        description = "Return the running SymForge operator dashboard URL, or guidance to start it."
+    )]
+    pub(crate) async fn admin_prompt(
+        &self,
+        _params: Parameters<AdminPromptInput>,
+    ) -> GetPromptResult {
+        // The universal in-harness affordance (FR-016, Constitution II): every
+        // MCP-speaking harness gets this, with or without a command file.
+        //
+        // Execution-model decision (009 US3): a prompt handler is a pure,
+        // read-only fetch. It does NOT start a server — starting one is a
+        // blocking, side-effectful process action that belongs to the
+        // `symforge admin` CLI verb, and `operator_server_reachable` /
+        // `start_operator_server` build their own current-thread tokio runtime and
+        // `block_on`, which would panic if invoked directly on this async worker.
+        // Instead the prompt does the read-only reachability check off the async
+        // runtime (via `spawn_blocking`) and returns the reachable dashboard URL,
+        // or guidance to run `symforge admin` when nothing is up yet.
+        let repo_root = self.capture_repo_root();
+        let dashboard_url =
+            tokio::task::spawn_blocking(move || resolve_running_dashboard_url(repo_root))
+                .await
+                .unwrap_or(None);
+
+        let body = build_admin_instructions(&self.project_name, dashboard_url.as_deref());
+        GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::User, body)])
+            .with_description(
+                "Open the SymForge operator dashboard (reuse the running server, or start it via `symforge admin`).",
+            )
+    }
+}
+
+/// Read-only resolution of the running operator dashboard URL for the
+/// `symforge-admin` prompt: load the project's `OperatorSetupProfile` for the
+/// remembered port and, if a server is reachable there, return its `/admin` URL.
+/// Returns `None` when there is no profile or nothing serves the remembered port.
+///
+/// This performs an HTTP reachability probe on its own current-thread runtime, so
+/// it MUST run off the async worker (the caller wraps it in `spawn_blocking`). It
+/// never starts a server — that is the `symforge admin` CLI verb's job (D3).
+fn resolve_running_dashboard_url(repo_root: Option<std::path::PathBuf>) -> Option<String> {
+    use std::time::Duration;
+    let base = repo_root?;
+    let profile = crate::cli::operator_profile::OperatorSetupProfile::load(&base)?;
+    let addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        profile.port,
+    );
+    if crate::cli::admin::operator_server_reachable(addr, Duration::from_millis(500)) {
+        Some(format!("http://{addr}/admin"))
+    } else {
+        None
+    }
+}
+
+fn build_admin_instructions(project_name: &str, dashboard_url: Option<&str>) -> String {
+    match dashboard_url {
+        Some(url) => format!(
+            "## SymForge Operator Dashboard for '{project_name}'\n\
+             \n\
+             The operator dashboard is running. Open it here:\n\
+             \n\
+             {url}\n\
+             \n\
+             This is the live SymForge admin view (index health, harness attach status, \
+             change activity). If the link does not open in your environment, copy the URL \
+             into a browser."
+        ),
+        None => format!(
+            "## SymForge Operator Dashboard for '{project_name}'\n\
+             \n\
+             No operator dashboard is currently running for this project.\n\
+             \n\
+             Start (or reattach to) it by running the CLI verb in a terminal at the \
+             project root:\n\
+             \n\
+             ```\n\
+             symforge admin\n\
+             ```\n\
+             \n\
+             `symforge admin` reuses a server already running on the remembered port, or \
+             starts one on a verified-free port and opens the dashboard. This prompt only \
+             reports a running dashboard — it does not start the server itself."
+        ),
     }
 }
 
@@ -520,6 +611,54 @@ mod tests {
         assert!(names.contains(&"symforge-onboard"));
         assert!(names.contains(&"symforge-refactor"));
         assert!(names.contains(&"symforge-debug"));
+        // 009 US3 (T024): the universal in-harness admin affordance.
+        assert!(names.contains(&"symforge-admin"));
+    }
+
+    #[tokio::test]
+    async fn test_admin_prompt_returns_guidance_when_no_server() {
+        // make_server() has no bound repo_root, so there is no profile / running
+        // server to resolve: the prompt must return the honest "run `symforge
+        // admin`" guidance rather than a fabricated URL (URL-or-guidance, D2).
+        let server = make_server();
+        let result = server
+            .admin_prompt(Parameters(AdminPromptInput::default()))
+            .await;
+
+        let text = result
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                rmcp::model::PromptMessageContent::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("admin prompt returns a text message");
+
+        // Guidance points at the CLI verb that actually starts the server.
+        assert!(
+            text.contains("symforge admin"),
+            "no-server guidance must name the `symforge admin` verb: {text}"
+        );
+        assert!(
+            text.contains("No operator dashboard is currently running"),
+            "must honestly report nothing is running: {text}"
+        );
+    }
+
+    #[test]
+    fn test_admin_instructions_report_running_url_when_present() {
+        // When a dashboard URL is resolved, the prompt body surfaces exactly that
+        // URL (the reuse path) and does not fall back to guidance.
+        let url = "http://127.0.0.1:8787/admin";
+        let body = build_admin_instructions("prompt_project", Some(url));
+        assert!(
+            body.contains(url),
+            "running body must include the URL: {body}"
+        );
+        assert!(
+            body.contains("dashboard is running"),
+            "running body must say the dashboard is up: {body}"
+        );
     }
 
     #[tokio::test]

@@ -218,16 +218,189 @@ pub struct AdminCliArgs {
     pub no_open: bool,
 }
 
-/// Entry point for `symforge admin`.
+/// The result of one `symforge admin` run, returned for caller messaging and
+/// test assertions (mirrors US2's `WizardOutcome`: every effect observable
+/// without scraping stderr).
 ///
-/// Phase 3 lands the shared reachability + serve-start helpers above; the full
-/// reachability -> reuse/start -> open flow lands in Phase US3 (T023). Until then
-/// this returns a clear not-yet-implemented error rather than a fake success.
-pub fn run(_args: AdminCliArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "symforge admin: the dashboard admin verb is not yet implemented (009 US3). \
-         Start the server with `symforge serve` and open the printed `/admin` URL."
-    )
+/// Tests inspect this to assert the reuse-vs-start decision, the reported URL,
+/// and the (no-op) browser open — deterministically, over fixtures, with no real
+/// browser (FR-017/018).
+#[derive(Debug)]
+pub struct AdminOutcome {
+    /// The running operator server (reused or started); always reachable
+    /// (FR-020).
+    pub session: ServerSessionDescriptor,
+    /// `true` when an already-reachable server on the remembered port was reused
+    /// instead of starting a second one (FR-015 / SC-004).
+    pub reused_server: bool,
+    /// The browser-open outcome for the dashboard URL.
+    pub browser_outcome: crate::cli::browser::BrowserOpenOutcome,
+}
+
+/// How long to wait for a reachability probe of the remembered port before
+/// deciding "nothing is serving there" and starting a fresh server.
+const ADMIN_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a fresh serve-start may take to become reachable before the admin
+/// verb gives up.
+const ADMIN_SERVE_START_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Entry point for `symforge admin`. Wires the live home/cwd context and the OS
+/// browser into [`run_admin`] and discards the outcome — the function already
+/// printed the dashboard URL to the operator.
+pub fn run(args: AdminCliArgs) -> anyhow::Result<()> {
+    let ctx = crate::cli::setup::SetupContext::from_env()?;
+    let browser = crate::cli::browser::OsBrowserOpener;
+    let outcome = run_admin(&args, &ctx, &browser)?;
+    if outcome.reused_server {
+        eprintln!(
+            "Operator dashboard already running — {}",
+            outcome.session.dashboard_url
+        );
+    } else {
+        eprintln!(
+            "Started operator dashboard — {}",
+            outcome.session.dashboard_url
+        );
+    }
+    eprintln!("Attach: {}", outcome.session.attach_url);
+    eprintln!(
+        "Browser: {:?} — open {}",
+        outcome.browser_outcome, outcome.session.dashboard_url
+    );
+    Ok(())
+}
+
+/// Testable admin-verb core: reuse a running operator server (reachable on the
+/// remembered port) or start one on a verified-free port, then open + return the
+/// dashboard URL (FR-015, contracts/admin-cli.md, SC-004).
+///
+/// Mirrors US2's `run_wizard` seam shape: tests call this directly with a
+/// TempDir-backed [`crate::cli::setup::SetupContext`] and a
+/// [`crate::cli::browser::NoopBrowserOpener`], then assert on the returned
+/// [`AdminOutcome`] — no real browser, and (apart from a deliberate loopback
+/// bind on the start path) no network beyond the reachability probe (FR-018).
+///
+/// Flow:
+/// 1. Load [`crate::cli::operator_profile::OperatorSetupProfile`] for the project
+///    base -> the remembered port.
+/// 2. If a port is remembered and [`operator_server_reachable`] confirms a server
+///    is up on the loopback address, **reuse it**: build the descriptor for that
+///    address and start nothing (SC-004 — never a second server).
+/// 3. Otherwise [`start_operator_server`] on a verified-free loopback port (no key
+///    this slice), then persist the bound port back to the profile so the next run
+///    reuses it.
+/// 4. Open the dashboard URL via `browser` (a no-op opener in tests) and return.
+pub fn run_admin<B: crate::cli::browser::BrowserOpener + ?Sized>(
+    args: &AdminCliArgs,
+    ctx: &crate::cli::setup::SetupContext,
+    browser: &B,
+) -> anyhow::Result<AdminOutcome> {
+    use crate::cli::operator_profile::OperatorSetupProfile;
+
+    let project_base = ctx.project_base();
+    let existing_profile = OperatorSetupProfile::load(&project_base);
+
+    // Step 1+2: reuse an already-running server on the remembered port (FR-015).
+    let mut reused_server = false;
+    let mut session: Option<ServerSessionDescriptor> = None;
+    if let Some(profile) = existing_profile.as_ref() {
+        let addr = loopback_addr_std(profile.port);
+        if operator_server_reachable(addr, ADMIN_REACHABILITY_TIMEOUT) {
+            session = Some(ServerSessionDescriptor::for_addr(addr, true));
+            reused_server = true;
+        }
+    }
+
+    // Step 3: nothing reachable -> start a fresh server on a verified-free
+    // loopback port, then remember it. Prefer the remembered port (so a restart
+    // lands back on the same bookmarkable port when it is free); else the
+    // historical default, else an OS-assigned ephemeral port — all via
+    // `start_operator_server`'s own free-address selection.
+    let session = match session {
+        Some(s) => s,
+        None => {
+            let preferred = preferred_start_addr(existing_profile.as_ref());
+            let started =
+                start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)?;
+            persist_started_port(&project_base, existing_profile.as_ref(), &started);
+            started
+        }
+    };
+
+    // Step 4: open the dashboard (a no-op opener in tests), unless `--no-open`.
+    let browser_outcome = if args.no_open {
+        crate::cli::browser::BrowserOpenOutcome::Skipped
+    } else {
+        browser.open_url(&session.dashboard_url)
+    };
+
+    Ok(AdminOutcome {
+        session,
+        reused_server,
+        browser_outcome,
+    })
+}
+
+/// Loopback `SocketAddr` for `port`, built with only `std` (no tokio reactor) so
+/// it is callable from the plain synchronous admin-verb context.
+fn loopback_addr_std(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+/// The preferred start address for a fresh admin serve-start: the remembered
+/// port if any (so a restart reuses the bookmarkable port when free), else the
+/// historical default `8787`, else (if even that fails to parse) an ephemeral
+/// `:0`. [`start_operator_server`] verifies the address is actually free and
+/// falls back to an OS-assigned port when it is occupied.
+fn preferred_start_addr(
+    existing_profile: Option<&crate::cli::operator_profile::OperatorSetupProfile>,
+) -> SocketAddr {
+    if let Some(profile) = existing_profile {
+        return loopback_addr_std(profile.port);
+    }
+    crate::server::serve::DEFAULT_LISTEN
+        .parse()
+        .unwrap_or_else(|_| loopback_addr_std(0))
+}
+
+/// Persist the just-bound port back to the operator profile so the next admin /
+/// setup run reuses this server (FR-012/015). Preserves the prior profile's
+/// installation type / harness list when one exists; on a first-ever admin start
+/// (no profile yet) records a minimal server-mode profile. A persist failure is
+/// non-fatal — the server is already up and reported — so it is logged as a
+/// warning, never an error that masks a running dashboard.
+fn persist_started_port(
+    project_base: &std::path::Path,
+    existing_profile: Option<&crate::cli::operator_profile::OperatorSetupProfile>,
+    started: &ServerSessionDescriptor,
+) {
+    use crate::cli::operator_profile::{AuthPosture, OperatorSetupProfile};
+
+    let port = started.bound_addr.port();
+    let updated_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let profile = match existing_profile {
+        Some(prior) => OperatorSetupProfile {
+            port,
+            updated_ms,
+            ..prior.clone()
+        },
+        None => OperatorSetupProfile {
+            installation_type: crate::cli::setup::InstallationType::Server,
+            port,
+            auth_posture: AuthPosture::LoopbackNoKey,
+            harnesses: Vec::new(),
+            updated_ms,
+        },
+    };
+
+    if let Err(error) = profile.save(project_base) {
+        tracing::warn!(%error, "admin: could not persist the started operator-server port");
+    }
 }
 
 #[cfg(test)]
@@ -284,5 +457,117 @@ mod tests {
         );
         // The server thread lives until process exit; the test does not stop it
         // (start-on-demand has no graceful-stop handle by design, D3).
+    }
+
+    // --- T021/T023 run_admin reuse-vs-start (mirrored from tests/admin_verb.rs
+    // so the coverage runs in-lib regardless of the Windows test-binary elevation
+    // prompt that blocks server-binding integration *binaries*) ----------------
+
+    use crate::cli::browser::{BrowserOpenOutcome, NoopBrowserOpener};
+    use crate::cli::operator_profile::{AuthPosture, OperatorSetupProfile};
+    use crate::cli::setup::{InstallationType, SetupContext};
+
+    fn ctx_over(home: &std::path::Path, project: &std::path::Path) -> SetupContext {
+        SetupContext {
+            home: home.to_path_buf(),
+            working_dir: project.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn run_admin_reuses_running_server_on_profile_port() {
+        // A real server is running; the profile points at its port.
+        let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
+            .expect("operator server should come up");
+        let running_port = running.bound_addr.port();
+
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        OperatorSetupProfile::new(
+            InstallationType::Server,
+            running_port,
+            AuthPosture::LoopbackNoKey,
+            &[],
+            1,
+        )
+        .save(project.path())
+        .expect("persist profile");
+
+        let ctx = ctx_over(home.path(), project.path());
+        let browser = NoopBrowserOpener::default();
+        let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
+            .expect("admin should reuse the running server");
+
+        assert!(
+            outcome.reused_server,
+            "must reuse, not start a second server"
+        );
+        assert_eq!(
+            outcome.session.bound_addr.port(),
+            running_port,
+            "reused descriptor names the running server's port (SC-004)"
+        );
+        assert_eq!(browser.opened_urls().len(), 1);
+        assert_eq!(
+            browser.opened_urls()[0],
+            outcome.session.dashboard_url,
+            "the reused dashboard URL is the one opened"
+        );
+    }
+
+    #[test]
+    fn run_admin_starts_and_persists_when_none_running() {
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        assert!(OperatorSetupProfile::load(project.path()).is_none());
+
+        let ctx = ctx_over(home.path(), project.path());
+        let browser = NoopBrowserOpener::default();
+        let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
+            .expect("admin should start a server when none runs");
+
+        assert!(!outcome.reused_server, "no server ran; must start one");
+        assert!(outcome.session.reachable);
+        assert!(
+            operator_server_reachable(outcome.session.bound_addr, Duration::from_millis(500)),
+            "the reported URL must actually be reachable (FR-020)"
+        );
+        assert_eq!(browser.opened_urls().len(), 1);
+
+        // The bound port is persisted so the next run reuses it (FR-012/015).
+        let profile = OperatorSetupProfile::load(project.path()).expect("port persisted");
+        assert_eq!(profile.port, outcome.session.bound_addr.port());
+    }
+
+    #[test]
+    fn run_admin_no_open_does_not_open_browser() {
+        let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(15))
+            .expect("operator server should come up");
+
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        OperatorSetupProfile::new(
+            InstallationType::Server,
+            running.bound_addr.port(),
+            AuthPosture::LoopbackNoKey,
+            &[],
+            1,
+        )
+        .save(project.path())
+        .expect("persist profile");
+
+        let ctx = ctx_over(home.path(), project.path());
+        let browser = NoopBrowserOpener::default();
+        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
+            .expect("admin --no-open should report without opening");
+
+        assert!(
+            browser.opened_urls().is_empty(),
+            "no_open suppresses the open"
+        );
+        assert_eq!(outcome.browser_outcome, BrowserOpenOutcome::Skipped);
+        assert!(outcome.session.dashboard_url.ends_with("/admin"));
     }
 }
