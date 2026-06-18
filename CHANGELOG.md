@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.1.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.0.0...v8.1.0) (2026-06-18)
+
+
+### Features
+
+* **stel:** ground token economics in real bytes; remove dead expected_equiv (010 Phase E/US5) ([2018d60](https://github.com/special-place-ai-heaven/symforge/commit/2018d60f528dfdc360bf7c9ae46ebee26bc536cc))
+
+
+### Bug Fixes
+
+* recoverable cold start - surface-aware recovery + populated index (010 Phase D/US4) ([cd74602](https://github.com/special-place-ai-heaven/symforge/commit/cd74602c45fbbf3e1661dc4fdec6d0f8d345b3d7))
+* **stel:** honest labels on status + economics surfaces (010 Phase A/US1) ([3d2ac1b](https://github.com/special-place-ai-heaven/symforge/commit/3d2ac1b4c35211386eb7761d6ca17fa117619515))
+* **stel:** if_match guarded apply enforced at the write, serialized per-path (010 Phase C/US3) ([d936bc4](https://github.com/special-place-ai-heaven/symforge/commit/d936bc497428c8348d7e0aea0ef3823030752e24))
+* **stel:** status reports the served daemon index, not empty front-end (010 Phase B/US2) ([9d764f1](https://github.com/special-place-ai-heaven/symforge/commit/9d764f163082f2803cc05766e9ba8e53cfc5bdee))
+
 ## [8.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v7.31.0...v8.0.0) (2026-06-17)
 
 
