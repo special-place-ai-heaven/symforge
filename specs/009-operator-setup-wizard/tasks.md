@@ -61,12 +61,12 @@ to the reported URL succeeds, no dead listener; 8787 free → binds 8787; explic
 **Purpose**: the seams + profile + serve-start helper US2 AND US3 both consume. Depends on
 US1's `probe_free_port`. BLOCKS US2/US3.
 
-- [ ] T008 [P] `OperatorSetupProfile` {installation_type, port, auth_posture, harnesses, updated_ms} with `load()/save()` at `.symforge/operator-setup.json` in `src/cli/operator_profile.rs` (mirror `OnboardingState`; atomic write; missing/malformed → default, never error) (E1, contracts/operator-profile.md). + unit test (load missing → default; save→load roundtrip).
-- [ ] T009 [P] `SetupSink` trait (`status`/`ask_choice`/`confirm`) + `StderrSetupSink` (real) + `ScriptedSetupSink` (test) in `src/cli/setup.rs` (mirror `OnboardingSink`) (E6, contracts/seams.md).
-- [ ] T010 [P] `BrowserOpener` trait (`open_url -> Opened|Skipped`) + real OS-opener impl (`std::process::Command`: `cmd /c start`/`open`/`xdg-open`, headless→Skipped) + `NoopBrowserOpener` in `src/cli/browser.rs` (D4, no new dep) + unit test (noop records URL, returns Skipped).
-- [ ] T011 Add a non-blocking serve-start helper (start `serve::run` on a background task bound to a `probe_free_port` address; poll reachability; return `ServerSessionDescriptor` {bound_addr, dashboard_url, attach_url, reachable}) + an operator-server reachability check (HTTP GET `/api/v1/summary`, short timeout — the `sidecar_port_is_alive` pattern over HTTP) in `src/cli/admin.rs` (shared) (D3/D6, E4).
+- [X] T008 [P] `OperatorSetupProfile` (harnesses as `HarnessId::slug` strings — HarnessId has no serde), atomic write, `load`→None on missing/malformed, no secrets persisted — DONE + 4 tests.
+- [X] T009 [P] `SetupSink` + `StderrSetupSink` + `ScriptedSetupSink` (+ `InstallationType` serde) — DONE + tests.
+- [X] T010 [P] `BrowserOpener` + `OsBrowserOpener` (Command; headless guard via DISPLAY/WAYLAND → Skipped, never errors) + `NoopBrowserOpener`; kept `BrowserOpenOutcome` name (Phase-1 skeleton) — DONE + tests, no new dep.
+- [X] T011 `ServerSessionDescriptor` + `operator_server_reachable` (reqwest sync block_on GET /api/v1/summary; any HTTP response→true) + `start_operator_server` (spawn OS thread w/ own runtime running serve::run on a pre-selected free addr; poll reachability). Reactor-bound `probe_free_port` panic from sync caller caught → reactor-free `select_free_addr_std`. Documented limit: no graceful-stop handle (D3 scope). DONE + live serve-start test.
 
-**Checkpoint**: seams + profile + serve-start/reachability compile + unit-tested. US2/US3 can begin.
+**Checkpoint**: seams + profile + serve-start/reachability compile + unit-tested (12). US2/US3 can begin. ✅
 
 ---
 
