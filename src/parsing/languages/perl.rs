@@ -21,8 +21,14 @@ fn walk_node(
     symbols: &mut Vec<SymbolRecord>,
 ) {
     let kind = match node.kind() {
-        "function_definition" | "function_definition_without_sub" => Some(SymbolKind::Function),
-        "package_statement" => Some(SymbolKind::Module),
+        // ts-parser-perl 1.1.x: subs and class methods are *_declaration_statement.
+        // Keep the legacy ganezdragon kinds harmless for forward-compat.
+        "subroutine_declaration_statement"
+        | "method_declaration_statement"
+        | "function_definition"
+        | "function_definition_without_sub" => Some(SymbolKind::Function),
+        // `package Foo;` and `class Foo {...}` both define a module-like scope.
+        "package_statement" | "class_statement" => Some(SymbolKind::Module),
         _ => None,
     };
 
@@ -34,15 +40,34 @@ fn walk_node(
 }
 
 fn find_name(node: &Node, source: &str, kind: SymbolKind) -> Option<String> {
+    // ts-parser-perl 1.1.x exposes the defined name via the `name:` field on
+    // subroutine/method/package/class statements:
+    //   (subroutine_declaration_statement name: (bareword) ...)   -> "greet"
+    //   (package_statement name: (package))                       -> "MyApp::Module"
+    //   (class_statement name: (package) (block (method_declaration_statement
+    //       name: (bareword) ...)))                               -> "Point" / "render"
+    // Prefer the field; the named child is the canonical name node.
+    if let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(text) = name_node.utf8_text(source.as_bytes())
+    {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    // Fallback: child-scan over the name-bearing node kinds. Covers both the
+    // ts-parser-perl kinds (`bareword`, `package`) and the legacy ganezdragon
+    // kinds (`name`, `identifier`, `package_name`, `subroutine_name`), so a
+    // grammar without the `name:` field still resolves.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        // For subroutine_declaration_statement, look for identifier after 'sub'
-        // For package_statement, look for package_name or identifier
-        if child.kind() == "name" || child.kind() == "identifier" || child.kind() == "package_name"
-        {
+        if matches!(
+            child.kind(),
+            "bareword" | "package" | "name" | "identifier" | "package_name"
+        ) {
             return Some(child.utf8_text(source.as_bytes()).unwrap_or("").to_string());
         }
-        // Some versions use 'subroutine_name' node
         if kind == SymbolKind::Function && child.kind() == "subroutine_name" {
             return Some(child.utf8_text(source.as_bytes()).unwrap_or("").to_string());
         }
@@ -99,6 +124,39 @@ mod tests {
                 .iter()
                 .any(|s| s.kind == SymbolKind::Module && s.name == "MyApp::Module"),
             "should extract package as Module, symbols: {:?}",
+            result.symbols
+        );
+    }
+
+    /// ts-parser-perl recovers the `class Foo { method bar {...} }` construct
+    /// that the old ganezdragon grammar ERROR-noded: `class Point` must surface
+    /// as a Module and `method render` as a Function.
+    #[test]
+    fn test_perl_class_and_method_extracted() {
+        let source = b"class Point {\n    method render { return 1; }\n}";
+        let result = process_file("test.pl", source, LanguageId::Perl);
+        assert!(
+            matches!(
+                result.outcome,
+                FileOutcome::Processed | FileOutcome::PartialParse { .. }
+            ),
+            "Perl class should parse: {:?}",
+            result.outcome
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Module && s.name == "Point"),
+            "should extract class Point as Module, symbols: {:?}",
+            result.symbols
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Function && s.name == "render"),
+            "should extract method render as Function, symbols: {:?}",
             result.symbols
         );
     }

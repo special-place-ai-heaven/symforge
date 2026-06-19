@@ -413,43 +413,86 @@ const SWIFT_XREF_QUERY: &str = r#"
 
 const PERL_XREF_QUERY: &str = r#"
 ; Method calls: $obj->method()
-(method_invocation
-  function_name: (identifier) @ref.method_call)
+(method_call_expression method: (method) @ref.method_call)
 
-; require statements
-(require_statement
-  package_name: (package_name) @ref.import)
+; Plain function calls: foo(1, 2)
+(function_call_expression function: (function) @ref.call)
+
+; Ambiguous list-op calls: print foo
+(ambiguous_function_call_expression function: (function) @ref.call)
+
+; use Foo::Bar;
+(use_statement module: (package) @ref.import)
+
+; require Baz::Qux;
+(require_expression (bareword) @ref.import)
 "#;
 
 // ---------------------------------------------------------------------------
 // OnceLock-cached compiled queries
 // ---------------------------------------------------------------------------
 
-static RUST_QUERY: OnceLock<Query> = OnceLock::new();
-static RUST_CONST_DEF_QUERY_C: OnceLock<Query> = OnceLock::new();
-static RUST_VALUE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
-static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
-static PYTHON_VALUE_TYPE_IDENT_QUERY_C: OnceLock<Query> = OnceLock::new();
-static PYTHON_STRING_TYPE_QUERY_C: OnceLock<Query> = OnceLock::new();
-static JS_QUERY: OnceLock<Query> = OnceLock::new();
-static TS_QUERY: OnceLock<Query> = OnceLock::new();
+// Each cache holds `Option<Query>`: `Some` once a query compiles, `None` when
+// `Query::new` rejects it (a grammar/query node-kind mismatch). Caching `None`
+// means a mismatch degrades to empty refs ONCE-AND-FOR-ALL instead of
+// re-attempting (and re-logging) on every file. See `compile_xref_query`.
+static RUST_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static RUST_CONST_DEF_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
+static RUST_VALUE_IDENT_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
+static PYTHON_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static PYTHON_VALUE_TYPE_IDENT_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
+static PYTHON_STRING_TYPE_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
+static JS_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static TS_QUERY: OnceLock<Option<Query>> = OnceLock::new();
 // A tree-sitter Query binds to a specific Language's node-kind IDs. The TSX
 // grammar (`LANGUAGE_TSX`) is a distinct Language from `LANGUAGE_TYPESCRIPT`,
 // so the same xref query source must be compiled and cached separately for it;
 // reusing the TS-compiled query against a TSX tree yields wrong/empty matches.
-static TSX_QUERY: OnceLock<Query> = OnceLock::new();
-static GO_QUERY: OnceLock<Query> = OnceLock::new();
-static JAVA_QUERY: OnceLock<Query> = OnceLock::new();
-static C_QUERY: OnceLock<Query> = OnceLock::new();
-static CPP_QUERY: OnceLock<Query> = OnceLock::new();
-static CSHARP_QUERY: OnceLock<Query> = OnceLock::new();
-static RUBY_QUERY: OnceLock<Query> = OnceLock::new();
-static KOTLIN_QUERY: OnceLock<Query> = OnceLock::new();
-static DART_QUERY: OnceLock<Query> = OnceLock::new();
-static ELIXIR_QUERY: OnceLock<Query> = OnceLock::new();
-static PHP_QUERY: OnceLock<Query> = OnceLock::new();
-static SWIFT_QUERY: OnceLock<Query> = OnceLock::new();
-static PERL_QUERY: OnceLock<Query> = OnceLock::new();
+static TSX_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static GO_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static JAVA_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static C_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static CPP_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static CSHARP_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static RUBY_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static KOTLIN_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static DART_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static ELIXIR_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static PHP_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static SWIFT_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+static PERL_QUERY: OnceLock<Option<Query>> = OnceLock::new();
+
+/// Compile a tree-sitter xref query, caching the result in `cache`.
+///
+/// On a `Query::new` error (a grammar/query node-kind mismatch — e.g. a
+/// grammar swap that renamed the nodes a query targets) this logs a
+/// `tracing::warn!` and caches `None`, so cross-reference extraction degrades
+/// to *empty refs* instead of panicking. The `None` is cached permanently:
+/// a query that fails to compile against the linked grammar will never
+/// compile, so there is no value in retrying (or re-logging) per file.
+///
+/// `label` names the query for the log line (e.g. `"perl"`, `"rust const-def"`).
+fn compile_xref_query(
+    cache: &'static OnceLock<Option<Query>>,
+    lang: &Language,
+    src: &str,
+    label: &str,
+) -> Option<&'static Query> {
+    cache
+        .get_or_init(|| match Query::new(lang, src) {
+            Ok(query) => Some(query),
+            Err(err) => {
+                tracing::warn!(
+                    query = label,
+                    error = %err,
+                    "xref query failed to compile against the linked grammar; \
+                     cross-references for this language are disabled"
+                );
+                None
+            }
+        })
+        .as_ref()
+}
 
 // ponytail: these ~17 per-language query getters look like collapsible
 // boilerplate (audit 2026-06-17, Tier 4a). A `OnceLock<Query>`-table collapse was
@@ -461,102 +504,113 @@ static PERL_QUERY: OnceLock<Query> = OnceLock::new();
 // where a wrong query silently corrupts xref and breaks LLM trust — the explicit,
 // impossible-to-misalign form is the superior one. Do NOT collapse without a
 // reason that outweighs that trade.
-fn rust_query(lang: &Language) -> &'static Query {
-    RUST_QUERY.get_or_init(|| Query::new(lang, RUST_XREF_QUERY).expect("valid rust xref query"))
+// Every getter returns `Option<&'static Query>`: `Some` on success, `None` if
+// the query failed to compile against the linked grammar (logged once, cached).
+// Callers degrade to empty refs on `None` rather than panicking.
+fn rust_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&RUST_QUERY, lang, RUST_XREF_QUERY, "rust")
 }
 
-fn rust_const_def_query(lang: &Language) -> &'static Query {
-    RUST_CONST_DEF_QUERY_C
-        .get_or_init(|| Query::new(lang, RUST_CONST_DEF_QUERY).expect("valid rust const-def query"))
+fn rust_const_def_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(
+        &RUST_CONST_DEF_QUERY_C,
+        lang,
+        RUST_CONST_DEF_QUERY,
+        "rust const-def",
+    )
 }
 
-fn rust_value_ident_query(lang: &Language) -> &'static Query {
-    RUST_VALUE_IDENT_QUERY_C.get_or_init(|| {
-        Query::new(lang, RUST_VALUE_IDENT_QUERY).expect("valid rust value-ident query")
-    })
+fn rust_value_ident_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(
+        &RUST_VALUE_IDENT_QUERY_C,
+        lang,
+        RUST_VALUE_IDENT_QUERY,
+        "rust value-ident",
+    )
 }
 
-fn python_query(lang: &Language) -> &'static Query {
-    PYTHON_QUERY
-        .get_or_init(|| Query::new(lang, PYTHON_XREF_QUERY).expect("valid python xref query"))
+fn python_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&PYTHON_QUERY, lang, PYTHON_XREF_QUERY, "python")
 }
 
-fn python_value_type_ident_query(lang: &Language) -> &'static Query {
-    PYTHON_VALUE_TYPE_IDENT_QUERY_C.get_or_init(|| {
-        Query::new(lang, PYTHON_VALUE_TYPE_IDENT_QUERY)
-            .expect("valid python value-type ident query")
-    })
+fn python_value_type_ident_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(
+        &PYTHON_VALUE_TYPE_IDENT_QUERY_C,
+        lang,
+        PYTHON_VALUE_TYPE_IDENT_QUERY,
+        "python value-type ident",
+    )
 }
 
-fn python_string_type_query(lang: &Language) -> &'static Query {
-    PYTHON_STRING_TYPE_QUERY_C.get_or_init(|| {
-        Query::new(lang, PYTHON_STRING_TYPE_QUERY).expect("valid python string-type query")
-    })
+fn python_string_type_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(
+        &PYTHON_STRING_TYPE_QUERY_C,
+        lang,
+        PYTHON_STRING_TYPE_QUERY,
+        "python string-type",
+    )
 }
 
-fn js_query(lang: &Language) -> &'static Query {
-    JS_QUERY.get_or_init(|| Query::new(lang, JS_XREF_QUERY).expect("valid js xref query"))
+fn js_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&JS_QUERY, lang, JS_XREF_QUERY, "js")
 }
 
-fn ts_query(lang: &Language) -> &'static Query {
-    TS_QUERY.get_or_init(|| Query::new(lang, TS_XREF_QUERY).expect("valid ts xref query"))
+fn ts_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&TS_QUERY, lang, TS_XREF_QUERY, "ts")
 }
 
 /// The TSX-grammar counterpart of [`ts_query`]. Compiled against `LANGUAGE_TSX`
 /// and cached independently of the plain TypeScript query.
-fn tsx_query(lang: &Language) -> &'static Query {
-    TSX_QUERY.get_or_init(|| Query::new(lang, TS_XREF_QUERY).expect("valid tsx xref query"))
+fn tsx_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&TSX_QUERY, lang, TS_XREF_QUERY, "tsx")
 }
 
-fn go_query(lang: &Language) -> &'static Query {
-    GO_QUERY.get_or_init(|| Query::new(lang, GO_XREF_QUERY).expect("valid go xref query"))
+fn go_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&GO_QUERY, lang, GO_XREF_QUERY, "go")
 }
 
-fn java_query(lang: &Language) -> &'static Query {
-    JAVA_QUERY.get_or_init(|| Query::new(lang, JAVA_XREF_QUERY).expect("valid java xref query"))
+fn java_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&JAVA_QUERY, lang, JAVA_XREF_QUERY, "java")
 }
 
-fn c_query(lang: &Language) -> &'static Query {
-    C_QUERY.get_or_init(|| Query::new(lang, C_XREF_QUERY).expect("valid c xref query"))
+fn c_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&C_QUERY, lang, C_XREF_QUERY, "c")
 }
 
-fn cpp_query(lang: &Language) -> &'static Query {
-    CPP_QUERY.get_or_init(|| Query::new(lang, CPP_XREF_QUERY).expect("valid cpp xref query"))
+fn cpp_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&CPP_QUERY, lang, CPP_XREF_QUERY, "cpp")
 }
 
-fn csharp_query(lang: &Language) -> &'static Query {
-    CSHARP_QUERY
-        .get_or_init(|| Query::new(lang, CSHARP_XREF_QUERY).expect("valid csharp xref query"))
+fn csharp_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&CSHARP_QUERY, lang, CSHARP_XREF_QUERY, "csharp")
 }
 
-fn ruby_query(lang: &Language) -> &'static Query {
-    RUBY_QUERY.get_or_init(|| Query::new(lang, RUBY_XREF_QUERY).expect("valid ruby xref query"))
+fn ruby_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&RUBY_QUERY, lang, RUBY_XREF_QUERY, "ruby")
 }
 
-fn kotlin_query(lang: &Language) -> &'static Query {
-    KOTLIN_QUERY
-        .get_or_init(|| Query::new(lang, KOTLIN_XREF_QUERY).expect("valid kotlin xref query"))
+fn kotlin_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&KOTLIN_QUERY, lang, KOTLIN_XREF_QUERY, "kotlin")
 }
 
-fn dart_query(lang: &Language) -> &'static Query {
-    DART_QUERY.get_or_init(|| Query::new(lang, DART_XREF_QUERY).expect("valid dart xref query"))
+fn dart_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&DART_QUERY, lang, DART_XREF_QUERY, "dart")
 }
 
-fn elixir_query(lang: &Language) -> &'static Query {
-    ELIXIR_QUERY
-        .get_or_init(|| Query::new(lang, ELIXIR_XREF_QUERY).expect("valid elixir xref query"))
+fn elixir_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&ELIXIR_QUERY, lang, ELIXIR_XREF_QUERY, "elixir")
 }
 
-fn php_query(lang: &Language) -> &'static Query {
-    PHP_QUERY.get_or_init(|| Query::new(lang, PHP_XREF_QUERY).expect("valid php xref query"))
+fn php_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&PHP_QUERY, lang, PHP_XREF_QUERY, "php")
 }
 
-fn swift_query(lang: &Language) -> &'static Query {
-    SWIFT_QUERY.get_or_init(|| Query::new(lang, SWIFT_XREF_QUERY).expect("valid swift xref query"))
+fn swift_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&SWIFT_QUERY, lang, SWIFT_XREF_QUERY, "swift")
 }
 
-fn perl_query(lang: &Language) -> &'static Query {
-    PERL_QUERY.get_or_init(|| Query::new(lang, PERL_XREF_QUERY).expect("valid perl xref query"))
+fn perl_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(&PERL_QUERY, lang, PERL_XREF_QUERY, "perl")
 }
 
 fn split_top_level_rust_items(input: &str) -> Vec<&str> {
@@ -720,7 +774,9 @@ fn extract_python_value_refs(
 ) -> Vec<ReferenceRecord> {
     let source_bytes = source.as_bytes();
     let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
-    let value_query = python_value_type_ident_query(ts_language);
+    let Some(value_query) = python_value_type_ident_query(ts_language) else {
+        return Vec::new();
+    };
     let value_capture_names = value_query.capture_names();
     let mut out: Vec<ReferenceRecord> = Vec::new();
     let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
@@ -822,7 +878,9 @@ fn extract_python_string_type_refs(
 ) -> Vec<ReferenceRecord> {
     let source_bytes = source.as_bytes();
     let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
-    let string_query = python_string_type_query(ts_language);
+    let Some(string_query) = python_string_type_query(ts_language) else {
+        return Vec::new();
+    };
     let string_capture_names = string_query.capture_names();
     let mut out: Vec<ReferenceRecord> = Vec::new();
     let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
@@ -901,7 +959,9 @@ fn extract_rust_value_refs(
 
     // Step 1: collect same-file const/static definition names and their
     // definition-site byte ranges (so we can skip the definition itself).
-    let def_query = rust_const_def_query(ts_language);
+    let Some(def_query) = rust_const_def_query(ts_language) else {
+        return Vec::new();
+    };
     let def_capture_names = def_query.capture_names();
     let mut def_names: HashSet<String> = HashSet::new();
     let mut def_ranges: HashSet<(u32, u32)> = HashSet::new();
@@ -940,7 +1000,9 @@ fn extract_rust_value_refs(
 
     // Step 2: scan every bare value-position identifier and emit a reference
     // only for those resolving to a known same-file const/static.
-    let value_query = rust_value_ident_query(ts_language);
+    let Some(value_query) = rust_value_ident_query(ts_language) else {
+        return Vec::new();
+    };
     let value_capture_names = value_query.capture_names();
     let mut out: Vec<ReferenceRecord> = Vec::new();
     let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
@@ -1115,6 +1177,13 @@ pub fn extract_references(
         LanguageId::Html | LanguageId::Css | LanguageId::Scss => {
             return (vec![], HashMap::new());
         }
+    };
+
+    // The main query may be `None` if it failed to compile against the linked
+    // grammar (e.g. a grammar swap renamed the nodes it targets). Degrade to
+    // empty refs rather than panicking — `compile_xref_query` already logged it.
+    let Some(query) = query else {
+        return (Vec::new(), HashMap::new());
     };
 
     // Safety: the query and parse tree use the same grammar version because both are produced by
@@ -2852,5 +2921,98 @@ public class PacketsController
             "use/import/require are all directives -> Import refs, refs: {:?}",
             refs
         );
+    }
+
+    // --- Perl (ts-parser-perl grammar) ---
+
+    /// Mirrors `test_java_method_invocation`: a method call, a plain call, and
+    /// two import forms (`use`/`require`) must all surface as the right refs.
+    /// Imports store the LAST path segment as `name` and the full dotted/`::`
+    /// path as `qualified_name` (see `push_import_reference`).
+    #[test]
+    fn test_perl_method_invocation_and_import() {
+        let source = "$obj->greet();\nhelper();\nuse Foo::Bar;\nrequire Baz::Qux;";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+
+        assert!(
+            has_ref(&refs, "greet", ReferenceKind::Call),
+            "should capture $obj->greet() method call, refs: {:?}",
+            refs
+        );
+        assert!(
+            has_ref(&refs, "helper", ReferenceKind::Call),
+            "should capture helper() function call, refs: {:?}",
+            refs
+        );
+
+        // `use Foo::Bar;` -> name "Bar", qualified_name "Foo::Bar".
+        let use_ref = find_ref(&refs, "Bar")
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .unwrap_or_else(|| panic!("should capture `use Foo::Bar` import, refs: {refs:?}"));
+        assert_eq!(use_ref.qualified_name.as_deref(), Some("Foo::Bar"));
+
+        // `require Baz::Qux;` -> name "Qux", qualified_name "Baz::Qux".
+        let require_ref = find_ref(&refs, "Qux")
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .unwrap_or_else(|| panic!("should capture `require Baz::Qux` import, refs: {refs:?}"));
+        assert_eq!(require_ref.qualified_name.as_deref(), Some("Baz::Qux"));
+    }
+
+    /// Xref proof-of-value: a method call inside a `class { method ... }` body —
+    /// the construct the old ganezdragon grammar ERROR-noded — is now recovered.
+    #[test]
+    fn test_perl_class_method_call_recovered() {
+        let source = "class Point {\n    method render {\n        $self->draw();\n    }\n}";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        assert!(
+            has_ref(&refs, "draw", ReferenceKind::Call),
+            "should recover $self->draw() inside a class method, refs: {:?}",
+            refs
+        );
+    }
+
+    /// A deliberately-malformed query must degrade to `None` (logged + cached),
+    /// never panic. This is the panic-hardening contract of `compile_xref_query`.
+    #[test]
+    fn test_compile_xref_query_degrades_on_mismatch() {
+        // A fresh, test-local cache so we observe the first-init outcome.
+        static BAD_QUERY_CACHE: OnceLock<Option<Query>> = OnceLock::new();
+        let lang: Language = tree_sitter_perl::LANGUAGE.into();
+        // `(no_such_node_kind_xyz)` is not a node in any grammar -> Query::new errs.
+        let result = compile_xref_query(
+            &BAD_QUERY_CACHE,
+            &lang,
+            "(no_such_node_kind_xyz) @ref.call",
+            "deliberately-bad",
+        );
+        assert!(
+            result.is_none(),
+            "a query against a non-existent node kind must compile to None, not panic"
+        );
+    }
+
+    /// Empirical anchor (kept `#[ignore]`): prints the s-expr for the verified
+    /// ts-parser-perl node shapes. Run with `--ignored` to re-confirm the node
+    /// names this implementation depends on after a grammar bump.
+    #[test]
+    #[ignore = "diagnostic probe; run with --ignored to re-verify grammar node names"]
+    fn probe_perl_grammar_sexp() {
+        let samples = [
+            "sub greet { 1 }",
+            "package MyApp::Module;",
+            "class Bar { method m { 1 } }",
+            "$obj->method(1, 2);",
+            "foo(1, 2);",
+            "print foo;",
+            "use Foo::Bar;",
+            "require Baz::Qux;",
+        ];
+        let mut parser = Parser::new();
+        let lang: Language = tree_sitter_perl::LANGUAGE.into();
+        parser.set_language(&lang).expect("set perl language");
+        for src in samples {
+            let tree = parser.parse(src, None).expect("parse");
+            println!("--- {src}\n{}", tree.root_node().to_sexp());
+        }
     }
 }

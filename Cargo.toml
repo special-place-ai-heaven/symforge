@@ -93,7 +93,7 @@ tree-sitter-c-sharp = "0.23.1"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-php = "0.24.2"
 tree-sitter-swift = "0.7.1"
-tree-sitter-perl = "1.1.2"
+tree-sitter-perl = { package = "ts-parser-perl", version = "1.1" }
 tree-sitter-kotlin-sg = "0.4.0"
 # 0.1.0+ is the nielsenko lineage (crates.io name taken over 2026-03):
 # spec-native grammar, co-owned by the ast-grep author, adopted by ast-grep
