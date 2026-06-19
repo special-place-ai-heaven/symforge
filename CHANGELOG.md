@@ -26,6 +26,28 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.4.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.3.0...v8.4.0) (2026-06-19)
+
+
+### Features
+
+* **init:** register Cursor as a symforge init target (P0 plan 001) ([d6952b3](https://github.com/special-place-ai-heaven/symforge/commit/d6952b38e6b3a8906c62640bbfd5fbe68816cc7b))
+* **mcp:** resolve workspace from MCP client roots, not launch cwd (plan 002) ([7ded0d1](https://github.com/special-place-ai-heaven/symforge/commit/7ded0d1a219e26d69bab83932403eb57e1f430e1))
+* **stel:** compact trust + usability campaign ([ff627ce](https://github.com/special-place-ai-heaven/symforge/commit/ff627cec064ac7396401889eaa95022d874bacee))
+* **stel:** compact-edit completeness — insert + within-symbol on the facade (plan 005) ([5d7f8b0](https://github.com/special-place-ai-heaven/symforge/commit/5d7f8b0679b3c1970a1221c37756ca939d8b21d1))
+* **stel:** opt-in SYMFORGE_STEL_COMPACT one-line envelope (plan 009a) ([0a2094a](https://github.com/special-place-ai-heaven/symforge/commit/0a2094a6b49457b8dff423d63de96becd2a6beaa))
+
+
+### Bug Fixes
+
+* **edit:** dedent body before re-indent + document the body contract (plan 006) ([39f041b](https://github.com/special-place-ai-heaven/symforge/commit/39f041b39db2ab4005574408a1d95cd45b9f8278))
+* **serve,admin:** bind operator ports in 8000-8999/5000-5999, never ephemeral (plan 008a) ([cc84cff](https://github.com/special-place-ai-heaven/symforge/commit/cc84cff9778dc3f70ef30216e2446b3732f4e067))
+* **stel:** disclose hidden-path exclusion in search completeness (plan 004) ([533089f](https://github.com/special-place-ai-heaven/symforge/commit/533089ffca59ff5631a0093a319fbbecd0a65f92))
+* **stel:** filter stopwords from fuzzy-find OR terms (plan 007) ([5e23c3f](https://github.com/special-place-ai-heaven/symforge/commit/5e23c3ff5979b3fb7ec7dc2c9f2d1706b2e6a637))
+* **stel:** ground edit economics in real body bytes (plan 009b) ([4008de8](https://github.com/special-place-ai-heaven/symforge/commit/4008de8811793175431852a6a81edfac09036beb))
+* **stel:** honest, actionable empty-index + no-repo-root recovery hints (plan 003) ([1d03592](https://github.com/special-place-ai-heaven/symforge/commit/1d03592145591d652725ab4b872e2a9a21c50e2a))
+* **stel:** symbol= routing, prose-symbol guard, find_references precision disclosure (plan 007b) ([08bef57](https://github.com/special-place-ai-heaven/symforge/commit/08bef571558ec07ef70214ae2fc543a57bd0984b))
+
 ## [8.3.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.2.0...v8.3.0) (2026-06-18)
 
 
