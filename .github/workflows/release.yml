@@ -32,6 +32,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Free disk space for Rust builds
+        run: bash execution/free_runner_disk.sh
+
       - name: Validate commit subjects for this push
         if: github.event_name == 'push'
         run: python execution/conventional_commits.py check-push-range "${{ github.event.before }}" "$GITHUB_SHA"
