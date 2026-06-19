@@ -56,7 +56,16 @@ fn render_live_envelope(query: &str, session_tokens_served: i64) -> String {
 
 fn render_full_status() -> String {
     let ledger = SessionLedger::new();
-    let ctx = StelStatusContext::from_server("compact", "symforge", true, 128, 512, &ledger, 4096);
+    let ctx = StelStatusContext::from_server(
+        "compact",
+        "symforge",
+        Some("E:/project/symforge".to_string()),
+        true,
+        128,
+        512,
+        &ledger,
+        4096,
+    );
     format_stel_status(
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),

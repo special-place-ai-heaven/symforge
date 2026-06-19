@@ -8438,6 +8438,11 @@ impl SymForgeServer {
             let metrics =
                 metrics_for_decision(plan_summary, &decision, &plan, 0, session_tokens_served);
             let envelope = handler::envelope_for_decision(&metrics);
+            // 012 D6-a: the preview body is `envelope + "\n\n" + StelEstimate JSON`
+            // that consumers parse to the end of the string, so a trailing
+            // free-text bound-root line would corrupt the JSON tail. Preview is a
+            // pre-flight estimate, not a served result; bound-root visibility is
+            // attached to the actual served/bypass responses below instead.
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
         }
@@ -8460,6 +8465,8 @@ impl SymForgeServer {
                 &step.tool,
                 None,
             );
+            // 012 D6-a: surface the bound project on every `symforge` response.
+            let output = self.with_bound_root_visibility(output);
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8580,6 +8587,8 @@ impl SymForgeServer {
             &route_label,
             tools_called,
         );
+        // 012 D6-a: surface the bound project on every `symforge` response.
+        let output = self.with_bound_root_visibility(output);
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
         statused_tool_result(output, outcome_class)
@@ -8870,9 +8879,17 @@ impl SymForgeServer {
     ) -> String {
         let guard = self.index.read();
         let ledger = self.stel_ledger.lock();
+        // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
+        // is the root bound on THIS server — on the daemon side it is the warm
+        // project's root (TR-01), on the front-end fallback it is the proxy's
+        // bound root. Normalized to forward slashes to match `runtime_status_for`.
+        let project_root = self
+            .capture_repo_root()
+            .map(|root| root.to_string_lossy().replace('\\', "/"));
         let ctx = crate::stel::StelStatusContext::from_server(
             "compact",
             &self.project_name,
+            project_root,
             guard.is_ready(),
             guard.file_count(),
             guard.symbol_count(),
@@ -8899,6 +8916,34 @@ impl SymForgeServer {
         request: &crate::stel::StelStatusRequest,
     ) -> String {
         self.render_stel_status_body(request)
+    }
+
+    /// Bound-root visibility line for the `symforge` response envelope (012 D6-a).
+    ///
+    /// Reuses [`Self::runtime_status_for`] (the same accessor `health` uses) so
+    /// the surfaced root carries the identical backslash normalization and
+    /// `project_root` derivation — a single source of truth for "which workspace
+    /// answered". Returns `project_root: (unbound)` when nothing is bound so a
+    /// stale or wrong binding is LOUD in every facade response, never silent.
+    fn stel_bound_root_line(&self) -> String {
+        let published = self.index.published_state();
+        let status =
+            self.runtime_status_for(&published, self.local_runtime_mode(), None, None, None);
+        format!(
+            "project_root: {}",
+            status.project_root.as_deref().unwrap_or("(unbound)")
+        )
+    }
+
+    /// Attach the bound-root visibility line to a finished `symforge` response so
+    /// the answering project is always observable (012 D6-a).
+    ///
+    /// Appended as a trailing line rather than prepended so the trust envelope
+    /// stays the FIRST block of the response — a contract relied on by consumers
+    /// and by the facade tests (`output.starts_with("── stel")`). The bound-root
+    /// line is still unconditionally present, so a stale/wrong binding is loud.
+    fn with_bound_root_visibility(&self, output: String) -> String {
+        format!("{output}\n{}", self.stel_bound_root_line())
     }
 
     #[allow(clippy::too_many_arguments)]

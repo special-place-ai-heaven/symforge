@@ -4564,6 +4564,132 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
+    /// 012 C4 (D4 retarget + D6-a bound-root visibility): after a daemon-proxy
+    /// session is retargeted from project A to project B at runtime via
+    /// `index_folder`, the `status` and `symforge` surfaces must report the NEW
+    /// project's bound root — never the stale one. This is the field wrong-repo
+    /// bug made observable: a stale binding can no longer read as a working one.
+    #[tokio::test]
+    async fn test_retarget_updates_bound_root_in_status_and_symforge_surfaces() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        // The facade surfaces require the compact profile.
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "compact");
+
+        let project_a = project_dir("symforge-retarget-root-a");
+        let project_b = project_dir("symforge-retarget-root-b");
+        std::fs::write(
+            project_a.path().join("src").join("lib.rs"),
+            "pub fn alpha_symbol() -> u32 { 1 }\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("lib.rs"),
+            "pub fn beta_symbol() -> u32 { 2 }\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        // Open a daemon session bound to project A.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "retarget-root".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Sanity: before retarget the bound root is project A and the local
+        // status render surfaces it.
+        let root_a_norm = project_a.path().display().to_string().replace('\\', "/");
+        let status_before =
+            server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+        assert!(
+            status_before.contains(&format!("project_root: {root_a_norm}")),
+            "pre-retarget status must surface project A root, got:\n{status_before}"
+        );
+
+        // Retarget to project B via the explicit `index_folder` verb (D4-C).
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+            }))
+            .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon proxy retarget must succeed, got: {indexed}"
+        );
+
+        // (a) The bound root followed the switch.
+        let switched = server
+            .capture_repo_root()
+            .expect("repo root after retarget");
+        assert_eq!(
+            switched,
+            project_b.path().to_path_buf(),
+            "repo_root must point at project B after retarget"
+        );
+
+        // (b) `status` (local render path) now reflects project B's root, not A.
+        let root_b_norm = project_b.path().display().to_string().replace('\\', "/");
+        let status_after =
+            server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+        assert!(
+            status_after.contains(&format!("project_root: {root_b_norm}")),
+            "post-retarget status must surface project B root, got:\n{status_after}"
+        );
+        assert!(
+            !status_after.contains(&format!("project_root: {root_a_norm}")),
+            "stale project A root must NOT survive in status after retarget, got:\n{status_after}"
+        );
+
+        // (c) the `symforge` facade envelope also carries the bound root line so a
+        // wrong-repo binding is loud on the primary read surface too.
+        // `SymforgeCallInput` flattens the `StelRequest`, so `query` is top-level.
+        let symforge_input = serde_json::from_value(serde_json::json!({
+            "query": "find beta_symbol"
+        }))
+        .expect("symforge facade input");
+        let symforge_result = server
+            .symforge_facade_tool(Parameters(symforge_input))
+            .await
+            .expect("symforge facade dispatch");
+        let serialized = serde_json::to_value(&symforge_result).expect("serialize symforge result");
+        let symforge_body = serialized["content"][0]["text"]
+            .as_str()
+            .expect("symforge result text")
+            .to_string();
+        assert!(
+            symforge_body.contains(&format!("project_root: {root_b_norm}")),
+            "symforge envelope must surface the bound project B root, got:\n{symforge_body}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
     #[tokio::test]
     async fn test_index_folder_idempotency_replays_same_key_same_request_in_daemon_route() {
         let _env_lock = env_lock().await;
