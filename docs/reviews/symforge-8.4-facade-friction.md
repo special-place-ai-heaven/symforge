@@ -47,4 +47,4 @@ Orientation queries with no literal `"repo map"` routed to `explore` (keyword hi
 
 ## AAP coordination
 
-`stel` is `#[cfg(feature = "server")]` — planner changes do not affect AAP embed builds. Keep `../symforge` on a tagged release for AAP `path` deps; land this fix on its own branch.
+`stel` is `#[cfg(feature = "server")]` — planner changes do not affect AAP embed builds. AAP path-deps `../symforge` and can bump `Cargo.lock` to whatever version it needs after symforge releases.
