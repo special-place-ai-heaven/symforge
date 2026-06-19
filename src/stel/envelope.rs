@@ -52,19 +52,32 @@ fn decision_label(decision: AdmissionDecision) -> &'static str {
 /// does not measure real token counts, so presenting any of them as a measured
 /// saving would violate the 010 honesty contract (FR-001/FR-002).
 ///
-/// The full multi-line block is the default. An operator who finds the per-call
-/// block noisy can set `SYMFORGE_STEL_COMPACT=1` to collapse it to one honest
-/// line (route · decision · est. served tokens); the full economics returns by
-/// unsetting the flag. (Plan 009a; a *default*-compact form is a follow-up that
-/// must update the honesty-surface assertions across the test corpus + schema.)
+/// The one-line COMPACT form is the DEFAULT: with no flag set, every live MCP
+/// call prepends a single honest line (route · decision · est. served tokens),
+/// keeping the load-bearing honesty while dropping the per-call economics noise.
+/// An operator who wants the full multi-line economics block back can set
+/// `SYMFORGE_STEL_FULL=1` (the on-request / contract form). That is the ONLY var
+/// that changes behavior here. `SYMFORGE_STEL_COMPACT` is now a no-op — compact is
+/// already the default, so the var is neither read nor required.
+///
+/// The compact one-liner body is UNCHANGED — it always keeps the route, the
+/// admission decision, and the `(est.)`-labeled served-token figure. This
+/// finishes the author-sanctioned default-compact follow-up: the honesty-surface
+/// assertions across the test corpus + schema were updated to force the full
+/// render where they verify the full contract, so no honesty assertion is lost.
 pub fn format_trust_envelope(input: &TrustEnvelopeInput) -> String {
-    format_trust_envelope_inner(input, stel_compact_envelope_enabled())
+    format_trust_envelope_inner(input, !stel_full_envelope_enabled())
 }
 
-/// Whether the operator opted into the one-line envelope via `SYMFORGE_STEL_COMPACT`.
-fn stel_compact_envelope_enabled() -> bool {
+/// Whether the operator opted into the full multi-line block.
+///
+/// Compact is now the default, so the gate is inverted: only an explicit
+/// `SYMFORGE_STEL_FULL=1|true|TRUE` (the on-request / contract form) restores the
+/// full economics block. `SYMFORGE_STEL_COMPACT` is a no-op (compact is already
+/// the default) and is intentionally not read here.
+fn stel_full_envelope_enabled() -> bool {
     matches!(
-        std::env::var("SYMFORGE_STEL_COMPACT").ok().as_deref(),
+        std::env::var("SYMFORGE_STEL_FULL").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
 }
@@ -130,10 +143,52 @@ fn format_trust_envelope_inner(input: &TrustEnvelopeInput, compact: bool) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    #[test]
-    fn envelope_matches_schema_example_shape() {
-        let text = format_trust_envelope(&TrustEnvelopeInput {
+    // Serializes the env-mutating public-entry tests so they are deterministic
+    // even without `--test-threads=1`. The pure `_inner`-based tests never touch
+    // process env and do not need it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Test-only RAII guard for `SYMFORGE_STEL_FULL`: set or unset on construction,
+    /// restore the prior value on drop. Mirrors the in-crate env-guard convention
+    /// (`cli::update::SymforgeHomeGuard`, the tools.rs `EnvVarGuard`). Callers hold
+    /// `ENV_LOCK` for the guard's lifetime so the env mutation is serialized.
+    struct StelFullEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl StelFullEnvGuard {
+        #[allow(unsafe_code)] // test-only env mutation, serialized under ENV_LOCK.
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("SYMFORGE_STEL_FULL");
+            // SAFETY: serialized under ENV_LOCK; no concurrent env readers.
+            unsafe { std::env::set_var("SYMFORGE_STEL_FULL", value) };
+            Self { previous }
+        }
+
+        #[allow(unsafe_code)] // test-only env mutation, serialized under ENV_LOCK.
+        fn unset() -> Self {
+            let previous = std::env::var_os("SYMFORGE_STEL_FULL");
+            // SAFETY: serialized under ENV_LOCK; no concurrent env readers.
+            unsafe { std::env::remove_var("SYMFORGE_STEL_FULL") };
+            Self { previous }
+        }
+    }
+
+    impl Drop for StelFullEnvGuard {
+        #[allow(unsafe_code)] // test-only env restore, serialized under ENV_LOCK.
+        fn drop(&mut self) {
+            // SAFETY: see `StelFullEnvGuard::set`.
+            match &self.previous {
+                Some(previous) => unsafe { std::env::set_var("SYMFORGE_STEL_FULL", previous) },
+                None => unsafe { std::env::remove_var("SYMFORGE_STEL_FULL") },
+            }
+        }
+    }
+
+    fn sample_input() -> TrustEnvelopeInput {
+        TrustEnvelopeInput {
             plan_summary: "trace → find_references (exact)".to_string(),
             decision: AdmissionDecision::Serve,
             response_tokens: 420,
@@ -143,9 +198,31 @@ mod tests {
             predicted_tokens: 400,
             predict_error_pct: 5.0,
             session_tokens_served: 1240,
-            calibration: "ok",
-            ledger_line: None,
-        });
+            calibration: "deferred",
+            ledger_line: Some("ledger: {}".to_string()),
+        }
+    }
+
+    #[test]
+    fn envelope_matches_schema_example_shape() {
+        // Asserts the FULL contract shape: route through the pure full path so the
+        // assertion is deterministic regardless of the (now compact) live default.
+        let text = format_trust_envelope_inner(
+            &TrustEnvelopeInput {
+                plan_summary: "trace → find_references (exact)".to_string(),
+                decision: AdmissionDecision::Serve,
+                response_tokens: 420,
+                est_net_vs_manual: 380,
+                schema_tokens: 45,
+                invoke_tokens: 80,
+                predicted_tokens: 400,
+                predict_error_pct: 5.0,
+                session_tokens_served: 1240,
+                calibration: "ok",
+                ledger_line: None,
+            },
+            false,
+        );
 
         assert!(text.starts_with("── stel ──\n"));
         assert!(text.contains("plan: trace → find_references (exact)"));
@@ -162,20 +239,24 @@ mod tests {
     #[test]
     fn reject_decision_never_prints_a_positive_saving() {
         // TR-11: a positive predicted net must not read as a saving on a reject,
-        // because SymForge did not deliver a serve result.
-        let text = format_trust_envelope(&TrustEnvelopeInput {
-            plan_summary: "trace → find_references (exact)".to_string(),
-            decision: AdmissionDecision::Reject,
-            response_tokens: 100,
-            est_net_vs_manual: 213,
-            schema_tokens: 45,
-            invoke_tokens: 80,
-            predicted_tokens: 400,
-            predict_error_pct: 0.0,
-            session_tokens_served: 213,
-            calibration: "deferred",
-            ledger_line: None,
-        });
+        // because SymForge did not deliver a serve result. Asserts the FULL block
+        // through the pure full path (deterministic vs the compact live default).
+        let text = format_trust_envelope_inner(
+            &TrustEnvelopeInput {
+                plan_summary: "trace → find_references (exact)".to_string(),
+                decision: AdmissionDecision::Reject,
+                response_tokens: 100,
+                est_net_vs_manual: 213,
+                schema_tokens: 45,
+                invoke_tokens: 80,
+                predicted_tokens: 400,
+                predict_error_pct: 0.0,
+                session_tokens_served: 213,
+                calibration: "deferred",
+                ledger_line: None,
+            },
+            false,
+        );
 
         assert!(text.contains("decision: reject"));
         assert!(text.contains("n/a (rejected) vs manual"));
@@ -221,5 +302,154 @@ mod tests {
             full.lines().count() > 1 && full.contains("session_tokens_served:"),
             "full form stays the multi-line block: {full}"
         );
+    }
+
+    #[test]
+    fn default_render_is_the_compact_one_liner() {
+        // Default-compact follow-up: with no env opt-in, the live default render
+        // is the single honest one-liner. Asserted through the pure compact path
+        // (`_inner(.., true)`) — this IS what `format_trust_envelope` returns when
+        // `SYMFORGE_STEL_FULL` is unset — so the assertion is deterministic and
+        // never touches process env.
+        let input = TrustEnvelopeInput {
+            plan_summary: "trace → find_references (exact)".to_string(),
+            decision: AdmissionDecision::Serve,
+            response_tokens: 420,
+            est_net_vs_manual: 380,
+            schema_tokens: 45,
+            invoke_tokens: 80,
+            predicted_tokens: 400,
+            predict_error_pct: 5.0,
+            session_tokens_served: 1240,
+            calibration: "deferred",
+            ledger_line: Some("ledger: {}".to_string()),
+        };
+        let default_render = format_trust_envelope_inner(&input, true);
+
+        assert_eq!(
+            default_render.lines().count(),
+            1,
+            "default render is a single line: {default_render}"
+        );
+        // Load-bearing honesty survives the default: the decision label and the
+        // `(est.)`-qualified served-token figure are present.
+        assert!(
+            default_render.contains("serve"),
+            "default render keeps the decision label: {default_render}"
+        );
+        assert!(
+            default_render.contains("(est.)"),
+            "default render keeps the est. served-token label: {default_render}"
+        );
+        // The per-call economics detail and any measured-savings phrasing are
+        // dropped — never a measured saving, never the gross session counter.
+        for forbidden in [
+            "session_tokens_served",
+            "predicted:",
+            " saved ",
+            "fewer vs manual",
+            "vs manual",
+        ] {
+            assert!(
+                !default_render.contains(forbidden),
+                "default render must drop `{forbidden}`: {default_render}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_entry_default_is_compact_full_is_opt_in() {
+        // Exercises the PUBLIC `format_trust_envelope` (not `_inner`), so it pins
+        // the shipped gate at envelope.rs: with `SYMFORGE_STEL_FULL` UNSET the live
+        // default render is the single compact line; with it set to `1` the full
+        // multi-line `── stel ──` economics block returns. Reverting the gate would
+        // fail this. Serialized under ENV_LOCK so it is deterministic even without
+        // `--test-threads=1`; the guards restore the prior env on drop.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let input = sample_input();
+
+        {
+            let _unset = StelFullEnvGuard::unset();
+            let default_render = format_trust_envelope(&input);
+            assert_eq!(
+                default_render.lines().count(),
+                1,
+                "unset SYMFORGE_STEL_FULL must yield the compact one-liner: {default_render}"
+            );
+            assert!(
+                default_render.contains("(est.)"),
+                "compact default keeps the est. served-token label: {default_render}"
+            );
+            assert!(
+                !default_render.contains("session_tokens_served:"),
+                "compact default drops the gross session counter: {default_render}"
+            );
+        }
+
+        {
+            let _full = StelFullEnvGuard::set("1");
+            let full_render = format_trust_envelope(&input);
+            assert!(
+                full_render.lines().count() > 1,
+                "SYMFORGE_STEL_FULL=1 must restore the multi-line block: {full_render}"
+            );
+            assert!(
+                full_render.starts_with("── stel ──\n"),
+                "full render is the `── stel ──` block: {full_render}"
+            );
+            assert!(
+                full_render.contains("session_tokens_served:"),
+                "full render carries the per-call economics: {full_render}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_entry_compact_flag_is_a_noop() {
+        // Documents that `SYMFORGE_STEL_COMPACT` is now a NO-OP: compact is already
+        // the default, the var is never read, so setting it alone (with
+        // SYMFORGE_STEL_FULL unset) still yields the compact one-liner. Only
+        // SYMFORGE_STEL_FULL changes behavior.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _unset_full = StelFullEnvGuard::unset();
+        let compact_guard = CompactEnvGuard::set("1");
+        let render = format_trust_envelope(&sample_input());
+        drop(compact_guard);
+        assert_eq!(
+            render.lines().count(),
+            1,
+            "SYMFORGE_STEL_COMPACT alone is a no-op; compact stays the default: {render}"
+        );
+    }
+
+    /// Test-only RAII guard for the (no-op) `SYMFORGE_STEL_COMPACT` var, used only
+    /// to prove it does not change behavior. Serialized under ENV_LOCK by callers.
+    struct CompactEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl CompactEnvGuard {
+        #[allow(unsafe_code)] // test-only env mutation, serialized under ENV_LOCK.
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("SYMFORGE_STEL_COMPACT");
+            // SAFETY: serialized under ENV_LOCK; no concurrent env readers.
+            unsafe { std::env::set_var("SYMFORGE_STEL_COMPACT", value) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for CompactEnvGuard {
+        #[allow(unsafe_code)] // test-only env restore, serialized under ENV_LOCK.
+        fn drop(&mut self) {
+            // SAFETY: see `CompactEnvGuard::set`.
+            match &self.previous {
+                Some(previous) => unsafe { std::env::set_var("SYMFORGE_STEL_COMPACT", previous) },
+                None => unsafe { std::env::remove_var("SYMFORGE_STEL_COMPACT") },
+            }
+        }
     }
 }

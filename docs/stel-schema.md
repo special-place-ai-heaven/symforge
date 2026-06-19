@@ -448,6 +448,21 @@ Every execution **must** populate `totals` for ledger; bypass/cache use zero L3 
 
 Prepended to every `symforge` and `symforge_edit` body (text or structured). Parsed by hosts; displayed to LLM.
 
+**Default is the COMPACT one-liner.** With no env opt-in, every live MCP call
+prepends a single honest line — route, admission decision, and the `(est.)`
+served-token figure — to keep per-call context noise minimal:
+
+```text
+── stel · trace → find_references (exact) · serve · ~420 tok served (est.) ──
+```
+
+Set `SYMFORGE_STEL_FULL=1` to restore the full multi-line economics block (the
+on-request / contract form below). That is the only variable that changes this
+behavior. `SYMFORGE_STEL_COMPACT` is now a no-op — compact is already the
+default, so the variable is neither read nor required. The full block stays the
+normative contract surface (it is what the golden-replay validators and the
+honesty regression assert):
+
 ```text
 ── stel ──
 plan: trace → find_references (exact)
@@ -459,7 +474,10 @@ calibration: deferred
 ──
 ```
 
-All token figures are estimates, never measured: `served`/`predicted` are
+The compact one-liner carries the SAME honesty load it always has: the served
+figure stays `(est.)`-qualified and no measured-saving claim appears; it simply
+drops the per-call economics detail. All token figures are estimates, never
+measured: `served`/`predicted` are
 `chars/4` approximations; the "fewer vs manual" figure is a heuristic
 prediction from the planner `400/800` constants (010 honesty contract,
 FR-001). `session_tokens_served` is a monotonic gross running total of tokens

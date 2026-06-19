@@ -140,6 +140,40 @@ mod tests {
     use super::*;
     use crate::stel::types::IntentBucket;
 
+    /// Test-only RAII guard forcing the FULL trust envelope.
+    ///
+    /// The live envelope is COMPACT by default; this unit verifies that the L2
+    /// decision and economics (schema/invoke tokens) flow into the FULL block, so
+    /// it opts back into full via `SYMFORGE_STEL_FULL`. Restored on drop. Matches
+    /// the in-crate env-guard convention (`cli::update::SymforgeHomeGuard`): the
+    /// lib test suite runs `--test-threads=1` and this is the only test that sets
+    /// the variable, so there is no concurrent env access.
+    struct StelFullEnvelopeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl StelFullEnvelopeGuard {
+        #[allow(unsafe_code)] // test-only env mutation under --test-threads=1.
+        fn set() -> Self {
+            let prev = std::env::var_os("SYMFORGE_STEL_FULL");
+            // SAFETY: the lib test suite runs single-threaded and this is the sole
+            // setter of SYMFORGE_STEL_FULL, so no other thread reads/writes env.
+            unsafe { std::env::set_var("SYMFORGE_STEL_FULL", "1") };
+            Self { prev }
+        }
+    }
+
+    impl Drop for StelFullEnvelopeGuard {
+        #[allow(unsafe_code)] // test-only env restore under --test-threads=1.
+        fn drop(&mut self) {
+            // SAFETY: see `StelFullEnvelopeGuard::set`.
+            match &self.prev {
+                Some(prev) => unsafe { std::env::set_var("SYMFORGE_STEL_FULL", prev) },
+                None => unsafe { std::env::remove_var("SYMFORGE_STEL_FULL") },
+            }
+        }
+    }
+
     #[test]
     fn prepend_envelope_places_header_before_body() {
         let envelope = "── stel ──\nplan: auto → ask (inferred)\n──";
@@ -170,6 +204,10 @@ mod tests {
     fn envelope_reflects_l2_decision_and_economics() {
         use crate::stel::controller::{COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS};
         use crate::stel::planner::build_plan;
+        // Verifies the FULL block carries the L2 decision + economics; force full
+        // because the live default is now the compact one-liner (which has no
+        // `decision:`/`schema`/`invoke` fields).
+        let _full = StelFullEnvelopeGuard::set();
         let request = StelRequest {
             query: "who references cfg_if".to_string(),
             ..Default::default()

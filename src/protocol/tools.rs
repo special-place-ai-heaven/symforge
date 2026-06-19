@@ -23356,6 +23356,11 @@ mod tests {
         let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
         let file_path = dir.path().join("src/lib.rs");
         let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+        // The live trust envelope is COMPACT by default (no `ledger:` line); this
+        // test legitimately needs the FULL block to parse the ledger metadata and
+        // assert `!legacy_executed`, so force full for its duration. The lib test
+        // suite runs `--test-threads=1` and `EnvVarGuard` restores on drop.
+        let _full = EnvVarGuard::set("SYMFORGE_STEL_FULL", "1");
 
         // A concurrent writer lands inside the guarded window: overwrite the
         // file with a third, divergent body. Captured path keeps the closure

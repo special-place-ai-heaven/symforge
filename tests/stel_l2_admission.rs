@@ -178,6 +178,9 @@ async fn cache_hit_dispatch_skips_legacy_tools_after_session_prefetch() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L2 admission asserts `decision:` lines that
+    // appear only in the full block (the compact one-liner has no `decision:`).
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "l2-cache-hit");
     let request = StelRequest {
@@ -221,6 +224,9 @@ async fn grounded_predictions_differ_by_real_file_size_end_to_end() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L2 admission asserts `decision:` lines that
+    // appear only in the full block (the compact one-liner has no `decision:`).
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let small_server = server_for_corpus(small_corpus, "ground-small");
     let large_server = server_for_corpus(large_corpus, "ground-large");
@@ -284,6 +290,9 @@ async fn grounded_small_file_reaches_bypass_end_to_end() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L2 admission asserts `decision:` lines that
+    // appear only in the full block (the compact one-liner has no `decision:`).
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let server = server_for_corpus(small_corpus, "ground-bypass");
     let output = dispatch_symforge(

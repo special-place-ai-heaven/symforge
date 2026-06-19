@@ -110,6 +110,9 @@ async fn symforge_edit_rejects_non_compact_surface() {
 async fn symforge_edit_rejects_unsafe_path() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-unsafe-path");
@@ -133,6 +136,9 @@ async fn symforge_edit_rejects_unsafe_path() {
 async fn symforge_edit_rejects_missing_symbol_and_body() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let (dir, _) = temp_rust_repo("fn foo() {}\n");
     let server = server_for_repo(dir.path(), "edit-missing-fields");
@@ -154,6 +160,9 @@ async fn symforge_edit_rejects_missing_symbol_and_body() {
 async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writes() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -191,6 +200,9 @@ async fn symforge_edit_preview_includes_envelope_ledger_and_dry_run_without_writ
 async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -218,6 +230,9 @@ async fn symforge_edit_explicit_apply_false_matches_preview_no_write() {
 async fn symforge_edit_rejects_missing_symbol_on_apply() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // No FULL-envelope opt-in here: this is a pre-apply reject that emits NO
+    // trust envelope at all (asserted below via `!output.contains("── stel ──")`),
+    // so the envelope render mode is irrelevant to what this test checks.
 
     let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -250,6 +265,9 @@ async fn symforge_edit_rejects_missing_symbol_on_apply() {
 async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -280,6 +298,9 @@ async fn symforge_edit_rejects_if_match_mismatch_on_apply() {
 async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { same }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -313,6 +334,9 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
 async fn symforge_edit_preview_then_apply_writes_once() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -370,6 +394,9 @@ async fn symforge_edit_preview_then_apply_writes_once() {
 async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn foo() { old }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -400,6 +427,9 @@ async fn symforge_edit_apply_idempotency_key_replays_without_double_write() {
 async fn symforge_edit_rejects_absolute_and_scheme_paths() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let (dir, file_path) = temp_rust_repo("fn foo() {}\n");
     let before = std::fs::read(&file_path).expect("read file");
@@ -439,6 +469,9 @@ async fn symforge_edit_rejects_absolute_and_scheme_paths() {
 async fn symforge_edit_insert_after_preview_then_apply_adds_new_symbol() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "fn anchor() { 1 }\n";
     let (dir, file_path) = temp_rust_repo(original);
@@ -496,6 +529,9 @@ async fn symforge_edit_insert_after_preview_then_apply_adds_new_symbol() {
 async fn symforge_edit_edit_within_amends_import_inside_module() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     // A file-level `use` is NOT an indexed symbol in Rust, but a `use` inside a
     // `mod` block IS reachable via edit_within scoped to the enclosing module.
@@ -538,6 +574,9 @@ async fn symforge_edit_completes_full_refactor_through_facade_only() {
     // committing, with NO native file-tool fallback.
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "\
 mod imports {
@@ -632,6 +671,9 @@ fn anchor() { 1 }
 async fn symforge_edit_failed_guarded_apply_is_not_classified_as_found() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: these apply/preview tests assert the
+    // `── stel ──` header and parse the `ledger:` line, both full-block only.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let original = "# foo\n\nOld section body.\n";
     let (dir, file_path) = temp_markdown_repo(original);
