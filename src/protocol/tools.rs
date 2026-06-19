@@ -877,10 +877,17 @@ fn context_bundle_completeness_label(
 }
 
 fn search_completeness_label(overflow_count: usize, suppressed_by_noise: usize) -> String {
+    // Honesty (trust): the index is built by a discovery walk with the `ignore`
+    // crate default `.hidden(true)`, so hidden / dotdir paths (`.github/`,
+    // `.gitlab-ci.yml`, …) are NOT indexed and never appear in results. A bare
+    // "full" claim would mislead an agent into trusting the file count as
+    // exhaustive (the dogfood report: `search_text` silently omitted
+    // `.github/workflows/release-please.yml` that ripgrep found). Qualify the
+    // claim so the agent knows to use a raw grep for hidden paths.
     let mut parts = vec![if overflow_count > 0 {
         format!("truncated by result cap ({overflow_count} more omitted)")
     } else {
-        "full for current scope".to_string()
+        "full for indexed scope (hidden/dotdir paths not indexed — grep those)".to_string()
     }];
     if suppressed_by_noise > 0 {
         if suppressed_by_noise > search::SUPPRESSED_TEXT_MATCH_DISPLAY_CAP {
@@ -6230,7 +6237,7 @@ impl SymForgeServer {
             // is always valid and is offered on every surface.
             let attach = match crate::protocol::surface_probe::surface_profile_from_env() {
                 crate::protocol::surface_probe::SurfaceProfile::Compact => {
-                    "re-launch SymForge from your project root"
+                    "set SYMFORGE_WORKSPACE_ROOT (or run `symforge init`) and reconnect"
                 }
                 crate::protocol::surface_probe::SurfaceProfile::Full
                 | crate::protocol::surface_probe::SurfaceProfile::Meta => {
@@ -6947,6 +6954,45 @@ impl SymForgeServer {
                 } else {
                     format::find_references_result_view(&view, &input.name, &limits)
                 };
+
+                // Honest disclosure (trust contract): a bare repo-wide name match
+                // resolves references by NAME only and silently merges references
+                // to DIFFERENT same-named definitions (e.g. a trait method and an
+                // unrelated inherent method both named `update_status`). When more
+                // than one definition shares the name, say so and tell the caller
+                // how to disambiguate, rather than presenting a conflated list as
+                // if it were precise. Skipped when `path` is set (the def-scoped
+                // resolution already pins the definition) or no refs were found.
+                if input.path.is_none() && !view.files.is_empty() {
+                    // ponytail: linear all-files scan for same-named defs; only
+                    // fires on the no-path branch that already returned hits, so
+                    // it is bounded. A reverse symbol-name index would make it
+                    // O(1) if this ever shows on a hot path.
+                    let def_paths = {
+                        let guard = self.index.read();
+                        symbol_candidate_paths(&guard, &input.name)
+                    };
+                    if def_paths.len() > 1 {
+                        let preview: Vec<&str> =
+                            def_paths.iter().take(5).map(String::as_str).collect();
+                        let suffix = if def_paths.len() > preview.len() {
+                            format!(", … (+{} more)", def_paths.len() - preview.len())
+                        } else {
+                            String::new()
+                        };
+                        output = format!(
+                            "Note: {} definitions named \"{}\" exist across the repo ({}{}). \
+                             These references are matched by name and MAY MIX usages of different \
+                             same-named definitions. Pass `path` (and `symbol_line` if needed) to \
+                             scope references to one definition.\n\n{}",
+                            def_paths.len(),
+                            input.name,
+                            preview.join(", "),
+                            suffix,
+                            output
+                        );
+                    }
+                }
 
                 // Supplemental: if index-based refs are empty, try text search to catch
                 // qualified-path calls (e.g., module::func()) that the xref extractor misses.
@@ -8362,6 +8408,15 @@ impl SymForgeServer {
                 .into_call_tool_result("query requires a non-empty question."));
         }
 
+        // Facade contract: a prose `symbol` would be passed verbatim as a tool
+        // `name` and yield a misleading "Symbol not found: <sentence>". Reject it
+        // here with a corrective message so the agent self-corrects.
+        if let Some(message) = crate::stel::planner::symbol_contract_violation(request) {
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(&message)
+            );
+        }
+
         let mut plan = build_plan(request);
         // US5 (010 FR-014, D2): ground the plan's economics in the real target
         // byte sizes from the index before the L2 gate runs, so `predicted_net`
@@ -8581,7 +8636,7 @@ impl SymForgeServer {
 
     #[tool(
         name = "symforge_edit",
-        description = "STEL structural edit facade — symbol-aware edits with economics gate; preview by default, apply:true commits.",
+        description = "STEL structural edit facade — replace a whole symbol's source by name. `body` is the FULL item source (signature + body, not just the inner block); pass it flush-left — the tool re-columns it to the symbol's indentation, so an already-indented body is not doubled. Leading doc-comments/attributes outside the symbol range are preserved unless `body` itself begins with a doc-comment. Preview by default; apply:true commits; if_match guards against a concurrent edit.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -19594,6 +19649,82 @@ mod tests {
             }))
             .await;
         assert_eq!(result, crate::protocol::format::empty_guard_message());
+    }
+
+    #[tokio::test]
+    async fn test_find_references_discloses_multiple_same_named_definitions() {
+        // BUG 3 (trust): a bare repo-wide name match silently merges references
+        // to DIFFERENT same-named definitions. When N>1 definitions share the
+        // name, the output must disclose this and tell the caller to scope by
+        // path, instead of presenting a conflated list as precise.
+        let def_a = make_symbol("update_status", SymbolKind::Function, 1, 1);
+        let def_b = make_symbol("update_status", SymbolKind::Function, 1, 1);
+        let caller_a = make_symbol("caller_a", SymbolKind::Function, 2, 2);
+        let file_a = make_file_with_refs(
+            "src/store_a.rs",
+            b"fn update_status() {}\nfn caller_a() { update_status(); }\n",
+            vec![def_a, caller_a],
+            vec![make_ref(
+                "update_status",
+                None,
+                ReferenceKind::Call,
+                1,
+                Some(1),
+            )],
+        );
+        let caller_b = make_symbol("caller_b", SymbolKind::Function, 2, 2);
+        let file_b = make_file_with_refs(
+            "src/store_b.rs",
+            b"fn update_status() {}\nfn caller_b() { update_status(); }\n",
+            vec![def_b, caller_b],
+            vec![make_ref(
+                "update_status",
+                None,
+                ReferenceKind::Call,
+                1,
+                Some(1),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file_a, file_b]));
+        let result = server
+            .find_references(Parameters(find_references_input("update_status")))
+            .await;
+        assert!(
+            result.contains("2 definitions named \"update_status\""),
+            "must disclose multiple same-named definitions; got: {result}"
+        );
+        assert!(
+            result.contains("MAY MIX") && result.contains("Pass `path`"),
+            "disclosure must warn of mixing and point to path scoping; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_no_disclosure_for_unique_definition() {
+        // The disclosure must NOT fire when only one definition has the name —
+        // the bare-name result is precise enough and the note would be noise.
+        let def = make_symbol("solitary_fn", SymbolKind::Function, 1, 1);
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/only.rs",
+            b"fn solitary_fn() {}\nfn caller() { solitary_fn(); }\n",
+            vec![def, caller],
+            vec![make_ref(
+                "solitary_fn",
+                None,
+                ReferenceKind::Call,
+                1,
+                Some(1),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let result = server
+            .find_references(Parameters(find_references_input("solitary_fn")))
+            .await;
+        assert!(
+            !result.contains("definitions named"),
+            "single definition must not trigger the disclosure; got: {result}"
+        );
     }
 
     #[tokio::test]

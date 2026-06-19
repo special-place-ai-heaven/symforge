@@ -549,22 +549,178 @@ fn workspace_root_env_override() -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
-    let candidate = PathBuf::from(trimmed);
+    validate_workspace_candidate(Path::new(trimmed), WORKSPACE_ROOT_ENV)
+}
+
+/// Validate a workspace-root candidate through the SAME guard chain used by
+/// `SYMFORGE_WORKSPACE_ROOT` and CWD discovery: it must be an existing directory
+/// that passes [`is_forbidden_root`]. Returns `Some(path)` only when both hold;
+/// any failure logs (tagged with `source` for diagnosis) and returns `None`.
+///
+/// This is the single shared gate so that no workspace-resolution path — env
+/// override, MCP client roots, or CWD walk — can ever widen the trust boundary.
+fn validate_workspace_candidate(candidate: &Path, source: &str) -> Option<PathBuf> {
     if !candidate.is_dir() {
         tracing::warn!(
             path = %candidate.display(),
-            "ignoring {WORKSPACE_ROOT_ENV}: not an existing directory"
+            "ignoring {source}: not an existing directory"
         );
         return None;
     }
-    if is_forbidden_root(&candidate) {
+    if is_forbidden_root(candidate) {
         tracing::warn!(
             path = %candidate.display(),
-            "ignoring {WORKSPACE_ROOT_ENV}: directory is too broad (home dir, drive root, or system path)"
+            "ignoring {source}: directory is too broad (home dir, drive root, or system path)"
         );
         return None;
     }
-    Some(candidate)
+    Some(candidate.to_path_buf())
+}
+
+/// Decode `%XX` percent-escapes in a URI path segment back to raw bytes, then
+/// interpret the result as UTF-8. Returns `None` only when an escape is
+/// malformed; un-escaped input passes through unchanged. Kept dependency-free
+/// so it compiles in the engine-only `embed` build (where `url`/`reqwest` are
+/// absent).
+fn percent_decode_path(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied()?;
+            let lo = bytes.get(i + 2).copied()?;
+            let decode = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            out.push(decode(hi)? << 4 | decode(lo)?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Convert an MCP `roots/list` URI into a filesystem path.
+///
+/// MCP roots arrive as `file://` URIs (per spec) but lenient clients may send a
+/// bare path. Returns `None` for empty input or a non-`file` scheme (e.g. an
+/// `http://` root we cannot index locally). Parsing is dependency-free so it
+/// compiles in the engine-only `embed` build (no `url`/`reqwest`): the `file://`
+/// authority and a leading slash before a Windows drive letter
+/// (`file:///C:/proj`) are stripped, and `%XX` escapes are decoded. A raw
+/// (non-URI) path is accepted verbatim for lenient clients.
+pub fn parse_root_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Non-`file` scheme (http/https/...) is not a local path. Detect a generic
+    // `scheme://` prefix; only `file` proceeds.
+    if let Some(scheme_end) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_end];
+        if !scheme.eq_ignore_ascii_case("file") {
+            // A scheme that is not `file` cannot be a local workspace root.
+            // Reject rather than guess.
+            if scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+            {
+                return None;
+            }
+        }
+    }
+
+    // Strip a `file://<authority>` prefix if present. The authority is empty for
+    // the common `file:///path` form; a non-empty authority (`file://host/path`)
+    // is treated as a UNC-style or remote host we cannot index, so it is dropped
+    // to the path component only when the authority is `localhost`/empty.
+    let rest = if let Some(after) = trimmed.strip_prefix("file://") {
+        // `after` is `<authority><path>`; the path begins at the first `/`.
+        match after.find('/') {
+            Some(idx) => {
+                let authority = &after[..idx];
+                if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                    &after[idx..]
+                } else {
+                    // Remote/UNC host — not a local workspace root.
+                    return None;
+                }
+            }
+            // `file://something` with no path — nothing usable.
+            None => return None,
+        }
+    } else {
+        trimmed
+    };
+
+    let decoded = percent_decode_path(rest)?;
+
+    // Windows drive form: `/C:/proj` -> `C:/proj`. A leading slash before a
+    // `<letter>:` drive is the URI artifact, not part of the path.
+    let cleaned = {
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            decoded[1..].to_string()
+        } else {
+            decoded
+        }
+    };
+
+    Some(PathBuf::from(cleaned))
+}
+
+/// Resolve the workspace root from the three resolution sources in strict
+/// precedence order, independent of process global state so it is unit-testable:
+///
+/// 1. `env_root` — the validated [`WORKSPACE_ROOT_ENV`] override (explicit operator intent).
+/// 2. `root_uris` — MCP client-declared roots, in client order (the open workspace folder).
+/// 3. `cwd_root` — the launch-CWD walk result from [`find_project_root`] (last resort).
+///
+/// Each MCP root URI is parsed via [`parse_root_uri`] and validated through the
+/// SAME [`validate_workspace_candidate`] guard as the env override, so a client
+/// cannot push a forbidden root (home dir, drive root, system path) past the
+/// trust boundary. The first source that yields a usable directory wins; a
+/// forbidden or unparseable client root is skipped, not fatal.
+///
+/// `env_root` and `cwd_root` are passed pre-resolved (the caller owns reading
+/// `WORKSPACE_ROOT_ENV` and walking the CWD) so this function performs no I/O
+/// beyond validating the candidate directories, keeping the precedence logic
+/// pure and testable with a temp-dir fixture.
+pub fn resolve_workspace_root(
+    env_root: Option<PathBuf>,
+    root_uris: &[String],
+    cwd_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // 1. Explicit env override wins outright (already validated by its caller).
+    if let Some(root) = env_root {
+        return Some(root);
+    }
+
+    // 2. MCP client roots, in order; first valid directory wins.
+    for uri in root_uris {
+        let Some(candidate) = parse_root_uri(uri) else {
+            continue;
+        };
+        if let Some(root) = validate_workspace_candidate(&candidate, "MCP client root") {
+            return Some(root);
+        }
+    }
+
+    // 3. Launch-CWD walk (already validated by find_project_root).
+    cwd_root
 }
 
 /// Returns `true` if `path` is a directory that should never be auto-indexed
@@ -2147,6 +2303,152 @@ mod tests {
             assert!(
                 workspace_root_env_override().is_none(),
                 "the forbidden home dir must be rejected by the shared trust-boundary guard"
+            );
+        }
+    }
+
+    // ── MCP-roots workspace resolution: pure precedence + URI parsing ──
+    //
+    // These exercise `resolve_workspace_root`/`parse_root_uri` with explicit
+    // arguments (no process global state), so they need neither the env lock
+    // nor a real launch CWD. The keystone case — no usable CWD and no env, a
+    // client root resolving the workspace — is asserted directly.
+    mod roots_workspace_resolution {
+        use super::*;
+
+        /// Build a `file://` URI for a real path in the host-native form so the
+        /// assertion holds on both Windows (`file:///C:/...`) and Unix
+        /// (`file:///home/...`). Percent-encoding is not applied; a dedicated
+        /// test covers decode.
+        fn file_uri(path: &std::path::Path) -> String {
+            let s = path.display().to_string().replace('\\', "/");
+            if s.starts_with('/') {
+                format!("file://{s}")
+            } else {
+                // Windows drive path: `C:/proj` -> `file:///C:/proj`.
+                format!("file:///{s}")
+            }
+        }
+
+        #[test]
+        fn client_root_wins_over_forbidden_cwd_and_no_env() {
+            // The keystone: launch CWD is the forbidden home dir (so the CWD
+            // walk yields None via find_project_root), no env override, and the
+            // MCP client declares its open workspace folder. The client root
+            // MUST resolve the workspace.
+            let workspace = TempDir::new().unwrap();
+            let uri = file_uri(workspace.path());
+
+            // `cwd_root` is None exactly as `find_project_root` returns for a
+            // forbidden home/system CWD — the bug condition.
+            let resolved = resolve_workspace_root(None, std::slice::from_ref(&uri), None)
+                .expect("a valid client root must resolve the workspace with no env and no CWD");
+            let resolved = resolved.canonicalize().unwrap_or(resolved);
+            let expected = workspace.path().canonicalize().unwrap();
+            assert_eq!(
+                resolved, expected,
+                "client root must drive workspace resolution when CWD is unusable"
+            );
+        }
+
+        #[test]
+        fn env_override_beats_client_roots() {
+            // Precedence rule 1: an explicit (already-validated) env root wins
+            // over any client root, even a valid one.
+            let env_ws = TempDir::new().unwrap();
+            let client_ws = TempDir::new().unwrap();
+            let client_uri = file_uri(client_ws.path());
+
+            let resolved = resolve_workspace_root(
+                Some(env_ws.path().to_path_buf()),
+                std::slice::from_ref(&client_uri),
+                None,
+            )
+            .expect("env override must resolve");
+            assert_eq!(
+                resolved,
+                env_ws.path().to_path_buf(),
+                "SYMFORGE_WORKSPACE_ROOT must take precedence over client roots"
+            );
+        }
+
+        #[test]
+        fn cwd_used_only_when_env_and_roots_absent() {
+            // Precedence rule 3: with no env and no usable client roots, fall
+            // back to the (already-validated) CWD walk result.
+            let cwd_ws = TempDir::new().unwrap();
+            let resolved = resolve_workspace_root(None, &[], Some(cwd_ws.path().to_path_buf()))
+                .expect("CWD fallback must resolve");
+            assert_eq!(resolved, cwd_ws.path().to_path_buf());
+        }
+
+        #[test]
+        fn forbidden_client_root_is_skipped_not_fatal() {
+            // A forbidden client root (home dir) must be skipped; a later valid
+            // root in the same list still wins. Trust boundary holds: a client
+            // cannot push a forbidden root past the guard.
+            let Some(home) = home_dir() else {
+                return; // no home dir in this environment
+            };
+            let valid = TempDir::new().unwrap();
+            let roots = vec![file_uri(&home), file_uri(valid.path())];
+
+            let resolved = resolve_workspace_root(None, &roots, None)
+                .expect("a valid later root must resolve after a forbidden one is skipped");
+            let resolved = resolved.canonicalize().unwrap_or(resolved);
+            let expected = valid.path().canonicalize().unwrap();
+            assert_eq!(resolved, expected);
+        }
+
+        #[test]
+        fn all_forbidden_roots_yield_none_when_no_other_source() {
+            let Some(home) = home_dir() else {
+                return;
+            };
+            let roots = vec![file_uri(&home)];
+            assert!(
+                resolve_workspace_root(None, &roots, None).is_none(),
+                "no env, all-forbidden roots, no CWD -> no workspace (must not widen trust)"
+            );
+        }
+
+        #[test]
+        fn parse_root_uri_handles_file_scheme_and_raw_path() {
+            let ws = TempDir::new().unwrap();
+            let native = ws.path().to_path_buf();
+
+            // file:// form round-trips to the same directory.
+            let from_uri = parse_root_uri(&file_uri(ws.path())).expect("file:// URI must parse");
+            assert_eq!(
+                from_uri.canonicalize().unwrap(),
+                native.canonicalize().unwrap()
+            );
+
+            // Raw (non-URI) path passes through verbatim for lenient clients.
+            let raw = native.display().to_string();
+            assert_eq!(parse_root_uri(&raw), Some(native.clone()));
+
+            // Empty / whitespace -> None.
+            assert_eq!(parse_root_uri("   "), None);
+        }
+
+        #[test]
+        fn parse_root_uri_rejects_non_file_scheme() {
+            assert_eq!(parse_root_uri("http://example.com/repo"), None);
+            assert_eq!(parse_root_uri("https://example.com/repo"), None);
+        }
+
+        #[test]
+        fn parse_root_uri_percent_decodes() {
+            // `file:///tmp/a%20b` -> `/tmp/a b`. Use a Unix-style path literal so
+            // the decode is asserted independent of the host filesystem.
+            let decoded = parse_root_uri("file:///tmp/a%20b/c%2Bd").expect("must parse");
+            // On Windows the leading-slash-before-drive rule does not apply here
+            // (no drive letter), so the path keeps its leading slash.
+            assert_eq!(
+                decoded.to_string_lossy().replace('\\', "/"),
+                "/tmp/a b/c+d",
+                "percent escapes must decode to literal bytes"
             );
         }
     }

@@ -783,6 +783,110 @@ impl SymForgeServer {
         }
     }
 
+    /// Bind the workspace from MCP client-declared roots when nothing else did.
+    ///
+    /// Called from [`ServerHandler::on_initialized`] after the client sends
+    /// `notifications/initialized`, this queries the client's `roots/list` and
+    /// resolves a workspace root with strict precedence:
+    /// `SYMFORGE_WORKSPACE_ROOT` > client roots > launch-CWD walk
+    /// ([`crate::discovery::resolve_workspace_root`]).
+    ///
+    /// Precedence is honored against the *already-bound* server state rather
+    /// than re-deciding it: startup resolved the env override and the CWD walk
+    /// before the transport came up, so if either bound a root the index is
+    /// already loading and this is a deliberate no-op (guarded by
+    /// `capture_repo_root().is_some()`). Client roots therefore fill ONLY the
+    /// gap the keystone bug leaves — a launcher (Cursor from a home CWD) where
+    /// neither env nor CWD resolved a workspace and the server came up bound to
+    /// nothing (`repo_root: None`, empty index). In that case the resolved root
+    /// drives the existing [`Self::index_folder`] path, which loads the local
+    /// in-process index (and, in a daemon-proxy server, would proxy the rebind);
+    /// daemon-proxy servers are always already bound, so this never reaches them.
+    ///
+    /// Failures are logged and swallowed: a client that declares no roots, an
+    /// unreachable `roots/list`, or a forbidden root must never break the
+    /// session — the server simply stays in its existing (empty) state, exactly
+    /// as before this hook existed.
+    async fn bind_workspace_from_client_roots(&self, peer: &rmcp::Peer<RoleServer>) {
+        // Only act when startup bound nothing. If env or the CWD walk already
+        // resolved a workspace, that decision wins (precedence) and we must not
+        // disturb the loaded index.
+        if self.capture_repo_root().is_some() {
+            return;
+        }
+
+        // Spec correctness: only issue `roots/list` when the client actually
+        // declared the `roots` capability at `initialize`. A client that did not
+        // advertise roots (capabilities `{}`) has no obligation to answer a
+        // `roots/list` request and may never reply, which would hang this hook
+        // (and the session) indefinitely. `peer_info()` is the client's stored
+        // `InitializeRequestParams`; absent or roots-less capabilities => skip.
+        let declares_roots = peer
+            .peer_info()
+            .map(|info| info.capabilities.roots.is_some())
+            .unwrap_or(false);
+        if !declares_roots {
+            tracing::debug!("client did not declare the roots capability; workspace stays unbound");
+            return;
+        }
+
+        // Defense in depth: even a roots-declaring client could stall. Bound the
+        // request so a non-answering peer cannot hang the session — on timeout we
+        // simply leave the workspace unbound, identical to the no-roots path.
+        let roots = match tokio::time::timeout(std::time::Duration::from_secs(5), peer.list_roots())
+            .await
+        {
+            Ok(Ok(result)) => result.roots,
+            Ok(Err(error)) => {
+                // Client declined / transport error. Stay unbound (pre-hook behavior).
+                tracing::debug!(%error, "client roots/list failed; workspace stays unbound");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "client roots/list did not respond within 5s; workspace stays unbound"
+                );
+                return;
+            }
+        };
+
+        if roots.is_empty() {
+            tracing::debug!("client declared no roots; workspace stays unbound");
+            return;
+        }
+
+        let root_uris: Vec<String> = roots.into_iter().map(|root| root.uri).collect();
+
+        // env is None here: a present env override would already have bound the
+        // root at startup (handled by the early return above), so passing None
+        // cannot let a client root jump ahead of the env override.
+        let Some(resolved) = crate::discovery::resolve_workspace_root(None, &root_uris, None)
+        else {
+            tracing::info!(
+                roots = ?root_uris,
+                "no usable workspace among client roots (forbidden/unparseable); staying unbound"
+            );
+            return;
+        };
+
+        tracing::info!(
+            root = %resolved.display(),
+            "binding workspace from MCP client roots (no env/CWD root at startup)"
+        );
+
+        // Drive the existing index path. `index_folder` handles both the local
+        // in-process reload (this server) and, in a daemon-proxy server, the
+        // proxied session rebind — so no new index plumbing is introduced.
+        let input = crate::protocol::tools::IndexFolderInput {
+            path: resolved.display().to_string(),
+            idempotency_key: None,
+        };
+        let result = self
+            .index_folder(rmcp::handler::server::wrapper::Parameters(input))
+            .await;
+        tracing::info!(outcome = %result, "workspace bind from client roots complete");
+    }
+
     /// Test-only dispatcher that routes a tool call by name and JSON payload.
     ///
     /// Mirrors the tool-name match in `daemon::execute_tool_call`, but takes
@@ -1008,6 +1112,23 @@ impl ServerHandler for SymForgeServer {
             meta: None,
             next_cursor: None,
         })
+    }
+
+    /// React to the client's `notifications/initialized`.
+    ///
+    /// After the handshake completes, the client's MCP `roots` capability (the
+    /// open workspace folder it declared) becomes queryable via `roots/list`.
+    /// We use it to bind the workspace when the launch CWD and
+    /// `SYMFORGE_WORKSPACE_ROOT` resolved nothing at startup — the keystone
+    /// "index won't load" case for home-CWD launchers (Cursor). Precedence
+    /// (`SYMFORGE_WORKSPACE_ROOT` > client roots > launch-CWD walk) is enforced
+    /// inside [`Self::bind_workspace_from_client_roots`], which is a deliberate
+    /// no-op whenever startup already bound a root. Shared by both transports
+    /// because stdio and the HTTP `/mcp` serve path dispatch through the same
+    /// `ServerHandler`.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        tracing::info!("client initialized");
+        self.bind_workspace_from_client_roots(&context.peer).await;
     }
 }
 

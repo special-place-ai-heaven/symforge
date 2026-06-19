@@ -276,8 +276,9 @@ pub(crate) enum EditError {
 fn session_stale_recovery() -> String {
     match crate::protocol::surface_probe::surface_profile_from_env() {
         crate::protocol::surface_probe::SurfaceProfile::Compact => {
-            "re-launch SymForge from your project root to refresh repo_root, or set \
-             SYMFORGE_SURFACE=full for the full tool surface"
+            "set SYMFORGE_WORKSPACE_ROOT to the project path (or run `symforge init` for \
+             this harness) and reconnect to refresh repo_root, or set SYMFORGE_SURFACE=full \
+             for the full tool surface"
                 .to_string()
         }
         crate::protocol::surface_probe::SurfaceProfile::Full

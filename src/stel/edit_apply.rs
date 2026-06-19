@@ -77,21 +77,34 @@ pub fn run_pre_apply_gates(
 
     let resolved = resolve_symbol_in_file(&file, path, name)?;
 
-    if let Some(if_match) = request.if_match.as_deref()
-        && if_match != resolved.current_body
-    {
-        return Err(EditValidationError::new(
-            "if_match does not match current symbol body",
-        ));
-    }
+    // The `if_match` value guard and the body-equality "already applied"
+    // short-circuit are REPLACE-specific: they compare against the resolved
+    // symbol's current body, which is the thing replace rewrites. For inserts the
+    // resolved symbol is only the anchor (a new symbol is added beside it, not
+    // rewritten), and for within-edits `body` is unused (the change is keyed on
+    // `old_text`/`new_text`). The internal `insert_symbol` / `edit_within_symbol`
+    // tools also expose no `if_match` field, so honoring it here would be a guard
+    // the write path cannot enforce. Apply these checks for `Replace` only; the
+    // splice-integrity guard (`base == disk` at write time) still protects every
+    // op, and within-edits remain naturally idempotent (a missing `old_text` is a
+    // no-op the internal tool reports).
+    if super::edit_planner::effective_op(request) == super::types::StelEditOp::Replace {
+        if let Some(if_match) = request.if_match.as_deref()
+            && if_match != resolved.current_body
+        {
+            return Err(EditValidationError::new(
+                "if_match does not match current symbol body",
+            ));
+        }
 
-    if request.idempotency_key.is_none()
-        && request
-            .body
-            .as_deref()
-            .is_some_and(|body| body == resolved.current_body)
-    {
-        return Ok(PreApplyOutcome::AlreadyApplied(resolved));
+        if request.idempotency_key.is_none()
+            && request
+                .body
+                .as_deref()
+                .is_some_and(|body| body == resolved.current_body)
+        {
+            return Ok(PreApplyOutcome::AlreadyApplied(resolved));
+        }
     }
 
     Ok(PreApplyOutcome::Ready(resolved))

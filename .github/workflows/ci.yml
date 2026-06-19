@@ -58,6 +58,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Free disk space for Rust builds
+        run: bash execution/free_runner_disk.sh
+
       # rust-toolchain.toml is the single source of truth for the toolchain
       # version; rustup resolves it natively (channel + components).
       - name: Install Rust toolchain (rust-toolchain.toml)

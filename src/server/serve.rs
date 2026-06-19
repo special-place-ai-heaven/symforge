@@ -162,15 +162,33 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
     tokio::net::TcpListener::from_std(std_listener)
 }
 
+/// Operator-friendly listen ports, in selection order. Corporate networks
+/// routinely permit the 8000/5000 ranges but block ephemeral high ports, so a
+/// no-explicit-port serve/admin start MUST resolve here and never drift to an
+/// OS-assigned `:0` port (the 61850 problem). A short curated spread comes
+/// first (memorable, non-adjacent), then the full 8000-8999 and 5000-5999
+/// ranges guarantee a free port if one exists.
+/// ponytail: ~2000 candidates; widen the ranges only if both ever fill.
+pub(crate) fn operator_port_candidates() -> impl Iterator<Item = u16> {
+    const SPREAD: [u16; 6] = [8080, 8088, 8181, 8585, 8686, 8989];
+    SPREAD
+        .into_iter()
+        .chain(8000u16..=8999)
+        .chain(5000u16..=5999)
+}
+
 /// Bind a verified-free listener, preferring `preferred` (US1, D1).
 ///
-/// The race-free free-port primitive: when `preferred` is `Some`, attempt to
-/// bind it via [`bind_listener`]; on success return that live listener. On a
-/// bind failure (e.g. the port is occupied), or when `preferred` is `None`,
-/// bind `127.0.0.1:0` and let the OS assign an ephemeral free port — binding
-/// `:0` is atomic, so the returned listener is guaranteed-free with no
-/// check-then-bind TOCTOU gap. The caller serves directly on the returned
-/// listener, so the reported URL == the bound URL (FR-020).
+/// The race-free free-port primitive: when `preferred` is `Some` and non-zero,
+/// attempt to bind it via [`bind_listener`]; on success return that live
+/// listener. On a bind failure (the port is occupied), or when `preferred` is
+/// `None`, bind the first free [`operator_port_candidates`] port (8000-8999 then
+/// 5000-5999) — never an OS-assigned ephemeral port, which corporate networks
+/// routinely block (the 61850 problem). An explicit `:0` `preferred` is honored
+/// verbatim (callers/tests that truly want an OS port). Each candidate bind is
+/// atomic, so the returned listener is guaranteed-free with no check-then-bind
+/// TOCTOU gap; the caller serves directly on it, so reported URL == bound URL
+/// (FR-020).
 ///
 /// This is the production path: it never drops and rebinds, so there is no
 /// window for another process to steal the chosen port. The thin
@@ -179,16 +197,27 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
 pub fn probe_free_listener(
     preferred: Option<SocketAddr>,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    if let Some(addr) = preferred
-        && let Ok(listener) = bind_listener(addr)
-    {
-        return Ok(listener);
+    if let Some(addr) = preferred {
+        // Explicit ephemeral (`:0`) is honored verbatim.
+        if addr.port() == 0 {
+            return bind_listener(addr);
+        }
+        if let Ok(listener) = bind_listener(addr) {
+            return Ok(listener);
+        }
     }
-    // No preference, or the preferred port was occupied: bind an OS-assigned
-    // ephemeral port (atomic — never a dead second listener on a busy port).
-    let ephemeral: SocketAddr =
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-    bind_listener(ephemeral)
+    // No preference, or the preferred port was occupied: bind the first free
+    // operator port in the corporate-friendly ranges. NEVER an OS ephemeral port.
+    for port in operator_port_candidates() {
+        let addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+        if let Ok(listener) = bind_listener(addr) {
+            return Ok(listener);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "no free operator port available in 8000-8999 or 5000-5999",
+    ))
 }
 
 /// Resolve a verified-free [`SocketAddr`], preferring `preferred` (US1, D1).
@@ -729,10 +758,18 @@ mod tests {
         (listener, addr)
     }
 
+    /// True when `port` is in the operator-friendly ranges (8000-8999 /
+    /// 5000-5999) that `operator_port_candidates` scans — never an OS ephemeral
+    /// high port that a corporate network would block (the 61850 problem).
+    fn in_operator_range(port: u16) -> bool {
+        (8000..=8999).contains(&port) || (5000..=5999).contains(&port)
+    }
+
     #[tokio::test]
-    async fn probe_free_port_falls_back_when_preferred_occupied() {
+    async fn probe_free_port_falls_back_to_operator_range_when_preferred_occupied() {
         // Occupy a port exclusively, then prefer it: probe must fall back to a
-        // DIFFERENT, OS-assigned free loopback port (never the occupied, never :0).
+        // DIFFERENT free loopback port IN THE OPERATOR RANGES (never the occupied
+        // port, never an OS ephemeral high port).
         let (occupied_listener, occupied) = occupy_exclusive();
 
         let chosen = probe_free_port(Some(occupied)).expect("probe falls back to a free port");
@@ -741,8 +778,12 @@ mod tests {
             occupied.port(),
             "must not pick the occupied port"
         );
-        assert_ne!(chosen.port(), 0, "must resolve a concrete OS-assigned port");
         assert!(chosen.ip().is_loopback(), "fallback stays on loopback");
+        assert!(
+            in_operator_range(chosen.port()),
+            "fallback must be an operator-range port (8000-8999/5000-5999), not ephemeral: {}",
+            chosen.port()
+        );
 
         // The fallback address is genuinely bindable (verified-free).
         let rebind = bind_listener(chosen).expect("the chosen fallback port is free");
@@ -764,16 +805,26 @@ mod tests {
             occupied.port(),
             "fell back off the occupied port"
         );
-        assert_ne!(local.port(), 0, "concrete OS-assigned port");
+        assert!(
+            in_operator_range(local.port()),
+            "fallback must be an operator-range port, not ephemeral: {}",
+            local.port()
+        );
         drop(listener);
         drop(occupied_listener);
     }
 
     #[tokio::test]
-    async fn probe_free_port_none_preference_binds_ephemeral() {
-        // No preference: bind an OS-assigned ephemeral loopback port.
+    async fn probe_free_port_none_preference_uses_operator_range() {
+        // No preference: bind the first free OPERATOR-RANGE loopback port
+        // (8000-8999/5000-5999), never an OS ephemeral high port that corporate
+        // networks block (the 61850 problem).
         let chosen = probe_free_port(None).expect("probe with no preference");
         assert!(chosen.ip().is_loopback());
-        assert_ne!(chosen.port(), 0, "OS must assign a concrete port");
+        assert!(
+            in_operator_range(chosen.port()),
+            "no-preference bind must be in the operator ranges, not ephemeral: {}",
+            chosen.port()
+        );
     }
 }

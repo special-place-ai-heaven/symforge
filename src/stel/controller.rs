@@ -30,6 +30,14 @@ const GROUNDED_RESPONSE_FRACTION_NUM: u64 = 3;
 /// Denominator of the grounded structured-response fraction (see numerator).
 const GROUNDED_RESPONSE_FRACTION_DEN: u64 = 5;
 
+/// Heuristic token cost of an edit response's fixed footer — the replace
+/// confirmation line (`path — replaced kind \`name\` (N → M bytes)`), the
+/// `Write semantics:` line, and a small allowance for stale-reference / impact
+/// lines. Added to a preview's echoed-body cost, and IS the whole predicted
+/// response for a committed apply (which does NOT re-emit the body). Coarse
+/// estimate, not a measured count.
+const EDIT_RESPONSE_FOOTER_TOKENS: u64 = 60;
+
 /// Token economics breakdown for one planned invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EconomicsBreakdown {
@@ -236,41 +244,25 @@ fn primary_path_from_step(step: &StelPlanStep) -> Option<String> {
 }
 
 /// Evaluate L2 admission for a structural edit plan (no NL P-FF bypass path).
+///
+/// A structural edit always `serve`s. Unlike a READ — where a non-positive net
+/// means "host-read the file directly, it is cheaper" — an EDIT has no host-side
+/// substitute: only running the tool performs the mutation. So the read ladder's
+/// `bypass` ("just host_read this path") and `degrade` (cap the response budget)
+/// are incoherent for a mutation, and the prior code never reached them anyway
+/// while the flat 520/900 floor pinned net at a permanent ~255. Now that the
+/// edit's economics are grounded in the new-body byte length (`grounded_edit_tokens`),
+/// a tiny edit's net legitimately goes non-positive; we surface that grounded net
+/// honestly in `decision_reason` but still `serve`, because the agent must run the
+/// tool to apply the change. The grounded `EconomicsBreakdown` still flows into the
+/// envelope (`predicted_tokens` / `est_net_vs_manual`) via `metrics_for_decision`.
 pub fn evaluate_edit_plan(plan: &StelPlan) -> StelDecision {
     let economics = estimate_economics(plan);
     let net = economics.predicted_net_vs_manual;
-    if net <= 0 {
-        let bypass = economics_bypass_body(plan, &economics);
-        return StelDecision {
-            plan_id: plan.plan_id.clone(),
-            decision: AdmissionDecision::Bypass,
-            decision_reason: format!("predicted_net={net} <= 0; edit economics bypass"),
-            effective_max_tokens: None,
-            degrade_flags: vec![],
-            steps: Some(plan.steps.clone()),
-            bypass: Some(bypass),
-            cache: None,
-        };
-    }
-    if net <= DEGRADE_MARGIN_LOW_TOKENS {
-        return StelDecision {
-            plan_id: plan.plan_id.clone(),
-            decision: AdmissionDecision::Degrade,
-            decision_reason: format!(
-                "predicted_net={net} <= margin_low={}",
-                DEGRADE_MARGIN_LOW_TOKENS
-            ),
-            effective_max_tokens: Some(DEGRADE_DEFAULT_MAX_TOKENS),
-            degrade_flags: vec!["max_tokens_cap".to_string()],
-            steps: Some(plan.steps.clone()),
-            bypass: None,
-            cache: None,
-        };
-    }
     StelDecision {
         plan_id: plan.plan_id.clone(),
         decision: AdmissionDecision::Serve,
-        decision_reason: format!("predicted_net={net} > margin={}", SERVE_MARGIN_TOKENS),
+        decision_reason: format!("predicted_net={net} (est.); structural edit always serves"),
         effective_max_tokens: None,
         degrade_flags: vec![],
         steps: Some(plan.steps.clone()),
@@ -351,12 +343,19 @@ pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
 
 /// Per-step `(predicted_response_tokens, predicted_manual_tokens)`.
 ///
-/// Grounded path: when `step.index_refs` is non-empty the manual baseline is the
-/// competent windowed read of the real target bytes, and the predicted response
-/// is the structured-serve fraction of that baseline (SymForge's symbol/outline/
-/// slice is smaller than a windowed manual read). Falls back to the plan-only
-/// `est_*` constants when no real size is known (preserves determinism for
-/// plan-only callers and existing fixtures).
+/// Grounded read path: when `step.index_refs` is non-empty the manual baseline is
+/// the competent windowed read of the real target bytes, and the predicted
+/// response is the structured-serve fraction of that baseline (SymForge's symbol/
+/// outline/slice is smaller than a windowed manual read).
+///
+/// Grounded edit path: a `replace_symbol_body` step carries the NEW symbol source
+/// (`body`) byte length as its `IndexRef` (see `build_edit_plan`). Its response
+/// model differs from a read's structured fraction — see [`grounded_edit_tokens`]
+/// — so edits branch here instead of reusing the read fraction, while still
+/// sharing the byte-grounded MANUAL baseline machinery.
+///
+/// Falls back to the plan-only `est_*` constants when no real size is known
+/// (preserves determinism for plan-only callers and existing fixtures).
 fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
     if step.index_refs.is_empty() {
         return (step.est_response_tokens, step.est_manual_tokens);
@@ -366,7 +365,54 @@ fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
         .iter()
         .map(|index_ref| index_ref.raw_chars as usize)
         .sum();
+    // All compact `symforge_edit` ops carry the NEW-content byte length as their
+    // IndexRef (`build_edit_plan`): the replacement body, the inserted symbol
+    // source, or the within-symbol replacement text. They share the edit response
+    // model (preview echoes the new content + footer; apply echoes only a footer),
+    // so route every edit tool through the same grounded edit estimator rather
+    // than the read fraction. Keeping them on `grounded_edit_tokens` keeps
+    // insert/within predictions honest and byte-scaled, not flat-floored.
+    if matches!(
+        step.tool.as_str(),
+        "replace_symbol_body" | "insert_symbol" | "edit_within_symbol"
+    ) {
+        return grounded_edit_tokens(step, total_raw_chars);
+    }
     grounded_tokens_from_raw_chars(total_raw_chars)
+}
+
+/// Map an edit step's NEW-body byte length to `(predicted_response, predicted_manual)`.
+///
+/// MANUAL baseline: editing a symbol by hand means reading its span and rewriting
+/// it; the new-body length is the plan-time proxy for that span (the old on-disk
+/// span is not resolved until apply). Flows through the SAME
+/// `competent_manual_baseline_chars` + `estimate_tokens_from_chars` estimator the
+/// read path uses, so there is one source of truth for the manual baseline.
+///
+/// RESPONSE: scales with what the edit echoes back, which depends on preview vs
+/// apply (read from the step's planned `dry_run` arg):
+/// - PREVIEW (`dry_run == true`): echoes the full new body plus a diff/footer ⇒
+///   `tokens(body) + footer`.
+/// - APPLY (`dry_run == false`): echoes only a confirmation + impact footer; the
+///   body is NOT re-emitted ⇒ `footer`.
+///
+/// So a preview always predicts more response than the equivalent apply, and both
+/// scale with body size only through the preview's echoed body — exactly the
+/// honesty fix for the old flat 520/900 floor.
+fn grounded_edit_tokens(step: &StelPlanStep, body_chars: usize) -> (u32, u32) {
+    let manual_chars = competent_manual_baseline_chars(body_chars);
+    let manual_tokens = estimate_tokens_from_chars(manual_chars);
+    let is_preview = step
+        .args
+        .get("dry_run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let response_tokens = if is_preview {
+        estimate_tokens_from_chars(body_chars).saturating_add(EDIT_RESPONSE_FOOTER_TOKENS)
+    } else {
+        EDIT_RESPONSE_FOOTER_TOKENS
+    };
+    (clamp_u32(response_tokens), clamp_u32(manual_tokens))
 }
 
 /// Map real target byte length to `(predicted_response_tokens, predicted_manual_tokens)`.
@@ -817,6 +863,119 @@ mod tests {
         assert!(
             decision.bypass.is_some(),
             "economics bypass must carry a host-read body"
+        );
+    }
+
+    /// Build a single-step `replace_symbol_body` edit plan grounded in a real
+    /// new-body byte length, mirroring what `build_edit_plan` stamps. `dry_run`
+    /// selects preview (`true`) vs committed apply (`false`).
+    fn grounded_edit_plan(body_chars: u64, dry_run: bool) -> StelPlan {
+        StelPlan {
+            plan_id: format!("edit-{body_chars}-{dry_run}"),
+            intent: IntentBucket::Edit,
+            confidence: RouteConfidence::Exact,
+            confidence_rationale: "test".to_string(),
+            steps: vec![StelPlanStep {
+                order: 1,
+                tool: "replace_symbol_body".to_string(),
+                args: serde_json::json!({
+                    "path": "src/lib.rs",
+                    "name": "foo",
+                    "new_body": "x",
+                    "dry_run": dry_run,
+                }),
+                // Plan-only floor that edit grounding must override.
+                est_response_tokens: 520,
+                est_manual_tokens: 900,
+                index_refs: vec![IndexRef {
+                    path: "src/lib.rs".to_string(),
+                    raw_chars: body_chars,
+                }],
+            }],
+            suggested_followup: None,
+        }
+    }
+
+    /// Edit-economics grounding (this plan): a LARGE-body edit preview predicts
+    /// proportionally MORE response tokens than a SMALL-body edit preview — the
+    /// prediction is no longer the flat 520 constant. This is the regression the
+    /// dogfood agents flagged (a 57%–507% predicted-vs-actual error from the flat
+    /// floor); the response now scales with the echoed new body.
+    #[test]
+    fn grounded_edit_preview_response_scales_with_body_size() {
+        let small = estimate_economics(&grounded_edit_plan(400, true));
+        let large = estimate_economics(&grounded_edit_plan(40_000, true));
+
+        // Not the flat plan-only floor of 520.
+        assert_ne!(
+            small.predicted_response_tokens, 520,
+            "grounded edit must override the flat 520 response floor"
+        );
+        assert_ne!(
+            small.predicted_response_tokens, large.predicted_response_tokens,
+            "edit response prediction must vary with new-body size"
+        );
+        assert!(
+            large.predicted_response_tokens > small.predicted_response_tokens,
+            "bigger edit body ⇒ more echoed response (small={} large={})",
+            small.predicted_response_tokens,
+            large.predicted_response_tokens
+        );
+        // Manual baseline (read+rewrite the span) also scales with body size.
+        assert!(
+            large.predicted_manual_tokens > small.predicted_manual_tokens,
+            "bigger edit body ⇒ bigger manual baseline (small={} large={})",
+            small.predicted_manual_tokens,
+            large.predicted_manual_tokens
+        );
+    }
+
+    /// Edit-economics grounding (this plan): for the SAME new body, a PREVIEW
+    /// predicts MORE response tokens than a committed APPLY — the preview echoes
+    /// the full new body, the apply echoes only a confirmation/impact footer and
+    /// does NOT re-emit the body. The flat 520 floor could never express this.
+    #[test]
+    fn grounded_edit_preview_predicts_more_response_than_apply() {
+        let preview = estimate_economics(&grounded_edit_plan(40_000, true));
+        let apply = estimate_economics(&grounded_edit_plan(40_000, false));
+
+        assert!(
+            preview.predicted_response_tokens > apply.predicted_response_tokens,
+            "preview (echoes body) must predict more response than apply (footer only): \
+             preview={} apply={}",
+            preview.predicted_response_tokens,
+            apply.predicted_response_tokens
+        );
+        // Apply response is just the fixed footer, independent of body size.
+        let apply_small = estimate_economics(&grounded_edit_plan(400, false));
+        assert_eq!(
+            apply.predicted_response_tokens, apply_small.predicted_response_tokens,
+            "committed apply does not re-emit the body ⇒ response is body-size invariant"
+        );
+        // The shared manual baseline still scales with body size for BOTH modes.
+        assert_eq!(
+            preview.predicted_manual_tokens, apply.predicted_manual_tokens,
+            "manual baseline depends on the symbol span, not on preview-vs-apply"
+        );
+    }
+
+    /// A structural edit always `serve`s even when its grounded net goes
+    /// non-positive: a mutation has no host-read substitute, so the read ladder's
+    /// `bypass`/`degrade` are incoherent here. (Pre-grounding this was moot — the
+    /// flat 520/900 floor pinned net at ~255, so the dead branches never ran.)
+    #[test]
+    fn grounded_tiny_edit_still_serves_no_bypass() {
+        // 8-byte body ⇒ manual ~2 tokens ⇒ net deeply negative, yet edits serve.
+        let decision = evaluate_edit_plan(&grounded_edit_plan(8, true));
+        assert_eq!(
+            decision.decision,
+            AdmissionDecision::Serve,
+            "tiny edit must still serve (no host-read substitute): {}",
+            decision.decision_reason
+        );
+        assert!(
+            decision.bypass.is_none(),
+            "edit decision must never carry a host-read bypass body"
         );
     }
 

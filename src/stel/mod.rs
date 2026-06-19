@@ -96,7 +96,8 @@ pub use surface_list::{
 };
 pub use types::{
     AdmissionDecision, CalibrationState, CoreToolName, GoldenRouteRow, IndexRef, IntentBucket,
-    RouteConfidence, StelBypassBody, StelCacheBody, StelDecision, StelEditIntent, StelEditRequest,
-    StelEstimate, StelExecution, StelExecutionTotals, StelLedgerEvent, StelPlan, StelPlanStep,
-    StelRequest, StelStatusDetail, StelStatusRequest, StelStepExecution, SymforgeCallInput,
+    RouteConfidence, StelBypassBody, StelCacheBody, StelDecision, StelEditIntent, StelEditOp,
+    StelEditRequest, StelEstimate, StelExecution, StelExecutionTotals, StelLedgerEvent, StelPlan,
+    StelPlanStep, StelRequest, StelStatusDetail, StelStatusRequest, StelStepExecution,
+    SymforgeCallInput,
 };

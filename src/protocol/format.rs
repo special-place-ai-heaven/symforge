@@ -4780,17 +4780,21 @@ pub fn loading_guard_message() -> String {
 /// for that message, computed from the **active** [`SurfaceProfile`], never a
 /// fixed string.
 ///
-/// - [`SurfaceProfile::Compact`]: names only callable recovery — re-launch from
-///   the project root (so cold-start discovery populates the index), or the
-///   documented `SYMFORGE_SURFACE=full` opt-out. MUST NOT mention `index_folder`
-///   or any other gated capability.
+/// - [`SurfaceProfile::Compact`]: names only operator-actionable recovery that
+///   actually works from a cold / home-cwd start — set `SYMFORGE_WORKSPACE_ROOT`
+///   or run `symforge init`, then reconnect — plus the documented
+///   `SYMFORGE_SURFACE=full` opt-out. MUST NOT mention `index_folder` (gated),
+///   and MUST NOT tell an LLM to "re-launch" (it cannot relaunch its own server).
+///   The `Index not loaded.` prefix is load-bearing — empty-index classifiers
+///   in tools/edit/golden-replay detect the guard by it.
 /// - [`SurfaceProfile::Full`] / [`SurfaceProfile::Meta`]: `index_folder` is
 ///   callable, so the hint may name it directly.
 pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
     match profile {
-        SurfaceProfile::Compact => "Index not loaded. Re-launch SymForge from your project \
-             root so the workspace is indexed on startup, or set SYMFORGE_SURFACE=full for the \
-             full tool surface."
+        SurfaceProfile::Compact => "Index not loaded. SymForge has no resolvable project \
+             root. To recover, set SYMFORGE_WORKSPACE_ROOT to the project path in this client's \
+             MCP config, or run `symforge init` for this harness, then reconnect. \
+             (SYMFORGE_SURFACE=full exposes the full tool surface for manual indexing.)"
             .to_string(),
         SurfaceProfile::Full | SurfaceProfile::Meta => {
             "Index not loaded. Call index_folder to index a directory.".to_string()

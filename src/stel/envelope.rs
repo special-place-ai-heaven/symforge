@@ -51,7 +51,39 @@ fn decision_label(decision: AdmissionDecision) -> &'static str {
 /// All token figures are explicitly labeled as estimates/heuristics: SymForge
 /// does not measure real token counts, so presenting any of them as a measured
 /// saving would violate the 010 honesty contract (FR-001/FR-002).
+///
+/// The full multi-line block is the default. An operator who finds the per-call
+/// block noisy can set `SYMFORGE_STEL_COMPACT=1` to collapse it to one honest
+/// line (route · decision · est. served tokens); the full economics returns by
+/// unsetting the flag. (Plan 009a; a *default*-compact form is a follow-up that
+/// must update the honesty-surface assertions across the test corpus + schema.)
 pub fn format_trust_envelope(input: &TrustEnvelopeInput) -> String {
+    format_trust_envelope_inner(input, stel_compact_envelope_enabled())
+}
+
+/// Whether the operator opted into the one-line envelope via `SYMFORGE_STEL_COMPACT`.
+fn stel_compact_envelope_enabled() -> bool {
+    matches!(
+        std::env::var("SYMFORGE_STEL_COMPACT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Render the envelope. `compact=false` is the full 010 block; `compact=true` is
+/// the opt-in one-liner. Pure in `compact` so both forms are unit-testable
+/// without mutating process env.
+fn format_trust_envelope_inner(input: &TrustEnvelopeInput, compact: bool) -> String {
+    if compact {
+        // One-line opt-in form: keeps the load-bearing honesty — the route, the
+        // admission decision, and that the served-token figure is an estimate —
+        // and drops the per-call economics detail.
+        return format!(
+            "── stel · {plan} · {decision} · ~{served} tok served (est.) ──",
+            plan = input.plan_summary,
+            decision = decision_label(input.decision),
+            served = input.response_tokens,
+        );
+    }
     // Heuristic predicted net vs a manual baseline — grounded in the real target
     // byte size when known (010 FR-014), else the planner's `400/800` floor;
     // never a measured token count. Labeled `est.`; a negative prediction reads
@@ -149,5 +181,45 @@ mod tests {
         assert!(text.contains("n/a (rejected) vs manual"));
         assert!(!text.contains("fewer vs manual"));
         assert!(!text.contains("213 saved"));
+    }
+
+    #[test]
+    fn compact_envelope_inner_is_one_honest_line() {
+        // Plan 009a: the opt-in compact form is a single line that keeps the
+        // load-bearing honesty (route, decision, est. served tokens) and drops
+        // the per-call economics detail; the full form stays multi-line.
+        let input = TrustEnvelopeInput {
+            plan_summary: "find → search_text".to_string(),
+            decision: AdmissionDecision::Serve,
+            response_tokens: 1234,
+            est_net_vs_manual: 50,
+            schema_tokens: 10,
+            invoke_tokens: 20,
+            predicted_tokens: 800,
+            predict_error_pct: 12.0,
+            session_tokens_served: 5000,
+            calibration: "deferred",
+            ledger_line: Some("ledger: {}".to_string()),
+        };
+        let compact = format_trust_envelope_inner(&input, true);
+        assert_eq!(
+            compact.lines().count(),
+            1,
+            "compact envelope is one line: {compact}"
+        );
+        assert!(compact.contains("serve"), "keeps the decision: {compact}");
+        assert!(
+            compact.contains("~1234 tok served (est.)"),
+            "keeps est. served tokens: {compact}"
+        );
+        assert!(
+            !compact.contains("session_tokens_served") && !compact.contains("predicted:"),
+            "drops the per-call detail: {compact}"
+        );
+        let full = format_trust_envelope_inner(&input, false);
+        assert!(
+            full.lines().count() > 1 && full.contains("session_tokens_served:"),
+            "full form stays the multi-line block: {full}"
+        );
     }
 }
