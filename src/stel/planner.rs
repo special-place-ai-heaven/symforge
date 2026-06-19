@@ -32,6 +32,12 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     if let Some(step) = symbol_lookup_step(request) {
         return build_plan_from_steps(request, vec![step]);
     }
+    if let Some(step) = symbol_impact_step(request) {
+        return build_plan_from_steps(request, vec![step]);
+    }
+    if let Some(step) = orient_lookup_step(request) {
+        return build_plan_from_steps(request, vec![step]);
+    }
     // US4 find fusion: a multi-word fuzzy find query that matches no explicit
     // routing phrase fans out across BOTH the path/file matcher (with the gated
     // co-change boost) and the symbol-name matcher, merged by the serve
@@ -93,26 +99,30 @@ pub(crate) fn is_bare_identifier(candidate: &str) -> bool {
     })
 }
 
-/// US-symbol-routing: a bare-identifier `symbol` for find/auto intent routes
+/// US-symbol-routing: a bare-identifier `symbol` for find/auto/read intent routes
 /// straight to a symbol lookup rather than letting the query-side text search
 /// own the route. Returns `None` (deferring to the existing pipeline) when:
 ///   - no `symbol` was supplied, or it is prose (the prose case is rejected with
 ///     a corrective error at the facade boundary, before planning), or
-///   - the intent is an explicit non-find/non-auto bucket (that bucket already
-///     consumes `symbol` where it makes sense — e.g. `route_trace`), or
+///   - the intent is an explicit bucket that already consumes `symbol` elsewhere
+///     (`route_trace`, `symbol_impact_step`, …), or
 ///   - an explicit routing phrase in the query already won (its precise
 ///     single-step golden route must stand).
 ///
 /// When it fires it prefers `get_symbol` (the caller named an exact symbol and,
 /// with a `path`, we can fetch its body directly) and otherwise `search_symbols`
-/// (name-ranked symbol discovery), never a full-text search over the prose query.
+/// for find/auto or `get_symbol` by name for read, never a full-text search over
+/// the prose query.
 fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
     let symbol = request.symbol.as_deref()?.trim();
     if !is_bare_identifier(symbol) {
         return None;
     }
     let bucket = request.intent.unwrap_or(IntentBucket::Auto);
-    if !matches!(bucket, IntentBucket::Auto | IntentBucket::Find) {
+    if !matches!(
+        bucket,
+        IntentBucket::Auto | IntentBucket::Find | IntentBucket::Read
+    ) {
         return None;
     }
     // An explicit routing phrase in the query is a precise signal that outranks a
@@ -125,8 +135,16 @@ fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
             "get_symbol",
             json!({ "path": path, "name": symbol }),
             IntentBucket::Read,
-            RouteConfidence::Inferred,
+            RouteConfidence::Exact,
             "explicit symbol + path lookup",
+        ))
+    } else if bucket == IntentBucket::Read {
+        Some(planned(
+            "get_symbol",
+            json!({ "name": symbol }),
+            IntentBucket::Read,
+            RouteConfidence::Inferred,
+            "read intent symbol body lookup",
         ))
     } else {
         Some(planned(
@@ -137,6 +155,74 @@ fn symbol_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
             "explicit symbol lookup",
         ))
     }
+}
+
+/// Impact intent with a bare `symbol`: resolve to a concrete tool instead of
+/// shoving the natural-language `query` into `find_dependents.path`.
+fn symbol_impact_step(request: &StelRequest) -> Option<PlannedStep> {
+    let symbol = request.symbol.as_deref()?.trim();
+    if !is_bare_identifier(symbol) {
+        return None;
+    }
+    if request.intent != Some(IntentBucket::Impact) {
+        return None;
+    }
+    if route_with_query_patterns(request).is_some() {
+        return None;
+    }
+    if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
+        return Some(planned(
+            "find_dependents",
+            json!({ "path": path, "compact": true }),
+            IntentBucket::Impact,
+            RouteConfidence::Exact,
+            "impact intent file dependents for explicit path",
+        ));
+    }
+    Some(planned(
+        "find_references",
+        json!({ "name": symbol, "compact": true }),
+        IntentBucket::Impact,
+        RouteConfidence::Inferred,
+        "impact intent symbol-level dependents (callers/usages)",
+    ))
+}
+
+/// Orient phrasing on auto/orient intent routes to `get_repo_map` before find
+/// fusion can tokenize the prose query into OR-literals.
+fn orient_lookup_step(request: &StelRequest) -> Option<PlannedStep> {
+    let bucket = request.intent.unwrap_or(IntentBucket::Auto);
+    if !matches!(bucket, IntentBucket::Auto | IntentBucket::Orient) {
+        return None;
+    }
+    let lower = request.query.trim().to_ascii_lowercase();
+    if !is_orient_query(&lower) {
+        return None;
+    }
+    if route_with_query_patterns(request).is_some() {
+        return None;
+    }
+    Some(planned(
+        "get_repo_map",
+        json!({}),
+        IntentBucket::Orient,
+        RouteConfidence::Inferred,
+        "orient/workspace phrasing",
+    ))
+}
+
+/// True when the query is asking for repository orientation rather than search.
+fn is_orient_query(lower: &str) -> bool {
+    lower.starts_with("orient me")
+        || lower.contains("repo map")
+        || lower.contains("crate map")
+        || lower.contains("map of")
+        || lower.contains("main crates")
+        || lower.contains("workspace layout")
+        || lower.contains("project layout")
+        || lower.contains("overview of the")
+        || lower.contains("overview of this")
+        || lower.contains("orient:")
 }
 
 fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> StelPlan {
@@ -374,7 +460,7 @@ fn is_multi_term_fuzzy_find(query: &str) -> bool {
     // "explain Z") are explore intent, not find — never fuse them. This keeps
     // the golden `explore` rows (e.g. "how to use records ORM") routing to
     // explore and mirrors smart_query's Understand/Explore lead-ins.
-    if is_guidance_query(&lower) {
+    if is_guidance_query(&lower) || is_orient_query(&lower) {
         return false;
     }
     let tokens: Vec<&str> = lower
@@ -734,7 +820,8 @@ fn route_impact(request: &StelRequest) -> PlannedStep {
 }
 
 fn route_orient(request: &StelRequest) -> PlannedStep {
-    if request.query.to_ascii_lowercase().contains("repo map") {
+    let lower = request.query.trim().to_ascii_lowercase();
+    if is_orient_query(&lower) {
         planned(
             "get_repo_map",
             json!({}),
@@ -742,13 +829,21 @@ fn route_orient(request: &StelRequest) -> PlannedStep {
             RouteConfidence::Inferred,
             "orient intent repo map",
         )
-    } else {
+    } else if is_guidance_query(&lower) {
         planned(
             "explore",
             json!({ "query": request.query.trim(), "depth": 2 }),
             IntentBucket::Orient,
             RouteConfidence::Inferred,
-            "orient intent explore",
+            "orient intent explore guidance",
+        )
+    } else {
+        planned(
+            "get_repo_map",
+            json!({}),
+            IntentBucket::Orient,
+            RouteConfidence::Inferred,
+            "orient intent default repo map",
         )
     }
 }
@@ -1512,5 +1607,78 @@ mod tests {
             ..Default::default()
         };
         assert!(symbol_contract_violation(&request).is_none());
+    }
+
+    #[test]
+    fn read_intent_symbol_and_path_routes_to_get_symbol() {
+        let plan = build_plan(&StelRequest {
+            query: "show source body".to_string(),
+            intent: Some(IntentBucket::Read),
+            symbol: Some("fail_and_cascade".to_string()),
+            path: Some("dag.rs".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "get_symbol");
+        assert_eq!(plan.steps[0].args["name"], "fail_and_cascade");
+        assert_eq!(plan.steps[0].args["path"], "dag.rs");
+    }
+
+    #[test]
+    fn read_intent_symbol_without_path_routes_to_get_symbol_not_query_as_path() {
+        let plan = build_plan(&StelRequest {
+            query: "Show the source body of fail_and_cascade".to_string(),
+            intent: Some(IntentBucket::Read),
+            symbol: Some("fail_and_cascade".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "get_symbol");
+        assert_eq!(plan.steps[0].args["name"], "fail_and_cascade");
+        assert!(plan.steps[0].args.get("path").is_none());
+    }
+
+    #[test]
+    fn impact_intent_symbol_routes_to_find_references_not_query_as_path() {
+        let plan = build_plan(&StelRequest {
+            query: "What depends on TaskStatus in this workspace?".to_string(),
+            intent: Some(IntentBucket::Impact),
+            symbol: Some("TaskStatus".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "find_references");
+        assert_eq!(plan.steps[0].args["name"], "TaskStatus");
+    }
+
+    #[test]
+    fn impact_intent_symbol_with_path_routes_to_find_dependents() {
+        let plan = build_plan(&StelRequest {
+            query: "what breaks if I change this file".to_string(),
+            intent: Some(IntentBucket::Impact),
+            symbol: Some("TaskStatus".to_string()),
+            path: Some("src/task.rs".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "find_dependents");
+        assert_eq!(plan.steps[0].args["path"], "src/task.rs");
+    }
+
+    #[test]
+    fn orient_intent_map_phrasing_routes_to_get_repo_map() {
+        let plan = build_plan(&StelRequest {
+            query: "map of workspace crates".to_string(),
+            intent: Some(IntentBucket::Orient),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "get_repo_map");
+    }
+
+    #[test]
+    fn auto_orient_me_phrasing_routes_to_get_repo_map_not_find_fusion() {
+        let plan = build_plan(&StelRequest {
+            query: "Orient me: what are the main crates in this workspace?".to_string(),
+            intent: Some(IntentBucket::Auto),
+            ..Default::default()
+        });
+        assert_eq!(plan.steps[0].tool, "get_repo_map");
+        assert_eq!(plan.steps.len(), 1);
     }
 }
