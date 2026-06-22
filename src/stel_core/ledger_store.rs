@@ -332,9 +332,10 @@ impl StelLedgerStore {
     /// `root/.symforge/.symforge/...`.
     ///
     /// Migration note: any pre-fix doubled-path data at
-    /// `root/.symforge/.symforge/stel-ledger.db` is orphaned, not migrated —
-    /// economics rows are best-effort calibration input (pre-1.0), so a one-time
-    /// reset of unpromoted, never-surfaced data is acceptable.
+    /// `root/.symforge/.symforge/stel-ledger.db` is orphaned, not migrated — that
+    /// calibration is unpromoted, never-surfaced, and re-derives from the retained
+    /// ledger samples on the next pass (pre-1.0), so orphaning this one-time
+    /// doubled-path data is acceptable.
     pub fn open(root: &Path, session_id: impl Into<String>) -> Self {
         let db_path = crate::paths::symforge_db_path(root, crate::paths::STEL_LEDGER_DB_NAME);
         match SqliteStelLedgerStore::open(&db_path, session_id) {
@@ -366,17 +367,26 @@ impl StelLedgerStore {
 
     /// Insert one ledger event. No-op when `Disabled`.
     ///
-    /// Degrade-silently contract (FR-011): a record error is logged and dropped,
-    /// never propagated. Under pathological multi-process contention a single
-    /// event may be lost if every retry within the `busy_timeout` window is
-    /// blocked — acceptable for best-effort calibration data (one dropped sample
-    /// out of thousands does not change a tuned constant; never blocks the
-    /// request path).
+    /// Degrade contract (FR-011): a record error is logged at WARN (observable —
+    /// the `error` field carries the cause) and dropped, never propagated; the
+    /// request path is never blocked.
+    ///
+    /// Durability decision (D5 — evidence-based, NOT "best effort"): the durable
+    /// write is lossy ONLY under pathological multi-process write contention, by
+    /// design. WAL + `busy_timeout=5000` makes a writer block up to 5s for the
+    /// lock, so a drop requires >5s of sustained contention; the typical topology
+    /// is a SINGLE writer per project (one stdio session) where the lock is
+    /// uncontended and a drop cannot occur. Calibration derives from a median over
+    /// at least `TUNING_MIN_CORPUS` (24) samples + held-out validation, so a rare
+    /// dropped sample cannot move a tuned constant. The WARN is the evidence
+    /// channel: if it fires frequently in practice, THAT is the trigger to add a
+    /// bounded retry/queue — the evidence (single-writer-typical + WAL + the 5s
+    /// window + median robustness) says it will not.
     pub fn record(&self, event: &StelLedgerEvent) {
         if let Self::Sqlite(store) = self
             && let Err(err) = store.record(event)
         {
-            tracing::warn!(error = %err, "stel ledger record failed; degrading silently");
+            tracing::warn!(error = %err, "stel ledger record dropped (D5: lossy only under sustained write contention; calibration is median-robust)");
         }
     }
 
