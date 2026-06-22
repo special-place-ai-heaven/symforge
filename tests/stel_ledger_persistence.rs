@@ -456,27 +456,90 @@ fn corrupt_db_degrades_to_disabled_not_a_panic() {
 // T006(h) — crash durability: WAL append survives an abrupt handle drop
 // ---------------------------------------------------------------------------
 
+/// Env-var guard naming the db directory the crash CHILD must open. When set,
+/// the test below runs in "child" mode (open + record + `abort()` mid-write);
+/// when unset, it is the PARENT (spawn the child, assert it crashed, reopen the
+/// SAME dir, prove the WAL append survived).
+const CRASH_CHILD_DIR_ENV: &str = "TC_013_CRASH_CHILD_DIR";
+
+/// Crash-durability (constitution IV: "shutdown is NOT a safe persistence
+/// boundary"). A clean `drop(store)` triggers SQLite's WAL checkpoint, so a
+/// drop-then-reopen test only proves CHECKPOINT durability — exactly the honesty
+/// defect this rewrite fixes. To prove genuine CRASH durability we must record
+/// an event and then terminate the process WITHOUT running any `Drop`/checkpoint,
+/// leaving the `-wal` un-checkpointed, and recover it on the next open.
+///
+/// Mechanism (cross-platform): the parent re-execs THIS test binary as a child
+/// with `--exact <this test> --nocapture` and `TC_013_CRASH_CHILD_DIR=<dir>`.
+/// The child opens the store under that dir, `record()`s, and calls
+/// `std::process::abort()` while the store handle is still live — so no `Drop`
+/// runs, no WAL checkpoint happens, and the process dies via SIGABRT (Unix) /
+/// a fatal abort (Windows). The parent asserts the child did NOT exit cleanly
+/// (no `success()`), then opens the SAME db dir and asserts the recorded event
+/// survived — recovered from the un-checkpointed WAL, not from a clean close.
 #[test]
 fn recorded_event_survives_abrupt_drop_without_clean_shutdown() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let db_path = tmp.path().join("stel-ledger.db");
-
-    // Record an event, then drop the handle WITHOUT any clean checkpoint/shutdown
-    // path — simulating a crash. The WAL append must already be durable.
-    {
-        let store = SqliteStelLedgerStore::open(&db_path, "sess-crash").expect("open");
-        store.record(&sample_event("p-crash")).expect("record");
-        // No explicit checkpoint, no graceful close — just drop at scope end.
-        drop(store);
+    // ---- CHILD MODE: open, record, abort WITHOUT a clean drop/checkpoint. ----
+    if let Ok(dir) = std::env::var(CRASH_CHILD_DIR_ENV) {
+        let db_path = std::path::Path::new(&dir).join("stel-ledger.db");
+        let store =
+            SqliteStelLedgerStore::open(&db_path, "sess-crash-child").expect("child: open store");
+        store
+            .record(&sample_event("p-crash"))
+            .expect("child: record event");
+        // Force the WAL append to disk WITHOUT a checkpoint: keep the connection
+        // open (no Drop, no `wal_checkpoint`) and crash hard. `abort()` does not
+        // unwind, does not run destructors, and does not flush via a clean close
+        // — it is the closest portable analogue of a power loss / SIGKILL. The
+        // `-wal` file is left with the un-checkpointed append for the parent to
+        // recover. `std::mem::forget` makes the no-Drop intent explicit even
+        // though `abort()` already skips destructors.
+        std::mem::forget(store);
+        std::process::abort();
     }
 
-    // Reopen the SAME db; the event must be present (constitution IV: shutdown is
-    // NOT the safe boundary — the append is durable mid-write).
-    let reopened = SqliteStelLedgerStore::open(&db_path, "sess-crash-2").expect("reopen");
+    // ---- PARENT MODE: spawn the child, assert it crashed, recover the event. ----
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    let exe = std::env::current_exe().expect("current_exe for re-exec");
+    let status = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "recorded_event_survives_abrupt_drop_without_clean_shutdown",
+            "--nocapture",
+        ])
+        .env(CRASH_CHILD_DIR_ENV, dir)
+        // The harness sets this so a single `--exact` test still runs.
+        .env("RUST_TEST_THREADS", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn crash child");
+
+    // The child must NOT have exited cleanly — `abort()` yields a non-success
+    // status (SIGABRT on Unix, a fatal exit code on Windows). A clean exit would
+    // mean the child drained through a normal shutdown path, invalidating the
+    // crash-durability claim.
+    assert!(
+        !status.success(),
+        "crash child must terminate abnormally (abort), not exit cleanly; got {status:?}"
+    );
+
+    // Reopen the SAME db dir. The event must be present — recovered from the
+    // un-checkpointed WAL left by the aborted child (constitution IV: the append
+    // is durable mid-write, BEFORE any clean shutdown/checkpoint).
+    let db_path = dir.join("stel-ledger.db");
+    assert!(
+        db_path.exists(),
+        "child must have created the db file before aborting"
+    );
+    let reopened = SqliteStelLedgerStore::open(&db_path, "sess-crash-recover").expect("reopen");
     let summary = reopened.summary().expect("summary");
     assert_eq!(
         summary.total_events, 1,
-        "the recorded event must survive an abrupt drop (WAL append durable)"
+        "the recorded event must survive a genuine process abort (WAL append durable, \
+         recovered without a clean checkpoint)"
     );
     let recent = reopened.recent(10).expect("recent");
     assert_eq!(recent.len(), 1);
