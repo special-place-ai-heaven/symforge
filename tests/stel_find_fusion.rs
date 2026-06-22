@@ -154,6 +154,8 @@ async fn run_find(server: &SymForgeServer, query: &str) -> String {
         symbol: None,
         max_tokens: None,
         preview: None,
+        project: None,
+        projects: None,
     };
     let params: Value = serde_json::to_value(symforge::stel::SymforgeCallInput {
         request,
@@ -376,6 +378,8 @@ async fn run_find_outcome(server: &SymForgeServer, query: &str) -> String {
         symbol: None,
         max_tokens: None,
         preview: None,
+        project: None,
+        projects: None,
     };
     let params: Value = serde_json::to_value(symforge::stel::SymforgeCallInput {
         request,

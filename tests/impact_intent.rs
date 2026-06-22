@@ -117,6 +117,8 @@ async fn run_impact_intent(server: &SymForgeServer, path: &str) -> String {
         symbol: None,
         max_tokens: None,
         preview: None,
+        project: None,
+        projects: None,
     };
     let params = serde_json::to_value(stel::SymforgeCallInput {
         request,

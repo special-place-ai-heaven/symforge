@@ -800,26 +800,59 @@ impl SymForgeServer {
     ///
     /// Precedence is honored against the *already-bound* server state rather
     /// than re-deciding it: startup resolved the env override and the CWD walk
-    /// before the transport came up, so if either bound a root the index is
-    /// already loading and this is a deliberate no-op (guarded by
-    /// `capture_repo_root().is_some()`). Client roots therefore fill ONLY the
-    /// gap the keystone bug leaves — a launcher (Cursor from a home CWD) where
-    /// neither env nor CWD resolved a workspace and the server came up bound to
-    /// nothing (`repo_root: None`, empty index). In that case the resolved root
-    /// drives the existing [`Self::index_folder`] path, which loads the local
-    /// in-process index (and, in a daemon-proxy server, would proxy the rebind);
-    /// daemon-proxy servers are always already bound, so this never reaches them.
+    /// before the transport came up. The env override always wins — if it is set
+    /// and valid the bound root came from it and this is a deliberate no-op.
+    ///
+    /// Two paths let declared client roots bind/retarget despite an existing
+    /// binding, both narrowly gated (see the body):
+    ///   - the keystone home-CWD case where neither env nor CWD bound anything
+    ///     (Cursor from a home directory: `repo_root: None`, empty index); and
+    ///   - (012 D4-A) a daemon-proxy session that came up bound to a CWD-derived
+    ///     root with NO env override — there client roots are authoritative
+    ///     (`roots > CWD`) and retarget the live session, fixing the wrong-repo
+    ///     binding that a stale launch CWD would otherwise pin forever.
+    ///
+    /// In both cases the resolved root drives the existing [`Self::index_folder`]
+    /// path, which loads the local in-process index or, in a daemon-proxy server,
+    /// proxies the rebind to `index_folder_for_session` (the per-session retarget).
+    /// A local (non-proxy) server that is already bound still returns immediately,
+    /// preserving its loaded index byte-for-byte.
     ///
     /// Failures are logged and swallowed: a client that declares no roots, an
     /// unreachable `roots/list`, or a forbidden root must never break the
     /// session — the server simply stays in its existing (empty) state, exactly
     /// as before this hook existed.
     async fn bind_workspace_from_client_roots(&self, peer: &rmcp::Peer<RoleServer>) {
-        // Only act when startup bound nothing. If env or the CWD walk already
-        // resolved a workspace, that decision wins (precedence) and we must not
-        // disturb the loaded index.
+        // Precedence: `SYMFORGE_WORKSPACE_ROOT (env) > client roots > CWD walk`.
+        //
+        // Two cases let declared client roots win over an already-bound root, both
+        // gated so the single-harness happy path and the local (non-daemon) loaded
+        // index are never disturbed:
+        //
+        //   1. Nothing was bound at startup (env + CWD both resolved nothing):
+        //      client roots are the only signal — bind from them. This is the
+        //      original home-CWD launcher fix (Cursor) and is unconditional.
+        //
+        //   2. (012 D4-A, per-connection RETARGET) A daemon-proxy session is
+        //      ALWAYS bound at startup (to whatever the launch CWD resolved), so
+        //      case 1 never fires for it and a stale CWD binding would silently
+        //      win forever — the #1 field wrong-repo bug. When the bound root did
+        //      NOT come from the env override, the client's declared roots are
+        //      authoritative (`roots > CWD`) and must retarget the session via the
+        //      existing `index_folder` → `index_folder_for_session` path.
+        //
+        // The env override always wins (case skipped) so `env > roots` holds, and
+        // a local (non-proxy) server keeps its exact prior behavior: it returns
+        // here whenever it is already bound, never reloading a loaded index.
         if self.capture_repo_root().is_some() {
-            return;
+            let bound_from_env = crate::discovery::workspace_root_env_override().is_some();
+            let is_daemon_proxy = self.daemon_client.is_some();
+            if bound_from_env || !is_daemon_proxy {
+                return;
+            }
+            tracing::debug!(
+                "daemon-proxy bound from CWD (no env override); allowing client roots to retarget"
+            );
         }
 
         // Spec correctness: only issue `roots/list` when the client actually
@@ -864,9 +897,10 @@ impl SymForgeServer {
 
         let root_uris: Vec<String> = roots.into_iter().map(|root| root.uri).collect();
 
-        // env is None here: a present env override would already have bound the
-        // root at startup (handled by the early return above), so passing None
-        // cannot let a client root jump ahead of the env override.
+        // env is None here: reaching this point guarantees the bound root did
+        // NOT come from the env override (the gate above returns early when
+        // `workspace_root_env_override().is_some()`), so passing None cannot let
+        // a client root jump ahead of the env override — `env > roots` holds.
         let Some(resolved) = crate::discovery::resolve_workspace_root(None, &root_uris, None)
         else {
             tracing::info!(
@@ -887,6 +921,7 @@ impl SymForgeServer {
         let input = crate::protocol::tools::IndexFolderInput {
             path: resolved.display().to_string(),
             idempotency_key: None,
+            add: None,
         };
         let result = self
             .index_folder(rmcp::handler::server::wrapper::Parameters(input))

@@ -11,6 +11,7 @@ pub mod rank_signals;
 pub mod search;
 pub mod store;
 pub mod trigram;
+pub mod view;
 
 pub use query::{
     ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,

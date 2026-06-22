@@ -71,6 +71,13 @@ impl AdmissionDecision {
 /// MCP input for the `symforge` compact-surface tool (L0 → L1).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelRequest {
+    /// The natural-language phrase to route. `#[serde(default)]` so an OMITTED
+    /// `query` deserializes to an empty string instead of failing rmcp
+    /// `Parameters` deserialization with an opaque error; `symforge_facade_tool`
+    /// then validates emptiness up front and returns a clean
+    /// `OutcomeClass::InvalidRequest` "query is required" (research D6,
+    /// contracts/engine-and-surface.md §3c).
+    #[serde(default)]
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<IntentBucket>,
@@ -83,6 +90,25 @@ pub struct StelRequest {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
+    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias for the
+    /// underlying cross-project reads. Mutually exclusive with `projects`; must be
+    /// a project id/alias, never a path. Omitting both keeps today's active-project
+    /// behavior. Surface parity only (Principle VII): the compact facade carries
+    /// the param but does not yet route it into its planned read steps — direct
+    /// `search_symbols`/`search_text`/`find_references` are the Phase 3 vehicle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
+    /// id/alias, or `["*"]` for all. Mutually exclusive with `project`; an empty
+    /// list is rejected. Daemon-only; surface parity only (see `project`).
+    // `#[schemars(with = "Vec<String>")]` keeps this as a plain `type: "array"`
+    // schema, NOT a `type: ["array", "null"]` union that strict MCP clients
+    // reject (enforced by `tests/strict_client_schema_compat.rs`); serde keeps the
+    // field optional. Kept as a plain comment (not a doc line) so it does not
+    // bloat the budget-constrained compact `symforge` schema description (A-025/H1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>")]
+    pub projects: Option<Vec<String>>,
 }
 
 /// MCP call input for `symforge` — production [`StelRequest`] plus optional Phase 0 harness fields.
@@ -380,10 +406,7 @@ impl GoldenRouteRow {
         StelRequest {
             query: self.query.clone(),
             intent: self.intent.or(Some(IntentBucket::Auto)),
-            path: None,
-            symbol: None,
-            max_tokens: None,
-            preview: None,
+            ..Default::default()
         }
     }
 }
@@ -425,6 +448,8 @@ mod tests {
             symbol: None,
             max_tokens: Some(1000),
             preview: Some(false),
+            project: None,
+            projects: None,
         };
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(value["query"], "who calls hard_link");

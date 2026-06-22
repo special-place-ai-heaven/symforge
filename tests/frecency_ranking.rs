@@ -531,6 +531,8 @@ async fn symforge_find_intent_does_not_bump() {
         symbol: None,
         max_tokens: None,
         preview: None,
+        project: None,
+        projects: None,
     };
     let params = serde_json::to_value(symforge::stel::SymforgeCallInput {
         request,

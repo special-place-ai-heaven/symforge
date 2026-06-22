@@ -19,6 +19,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::live_index::view::{BaseKey, CommitId, IndexBase, Targets, WorkingSet};
 use crate::live_index::{self, SharedIndex};
 use crate::paths;
 use crate::protocol::SymForgeServer;
@@ -111,6 +112,27 @@ pub struct DaemonSessionClient {
 
 pub struct DaemonState {
     next_session_id: AtomicU64,
+    // LOCK ORDER (Feature 012): `bases` -> `projects` -> `sessions`.
+    // Acquire only DOWNWARD; never acquire an earlier lock while holding a later
+    // one. The pre-012 rule was `projects` -> `sessions` (see `close_session`,
+    // `index_folder_for_session`, `session_runtime`); 012 prepends `bases` at the
+    // top because base interning (`intern_base`) may run just before a project
+    // insert. `intern_base` itself acquires ONLY `bases` and touches no other
+    // lock, so call sites stay free to order the rest. Per-session `working_set`
+    // is an `Arc<RwLock<WorkingSet>>` OUTSIDE this hierarchy (its own lock, never
+    // held across a daemon-map lock), so it cannot participate in an inversion.
+    /// Per-daemon base intern table (Feature 012). Equal `(canonical_root,
+    /// commit)` keys MUST share ONE `Arc<IndexBase>` (SC-002): `intern_base`
+    /// returns the existing Arc on a key hit and only mints a new base (drawing a
+    /// generation from `base_generation_seq`) on a miss. Phase 0/1: populated on
+    /// project load/activate and seeded into per-session working sets, but no
+    /// query route reads it yet (cross-project routing is Phase 2/3).
+    bases: RwLock<HashMap<BaseKey, Arc<IndexBase>>>,
+    /// Monotonic source of `base_generation` fence tokens, minted only when
+    /// `intern_base` publishes a NEW base. Starts at 1; a shared (interned) base
+    /// keeps its original generation, so this is strictly increasing across
+    /// distinct published bases (the D2 fence the engine asserts on).
+    base_generation_seq: AtomicU64,
     projects: RwLock<HashMap<String, ProjectInstance>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
@@ -156,7 +178,21 @@ struct ProjectInstance {
 
 struct SessionRecord {
     session_id: String,
-    project_id: String,
+    /// The single active project this session resolves to (Feature 012: renamed
+    /// from `project_id`). `session_runtime` resolves the one active project via
+    /// this id, so single-project behavior is unchanged. Phases 2/3 will let a
+    /// session hold MULTIPLE projects in `working_set` with this field naming the
+    /// active/bound one; for Phase 0/1 it is the sole project, byte-for-byte the
+    /// prior `project_id`.
+    active_project_id: String,
+    /// Per-session copy-on-write working set (Feature 012, Phase 1). Seeded on
+    /// open with a SINGLE entry — the active project + its interned shared base +
+    /// an EMPTY overlay — and INERT: no query route reads it yet (Phase 2/3) and
+    /// NO code path writes into its overlay (the no-overlay-writes invariant that
+    /// keeps Principle I airtight). `Arc<RwLock>` is mandatory: `SessionRecord` is
+    /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
+    /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
+    working_set: Arc<RwLock<WorkingSet>>,
     client_name: String,
     pid: Option<u32>,
     opened_at: SystemTime,
@@ -168,7 +204,9 @@ impl Clone for SessionRecord {
     fn clone(&self) -> Self {
         Self {
             session_id: self.session_id.clone(),
-            project_id: self.project_id.clone(),
+            active_project_id: self.active_project_id.clone(),
+            // Share the SAME working-set lock across clones (O(1), singular state).
+            working_set: Arc::clone(&self.working_set),
             client_name: self.client_name.clone(),
             pid: self.pid,
             opened_at: self.opened_at,
@@ -539,6 +577,14 @@ struct SessionRuntime {
     symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
     /// Cached `SymForgeServer` clone — cheap because all inner state is `Arc`-wrapped.
     server: SymForgeServer,
+    /// Feature 012 (Phase 3): the session's working set, shared by `Arc` so the
+    /// cross-project read route (`search_symbols`/`search_text`/`find_references`
+    /// with `project`/`projects`) can read the open projects directly. The single
+    /// active-project path NEVER reads this (it dispatches to `server` as before),
+    /// so single-project behavior is byte-identical. No overlay is written. The
+    /// active project's id for the targeting contract is `project_id` above (the
+    /// default target when neither `project` nor `projects` is supplied).
+    working_set: Arc<RwLock<WorkingSet>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +607,8 @@ impl DaemonState {
     fn with_token(auth_token: String) -> Self {
         Self {
             next_session_id: AtomicU64::new(1),
+            bases: RwLock::new(HashMap::new()),
+            base_generation_seq: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
@@ -569,11 +617,56 @@ impl DaemonState {
         }
     }
 
+    /// Intern `candidate` into the per-daemon base table, enforcing SC-002 (Feature
+    /// 012, Phase 0). Returns the SHARED `Arc<IndexBase>` for the candidate's
+    /// [`BaseKey`]: the existing allocation when an equal key is already present
+    /// (so two consumers at the same `(root, commit)` share ONE base, verified by
+    /// `Arc::ptr_eq`), otherwise the candidate re-stamped with a freshly minted
+    /// monotonic `base_generation` and published.
+    ///
+    /// LOCK ORDER: acquires ONLY `bases` (the top of the `bases -> projects ->
+    /// sessions` hierarchy) and touches no other daemon lock, so callers remain
+    /// free to acquire `projects`/`sessions` afterwards without risking an
+    /// inversion. Never call this while holding `projects` or `sessions`.
+    fn intern_base(&self, candidate: Arc<IndexBase>) -> Arc<IndexBase> {
+        let mut bases = self.bases.write();
+        if let Some(existing) = bases.get(&candidate.key) {
+            return Arc::clone(existing);
+        }
+        // Miss: re-stamp with the authoritative monotonic generation, then publish.
+        // `IndexBase: Clone` is cheap (it clones the `Arc<LiveIndex>` handle, never
+        // the file map), and the candidate is the sole owner here.
+        let generation = self.base_generation_seq.fetch_add(1, Ordering::Relaxed);
+        let mut published = (*candidate).clone();
+        published.base_generation = generation;
+        let published = Arc::new(published);
+        bases.insert(published.key.clone(), Arc::clone(&published));
+        published
+    }
+
+    /// Intern the base for `project_id` if the project is currently loaded
+    /// (Feature 012, Phase 0). Reads the project under `projects.read()` to build
+    /// the candidate base, releases that lock, then interns under `bases.write()`.
+    ///
+    /// LOCK ORDER NOTE: this takes `projects` THEN `bases`, which is the REVERSE
+    /// of the declared `bases -> projects` order. It is safe ONLY because the two
+    /// guards never overlap — the `projects` read guard is dropped at the end of
+    /// the inner block BEFORE `intern_base` acquires `bases`. The hierarchy
+    /// forbids HOLDING `projects` while acquiring `bases`, not acquiring them in
+    /// sequence with no overlap. Returns `None` if the project is not loaded.
+    fn intern_base_for_project(&self, project_id: &str) -> Option<Arc<IndexBase>> {
+        let candidate = {
+            let projects = self.projects.read();
+            projects.get(project_id).map(ProjectInstance::base)
+        }; // projects read guard dropped here, before bases.write() below
+        candidate.map(|candidate| self.intern_base(candidate))
+    }
+
     fn register_session_for_existing_project(
         &self,
         project_id: &str,
         request: &OpenProjectRequest,
-        _canonical_root: &Path,
+        canonical_root: &Path,
     ) -> anyhow::Result<OpenProjectResponse> {
         let session_id = format!(
             "session-{}",
@@ -581,14 +674,27 @@ impl DaemonState {
         );
         let now = SystemTime::now();
 
+        // D17 (atomic open, fail-never): ensure the project EXISTS and register
+        // this session's id under a SINGLE `projects.write()` hold, so a
+        // concurrent `close_session` cannot reap the project in a
+        // check-then-register window. If a concurrent close removed it between
+        // `open_project_session`'s probe and here, RECOVER by reloading +
+        // activating under the held write lock (rare path; load-under-lock is
+        // acceptable and is what makes open fail-never) instead of bailing
+        // "was removed between check and session registration". Once our
+        // `session_ids` entry is in, close will not reap the project.
         let (project_name, canonical_root_text, session_count) = {
             let mut projects = self.projects.write();
-            let project = projects.get_mut(project_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "project {} was removed between check and session registration",
-                    project_id
-                )
-            })?;
+            if !projects.contains_key(project_id) {
+                let mut reloaded = ProjectInstance::load(canonical_root)?;
+                if reloaded.activation_state == ActivationState::Inactive {
+                    reloaded.activate();
+                }
+                projects.insert(project_id.to_string(), reloaded);
+            }
+            let project = projects
+                .get_mut(project_id)
+                .expect("project present: inserted above under this same write lock when absent");
             project.session_ids.insert(session_id.clone());
             (
                 project.project_name.clone(),
@@ -597,9 +703,26 @@ impl DaemonState {
             )
         };
 
+        // Intern the base AFTER the project is guaranteed present and the session
+        // is registered. `bases -> projects -> sessions` order holds: `bases` is
+        // acquired (inside `intern_base_for_project`) only after the
+        // `projects.write()` above is released, never while another daemon lock is
+        // held. Our `session_ids` entry already pins the project, so it cannot
+        // vanish during interning. Seed the session's working set with ONE entry:
+        // the active project, its interned shared base, and an EMPTY overlay
+        // (Phase 1, no-overlay-writes invariant). If interning returns `None` the
+        // working set stays empty and `session_runtime` still resolves via
+        // `active_project_id`, so behavior is unchanged.
+        let base = self.intern_base_for_project(project_id);
+        let mut working_set = WorkingSet::new();
+        if let Some(base) = base {
+            working_set.add(project_id.to_string(), base);
+        }
+
         let session = SessionRecord {
             session_id: session_id.clone(),
-            project_id: project_id.to_string(),
+            active_project_id: project_id.to_string(),
+            working_set: Arc::new(RwLock::new(working_set)),
             client_name: request.client_name.clone(),
             pid: request.pid,
             opened_at: now,
@@ -692,66 +815,76 @@ impl DaemonState {
 
     pub fn close_session(&self, session_id: &str) -> Option<CloseSessionResponse> {
         // Lock ordering: projects write first, then sessions write.
-        // Scan all projects instead of relying on session.project_id,
-        // which can be stale if index_folder_for_session reassigned concurrently.
-        let mut project_removed = false;
-        let (project_id, remaining_sessions) = {
-            let mut projects = self.projects.write();
-            let owning_project_id = projects
-                .iter()
-                .find(|(_, project)| project.session_ids.contains(session_id))
-                .map(|(id, _)| id.clone());
+        // Scan ALL projects instead of relying on session.project_id, which can be
+        // stale if index_folder_for_session reassigned concurrently.
+        //
+        // Feature 012 (Phase 2): a session may now reference MORE THAN ONE project
+        // (the active one plus any additively-opened ones in its working set), so
+        // closing it must detach the session from EVERY project that lists it and
+        // tear down each whose `session_ids` then empties — not just the first
+        // match. Leaving an additively-opened project's `session_ids` pointing at a
+        // closed session would leak the project forever. The reported `project_id`
+        // / `remaining_sessions` / `project_removed` describe the session's ACTIVE
+        // project (its primary association), preserving the wire contract; sibling
+        // additive projects are reaped silently.
+        let active_project_id = self
+            .sessions
+            .read()
+            .get(session_id)
+            .map(|s| s.active_project_id.clone());
 
-            match owning_project_id {
-                Some(pid) => {
+        let mut active_remaining = 0usize;
+        let mut active_removed = false;
+        let mut active_pid_seen = false;
+        {
+            let mut projects = self.projects.write();
+            // All projects that list this session (active + additive siblings).
+            let owning: Vec<String> = projects
+                .iter()
+                .filter(|(_, project)| project.session_ids.contains(session_id))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for pid in owning {
+                let is_active = active_project_id.as_deref() == Some(pid.as_str());
+                let remaining = {
                     let Some(project) = projects.get_mut(&pid) else {
-                        tracing::warn!(
-                            project_id = %pid,
-                            session_id,
-                            "daemon close observed stale owning project; returning orphan close response"
-                        );
-                        let session = self.sessions.write().remove(session_id)?;
-                        return Some(CloseSessionResponse {
-                            session_id: session.session_id,
-                            project_id: "orphan".to_string(),
-                            remaining_sessions: 0,
-                            project_removed: false,
-                        });
+                        continue;
                     };
                     project.session_ids.remove(session_id);
-                    let remaining = project.session_ids.len();
-                    if remaining == 0 {
-                        if let Some(mut removed) = projects.remove(&pid) {
-                            abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
-                        }
-                        project_removed = true;
+                    project.session_ids.len()
+                };
+                let removed = if remaining == 0 {
+                    if let Some(mut removed) = projects.remove(&pid) {
+                        abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
                     }
-                    (pid, remaining)
-                }
-                None => {
-                    // Session not found in any project -- it was never registered under
-                    // a project or its project was already removed. Clean up the session
-                    // record only. We return "orphan" as the project_id because
-                    // session.project_id may be stale (set at open time and never
-                    // updated if index_folder_for_session later reassigned it).
-                    let session = self.sessions.write().remove(session_id)?;
-                    return Some(CloseSessionResponse {
-                        session_id: session.session_id,
-                        project_id: "orphan".to_string(),
-                        remaining_sessions: 0,
-                        project_removed: false,
-                    });
+                    true
+                } else {
+                    false
+                };
+                if is_active {
+                    active_pid_seen = true;
+                    active_remaining = remaining;
+                    active_removed = removed;
                 }
             }
-        };
+        }
 
         let session = self.sessions.write().remove(session_id)?;
+
+        // If the session referenced no project, or its active project was already
+        // gone (e.g. concurrent reassignment), report an orphan close — the
+        // session record is still cleaned up above.
+        let project_id = match (active_project_id, active_pid_seen) {
+            (Some(pid), true) => pid,
+            _ => "orphan".to_string(),
+        };
 
         Some(CloseSessionResponse {
             session_id: session.session_id,
             project_id,
-            remaining_sessions,
-            project_removed,
+            remaining_sessions: active_remaining,
+            project_removed: active_removed,
         })
     }
 
@@ -801,7 +934,7 @@ impl DaemonState {
             .filter_map(|session_id| sessions.get(session_id))
             .map(|session| SessionSummary {
                 session_id: session.session_id.clone(),
-                project_id: session.project_id.clone(),
+                project_id: session.active_project_id.clone(),
                 client_name: session.client_name.clone(),
                 pid: session.pid,
                 opened_at_unix_secs: unix_seconds(session.opened_at),
@@ -838,6 +971,17 @@ impl DaemonState {
             ));
         }
         let target_project_id = project_key(&target_root);
+
+        // Feature 012 (Phase 2): ADDITIVE open. A NEW code path, distinct from
+        // the destructive `needs_reassign` retarget below: it adds `target_root`
+        // as a SECOND project in the session's working set (intern its base, join
+        // `session_ids` additively, `working_set.add(..)`) WITHOUT evicting the
+        // current project or changing `active_project_id`. This is what enables
+        // cross-project reads (Phase 3). No overlay is written (invariant).
+        if input.add == Some(true) {
+            return self.index_folder_additive(session_id, &target_project_id, &target_root);
+        }
+
         let current_session_root = {
             let projects = self.projects.read();
             let sessions = self.sessions.read();
@@ -845,7 +989,7 @@ impl DaemonState {
                 .get(session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
             projects
-                .get(&session.project_id)
+                .get(&session.active_project_id)
                 .map(|project| project.canonical_root.clone())
         };
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
@@ -876,7 +1020,7 @@ impl DaemonState {
                 let sessions = self.sessions.read();
                 sessions
                     .get(session_id)
-                    .map(|s| s.project_id.clone())
+                    .map(|s| s.active_project_id.clone())
                     .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?
             };
             let needs_reassign = current_project_id != target_project_id;
@@ -930,11 +1074,38 @@ impl DaemonState {
 
         // Update the session's project association *after* the projects lock is
         // released to maintain lock order (projects before sessions everywhere).
-        if needs_reassign && let Some(session) = self.sessions.write().get_mut(session_id) {
-            session.project_id = target_project_id;
-            session
-                .last_seen_at
-                .store(now_epoch_millis(), Ordering::Relaxed);
+        if needs_reassign {
+            // Feature 012 (Phase 2) — CLOSE THE RETARGET SEAM. Phase 0/1 updated
+            // ONLY `active_project_id`, leaving the seeded `working_set` entry
+            // pointing at the pre-retarget (now-evicted) project, so the working
+            // set was inconsistent with the active project. Now that Phase 3
+            // reads the working set, re-seed it: swap the OLD active entry for the
+            // freshly retargeted project + its interned base + a fresh EMPTY
+            // overlay. Additively-opened sibling projects (if any) are left
+            // intact — retarget only swaps the ACTIVE slot. The base is interned
+            // FIRST, holding no session lock (`intern_base_for_project` takes
+            // `projects` then `bases` with no overlap), then applied under
+            // `sessions.write()`. No overlay is written (invariant).
+            let new_base = self.intern_base_for_project(&target_project_id);
+            if let Some(session) = self.sessions.write().get_mut(session_id) {
+                let old_active =
+                    std::mem::replace(&mut session.active_project_id, target_project_id.clone());
+                if let Some(base) = new_base {
+                    let mut working_set = session.working_set.write();
+                    // Drop the stale active entry (its project was evicted on the
+                    // retarget) before adding the new active project. If `add`
+                    // already holds an entry for `target_project_id` (an additive
+                    // open that we are now promoting to active), it is replaced
+                    // with a fresh overlay — still single-overlay, still empty.
+                    if old_active != target_project_id {
+                        working_set.remove(&old_active);
+                    }
+                    working_set.add(target_project_id.clone(), base);
+                }
+                session
+                    .last_seen_at
+                    .store(now_epoch_millis(), Ordering::Relaxed);
+            }
         }
 
         let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
@@ -948,24 +1119,199 @@ impl DaemonState {
         Ok(output)
     }
 
+    /// Feature 012 (Phase 2): the ADDITIVE `index_folder(add:true)` code path.
+    ///
+    /// Opens `target_root` as an ADDITIONAL project in `session_id`'s working set
+    /// without retargeting: the session keeps its active project and gains this
+    /// one, so a later cross-project read can target both. Concretely it
+    /// (1) loads+activates the target project if not already loaded and joins the
+    /// session to it additively (no evict, no `active_project_id` change), then
+    /// (2) interns the target base and `working_set.add(..)`s it with a fresh
+    /// EMPTY overlay. Re-adding an already-open project re-indexes it and refreshes
+    /// its working-set entry (fresh empty overlay) — idempotent at the open level.
+    ///
+    /// LOCK ORDER (`bases -> projects -> sessions`): the `projects` write guard is
+    /// fully released before `intern_base_for_project` (which takes `projects`
+    /// then `bases` with no overlap) and before `sessions.write()`. No overlay is
+    /// written (invariant). No idempotency-key replay here — additive opens are
+    /// not part of the retarget replay ledger.
+    fn index_folder_additive(
+        &self,
+        session_id: &str,
+        target_project_id: &str,
+        target_root: &Path,
+    ) -> anyhow::Result<String> {
+        // (1) Load/activate the target project if absent and join the session to
+        // it additively, then reload to index the current tree. All project-map
+        // mutation is scoped to this block so the write guard is released before
+        // we touch `bases`/`sessions` below (lock order).
+        let (file_count, symbol_count) = {
+            let mut projects = self.projects.write();
+
+            // Confirm the session exists (fail loud on an unknown session) under
+            // the same projects guard ordering used elsewhere.
+            {
+                let sessions = self.sessions.read();
+                if !sessions.contains_key(session_id) {
+                    return Err(anyhow::anyhow!("unknown session '{session_id}'"));
+                }
+            }
+
+            if !projects.contains_key(target_project_id) {
+                let mut project = ProjectInstance::load(target_root)?;
+                debug_assert_eq!(
+                    project.activation_state,
+                    ActivationState::Inactive,
+                    "freshly loaded project must be Inactive"
+                );
+                project.activate();
+                projects.insert(target_project_id.to_string(), project);
+            }
+
+            let target_project = projects
+                .get_mut(target_project_id)
+                .ok_or_else(|| anyhow::anyhow!("missing target project after load"))?;
+            // Additive join: the session now references this project too.
+            target_project.session_ids.insert(session_id.to_string());
+            target_project.reload(target_root)?
+        }; // projects write guard released here
+
+        // (2) Attach the freshly-indexed project to the session's working set
+        // (intern base under `bases`, join session_ids, add a fresh EMPTY overlay)
+        // via the shared `add_project_to_session` helper — same lock order, one
+        // implementation of the attach step.
+        if !self.add_project_to_session(session_id, target_project_id) {
+            return Err(anyhow::anyhow!(
+                "failed to attach project to session working set after additive load"
+            ));
+        }
+
+        Ok(format!(
+            "Indexed {file_count} files, {symbol_count} symbols (added to working set)."
+        ))
+    }
+
+    /// Feature 012 (Phase 2): add an already-loaded project to a session's working
+    /// set as an additional, non-active project. Returns `false` if the session or
+    /// the project is unknown. The base is interned FIRST (no session lock held)
+    /// to preserve the `bases -> projects -> sessions` order; a fresh EMPTY overlay
+    /// is attached (no overlay write). Idempotent: re-adding refreshes the entry.
+    fn add_project_to_session(&self, session_id: &str, project_id: &str) -> bool {
+        let Some(base) = self.intern_base_for_project(project_id) else {
+            return false;
+        };
+        {
+            let mut projects = self.projects.write();
+            let Some(project) = projects.get_mut(project_id) else {
+                return false;
+            };
+            project.session_ids.insert(session_id.to_string());
+        }
+        match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                session
+                    .working_set
+                    .write()
+                    .add(project_id.to_string(), base);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Feature 012 (Phase 2): set the session's ACTIVE project to one already in
+    /// its working set. Returns `false` if the session is unknown or `project_id`
+    /// is not an open working-set entry (cannot activate a project that is not
+    /// open). Only flips `active_project_id`; the working set is untouched (the
+    /// target entry already exists). No overlay is written.
+    //
+    // ponytail: explicit working-set management seam. It has no production route
+    // yet — the DEFERRED "dedicated working-set management tool" (US-follow-up)
+    // owns wiring it to an MCP verb. Exercised by daemon unit tests today; allow
+    // dead_code so the server build (dead-code-on) stays green until that tool
+    // lands, rather than deleting a vetted, tested primitive.
+    #[allow(dead_code)]
+    fn set_active_project(&self, session_id: &str, project_id: &str) -> bool {
+        match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                let is_open = session.working_set.read().get(project_id).is_some();
+                if !is_open {
+                    return false;
+                }
+                session.active_project_id = project_id.to_string();
+                session
+                    .last_seen_at
+                    .store(now_epoch_millis(), Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Feature 012 (Phase 2): remove a project from a session's working set.
+    /// Refuses (returns `false`) to remove the ACTIVE project — the active slot
+    /// always resolves to a live working-set entry — or when the session/entry is
+    /// unknown. Also drops the session from the project's `session_ids` (and tears
+    /// the project down if that was its last session, matching retarget eviction).
+    //
+    // ponytail: companion seam to `set_active_project`; same DEFERRED working-set
+    // management tool owns its route. Tested in the daemon module; allow dead_code
+    // until the tool wires it.
+    #[allow(dead_code)]
+    fn remove_project_from_session(&self, session_id: &str, project_id: &str) -> bool {
+        // First detach from the working set, refusing the active project.
+        let removed = match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                if session.active_project_id == project_id {
+                    return false;
+                }
+                let mut working_set = session.working_set.write();
+                working_set.remove(project_id).is_some()
+            }
+            None => false,
+        };
+        if !removed {
+            return false;
+        }
+        // Detach the session from the project; tear the project down if this was
+        // its last session (mirrors the retarget eviction in
+        // `index_folder_for_session`).
+        let mut projects = self.projects.write();
+        if let Some(project) = projects.get_mut(project_id) {
+            project.session_ids.remove(session_id);
+            if project.session_ids.is_empty()
+                && let Some(mut evicted) = projects.remove(project_id)
+            {
+                abort_watcher_task(&mut evicted.watcher_task, &evicted.stop_token);
+            }
+        }
+        true
+    }
+
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
         // Acquire projects read lock BEFORE sessions read lock so that
-        // the project_id we read from the session is still valid while
-        // we look it up in the projects map.
+        // the active_project_id we read from the session is still valid while
+        // we look it up in the projects map. (Lock order: projects -> sessions;
+        // `bases` is not taken here.) Feature 012: resolution is via
+        // `active_project_id` — the single active project — so the single-project
+        // path is byte-for-byte unchanged. Phase 3 ALSO carries the session's
+        // `working_set` handle (an `Arc` clone, O(1)) so the cross-project read
+        // route can read it; the single-active path never touches it.
         let projects = self.projects.read();
         let session = {
             let sessions = self.sessions.read();
             sessions.get(session_id)?.clone()
         };
-        let project = projects.get(&session.project_id)?;
+        let project = projects.get(&session.active_project_id)?;
         Some(SessionRuntime {
             canonical_root: project.canonical_root.clone(),
-            project_id: session.project_id.clone(),
+            project_id: session.active_project_id.clone(),
             session_id: session.session_id.clone(),
             index: Arc::clone(&project.index),
             token_stats: Arc::clone(&project.token_stats),
             symbol_cache: Arc::clone(&project.symbol_cache),
             server: project.server.clone(),
+            working_set: Arc::clone(&session.working_set),
         })
     }
 
@@ -1697,6 +2043,40 @@ impl ProjectInstance {
         })
     }
 
+    /// Build a candidate [`IndexBase`] for this project (Feature 012, Phase 0).
+    ///
+    /// Wraps the project's CURRENT published snapshot (`index.read()` ->
+    /// `Arc<LiveIndex>`, the SAME shared handle the project already serves, so no
+    /// second store and no `LiveIndex` change — Principle I) with a sharable
+    /// [`BaseKey`] = `(canonical_root, commit)`. `commit` is the git HEAD sha for
+    /// the root, or [`CommitId::Dirtyless`] when the root is not a git repository
+    /// (so a non-git tree still has a stable, shareable identity).
+    ///
+    /// STALENESS: the captured `Arc<LiveIndex>` is a SNAPSHOT frozen at this
+    /// instant. Once interned, the watcher's later `ArcSwap` reloads (this project
+    /// re-indexing files that changed on disk) do NOT rewrite the interned handle,
+    /// so a cross-project read off the interned base goes stale after ANY
+    /// watcher-picked-up change — not only after a git commit. See
+    /// [`crate::live_index::view::IndexBase::index`]. Re-interning on
+    /// watcher-observed change (live-freshness rebase) is the deferred Phase 4.
+    ///
+    /// The returned base carries `base_generation = 1` (the start value). This is
+    /// a CANDIDATE only: [`DaemonState::intern_base`] is the authority on
+    /// generation and identity. On an intern cache hit it returns the EXISTING
+    /// shared `Arc<IndexBase>` (SC-002) and discards this candidate; on a miss it
+    /// re-stamps the generation from the daemon's monotonic sequence before
+    /// publishing. Callers should therefore route every base through
+    /// `intern_base` rather than using this value directly.
+    fn base(&self) -> Arc<IndexBase> {
+        let index = Arc::clone(&self.index.read());
+        let commit = match crate::git::head_sha(&self.canonical_root) {
+            Ok(sha) => CommitId::Sha(sha),
+            Err(_) => CommitId::Dirtyless,
+        };
+        let key = BaseKey::new(self.canonical_root.clone(), commit);
+        Arc::new(IndexBase::new(key, index, 1))
+    }
+
     /// Activate background tasks (watcher + git temporal) for this project.
     /// Must only be called once, on an `Inactive` instance, after the caller
     /// has committed the instance into the project map under write-lock.
@@ -2284,12 +2664,574 @@ async fn close_session_handler(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Feature 012 (Phase 3): resolve the cross-project `project` / `projects`
+/// params into a [`Targets`] selector, enforcing the surface contract.
+///
+/// CONTRACT (FR-004 / SC-001):
+/// * BOTH omitted -> `One(active_project_id)` -> today's exact single-project
+///   behavior (the caller dispatches it down the unchanged per-project path).
+/// * `project` AND `projects` both set -> error (mutually exclusive).
+/// * `projects: []` -> error (no silent "all"; `["*"]` is the explicit all).
+/// * `projects: ["*"]` -> `All`.
+/// * `project` containing a path separator -> corrective error (targets key on
+///   project id/alias, NEVER a filesystem path).
+/// * `project: id` -> `One(id)`; `projects: [ids..]` -> `Subset(ids)`.
+///
+/// Returns `Err(message)` for any contract violation; the message is surfaced to
+/// the caller as an `InvalidRequest`-class tool response.
+fn resolve_targets(
+    project: Option<&str>,
+    projects: Option<&[String]>,
+    active_project_id: &str,
+) -> Result<Targets, String> {
+    match (project, projects) {
+        (Some(_), Some(_)) => Err(
+            "project and projects are mutually exclusive: pass exactly one (a single \
+             id in `project`, or a list/`[\"*\"]` in `projects`)."
+                .to_string(),
+        ),
+        (Some(id), None) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err("project must be a non-empty project id/alias.".to_string());
+            }
+            // Target keys on project id/alias, NEVER a filesystem path. A path
+            // here is a usage mistake -> corrective error pointing at the open
+            // verb. `project-<hash>` ids and aliases never contain separators.
+            if id.contains('/') || id.contains('\\') {
+                return Err(format!(
+                    "project must be a project id/alias, not a filesystem path ('{id}'). \
+                     Open the folder first with index_folder(path=\"{id}\", add=true), \
+                     then target it by its returned project id."
+                ));
+            }
+            Ok(Targets::One(id.to_string()))
+        }
+        (None, Some(list)) => {
+            if list.is_empty() {
+                return Err(
+                    "projects must not be empty: pass [\"*\"] for all open projects or an \
+                     explicit list of project ids."
+                        .to_string(),
+                );
+            }
+            // Trim every entry before matching (symmetry with the single `project`
+            // branch, which trims): leading/trailing whitespace must not defeat
+            // the `*` check, the path-separator guard, or id equality.
+            let trimmed: Vec<&str> = list.iter().map(|id| id.trim()).collect();
+            if trimmed.iter().any(|id| id.is_empty()) {
+                return Err(
+                    "projects entries must be non-empty project ids/aliases (blank entry found)."
+                        .to_string(),
+                );
+            }
+            if trimmed.contains(&"*") {
+                // Any `*` in the list means "all open projects".
+                return Ok(Targets::All);
+            }
+            for id in &trimmed {
+                if id.contains('/') || id.contains('\\') {
+                    return Err(format!(
+                        "projects entries must be project ids/aliases, not filesystem paths \
+                         ('{id}'). Open the folder first with \
+                         index_folder(path=\"{id}\", add=true)."
+                    ));
+                }
+            }
+            // Dedup the subset's ids (order-preserving): a duplicate id would
+            // otherwise render a second bogus `── project: <id> ──` header for the
+            // same project. `Targets::selects` is membership, so dedup is purely a
+            // rendering-honesty fix, not a behavior change.
+            let mut seen = std::collections::HashSet::new();
+            let deduped: Vec<String> = trimmed
+                .into_iter()
+                .filter(|id| seen.insert(id.to_string()))
+                .map(|id| id.to_string())
+                .collect();
+            Ok(Targets::Subset(deduped))
+        }
+        (None, None) => Ok(Targets::One(active_project_id.to_string())),
+    }
+}
+
+/// Whether `targets` resolves to exactly the single active project — the
+/// no-regression fast path that dispatches down the UNCHANGED per-project route
+/// (byte-identical to pre-012). Any other shape (`Subset`, `All`, or a single
+/// NON-active project) is a cross-project read served from the working set.
+fn targets_is_single_active(targets: &Targets, active_project_id: &str) -> bool {
+    matches!(targets, Targets::One(id) if id == active_project_id)
+}
+
+/// Validate that every explicitly-named target is actually OPEN in the working
+/// set, returning a clear "project not open" error otherwise (FR-004). `All`
+/// needs no check (it selects whatever is open). Unknown ids are a usage error,
+/// not a silent empty result.
+fn ensure_targets_open(targets: &Targets, working_set: &WorkingSet) -> Result<(), String> {
+    let missing: Vec<&String> = match targets {
+        Targets::One(id) => {
+            if working_set.get(id).is_none() {
+                vec![id]
+            } else {
+                Vec::new()
+            }
+        }
+        Targets::Subset(ids) => ids
+            .iter()
+            .filter(|id| working_set.get(id).is_none())
+            .collect(),
+        Targets::All => Vec::new(),
+    };
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "project not open: {}. Open it in this session first with \
+             index_folder(path=..., add=true), then retarget.",
+            missing
+                .iter()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+/// Default cap on the TOTAL number of rendered hits a cross-project read emits
+/// across all targeted projects when the caller passes no `limit`. The
+/// single-project paths bound themselves (search_symbols default 50, references
+/// 20, text 50); the cross-project path fans out over N projects, so without a
+/// shared cap a `projects:["*"]` query over many large projects could emit an
+/// unbounded result. 200 is generous for a multi-project view yet hard-bounds the
+/// output. The caller's `limit` overrides this (clamped to the hard ceiling).
+const CROSS_PROJECT_DEFAULT_RESULT_CAP: usize = 200;
+
+/// Absolute ceiling on the cross-project total hit count, even when the caller
+/// passes a large `limit`. A cross-project read must never blow up the result no
+/// matter what `limit` is requested.
+const CROSS_PROJECT_MAX_RESULT_CAP: usize = 1000;
+
+/// Resolve the effective total-hit cap for a cross-project read from the caller's
+/// optional `limit`: `None` -> the default cap; `Some(l)` -> `l` clamped to
+/// `[1, CROSS_PROJECT_MAX_RESULT_CAP]` (a zero or absurd limit cannot disable the
+/// bound).
+fn cross_project_result_cap(limit: Option<u32>) -> usize {
+    match limit {
+        Some(l) => (l as usize).clamp(1, CROSS_PROJECT_MAX_RESULT_CAP),
+        None => CROSS_PROJECT_DEFAULT_RESULT_CAP,
+    }
+}
+
+/// Apply the caller's optional `max_tokens` budget to an already-assembled
+/// cross-project body, truncating at a line boundary and DISCLOSING the
+/// truncation honestly (Principle III). Uses the project-wide ~4-bytes/token
+/// approximation that the other budgeted formatters use. A `None` or zero budget
+/// is a no-op. Returns the (possibly truncated) body.
+fn apply_cross_project_token_budget(body: String, max_tokens: Option<u64>) -> String {
+    let Some(max_tokens) = max_tokens.filter(|t| *t > 0) else {
+        return body;
+    };
+    let max_bytes = (max_tokens as usize).saturating_mul(4);
+    if max_bytes == 0 || body.len() <= max_bytes {
+        return body;
+    }
+    // Truncate at the last newline that fits the byte budget so we never emit a
+    // half-line, then disclose that the body was cut by the token budget. We scan
+    // newline byte offsets directly (UTF-8 safe: `\n` is a single byte and never a
+    // continuation byte, so `idx <= max_bytes` is always a valid char boundary —
+    // no panic on multibyte match lines).
+    let cut_end = body
+        .bytes()
+        .enumerate()
+        .filter(|&(idx, b)| b == b'\n' && idx < max_bytes)
+        .map(|(idx, _)| idx + 1)
+        .next_back();
+    let mut truncated = match cut_end {
+        Some(end) => body[..end].to_string(),
+        None => String::new(),
+    };
+    truncated.push_str(&format!(
+        "... (truncated to fit max_tokens={max_tokens}; cross-project output is \
+         token-bounded — raise max_tokens or query a single project for the full set)\n"
+    ));
+    truncated
+}
+
+/// Honest refusal of the DEFERRED per-project derived-index scoping when combined
+/// with cross-project targeting (Principle VII). The cross-project read serves
+/// from each project's interned base via the overlay-aware `WorkingSet` search,
+/// which does NOT honor the per-project derived-index scoping params
+/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
+/// Rather than silently ignore such a param (handing back results that look
+/// scoped but are not), return a clear error naming the offending param. Returns
+/// `Err(message)` for the FIRST unsupported scoping param present, else `Ok(())`.
+///
+/// `kind` (symbol/reference kind filter) IS honored cross-project and is NOT
+/// rejected here; only the deferred derived-index scoping is refused.
+fn reject_unsupported_cross_project_scoping(
+    tool_name: &str,
+    params: &serde_json::Value,
+) -> anyhow::Result<()> {
+    fn refuse(param: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "{param} scoping is not supported with cross-project targeting; \
+             query a single project for scoped results."
+        );
+    }
+    // A lenient peek of ONLY the deferred scoping fields; unrelated/invalid
+    // sibling fields must not make this check fail (the real decode happens in
+    // the per-tool branch). `null`/absent fields deserialize to `None`.
+    #[derive(serde::Deserialize, Default)]
+    struct ScopePeek {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        path_prefix: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
+        #[serde(default)]
+        symbol_kind: Option<String>,
+        #[serde(default)]
+        direction: Option<String>,
+        #[serde(default)]
+        structural: Option<bool>,
+    }
+    let peek: ScopePeek = serde_json::from_value(params.clone()).unwrap_or_default();
+    let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+    match tool_name {
+        "search_symbols" => {
+            if present(&peek.path_prefix) {
+                return refuse("path_prefix");
+            }
+            if present(&peek.language) {
+                return refuse("language");
+            }
+        }
+        "search_text" => {
+            if present(&peek.path_prefix) {
+                return refuse("path_prefix");
+            }
+            if present(&peek.language) {
+                return refuse("language");
+            }
+            if peek.structural == Some(true) {
+                return refuse("structural");
+            }
+        }
+        "find_references" => {
+            if present(&peek.path) {
+                return refuse("path");
+            }
+            if present(&peek.symbol_kind) {
+                return refuse("symbol_kind");
+            }
+            if present(&peek.direction) {
+                return refuse("direction");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
+/// against the session's working set and format the attributed [`ProjectHit`]
+/// results with `── project: <id> ──` section headers (flat, no header, when a
+/// single project is targeted). This is reached ONLY when `targets` is not the
+/// single active project; the active-project path never enters here.
+///
+/// Read-only by construction: it calls the overlay-aware `WorkingSet` search
+/// methods, which never mutate an overlay (the no-overlay-writes invariant).
+///
+/// HONESTY (012 hardening): unlike the single-project path, the cross-project
+/// path does NOT honor the per-project derived-index scoping params
+/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
+/// Rather than silently drop them, every such param is REFUSED up front
+/// ([`reject_unsupported_cross_project_scoping`]). The output is also BOUNDED: a
+/// total-hit cap (caller `limit`, else [`CROSS_PROJECT_DEFAULT_RESULT_CAP`]) and
+/// the caller's optional `max_tokens` budget are applied by the formatters, which
+/// disclose any truncation.
+fn execute_cross_project_read(
+    tool_name: &str,
+    params: serde_json::Value,
+    targets: Targets,
+    working_set: &WorkingSet,
+) -> anyhow::Result<String> {
+    ensure_targets_open(&targets, working_set).map_err(|message| anyhow::anyhow!("{message}"))?;
+
+    // Honest refusal of the DEFERRED per-project derived-index scoping when
+    // combined with cross-project targeting (rather than silently dropping it).
+    reject_unsupported_cross_project_scoping(tool_name, &params)?;
+
+    // Whether to render per-project section headers: a single targeted project
+    // renders flat (one project's hits, no header); 2+ get headers.
+    let multi = match &targets {
+        Targets::One(_) => false,
+        Targets::Subset(ids) => ids.len() > 1,
+        Targets::All => working_set.len() > 1,
+    };
+
+    match tool_name {
+        "search_symbols" => {
+            let input: SearchSymbolsInput = decode_params(params)?;
+            let query = input.query.as_deref().unwrap_or("").trim();
+            if query.is_empty() {
+                anyhow::bail!(
+                    "cross-project search_symbols requires a non-empty query \
+                     (browse mode is single-project only)."
+                );
+            }
+            let cap = cross_project_result_cap(input.limit);
+            let hits = working_set.search_symbols(&targets, query, input.kind.as_deref());
+            let body = format_cross_project_symbols(&hits, query, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+        }
+        "search_text" => {
+            let input: SearchTextInput = decode_params(params)?;
+            let regex = input.regex.unwrap_or(false);
+            let cap = cross_project_result_cap(input.limit);
+            let results = working_set
+                .search_text(
+                    &targets,
+                    input.query.as_deref(),
+                    input.terms.as_deref(),
+                    regex,
+                )
+                .map_err(|error| anyhow::anyhow!("text search failed: {error:?}"))?;
+            let body = format_cross_project_text(&results, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+        }
+        "find_references" => {
+            let input: FindReferencesInput = decode_params(params)?;
+            let name = input.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("cross-project find_references requires a non-empty name.");
+            }
+            let kind_filter = match input.kind.as_deref() {
+                Some("call") => Some(crate::domain::ReferenceKind::Call),
+                Some("import") => Some(crate::domain::ReferenceKind::Import),
+                Some("type_usage") => Some(crate::domain::ReferenceKind::TypeUsage),
+                Some("macro_use") => Some(crate::domain::ReferenceKind::MacroUse),
+                Some("value_use") => Some(crate::domain::ReferenceKind::ValueUse),
+                _ => None,
+            };
+            let cap = cross_project_result_cap(input.limit);
+            let hits = working_set.find_references(&targets, name, kind_filter, false);
+            let body = format_cross_project_references(&hits, name, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+        }
+        other => anyhow::bail!("'{other}' is not a cross-project read verb"),
+    }
+}
+
+/// Format cross-project symbol hits, grouped by project (`── project: <id> ──`
+/// headers when `multi`). Within a project, hits arrive already tier-sorted from
+/// the view search.
+///
+/// BOUNDED: at most `cap` hits are rendered across all projects (the shared
+/// cross-project total cap). When `hits.len() > cap` the surplus is dropped and
+/// the truncation is disclosed honestly (Principle III) with the shown/total
+/// counts and the corrective hint. The cap is applied in working-set/tier order,
+/// so the highest-ranked hits per project survive the cut.
+fn format_cross_project_symbols(
+    hits: &[crate::live_index::view::ProjectHit<crate::live_index::view::ViewSymbolHit>],
+    query: &str,
+    multi: bool,
+    cap: usize,
+) -> String {
+    if hits.is_empty() {
+        return format!("No symbols matching '{query}' in the targeted project(s).");
+    }
+    let total = hits.len();
+    let shown = total.min(cap);
+    let mut out = String::new();
+    let mut current: Option<&str> = None;
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} matches across projects\n"));
+    }
+    for ph in hits.iter().take(shown) {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let h = &ph.hit;
+        out.push_str(&format!(
+            "  {}: {} {}  ({})\n",
+            h.line, h.kind, h.name, h.path
+        ));
+    }
+    out
+}
+
+/// Format cross-project text-search results, grouped by project. Each project's
+/// `TextSearchResult` renders its files and per-line matches.
+///
+/// BOUNDED: at most `cap` per-line matches are rendered across all files in all
+/// projects (the unbounded element here is the cumulative match-line count, not
+/// the file count). Once `cap` lines have been emitted, the rest are dropped and
+/// the truncation disclosed (shown/total + corrective hint). A project/file with
+/// no remaining budget is skipped, so headers are only emitted for content that
+/// is actually rendered.
+fn format_cross_project_text(
+    results: &[crate::live_index::view::ProjectHit<crate::live_index::search::TextSearchResult>],
+    multi: bool,
+    cap: usize,
+) -> String {
+    let total: usize = results.iter().map(|ph| ph.hit.total_matches).sum();
+    if total == 0 {
+        return "No text matches in the targeted project(s).".to_string();
+    }
+
+    // Render into a body first while counting emitted match lines, so the header
+    // can honestly state shown-vs-total once we know how many we actually wrote.
+    let mut body = String::new();
+    let mut shown = 0usize;
+    'projects: for ph in results {
+        if ph.hit.files.is_empty() {
+            continue;
+        }
+        let mut header_written = false;
+        for file in &ph.hit.files {
+            if file.matches.is_empty() {
+                continue;
+            }
+            if shown >= cap {
+                break 'projects;
+            }
+            // Emit the project header lazily, only when this project contributes
+            // at least one rendered line within budget.
+            if multi && !header_written {
+                body.push_str(&format!(
+                    "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                    ph.project_id
+                ));
+                header_written = true;
+            }
+            body.push_str(&format!("{}\n", file.path));
+            for m in &file.matches {
+                if shown >= cap {
+                    break 'projects;
+                }
+                body.push_str(&format!("  {}: {}\n", m.line_number, m.line));
+                shown += 1;
+            }
+        }
+    }
+
+    let mut out = String::new();
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} text matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} text matches across projects\n"));
+    }
+    out.push_str(&body);
+    out
+}
+
+/// Format cross-project reference hits, grouped by project.
+///
+/// BOUNDED: at most `cap` reference hits are rendered across all projects; the
+/// surplus is dropped and the truncation disclosed (shown/total + corrective
+/// hint), mirroring [`format_cross_project_symbols`].
+fn format_cross_project_references(
+    hits: &[crate::live_index::view::ProjectHit<(String, crate::domain::ReferenceRecord)>],
+    name: &str,
+    multi: bool,
+    cap: usize,
+) -> String {
+    if hits.is_empty() {
+        return format!("No references to '{name}' in the targeted project(s).");
+    }
+    let total = hits.len();
+    let shown = total.min(cap);
+    let mut out = String::new();
+    let mut current: Option<&str> = None;
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} references across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} references across projects\n"));
+    }
+    for ph in hits.iter().take(shown) {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let (path, reference) = &ph.hit;
+        // `line_range` is zero-indexed in the engine; display 1-based.
+        out.push_str(&format!(
+            "  {}:{} [{:?}] {}\n",
+            path,
+            reference.line_range.0 + 1,
+            reference.kind,
+            reference.name
+        ));
+    }
+    out
+}
+
 async fn execute_tool_call(
     runtime: SessionRuntime,
     tool_name: &str,
     params: serde_json::Value,
 ) -> anyhow::Result<String> {
     runtime.token_stats.record_tool_call(tool_name);
+
+    // Feature 012 (Phase 3): cross-project READ route. For the three read verbs
+    // ONLY, peek the `project`/`projects` params and resolve a `Targets`. When it
+    // is the single active project (the default — both params omitted — or an
+    // explicit `project=<active id>`), fall through to the UNCHANGED per-project
+    // dispatch below (byte-identical no-regression). Any other target shape
+    // (`Subset`, `All`, or a single non-active project) is served here from the
+    // session's working set with attributed `── project: <id> ──` output. Edits,
+    // analyze_file_impact, orient, and meta verbs are NEVER routed here — they
+    // stay single-project on the active project (cross-project writes deferred).
+    if matches!(
+        tool_name,
+        "search_symbols" | "search_text" | "find_references"
+    ) {
+        #[derive(serde::Deserialize)]
+        struct CrossProjectPeek {
+            #[serde(default)]
+            project: Option<String>,
+            #[serde(default)]
+            projects: Option<Vec<String>>,
+        }
+        // A lenient peek: unrelated/invalid sibling fields must NOT make the real
+        // tool call fail here, so only the two targeting fields are extracted.
+        let peek: CrossProjectPeek =
+            serde_json::from_value(params.clone()).unwrap_or(CrossProjectPeek {
+                project: None,
+                projects: None,
+            });
+        let targets = resolve_targets(
+            peek.project.as_deref(),
+            peek.projects.as_deref(),
+            &runtime.project_id,
+        )
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+        if !targets_is_single_active(&targets, &runtime.project_id) {
+            let working_set = runtime.working_set.read();
+            return execute_cross_project_read(tool_name, params, targets, &working_set);
+        }
+        // else: single active project -> fall through to the unchanged path.
+    }
 
     // Use the cached server from ProjectInstance (cloned cheaply via Arc internals)
     // instead of constructing a new SymForgeServer per tool call.
@@ -2936,6 +3878,567 @@ mod tests {
         assert_eq!(state.health().session_count, 2);
     }
 
+    /// Test-only: pull the single interned `Arc<IndexBase>` a session's working
+    /// set was seeded with (Feature 012, Phase 0/1). Panics if the session or its
+    /// seeded entry is missing — both are invariants the open path guarantees.
+    fn session_seeded_base(state: &DaemonState, session_id: &str) -> Arc<IndexBase> {
+        let sessions = state.sessions.read();
+        let session = sessions.get(session_id).expect("session present");
+        let working_set = session.working_set.read();
+        assert_eq!(
+            working_set.len(),
+            1,
+            "Phase 1 seeds exactly one working-set entry"
+        );
+        let entry = working_set
+            .get(&session.active_project_id)
+            .expect("seeded entry for the active project");
+        Arc::clone(&entry.base)
+    }
+
+    // ── Feature 012 Phase 0 — base interning shares one Arc<IndexBase> (SC-002) ──
+    #[test]
+    fn test_open_same_root_twice_shares_interned_base() {
+        let project = project_dir("symforge-daemon-base-intern");
+        let state = DaemonState::new();
+
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(11),
+            })
+            .expect("first session");
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                // Same logical root via a `.` component -> same canonical root,
+                // same BaseKey -> MUST intern to the same Arc<IndexBase>.
+                project_root: project.path().join(".").display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(22),
+            })
+            .expect("second session");
+
+        assert_eq!(
+            first.project_id, second.project_id,
+            "same canonical root -> same project"
+        );
+
+        let base_first = session_seeded_base(&state, &first.session_id);
+        let base_second = session_seeded_base(&state, &second.session_id);
+
+        // SC-002: two opens on the same (root, commit) share ONE base allocation.
+        assert!(
+            Arc::ptr_eq(&base_first, &base_second),
+            "two sessions on the same (root, commit) must share one Arc<IndexBase>"
+        );
+        // The intern table holds exactly one base for the single key.
+        assert_eq!(
+            state.bases.read().len(),
+            1,
+            "one canonical root -> one interned base"
+        );
+    }
+
+    // ── Feature 012 Phase 0 — distinct roots intern distinct bases ──────────────
+    #[test]
+    fn test_open_distinct_roots_intern_distinct_bases() {
+        let project_a = project_dir("symforge-daemon-base-distinct-a");
+        let project_b = project_dir("symforge-daemon-base-distinct-b");
+        let state = DaemonState::new();
+
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("project a session");
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_b.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: None,
+            })
+            .expect("project b session");
+
+        let base_a = session_seeded_base(&state, &first.session_id);
+        let base_b = session_seeded_base(&state, &second.session_id);
+
+        assert!(
+            !Arc::ptr_eq(&base_a, &base_b),
+            "distinct roots must NOT share a base"
+        );
+        assert_ne!(
+            base_a.key, base_b.key,
+            "distinct roots -> distinct BaseKeys"
+        );
+        assert_eq!(
+            state.bases.read().len(),
+            2,
+            "two roots -> two interned bases"
+        );
+    }
+
+    // ── Feature 012 Phase 1 — seeded working set is single-entry with an EMPTY
+    //    overlay (the no-overlay-writes invariant) ───────────────────────────────
+    #[test]
+    fn test_session_working_set_seeded_single_entry_empty_overlay() {
+        let project = project_dir("symforge-daemon-ws-seed");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("session");
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session present");
+        assert_eq!(
+            session.active_project_id, opened.project_id,
+            "active project id is the opened project"
+        );
+        let working_set = session.working_set.read();
+        assert_eq!(working_set.len(), 1, "exactly one seeded entry");
+        let entry = working_set
+            .get(&opened.project_id)
+            .expect("seeded entry keyed by the active project");
+        // INVARIANT: the seeded overlay is EMPTY (no US1 code path writes one).
+        assert_eq!(
+            entry.overlay.delta_count(),
+            0,
+            "seeded overlay must be empty (no-overlay-writes invariant)"
+        );
+        // The seeded overlay is fenced to the seeded base.
+        assert!(
+            entry.overlay.is_valid_against(&entry.base),
+            "seeded overlay must be fenced to its base"
+        );
+    }
+
+    // ── Feature 012 Phase 3 — resolve_targets contract (FR-004 / SC-001) ─────────
+    #[test]
+    fn test_resolve_targets_contract() {
+        let active = "project-active";
+
+        // Both omitted -> One(active) -> today's behavior.
+        assert_eq!(
+            resolve_targets(None, None, active).unwrap(),
+            Targets::One(active.to_string())
+        );
+
+        // A single explicit id (the active one) -> One(active) (still the fast path).
+        assert_eq!(
+            resolve_targets(Some(active), None, active).unwrap(),
+            Targets::One(active.to_string())
+        );
+
+        // A single explicit OTHER id -> One(other) (cross-project, single target).
+        assert_eq!(
+            resolve_targets(Some("project-other"), None, active).unwrap(),
+            Targets::One("project-other".to_string())
+        );
+
+        // ["*"] -> All.
+        assert_eq!(
+            resolve_targets(None, Some(&["*".to_string()]), active).unwrap(),
+            Targets::All
+        );
+
+        // An explicit subset -> Subset.
+        assert_eq!(
+            resolve_targets(
+                None,
+                Some(&["project-a".to_string(), "project-b".to_string()]),
+                active
+            )
+            .unwrap(),
+            Targets::Subset(vec!["project-a".to_string(), "project-b".to_string()])
+        );
+
+        // Mutually exclusive -> error.
+        assert!(
+            resolve_targets(Some("project-a"), Some(&["project-b".to_string()]), active).is_err()
+        );
+
+        // Empty projects -> error (no silent All).
+        assert!(resolve_targets(None, Some(&[]), active).is_err());
+
+        // A filesystem path in `project=` -> corrective error pointing at add:true.
+        let err = resolve_targets(Some("E:/project/symforge"), None, active).unwrap_err();
+        assert!(
+            err.contains("index_folder") && err.contains("add"),
+            "path-in-project error must point at index_folder(add:true): {err}"
+        );
+        assert!(resolve_targets(Some("/abs/path"), None, active).is_err());
+
+        // A path inside `projects=` -> error too.
+        assert!(resolve_targets(None, Some(&["src/lib.rs".to_string()]), active).is_err());
+
+        // Empty/whitespace project id -> error.
+        assert!(resolve_targets(Some("   "), None, active).is_err());
+    }
+
+    #[test]
+    fn test_targets_is_single_active() {
+        let active = "project-active";
+        assert!(targets_is_single_active(
+            &Targets::One(active.to_string()),
+            active
+        ));
+        assert!(!targets_is_single_active(
+            &Targets::One("project-other".to_string()),
+            active
+        ));
+        assert!(!targets_is_single_active(&Targets::All, active));
+        assert!(!targets_is_single_active(
+            &Targets::Subset(vec![active.to_string()]),
+            active
+        ));
+    }
+
+    // ── Feature 012 Phase 2 — set_active_project / remove_project_from_session ───
+    #[test]
+    fn test_set_active_and_remove_project_management() {
+        let project_a = project_dir("symforge-mgmt-a");
+        let project_b = project_dir("symforge-mgmt-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "mgmt".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        // Additively open B in the same session.
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Working set now holds both; A is still active.
+        {
+            let sessions = state.sessions.read();
+            let session = sessions.get(&opened.session_id).expect("session");
+            let ws = session.working_set.read();
+            assert_eq!(ws.len(), 2, "working set holds A and B");
+            assert_eq!(session.active_project_id, active_a, "A still active");
+            assert!(ws.get(&active_a).is_some());
+            assert!(ws.get(&project_b_id).is_some());
+        }
+
+        // Cannot activate a project that is not open.
+        assert!(
+            !state.set_active_project(&opened.session_id, "project-not-open"),
+            "activating a non-open project must fail"
+        );
+        // Activate B (it is open).
+        assert!(
+            state.set_active_project(&opened.session_id, &project_b_id),
+            "activating an open project must succeed"
+        );
+        assert_eq!(
+            state
+                .sessions
+                .read()
+                .get(&opened.session_id)
+                .unwrap()
+                .active_project_id,
+            project_b_id,
+            "B is now active"
+        );
+
+        // Cannot remove the ACTIVE project (B).
+        assert!(
+            !state.remove_project_from_session(&opened.session_id, &project_b_id),
+            "removing the active project must be refused"
+        );
+        // Remove A (now non-active) -> succeeds and drops it from the working set.
+        assert!(
+            state.remove_project_from_session(&opened.session_id, &active_a),
+            "removing a non-active open project must succeed"
+        );
+        {
+            let sessions = state.sessions.read();
+            let ws = sessions.get(&opened.session_id).unwrap().working_set.read();
+            assert_eq!(ws.len(), 1, "only B remains");
+            assert!(ws.get(&active_a).is_none(), "A removed");
+            assert!(ws.get(&project_b_id).is_some(), "B remains");
+        }
+        // A had only this session -> it should be torn down as a project.
+        assert!(
+            !state
+                .list_projects()
+                .iter()
+                .any(|p| p.project_id == active_a),
+            "project A removed after its last session reference dropped"
+        );
+
+        let _ = state.close_session(&opened.session_id);
+    }
+
+    // ── Feature 012 Phase 2 — additive open keeps active project + adds to WS ────
+    #[test]
+    fn test_index_folder_additive_keeps_active_and_adds_to_working_set() {
+        let project_a = project_dir("symforge-additive-a");
+        let project_b = project_dir("symforge-additive-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "additive".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        let output = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        assert!(
+            output.contains("added to working set"),
+            "additive open should report working-set addition: {output}"
+        );
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        // Active project UNCHANGED (still A) — additive does not retarget.
+        assert_eq!(session.active_project_id, active_a, "A still active");
+        let ws = session.working_set.read();
+        assert_eq!(ws.len(), 2, "working set has A and B after additive open");
+        // Both overlays remain EMPTY (no-overlay-writes invariant).
+        for entry in ws.iter() {
+            assert_eq!(
+                entry.overlay.delta_count(),
+                0,
+                "no overlay write on additive open (project {})",
+                entry.project_id
+            );
+        }
+    }
+
+    // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
+    #[test]
+    fn test_retarget_reseeds_working_set_active_entry() {
+        let project_a = project_dir("symforge-reseed-a");
+        let project_b = project_dir("symforge-reseed-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reseed".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        // Retarget (add: None) to B — the destructive path.
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("retarget to B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        assert_eq!(session.active_project_id, project_b_id, "active is now B");
+        let ws = session.working_set.read();
+        // The working set's active entry was re-seeded to B (the retarget seam fix):
+        // the stale A entry is gone and B is present and consistent with active.
+        assert_eq!(ws.len(), 1, "single re-seeded active entry after retarget");
+        assert!(
+            ws.get(&active_a).is_none(),
+            "stale pre-retarget entry (A) must be dropped"
+        );
+        let entry = ws
+            .get(&project_b_id)
+            .expect("working set re-seeded with the new active project B");
+        assert_eq!(
+            entry.overlay.delta_count(),
+            0,
+            "re-seeded overlay must be empty"
+        );
+        assert!(
+            entry.overlay.is_valid_against(&entry.base),
+            "re-seeded overlay fenced to its base"
+        );
+    }
+
+    // ── Feature 012 Phase 0/1/2 — multi-threaded lock stress (critique #4) ───────
+    //
+    // The mandated `--test-threads=1` suite CANNOT surface a deadlock on the new
+    // `bases -> projects -> sessions` hot path, so THIS test spins REAL OS threads
+    // that hammer the lock acquisition order concurrently. Threads churn:
+    //   * `open_project_session` (intern_base -> projects.write -> sessions.write),
+    //   * `session_runtime` (projects.read -> sessions.read, the hot read path),
+    //   * `index_folder_for_session` BOTH ways — the destructive `needs_reassign`
+    //     RETARGET (alternating target roots: projects.write mid-function juggling
+    //     + working-set re-seed + sessions.write) AND the additive `add:true` path
+    //     (load/activate + additive session_ids join + intern + working_set.add) —
+    //     this file's trickiest lock juggling, now under contention,
+    //   * `close_session` (projects.write -> sessions.write),
+    //   * `health` / `list_projects` (independent reads),
+    // over a SHARED pool of roots so the SAME BaseKey is interned from many threads
+    // (the contended path) AND distinct roots are interned (table growth). A
+    // lock-order inversion would deadlock; a panic in any thread is propagated by
+    // `join().expect(..)`. The test passing == no deadlock and no panic under load.
+    #[test]
+    fn test_concurrent_session_lifecycle_no_deadlock_or_panic() {
+        use std::sync::Arc as StdArc;
+
+        // A shared pool of roots: same roots reused across threads force repeated
+        // interning of identical BaseKeys; the per-thread index adds fresh roots.
+        let shared_roots: Vec<TempDir> = (0..4)
+            .map(|i| project_dir(&format!("symforge-stress-shared-{i}")))
+            .collect();
+        let shared_root_paths: StdArc<Vec<String>> = StdArc::new(
+            shared_roots
+                .iter()
+                .map(|d| d.path().display().to_string())
+                .collect(),
+        );
+
+        let state = StdArc::new(DaemonState::new());
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 40;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let state = StdArc::clone(&state);
+            let shared_root_paths = StdArc::clone(&shared_root_paths);
+            // Each thread also owns a private root so distinct-root interning and
+            // project churn (load -> activate -> remove on last close) is exercised.
+            let private_root = project_dir(&format!("symforge-stress-private-{t}"));
+            let private_path = private_root.path().display().to_string();
+            // A second per-thread root to retarget/additively-open INTO under
+            // contention (forces `needs_reassign` retarget + add:true paths).
+            let retarget_root = project_dir(&format!("symforge-stress-retarget-{t}"));
+            let retarget_path = retarget_root.path().display().to_string();
+            handles.push(std::thread::spawn(move || {
+                // Keep the TempDirs alive for the whole thread body.
+                let _private_root = private_root;
+                let _retarget_root = retarget_root;
+                for i in 0..ITERS {
+                    // Alternate between a shared root (contended intern of the same
+                    // BaseKey) and this thread's private root (table growth/churn).
+                    let root = if i % 2 == 0 {
+                        shared_root_paths[(t + i) % shared_root_paths.len()].clone()
+                    } else {
+                        private_path.clone()
+                    };
+
+                    // D17 (atomic open, fail-never): `open_project_session` now
+                    // ensures the project AND registers the session under a single
+                    // `projects.write()` hold (recovering by reload if a concurrent
+                    // `close_session` removed it), so the former "was removed between
+                    // check and session registration" race CANNOT occur. Open MUST
+                    // succeed under contention — a failure is a real regression, not
+                    // a tolerated benign race. (A lock-order inversion would instead
+                    // HANG at join and never reach this assert.)
+                    let opened = state
+                        .open_project_session(OpenProjectRequest {
+                            project_root: root.clone(),
+                            client_name: "stress".to_string(),
+                            pid: Some((t * 1000 + i) as u32),
+                        })
+                        .expect(
+                            "open_project_session must succeed under contention (D17 fail-never)",
+                        );
+
+                    // Hot read path: resolves the active project via the new field.
+                    // (May be `None` if a concurrent close already tore the project
+                    // down — also benign and not a deadlock.)
+                    let _ = state.session_runtime(&opened.session_id);
+
+                    // Independent reads exercised concurrently with writers.
+                    let _ = state.health();
+                    let _ = state.list_projects();
+                    let _ = state.list_sessions(&opened.project_id);
+
+                    // Feature 012 — exercise the trickiest lock juggling under
+                    // contention. Alternate the two `index_folder_for_session`
+                    // code paths so both run concurrently across threads:
+                    //   * even i -> destructive RETARGET (add: None) into the
+                    //     per-thread retarget root: projects.write mid-function
+                    //     juggling + working-set re-seed + sessions.write;
+                    //   * odd  i -> ADDITIVE add:true into the same root: additive
+                    //     session_ids join + intern + working_set.add.
+                    // Both can legitimately fail loud (e.g. the session was closed
+                    // by a concurrent worker, or the open lost the benign race);
+                    // those errors are tolerated — only a deadlock (hang at join)
+                    // or a panic is a failure here.
+                    let _ = state.index_folder_for_session(
+                        &opened.session_id,
+                        IndexFolderInput {
+                            path: retarget_path.clone(),
+                            idempotency_key: None,
+                            add: Some(i % 2 == 1),
+                        },
+                    );
+
+                    // Close: projects.write -> sessions.write (the order under test).
+                    let _ = state.close_session(&opened.session_id);
+                }
+            }));
+        }
+
+        for handle in handles {
+            // A deadlock would hang here (caught by the harness/CI timeout); a panic
+            // in any worker is surfaced as a test failure via expect.
+            handle.join().expect("stress worker thread panicked");
+        }
+
+        // Keep the shared TempDirs alive until all threads have joined.
+        drop(shared_roots);
+
+        // After every session is closed, no projects or sessions should remain.
+        assert_eq!(
+            state.health().session_count,
+            0,
+            "all sessions closed after the stress loop"
+        );
+        assert!(
+            state.list_projects().is_empty(),
+            "all projects removed after their last session closed"
+        );
+    }
+
     #[test]
     fn test_index_folder_for_session_refuses_sensitive_root() {
         // Regression: the daemon path historically never called the sensitive
@@ -2963,6 +4466,7 @@ mod tests {
                 IndexFolderInput {
                     path: sensitive.to_string(),
                     idempotency_key: None,
+                    add: None,
                 },
             )
             .expect("refusal must be a clean Ok response, never an Err or panic");
@@ -3013,6 +4517,107 @@ mod tests {
         );
     }
 
+    // ── Feature 012 Phase 2 — close_session reaps ALL referenced projects ────────
+    //
+    // The advertised multi-project leak fix: a session that additively opened a
+    // SECOND project references BOTH (active A + additive B). Closing it must
+    // detach from EVERY referenced project and tear down each whose session set
+    // then empties — not just the active one. A leak would leave B in the project
+    // map (and its watcher running) forever. This runs under a multi-thread Tokio
+    // runtime so `activate()` actually spawns real watcher tasks (sync tests get
+    // `None` watchers), letting us assert teardown via each project's `stop_token`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_session_reaps_all_working_set_projects_and_watchers() {
+        let project_a = project_dir("symforge-reap-a");
+        let project_b = project_dir("symforge-reap-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        // Open a session bound to A, then additively open B into its working set.
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reap".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Both projects are open and the session references BOTH (active + additive).
+        assert_eq!(
+            state.list_projects().len(),
+            2,
+            "A and B both open before close"
+        );
+
+        // Capture each project's watcher stop_token BEFORE closing so we can prove
+        // the teardown path (abort_watcher_task -> stop_token = true) ran for BOTH.
+        // Under the multi-thread runtime, activate()/reload() spawned real watchers.
+        let (token_a, token_b, watcher_a_live, watcher_b_live) = {
+            let projects = state.projects.read();
+            let a = projects.get(&active_a).expect("A loaded");
+            let b = projects.get(&project_b_id).expect("B loaded");
+            (
+                Arc::clone(&a.stop_token),
+                Arc::clone(&b.stop_token),
+                a.watcher_task.is_some(),
+                b.watcher_task.is_some(),
+            )
+        };
+        assert!(
+            watcher_a_live && watcher_b_live,
+            "both projects must have a live watcher task before close \
+             (A: {watcher_a_live}, B: {watcher_b_live})"
+        );
+        assert!(
+            !token_a.load(Ordering::Acquire) && !token_b.load(Ordering::Acquire),
+            "watcher stop tokens must be unset (false) while the projects are live"
+        );
+
+        // Close the only session.
+        let closed = state
+            .close_session(&opened.session_id)
+            .expect("close session");
+        // Wire contract: reported fields describe the ACTIVE project (A).
+        assert_eq!(
+            closed.project_id, active_a,
+            "reported pid is the active project A"
+        );
+        assert_eq!(closed.remaining_sessions, 0);
+        assert!(closed.project_removed, "active project A reaped");
+
+        // BOTH projects reaped (the leak fix): the map is empty, not just A gone.
+        assert!(
+            state.list_projects().is_empty(),
+            "close_session must reap BOTH A and B, leaving no open project: {:?}",
+            state.list_projects()
+        );
+
+        // BOTH watchers torn down: each project's stop_token was flipped true by
+        // abort_watcher_task during reaping (the additive sibling B included).
+        assert!(
+            token_a.load(Ordering::Acquire),
+            "A's watcher stop_token must be set after close (watcher torn down)"
+        );
+        assert!(
+            token_b.load(Ordering::Acquire),
+            "B's watcher stop_token must be set after close (additive sibling watcher torn down)"
+        );
+    }
+
     #[test]
     fn test_close_session_removes_project_when_last_session_leaves() {
         let project = project_dir("symforge-daemon-d");
@@ -3056,7 +4661,8 @@ mod tests {
             session_id.clone(),
             SessionRecord {
                 session_id: session_id.clone(),
-                project_id: "missing-project".to_string(),
+                active_project_id: "missing-project".to_string(),
+                working_set: Arc::new(RwLock::new(WorkingSet::new())),
                 client_name: "codex".to_string(),
                 pid: Some(777),
                 opened_at: SystemTime::now(),
@@ -3448,6 +5054,407 @@ mod tests {
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Feature 012 US1 — cross-project query, end-to-end on the DAEMON path.
+    ///
+    /// Drives the real production data path on loopback HTTP:
+    ///   1. spawn a daemon, open a session bound to project A;
+    ///   2. `index_folder(B, add:true)` -> B joins the session's working set
+    ///      ADDITIVELY (A stays active);
+    ///   3. a `search_symbols` with `projects:["*"]` returns ATTRIBUTED hits from
+    ///      BOTH A and B (each project's distinctly-named symbol, under its own
+    ///      `── project: <id> ──` header);
+    ///   4. a `search_symbols` with NO project params returns ONLY the active
+    ///      project A's symbol (the no-regression default target).
+    ///
+    /// This is the US1 acceptance gate at the daemon level. Honest coverage limit:
+    /// it exercises the in-process front-end-absent daemon HTTP route directly
+    /// (the production topology's data path); a full MCP-client dogfood against a
+    /// built binary is a separate live-verify step.
+    #[tokio::test]
+    async fn test_cross_project_query_returns_attributed_hits_from_both_projects() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        let project_a = project_dir("symforge-xproj-a");
+        let project_b = project_dir("symforge-xproj-b");
+        // Distinctly-named symbols so attribution is unambiguous. Both share the
+        // substring "xproj_marker" so one query matches across both projects.
+        std::fs::write(
+            project_a.path().join("src").join("a.rs"),
+            "pub fn xproj_marker_alpha() -> u32 { 1 }\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("b.rs"),
+            "pub fn xproj_marker_beta() -> u32 { 2 }\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        // (1) Open a session bound to A.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "xproj".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_a_id = opened.project_id.clone();
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Index A through the session so its index is warm (open does a load; a
+        // reload via the active path guarantees the file is indexed).
+        let index_a = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_a.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("index A request")
+            .error_for_status()
+            .expect("index A status")
+            .text()
+            .await
+            .expect("index A body");
+        assert!(index_a.contains("Indexed"), "index A: {index_a}");
+
+        // (2) Additively open B.
+        let index_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: Some(true),
+            })
+            .send()
+            .await
+            .expect("index B request")
+            .error_for_status()
+            .expect("index B status")
+            .text()
+            .await
+            .expect("index B body");
+        assert!(
+            index_b.contains("added to working set"),
+            "additive index B: {index_b}"
+        );
+
+        // (3) Cross-project query with projects:["*"] -> hits from BOTH projects.
+        let cross = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"]
+            }))
+            .send()
+            .await
+            .expect("cross query request")
+            .error_for_status()
+            .expect("cross query status")
+            .text()
+            .await
+            .expect("cross query body");
+        assert!(
+            cross.contains("xproj_marker_alpha"),
+            "cross-project query must surface A's symbol: {cross}"
+        );
+        assert!(
+            cross.contains("xproj_marker_beta"),
+            "cross-project query must surface B's symbol: {cross}"
+        );
+        // Both projects attributed with their own section headers (ProjectHit ids).
+        assert!(
+            cross.contains(&format!("project: {project_a_id}")),
+            "A must be attributed by project id: {cross}"
+        );
+        assert!(
+            cross.contains(&format!("project: {project_b_id}")),
+            "B must be attributed by project id: {cross}"
+        );
+
+        // (4) No-params query -> ONLY the active project A (no-regression default).
+        let active_only = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker"
+            }))
+            .send()
+            .await
+            .expect("active query request")
+            .error_for_status()
+            .expect("active query status")
+            .text()
+            .await
+            .expect("active query body");
+        assert!(
+            active_only.contains("xproj_marker_alpha"),
+            "active-only query must surface A's symbol: {active_only}"
+        );
+        assert!(
+            !active_only.contains("xproj_marker_beta"),
+            "active-only query must NOT surface B's symbol (single active project): {active_only}"
+        );
+        // Single active project renders flat — no cross-project section header.
+        assert!(
+            !active_only.contains("project: "),
+            "single-active query must render flat (no project header): {active_only}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    // ── Feature 012 hardening — cross-project output is BOUNDED ──────────────────
+    //
+    // Without a cap the cross-project formatter would render every hit from every
+    // targeted project (unbounded, unlike the single-project path). Prove the
+    // total-hit cap truncates the rendered hits AND discloses the truncation.
+    #[test]
+    fn test_cross_project_symbols_output_is_capped_and_discloses_truncation() {
+        use crate::live_index::search::SymbolMatchTier;
+        use crate::live_index::view::{ProjectHit, ViewSymbolHit};
+
+        // 5 synthetic hits across two projects.
+        let hits: Vec<ProjectHit<ViewSymbolHit>> = (0..5)
+            .map(|i| ProjectHit {
+                project_id: if i < 3 { "proj-a" } else { "proj-b" }.to_string(),
+                hit: ViewSymbolHit {
+                    name: format!("sym_{i}"),
+                    path: format!("src/f{i}.rs"),
+                    kind: "fn".to_string(),
+                    line: i + 1,
+                    tier: SymbolMatchTier::Exact,
+                },
+            })
+            .collect();
+
+        // Cap below the hit count -> truncated + disclosed.
+        let capped = format_cross_project_symbols(&hits, "sym", true, 2);
+        assert!(
+            capped.starts_with("2 of 5 matches across projects (truncated;"),
+            "header must disclose shown-of-total truncation: {capped}"
+        );
+        assert!(
+            capped.contains("query a single project for the full set"),
+            "truncation must carry the corrective hint: {capped}"
+        );
+        // Exactly the first 2 hit lines are rendered (sym_0, sym_1); sym_2.. dropped.
+        assert!(capped.contains("sym_0") && capped.contains("sym_1"));
+        assert!(
+            !capped.contains("sym_2") && !capped.contains("sym_4"),
+            "hits beyond the cap must NOT be rendered: {capped}"
+        );
+
+        // Cap above the hit count -> no truncation language, all hits rendered.
+        let full = format_cross_project_symbols(&hits, "sym", true, 100);
+        assert!(
+            full.starts_with("5 matches across projects\n"),
+            "uncapped header must not claim truncation: {full}"
+        );
+        assert!(
+            full.contains("sym_4"),
+            "all hits rendered when under cap: {full}"
+        );
+        assert!(
+            !full.contains("truncated"),
+            "no truncation notice when under cap: {full}"
+        );
+    }
+
+    // The cross-project total-hit cap derived from the caller's `limit`:
+    // None -> default cap; a value clamps into [1, MAX]; zero/absurd cannot
+    // disable the bound.
+    #[test]
+    fn test_cross_project_result_cap_clamps_limit() {
+        assert_eq!(
+            cross_project_result_cap(None),
+            CROSS_PROJECT_DEFAULT_RESULT_CAP,
+            "no limit -> default cap"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(10)),
+            10,
+            "small limit honored"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(0)),
+            1,
+            "zero clamps up to 1 (cap never disabled)"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(u32::MAX)),
+            CROSS_PROJECT_MAX_RESULT_CAP,
+            "absurd limit clamps to the hard ceiling"
+        );
+    }
+
+    // The `max_tokens` budget truncates an assembled body at a line boundary and
+    // discloses the cut.
+    #[test]
+    fn test_cross_project_token_budget_truncates_and_discloses() {
+        let body = (0..50)
+            .map(|i| format!("line {i} with some content\n"))
+            .collect::<String>();
+        // ~26 bytes/line * 50 = ~1300 bytes; max_tokens=10 -> 40-byte budget.
+        let out = apply_cross_project_token_budget(body.clone(), Some(10));
+        assert!(out.len() < body.len(), "budget must shrink the body");
+        assert!(
+            out.contains("truncated to fit max_tokens=10"),
+            "truncation must be disclosed: {out}"
+        );
+        assert!(
+            out.ends_with('\n'),
+            "truncated body ends on a line boundary"
+        );
+
+        // No budget / zero budget -> identity.
+        assert_eq!(apply_cross_project_token_budget(body.clone(), None), body);
+        assert_eq!(
+            apply_cross_project_token_budget(body.clone(), Some(0)),
+            body
+        );
+    }
+
+    // ── Feature 012 hardening — cross-project REFUSES deferred scoping params ─────
+    //
+    // The per-project derived-index scoping (path/path_prefix/language/symbol_kind/
+    // direction/structural) is NOT honored cross-project. Prove each is REFUSED
+    // (honest, not silently dropped) with the corrective message, and that `kind`
+    // (which IS honored) is NOT refused.
+    #[test]
+    fn test_reject_unsupported_cross_project_scoping_per_tool() {
+        use serde_json::json;
+
+        // search_symbols: path_prefix + language refused; kind allowed.
+        let err = reject_unsupported_cross_project_scoping(
+            "search_symbols",
+            &json!({ "query": "x", "path_prefix": "src/" }),
+        )
+        .expect_err("path_prefix must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path_prefix scoping is not supported with cross-project targeting")
+                && msg.contains("query a single project for scoped results"),
+            "refusal message must name the param + corrective hint: {msg}"
+        );
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "language": "Rust" }),
+            )
+            .is_err(),
+            "language must be refused on search_symbols"
+        );
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "kind": "fn" }),
+            )
+            .is_ok(),
+            "kind IS honored cross-project and must NOT be refused"
+        );
+
+        // search_text: structural refused.
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_text",
+                &json!({ "query": "x", "structural": true }),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("structural scoping is not supported"),
+            "structural must be refused on search_text"
+        );
+
+        // find_references: path / symbol_kind / direction refused.
+        for (field, value) in [
+            ("path", json!("src/db.rs")),
+            ("symbol_kind", json!("fn")),
+            ("direction", json!("trait")),
+        ] {
+            let err = reject_unsupported_cross_project_scoping(
+                "find_references",
+                &json!({ "name": "x", field: value }),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("{field} scoping is not supported")),
+                "{field} must be refused on find_references: {err}"
+            );
+        }
+
+        // Blank/empty values are treated as not-set (no false refusal).
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "path_prefix": "  " }),
+            )
+            .is_ok(),
+            "blank scoping value must not trip the refusal"
+        );
+    }
+
+    // End-to-end: the scoping refusal fires from `execute_cross_project_read`
+    // BEFORE any query runs (the working set need not even contain the target —
+    // but here it does, so we prove the refusal precedes a would-be-successful
+    // query). A synthetic single-entry working set over an empty base.
+    #[test]
+    fn test_execute_cross_project_read_rejects_scoping_before_query() {
+        use crate::live_index::store::LiveIndex;
+        use crate::live_index::view::{BaseKey, CommitId, IndexBase, WorkingSet};
+        use serde_json::json;
+
+        let base = Arc::new(IndexBase::new(
+            BaseKey::new("/synthetic/root", CommitId::Dirtyless),
+            Arc::new(LiveIndex::empty_live_index()),
+            1,
+        ));
+        let mut ws = WorkingSet::new();
+        ws.add("proj-x", base);
+
+        let err = execute_cross_project_read(
+            "search_symbols",
+            json!({ "query": "anything", "language": "Rust" }),
+            Targets::Subset(vec!["proj-x".to_string()]),
+            &ws,
+        )
+        .expect_err("scoping param must be refused");
+        assert!(
+            err.to_string()
+                .contains("language scoping is not supported with cross-project targeting"),
+            "cross-project read must refuse the deferred scoping param: {err}"
+        );
     }
 
     #[tokio::test]
@@ -4245,6 +6252,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             })
             .send()
             .await
@@ -4384,6 +6392,7 @@ mod tests {
             .index_folder(Parameters(IndexFolderInput {
                 path: project.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -4532,6 +6541,7 @@ mod tests {
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -4558,6 +6568,133 @@ mod tests {
             switched_root,
             project_b.path().to_path_buf(),
             "repo_root must point at the new project after a proxy switch"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// 012 C4 (D4 retarget + D6-a bound-root visibility): after a daemon-proxy
+    /// session is retargeted from project A to project B at runtime via
+    /// `index_folder`, the `status` and `symforge` surfaces must report the NEW
+    /// project's bound root — never the stale one. This is the field wrong-repo
+    /// bug made observable: a stale binding can no longer read as a working one.
+    #[tokio::test]
+    async fn test_retarget_updates_bound_root_in_status_and_symforge_surfaces() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        // The facade surfaces require the compact profile.
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "compact");
+
+        let project_a = project_dir("symforge-retarget-root-a");
+        let project_b = project_dir("symforge-retarget-root-b");
+        std::fs::write(
+            project_a.path().join("src").join("lib.rs"),
+            "pub fn alpha_symbol() -> u32 { 1 }\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("lib.rs"),
+            "pub fn beta_symbol() -> u32 { 2 }\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        // Open a daemon session bound to project A.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "retarget-root".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Sanity: before retarget the bound root is project A and the local
+        // status render surfaces it.
+        let root_a_norm = project_a.path().display().to_string().replace('\\', "/");
+        let status_before =
+            server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+        assert!(
+            status_before.contains(&format!("project_root: {root_a_norm}")),
+            "pre-retarget status must surface project A root, got:\n{status_before}"
+        );
+
+        // Retarget to project B via the explicit `index_folder` verb (D4-C).
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon proxy retarget must succeed, got: {indexed}"
+        );
+
+        // (a) The bound root followed the switch.
+        let switched = server
+            .capture_repo_root()
+            .expect("repo root after retarget");
+        assert_eq!(
+            switched,
+            project_b.path().to_path_buf(),
+            "repo_root must point at project B after retarget"
+        );
+
+        // (b) `status` (local render path) now reflects project B's root, not A.
+        let root_b_norm = project_b.path().display().to_string().replace('\\', "/");
+        let status_after =
+            server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+        assert!(
+            status_after.contains(&format!("project_root: {root_b_norm}")),
+            "post-retarget status must surface project B root, got:\n{status_after}"
+        );
+        assert!(
+            !status_after.contains(&format!("project_root: {root_a_norm}")),
+            "stale project A root must NOT survive in status after retarget, got:\n{status_after}"
+        );
+
+        // (c) the `symforge` facade envelope also carries the bound root line so a
+        // wrong-repo binding is loud on the primary read surface too.
+        // `SymforgeCallInput` flattens the `StelRequest`, so `query` is top-level.
+        let symforge_input = serde_json::from_value(serde_json::json!({
+            "query": "find beta_symbol"
+        }))
+        .expect("symforge facade input");
+        let symforge_result = server
+            .symforge_facade_tool(Parameters(symforge_input))
+            .await
+            .expect("symforge facade dispatch");
+        let serialized = serde_json::to_value(&symforge_result).expect("serialize symforge result");
+        let symforge_body = serialized["content"][0]["text"]
+            .as_str()
+            .expect("symforge result text")
+            .to_string();
+        assert!(
+            symforge_body.contains(&format!("project_root: {root_b_norm}")),
+            "symforge envelope must surface the bound project B root, got:\n{symforge_body}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -4611,6 +6748,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await
@@ -4636,6 +6774,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await
@@ -4655,6 +6794,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_a.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await
