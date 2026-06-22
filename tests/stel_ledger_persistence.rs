@@ -1,8 +1,8 @@
 //! Durable STEL ledger — feature 013 Foundational contract (T004/T005/T006).
 //!
-//! Server-gated: the `ledger_store` module is `#[cfg(feature = "server")]` for
-//! this phase (the embed un-gate is US1 T018, not now), so the whole file is
-//! gated to keep `--no-default-features --features embed --all-targets`
+//! Server-gated: the `ledger_store` module is `#[cfg(feature = "server")]`
+//! (embed durability is DEFERRED — see the MINOR 3 note below), so the whole
+//! file is gated to keep `--no-default-features --features embed --all-targets`
 //! compiling.
 #![cfg(feature = "server")]
 
@@ -559,19 +559,19 @@ fn recorded_event_survives_abrupt_drop_without_clean_shutdown() {
 // T014 durable-surface dependency-shape guard, T015 cross-session accumulation
 // + degrade-to-Disabled, T016 transport parity, T017 frecency non-bump.
 //
-// IMPORTANT honesty note on T014 / embed reachability: the durable `ledger_store`
-// inner module is un-gated to `any(feature="server", feature="embed")` (T018),
-// AND the protocol field/builder/write-through are un-gated likewise (T019).
-// However the PARENT modules are server-gated at the crate root
-// (`src/lib.rs`: `#[cfg(feature="server")] pub mod stel;` and `pub mod protocol;`),
-// and `stel::{controller,executor,planner,edit_apply}` hard-import
-// `crate::protocol::{format,session,smart_query,result_status,tools}`. So genuine
-// embed reachability of the durable store is BLOCKED at `lib.rs` and is NOT
-// delivered by the anchored T018/T019 edits alone — it needs a structural split
-// (a protocol-free ledger seam, out of focused-US1 scope). The inner gates are
-// kept as intent-documentation; `--no-default-features --features embed --lib`
-// stays green because the dead-under-embed module is simply never compiled. This
-// test therefore pins the durable SURFACE SHAPE the SERVER stdio path (T020)
+// IMPORTANT honesty note on T014 / embed reachability (013 US1 review fix,
+// MINOR 3): embed durability is DEFERRED, so the durable `ledger_store` inner
+// module and the protocol field/builder/write-through stay server-gated. An
+// `any(feature="server", feature="embed")` cfg there would be DEAD under embed
+// and falsely signal embed-capability: the PARENT modules are server-gated at
+// the crate root (`src/lib.rs`: `#[cfg(feature="server")] pub mod stel;` and
+// `pub mod protocol;`), and `stel::{controller,executor,planner,edit_apply}`
+// hard-import `crate::protocol::{format,session,smart_query,result_status,
+// tools}`. So genuine embed reachability of the durable store is BLOCKED at
+// `lib.rs` and needs a structural split (a protocol-free ledger seam, out of
+// focused-US1 scope; spec FR-001 note). `--no-default-features --features embed
+// --lib` stays green because the server-gated module is simply not compiled.
+// This test therefore pins the durable SURFACE SHAPE the SERVER stdio path (T020)
 // relies on — feature-independent enum, no server-only type leak — not an
 // embed-build reachability it cannot honestly claim today.
 
@@ -594,8 +594,8 @@ fn durable_store_surface_is_feature_independent_no_server_only_types() {
     assert!(disabled.summary().is_none());
 
     // The subsystem-state mapping the status surface consumes is reachable from
-    // the same enum, with no server-only import — this is what the un-gated
-    // `durable_ledger_summary_for_status` reads on the stdio/embed path.
+    // the same enum, with no server-only import — this is what
+    // `durable_ledger_summary_for_status` reads on the server stdio path.
     match disabled.subsystem_state() {
         symforge::stel::ledger_store::LedgerSubsystemState::Disabled { reason } => {
             assert!(!reason.is_empty(), "Disabled must carry a non-empty reason");
@@ -613,9 +613,13 @@ fn durable_store_surface_is_feature_independent_no_server_only_types() {
 #[test]
 fn cross_session_accumulation_is_cumulative_across_restarts() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path();
+    // Production calling convention (013 US1 review fix): the dir-entry `open`
+    // takes the project ROOT and joins the `.symforge/`-prefixed db const itself,
+    // exactly as serve.rs / main.rs do. Passing the root (not `.symforge`) is
+    // what genuinely exercises the real call path.
+    let root = tmp.path();
 
-    // Simulate >= 3 process restarts: each "session" opens the SAME dir via the
+    // Simulate >= 3 process restarts: each "session" opens the SAME root via the
     // dir-entry `open` (exactly what the stdio bootstrap calls), records a
     // distinct number of events, then drops the handle (process exit).
     let per_session = [2_u64, 3, 4, 5];
@@ -623,7 +627,7 @@ fn cross_session_accumulation_is_cumulative_across_restarts() {
     let mut last_seen_total = 0_u64;
 
     for (session_idx, count) in per_session.iter().enumerate() {
-        let store = StelLedgerStore::open(dir, format!("stdio-sess-{session_idx}"));
+        let store = StelLedgerStore::open(root, format!("stdio-sess-{session_idx}"));
         // On reopen, the prior sessions' events must already be counted — the
         // store is restored, NOT reset to zero.
         let on_open = store
@@ -659,7 +663,7 @@ fn cross_session_accumulation_is_cumulative_across_restarts() {
 
     // Final independent reopen confirms the durable cumulative count survived
     // every restart (SC-003: >= 3 restarts, cumulative, non-reset).
-    let final_store = StelLedgerStore::open(dir, "stdio-sess-final");
+    let final_store = StelLedgerStore::open(root, "stdio-sess-final");
     assert_eq!(
         final_store.summary().expect("final summary").total_events,
         expected_total,
@@ -843,5 +847,59 @@ fn single_process_two_openers_coexist_without_contention_or_lost_writes() {
         reopened.summary().expect("reopen summary").total_events,
         20,
         "all interleaved two-opener writes must be durable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 013 US1 review fix (MAJOR 1) — the dir-entry `open` takes the project ROOT
+// and joins the `.symforge/`-prefixed db const ITSELF, landing the db at exactly
+// `<root>/.symforge/stel-ledger.db` (the convention every other store follows).
+// The production call sites (serve.rs / main.rs stdio + daemon-proxy) pass the
+// project ROOT, so this is the on-disk path they actually produce. The earlier
+// bug passed `ensure_symforge_dir(root)` (= `root/.symforge`), DOUBLING the
+// prefix to `root/.symforge/.symforge/stel-ledger.db`. This test pins the path
+// under the real production convention — the test that would have caught it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_under_project_root_lands_db_at_single_symforge_prefix_not_doubled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    // Open via the PRODUCTION calling convention: pass the project ROOT (exactly
+    // what serve.rs / main.rs pass). The store must open cleanly and record.
+    let store = StelLedgerStore::open(root, "prod-convention");
+    assert!(
+        matches!(store, StelLedgerStore::Sqlite(_)),
+        "opening under the project root must succeed (parent .symforge created on demand)"
+    );
+    store.record(&sample_event("p-path"));
+    assert_eq!(store.summary().expect("summary").total_events, 1);
+    drop(store);
+
+    // The db must exist at exactly `<root>/.symforge/stel-ledger.db` — the
+    // single-prefix path the const encodes.
+    let expected = root.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    assert_eq!(
+        expected,
+        root.join(".symforge").join("stel-ledger.db"),
+        "the db-path const must encode a single .symforge prefix"
+    );
+    assert!(
+        expected.exists(),
+        "db must land at <root>/.symforge/stel-ledger.db, not exist there: {}",
+        expected.display()
+    );
+
+    // The DOUBLED path the old bug produced must NOT exist — proving the prefix
+    // is applied exactly once under the production convention.
+    let doubled = root
+        .join(".symforge")
+        .join(".symforge")
+        .join("stel-ledger.db");
+    assert!(
+        !doubled.exists(),
+        "the doubled-prefix path must NOT exist (regression guard): {}",
+        doubled.display()
     );
 }

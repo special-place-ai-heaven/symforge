@@ -49,13 +49,13 @@ use crate::watcher::WatcherInfo;
 /// Dependency-free: an atomic in-flight counter polled by [`Self::drain`]. Each
 /// scheduled write holds a [`LedgerWriteGuard`] whose `Drop` decrements the
 /// counter when the blocking write returns.
-#[cfg(any(feature = "server", feature = "embed"))]
+#[cfg(feature = "server")]
 #[derive(Debug, Default)]
 pub struct LedgerWriteTracker {
     in_flight: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(any(feature = "server", feature = "embed"))]
+#[cfg(feature = "server")]
 impl LedgerWriteTracker {
     /// Register a write about to be scheduled; the returned guard decrements the
     /// in-flight count on drop (i.e. when the blocking write completes).
@@ -90,10 +90,10 @@ impl LedgerWriteTracker {
 
 /// Guard returned by [`LedgerWriteTracker::begin`]; decrements the in-flight
 /// count when the blocking durable write completes (on drop).
-#[cfg(any(feature = "server", feature = "embed"))]
+#[cfg(feature = "server")]
 struct LedgerWriteGuard(std::sync::Arc<LedgerWriteTracker>);
 
-#[cfg(any(feature = "server", feature = "embed"))]
+#[cfg(feature = "server")]
 impl Drop for LedgerWriteGuard {
     fn drop(&mut self) {
         self.0
@@ -189,18 +189,24 @@ pub struct SymForgeServer {
     /// Bounded analytics queue. Disabled by default until an explicit local
     /// analytics configuration installs an enabled recorder.
     pub(crate) analytics_recorder: Arc<RwLock<crate::analytics::AnalyticsRecorder>>,
-    /// Durable STEL L4 economics ledger (US3). `None` on stdio/embed (no
-    /// persistence); `Some` only when `serve::run` wires the opened store in.
-    /// The same `Arc` is shared with `ServerRuntime` so there is exactly one
-    /// durable ledger path (no economics double-count). When `Some` it may be
-    /// [`crate::stel::ledger_store::StelLedgerStore::Disabled`] if the DB could
-    /// not open — write-through then degrades to a logged no-op (FR-011).
-    #[cfg(any(feature = "server", feature = "embed"))]
+    /// Durable STEL L4 economics ledger. `Some` when `serve::run` (US3) or the
+    /// stdio/daemon-proxy bootstrap (US1 T020/T021) wires the opened store in;
+    /// `None` otherwise. The same `Arc` is shared with `ServerRuntime` so there
+    /// is exactly one durable ledger path (no economics double-count). When
+    /// `Some` it may be [`crate::stel::ledger_store::StelLedgerStore::Disabled`]
+    /// if the DB could not open — write-through then degrades to a logged no-op
+    /// (FR-011).
+    ///
+    /// Server-gated: embed durability is DEFERRED — `protocol` is crate-root
+    /// server-gated (`src/lib.rs`), so an `any(server, embed)` cfg here would be
+    /// dead under embed. Reaching the store from embed needs a structural
+    /// protocol-free seam (out of US1 scope; spec FR-001 note).
+    #[cfg(feature = "server")]
     pub(crate) stel_ledger_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
     /// In-flight durable-ledger write tracker (P2-3): lets `serve::run` drain
     /// pending `spawn_blocking` economics writes on shutdown so events accepted
     /// just before SIGINT/SIGTERM are not lost.
-    #[cfg(any(feature = "server", feature = "embed"))]
+    #[cfg(feature = "server")]
     pub(crate) ledger_writes: Arc<LedgerWriteTracker>,
 }
 
@@ -252,9 +258,9 @@ impl SymForgeServer {
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
-            #[cfg(any(feature = "server", feature = "embed"))]
+            #[cfg(feature = "server")]
             stel_ledger_store: None,
-            #[cfg(any(feature = "server", feature = "embed"))]
+            #[cfg(feature = "server")]
             ledger_writes: Arc::new(LedgerWriteTracker::default()),
         }
     }
@@ -282,9 +288,9 @@ impl SymForgeServer {
             stel_ledger: Arc::new(Mutex::new(crate::stel::ledger::SessionLedger::new())),
             worktree_misuse: Arc::new(crate::worktree::WorktreeMisuseCounter::new()),
             analytics_recorder: Arc::new(RwLock::new(analytics_recorder)),
-            #[cfg(any(feature = "server", feature = "embed"))]
+            #[cfg(feature = "server")]
             stel_ledger_store: None,
-            #[cfg(any(feature = "server", feature = "embed"))]
+            #[cfg(feature = "server")]
             ledger_writes: Arc::new(LedgerWriteTracker::default()),
         }
     }
@@ -296,7 +302,7 @@ impl SymForgeServer {
     /// single durable ledger path — the in-memory `SessionLedger` write and the
     /// durable write-through both happen in `finalize_symforge_with_ledger`, so
     /// no economics row is counted twice.
-    #[cfg(any(feature = "server", feature = "embed"))]
+    #[cfg(feature = "server")]
     pub fn with_stel_ledger_store(
         mut self,
         store: Arc<crate::stel::ledger_store::StelLedgerStore>,
@@ -324,7 +330,7 @@ impl SymForgeServer {
     /// durable write moves off the hot path. When no runtime is present (sync
     /// tests / embed call sites) we record synchronously so events are never
     /// lost. Either way `record` degrades silently on store error.
-    #[cfg(any(feature = "server", feature = "embed"))]
+    #[cfg(feature = "server")]
     fn persist_ledger_event_durably(&self, event: &crate::stel::types::StelLedgerEvent) {
         let Some(store) = self.stel_ledger_store.as_ref() else {
             return;
@@ -356,12 +362,12 @@ impl SymForgeServer {
 
     /// The in-flight durable-ledger write tracker (P2-3), exposed so
     /// `serve::run` can drain pending economics writes on shutdown.
-    #[cfg(any(feature = "server", feature = "embed"))]
+    #[cfg(feature = "server")]
     pub(crate) fn ledger_write_tracker(&self) -> &Arc<LedgerWriteTracker> {
         &self.ledger_writes
     }
 
-    #[cfg(not(any(feature = "server", feature = "embed")))]
+    #[cfg(not(feature = "server"))]
     #[inline]
     fn persist_ledger_event_durably(&self, _event: &crate::stel::types::StelLedgerEvent) {}
 
@@ -370,21 +376,22 @@ impl SymForgeServer {
     ///
     /// Maps the wired durable store's [`subsystem_state`] onto the
     /// feature-independent surface enum. Reports `Unavailable` when no store is
-    /// attached (stdio), `Disabled { reason }` for a wired-but-failing store
-    /// (open failed at startup or live query failed — N-3, never swallowed), and
-    /// `Durable` otherwise. On stdio/embed builds (`server` feature off) this is
-    /// a compile-time `Unavailable`.
+    /// attached, `Disabled { reason }` for a wired-but-failing store (open failed
+    /// at startup or live query failed — N-3, never swallowed), and `Durable`
+    /// otherwise. On embed builds (`server` feature off) this is a compile-time
+    /// `Unavailable`.
     ///
-    /// Reachability note (honest scope of N-3/FR-008): a durable store is wired
-    /// only by `server::serve::run` (the operator `/mcp` surface). The daemon
-    /// per-session runtime and the stdio local-fallback server leave
-    /// `stel_ledger_store: None`, so over the daemon-proxy `status` path this is
-    /// structurally `Unavailable` — truthfully so (no durable store is attached
-    /// there). The `Durable` vs `Disabled { reason }` distinction is observable
-    /// on the `serve` surface, where a store is actually attached.
+    /// Reachability note (honest scope of N-3/FR-008): a durable store is wired by
+    /// `server::serve::run` (the `/mcp` surface) AND by the stdio + daemon-proxy
+    /// bootstrap (US1 T020/T021). On the daemon-proxy `status` path the proxy
+    /// itself holds the store, so `status_stel_tool` overlays THIS value onto the
+    /// proxied worker body (`overlay_proxy_durable_ledger_line`) — the operator
+    /// sees the proxy's real `Durable`/`Disabled` state, not the storeless
+    /// worker's `unavailable` (013 US1 review fix, MAJOR 2). It stays
+    /// `Unavailable` only when no store is attached anywhere.
     ///
     /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
-    #[cfg(any(feature = "server", feature = "embed"))]
+    #[cfg(feature = "server")]
     fn durable_ledger_summary_for_status(&self) -> crate::stel::status::DurableLedgerState {
         use crate::stel::ledger_store::LedgerSubsystemState;
         use crate::stel::status::{DurableLedgerState, DurableLedgerSummary};
@@ -404,7 +411,7 @@ impl SymForgeServer {
         }
     }
 
-    #[cfg(not(any(feature = "server", feature = "embed")))]
+    #[cfg(not(feature = "server"))]
     #[inline]
     fn durable_ledger_summary_for_status(&self) -> crate::stel::status::DurableLedgerState {
         crate::stel::status::DurableLedgerState::Unavailable

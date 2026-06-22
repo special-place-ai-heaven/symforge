@@ -266,30 +266,26 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     // capture + durable write-through stays on the proxy. So durable accumulation
     // in the daemon-default deployment requires attaching the durable store
     // HERE, on the proxy — mirroring the local-stdio attach (T020) and serve.rs.
-    // This deliberately does NOT touch the privileged daemon worker.
+    // Open under the project ROOT: `StelLedgerStore::open` joins the
+    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
+    // dir on demand (passing the already-`.symforge` data dir here would double
+    // the prefix). A dir/open failure degrades to `Disabled` INSIDE `open`
+    // (logged, in-memory, FR-003). This deliberately does NOT touch the
+    // privileged daemon worker.
     //
-    // Honesty caveat (documented, tested in surface_honesty T023): `status` IS
-    // proxied to the daemon worker, which has no durable store, so the
-    // `detail:full` `durable_ledger` line over the daemon path reads
-    // `unavailable` truthfully — events still accumulate durably here, but the
-    // status surface rendered from the worker cannot observe this proxy's store.
+    // Observability (013 US1 review fix): `status` IS proxied to the daemon
+    // worker, which has no durable store — but the proxy OWNS this store, so
+    // `status_stel_tool` overlays the proxy's OWN `durable_ledger` line onto the
+    // proxied `detail:full` body (`overlay_proxy_durable_ledger_line`). The
+    // operator therefore sees this proxy's real `Durable{..}` accumulation, not
+    // the worker's `unavailable`. If the proxy ALSO has no store, the line stays
+    // `unavailable` honestly.
     if let Some(root) = session.project_root() {
-        match symforge::paths::ensure_symforge_dir(root) {
-            Ok(dir) => {
-                let store = symforge::stel::ledger_store::StelLedgerStore::open(
-                    &dir,
-                    format!("stdio-daemon-{}", std::process::id()),
-                );
-                server = server.with_stel_ledger_store(Arc::new(store));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    root = %root.display(),
-                    %error,
-                    "could not ensure symforge data dir; STEL ledger will not persist on daemon-backed stdio"
-                );
-            }
-        }
+        let store = symforge::stel::ledger_store::StelLedgerStore::open(
+            root,
+            format!("stdio-daemon-{}", std::process::id()),
+        );
+        server = server.with_stel_ledger_store(Arc::new(store));
     }
 
     tracing::info!(
@@ -462,30 +458,22 @@ async fn run_local_mcp_server_async(
 
     // Feature 013 US1 (T020): attach the durable STEL economics ledger on the
     // LOCAL stdio path so predicted-vs-actual events accumulate ACROSS restarts
-    // (FR-001/SC-003), not just in serve mode. Mirrors `serve::build_serve_runtime`
-    // (serve.rs:324-354): open under the project's `.symforge` data dir; a
-    // dir/open failure logs and proceeds in-memory (degrade to `Disabled`,
-    // FR-003) so stdio never fails to start over a ledger problem. The
-    // `symforge` compact tool's `finalize_symforge_with_ledger` write-through
-    // then persists each economics row to this store. This brings stdio to
-    // parity with serve (Principle VII) for the durable backing.
+    // (FR-001/SC-003), not just in serve mode. Mirrors `serve::build_serve_runtime`:
+    // open under the project ROOT — `StelLedgerStore::open` joins the
+    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
+    // dir on demand (the same convention as analytics/coupling/frecency; passing
+    // the already-`.symforge` data dir here would double the prefix). A dir/open
+    // failure degrades to `Disabled` INSIDE `open` (logged, in-memory, FR-003),
+    // so stdio never fails to start over a ledger problem. The `symforge` compact
+    // tool's `finalize_symforge_with_ledger` write-through then persists each
+    // economics row to this store, bringing stdio to parity with serve
+    // (Principle VII) for the durable backing.
     if let Some(root) = watcher_root.as_ref() {
-        match symforge::paths::ensure_symforge_dir(root) {
-            Ok(dir) => {
-                let store = symforge::stel::ledger_store::StelLedgerStore::open(
-                    &dir,
-                    format!("stdio-{}", std::process::id()),
-                );
-                server = server.with_stel_ledger_store(Arc::new(store));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    root = %root.display(),
-                    %error,
-                    "could not ensure symforge data dir; STEL ledger will not persist on stdio"
-                );
-            }
-        }
+        let store = symforge::stel::ledger_store::StelLedgerStore::open(
+            root,
+            format!("stdio-{}", std::process::id()),
+        );
+        server = server.with_stel_ledger_store(Arc::new(store));
     }
 
     tracing::info!("starting MCP server on stdio transport");

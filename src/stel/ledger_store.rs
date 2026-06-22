@@ -296,10 +296,24 @@ pub enum StelLedgerStore {
 }
 
 impl StelLedgerStore {
-    /// Open or create `stel-ledger.db` under `dir`, run migration, set WAL + busy timeout.
-    /// On any failure returns `Disabled` (logged, never panics) — FR-011.
-    pub fn open(dir: &Path, session_id: impl Into<String>) -> Self {
-        let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    /// Open or create the durable ledger db under the project `root`, run
+    /// migration, set WAL + busy timeout. On any failure returns `Disabled`
+    /// (logged, never panics) — FR-011.
+    ///
+    /// `root` is the project ROOT, not the `.symforge` data dir: this joins the
+    /// `.symforge/`-prefixed [`SYMFORGE_STEL_LEDGER_DB_PATH`] against it itself,
+    /// matching every other store (analytics/coupling/frecency join their
+    /// prefixed const against the project root). The parent `.symforge` dir is
+    /// created on demand by [`SqliteStelLedgerStore::open`] (SQLite will NOT
+    /// create it). Passing the already-`.symforge` data dir here would double the
+    /// prefix to `root/.symforge/.symforge/...`.
+    ///
+    /// Migration note: any pre-fix doubled-path data at
+    /// `root/.symforge/.symforge/stel-ledger.db` is orphaned, not migrated —
+    /// economics rows are best-effort calibration input (pre-1.0), so a one-time
+    /// reset of unpromoted, never-surfaced data is acceptable.
+    pub fn open(root: &Path, session_id: impl Into<String>) -> Self {
+        let db_path = root.join(SYMFORGE_STEL_LEDGER_DB_PATH);
         match SqliteStelLedgerStore::open(&db_path, session_id) {
             Ok(store) => Self::Sqlite(store),
             Err(err) => {
@@ -328,6 +342,13 @@ impl StelLedgerStore {
     }
 
     /// Insert one ledger event. No-op when `Disabled`.
+    ///
+    /// Degrade-silently contract (FR-011): a record error is logged and dropped,
+    /// never propagated. Under pathological multi-process contention a single
+    /// event may be lost if every retry within the `busy_timeout` window is
+    /// blocked — acceptable for best-effort calibration data (one dropped sample
+    /// out of thousands does not change a tuned constant; never blocks the
+    /// request path).
     pub fn record(&self, event: &StelLedgerEvent) {
         if let Self::Sqlite(store) = self
             && let Err(err) = store.record(event)
