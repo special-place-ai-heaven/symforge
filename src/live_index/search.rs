@@ -683,6 +683,12 @@ pub const SUPPRESSED_TEXT_MATCH_DISPLAY_CAP: usize = 100;
 /// context windows) inherits the bound for free.
 pub const MAX_DISPLAY_LINE_CHARS: usize = 2000;
 
+/// The default per-file visible-match cap shared by `for_current_code_search`
+/// (both the symbol and text option presets). The overlay post-filter
+/// (`live_index::view`) reuses this so an upserted dirty file is bounded
+/// identically to a base file.
+pub(super) const DEFAULT_MAX_PER_FILE: usize = 5;
+
 /// Truncate a source line to a bounded, char-boundary-safe head excerpt with an
 /// honest marker when it exceeds [`MAX_DISPLAY_LINE_CHARS`].
 ///
@@ -690,7 +696,10 @@ pub const MAX_DISPLAY_LINE_CHARS: usize = 2000;
 /// minified bundles) never causes a byte-boundary panic. Lines at or under the
 /// cap are returned unchanged. The marker reports the number of characters
 /// omitted so the result stays honest about what was elided.
-fn truncate_display_line(line: &str) -> String {
+///
+/// `pub(super)` so the overlay post-filter (`live_index::view`) applies the
+/// SAME per-line cap as the base search instead of emitting raw lines.
+pub(super) fn truncate_display_line(line: &str) -> String {
     // Fast path: most lines are short. `len()` (bytes) is a cheap upper bound on
     // char count, so a line whose byte length fits the cap cannot exceed it in
     // chars and needs no scan.
@@ -1201,6 +1210,32 @@ fn file_matches_text_options(
         && !file_hidden_by_search_policy(path, file, options)
 }
 
+/// File-level scope+noise gate for the default code-search preset
+/// (`TextSearchOptions::for_current_code_search`), expressed without any
+/// caller-supplied glob/path scope (the overlay post-filter has none).
+///
+/// Returns `true` when a file with `path` and `classification` would survive
+/// the base's file-level filtering for `search_text`/`find_references`:
+/// `SearchScope::Code` (code class only) + the default `NoisePolicy`
+/// (generated and test files hidden; vendor kept) + personal-tooling exclusion.
+/// It is single-sourced through [`SearchScope::allows`],
+/// [`NoisePolicy::allows`], and [`is_personal_tooling_path`] so the overlay
+/// scan cannot diverge from the base classifier.
+///
+/// `pub(super)` for the overlay post-filter in `live_index::view`; the base
+/// path keeps using `file_matches_text_base_scope` + `file_hidden_by_search_policy`
+/// (which additionally honor caller glob/path/language scope).
+pub(super) fn current_code_search_keeps_file(
+    path: &str,
+    classification: &FileClassification,
+) -> bool {
+    let options = TextSearchOptions::for_current_code_search();
+    options.search_scope.allows(classification)
+        && options.noise_policy.allows(classification)
+        && !(!options.include_personal_tooling
+            && crate::live_index::query::is_personal_tooling_path(path))
+}
+
 /// Structural (AST-pattern) search across indexed files.
 ///
 /// Uses ast-grep to match a tree-sitter AST pattern against source files.
@@ -1520,7 +1555,10 @@ fn compute_importance_score(
     0.30 * match_count_norm + 0.40 * caller_norm + 0.15 * churn_score + 0.15 * max_kind
 }
 
-fn compute_test_ranges(file: &crate::live_index::IndexedFile) -> Vec<(u32, u32)> {
+/// `pub(super)` so the overlay post-filter (`live_index::view`) suppresses
+/// matches inside Rust `#[cfg(test)]`/`mod tests` blocks exactly as the base
+/// `collect_text_matches` does for an upserted dirty file.
+pub(super) fn compute_test_ranges(file: &crate::live_index::IndexedFile) -> Vec<(u32, u32)> {
     file.symbols
         .iter()
         .filter(|s| s.name == "tests" && s.kind == SymbolKind::Module)

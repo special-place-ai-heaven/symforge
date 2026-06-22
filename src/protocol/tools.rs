@@ -70,6 +70,100 @@ fn statused_tool_result(
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
 }
 
+/// Lexically normalize a path, resolving `.`/`..` segments WITHOUT touching the
+/// filesystem (so a not-yet-existing within-project filter path can still be
+/// checked for `..` escapes). Absolute prefixes and the path root are preserved.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                // Pop a normal segment if there is one; never pop past the root
+                // or a prefix (drive/UNC) component.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `path` (a `symforge` `path:` filter) resolves WITHIN the bound
+/// project `root` (012 D6 / contracts §3c). `path:` is a within-project filter,
+/// never a project selector, so a path that escapes the bound root is a caller
+/// error.
+///
+/// Resolution: a relative `path` is joined onto `root`; an absolute `path` is
+/// used as-is. Both the resolved target and the root are canonicalized when they
+/// exist on disk (resolving symlinks/`..`); when the target does not exist yet,
+/// we fall back to a lexical normalization so a `../../escape` filter is still
+/// rejected. Containment is the canonical/normalized-root being a prefix of the
+/// canonical/normalized target (equal counts as within).
+fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let raw = Path::new(path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        canonical_root.join(raw)
+    };
+    let resolved = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(&resolved));
+
+    // Compare with the Windows verbatim (`\\?\`) prefix stripped from BOTH sides
+    // so a canonicalized root (which gains `\\?\`) and a lexically-normalized
+    // not-yet-existing target (which does not) still compare correctly.
+    let resolved_cmp = strip_verbatim_prefix(&resolved);
+    let root_cmp = strip_verbatim_prefix(&canonical_root);
+    resolved_cmp.starts_with(&root_cmp)
+}
+
+/// Strip the Windows verbatim/UNC `\\?\` prefix from a path for comparison,
+/// returning a plain comparable `PathBuf`. On a path without the prefix (or on
+/// non-Windows) this is an allocation-light passthrough.
+///
+/// We rebuild the path from its components: a `Prefix` component that is verbatim
+/// (`\\?\C:`, `\\?\UNC\...`) is replaced by its plain disk/UNC form so it lines
+/// up with a non-canonicalized (lexically normalized) sibling path.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::VerbatimDisk(disk) => {
+                    out.push(format!("{}:\\", disk as char));
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut unc = std::ffi::OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    out.push(unc);
+                }
+                _ => out.push(component.as_os_str()),
+            },
+            Component::RootDir => {
+                // Disk prefixes above already include the root separator; only
+                // push a bare root when there is no preceding prefix.
+                if out.as_os_str().is_empty() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 pub(super) fn is_index_unavailable_output(text: &str) -> bool {
     text.starts_with("Index not loaded.")
         || text.starts_with("Index is loading")
@@ -8374,6 +8468,16 @@ impl SymForgeServer {
             return statused_tool_result(output, outcome_class);
         }
 
+        // Surface-honesty (012 D6 / contracts §3c): with `query` now
+        // `#[serde(default)]`, an omitted/blank `query` no longer fails rmcp
+        // deserialization with an opaque error — validate it explicitly here and
+        // return a clean, actionable InvalidRequest instead.
+        if params.0.request.query.trim().is_empty() {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                "query is required: pass a natural-language phrase",
+            ));
+        }
+
         if super::surface_probe::surface_profile_from_env()
             != super::surface_probe::SurfaceProfile::Compact
         {
@@ -8415,6 +8519,27 @@ impl SymForgeServer {
             return Ok(
                 ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(&message)
             );
+        }
+
+        // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
+        // filter, not a project selector. A `path:` that resolves outside the
+        // bound project would silently match nothing (or, for an absolute path,
+        // mislead the caller into thinking they retargeted). Reject it up front
+        // with a clear message naming the bound root, mirroring the
+        // `symbol_contract_violation` corrective pattern. Skipped when no root is
+        // bound (nothing to verify against) or when `path` is blank.
+        if let Some(root) = self.capture_repo_root() {
+            if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
+                if !path_is_within_bound_project(path, &root) {
+                    let root_display = root.display().to_string().replace('\\', "/");
+                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                        .into_call_tool_result(&format!(
+                            "path is outside the bound project {root_display}: \
+                             `path:` is a within-project filter, not a project selector \
+                             (use `index_folder {{ path }}` to retarget the workspace)."
+                        )));
+                }
+            }
         }
 
         let mut plan = build_plan(request);

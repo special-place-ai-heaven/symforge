@@ -31,10 +31,12 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    SymbolMatchTier, TextSearchError, TextSearchResult, search_symbols as base_search_symbols,
-    search_text as base_search_text,
+    DEFAULT_MAX_PER_FILE, SymbolMatchTier, TextSearchError, TextSearchResult,
+    compute_test_ranges, current_code_search_keeps_file, search_symbols as base_search_symbols,
+    search_text as base_search_text, truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
+use crate::live_index::query::is_filtered_name;
 
 /// The commit identity component of a [`BaseKey`].
 ///
@@ -392,17 +394,28 @@ impl<'a> IndexView<'a> {
     /// hit is never returned, and the upserted file's real hits are. Cost is
     /// O(base text search) + O(dirty set scan), never an overlay-wide reindex.
     ///
+    /// The overlay scan mirrors the base file-level filtering: each upserted
+    /// file is gated by [`current_code_search_keeps_file`] (scope=Code, default
+    /// noise policy hiding test/generated files, personal-tooling excluded) so a
+    /// dirty test/generated file does not leak hits the base would suppress, and
+    /// the per-file scan applies the same `#[cfg(test)]` line suppression,
+    /// per-file cap (`DEFAULT_MAX_PER_FILE`), and line truncation. Appended
+    /// overlay files are sorted by path for deterministic output (Principle V).
+    ///
     /// `// DEFERRED (012 full tier):` a per-overlay trigram index would let the
     /// dirty-file scan use the same accelerated path as the base. Until then the
     /// dirty files are scanned linearly (correct, bounded by the small dirty
     /// set). DOCUMENTED LIMITATION: after the post-filter, `total_matches` is
     /// RECOMPUTED as the sum of the returned files' displayed match lines (each
-    /// bounded by the engine's `max_per_file`), so it is coherent with `files`
-    /// but is NOT the base's pre-cap visible total. `overflow_count` and
-    /// `suppressed_by_noise` are carried through from the base search unchanged
-    /// (base-accurate, not re-derived across the overlay) — honest, not globally
-    /// re-ranked. Per-consumer derived indices that would make these globally
-    /// exact are the deferred work.
+    /// bounded by `DEFAULT_MAX_PER_FILE`), so it is coherent with `files` but is
+    /// NOT the base's pre-cap visible total. Because the merged result differs
+    /// from the base result, the base's `overflow_count` and
+    /// `suppressed_by_noise` would be STALE; rather than carry misleading base
+    /// numbers, the overlay branch sets `overflow_count = 0` (no precise
+    /// merged-overflow claim) and `suppressed_by_noise` to ONLY the overlay
+    /// `#[cfg(test)]` suppressions actually counted while scanning the dirty set.
+    /// Per-consumer derived indices that would make these globally exact are the
+    /// deferred work.
     pub fn search_text(
         &self,
         query: Option<&str>,
@@ -424,21 +437,43 @@ impl<'a> IndexView<'a> {
 
         // (3) Scan each overlay Upsert directly for the same matcher and append
         // its current matches. A Tombstone contributes nothing (file removed).
+        //
+        // Overlay files are gathered into a vec and SORTED BY PATH before
+        // appending so the merged output order is DETERMINISTIC (Principle V/IV);
+        // `deltas` is a HashMap whose iteration order is not stable. Each
+        // upserted file is first put through the SAME file-level scope+noise gate
+        // the base applies (`current_code_search_keeps_file`) so an upserted
+        // test/generated/vendor/personal-tooling file does NOT leak hits the base
+        // would suppress; then `scan_file_lines` applies the in-file
+        // `#[cfg(test)]` suppression, the per-file cap, and line truncation.
         let matcher = overlay_text_matcher(query, terms, regex)?;
+        let mut overlay_suppressed = 0usize;
         if let Some(matcher) = matcher {
+            let mut appended: Vec<super::search::TextFileMatches> = Vec::new();
             for (path, delta) in deltas {
-                if let FileDelta::Upsert(file) = delta {
-                    let line_matches = scan_file_lines(file, &matcher);
-                    if !line_matches.is_empty() {
-                        result.files.push(super::search::TextFileMatches {
-                            path: path.clone(),
-                            matches: line_matches,
-                            rendered_lines: None,
-                            callers: None,
-                        });
-                    }
+                let FileDelta::Upsert(file) = delta else {
+                    continue;
+                };
+                // File-level scope+noise gate (mirrors the base's
+                // file_matches_text_base_scope + file_hidden_by_search_policy at
+                // the default code-search preset).
+                if !current_code_search_keeps_file(path, &file.classification) {
+                    continue;
+                }
+                let scan = scan_file_lines(file, &matcher);
+                overlay_suppressed += scan.suppressed;
+                if !scan.matches.is_empty() {
+                    appended.push(super::search::TextFileMatches {
+                        path: path.clone(),
+                        matches: scan.matches,
+                        rendered_lines: None,
+                        callers: None,
+                    });
                 }
             }
+            // Deterministic ordering of the appended overlay files.
+            appended.sort_by(|a, b| a.path.cmp(&b.path));
+            result.files.extend(appended);
         }
 
         // Recompute `total_matches` to stay COHERENT with the post-filtered
@@ -447,10 +482,26 @@ impl<'a> IndexView<'a> {
         // appended `matches` lists rather than incrementally patching the base
         // counter, which would leave it stale after the retain above. NOTE: this
         // makes `total_matches` reflect the displayed match lines (each file's
-        // `matches` is already bounded by the engine's `max_per_file`); it is an
-        // honest count of the merged result, not the base's pre-cap visible
-        // total. See the DOCUMENTED LIMITATION on this method.
+        // `matches` is bounded by `DEFAULT_MAX_PER_FILE`); it is an honest count
+        // of the merged result, not the base's pre-cap visible total. See the
+        // DOCUMENTED LIMITATION on this method.
         result.total_matches = result.files.iter().map(|f| f.matches.len()).sum();
+
+        // `overflow_count` and `suppressed_by_noise` from the BASE search
+        // described the pre-filter base result; after dropping base files and
+        // appending overlay scans they no longer describe the merged result, so
+        // carrying the base numbers would be a LIE. We cannot cheaply re-derive a
+        // globally exact visible-overflow across the overlay (that is the
+        // deferred per-consumer derived index), so we report a COHERENT,
+        // honest-but-coarse value instead of stale base numbers:
+        //   * overflow_count -> 0 (we do not claim a precise hidden-overflow
+        //     count across the merged set);
+        //   * suppressed_by_noise -> only the overlay `#[cfg(test)]` suppressions
+        //     we actually counted while scanning the dirty set (the base's own
+        //     suppression total is not re-derived across the post-filter).
+        // This keeps every reported field consistent with the result we return.
+        result.overflow_count = 0;
+        result.suppressed_by_noise = overlay_suppressed;
 
         Ok(result)
     }
@@ -467,6 +518,13 @@ impl<'a> IndexView<'a> {
     ///
     /// Returns `(path, ReferenceRecord)` pairs owned by the view's lifetime.
     ///
+    /// Like [`search_text`], the overlay scan applies the SAME file-level
+    /// scope+noise gate as the base ([`current_code_search_keeps_file`]) so a
+    /// dirty test/generated file does not leak references, honors
+    /// `include_filtered` (skipping [`is_filtered_name`] references when
+    /// `!include_filtered`, mirroring the base), and sorts appended overlay files
+    /// by path for deterministic output (Principle V).
+    ///
     /// `// DEFERRED (012 full tier):` a per-overlay reverse index would replace
     /// the linear `references` scan of the dirty files. Until then the dirty set
     /// is scanned directly (correct, O(dirty set)). DOCUMENTED LIMITATION: the
@@ -474,6 +532,8 @@ impl<'a> IndexView<'a> {
     /// file's `references` (and qualified-name equality); it does not reproduce
     /// the base's alias-map resolution across overlay files. Alias resolution
     /// across dirty files is part of the deferred derived-index work.
+    ///
+    /// [`search_text`]: IndexView::search_text
     pub fn find_references(
         &self,
         name: &str,
@@ -498,27 +558,47 @@ impl<'a> IndexView<'a> {
         out.retain(|(path, _)| !deltas.contains_key(path));
 
         // (3) Scan overlay Upserts directly for matching references.
+        //
+        // Overlay files are gathered and SORTED BY PATH before appending so the
+        // merged output order is DETERMINISTIC (Principle V); `deltas` iteration
+        // is unordered. Each upserted file is gated by the SAME file-level
+        // scope+noise filter as the base (`current_code_search_keeps_file`) so a
+        // dirty test/generated/vendor/personal-tooling file does not leak
+        // references the base would suppress. We mirror the base's
+        // `include_filtered` behavior by skipping `is_filtered_name` references
+        // (single-letter generics / language builtins) when `!include_filtered`.
         let is_qualified = name.contains("::") || name.contains('.');
+        let mut appended: Vec<(String, &'a ReferenceRecord)> = Vec::new();
         for (path, delta) in deltas {
-            if let FileDelta::Upsert(file) = delta {
-                for reference in &file.references {
-                    let name_matches = if is_qualified {
-                        reference.qualified_name.as_deref() == Some(name)
-                    } else {
-                        reference.name == name
-                    };
-                    if !name_matches {
-                        continue;
-                    }
-                    if let Some(kf) = kind_filter
-                        && reference.kind != kf
-                    {
-                        continue;
-                    }
-                    out.push((path.clone(), reference));
+            let FileDelta::Upsert(file) = delta else {
+                continue;
+            };
+            if !current_code_search_keeps_file(path, &file.classification) {
+                continue;
+            }
+            for reference in &file.references {
+                let name_matches = if is_qualified {
+                    reference.qualified_name.as_deref() == Some(name)
+                } else {
+                    reference.name == name
+                };
+                if !name_matches {
+                    continue;
                 }
+                if let Some(kf) = kind_filter
+                    && reference.kind != kf
+                {
+                    continue;
+                }
+                // Mirror the base: hide filtered names unless explicitly asked.
+                if !include_filtered && is_filtered_name(&reference.name, &file.language) {
+                    continue;
+                }
+                appended.push((path.clone(), reference));
             }
         }
+        appended.sort_by(|a, b| a.0.cmp(&b.0));
+        out.extend(appended);
 
         out
     }
@@ -627,26 +707,72 @@ fn overlay_text_matcher(
     }))
 }
 
-/// Scan an overlay file's content line by line, returning [`TextLineMatch`]es
-/// for the matcher. Line numbers are 1-based, trailing `\r` trimmed — matching
-/// the engine's `collect_text_matches` line handling.
-fn scan_file_lines(
-    file: &IndexedFile,
-    matcher: &OverlayTextMatcher,
-) -> Vec<super::search::TextLineMatch> {
+/// Result of scanning one overlay `Upsert` file for the matcher: the bounded,
+/// truncated display matches plus the count of matches suppressed by the
+/// in-file Rust `#[cfg(test)]` noise filter.
+struct OverlayFileScan {
+    matches: Vec<super::search::TextLineMatch>,
+    suppressed: usize,
+}
+
+/// Scan an overlay file's content line by line, mirroring the base
+/// `collect_text_matches` semantics for an upserted dirty file:
+/// * line numbers are 1-based, trailing `\r` trimmed;
+/// * matches inside Rust `#[cfg(test)]`/`mod tests` ranges are suppressed (and
+///   counted) under the default code-search noise policy;
+/// * at most [`DEFAULT_MAX_PER_FILE`] visible match lines are RETAINED, each
+///   passed through [`truncate_display_line`] so a single huge line cannot
+///   detonate the result.
+///
+/// File-level scope/noise gating (test/generated/vendor/personal-tooling files)
+/// is the CALLER's responsibility via [`current_code_search_keeps_file`]; this
+/// function assumes the file already passed that gate and only applies the
+/// in-file (`#[cfg(test)]`) line suppression + per-file cap + truncation.
+fn scan_file_lines(file: &IndexedFile, matcher: &OverlayTextMatcher) -> OverlayFileScan {
+    // Rust test-module line ranges, suppressed under the default code-search
+    // noise policy (which excludes tests). Non-Rust files have none.
+    let test_ranges: Vec<(u32, u32)> = if file.language == crate::domain::LanguageId::Rust {
+        compute_test_ranges(file)
+    } else {
+        Vec::new()
+    };
+
     let content = String::from_utf8_lossy(&file.content);
     let mut matches = Vec::new();
+    let mut suppressed = 0usize;
     for (line_idx, line) in content.lines().enumerate() {
         let line = line.trim_end_matches('\r');
-        if matcher.is_match(line) {
+        if !matcher.is_match(line) {
+            continue;
+        }
+        // Suppress (and count) matches inside Rust #[cfg(test)] modules.
+        if !test_ranges.is_empty() {
+            let line_num = line_idx as u32;
+            if test_ranges
+                .iter()
+                .any(|&(start, end)| line_num >= start && line_num <= end)
+            {
+                suppressed += 1;
+                continue;
+            }
+        }
+        // Cap the RETAINED display matches at the base's per-file limit, while
+        // still counting (above) every suppressed line. We do not need a visible
+        // overflow count here because the overlay branch reports overflow as
+        // "unknown across overlay" (see search_text), but bounding the retained
+        // lines is required to match base output size.
+        if matches.len() < DEFAULT_MAX_PER_FILE {
             matches.push(super::search::TextLineMatch {
                 line_number: line_idx + 1,
-                line: line.to_string(),
+                line: truncate_display_line(line),
                 enclosing_symbol: None,
             });
         }
     }
-    matches
+    OverlayFileScan {
+        matches,
+        suppressed,
+    }
 }
 
 /// Selects which projects in a [`WorkingSet`] a cross-project query targets
@@ -1602,6 +1728,224 @@ mod tests {
             "an upserted file's reference must be returned"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    // ── overlay text scan: per-file cap + line truncation match the base ──────
+    #[test]
+    fn view_search_text_overlay_caps_and_truncates() {
+        // Base has no NEEDLE; the upserted file carries 10 matching lines plus
+        // one absurdly long matching line (to prove truncation).
+        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
+        let mut overlay = Overlay::fresh(&base);
+
+        let mut body = String::new();
+        for i in 0..10 {
+            body.push_str(&format!("let NEEDLE_{i} = {i};\n"));
+        }
+        // A single match line longer than MAX_DISPLAY_LINE_CHARS (2000).
+        body.push_str(&format!("let NEEDLE_long = \"{}\";\n", "x".repeat(5000)));
+        overlay.upsert("added.rs", Arc::new(make_file("added.rs", &body)));
+
+        let view = IndexView::new(&base, Some(&overlay)).unwrap();
+        let result = view
+            .search_text(Some("NEEDLE"), None, false)
+            .expect("overlay text search");
+
+        let added = result
+            .files
+            .iter()
+            .find(|f| f.path == "added.rs")
+            .expect("added.rs present");
+        // 11 visible matches collapse to at most DEFAULT_MAX_PER_FILE (5).
+        assert_eq!(
+            added.matches.len(),
+            5,
+            "overlay scan must cap retained matches at DEFAULT_MAX_PER_FILE like the base"
+        );
+        // No retained line exceeds the display cap; if a long line survived the
+        // cap it must carry the honest truncation marker.
+        for m in &added.matches {
+            assert!(
+                m.line.chars().count() <= super::super::search::MAX_DISPLAY_LINE_CHARS + 64,
+                "retained overlay line must be truncated, not raw: len={}",
+                m.line.chars().count()
+            );
+        }
+        // total_matches is coherent with the displayed (capped) match lines.
+        assert_eq!(result.total_matches, added.matches.len());
+        // Coherent meta after the post-filter (not stale base numbers).
+        assert_eq!(result.overflow_count, 0);
+        assert_eq!(result.suppressed_by_noise, 0);
+    }
+
+    // ── overlay text scan: an upserted TEST-classified file is suppressed ──────
+    #[test]
+    fn view_search_text_overlay_suppresses_test_classified_file() {
+        // Base file (code) carries NEEDLE; an upserted file under tests/ also
+        // carries NEEDLE but must be suppressed by the file-level noise gate, the
+        // same way the base hides test files under for_current_code_search().
+        let base = base_with_symbol("/a", "c0", "f", "let NEEDLE = 1;");
+        let mut overlay = Overlay::fresh(&base);
+        // for_code_path("tests/foo.rs") => is_test = true.
+        overlay.upsert(
+            "tests/foo.rs",
+            Arc::new(make_file("tests/foo.rs", "let NEEDLE = 99;")),
+        );
+        // A normal code file IS kept.
+        overlay.upsert(
+            "src/added.rs",
+            Arc::new(make_file("src/added.rs", "let NEEDLE = 2;")),
+        );
+
+        let view = IndexView::new(&base, Some(&overlay)).unwrap();
+        let result = view
+            .search_text(Some("NEEDLE"), None, false)
+            .expect("overlay text search");
+        let paths: std::collections::BTreeSet<&str> =
+            result.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !paths.contains("tests/foo.rs"),
+            "an upserted test-classified file must not leak hits the base would suppress"
+        );
+        assert!(
+            paths.contains("src/added.rs"),
+            "an upserted code file's hit is returned"
+        );
+    }
+
+    // ── overlay text scan: #[cfg(test)] block suppression + count ──────────────
+    #[test]
+    fn view_search_text_overlay_suppresses_cfg_test_block() {
+        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
+        let mut overlay = Overlay::fresh(&base);
+
+        // A Rust file with a `tests` module (lines 2..=3) carrying NEEDLE; the
+        // match on line 0 is visible, the in-module matches are suppressed.
+        let content = "let NEEDLE = 0;\nmod tests {\nlet NEEDLE = 1;\nlet NEEDLE = 2;\n}\n";
+        let mut file = make_file("src/code.rs", content);
+        file.symbols = vec![SymbolRecord {
+            name: "tests".to_string(),
+            kind: SymbolKind::Module,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, content.len() as u32),
+            // line_range is 0-based inclusive: the `mod tests` block spans lines 1..=4.
+            line_range: (1, 4),
+            doc_byte_range: None,
+            item_byte_range: None,
+        }];
+        overlay.upsert("src/code.rs", Arc::new(file));
+
+        let view = IndexView::new(&base, Some(&overlay)).unwrap();
+        let result = view
+            .search_text(Some("NEEDLE"), None, false)
+            .expect("overlay text search");
+        let code = result
+            .files
+            .iter()
+            .find(|f| f.path == "src/code.rs")
+            .expect("src/code.rs present");
+        assert_eq!(
+            code.matches.len(),
+            1,
+            "only the non-test-module NEEDLE match should be visible"
+        );
+        assert_eq!(code.matches[0].line_number, 1);
+        assert_eq!(
+            result.suppressed_by_noise, 2,
+            "the two #[cfg(test)]-module matches are counted as suppressed"
+        );
+    }
+
+    // ── overlay find_references: include_filtered asymmetry ────────────────────
+    #[test]
+    fn view_find_references_overlay_honors_include_filtered() {
+        // Base is empty of refs; the overlay adds a file referencing `T`, a
+        // single-letter generic that `is_filtered_name` filters by default.
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        idx.rebuild_reverse_index();
+        let base = Arc::new(IndexBase::new(
+            BaseKey::new("/a", CommitId::Sha("c0".to_string())),
+            Arc::new(idx),
+            1,
+        ));
+
+        let mut overlay = Overlay::fresh(&base);
+        let mut added = make_file("src/added.rs", "fn n<T>() -> T { todo!() }");
+        added.references = vec![ReferenceRecord {
+            name: "T".to_string(),
+            qualified_name: None,
+            kind: ReferenceKind::TypeUsage,
+            byte_range: (0, 1),
+            line_range: (0, 0),
+            enclosing_symbol_index: None,
+        }];
+        overlay.upsert("src/added.rs", Arc::new(added));
+
+        let view = IndexView::new(&base, Some(&overlay)).unwrap();
+        // include_filtered = false -> single-letter generic T is hidden.
+        let hidden = view.find_references("T", None, false);
+        assert!(
+            hidden.is_empty(),
+            "with include_filtered=false an overlay single-letter generic ref must be filtered"
+        );
+        // include_filtered = true -> the same ref is returned.
+        let shown = view.find_references("T", None, true);
+        assert_eq!(
+            shown.len(),
+            1,
+            "with include_filtered=true the overlay ref is returned"
+        );
+        assert_eq!(shown[0].0, "src/added.rs");
+    }
+
+    // ── overlay scans: appended files are deterministically ordered ────────────
+    #[test]
+    fn view_overlay_appended_files_are_path_sorted() {
+        // Many upserted code files all carrying NEEDLE; the appended order must be
+        // path-sorted regardless of HashMap iteration order.
+        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
+        let mut overlay = Overlay::fresh(&base);
+        let names = ["src/zeta.rs", "src/alpha.rs", "src/mike.rs", "src/bravo.rs"];
+        for n in names {
+            overlay.upsert(n, Arc::new(make_file(n, "let NEEDLE = 1;")));
+        }
+
+        let view = IndexView::new(&base, Some(&overlay)).unwrap();
+        let result = view
+            .search_text(Some("NEEDLE"), None, false)
+            .expect("overlay text search");
+        let ordered: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+        let mut expected = names.to_vec();
+        expected.sort();
+        assert_eq!(
+            ordered, expected,
+            "appended overlay text files must be path-sorted (deterministic, Principle V)"
+        );
+
+        // Same determinism for find_references.
+        let mut ref_overlay = Overlay::fresh(&base);
+        for n in names {
+            let mut f = make_file(n, "fn u() { target(); }");
+            f.references = vec![ReferenceRecord {
+                name: "target".to_string(),
+                qualified_name: None,
+                kind: ReferenceKind::Call,
+                byte_range: (0, 6),
+                line_range: (0, 0),
+                enclosing_symbol_index: None,
+            }];
+            ref_overlay.upsert(n, Arc::new(f));
+        }
+        let ref_view = IndexView::new(&base, Some(&ref_overlay)).unwrap();
+        let refs = ref_view.find_references("target", None, true);
+        let ref_order: Vec<&str> = refs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            ref_order, expected,
+            "appended overlay reference files must be path-sorted (deterministic, Principle V)"
+        );
     }
 
     // ── cross-project text query is source-attributed ────────────────────────

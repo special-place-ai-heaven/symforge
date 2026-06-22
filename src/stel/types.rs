@@ -71,6 +71,13 @@ impl AdmissionDecision {
 /// MCP input for the `symforge` compact-surface tool (L0 → L1).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelRequest {
+    /// The natural-language phrase to route. `#[serde(default)]` so an OMITTED
+    /// `query` deserializes to an empty string instead of failing rmcp
+    /// `Parameters` deserialization with an opaque error; `symforge_facade_tool`
+    /// then validates emptiness up front and returns a clean
+    /// `OutcomeClass::InvalidRequest` "query is required" (research D6,
+    /// contracts/engine-and-surface.md §3c).
+    #[serde(default)]
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<IntentBucket>,

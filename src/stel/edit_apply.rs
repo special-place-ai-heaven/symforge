@@ -10,6 +10,39 @@ use crate::live_index::{IndexedFile, SharedIndex};
 use super::edit_planner::EditValidationError;
 use super::types::StelEditRequest;
 
+/// Normalize bytes for a PRE-FLIGHT equality compare only (012 D6 /
+/// contracts §3c): strip a leading UTF-8 BOM and fold CRLF/CR line endings to
+/// LF, so an `if_match` or index-vs-disk compare that differs ONLY by line
+/// endings or a BOM is not falsely rejected.
+///
+/// IMPORTANT: this is for the pre-flight gate ONLY. The write path's byte-exact
+/// splice guard (`protocol::edit::guarded_atomic_write_file`) is intentionally
+/// NOT normalized — it must compare the exact bytes being written so the
+/// optimistic-concurrency guarantee (Principle IV idempotency) is preserved.
+fn normalize_for_match(bytes: &[u8]) -> Vec<u8> {
+    // Strip a single leading UTF-8 BOM (EF BB BF) if present.
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+
+    // Fold CRLF and bare CR to LF. Iterating bytes is safe: CR (0x0D) and LF
+    // (0x0A) are ASCII and never appear inside a multibyte UTF-8 sequence.
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'\r' => {
+                out.push(b'\n');
+                // Swallow a following LF so CRLF collapses to a single LF.
+                if i + 1 < body.len() && body[i + 1] == b'\n' {
+                    i += 1;
+                }
+            }
+            other => out.push(other),
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Resolved symbol span used for apply metadata and pre-flight gates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedEditSymbol {
@@ -89,8 +122,13 @@ pub fn run_pre_apply_gates(
     // op, and within-edits remain naturally idempotent (a missing `old_text` is a
     // no-op the internal tool reports).
     if super::edit_planner::effective_op(request) == super::types::StelEditOp::Replace {
+        // Pre-flight compare is NORMALIZED (CRLF/LF + optional BOM) so an
+        // `if_match` that matches the current body apart from line endings or a
+        // BOM is not falsely rejected. The byte-exact write-time splice guard is
+        // unaffected (it re-reads and compares raw bytes).
         if let Some(if_match) = request.if_match.as_deref()
-            && if_match != resolved.current_body
+            && normalize_for_match(if_match.as_bytes())
+                != normalize_for_match(resolved.current_body.as_bytes())
         {
             return Err(EditValidationError::new(
                 "if_match does not match current symbol body",
@@ -153,7 +191,11 @@ fn verify_index_matches_disk(
             "cannot read on-disk file for content verification: {error}"
         ))
     })?;
-    if file.content.as_slice() != disk.as_slice() {
+    // Normalized PRE-FLIGHT compare (CRLF/LF + optional BOM): a working tree
+    // that differs from the index snapshot only by line endings or a BOM is not
+    // a genuine drift and must not block apply. The write-time re-read in
+    // `guarded_atomic_write_file` still compares the exact bytes being spliced.
+    if normalize_for_match(file.content.as_slice()) != normalize_for_match(disk.as_slice()) {
         return Err(EditValidationError::new(
             "on-disk content does not match index snapshot for apply",
         ));
@@ -236,5 +278,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("if_match"));
+    }
+
+    #[test]
+    fn normalize_for_match_folds_crlf_and_strips_bom() {
+        // CRLF == LF after normalization.
+        assert_eq!(
+            normalize_for_match(b"a\r\nb\r\n"),
+            normalize_for_match(b"a\nb\n")
+        );
+        // Bare CR also folds to LF.
+        assert_eq!(normalize_for_match(b"a\rb"), normalize_for_match(b"a\nb"));
+        // Leading BOM is stripped before comparison.
+        assert_eq!(
+            normalize_for_match(b"\xEF\xBB\xBFhello"),
+            normalize_for_match(b"hello")
+        );
+        // A genuine content difference still differs.
+        assert_ne!(normalize_for_match(b"old"), normalize_for_match(b"new"));
+    }
+
+    #[test]
+    fn pre_apply_accepts_if_match_differing_only_by_crlf_and_bom() {
+        // On-disk + indexed body uses LF; the caller's `if_match` is byte-equal
+        // EXCEPT for a leading BOM and CRLF line endings. The normalized
+        // pre-flight compare must NOT falsely reject this valid edit.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Multi-line body so CRLF folding is actually exercised.
+        let content = b"fn foo() {\n    ok();\n}\n";
+        std::fs::write(src.join("lib.rs"), content).unwrap();
+        let shared = LiveIndex::load(dir.path()).expect("load index");
+        let abs = src.join("lib.rs");
+
+        // Resolve the current body so the test's if_match mirrors it apart from
+        // line endings + a BOM, independent of how the parser spans the symbol.
+        let current_body = {
+            let guard = shared.read();
+            let file = guard.capture_shared_file("src/lib.rs").unwrap();
+            resolve_symbol_in_file(&file, "src/lib.rs", "foo")
+                .unwrap()
+                .current_body
+        };
+        let crlf_bom_if_match =
+            format!("\u{feff}{}", current_body.replace('\n', "\r\n"));
+        assert_ne!(
+            crlf_bom_if_match, current_body,
+            "the test input must actually differ in raw bytes"
+        );
+
+        let outcome = run_pre_apply_gates(
+            &shared,
+            &StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("foo".to_string()),
+                // A genuinely new body so we land on Ready, not AlreadyApplied.
+                body: Some("fn foo() {\n    changed();\n}".to_string()),
+                if_match: Some(crlf_bom_if_match),
+                apply: Some(true),
+                ..Default::default()
+            },
+            &abs,
+        )
+        .expect("CRLF/BOM-only if_match difference must not be rejected");
+        assert!(
+            matches!(outcome, PreApplyOutcome::Ready(_)),
+            "expected a Ready pre-apply outcome, got {outcome:?}"
+        );
     }
 }
