@@ -8597,6 +8597,32 @@ impl SymForgeServer {
             );
         }
 
+        // Surface-honesty (012 Phase 3 / Principle VII): `StelRequest` carries
+        // `project`/`projects` for schema parity with the direct tools, but the L1
+        // planner does NOT route them into its read steps. Accepting them silently
+        // would single-project-resolve a `projects:["*"]` caller and hand back
+        // partial results that LOOK cross-project — a silent drop. Refuse honestly
+        // instead: name the supported vehicle. A blank `project` / empty `projects`
+        // is treated as "not set" (it would target the active project anyway), so
+        // the refusal fires only on a meaningful cross-project request.
+        let has_project = request
+            .project
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        let has_projects = request
+            .projects
+            .as_deref()
+            .is_some_and(|ids| ids.iter().any(|id| !id.trim().is_empty()));
+        if has_project || has_projects {
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                    "cross-project targeting is not routed through the `symforge` facade; \
+                 call search_symbols / search_text / find_references directly with \
+                 project/projects.",
+                ),
+            );
+        }
+
         // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
         // filter, not a project selector. A `path:` that resolves outside the
         // bound project would silently match nothing (or, for an absolute path,
@@ -23831,6 +23857,85 @@ mod tests {
         assert!(
             !on_disk.contains("old"),
             "negative control must replace the old body:\n{on_disk}"
+        );
+    }
+
+    // ── Feature 012 hardening — `symforge` facade REFUSES cross-project targeting ─
+    //
+    // `StelRequest` carries `project`/`projects` for schema parity, but the L1
+    // planner does not route them, so accepting one would silently single-project-
+    // resolve a `projects:["*"]` caller (a silent drop, Principle VII). The facade
+    // must refuse honestly with an InvalidRequest naming the direct-tool vehicle.
+    #[tokio::test]
+    async fn symforge_facade_rejects_cross_project_targeting() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
+        let content = medium_test_source("pub fn thing() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        // `projects: ["*"]` -> refused (not silently single-project resolved).
+        let projects_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                projects: Some(vec!["*".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(projects_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("cross-project targeting is not routed through the `symforge` facade")
+                && text.contains("search_symbols")
+                && text.contains("find_references"),
+            "refusal must name the direct-tool vehicle: {text}"
+        );
+
+        // `project: "proj-x"` -> refused identically.
+        let project_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("proj-x".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(project_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+
+        // A blank `project` is treated as not-set: the facade must NOT refuse on it
+        // (it would target the active project anyway). It proceeds past the
+        // cross-project guard (whatever the downstream outcome, it is NOT the
+        // cross-project refusal message).
+        let blank_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("   ".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(blank_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(
+            !text.contains("cross-project targeting is not routed"),
+            "a blank `project` must not trip the cross-project refusal: {text}"
         );
     }
 }

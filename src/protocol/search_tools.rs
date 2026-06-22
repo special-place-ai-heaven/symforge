@@ -54,7 +54,12 @@ pub struct SearchSymbolsInput {
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
     /// id/alias, or `["*"]` for every open project. Mutually exclusive with
     /// `project`. An empty list is rejected (no silent "all"). Daemon-only.
+    // `#[schemars(with = "Vec<String>")]` keeps this a plain `type: "array"`
+    // schema, NOT the `type: ["array", "null"]` union that strict MCP clients
+    // reject (mirrors `SearchTextInput::terms`; enforced by
+    // `tests/strict_client_schema_compat.rs`); serde keeps the field optional.
     #[serde(default)]
+    #[schemars(with = "Vec<String>")]
     pub projects: Option<Vec<String>>,
 }
 
@@ -140,7 +145,12 @@ pub struct SearchTextInput {
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
     /// id/alias, or `["*"]` for every open project. Mutually exclusive with
     /// `project`; an empty list is rejected. Daemon-only.
+    // `#[schemars(with = "Vec<String>")]` keeps this a plain `type: "array"`
+    // schema, NOT the `type: ["array", "null"]` union that strict MCP clients
+    // reject (mirrors `SearchTextInput::terms`; enforced by
+    // `tests/strict_client_schema_compat.rs`); serde keeps the field optional.
     #[serde(default)]
+    #[schemars(with = "Vec<String>")]
     pub projects: Option<Vec<String>>,
 }
 
@@ -243,7 +253,12 @@ pub struct FindReferencesInput {
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
     /// id/alias, or `["*"]` for every open project. Mutually exclusive with
     /// `project`; an empty list is rejected. Daemon-only.
+    // `#[schemars(with = "Vec<String>")]` keeps this a plain `type: "array"`
+    // schema, NOT the `type: ["array", "null"]` union that strict MCP clients
+    // reject (mirrors `SearchTextInput::terms`; enforced by
+    // `tests/strict_client_schema_compat.rs`); serde keeps the field optional.
     #[serde(default)]
+    #[schemars(with = "Vec<String>")]
     pub projects: Option<Vec<String>>,
 }
 

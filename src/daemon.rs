@@ -2042,6 +2042,14 @@ impl ProjectInstance {
     /// the root, or [`CommitId::Dirtyless`] when the root is not a git repository
     /// (so a non-git tree still has a stable, shareable identity).
     ///
+    /// STALENESS: the captured `Arc<LiveIndex>` is a SNAPSHOT frozen at this
+    /// instant. Once interned, the watcher's later `ArcSwap` reloads (this project
+    /// re-indexing files that changed on disk) do NOT rewrite the interned handle,
+    /// so a cross-project read off the interned base goes stale after ANY
+    /// watcher-picked-up change — not only after a git commit. See
+    /// [`crate::live_index::view::IndexBase::index`]. Re-interning on
+    /// watcher-observed change (live-freshness rebase) is the deferred Phase 4.
+    ///
     /// The returned base carries `base_generation = 1` (the start value). This is
     /// a CANDIDATE only: [`DaemonState::intern_base`] is the authority on
     /// generation and identity. On an intern cache hit it returns the EXISTING
@@ -2697,11 +2705,21 @@ fn resolve_targets(
                         .to_string(),
                 );
             }
-            if list.iter().any(|id| id == "*") {
+            // Trim every entry before matching (symmetry with the single `project`
+            // branch, which trims): leading/trailing whitespace must not defeat
+            // the `*` check, the path-separator guard, or id equality.
+            let trimmed: Vec<&str> = list.iter().map(|id| id.trim()).collect();
+            if trimmed.iter().any(|id| id.is_empty()) {
+                return Err(
+                    "projects entries must be non-empty project ids/aliases (blank entry found)."
+                        .to_string(),
+                );
+            }
+            if trimmed.contains(&"*") {
                 // Any `*` in the list means "all open projects".
                 return Ok(Targets::All);
             }
-            for id in list {
+            for id in &trimmed {
                 if id.contains('/') || id.contains('\\') {
                     return Err(format!(
                         "projects entries must be project ids/aliases, not filesystem paths \
@@ -2710,7 +2728,17 @@ fn resolve_targets(
                     ));
                 }
             }
-            Ok(Targets::Subset(list.to_vec()))
+            // Dedup the subset's ids (order-preserving): a duplicate id would
+            // otherwise render a second bogus `── project: <id> ──` header for the
+            // same project. `Targets::selects` is membership, so dedup is purely a
+            // rendering-honesty fix, not a behavior change.
+            let mut seen = std::collections::HashSet::new();
+            let deduped: Vec<String> = trimmed
+                .into_iter()
+                .filter(|id| seen.insert(id.to_string()))
+                .map(|id| id.to_string())
+                .collect();
+            Ok(Targets::Subset(deduped))
         }
         (None, None) => Ok(Targets::One(active_project_id.to_string())),
     }
@@ -2758,6 +2786,144 @@ fn ensure_targets_open(targets: &Targets, working_set: &WorkingSet) -> Result<()
     }
 }
 
+/// Default cap on the TOTAL number of rendered hits a cross-project read emits
+/// across all targeted projects when the caller passes no `limit`. The
+/// single-project paths bound themselves (search_symbols default 50, references
+/// 20, text 50); the cross-project path fans out over N projects, so without a
+/// shared cap a `projects:["*"]` query over many large projects could emit an
+/// unbounded result. 200 is generous for a multi-project view yet hard-bounds the
+/// output. The caller's `limit` overrides this (clamped to the hard ceiling).
+const CROSS_PROJECT_DEFAULT_RESULT_CAP: usize = 200;
+
+/// Absolute ceiling on the cross-project total hit count, even when the caller
+/// passes a large `limit`. A cross-project read must never blow up the result no
+/// matter what `limit` is requested.
+const CROSS_PROJECT_MAX_RESULT_CAP: usize = 1000;
+
+/// Resolve the effective total-hit cap for a cross-project read from the caller's
+/// optional `limit`: `None` -> the default cap; `Some(l)` -> `l` clamped to
+/// `[1, CROSS_PROJECT_MAX_RESULT_CAP]` (a zero or absurd limit cannot disable the
+/// bound).
+fn cross_project_result_cap(limit: Option<u32>) -> usize {
+    match limit {
+        Some(l) => (l as usize).clamp(1, CROSS_PROJECT_MAX_RESULT_CAP),
+        None => CROSS_PROJECT_DEFAULT_RESULT_CAP,
+    }
+}
+
+/// Apply the caller's optional `max_tokens` budget to an already-assembled
+/// cross-project body, truncating at a line boundary and DISCLOSING the
+/// truncation honestly (Principle III). Uses the project-wide ~4-bytes/token
+/// approximation that the other budgeted formatters use. A `None` or zero budget
+/// is a no-op. Returns the (possibly truncated) body.
+fn apply_cross_project_token_budget(body: String, max_tokens: Option<u64>) -> String {
+    let Some(max_tokens) = max_tokens.filter(|t| *t > 0) else {
+        return body;
+    };
+    let max_bytes = (max_tokens as usize).saturating_mul(4);
+    if max_bytes == 0 || body.len() <= max_bytes {
+        return body;
+    }
+    // Truncate at the last newline that fits the byte budget so we never emit a
+    // half-line, then disclose that the body was cut by the token budget. We scan
+    // newline byte offsets directly (UTF-8 safe: `\n` is a single byte and never a
+    // continuation byte, so `idx <= max_bytes` is always a valid char boundary —
+    // no panic on multibyte match lines).
+    let cut_end = body
+        .bytes()
+        .enumerate()
+        .filter(|&(idx, b)| b == b'\n' && idx < max_bytes)
+        .map(|(idx, _)| idx + 1)
+        .next_back();
+    let mut truncated = match cut_end {
+        Some(end) => body[..end].to_string(),
+        None => String::new(),
+    };
+    truncated.push_str(&format!(
+        "... (truncated to fit max_tokens={max_tokens}; cross-project output is \
+         token-bounded — raise max_tokens or query a single project for the full set)\n"
+    ));
+    truncated
+}
+
+/// Honest refusal of the DEFERRED per-project derived-index scoping when combined
+/// with cross-project targeting (Principle VII). The cross-project read serves
+/// from each project's interned base via the overlay-aware `WorkingSet` search,
+/// which does NOT honor the per-project derived-index scoping params
+/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
+/// Rather than silently ignore such a param (handing back results that look
+/// scoped but are not), return a clear error naming the offending param. Returns
+/// `Err(message)` for the FIRST unsupported scoping param present, else `Ok(())`.
+///
+/// `kind` (symbol/reference kind filter) IS honored cross-project and is NOT
+/// rejected here; only the deferred derived-index scoping is refused.
+fn reject_unsupported_cross_project_scoping(
+    tool_name: &str,
+    params: &serde_json::Value,
+) -> anyhow::Result<()> {
+    fn refuse(param: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "{param} scoping is not supported with cross-project targeting; \
+             query a single project for scoped results."
+        );
+    }
+    // A lenient peek of ONLY the deferred scoping fields; unrelated/invalid
+    // sibling fields must not make this check fail (the real decode happens in
+    // the per-tool branch). `null`/absent fields deserialize to `None`.
+    #[derive(serde::Deserialize, Default)]
+    struct ScopePeek {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        path_prefix: Option<String>,
+        #[serde(default)]
+        language: Option<String>,
+        #[serde(default)]
+        symbol_kind: Option<String>,
+        #[serde(default)]
+        direction: Option<String>,
+        #[serde(default)]
+        structural: Option<bool>,
+    }
+    let peek: ScopePeek = serde_json::from_value(params.clone()).unwrap_or_default();
+    let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+
+    match tool_name {
+        "search_symbols" => {
+            if present(&peek.path_prefix) {
+                return refuse("path_prefix");
+            }
+            if present(&peek.language) {
+                return refuse("language");
+            }
+        }
+        "search_text" => {
+            if present(&peek.path_prefix) {
+                return refuse("path_prefix");
+            }
+            if present(&peek.language) {
+                return refuse("language");
+            }
+            if peek.structural == Some(true) {
+                return refuse("structural");
+            }
+        }
+        "find_references" => {
+            if present(&peek.path) {
+                return refuse("path");
+            }
+            if present(&peek.symbol_kind) {
+                return refuse("symbol_kind");
+            }
+            if present(&peek.direction) {
+                return refuse("direction");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
 /// against the session's working set and format the attributed [`ProjectHit`]
 /// results with `── project: <id> ──` section headers (flat, no header, when a
@@ -2766,6 +2932,15 @@ fn ensure_targets_open(targets: &Targets, working_set: &WorkingSet) -> Result<()
 ///
 /// Read-only by construction: it calls the overlay-aware `WorkingSet` search
 /// methods, which never mutate an overlay (the no-overlay-writes invariant).
+///
+/// HONESTY (012 hardening): unlike the single-project path, the cross-project
+/// path does NOT honor the per-project derived-index scoping params
+/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
+/// Rather than silently drop them, every such param is REFUSED up front
+/// ([`reject_unsupported_cross_project_scoping`]). The output is also BOUNDED: a
+/// total-hit cap (caller `limit`, else [`CROSS_PROJECT_DEFAULT_RESULT_CAP`]) and
+/// the caller's optional `max_tokens` budget are applied by the formatters, which
+/// disclose any truncation.
 fn execute_cross_project_read(
     tool_name: &str,
     params: serde_json::Value,
@@ -2773,6 +2948,10 @@ fn execute_cross_project_read(
     working_set: &WorkingSet,
 ) -> anyhow::Result<String> {
     ensure_targets_open(&targets, working_set).map_err(|message| anyhow::anyhow!("{message}"))?;
+
+    // Honest refusal of the DEFERRED per-project derived-index scoping when
+    // combined with cross-project targeting (rather than silently dropping it).
+    reject_unsupported_cross_project_scoping(tool_name, &params)?;
 
     // Whether to render per-project section headers: a single targeted project
     // renders flat (one project's hits, no header); 2+ get headers.
@@ -2792,12 +2971,15 @@ fn execute_cross_project_read(
                      (browse mode is single-project only)."
                 );
             }
+            let cap = cross_project_result_cap(input.limit);
             let hits = working_set.search_symbols(&targets, query, input.kind.as_deref());
-            Ok(format_cross_project_symbols(&hits, query, multi))
+            let body = format_cross_project_symbols(&hits, query, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
         "search_text" => {
             let input: SearchTextInput = decode_params(params)?;
             let regex = input.regex.unwrap_or(false);
+            let cap = cross_project_result_cap(input.limit);
             let results = working_set
                 .search_text(
                     &targets,
@@ -2806,7 +2988,8 @@ fn execute_cross_project_read(
                     regex,
                 )
                 .map_err(|error| anyhow::anyhow!("text search failed: {error:?}"))?;
-            Ok(format_cross_project_text(&results, multi))
+            let body = format_cross_project_text(&results, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
         "find_references" => {
             let input: FindReferencesInput = decode_params(params)?;
@@ -2822,8 +3005,10 @@ fn execute_cross_project_read(
                 Some("value_use") => Some(crate::domain::ReferenceKind::ValueUse),
                 _ => None,
             };
+            let cap = cross_project_result_cap(input.limit);
             let hits = working_set.find_references(&targets, name, kind_filter, false);
-            Ok(format_cross_project_references(&hits, name, multi))
+            let body = format_cross_project_references(&hits, name, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
         other => anyhow::bail!("'{other}' is not a cross-project read verb"),
     }
@@ -2832,19 +3017,34 @@ fn execute_cross_project_read(
 /// Format cross-project symbol hits, grouped by project (`── project: <id> ──`
 /// headers when `multi`). Within a project, hits arrive already tier-sorted from
 /// the view search.
+///
+/// BOUNDED: at most `cap` hits are rendered across all projects (the shared
+/// cross-project total cap). When `hits.len() > cap` the surplus is dropped and
+/// the truncation is disclosed honestly (Principle III) with the shown/total
+/// counts and the corrective hint. The cap is applied in working-set/tier order,
+/// so the highest-ranked hits per project survive the cut.
 fn format_cross_project_symbols(
     hits: &[crate::live_index::view::ProjectHit<crate::live_index::view::ViewSymbolHit>],
     query: &str,
     multi: bool,
+    cap: usize,
 ) -> String {
     if hits.is_empty() {
         return format!("No symbols matching '{query}' in the targeted project(s).");
     }
+    let total = hits.len();
+    let shown = total.min(cap);
     let mut out = String::new();
     let mut current: Option<&str> = None;
-    let total = hits.len();
-    out.push_str(&format!("{total} matches across projects\n"));
-    for ph in hits {
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} matches across projects\n"));
+    }
+    for ph in hits.iter().take(shown) {
         if multi && current != Some(ph.project_id.as_str()) {
             current = Some(ph.project_id.as_str());
             out.push_str(&format!(
@@ -2863,49 +3063,99 @@ fn format_cross_project_symbols(
 
 /// Format cross-project text-search results, grouped by project. Each project's
 /// `TextSearchResult` renders its files and per-line matches.
+///
+/// BOUNDED: at most `cap` per-line matches are rendered across all files in all
+/// projects (the unbounded element here is the cumulative match-line count, not
+/// the file count). Once `cap` lines have been emitted, the rest are dropped and
+/// the truncation disclosed (shown/total + corrective hint). A project/file with
+/// no remaining budget is skipped, so headers are only emitted for content that
+/// is actually rendered.
 fn format_cross_project_text(
     results: &[crate::live_index::view::ProjectHit<crate::live_index::search::TextSearchResult>],
     multi: bool,
+    cap: usize,
 ) -> String {
     let total: usize = results.iter().map(|ph| ph.hit.total_matches).sum();
     if total == 0 {
         return "No text matches in the targeted project(s).".to_string();
     }
-    let mut out = String::new();
-    out.push_str(&format!("{total} text matches across projects\n"));
-    for ph in results {
+
+    // Render into a body first while counting emitted match lines, so the header
+    // can honestly state shown-vs-total once we know how many we actually wrote.
+    let mut body = String::new();
+    let mut shown = 0usize;
+    'projects: for ph in results {
         if ph.hit.files.is_empty() {
             continue;
         }
-        if multi {
-            out.push_str(&format!(
-                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
-                ph.project_id
-            ));
-        }
+        let mut header_written = false;
         for file in &ph.hit.files {
-            out.push_str(&format!("{}\n", file.path));
+            if file.matches.is_empty() {
+                continue;
+            }
+            if shown >= cap {
+                break 'projects;
+            }
+            // Emit the project header lazily, only when this project contributes
+            // at least one rendered line within budget.
+            if multi && !header_written {
+                body.push_str(&format!(
+                    "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                    ph.project_id
+                ));
+                header_written = true;
+            }
+            body.push_str(&format!("{}\n", file.path));
             for m in &file.matches {
-                out.push_str(&format!("  {}: {}\n", m.line_number, m.line));
+                if shown >= cap {
+                    break 'projects;
+                }
+                body.push_str(&format!("  {}: {}\n", m.line_number, m.line));
+                shown += 1;
             }
         }
     }
+
+    let mut out = String::new();
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} text matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} text matches across projects\n"));
+    }
+    out.push_str(&body);
     out
 }
 
 /// Format cross-project reference hits, grouped by project.
+///
+/// BOUNDED: at most `cap` reference hits are rendered across all projects; the
+/// surplus is dropped and the truncation disclosed (shown/total + corrective
+/// hint), mirroring [`format_cross_project_symbols`].
 fn format_cross_project_references(
     hits: &[crate::live_index::view::ProjectHit<(String, crate::domain::ReferenceRecord)>],
     name: &str,
     multi: bool,
+    cap: usize,
 ) -> String {
     if hits.is_empty() {
         return format!("No references to '{name}' in the targeted project(s).");
     }
+    let total = hits.len();
+    let shown = total.min(cap);
     let mut out = String::new();
     let mut current: Option<&str> = None;
-    out.push_str(&format!("{} references across projects\n", hits.len()));
-    for ph in hits {
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} references across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} references across projects\n"));
+    }
+    for ph in hits.iter().take(shown) {
         if multi && current != Some(ph.project_id.as_str()) {
             current = Some(ph.project_id.as_str());
             out.push_str(&format!(
@@ -4282,6 +4532,107 @@ mod tests {
         );
     }
 
+    // ── Feature 012 Phase 2 — close_session reaps ALL referenced projects ────────
+    //
+    // The advertised multi-project leak fix: a session that additively opened a
+    // SECOND project references BOTH (active A + additive B). Closing it must
+    // detach from EVERY referenced project and tear down each whose session set
+    // then empties — not just the active one. A leak would leave B in the project
+    // map (and its watcher running) forever. This runs under a multi-thread Tokio
+    // runtime so `activate()` actually spawns real watcher tasks (sync tests get
+    // `None` watchers), letting us assert teardown via each project's `stop_token`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_session_reaps_all_working_set_projects_and_watchers() {
+        let project_a = project_dir("symforge-reap-a");
+        let project_b = project_dir("symforge-reap-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        // Open a session bound to A, then additively open B into its working set.
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reap".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Both projects are open and the session references BOTH (active + additive).
+        assert_eq!(
+            state.list_projects().len(),
+            2,
+            "A and B both open before close"
+        );
+
+        // Capture each project's watcher stop_token BEFORE closing so we can prove
+        // the teardown path (abort_watcher_task -> stop_token = true) ran for BOTH.
+        // Under the multi-thread runtime, activate()/reload() spawned real watchers.
+        let (token_a, token_b, watcher_a_live, watcher_b_live) = {
+            let projects = state.projects.read();
+            let a = projects.get(&active_a).expect("A loaded");
+            let b = projects.get(&project_b_id).expect("B loaded");
+            (
+                Arc::clone(&a.stop_token),
+                Arc::clone(&b.stop_token),
+                a.watcher_task.is_some(),
+                b.watcher_task.is_some(),
+            )
+        };
+        assert!(
+            watcher_a_live && watcher_b_live,
+            "both projects must have a live watcher task before close \
+             (A: {watcher_a_live}, B: {watcher_b_live})"
+        );
+        assert!(
+            !token_a.load(Ordering::Acquire) && !token_b.load(Ordering::Acquire),
+            "watcher stop tokens must be unset (false) while the projects are live"
+        );
+
+        // Close the only session.
+        let closed = state
+            .close_session(&opened.session_id)
+            .expect("close session");
+        // Wire contract: reported fields describe the ACTIVE project (A).
+        assert_eq!(
+            closed.project_id, active_a,
+            "reported pid is the active project A"
+        );
+        assert_eq!(closed.remaining_sessions, 0);
+        assert!(closed.project_removed, "active project A reaped");
+
+        // BOTH projects reaped (the leak fix): the map is empty, not just A gone.
+        assert!(
+            state.list_projects().is_empty(),
+            "close_session must reap BOTH A and B, leaving no open project: {:?}",
+            state.list_projects()
+        );
+
+        // BOTH watchers torn down: each project's stop_token was flipped true by
+        // abort_watcher_task during reaping (the additive sibling B included).
+        assert!(
+            token_a.load(Ordering::Acquire),
+            "A's watcher stop_token must be set after close (watcher torn down)"
+        );
+        assert!(
+            token_b.load(Ordering::Acquire),
+            "B's watcher stop_token must be set after close (additive sibling watcher torn down)"
+        );
+    }
+
     #[test]
     fn test_close_session_removes_project_when_last_session_leaves() {
         let project = project_dir("symforge-daemon-d");
@@ -4896,6 +5247,229 @@ mod tests {
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    // ── Feature 012 hardening — cross-project output is BOUNDED ──────────────────
+    //
+    // Without a cap the cross-project formatter would render every hit from every
+    // targeted project (unbounded, unlike the single-project path). Prove the
+    // total-hit cap truncates the rendered hits AND discloses the truncation.
+    #[test]
+    fn test_cross_project_symbols_output_is_capped_and_discloses_truncation() {
+        use crate::live_index::search::SymbolMatchTier;
+        use crate::live_index::view::{ProjectHit, ViewSymbolHit};
+
+        // 5 synthetic hits across two projects.
+        let hits: Vec<ProjectHit<ViewSymbolHit>> = (0..5)
+            .map(|i| ProjectHit {
+                project_id: if i < 3 { "proj-a" } else { "proj-b" }.to_string(),
+                hit: ViewSymbolHit {
+                    name: format!("sym_{i}"),
+                    path: format!("src/f{i}.rs"),
+                    kind: "fn".to_string(),
+                    line: i + 1,
+                    tier: SymbolMatchTier::Exact,
+                },
+            })
+            .collect();
+
+        // Cap below the hit count -> truncated + disclosed.
+        let capped = format_cross_project_symbols(&hits, "sym", true, 2);
+        assert!(
+            capped.starts_with("2 of 5 matches across projects (truncated;"),
+            "header must disclose shown-of-total truncation: {capped}"
+        );
+        assert!(
+            capped.contains("query a single project for the full set"),
+            "truncation must carry the corrective hint: {capped}"
+        );
+        // Exactly the first 2 hit lines are rendered (sym_0, sym_1); sym_2.. dropped.
+        assert!(capped.contains("sym_0") && capped.contains("sym_1"));
+        assert!(
+            !capped.contains("sym_2") && !capped.contains("sym_4"),
+            "hits beyond the cap must NOT be rendered: {capped}"
+        );
+
+        // Cap above the hit count -> no truncation language, all hits rendered.
+        let full = format_cross_project_symbols(&hits, "sym", true, 100);
+        assert!(
+            full.starts_with("5 matches across projects\n"),
+            "uncapped header must not claim truncation: {full}"
+        );
+        assert!(
+            full.contains("sym_4"),
+            "all hits rendered when under cap: {full}"
+        );
+        assert!(
+            !full.contains("truncated"),
+            "no truncation notice when under cap: {full}"
+        );
+    }
+
+    // The cross-project total-hit cap derived from the caller's `limit`:
+    // None -> default cap; a value clamps into [1, MAX]; zero/absurd cannot
+    // disable the bound.
+    #[test]
+    fn test_cross_project_result_cap_clamps_limit() {
+        assert_eq!(
+            cross_project_result_cap(None),
+            CROSS_PROJECT_DEFAULT_RESULT_CAP,
+            "no limit -> default cap"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(10)),
+            10,
+            "small limit honored"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(0)),
+            1,
+            "zero clamps up to 1 (cap never disabled)"
+        );
+        assert_eq!(
+            cross_project_result_cap(Some(u32::MAX)),
+            CROSS_PROJECT_MAX_RESULT_CAP,
+            "absurd limit clamps to the hard ceiling"
+        );
+    }
+
+    // The `max_tokens` budget truncates an assembled body at a line boundary and
+    // discloses the cut.
+    #[test]
+    fn test_cross_project_token_budget_truncates_and_discloses() {
+        let body = (0..50)
+            .map(|i| format!("line {i} with some content\n"))
+            .collect::<String>();
+        // ~26 bytes/line * 50 = ~1300 bytes; max_tokens=10 -> 40-byte budget.
+        let out = apply_cross_project_token_budget(body.clone(), Some(10));
+        assert!(out.len() < body.len(), "budget must shrink the body");
+        assert!(
+            out.contains("truncated to fit max_tokens=10"),
+            "truncation must be disclosed: {out}"
+        );
+        assert!(
+            out.ends_with('\n'),
+            "truncated body ends on a line boundary"
+        );
+
+        // No budget / zero budget -> identity.
+        assert_eq!(apply_cross_project_token_budget(body.clone(), None), body);
+        assert_eq!(
+            apply_cross_project_token_budget(body.clone(), Some(0)),
+            body
+        );
+    }
+
+    // ── Feature 012 hardening — cross-project REFUSES deferred scoping params ─────
+    //
+    // The per-project derived-index scoping (path/path_prefix/language/symbol_kind/
+    // direction/structural) is NOT honored cross-project. Prove each is REFUSED
+    // (honest, not silently dropped) with the corrective message, and that `kind`
+    // (which IS honored) is NOT refused.
+    #[test]
+    fn test_reject_unsupported_cross_project_scoping_per_tool() {
+        use serde_json::json;
+
+        // search_symbols: path_prefix + language refused; kind allowed.
+        let err = reject_unsupported_cross_project_scoping(
+            "search_symbols",
+            &json!({ "query": "x", "path_prefix": "src/" }),
+        )
+        .expect_err("path_prefix must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path_prefix scoping is not supported with cross-project targeting")
+                && msg.contains("query a single project for scoped results"),
+            "refusal message must name the param + corrective hint: {msg}"
+        );
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "language": "Rust" }),
+            )
+            .is_err(),
+            "language must be refused on search_symbols"
+        );
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "kind": "fn" }),
+            )
+            .is_ok(),
+            "kind IS honored cross-project and must NOT be refused"
+        );
+
+        // search_text: structural refused.
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_text",
+                &json!({ "query": "x", "structural": true }),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("structural scoping is not supported"),
+            "structural must be refused on search_text"
+        );
+
+        // find_references: path / symbol_kind / direction refused.
+        for (field, value) in [
+            ("path", json!("src/db.rs")),
+            ("symbol_kind", json!("fn")),
+            ("direction", json!("trait")),
+        ] {
+            let err = reject_unsupported_cross_project_scoping(
+                "find_references",
+                &json!({ "name": "x", field: value }),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("{field} scoping is not supported")),
+                "{field} must be refused on find_references: {err}"
+            );
+        }
+
+        // Blank/empty values are treated as not-set (no false refusal).
+        assert!(
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "path_prefix": "  " }),
+            )
+            .is_ok(),
+            "blank scoping value must not trip the refusal"
+        );
+    }
+
+    // End-to-end: the scoping refusal fires from `execute_cross_project_read`
+    // BEFORE any query runs (the working set need not even contain the target —
+    // but here it does, so we prove the refusal precedes a would-be-successful
+    // query). A synthetic single-entry working set over an empty base.
+    #[test]
+    fn test_execute_cross_project_read_rejects_scoping_before_query() {
+        use crate::live_index::store::LiveIndex;
+        use crate::live_index::view::{BaseKey, CommitId, IndexBase, WorkingSet};
+        use serde_json::json;
+
+        let base = Arc::new(IndexBase::new(
+            BaseKey::new("/synthetic/root", CommitId::Dirtyless),
+            Arc::new(LiveIndex::empty_live_index()),
+            1,
+        ));
+        let mut ws = WorkingSet::new();
+        ws.add("proj-x", base);
+
+        let err = execute_cross_project_read(
+            "search_symbols",
+            json!({ "query": "anything", "language": "Rust" }),
+            Targets::Subset(vec!["proj-x".to_string()]),
+            &ws,
+        )
+        .expect_err("scoping param must be refused");
+        assert!(
+            err.to_string()
+                .contains("language scoping is not supported with cross-project targeting"),
+            "cross-project read must refuse the deferred scoping param: {err}"
+        );
     }
 
     #[tokio::test]

@@ -84,8 +84,27 @@ pub struct IndexBase {
     /// Sharable identity `(canonical_root, commit)`.
     pub key: BaseKey,
     /// The existing immutable snapshot, shared by `Arc` across consumers.
+    ///
+    /// STALENESS (documented limitation): this is a SNAPSHOT frozen at the
+    /// instant the base was interned/opened — the `Arc<LiveIndex>` handle taken
+    /// from the project's `ArcSwap` at intern time. It is NOT live: the project's
+    /// background watcher keeps swapping a NEW `Arc<LiveIndex>` into the project's
+    /// `ArcSwap` as files change on disk, but those swaps do NOT rewrite this
+    /// already-interned handle. So a cross-project read served from this base goes
+    /// stale after ANY watcher-picked-up change to the project (edit, add, delete
+    /// on disk) — NOT only after a git commit. `base_generation` advances only
+    /// when a NEW base is published (a fresh intern), which today does not
+    /// re-trigger on watcher reloads of an already-interned base. Re-interning a
+    /// base on watcher-observed change so a long-lived cross-project session
+    /// tracks current repository state (the live-freshness rebase) is the deferred
+    /// Phase 4 work; until then a session should re-open (retarget / additive
+    /// re-add) a project to pick up a fresh base.
     pub index: Arc<LiveIndex>,
-    /// Monotonic fence token; bumped only when a new commit publishes a new base.
+    /// Monotonic fence token, bumped when a NEW base is published (a fresh intern,
+    /// e.g. a new commit producing a new `BaseKey`). See the `index` field's
+    /// STALENESS note: this generation does NOT advance for watcher reloads of an
+    /// already-interned base, so it is a publish-identity token, not a
+    /// live-freshness signal.
     pub base_generation: u64,
 }
 

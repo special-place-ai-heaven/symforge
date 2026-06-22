@@ -101,7 +101,13 @@ pub struct StelRequest {
     /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
     /// id/alias, or `["*"]` for all. Mutually exclusive with `project`; an empty
     /// list is rejected. Daemon-only; surface parity only (see `project`).
+    // `#[schemars(with = "Vec<String>")]` keeps this as a plain `type: "array"`
+    // schema, NOT a `type: ["array", "null"]` union that strict MCP clients
+    // reject (enforced by `tests/strict_client_schema_compat.rs`); serde keeps the
+    // field optional. Kept as a plain comment (not a doc line) so it does not
+    // bloat the budget-constrained compact `symforge` schema description (A-025/H1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>")]
     pub projects: Option<Vec<String>>,
 }
 
