@@ -254,7 +254,44 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         }
     });
 
-    let server = protocol::SymForgeServer::new_daemon_proxy(session.clone());
+    let mut server = protocol::SymForgeServer::new_daemon_proxy(session.clone());
+
+    // Feature 013 US1 (T021): the DEFAULT operator stdio is daemon-backed, and
+    // the `symforge` compact tool — the ONLY tool that records STEL economics
+    // ledger events (via `finalize_symforge_with_ledger`) — executes on THIS
+    // proxy server, NOT on the daemon worker. The daemon worker's
+    // `execute_tool_call` (daemon.rs) dispatches only the primitive tools +
+    // `status`; it has no `symforge` arm. The proxy fetches served data FROM the
+    // daemon (each primitive proxies via `proxy_tool_call`), but the economics
+    // capture + durable write-through stays on the proxy. So durable accumulation
+    // in the daemon-default deployment requires attaching the durable store
+    // HERE, on the proxy — mirroring the local-stdio attach (T020) and serve.rs.
+    // This deliberately does NOT touch the privileged daemon worker.
+    //
+    // Honesty caveat (documented, tested in surface_honesty T023): `status` IS
+    // proxied to the daemon worker, which has no durable store, so the
+    // `detail:full` `durable_ledger` line over the daemon path reads
+    // `unavailable` truthfully — events still accumulate durably here, but the
+    // status surface rendered from the worker cannot observe this proxy's store.
+    if let Some(root) = session.project_root() {
+        match symforge::paths::ensure_symforge_dir(root) {
+            Ok(dir) => {
+                let store = symforge::stel::ledger_store::StelLedgerStore::open(
+                    &dir,
+                    format!("stdio-daemon-{}", std::process::id()),
+                );
+                server = server.with_stel_ledger_store(Arc::new(store));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    %error,
+                    "could not ensure symforge data dir; STEL ledger will not persist on daemon-backed stdio"
+                );
+            }
+        }
+    }
+
     tracing::info!(
         project_id = %session.project_id(),
         session_id = %session.session_id(),

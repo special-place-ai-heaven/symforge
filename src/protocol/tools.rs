@@ -8386,7 +8386,11 @@ impl SymForgeServer {
     }
 
     /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.
-    async fn symforge_stel_handler(
+    ///
+    /// `pub(crate)` so the durable-ledger proxy test (feature 013 US1 T021) can
+    /// drive the economics path directly, below the `SYMFORGE_SURFACE` facade
+    /// gate, without a process-global env mutation. Not a public API change.
+    pub(crate) async fn symforge_stel_handler(
         &self,
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
