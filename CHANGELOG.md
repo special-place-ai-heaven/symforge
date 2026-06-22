@@ -26,6 +26,20 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.5.0...v8.6.0) (2026-06-22)
+
+
+### Features
+
+* **stel:** durable ledger on daemon-backed stdio via proxy attach (013 US1) ([473b9be](https://github.com/special-place-ai-heaven/symforge/commit/473b9be3278a1916f2374704d7955874bf4133a7))
+* **stel:** durable ledger on local stdio + embed reach (013 US1) ([1b2b780](https://github.com/special-place-ai-heaven/symforge/commit/1b2b780a0ec374c8fd18355fad836ed2f54ef1d4))
+* **stel:** durable-ledger foundation for 013 (v2 schema, retention, tuned-store) ([6dca715](https://github.com/special-place-ai-heaven/symforge/commit/6dca71576bc854d45b6a386cb415ba4b07bb0244))
+
+
+### Bug Fixes
+
+* **stel:** 013 US1 review fixes — db path convention + daemon status overlay ([44cbea3](https://github.com/special-place-ai-heaven/symforge/commit/44cbea3477370b7c838aac35d4b740f0b9d620c4))
+
 ## [8.5.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.4.1...v8.5.0) (2026-06-22)
 
 
