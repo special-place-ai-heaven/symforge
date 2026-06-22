@@ -273,13 +273,15 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     // (logged, in-memory, FR-003). This deliberately does NOT touch the
     // privileged daemon worker.
     //
-    // Observability (013 US1 review fix): `status` IS proxied to the daemon
-    // worker, which has no durable store — but the proxy OWNS this store, so
-    // `status_stel_tool` overlays the proxy's OWN `durable_ledger` line onto the
-    // proxied `detail:full` body (`overlay_proxy_durable_ledger_line`). The
-    // operator therefore sees this proxy's real `Durable{..}` accumulation, not
-    // the worker's `unavailable`. If the proxy ALSO has no store, the line stays
-    // `unavailable` honestly.
+    // Observability (D2-ROOT): `status` IS proxied to the daemon worker, which
+    // owns the index but has an empty ledger + no durable store — but the proxy
+    // OWNS the ledger + this store, so `status_stel_tool` overlays ALL of the
+    // proxy's OWN ledger/store-derived lines (`ledger_events`, `last_ledger_*`,
+    // `durable_ledger`, the `calibration` section) onto the proxied body
+    // (`overlay_proxy_status_lines`). The operator therefore sees this proxy's
+    // real accumulation + calibration verdict, not the worker's blind
+    // `0`/`none`/`unavailable`/`deferred`. If the proxy ALSO has no store /
+    // empty ledger, the lines stay truthfully `0`/`none`/`unavailable`/`deferred`.
     if let Some(root) = session.project_root() {
         let store = symforge::stel::ledger_store::StelLedgerStore::open(
             root,

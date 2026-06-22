@@ -163,6 +163,84 @@ pub fn format_durable_ledger_line(state: &DurableLedgerState) -> String {
     }
 }
 
+/// Render the two `last_ledger_decision:` / `last_ledger_route:` lines for a
+/// status context.
+///
+/// Single source of truth for the format so the full-status formatter and the
+/// daemon-proxy status overlay ([`crate::protocol`]) never drift. Returns a
+/// 2-element array `[decision_line, route_line]`:
+/// - `last_ledger_decision: {decision}` / `last_ledger_route: {route}` when the
+///   session ledger has a last event (route falls back to `none` when the event
+///   recorded no tool),
+/// - `last_ledger_decision: none` / `last_ledger_route: none` when the ledger is
+///   empty.
+pub fn format_last_ledger_lines(ctx: &StelStatusContext<'_>) -> [String; 2] {
+    match (&ctx.last_ledger_decision, &ctx.last_ledger_route) {
+        (Some(decision), route) => {
+            let route = route.as_deref().unwrap_or("none");
+            [
+                format!("last_ledger_decision: {decision}"),
+                format!("last_ledger_route: {route}"),
+            ]
+        }
+        (None, _) => [
+            "last_ledger_decision: none".to_string(),
+            "last_ledger_route: none".to_string(),
+        ],
+    }
+}
+
+/// The set of `status` body lines/blocks DERIVED from proxy-owned state (the
+/// session ledger + durable store), as the proxy itself would render them.
+///
+/// On the daemon-backed stdio default, `status` is proxied to the daemon WORKER
+/// (which owns the populated INDEX but has an EMPTY ledger + no durable store),
+/// while the PROXY owns `stel_ledger` + `stel_ledger_store`. So every line below
+/// reads the worker's blind zero unless the proxy overlays its OWN rendering.
+/// This struct is that rendering — built from a proxy-side [`StelStatusContext`]
+/// via [`render_proxy_owned_lines`] so the overlay reuses the EXACT formatters
+/// the worker uses (no divergent formatting), and consumed by
+/// `crate::protocol`'s `overlay_proxy_status_lines`.
+///
+/// It deliberately does NOT carry the INDEX lines (`index_ready`/`index_files`/
+/// `index_symbols`/`project`): the worker owns the warm index (TR-01), so those
+/// stay the worker's and must never be overlaid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyOwnedStatusLines {
+    /// `ledger_events: {n}` — the proxy session ledger length.
+    pub ledger_events: String,
+    /// `last_ledger_decision: {..}` — full-detail only.
+    pub last_ledger_decision: String,
+    /// `last_ledger_route: {..}` — full-detail only.
+    pub last_ledger_route: String,
+    /// `durable_ledger: {..}` — full-detail only.
+    pub durable_ledger: String,
+    /// The whole `── calibration (observational) ──` … `──` block, rendered from
+    /// the proxy's calibration summary/verdict — full-detail only.
+    pub calibration_section: String,
+}
+
+/// Render the proxy-owned `status` line-set from a proxy-side context.
+///
+/// The SINGLE place that maps a [`StelStatusContext`] onto the exact line/block
+/// strings the proxy must overlay. Reuses the same `format_*` helpers the
+/// worker-side formatter calls, so the overlaid lines are byte-identical to what
+/// a worker WOULD render if it had the proxy's ledger/store. Honesty: an empty
+/// proxy ledger yields `ledger_events: 0` / `last_ledger_*: none`, an
+/// `Unavailable`/`Disabled` store yields the truthful durable line, and a
+/// `Deferred`/`Accumulating` verdict yields that calibration section — the
+/// overlay never invents state.
+pub fn render_proxy_owned_lines(ctx: &StelStatusContext<'_>) -> ProxyOwnedStatusLines {
+    let [last_ledger_decision, last_ledger_route] = format_last_ledger_lines(ctx);
+    ProxyOwnedStatusLines {
+        ledger_events: format!("ledger_events: {}", ctx.ledger_events),
+        last_ledger_decision,
+        last_ledger_route,
+        durable_ledger: format_durable_ledger_line(&ctx.durable_ledger),
+        calibration_section: format_calibration_section(&ctx.calibration),
+    }
+}
+
 /// Format the compact-surface `status` tool body.
 pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'_>) -> String {
     let detail = request.detail.unwrap_or(StelStatusDetail::Compact);
@@ -209,17 +287,10 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
         format!("index_symbols: {}", ctx.index_symbols),
         format!("session_tokens: {}", ctx.session_tokens),
     ];
-    match (&ctx.last_ledger_decision, &ctx.last_ledger_route) {
-        (Some(decision), route) => {
-            extra.push(format!("last_ledger_decision: {decision}"));
-            let route = route.as_deref().unwrap_or("none");
-            extra.push(format!("last_ledger_route: {route}"));
-        }
-        (None, _) => {
-            extra.push("last_ledger_decision: none".to_string());
-            extra.push("last_ledger_route: none".to_string());
-        }
-    }
+    // Single source of truth for the two last-ledger lines (shared with the
+    // daemon-proxy overlay via `format_last_ledger_lines`), so the worker-side
+    // formatter and the proxy overlay can never drift in format.
+    extra.extend(format_last_ledger_lines(ctx));
     extra.push(format_durable_ledger_line(&ctx.durable_ledger));
     extra.push(format_calibration_section(&ctx.calibration));
     // Insert full-only lines before the closing banner.

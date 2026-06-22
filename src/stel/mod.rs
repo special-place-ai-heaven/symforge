@@ -108,7 +108,8 @@ pub use ledger::{
 pub use planner::{build_plan, confidence_label, is_find_fusion_plan, plan_summary_line};
 pub use status::{
     DEFERRED_ITEMS, DurableLedgerState, DurableLedgerSummary, PHASE0_EVIDENCE_COMMIT,
-    PHASE0_GO_COMMIT, StelStatusContext, format_durable_ledger_line, format_stel_status,
+    PHASE0_GO_COMMIT, ProxyOwnedStatusLines, StelStatusContext, format_durable_ledger_line,
+    format_last_ledger_lines, format_stel_status, render_proxy_owned_lines,
 };
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{

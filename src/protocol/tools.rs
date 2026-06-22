@@ -3055,46 +3055,92 @@ fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version:
     proxied_health
 }
 
-/// Overlay the proxy's OWN durable-ledger state onto a `status detail:full` body
-/// proxied from the daemon worker (013 US1 review fix, MAJOR 2).
+/// Overlay ALL of the proxy's OWN ledger/store-derived lines onto a `status`
+/// body proxied from the daemon worker (D2-ROOT — proxy-owned state invisible to
+/// worker-rendered responses).
 ///
 /// In the daemon-backed stdio default, `status` is proxied to the daemon WORKER,
-/// which has NO durable store wired — so its `detail:full` body always renders
-/// `durable_ledger: unavailable`. But the PROXY owns the durable store (attached
-/// in `main.rs`), and economics events accumulate THERE. The operator's one
-/// observability window must show the proxy's truth, not the worker's blind spot.
+/// which owns the populated INDEX but has an EMPTY session ledger and NO durable
+/// store wired — so its body renders `ledger_events: 0`, `last_ledger_*: none`,
+/// `durable_ledger: unavailable`, and `calibration: deferred`. But the PROXY
+/// owns `stel_ledger` + `stel_ledger_store` (attached in `main.rs`), and
+/// economics events accumulate THERE. The operator's one observability window
+/// must show the proxy's truth, not the worker's blind spot.
 ///
-/// This replaces the worker's single `durable_ledger:` line with the proxy's own
-/// rendering of `proxy_state`. If the proxy ALSO has no store
-/// (`DurableLedgerState::Unavailable`), the line stays `unavailable` honestly —
-/// the overlay never invents a durable figure. When the worker body has no
-/// `durable_ledger:` line (a `detail:compact` response, or an older worker
-/// without the line), the body is returned unchanged — there is nothing to
-/// overlay.
-fn overlay_proxy_durable_ledger_line(
+/// This rewrites every proxy-owned line/block with the proxy's own rendering
+/// (`proxy`, built once from `self.stel_ledger` + `self.stel_ledger_store` via
+/// [`SymForgeServer::proxy_owned_status_lines`], so the overlaid text is
+/// byte-identical to what the worker WOULD render if it had the proxy's state):
+/// - `ledger_events:` (present in compact AND full bodies),
+/// - `last_ledger_decision:` / `last_ledger_route:` (full only),
+/// - `durable_ledger:` (full only),
+/// - the whole `── calibration (observational) ──` … `──` block (full only).
+///
+/// The INDEX lines (`index_ready`/`index_files`/`index_symbols`/`project`) stay
+/// the WORKER's — it owns the warm index (TR-01) — and are NEVER overlaid.
+///
+/// Honesty: if the proxy's ledger is empty / its store is `Unavailable`/
+/// `Disabled`, the overlaid values reflect THAT truthfully (`ledger_events: 0`,
+/// `last_ledger_*: none`, `durable_ledger: unavailable`, `calibration: deferred`)
+/// — the overlay makes status reflect the PROXY's real state, whatever it is,
+/// not the worker's blind zero, and never invents accumulation.
+///
+/// Each rewrite is guarded on the line/block actually being present: a
+/// `detail:compact` worker body (only `ledger_events:`, no full-only lines or
+/// calibration section) or an older worker missing a line is a no-op for the
+/// absent parts — exactly like the original single-line durable overlay.
+fn overlay_proxy_status_lines(
     worker_body: String,
-    proxy_state: &crate::stel::DurableLedgerState,
+    proxy: &crate::stel::ProxyOwnedStatusLines,
 ) -> String {
-    let replacement = crate::stel::format_durable_ledger_line(proxy_state);
-    let mut replaced = false;
-    let mut out_lines: Vec<String> = Vec::with_capacity(worker_body.lines().count() + 1);
-    for line in worker_body.lines() {
-        if line.starts_with("durable_ledger:") {
-            out_lines.push(replacement.clone());
-            replaced = true;
+    let trailing_newline = worker_body.ends_with('\n');
+    let lines: Vec<&str> = worker_body.lines().collect();
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.starts_with("ledger_events:") {
+            // Present in BOTH compact and full bodies — proxy's session length.
+            out_lines.push(proxy.ledger_events.clone());
+        } else if line.starts_with("last_ledger_decision:") {
+            out_lines.push(proxy.last_ledger_decision.clone());
+        } else if line.starts_with("last_ledger_route:") {
+            out_lines.push(proxy.last_ledger_route.clone());
+        } else if line.starts_with("durable_ledger:") {
+            out_lines.push(proxy.durable_ledger.clone());
+        } else if line == "── calibration (observational) ──" {
+            // Replace the WHOLE worker calibration block (header through its
+            // closing `──`) with the proxy's rendering, then skip past it. The
+            // block is the proxy-rendered section verbatim, so its line count may
+            // differ — we consume the worker block by structure, not by count.
+            for replacement_line in proxy.calibration_section.lines() {
+                out_lines.push(replacement_line.to_string());
+            }
+            // Advance the worker cursor past its calibration header...
+            i += 1;
+            // ...and past its body up to and including the section's closing
+            // `──` banner (the first standalone `──` after the header).
+            while i < lines.len() && lines[i] != "──" {
+                i += 1;
+            }
+            if i < lines.len() {
+                // Skip the closing `──` (already included by the replacement).
+                i += 1;
+            }
+            continue;
         } else {
+            // Everything else — the static labels and the WORKER-owned index/
+            // project lines — is preserved verbatim.
             out_lines.push(line.to_string());
         }
+        i += 1;
     }
-    if !replaced {
-        // No durable_ledger line in the worker body (compact detail / older
-        // worker): nothing to overlay, return the original untouched.
-        return worker_body;
-    }
+
     let mut out = out_lines.join("\n");
     // Preserve a trailing newline if the original body had one (joining lines
-    // drops it), so the overlay is byte-faithful apart from the swapped line.
-    if worker_body.ends_with('\n') {
+    // drops it), so the overlay is byte-faithful apart from the swapped lines.
+    if trailing_newline {
         out.push('\n');
     }
     out
@@ -8907,17 +8953,18 @@ impl SymForgeServer {
         // is unreachable (degraded fallback, where `ensure_local_index` has
         // populated `self.index`).
         if let Some(result) = self.proxy_tool_call("status", &params.0).await {
-            // 013 US1 review fix (MAJOR 2): the daemon worker has no durable store,
-            // so its proxied `detail:full` body reads `durable_ledger: unavailable`
-            // — but THIS proxy owns the store and events accumulate here. Overlay
-            // the proxy's OWN durable-ledger line onto the worker body so the
-            // operator's status window shows reality, not the worker's blind spot.
-            // No-op for `detail:compact` (no durable_ledger line to replace), and
-            // honestly stays `unavailable` if this proxy also has no store.
-            let result = overlay_proxy_durable_ledger_line(
-                result,
-                &self.durable_ledger_summary_for_status(),
-            );
+            // D2-ROOT: the daemon worker owns the populated INDEX but has an EMPTY
+            // session ledger + NO durable store, so its proxied body reads
+            // `ledger_events: 0`, `last_ledger_*: none`, `durable_ledger:
+            // unavailable`, `calibration: deferred` — but THIS proxy owns the
+            // ledger + store and events accumulate here. Overlay ALL of the
+            // proxy's OWN ledger/store-derived lines (not just durable_ledger)
+            // onto the worker body so the operator's status window shows reality,
+            // not the worker's blind zero. The INDEX lines stay the worker's
+            // (TR-01). No-op for the parts absent in `detail:compact`, and
+            // honestly stays `0`/`none`/`unavailable`/`deferred` if this proxy's
+            // own ledger/store is empty.
+            let result = overlay_proxy_status_lines(result, &self.proxy_owned_status_lines());
             // Mirror `health`: warn loudly if the daemon we proxied to runs an
             // older binary than this front-end.
             let body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
@@ -8996,6 +9043,49 @@ impl SymForgeServer {
             Some(note) => format!("{body}\n{note}"),
             None => body,
         }
+    }
+
+    /// Render the proxy-owned `status` line-set from THIS server's OWN ledger +
+    /// durable store + calibration verdict — the proxy's truth for the lines a
+    /// worker-rendered `status` body misrepresents on the daemon-backed default
+    /// (D2-ROOT).
+    ///
+    /// Builds the SAME [`StelStatusContext`] that [`Self::render_stel_status_body`]
+    /// builds (the proxy's `stel_ledger` session events, `durable_ledger_summary`,
+    /// and durable `calibration` verdict) — only WITHOUT the index/project lines,
+    /// which stay the worker's (TR-01). Used by `status_stel_tool` to overlay the
+    /// proxy's `ledger_events`/`last_ledger_*`/`durable_ledger`/`calibration`
+    /// onto the proxied worker body so the operator's status window reflects the
+    /// proxy's real accumulation, not the storeless worker's blind zero.
+    ///
+    /// Honesty: an empty proxy ledger yields `ledger_events: 0` /
+    /// `last_ledger_*: none`; an `Unavailable`/`Disabled` store yields the
+    /// truthful durable line; a `Deferred`/`Accumulating` verdict yields that
+    /// calibration section — exactly as `render_stel_status_body` would render
+    /// them. No store/reset side effects here: this is a pure read.
+    pub(crate) fn proxy_owned_status_lines(&self) -> crate::stel::ProxyOwnedStatusLines {
+        // Index/project fields are NOT consumed by `render_proxy_owned_lines`
+        // (those lines stay the worker's), so we pass the proxy's own empty-index
+        // values without reading the index — keeping this a ledger/store-only read.
+        let ledger = self.stel_ledger.lock();
+        let mut ctx = crate::stel::StelStatusContext::from_server(
+            "compact",
+            &self.project_name,
+            false,
+            0,
+            0,
+            &ledger,
+            self.session_context.snapshot().total_tokens,
+        )
+        .with_durable_ledger(self.durable_ledger_summary_for_status());
+        // Mirror `render_stel_status_body`: override the in-memory verdict with the
+        // DURABLE one (cross-session samples + active tuning). `None` keeps the
+        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
+        // `Tuned`).
+        if let Some(verdict) = self.durable_calibration_verdict() {
+            ctx = ctx.with_calibration_verdict(verdict);
+        }
+        crate::stel::render_proxy_owned_lines(&ctx)
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -9567,17 +9657,33 @@ mod tests {
         assert_eq!(out, proxied);
     }
 
-    // ── 013 US1 review fix (MAJOR 2): daemon-proxy durable-ledger overlay ─────
+    // ── D2-ROOT: daemon-proxy overlays ALL proxy-owned status lines ──────────
 
     /// A faithful worker `status detail:full` body: rendered by a storeless
-    /// server (no `with_stel_ledger_store`), exactly as the daemon worker
-    /// produces it — so its `durable_ledger:` line reads `unavailable`.
+    /// server (no `with_stel_ledger_store`, EMPTY session ledger), exactly as the
+    /// daemon worker produces it — so its proxy-owned lines read the blind
+    /// `ledger_events: 0` / `last_ledger_*: none` / `durable_ledger: unavailable`
+    /// / `calibration: deferred`.
     fn worker_full_status_body() -> String {
         let server = make_server(make_live_index_ready(vec![]));
         server.render_stel_status_body(&crate::stel::StelStatusRequest {
             detail: Some(crate::stel::StelStatusDetail::Full),
             reset_calibration: None,
         })
+    }
+
+    /// Build a `ProxyOwnedStatusLines` carrying a given durable state, with the
+    /// other proxy-owned lines rendered from an EMPTY in-memory ledger (so they
+    /// match the worker's `0`/`none`/`deferred` — these durable-focused tests
+    /// assert only the durable line, the rest are no-op-equivalent replacements).
+    fn proxy_lines_with_durable(
+        state: crate::stel::DurableLedgerState,
+    ) -> crate::stel::ProxyOwnedStatusLines {
+        let ledger = crate::stel::SessionLedger::new();
+        let ctx =
+            crate::stel::StelStatusContext::from_server("compact", "proj", false, 0, 0, &ledger, 0)
+                .with_durable_ledger(state);
+        crate::stel::render_proxy_owned_lines(&ctx)
     }
 
     #[test]
@@ -9593,13 +9699,13 @@ mod tests {
 
         // ...but the proxy owns a real durable store, so the overlay must swap in
         // the proxy's true accumulation figure and erase the worker's blind spot.
-        let overlaid = super::overlay_proxy_durable_ledger_line(
+        let overlaid = super::overlay_proxy_status_lines(
             worker,
-            &DurableLedgerState::Durable(DurableLedgerSummary {
+            &proxy_lines_with_durable(DurableLedgerState::Durable(DurableLedgerSummary {
                 total_events: 9,
                 total_net_vs_manual: 123,
                 session_count: 2,
-            }),
+            })),
         );
         assert!(
             overlaid.contains("durable_ledger: events=9 net_vs_manual=123 sessions=2"),
@@ -9626,8 +9732,10 @@ mod tests {
 
         // Honest no-store-anywhere case: the overlay must NOT invent a figure.
         let worker = worker_full_status_body();
-        let overlaid =
-            super::overlay_proxy_durable_ledger_line(worker, &DurableLedgerState::Unavailable);
+        let overlaid = super::overlay_proxy_status_lines(
+            worker,
+            &proxy_lines_with_durable(DurableLedgerState::Unavailable),
+        );
         assert!(
             overlaid.contains("durable_ledger: unavailable"),
             "no store anywhere -> stays unavailable:\n{overlaid}"
@@ -9639,11 +9747,13 @@ mod tests {
     }
 
     #[test]
-    fn overlay_is_noop_when_body_has_no_durable_ledger_line() {
+    fn overlay_is_noop_for_durable_when_body_has_no_durable_ledger_line() {
         use crate::stel::{DurableLedgerState, DurableLedgerSummary};
 
-        // A `detail:compact` worker body carries no durable_ledger line; the
-        // overlay must return it byte-for-byte unchanged (nothing to replace).
+        // A `detail:compact` worker body carries no durable_ledger line / no
+        // calibration section / no last_ledger lines: the overlay must leave the
+        // durable line absent (nothing to replace) and rewrite only `ledger_events`
+        // (the one proxy-owned line a compact body carries — here both are 0).
         let compact = make_server(make_live_index_ready(vec![])).render_stel_status_body(
             &crate::stel::StelStatusRequest {
                 detail: None,
@@ -9654,15 +9764,22 @@ mod tests {
             !compact.contains("durable_ledger:"),
             "precondition: compact body has no durable_ledger line:\n{compact}"
         );
-        let out = super::overlay_proxy_durable_ledger_line(
+        let out = super::overlay_proxy_status_lines(
             compact.clone(),
-            &DurableLedgerState::Durable(DurableLedgerSummary {
+            &proxy_lines_with_durable(DurableLedgerState::Durable(DurableLedgerSummary {
                 total_events: 1,
                 total_net_vs_manual: 0,
                 session_count: 1,
-            }),
+            })),
         );
-        assert_eq!(out, compact, "no durable_ledger line -> unchanged body");
+        // No durable_ledger / calibration section in a compact body to overlay,
+        // and the empty-ledger proxy's `ledger_events: 0` matches the worker's, so
+        // the compact body is unchanged.
+        assert_eq!(out, compact, "no full-only lines -> compact body unchanged");
+        assert!(
+            !out.contains("durable_ledger:"),
+            "the overlay must NOT inject a durable line into a compact body:\n{out}"
+        );
     }
 
     /// End-to-end at the proxy boundary: a `new_daemon_proxy` server WITH a
@@ -9704,7 +9821,10 @@ mod tests {
             }
             other => panic!("a proxy WITH a store must be Durable, got {other:?}"),
         }
-        let overlaid = super::overlay_proxy_durable_ledger_line(worker_full_status_body(), &state);
+        let overlaid = super::overlay_proxy_status_lines(
+            worker_full_status_body(),
+            &proxy.proxy_owned_status_lines(),
+        );
         assert!(
             overlaid.contains("durable_ledger: events=2"),
             "proxy-backed status must show the proxy's real durable line:\n{overlaid}"
@@ -9726,13 +9846,180 @@ mod tests {
             detail: Some(StelStatusDetail::Full),
             reset_calibration: None,
         });
-        let bare_overlaid = super::overlay_proxy_durable_ledger_line(
-            bare_body,
-            &bare.durable_ledger_summary_for_status(),
-        );
+        let bare_overlaid =
+            super::overlay_proxy_status_lines(bare_body, &bare.proxy_owned_status_lines());
         assert!(
             bare_overlaid.contains("durable_ledger: unavailable"),
             "a no-store proxy stays unavailable after overlay:\n{bare_overlaid}"
+        );
+    }
+
+    /// D2-ROOT: a `new_daemon_proxy` server WITH a populated session ledger AND a
+    /// durable store (samples + a validated `tuned` artifact) must overlay ALL of
+    /// its proxy-owned `status detail:full` lines — `ledger_events` (non-zero),
+    /// `last_ledger_decision`/`last_ledger_route`, the durable line, AND the real
+    /// `calibration` verdict — onto the storeless worker body, NOT the worker's
+    /// blind `0`/`none`/`unavailable`/`deferred`. The mirror case (no store, empty
+    /// ledger) stays truthfully `0`/`none`/`unavailable`/`deferred`.
+    #[test]
+    fn daemon_proxy_overlays_all_proxy_owned_status_lines_not_worker_blind_view() {
+        use crate::stel::ledger_store::{
+            CURRENT_ESTIMATOR_VERSION, StelLedgerStore, TunedEstimateConstants,
+        };
+
+        fn fake_proxy() -> SymForgeServer {
+            // Dead URL: this test never hits the network — it exercises only the
+            // proxy's OWN ledger + store, exactly as the overlay does.
+            let client = crate::daemon::DaemonSessionClient::new_for_test(
+                "http://127.0.0.1:1".to_string(),
+                "p".to_string(),
+                "s".to_string(),
+                "proj".to_string(),
+            );
+            SymForgeServer::new_daemon_proxy(client)
+        }
+
+        // The faithful storeless WORKER body: blind on every proxy-owned line.
+        let worker = worker_full_status_body();
+        assert!(
+            worker.contains("ledger_events: 0"),
+            "worker blind: {worker}"
+        );
+        assert!(
+            worker.contains("last_ledger_decision: none"),
+            "worker blind: {worker}"
+        );
+        assert!(
+            worker.contains("last_ledger_route: none"),
+            "worker blind: {worker}"
+        );
+        assert!(
+            worker.contains("durable_ledger: unavailable"),
+            "worker blind: {worker}"
+        );
+        assert!(
+            worker.contains("calibration: deferred"),
+            "worker blind: {worker}"
+        );
+
+        // ── Populated proxy: session ledger + durable store with a TUNED artifact.
+        let store = StelLedgerStore::open_in_memory("proxy-sess").expect("in-memory store");
+        // Durable samples so `samples_for_estimator` is non-empty (the verdict
+        // path reads them), then a validated tuning (error_before > error_after)
+        // so the durable verdict is `Tuned` — the operator-critical line.
+        for _ in 0..60 {
+            store.record(&sample_durable_event());
+        }
+        store
+            .store_active_tuning(&TunedEstimateConstants {
+                response_correction_factor: 2.0,
+                estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
+                sample_size: 60,
+                error_before: 300.0,
+                error_after: 12.0,
+                tuned_at_ms: 1,
+            })
+            .expect("store active tuning");
+        let proxy = fake_proxy().with_stel_ledger_store(Arc::new(store));
+        // Two session events accumulate on the PROXY's in-memory ledger (the
+        // worker's is empty): last event -> decision `serve`, route
+        // `find_references` (from `sample_durable_event`).
+        {
+            let ledger = proxy.stel_ledger().lock();
+            ledger.push(sample_durable_event());
+            ledger.push(sample_durable_event());
+        }
+
+        // Sanity: the proxy's durable verdict is the real `Tuned` (not deferred).
+        match proxy.durable_calibration_verdict() {
+            Some(crate::stel::calibration::CalibrationVerdict::Tuned { .. }) => {}
+            other => panic!("proxy durable verdict must be Tuned, got {other:?}"),
+        }
+
+        let overlaid =
+            super::overlay_proxy_status_lines(worker.clone(), &proxy.proxy_owned_status_lines());
+
+        // (1) ledger_events: the proxy's real session length (2), NOT the worker 0.
+        assert!(
+            overlaid.contains("ledger_events: 2"),
+            "overlay must show the proxy's real ledger_events, not worker 0:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("ledger_events: 0"),
+            "the worker's blind ledger_events: 0 must be replaced:\n{overlaid}"
+        );
+        // (2) last_ledger_decision / route: the proxy's last event, NOT none.
+        assert!(
+            overlaid.contains("last_ledger_decision: serve"),
+            "overlay must show the proxy's last decision, not none:\n{overlaid}"
+        );
+        assert!(
+            overlaid.contains("last_ledger_route: find_references"),
+            "overlay must show the proxy's last route, not none:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("last_ledger_decision: none"),
+            "the worker's blind last_ledger_decision: none must be replaced:\n{overlaid}"
+        );
+        // (3) durable_ledger: the proxy's real accumulation, NOT unavailable.
+        assert!(
+            overlaid.contains("durable_ledger: events="),
+            "overlay must show the proxy's real durable line, not unavailable:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("durable_ledger: unavailable"),
+            "the worker's blind durable_ledger: unavailable must be replaced:\n{overlaid}"
+        );
+        // (4) calibration: the operator-critical leak. The proxy's store has a
+        // `tuned` verdict, so the overlaid section must read `tuned (..)`, NOT the
+        // worker's blind `deferred`.
+        assert!(
+            overlaid.contains("calibration: tuned ("),
+            "overlay must show the proxy's REAL calibration verdict (tuned), not the worker's deferred:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("calibration: deferred"),
+            "the worker's blind calibration: deferred must be replaced (operator-critical leak):\n{overlaid}"
+        );
+        // Exactly one calibration section survives (block replaced, not duplicated).
+        assert_eq!(
+            overlaid
+                .matches("── calibration (observational) ──")
+                .count(),
+            1,
+            "overlay must leave exactly one calibration section:\n{overlaid}"
+        );
+        // The WORKER-owned index/project lines stay the worker's — never overlaid.
+        // (The worker body here is storeless+empty-index, so they read 0/false;
+        // the point is the overlay did not touch them.)
+        assert!(
+            overlaid.contains("index_ready: ") && overlaid.contains("index_files: "),
+            "the worker's index lines must survive the overlay:\n{overlaid}"
+        );
+
+        // ── Honesty mirror: a no-store, empty-ledger proxy stays truthful.
+        let bare = fake_proxy();
+        let bare_overlaid =
+            super::overlay_proxy_status_lines(worker, &bare.proxy_owned_status_lines());
+        assert!(
+            bare_overlaid.contains("ledger_events: 0"),
+            "empty proxy stays ledger_events: 0:\n{bare_overlaid}"
+        );
+        assert!(
+            bare_overlaid.contains("last_ledger_decision: none"),
+            "empty proxy stays last_ledger_decision: none:\n{bare_overlaid}"
+        );
+        assert!(
+            bare_overlaid.contains("durable_ledger: unavailable"),
+            "no-store proxy stays durable_ledger: unavailable:\n{bare_overlaid}"
+        );
+        assert!(
+            bare_overlaid.contains("calibration: deferred"),
+            "no-store/empty proxy stays calibration: deferred (honest):\n{bare_overlaid}"
+        );
+        assert!(
+            !bare_overlaid.contains("calibration: tuned"),
+            "an empty proxy must NEVER invent a tuned verdict:\n{bare_overlaid}"
         );
     }
 

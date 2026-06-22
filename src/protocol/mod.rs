@@ -560,11 +560,11 @@ impl SymForgeServer {
     /// Reachability note (honest scope of N-3/FR-008): a durable store is wired by
     /// `server::serve::run` (the `/mcp` surface) AND by the stdio + daemon-proxy
     /// bootstrap (US1 T020/T021). On the daemon-proxy `status` path the proxy
-    /// itself holds the store, so `status_stel_tool` overlays THIS value onto the
-    /// proxied worker body (`overlay_proxy_durable_ledger_line`) — the operator
-    /// sees the proxy's real `Durable`/`Disabled` state, not the storeless
-    /// worker's `unavailable` (013 US1 review fix, MAJOR 2). It stays
-    /// `Unavailable` only when no store is attached anywhere.
+    /// itself holds the store, so `status_stel_tool` overlays THIS value (among
+    /// all proxy-owned lines) onto the proxied worker body
+    /// (`overlay_proxy_status_lines`) — the operator sees the proxy's real
+    /// `Durable`/`Disabled` state, not the storeless worker's `unavailable`
+    /// (D2-ROOT). It stays `Unavailable` only when no store is attached anywhere.
     ///
     /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
     #[cfg(feature = "server")]
