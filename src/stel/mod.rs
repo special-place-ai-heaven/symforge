@@ -14,7 +14,6 @@
 //! Deferred: calibration auto-tuning/persistence, symforge_edit apply path.
 
 pub mod a029;
-pub mod calibration;
 pub mod controller;
 pub mod edit_apply;
 pub mod edit_planner;
@@ -24,34 +23,42 @@ pub mod gates;
 pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
-// Feature 013 US1: durable STEL ledger store. Server-gated.
-//
-// Embed durability is DEFERRED — an `any(server, embed)` cfg here would be DEAD
-// under embed and falsely signal embed-capability: the whole `stel` module is
-// crate-root server-gated (`src/lib.rs`: `#[cfg(feature = "server")] pub mod
-// stel;`), and `stel::{controller,executor,planner,edit_apply}` hard-import
-// `crate::protocol`, itself server-gated. Reaching the store from embed needs a
-// structural protocol-free seam (out of US1 scope; see spec FR-001 note).
-#[cfg(feature = "server")]
-pub mod ledger_store;
 pub mod planner;
 pub mod status;
 pub mod surface;
 pub mod surface_list;
-pub mod types;
+
+// D3-ROOT extract-up: the protocol-free trio (`types` + the durable
+// `ledger_store` + `calibration`) now lives in the `any(server, embed)`
+// `crate::stel_core` module so it ALSO compiles under the engine-only `embed`
+// facade (FR-001 embed durability). Re-export it here at the original paths so
+// every existing `crate::stel::{types,ledger_store,calibration}` caller — and
+// the 13 `pub use` re-export blocks below — keep resolving unchanged. The
+// SERVER build is byte-for-byte equivalent; the move is behavior-preserving.
+pub use crate::stel_core::{calibration, ledger_store, types};
+
+// Server-only fixture-driven tests for the observational calibration summary.
+// They build `StelLedgerEvent`s via `controller`/`ledger`/`planner` (all
+// server-only), so they cannot live in `stel_core` (which must stay embed-
+// compilable). Moved verbatim from the old `stel::calibration` test module.
+#[cfg(test)]
+mod calibration_summary_tests;
 
 pub use a029::{
     A029_T2_PASS_THRESHOLD, A029SpikeResults, A029T2Row, A029Verdict, T2Equivalence,
     classify_t2_equivalence, evaluate_a029_verdict, normalize_spike_results,
 };
 pub use calibration::{
-    StelCalibrationSummary, TUNING_REVIEW_MIN_EVENTS, format_calibration_section,
-    summarize_calibration,
+    CalibrationVerdict, PredictionSample, SC002_MAE_REDUCTION_MARGIN, StelCalibrationSummary,
+    TUNING_MIN_SAMPLES, TUNING_REVIEW_MIN_EVENTS, compute_calibration_verdict,
+    derive_tuning_candidate, format_calibration_section, render_calibration_verdict,
+    summarize_calibration, validate_candidate,
 };
 pub use controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, EconomicsBreakdown, SERVE_MARGIN_TOKENS,
-    build_estimate, detect_pff_bypass, estimate_economics, evaluate_edit_plan, evaluate_plan,
-    evaluate_plan_with_session,
+    STATIC_MANUAL_FLOOR, STATIC_RESPONSE_FLOOR, active_tuning_in_force, build_estimate,
+    detect_pff_bypass, estimate_economics, estimate_economics_tuned, evaluate_edit_plan,
+    evaluate_plan, evaluate_plan_with_session,
 };
 pub use edit_apply::{
     PreApplyOutcome, ResolvedEditSymbol, apply_requested, format_already_applied_body,

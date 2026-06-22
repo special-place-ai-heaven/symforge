@@ -14,9 +14,13 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 /// Stable comma-separated deferred-work list (sorted for test stability).
 ///
 /// `ledger_persistence` was removed (010 FR-004): the durable SQLite ledger
-/// store DOES ship in serve mode, so listing it as deferred was false. The
-/// remaining items are genuinely not-yet-implemented seams.
-pub const DEFERRED_ITEMS: &str = "b_results,calibration_auto_tune,multi_step_planner";
+/// store DOES ship in serve mode, so listing it as deferred was false.
+/// `calibration_auto_tune` was removed (013 US2, T038): the auto-tune now
+/// DERIVES, held-out-VALIDATES, and APPLIES corrected token-estimate constants
+/// (the `tuned` state is reachable with a before/after error artifact), so
+/// listing it as deferred would be false. The remaining items are genuinely
+/// not-yet-implemented seams.
+pub const DEFERRED_ITEMS: &str = "b_results,multi_step_planner";
 
 /// Restart-survival view of the durable STEL ledger store (US3/T029).
 ///
@@ -49,7 +53,10 @@ pub enum DurableLedgerState {
 }
 
 /// Inputs collected from the live server when formatting a status response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PartialEq` (not `Eq`): the embedded calibration summary carries `f64`
+/// held-out error figures in its verdict (feature 013 US2).
+#[derive(Clone, Debug, PartialEq)]
 pub struct StelStatusContext<'a> {
     pub surface: &'static str,
     pub version: &'static str,
@@ -109,6 +116,26 @@ impl<'a> StelStatusContext<'a> {
     /// `status` read calls this with the opened store's `subsystem_state()`.
     pub fn with_durable_ledger(mut self, state: DurableLedgerState) -> Self {
         self.durable_ledger = state;
+        self
+    }
+
+    /// Override the calibration verdict with the DURABLE one (feature 013, T033 /
+    /// FR-009), so `status detail:full` reflects the persisted calibration state
+    /// (cross-session samples + active tuning), not only this session's in-memory
+    /// events. Also re-renders the `tuning_note` from the new verdict so the
+    /// section's two calibration lines stay consistent.
+    ///
+    /// Honesty invariant (data-model): a `Disabled`/`Unavailable` durable store
+    /// pins the state at in-memory-only — callers pass `None` (keeping the
+    /// in-memory verdict, which is `Deferred`/`Accumulating`, never a false
+    /// `Tuned`). Only a `Durable` store with a real artifact yields `Tuned` here.
+    pub fn with_calibration_verdict(
+        mut self,
+        verdict: crate::stel::calibration::CalibrationVerdict,
+    ) -> Self {
+        self.calibration.tuning_note =
+            crate::stel::calibration::render_calibration_verdict(&verdict);
+        self.calibration.verdict = verdict;
         self
     }
 }
@@ -245,7 +272,7 @@ mod tests {
             "ledger_events: 2",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,calibration_auto_tune,multi_step_planner",
+            "deferred: b_results,multi_step_planner",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
@@ -260,6 +287,11 @@ mod tests {
             !body.contains("ledger_persistence"),
             "ledger_persistence ships in serve mode; not deferred:\n{body}"
         );
+        // 013 T038: the auto-tune ships (tuned state reachable); not deferred.
+        assert!(
+            !body.contains("calibration_auto_tune"),
+            "calibration_auto_tune ships in 013 US2; not deferred:\n{body}"
+        );
         assert!(
             !body.contains("── calibration (observational) ──"),
             "compact detail must not include calibration section"
@@ -271,6 +303,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &sample_context(),
         );
@@ -301,6 +334,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &ctx,
         );
@@ -316,6 +350,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &sample_context(),
         );
@@ -335,6 +370,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &ctx,
         );

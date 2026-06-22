@@ -443,6 +443,17 @@ impl StelLedgerStore {
             Self::Sqlite(store) => store.samples_for_estimator(version, limit),
         }
     }
+
+    /// Clear accumulated calibration (tuned constants + samples) for `version`
+    /// (feature 013, T037 / FR-011 operator reset). A `Disabled` store reports
+    /// `0` cleared — there is nothing durable to reset, and the in-memory state
+    /// is already `Deferred`. Never rebuilds the index.
+    pub fn clear_calibration_for_estimator(&self, version: &str) -> Result<usize> {
+        match self {
+            Self::Disabled => Ok(0),
+            Self::Sqlite(store) => store.clear_calibration_for_estimator(version),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +915,33 @@ impl SqliteStelLedgerStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    /// Clear accumulated calibration for `estimator_version` (feature 013, T037 /
+    /// FR-011 operator reset). Deletes the active tuned-constant set AND the
+    /// ledger sample rows tagged with that version, so the calibration surface
+    /// returns to `Deferred` — WITHOUT rebuilding the index (only the calibration
+    /// tables are touched; the symbol index is a separate store). Returns the
+    /// number of sample rows deleted (audit). Idempotent: a second call on an
+    /// already-cleared version deletes nothing and still succeeds.
+    ///
+    /// Pre-013 sentinel rows are left intact (they are already excluded from the
+    /// active population and kept for audit). Runs under the poisoned-mutex
+    /// recovery; NO frecency bump (Principle V).
+    pub fn clear_calibration_for_estimator(&self, estimator_version: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM stel_calibration WHERE estimator_version = ?1",
+            params![estimator_version],
+        )
+        .context("clearing active stel tuning constants")?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM stel_ledger_events WHERE estimator_version = ?1",
+                params![estimator_version],
+            )
+            .context("clearing stel ledger samples for estimator")?;
+        Ok(deleted)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -912,8 +950,8 @@ impl SqliteStelLedgerStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
     use super::*;
-    use crate::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
 
     fn sample_event(plan_id: &str) -> StelLedgerEvent {
         StelLedgerEvent {

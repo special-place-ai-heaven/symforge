@@ -5,15 +5,23 @@
 use crate::protocol::format::{competent_manual_baseline_chars, estimate_tokens_from_chars};
 use crate::protocol::session::SessionContext;
 
+use super::ledger_store::TunedEstimateConstants;
 use super::types::{
     AdmissionDecision, GoldenRouteRow, IndexRef, RouteConfidence, StelBypassBody, StelCacheBody,
     StelDecision, StelEstimate, StelPlan, StelPlanStep, StelRequest,
 };
 
-/// Compact-3 worst-case schema tax per call (A-006 conservative path; no amortization credit).
-pub const COMPACT_SCHEMA_TOKENS: u32 = 45;
-/// Compact `symforge` invoke overhead per call (schema example + Phase 0 doctrine).
-pub const COMPACT_INVOKE_TOKENS: u32 = 80;
+// D3-ROOT extract-up: the four token-economics floors moved to the
+// protocol-free `crate::stel_core::consts` (the ONLY tie that bound the
+// `calibration` math to this server-only controller). Re-export them here at
+// their original `stel::controller::…` paths so every existing caller
+// (`crate::stel::controller::COMPACT_SCHEMA_TOKENS`, the `stel::mod` re-export,
+// `protocol::mod`, `handler`, the calibration-tuning integration test) and the
+// controller's own production code below resolve unchanged.
+pub use crate::stel_core::consts::{
+    COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, STATIC_MANUAL_FLOOR, STATIC_RESPONSE_FLOOR,
+};
+
 /// Minimum predicted net vs manual before `serve` (schema `margin_high`).
 pub const SERVE_MARGIN_TOKENS: i32 = 50;
 /// Predicted net at or below this (but above zero) triggers `degrade` (`margin_low`).
@@ -55,10 +63,32 @@ pub fn evaluate_plan(request: &StelRequest, plan: &StelPlan) -> StelDecision {
 }
 
 /// Evaluate L2 admission with optional in-process session context for cache-hit detection.
+///
+/// Static-floor economics: identical to the pre-013 behaviour. The tuned variant
+/// [`evaluate_plan_tuned`] threads a validated tuning into the same logic; this
+/// is the `tuned = None` entry every existing caller (and golden-replay) takes,
+/// so routing/policy is byte-exact unless a tuning is explicitly in force.
 pub fn evaluate_plan_with_session(
     request: &StelRequest,
     plan: &StelPlan,
     session: Option<&SessionContext>,
+) -> StelDecision {
+    evaluate_plan_tuned(request, plan, session, None)
+}
+
+/// Evaluate L2 admission with an optional validated tuning in force (feature 013,
+/// T032 / FR-006). When `tuned` is `Some`, the economics that drive the
+/// serve/degrade/bypass branches use the tuned constants, so the adaptive
+/// decision reflects better-grounded numbers; when `None`, the static floors
+/// apply and the decision is byte-identical to the pre-013 path. Routing
+/// correctness, policy/deny, and safety guards are untouched — only the
+/// token-estimate inputs change (FR-007). The caller must pass only an in-force
+/// tuning (see [`active_tuning_in_force`]).
+pub fn evaluate_plan_tuned(
+    request: &StelRequest,
+    plan: &StelPlan,
+    session: Option<&SessionContext>,
+    tuned: Option<&TunedEstimateConstants>,
 ) -> StelDecision {
     if let Some(bypass) = detect_pff_bypass(request) {
         return decision_from_pff_bypass(plan, request, bypass);
@@ -70,7 +100,7 @@ pub fn evaluate_plan_with_session(
         return decision_from_cache_hit(plan, request, cache);
     }
 
-    let economics = estimate_economics(plan);
+    let economics = estimate_economics_tuned(plan, tuned);
     let net = economics.predicted_net_vs_manual;
 
     if net <= 0 {
@@ -317,25 +347,63 @@ pub fn build_estimate(
 /// an *estimate* (predicted from real bytes, not a measured token count) — the
 /// envelope keeps the `est_`/`heuristic` label (relabel != measure).
 pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
+    // The static-floor path: identical to the pre-013 behaviour, so golden-replay
+    // and every existing prediction are byte-exact unless a validated tuning is
+    // explicitly threaded through `estimate_economics_tuned`.
+    estimate_economics_tuned(plan, None)
+}
+
+/// Select the tuned constants that are IN FORCE for the current estimator (R3).
+///
+/// Returns `Some` only when `tuned` is present AND its `estimator_version`
+/// matches `current_version`; otherwise `None`, so a stale-version tuned set
+/// never silently applies (FR-006 in-force rule). Pure — unit-testable without a
+/// store.
+pub fn active_tuning_in_force(
+    tuned: Option<TunedEstimateConstants>,
+    current_version: &str,
+) -> Option<TunedEstimateConstants> {
+    tuned.filter(|c| c.estimator_version == current_version)
+}
+
+/// Economics with an optional validated tuning in force (feature 013, T032).
+///
+/// When `tuned` is `Some`, the per-step FLOOR path uses the tuned
+/// `response_floor`/`manual_floor` (replacing the static `400/800`) and the
+/// schema/invoke overhead uses the tuned `schema_tokens`/`invoke_tokens`
+/// (replacing `COMPACT_SCHEMA_TOKENS`/`COMPACT_INVOKE_TOKENS`). When `tuned` is
+/// `None` the static floors apply — byte-identical to the pre-013 path. The
+/// byte-grounded read/edit path (a step with `index_refs`) is UNCHANGED in both
+/// cases: tuning corrects only the floor that applies when byte grounding is
+/// absent, plus the schema/invoke constants. The served figure stays an estimate.
+///
+/// The caller is responsible for passing only an IN-FORCE tuning (matching the
+/// current estimator version) — see [`active_tuning_in_force`].
+pub fn estimate_economics_tuned(
+    plan: &StelPlan,
+    tuned: Option<&TunedEstimateConstants>,
+) -> EconomicsBreakdown {
     let (predicted_response_tokens, predicted_manual_tokens) = plan
         .steps
         .iter()
-        .map(grounded_step_tokens)
+        .map(|step| grounded_step_tokens_tuned(step, tuned))
         .fold((0u32, 0u32), |(resp, manual), (step_resp, step_manual)| {
             (
                 resp.saturating_add(step_resp),
                 manual.saturating_add(step_manual),
             )
         });
+    let schema_tokens = tuned.map_or(COMPACT_SCHEMA_TOKENS, |c| c.schema_tokens);
+    let invoke_tokens = tuned.map_or(COMPACT_INVOKE_TOKENS, |c| c.invoke_tokens);
     let predicted_symforge_tokens = predicted_response_tokens
-        .saturating_add(COMPACT_SCHEMA_TOKENS)
-        .saturating_add(COMPACT_INVOKE_TOKENS);
+        .saturating_add(schema_tokens)
+        .saturating_add(invoke_tokens);
     let predicted_net_vs_manual = predicted_manual_tokens as i32 - predicted_symforge_tokens as i32;
     EconomicsBreakdown {
         predicted_response_tokens,
         predicted_manual_tokens,
-        predicted_schema_tokens: COMPACT_SCHEMA_TOKENS,
-        predicted_invoke_tokens: COMPACT_INVOKE_TOKENS,
+        predicted_schema_tokens: schema_tokens,
+        predicted_invoke_tokens: invoke_tokens,
         predicted_symforge_tokens,
         predicted_net_vs_manual,
     }
@@ -356,9 +424,20 @@ pub fn estimate_economics(plan: &StelPlan) -> EconomicsBreakdown {
 ///
 /// Falls back to the plan-only `est_*` constants when no real size is known
 /// (preserves determinism for plan-only callers and existing fixtures).
-fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
+fn grounded_step_tokens_tuned(
+    step: &StelPlanStep,
+    tuned: Option<&TunedEstimateConstants>,
+) -> (u32, u32) {
     if step.index_refs.is_empty() {
-        return (step.est_response_tokens, step.est_manual_tokens);
+        // Plan-only floor path: this is the ONLY place a validated tuning
+        // replaces the static per-step floor. A tuned set overrides the planner's
+        // `est_*` constants with its derived `response_floor`/`manual_floor`; with
+        // no tuning the plan's own (static 400/800) floor is used, byte-exact with
+        // the pre-013 behaviour. The byte-grounded branches below are unchanged.
+        return match tuned {
+            Some(c) => (c.response_floor, c.manual_floor),
+            None => (step.est_response_tokens, step.est_manual_tokens),
+        };
     }
     let total_raw_chars: usize = step
         .index_refs

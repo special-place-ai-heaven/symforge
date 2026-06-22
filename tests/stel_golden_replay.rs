@@ -349,3 +349,97 @@ async fn replay_serve_rows_grouped_by_corpus(rows: &[&GoldenRouteRow]) {
         failures.join("\n\n")
     );
 }
+
+// ===========================================================================
+// T035 (feature 013 US2) — routing/policy/golden-replay is byte-exact across
+// deferred/accumulating/tuned states (calibration changes ESTIMATES, not
+// DECISIONS), and calibration writes never bump frecency. Proves FR-007 / SC-004
+// and the estimate-only contract (Principle V/VII).
+// ===========================================================================
+
+/// The L2 DECISION for every golden row is identical whether tuning is None,
+/// matching the deferred/accumulating scenario where no tuning is in force.
+/// `evaluate_plan_tuned(.., None)` MUST equal `evaluate_plan` byte-for-byte, so
+/// the calibration machinery cannot perturb routing/policy when no validated
+/// tuning exists (the golden-replay topology).
+#[test]
+fn golden_row_decisions_are_byte_exact_with_no_tuning_in_force() {
+    use symforge::stel::controller::{evaluate_plan, evaluate_plan_tuned};
+
+    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
+    for row in &rows {
+        let request = stel::request_for_golden_row(row);
+        let plan = stel::build_plan(&request);
+
+        let baseline = evaluate_plan(&request, &plan);
+        let with_machinery = evaluate_plan_tuned(&request, &plan, None, None);
+
+        // Serialize both decisions and compare byte-for-byte: the calibration
+        // code path with `tuned = None` is the identity of the pre-013 decision.
+        let baseline_json = serde_json::to_string(&baseline).expect("serialize baseline");
+        let machinery_json = serde_json::to_string(&with_machinery).expect("serialize machinery");
+        assert_eq!(
+            baseline_json, machinery_json,
+            "row {}: calibration machinery (tuned=None) must not change the decision",
+            row.id
+        );
+
+        // And the routing/policy expectation the golden corpus pins is unchanged.
+        assert_eq!(
+            with_machinery.decision, row.expected_decision,
+            "row {}: golden expected decision must hold under the calibration path",
+            row.id
+        );
+    }
+}
+
+/// Persisting accepted tuned constants (the calibration write) must NOT bump
+/// discovery/search frecency — calibration is estimate-only and has no business
+/// touching the ranking subsystem (Principle V).
+#[test]
+fn calibration_write_does_not_bump_frecency() {
+    use symforge::live_index::frecency::FrecencyStore;
+    use symforge::stel::ledger_store::{
+        CURRENT_ESTIMATOR_VERSION, StelLedgerStore, TunedEstimateConstants,
+    };
+
+    let frecency = FrecencyStore::open_in_memory().expect("open frecency store");
+    let before = frecency.last_10_bumps().expect("frecency snapshot before");
+    assert!(before.is_empty(), "fresh frecency store has no bumps");
+
+    // Store + reload an active tuning set (the audited gated-action write). The
+    // STEL ledger store has no dependency on frecency, so this must not touch
+    // discovery ranking at all.
+    let store = StelLedgerStore::open_in_memory("sess-calib-frecency").expect("ledger store");
+    let tuned = TunedEstimateConstants {
+        response_floor: 800,
+        manual_floor: 1600,
+        schema_tokens: 90,
+        invoke_tokens: 160,
+        estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
+        sample_size: 60,
+        error_before: 300.0,
+        error_after: 12.0,
+        tuned_at_ms: 1,
+    };
+    store.store_active_tuning(&tuned).expect("store tuning");
+    let _ = store
+        .load_active_tuning(CURRENT_ESTIMATOR_VERSION)
+        .expect("load tuning");
+
+    let after = frecency.last_10_bumps().expect("frecency snapshot after");
+    assert_eq!(
+        before, after,
+        "calibration writes must NOT bump discovery/search frecency"
+    );
+
+    // Control: a genuine bump DOES change the snapshot (assertion is not vacuous).
+    frecency
+        .bump(&[std::path::PathBuf::from("src/lib.rs")], 1_718_000_000)
+        .expect("control bump");
+    let bumped = frecency.last_10_bumps().expect("snapshot after bump");
+    assert_ne!(
+        after, bumped,
+        "a genuine frecency bump must change the snapshot"
+    );
+}

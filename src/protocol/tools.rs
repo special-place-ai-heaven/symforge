@@ -8440,7 +8440,7 @@ impl SymForgeServer {
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         use crate::protocol::smart_query;
-        use crate::stel::controller::{build_estimate, evaluate_plan_with_session};
+        use crate::stel::controller::{build_estimate, evaluate_plan_tuned};
         use crate::stel::executor::{
             ServedStepResult, apply_compact_serve_caps, apply_degrade_to_plan,
             chain_failure_decision, format_bypass_body, format_cache_hit_body,
@@ -8448,7 +8448,7 @@ impl SymForgeServer {
             format_single_step_serve_body, is_degrade, route_tool_label, serve_chain_outcome_class,
             serve_step_failed, serve_step_outcome, should_skip_legacy_dispatch, tools_executed,
         };
-        use crate::stel::handler::{self, metrics_for_decision};
+        use crate::stel::handler::{self, metrics_for_decision_tuned};
         use crate::stel::planner::{build_plan, plan_summary_line};
 
         let q = smart_query::strip_leading_articles(request.query.trim());
@@ -8473,7 +8473,14 @@ impl SymForgeServer {
         // become reachable (a tiny target's manual baseline falls below
         // SymForge's fixed schema+invoke overhead → economics bypass).
         self.ground_plan_economics(&mut plan);
-        let decision = evaluate_plan_with_session(request, &plan, Some(&self.session_context));
+        // T032 / FR-006: load the validated tuning in force for the current
+        // estimator (None when no durable store / no accepted tuning / a stale
+        // version), and thread it through BOTH the L2 decision and the envelope
+        // economics so adaptive serve/degrade/bypass branches use the calibrated
+        // floors. With no tuning this is byte-identical to the static path.
+        let tuned = self.active_tuning_for_economics();
+        let decision =
+            evaluate_plan_tuned(request, &plan, Some(&self.session_context), tuned.as_ref());
         let step = plan
             .steps
             .first()
@@ -8484,8 +8491,14 @@ impl SymForgeServer {
         if request.preview == Some(true) {
             let estimate = build_estimate(request, &plan, &decision);
             let body = handler::format_preview_estimate(&estimate);
-            let metrics =
-                metrics_for_decision(plan_summary, &decision, &plan, 0, session_tokens_served);
+            let metrics = metrics_for_decision_tuned(
+                plan_summary,
+                &decision,
+                &plan,
+                0,
+                session_tokens_served,
+                tuned.as_ref(),
+            );
             let envelope = handler::envelope_for_decision(&metrics);
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8508,6 +8521,7 @@ impl SymForgeServer {
                 false,
                 &step.tool,
                 None,
+                tuned.as_ref(),
             );
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
@@ -8628,6 +8642,7 @@ impl SymForgeServer {
             !step_results.is_empty(),
             &route_label,
             tools_called,
+            tuned.as_ref(),
         );
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
@@ -8768,6 +8783,10 @@ impl SymForgeServer {
                         false,
                         "replace_symbol_body",
                         None,
+                        // Edits are byte-grounded (grounded_edit_tokens), not
+                        // floor-tuned; the auto-tune corrects only the plan-floor
+                        // path, so no tuning applies here.
+                        None,
                     );
                     self.session_context
                         .record_summary_output("symforge_edit", handler::estimate_tokens(&output));
@@ -8838,6 +8857,8 @@ impl SymForgeServer {
             &body,
             legacy_executed,
             &step.tool,
+            None,
+            // Edits are byte-grounded, not floor-tuned (see above).
             None,
         );
         self.session_context
@@ -8928,9 +8949,27 @@ impl SymForgeServer {
         &self,
         request: &crate::stel::StelStatusRequest,
     ) -> String {
+        // T037 / FR-011 operator reset: clear accumulated calibration BEFORE
+        // rendering, so the surface returns to `Deferred`. MCP-native — a param on
+        // the existing `status` tool, never injected context; never rebuilds the
+        // index (only the calibration tables are cleared).
+        let reset_note = if request.reset_calibration == Some(true) {
+            match self.reset_calibration() {
+                Some(cleared) => Some(format!(
+                    "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
+                )),
+                None => Some(
+                    "calibration_reset: no durable store; in-memory calibration is already deferred"
+                        .to_string(),
+                ),
+            }
+        } else {
+            None
+        };
+
         let guard = self.index.read();
         let ledger = self.stel_ledger.lock();
-        let ctx = crate::stel::StelStatusContext::from_server(
+        let mut ctx = crate::stel::StelStatusContext::from_server(
             "compact",
             &self.project_name,
             guard.is_ready(),
@@ -8943,7 +8982,22 @@ impl SymForgeServer {
         // restart-survival is observable from `status` (Unavailable on
         // stdio/embed; Disabled{reason} for a wired-but-failing store — N-3).
         .with_durable_ledger(self.durable_ledger_summary_for_status());
-        crate::stel::format_stel_status(request, &ctx)
+
+        // T033 / FR-009: override the in-memory verdict with the DURABLE one so
+        // `status detail:full` reflects the persisted cross-session calibration
+        // state + active tuning. `None` (no/failed durable store) keeps the
+        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
+        // `Tuned`). After a reset above, the durable read sees zero samples ->
+        // `Deferred`.
+        if let Some(verdict) = self.durable_calibration_verdict() {
+            ctx = ctx.with_calibration_verdict(verdict);
+        }
+
+        let body = crate::stel::format_stel_status(request, &ctx);
+        match reset_note {
+            Some(note) => format!("{body}\n{note}"),
+            None => body,
+        }
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -8974,19 +9028,25 @@ impl SymForgeServer {
         legacy_executed: bool,
         selected_tool: &str,
         tools_called: Option<Vec<String>>,
+        tuned: Option<&crate::stel::ledger_store::TunedEstimateConstants>,
     ) -> String {
-        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision};
+        use crate::stel::handler::{self, finalize_symforge_output, metrics_for_decision_tuned};
         use crate::stel::ledger::{
             LedgerCaptureInput, capture_ledger, format_ledger_envelope_line,
         };
 
         let response_tokens = handler::estimate_tokens(body);
-        let metrics = metrics_for_decision(
+        // T032: record the prediction the predictor ACTUALLY made for this call —
+        // tuned when a validated tuning is in force, static otherwise — so the
+        // ledger's predicted-vs-actual residual reflects the live estimator and
+        // the next tuning pass measures progress against it (hysteresis).
+        let metrics = metrics_for_decision_tuned(
             plan_summary,
             decision,
             plan,
             response_tokens,
             session_tokens_served,
+            tuned,
         );
         let (event, meta) = capture_ledger(&LedgerCaptureInput {
             plan,
@@ -9518,6 +9578,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         server.render_stel_status_body(&crate::stel::StelStatusRequest {
             detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
         })
     }
 
@@ -9585,8 +9646,12 @@ mod tests {
 
         // A `detail:compact` worker body carries no durable_ledger line; the
         // overlay must return it byte-for-byte unchanged (nothing to replace).
-        let compact = make_server(make_live_index_ready(vec![]))
-            .render_stel_status_body(&crate::stel::StelStatusRequest { detail: None });
+        let compact = make_server(make_live_index_ready(vec![])).render_stel_status_body(
+            &crate::stel::StelStatusRequest {
+                detail: None,
+                reset_calibration: None,
+            },
+        );
         assert!(
             !compact.contains("durable_ledger:"),
             "precondition: compact body has no durable_ledger line:\n{compact}"
@@ -9661,6 +9726,7 @@ mod tests {
         );
         let bare_body = bare.render_stel_status_body(&StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
+            reset_calibration: None,
         });
         let bare_overlaid = super::overlay_proxy_durable_ledger_line(
             bare_body,

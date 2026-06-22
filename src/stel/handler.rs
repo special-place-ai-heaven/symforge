@@ -1,7 +1,8 @@
 //! Phase 1 S4+ — `symforge` response envelope wiring (L1 planner + L2 economics + L3 bypass).
 
-use super::controller::{EconomicsBreakdown, build_estimate, estimate_economics};
+use super::controller::{EconomicsBreakdown, build_estimate, estimate_economics_tuned};
 use super::envelope::{TrustEnvelopeInput, format_trust_envelope};
+use super::ledger_store::TunedEstimateConstants;
 use super::types::{AdmissionDecision, StelDecision, StelEstimate, StelPlan, StelRequest};
 
 /// Estimated token count from UTF-8 body length (`chars/4` approximation).
@@ -30,6 +31,11 @@ pub struct DecisionEnvelopeMetrics {
     /// NOT a net saving). Honest name per 010 FR-002 / TR-05.
     pub session_tokens_served: i64,
     pub predict_error_pct: f32,
+    /// Honest calibration verdict rendering for the envelope (feature 013 US2,
+    /// FR-009). `deferred` when no validated tuning is in force; `tuned (error:
+    /// before -> after ...)` when a validated tuning IS in force (carrying its
+    /// artifact). Built by `metrics_for_decision_tuned` from the live tuning.
+    pub calibration: String,
     pub ledger_line: Option<String>,
 }
 
@@ -48,10 +54,10 @@ pub fn envelope_for_decision(metrics: &DecisionEnvelopeMetrics) -> String {
         predicted_tokens: metrics.economics.predicted_response_tokens,
         predict_error_pct: metrics.predict_error_pct,
         session_tokens_served: metrics.session_tokens_served,
-        // Auto-tuning calibration is permanently deferred (the `CalibrationState`
-        // seam is inert — N-1); honest label is `deferred`, never `pending`,
-        // which would imply transient/in-progress work (010 TR-10 / N-1).
-        calibration: "deferred",
+        // Honest live verdict (feature 013 US2): `deferred` until a validated
+        // tuning is in force, then `tuned (...)` with the before/after artifact.
+        // The word `tuned` is never produced without that artifact.
+        calibration: metrics.calibration.clone(),
         ledger_line: metrics.ledger_line.clone(),
     })
 }
@@ -62,6 +68,10 @@ pub fn envelope_for_stub_serve(metrics: &DecisionEnvelopeMetrics) -> String {
 }
 
 /// Build envelope metrics from L2 output and optional post-execution response size.
+///
+/// Static-floor economics (no tuning). The tuned variant
+/// [`metrics_for_decision_tuned`] threads a validated tuning through; this entry
+/// keeps every existing caller byte-exact.
 pub fn metrics_for_decision(
     plan_summary: String,
     decision: &StelDecision,
@@ -69,14 +79,35 @@ pub fn metrics_for_decision(
     response_tokens: u32,
     session_tokens_served: i64,
 ) -> DecisionEnvelopeMetrics {
+    metrics_for_decision_tuned(
+        plan_summary,
+        decision,
+        plan,
+        response_tokens,
+        session_tokens_served,
+        None,
+    )
+}
+
+/// As [`metrics_for_decision`], but with an optional validated tuning in force
+/// (feature 013, T032). When `tuned` is `Some`, the predicted economics figures
+/// shown in the envelope use the tuned constants; the figure stays an estimate.
+pub fn metrics_for_decision_tuned(
+    plan_summary: String,
+    decision: &StelDecision,
+    plan: &StelPlan,
+    response_tokens: u32,
+    session_tokens_served: i64,
+    tuned: Option<&TunedEstimateConstants>,
+) -> DecisionEnvelopeMetrics {
     let economics = if decision.decision == AdmissionDecision::Bypass {
         decision
             .bypass
             .as_ref()
             .map(super::controller::economics_for_bypass)
-            .unwrap_or_else(|| estimate_economics(plan))
+            .unwrap_or_else(|| estimate_economics_tuned(plan, tuned))
     } else {
-        estimate_economics(plan)
+        estimate_economics_tuned(plan, tuned)
     };
     let predict_error_pct = if economics.predicted_response_tokens == 0 {
         0.0
@@ -91,7 +122,33 @@ pub fn metrics_for_decision(
         response_tokens,
         session_tokens_served,
         predict_error_pct,
+        // Honest live calibration verdict for the envelope (feature 013 US2,
+        // FR-009): a validated tuning IN FORCE for this call reads `tuned (...)`
+        // with its before/after artifact; otherwise `deferred`. The renderer
+        // never emits `tuned` without the artifact, so the envelope cannot
+        // over-claim. The per-call envelope reflects what THIS call's economics
+        // used; the full durable verdict (accumulating counts) lives on `status`.
+        calibration: calibration_label_for_tuning(tuned),
         ledger_line: None,
+    }
+}
+
+/// The envelope calibration line for a per-call tuning state (feature 013 US2).
+///
+/// `tuned (...)` with the before/after artifact when a validated tuning is in
+/// force for this call (so the served prediction used calibrated constants),
+/// else `deferred`. Never `tuned` without the artifact (SC-005) — the renderer
+/// constructs the `Tuned` verdict directly from the tuning's `error_before`/
+/// `error_after`, which are the held-out figures that justified it.
+fn calibration_label_for_tuning(tuned: Option<&TunedEstimateConstants>) -> String {
+    use super::calibration::{CalibrationVerdict, render_calibration_verdict};
+    match tuned {
+        Some(c) => render_calibration_verdict(&CalibrationVerdict::Tuned {
+            sample_size: c.sample_size as usize,
+            error_before: c.error_before,
+            error_after: c.error_after,
+        }),
+        None => render_calibration_verdict(&CalibrationVerdict::Deferred),
     }
 }
 

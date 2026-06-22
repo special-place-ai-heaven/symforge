@@ -20,6 +20,18 @@ pub mod discovery;
 pub mod edit_safety;
 pub mod idempotency;
 
+// ── Protocol-free STEL storage + calibration seam (D3-ROOT extract-up) ──
+// The durable economics ledger + calibration math are pure STORAGE + MATH with
+// no transport/protocol dependency, so they compile under BOTH the full server
+// build AND the engine-only `embed` facade — delivering FR-001 embed
+// durability. The server-only `stel` module re-exports these submodules so
+// every existing `crate::stel::{types,ledger_store,calibration}` caller path
+// resolves unchanged. Gated `any(server, embed)`: dead under neither, so no
+// false embed-capability signal (unlike a bare `any(...)` on a server-coupled
+// module).
+#[cfg(any(feature = "server", feature = "embed"))]
+pub mod stel_core;
+
 // ── Server surface: excluded from `--no-default-features --features embed` ──
 // daemon/sidecar/protocol-server/CLI + their heavy deps (axum, rmcp, clap,
 // reqwest, notify, tracing-subscriber). Library embedders never compile these.
