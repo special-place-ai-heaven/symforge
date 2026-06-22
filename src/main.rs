@@ -267,7 +267,40 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         }
     });
 
-    let server = protocol::SymForgeServer::new_daemon_proxy(session.clone());
+    let mut server = protocol::SymForgeServer::new_daemon_proxy(session.clone());
+
+    // Feature 013 US1 (T021): the DEFAULT operator stdio is daemon-backed, and
+    // the `symforge` compact tool — the ONLY tool that records STEL economics
+    // ledger events (via `finalize_symforge_with_ledger`) — executes on THIS
+    // proxy server, NOT on the daemon worker. The daemon worker's
+    // `execute_tool_call` (daemon.rs) dispatches only the primitive tools +
+    // `status`; it has no `symforge` arm. The proxy fetches served data FROM the
+    // daemon (each primitive proxies via `proxy_tool_call`), but the economics
+    // capture + durable write-through stays on the proxy. So durable accumulation
+    // in the daemon-default deployment requires attaching the durable store
+    // HERE, on the proxy — mirroring the local-stdio attach (T020) and serve.rs.
+    // Open under the project ROOT: `StelLedgerStore::open` joins the
+    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
+    // dir on demand (passing the already-`.symforge` data dir here would double
+    // the prefix). A dir/open failure degrades to `Disabled` INSIDE `open`
+    // (logged, in-memory, FR-003). This deliberately does NOT touch the
+    // privileged daemon worker.
+    //
+    // Observability (013 US1 review fix): `status` IS proxied to the daemon
+    // worker, which has no durable store — but the proxy OWNS this store, so
+    // `status_stel_tool` overlays the proxy's OWN `durable_ledger` line onto the
+    // proxied `detail:full` body (`overlay_proxy_durable_ledger_line`). The
+    // operator therefore sees this proxy's real `Durable{..}` accumulation, not
+    // the worker's `unavailable`. If the proxy ALSO has no store, the line stays
+    // `unavailable` honestly.
+    if let Some(root) = session.project_root() {
+        let store = symforge::stel::ledger_store::StelLedgerStore::open(
+            root,
+            format!("stdio-daemon-{}", std::process::id()),
+        );
+        server = server.with_stel_ledger_store(Arc::new(store));
+    }
+
     tracing::info!(
         project_id = %session.project_id(),
         session_id = %session.session_id(),
@@ -428,13 +461,34 @@ async fn run_local_mcp_server_async(
     let token_stats = Some(Arc::clone(&sidecar_handle.token_stats));
 
     // Create MCP server and serve on stdio transport.
-    let server = protocol::SymForgeServer::new(
+    let mut server = protocol::SymForgeServer::new(
         Arc::clone(&index),
         project_name,
         watcher_info,
         watcher_root.clone(),
         token_stats,
     );
+
+    // Feature 013 US1 (T020): attach the durable STEL economics ledger on the
+    // LOCAL stdio path so predicted-vs-actual events accumulate ACROSS restarts
+    // (FR-001/SC-003), not just in serve mode. Mirrors `serve::build_serve_runtime`:
+    // open under the project ROOT — `StelLedgerStore::open` joins the
+    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
+    // dir on demand (the same convention as analytics/coupling/frecency; passing
+    // the already-`.symforge` data dir here would double the prefix). A dir/open
+    // failure degrades to `Disabled` INSIDE `open` (logged, in-memory, FR-003),
+    // so stdio never fails to start over a ledger problem. The `symforge` compact
+    // tool's `finalize_symforge_with_ledger` write-through then persists each
+    // economics row to this store, bringing stdio to parity with serve
+    // (Principle VII) for the durable backing.
+    if let Some(root) = watcher_root.as_ref() {
+        let store = symforge::stel::ledger_store::StelLedgerStore::open(
+            root,
+            format!("stdio-{}", std::process::id()),
+        );
+        server = server.with_stel_ledger_store(Arc::new(store));
+    }
+
     tracing::info!("starting MCP server on stdio transport");
     let service = serve_server(server, transport::stdio()).await?;
 

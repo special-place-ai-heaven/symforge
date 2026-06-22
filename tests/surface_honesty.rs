@@ -74,6 +74,31 @@ fn render_full_status() -> String {
     )
 }
 
+/// Render the `detail:full` status with an explicit durable-ledger state, as the
+/// stdio path does after attaching the durable store (feature 013 US1 T020/T023).
+/// `from_server` defaults to `Unavailable`; `with_durable_ledger` overrides it,
+/// mirroring `durable_ledger_summary_for_status` on the live server.
+fn render_full_status_with_durable(state: symforge::stel::DurableLedgerState) -> String {
+    let ledger = SessionLedger::new();
+    let ctx = StelStatusContext::from_server(
+        "compact",
+        "symforge",
+        Some("E:/project/symforge".to_string()),
+        true,
+        128,
+        512,
+        &ledger,
+        4096,
+    )
+    .with_durable_ledger(state);
+    format_stel_status(
+        &StelStatusRequest {
+            detail: Some(StelStatusDetail::Full),
+        },
+        &ctx,
+    )
+}
+
 #[test]
 fn envelope_never_presents_a_gross_counter_as_net_savings() {
     let envelope = render_live_envelope("who references cfg_if", 4096);
@@ -213,4 +238,112 @@ fn calibration_summary_surface_is_observational_not_validated() {
         section.contains("deferred"),
         "auto-tuning must read as deferred:\n{section}"
     );
+}
+
+// ===========================================================================
+// T023 (feature 013 US1) — the durable-ledger state rendered on the stdio
+// `status detail:full` path distinguishes Durable / Disabled{reason} /
+// Unavailable HONESTLY, and never presents a durable-accumulation figure as
+// measured when the store is Disabled. (FR-003, SC-005, Principle III)
+// ===========================================================================
+
+#[test]
+fn durable_ledger_durable_state_reports_its_real_accumulation_figure() {
+    use symforge::stel::{DurableLedgerState, DurableLedgerSummary};
+
+    // A healthy durable store (the stdio path after T020 attach, store open) must
+    // surface its REAL cumulative figures — this is the honest "events accumulate
+    // across restarts" signal (SC-003), only ever shown when actually Durable.
+    let status =
+        render_full_status_with_durable(DurableLedgerState::Durable(DurableLedgerSummary {
+            total_events: 42,
+            total_net_vs_manual: 1337,
+            session_count: 3,
+        }));
+    assert!(
+        status.contains("durable_ledger: events=42 net_vs_manual=1337 sessions=3"),
+        "a Durable store must report its real cumulative figures:\n{status}"
+    );
+    // It must NOT read `unavailable`/`disabled` when it is genuinely durable.
+    assert!(
+        !status.contains("durable_ledger: unavailable"),
+        "a durable store must not read unavailable:\n{status}"
+    );
+    assert!(
+        !status.contains("durable_ledger: disabled"),
+        "a durable store must not read disabled:\n{status}"
+    );
+}
+
+#[test]
+fn durable_ledger_disabled_state_names_the_reason_and_claims_no_accumulation() {
+    use symforge::stel::DurableLedgerState;
+
+    // A wired-but-failing store (FR-003 honest degrade) must read `disabled`
+    // WITH the reason (broken, not "off"), and MUST NOT present any durable
+    // accumulation figure as measured — the whole honesty point of SC-005.
+    let status = render_full_status_with_durable(DurableLedgerState::Disabled {
+        reason: "summary query failed: disk I/O error".to_string(),
+    });
+    assert!(
+        status.contains("durable_ledger: disabled (summary query failed: disk I/O error)"),
+        "a Disabled store must name its failure reason distinguishably:\n{status}"
+    );
+    // No `events=` accumulation figure may appear for a Disabled store — a
+    // Disabled store has no measured durable accumulation to present.
+    assert!(
+        !status.contains("durable_ledger: events="),
+        "a Disabled store must NOT present a durable-accumulation figure as measured:\n{status}"
+    );
+}
+
+#[test]
+fn durable_ledger_unavailable_is_distinct_from_disabled() {
+    use symforge::stel::DurableLedgerState;
+
+    // No store wired (e.g. the daemon-proxy `status` path, or stdio when the data
+    // dir could not be ensured) reads `unavailable` — structurally distinct from
+    // a wired-but-broken `disabled`. "Off" must never read identically to
+    // "broken" (N-3 / FR-008 honesty invariant carried onto the stdio surface).
+    let unavailable = render_full_status_with_durable(DurableLedgerState::Unavailable);
+    assert!(
+        unavailable.contains("durable_ledger: unavailable"),
+        "a never-configured store must read unavailable:\n{unavailable}"
+    );
+    assert!(
+        !unavailable.contains("durable_ledger: disabled"),
+        "unavailable must not collapse into disabled:\n{unavailable}"
+    );
+    assert!(
+        !unavailable.contains("durable_ledger: events="),
+        "an unavailable store presents no accumulation figure:\n{unavailable}"
+    );
+
+    // The three states render to three DISTINCT lines — the surface never blurs
+    // durable / broken / off.
+    let durable = render_full_status_with_durable(DurableLedgerState::Durable(
+        symforge::stel::DurableLedgerSummary {
+            total_events: 1,
+            total_net_vs_manual: 2,
+            session_count: 1,
+        },
+    ));
+    let disabled = render_full_status_with_durable(DurableLedgerState::Disabled {
+        reason: "open failed".to_string(),
+    });
+    let durable_line = durable
+        .lines()
+        .find(|l| l.starts_with("durable_ledger:"))
+        .unwrap();
+    let disabled_line = disabled
+        .lines()
+        .find(|l| l.starts_with("durable_ledger:"))
+        .unwrap();
+    let unavailable_line = unavailable
+        .lines()
+        .find(|l| l.starts_with("durable_ledger:"))
+        .unwrap();
+    assert_ne!(durable_line, disabled_line);
+    assert_ne!(durable_line, unavailable_line);
+    assert_ne!(disabled_line, unavailable_line);
 }

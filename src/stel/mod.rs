@@ -24,6 +24,14 @@ pub mod gates;
 pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
+// Feature 013 US1: durable STEL ledger store. Server-gated.
+//
+// Embed durability is DEFERRED — an `any(server, embed)` cfg here would be DEAD
+// under embed and falsely signal embed-capability: the whole `stel` module is
+// crate-root server-gated (`src/lib.rs`: `#[cfg(feature = "server")] pub mod
+// stel;`), and `stel::{controller,executor,planner,edit_apply}` hard-import
+// `crate::protocol`, itself server-gated. Reaching the store from embed needs a
+// structural protocol-free seam (out of US1 scope; see spec FR-001 note).
 #[cfg(feature = "server")]
 pub mod ledger_store;
 pub mod planner;
@@ -91,7 +99,7 @@ pub use planner::{
 };
 pub use status::{
     DEFERRED_ITEMS, DurableLedgerState, DurableLedgerSummary, PHASE0_EVIDENCE_COMMIT,
-    PHASE0_GO_COMMIT, StelStatusContext, format_stel_status,
+    PHASE0_GO_COMMIT, StelStatusContext, format_durable_ledger_line, format_stel_status,
 };
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{

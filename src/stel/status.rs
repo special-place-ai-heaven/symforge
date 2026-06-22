@@ -121,6 +121,29 @@ impl<'a> StelStatusContext<'a> {
     }
 }
 
+/// Render the single `durable_ledger:` line for a [`DurableLedgerState`].
+///
+/// Single source of truth for the line format so the full-status formatter and
+/// the daemon-proxy status overlay ([`crate::protocol`]) never drift. Returns
+/// exactly one of:
+/// - `durable_ledger: events={} net_vs_manual={} sessions={}` (Durable)
+/// - `durable_ledger: disabled ({reason})` (wired-but-failing, N-3/FR-008)
+/// - `durable_ledger: unavailable` (no store wired)
+pub fn format_durable_ledger_line(state: &DurableLedgerState) -> String {
+    match state {
+        DurableLedgerState::Durable(summary) => format!(
+            "durable_ledger: events={} net_vs_manual={} sessions={}",
+            summary.total_events, summary.total_net_vs_manual, summary.session_count
+        ),
+        // N-3 / FR-008: a wired-but-failing store is reported distinctly from a
+        // never-configured one, carrying the reason.
+        DurableLedgerState::Disabled { reason } => {
+            format!("durable_ledger: disabled ({reason})")
+        }
+        DurableLedgerState::Unavailable => "durable_ledger: unavailable".to_string(),
+    }
+}
+
 /// Format the compact-surface `status` tool body.
 pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'_>) -> String {
     let detail = request.detail.unwrap_or(StelStatusDetail::Compact);
@@ -185,22 +208,7 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
             extra.push("last_ledger_route: none".to_string());
         }
     }
-    match &ctx.durable_ledger {
-        DurableLedgerState::Durable(summary) => {
-            extra.push(format!(
-                "durable_ledger: events={} net_vs_manual={} sessions={}",
-                summary.total_events, summary.total_net_vs_manual, summary.session_count
-            ));
-        }
-        // N-3 / FR-008: a wired-but-failing store is reported distinctly from a
-        // never-configured one, carrying the reason.
-        DurableLedgerState::Disabled { reason } => {
-            extra.push(format!("durable_ledger: disabled ({reason})"));
-        }
-        DurableLedgerState::Unavailable => {
-            extra.push("durable_ledger: unavailable".to_string());
-        }
-    }
+    extra.push(format_durable_ledger_line(&ctx.durable_ledger));
     extra.push(format_calibration_section(&ctx.calibration));
     // Insert full-only lines before the closing banner.
     if let Some(pos) = body.rfind("\n──\n") {
