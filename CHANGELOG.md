@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.5.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.4.1...v8.5.0) (2026-06-22)
+
+
+### Features
+
+* **stel:** default trust envelope to the compact one-liner ([c4d8d9c](https://github.com/special-place-ai-heaven/symforge/commit/c4d8d9cbd733289d72a478f097c13ed4e255506e))
+
 ## [8.4.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.4.0...v8.4.1) (2026-06-20)
 
 
