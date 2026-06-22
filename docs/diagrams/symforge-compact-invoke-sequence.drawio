@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="26.0.0">
+  <diagram name="symforge compact invoke">
+    <mxGraphModel dx="1422" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1500" pageHeight="2000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="2" value="symforge compact invoke — AS-IS with 012 TO-BE fix points (C3 · C4)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="200" y="10" width="1100" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Lifeline headers -->
+        <mxCell id="10" value="MCP Client&#xa;(Cursor / Codex)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="60" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="Front-end&#xa;SymForgeServer&#xa;(stdio proxy shell)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="60" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="Shared Daemon&#xa;(axum per-session)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="60" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="LiveIndex&#xa;(warm, served)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="750" y="60" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="Local LiveIndex&#xa;(fallback only)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="980" y="60" width="160" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Lifeline dashed verticals -->
+        <mxCell id="15" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="120" as="sourcePoint" /><mxPoint x="140" y="1880" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="16" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="120" as="sourcePoint" /><mxPoint x="370" y="1880" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="17" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="605" y="120" as="sourcePoint" /><mxPoint x="605" y="1880" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="18" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="825" y="120" as="sourcePoint" /><mxPoint x="825" y="1880" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="19" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="1060" y="120" as="sourcePoint" /><mxPoint x="1060" y="1880" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <!-- PHASE A: Startup -->
+        <mxCell id="20" value="Phase A — Startup &amp; binding (C4 lives here)" style="swimlane;startSize=28;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="140" width="1120" height="320" as="geometry" />
+        </mxCell>
+
+        <mxCell id="21" value="1 launch MCP (launch CWD may ≠ workspace)" style="text;html=1;align=left;fillColor=none;strokeColor=none;" vertex="1" parent="20">
+          <mxGeometry x="20" y="40" width="280" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="2 connect_or_spawn_session(root from CWD)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="80" as="sourcePoint" /><mxPoint x="370" y="80" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="23" value="3 open session + bind project_id" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="110" as="sourcePoint" /><mxPoint x="605" y="110" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="24" value="4 new_daemon_proxy() — self.index = EMPTY by design" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="140" as="sourcePoint" /><mxPoint x="370" y="170" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="25" value="repo_root pinned from daemon connect" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="20">
+          <mxGeometry x="280" y="155" width="200" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="26" value="5 notifications/initialized → bind_workspace_from_client_roots" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="210" as="sourcePoint" /><mxPoint x="370" y="210" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="27" value="AS-IS: early return if repo_root already Some (C4)&#xa;TO-BE 012: un-gate for daemon-proxy; env &gt; roots &gt; CWD" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=2;" vertex="1" parent="20">
+          <mxGeometry x="500" y="185" width="300" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="28" value="6 explicit retarget: index_folder { path }" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeColor=#9673a6;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="260" as="sourcePoint" /><mxPoint x="370" y="260" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="29" value="7 proxy → index_folder_for_session (daemon.rs:815)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="285" as="sourcePoint" /><mxPoint x="605" y="285" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="30" value="8 reload warm index at new root" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="20">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="605" y="310" as="sourcePoint" /><mxPoint x="825" y="310" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <!-- PHASE B: symforge call - common STEL -->
+        <mxCell id="40" value="Phase B — symforge_facade_tool → STEL L1/L2 (both lanes)" style="swimlane;startSize=28;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="480" width="1120" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="41" value="9 tools/call symforge { query }" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="40">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="50" as="sourcePoint" /><mxPoint x="370" y="50" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="42" value="10 compact-surface gate (surface_probe)" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="40">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="75" as="sourcePoint" /><mxPoint x="370" y="95" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="43" value="11 symforge_stel_handler (tools.rs:8389)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="40">
+          <mxGeometry x="290" y="100" width="180" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="44" value="12 L1 build_plan + ground_plan_economics" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="40">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="380" y="150" as="sourcePoint" /><mxPoint x="380" y="170" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="45" value="13 L2 evaluate_plan_with_session → Serve | Bypass | CacheHit | Degrade" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="40">
+          <mxGeometry x="250" y="175" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="46" value="14 preview:true → StelEstimate JSON (no L3 dispatch)" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;strokeColor=#9673a6;" edge="1" parent="40">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="230" as="sourcePoint" /><mxPoint x="140" y="230" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="47" value="15 should_skip_legacy_dispatch? → bypass/cache body (front-end only)" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="40">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="255" as="sourcePoint" /><mxPoint x="140" y="255" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <!-- PHASE C: Daemon proxy lane -->
+        <mxCell id="50" value="Phase C — L3 serve: DAEMON PROXY lane (default production path)" style="swimlane;startSize=28;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="780" width="860" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="51" value="16 dispatch_tool_for_tests(step.tool)" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="45" as="sourcePoint" /><mxPoint x="370" y="65" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="52" value="17 proxy_tool_call → daemon HTTP (protocol/mod.rs:591)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeWidth=2;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="90" as="sourcePoint" /><mxPoint x="605" y="90" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="53" value="18 execute_tool_call on warm index" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeWidth=2;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="605" y="120" as="sourcePoint" /><mxPoint x="825" y="120" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="54" value="19 search_symbols / explore / … (real answers)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeColor=#82b366;strokeWidth=2;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="825" y="150" as="sourcePoint" /><mxPoint x="605" y="150" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="55" value="20 tool body → format_single/multi_step_serve_body" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="605" y="180" as="sourcePoint" /><mxPoint x="370" y="180" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="56" value="21 finalize_symforge_with_ledger → L4 SessionLedger + envelope" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="50">
+          <mxGeometry x="260" y="200" width="240" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="57" value="22 trust envelope + body → client" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeWidth=2;" edge="1" parent="50">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="260" as="sourcePoint" /><mxPoint x="140" y="260" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="58" value="TO-BE 012: envelope + status include project_root (bound-root visibility)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=2;" vertex="1" parent="50">
+          <mxGeometry x="480" y="250" width="340" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- C3 callout -->
+        <mxCell id="60" value="C3 BUG — status path diverges&#xa;&#xa;symforge/explore → proxy_tool_call → daemon index ✓&#xa;status_stel_tool → reads self.index (EMPTY shell) ✗&#xa;&#xa;TO-BE 012: proxy status OR read daemon registry;&#xa;never report zeros for a warm daemon" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="920" y="800" width="320" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="61" value="status (no proxy)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeColor=#b85450;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="140" y="960" as="sourcePoint" /><mxPoint x="370" y="960" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="62" value="reads empty self.index" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;strokeColor=#b85450;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="990" as="sourcePoint" /><mxPoint x="370" y="1020" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="63" value="index_ready: false, index_files: 0 (WRONG)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;strokeColor=#b85450;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="1040" as="sourcePoint" /><mxPoint x="140" y="1040" as="targetPoint" /></mxGeometry>
+        </mxCell>
+
+        <!-- PHASE D: Local fallback lane -->
+        <mxCell id="70" value="Phase D — LOCAL FALLBACK lane (daemon unreachable / degraded)" style="swimlane;startSize=28;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1140" width="1120" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="71" value="proxy_tool_call fails / timeout / reconnect fails" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;strokeColor=#b85450;" edge="1" parent="70">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="45" as="sourcePoint" /><mxPoint x="370" y="65" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="72" value="ensure_local_index() — reload from .symforge or source" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="70">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="85" as="sourcePoint" /><mxPoint x="1060" y="85" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="73" value="root-mismatch guard: reload if repo_root changed (M2)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="70">
+          <mxGeometry x="820" y="100" width="260" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="74" value="dispatch_tool_for_tests → self.index (in-process)" style="html=1;verticalAlign=bottom;endArrow=block;rounded=0;" edge="1" parent="70">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="160" as="sourcePoint" /><mxPoint x="1060" y="160" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="75" value="same L4 + envelope path on front-end" style="html=1;verticalAlign=bottom;endArrow=open;dashed=1;rounded=0;" edge="1" parent="70">
+          <mxGeometry relative="1" as="geometry"><mxPoint x="370" y="200" as="sourcePoint" /><mxPoint x="140" y="200" as="targetPoint" /></mxGeometry>
+        </mxCell>
+        <mxCell id="76" value="status reads self.index — CORRECT in this lane (index was loaded)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="70">
+          <mxGeometry x="500" y="220" width="340" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="80" value="Legend" style="swimlane;startSize=24;fillColor=#ffffff;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1460" width="420" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="81" value="Solid arrow = synchronous call / data" style="text;html=1;strokeColor=none;fillColor=none;align=left;" vertex="1" parent="80">
+          <mxGeometry x="16" y="30" width="260" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="82" value="Dashed = internal step or optional path" style="text;html=1;strokeColor=none;fillColor=none;align=left;" vertex="1" parent="80">
+          <mxGeometry x="16" y="52" width="280" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="83" value="Red box = AS-IS bug · Green/yellow = 012 TO-BE fix" style="text;html=1;strokeColor=none;fillColor=none;align=left;" vertex="1" parent="80">
+          <mxGeometry x="16" y="74" width="320" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="84" value="Code anchors: main.rs:221 new_daemon_proxy · mod.rs:810 bind_workspace · mod.rs:591 proxy_tool_call · daemon.rs:815 index_folder_for_session · tools.rs:8389 symforge_stel_handler" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontSize=11;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="480" y="1470" width="680" height="40" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
