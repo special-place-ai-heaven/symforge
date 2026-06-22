@@ -48,10 +48,14 @@ pub use a029::{
     A029_T2_PASS_THRESHOLD, A029SpikeResults, A029T2Row, A029Verdict, T2Equivalence,
     classify_t2_equivalence, evaluate_a029_verdict, normalize_spike_results,
 };
+// D14 (hardening): `derive_tuning_candidate` is intentionally NOT re-exported —
+// it is `pub(crate)` (a train-slice-only primitive with no leakage-free split).
+// External callers must derive+validate through `compute_calibration_verdict`,
+// which owns the out-of-time split; only that function may call `derive` directly.
 pub use calibration::{
     CORRECTION_FACTOR_CAP, CalibrationVerdict, NO_CORRECTION_FACTOR, PredictionSample,
     SC002_MAE_REDUCTION_MARGIN, StelCalibrationSummary, TUNING_MIN_CORPUS, TUNING_MIN_SAMPLES,
-    TUNING_REVIEW_MIN_EVENTS, apply_factor, compute_calibration_verdict, derive_tuning_candidate,
+    TUNING_REVIEW_MIN_EVENTS, apply_factor, compute_calibration_verdict,
     format_calibration_section, render_calibration_verdict, summarize_calibration,
     validate_candidate,
 };

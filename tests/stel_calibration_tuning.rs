@@ -12,20 +12,26 @@
 //! whole `stel` module is `#[cfg(feature = "server")]`.
 #![cfg(feature = "server")]
 
+// D14: `derive_tuning_candidate` is no longer importable here — it is `pub(crate)`
+// (train-slice-only). The integration suite exercises derivation reproducibility
+// and the factor cap THROUGH `compute_calibration_verdict`, the leakage-safe public
+// API that owns the out-of-time split, which is the only correct external entry.
 use symforge::stel::calibration::{
     CORRECTION_FACTOR_CAP, CalibrationVerdict, NO_CORRECTION_FACTOR, PredictionSample,
     SC002_MAE_REDUCTION_MARGIN, TUNING_MIN_CORPUS, TUNING_MIN_SAMPLES, apply_factor,
-    compute_calibration_verdict, derive_tuning_candidate, validate_candidate,
+    compute_calibration_verdict, validate_candidate,
 };
 use symforge::stel::controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, STATIC_RESPONSE_FLOOR, active_tuning_in_force,
-    estimate_economics, estimate_economics_tuned, index_ref_for_target,
+    estimate_economics, estimate_economics_tuned, evaluate_plan_tuned, index_ref_for_target,
 };
+use symforge::stel::ledger::{LedgerCaptureInput, build_ledger_event};
 use symforge::stel::ledger_store::{
     CURRENT_ESTIMATOR_VERSION, StelLedgerStore, TunedEstimateConstants,
 };
 use symforge::stel::types::{
     AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent, StelPlan, StelPlanStep,
+    StelRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -431,27 +437,45 @@ fn out_of_time_split_rejects_drifted_correction() {
 
 #[test]
 fn tuning_is_reproducible() {
-    let a = derive_tuning_candidate(&biased_corpus(30, 400, 1.6)).expect("candidate a");
-    let b = derive_tuning_candidate(&biased_corpus(30, 400, 1.6)).expect("candidate b");
-    assert_eq!(a, b, "a fixed corpus must yield an identical factor");
-
-    let (va, _) = compute_calibration_verdict(
+    // D14: reproducibility is exercised through the leakage-safe public verdict API
+    // (which owns the out-of-time split) rather than the now-crate-private
+    // `derive_tuning_candidate`. A fixed corpus must yield an identical verdict AND
+    // an identical derived factor on the accepted candidate.
+    let (va, ca) = compute_calibration_verdict(
         &biased_corpus(TUNING_MIN_CORPUS, 400, 2.0),
         NO_CORRECTION_FACTOR,
     );
-    let (vb, _) = compute_calibration_verdict(
+    let (vb, cb) = compute_calibration_verdict(
         &biased_corpus(TUNING_MIN_CORPUS, 400, 2.0),
         NO_CORRECTION_FACTOR,
     );
     assert_eq!(va, vb, "a fixed corpus must yield an identical verdict");
+    let fa = ca.expect("biased corpus tunes").response_correction_factor;
+    let fb = cb.expect("biased corpus tunes").response_correction_factor;
+    assert_eq!(fa, fb, "a fixed corpus must yield an identical factor");
 }
 
 #[test]
 fn factor_is_bounded_to_the_cap() {
-    // A wildly under-predicting corpus clamps at the CAP (no absurd swing).
-    let candidate =
-        derive_tuning_candidate(&biased_corpus(TUNING_MIN_SAMPLES, 100, 10.0)).expect("candidate");
-    assert_eq!(candidate.response_correction_factor, CORRECTION_FACTOR_CAP);
+    // A wildly under-predicting corpus (actuals 10x the prediction) must clamp the
+    // correction at the CAP (no absurd swing). Exercised end-to-end through the
+    // public verdict API (D14): even clamped at the CAP the correction closes
+    // enough of the real residual (100 -> 400 vs an actual 1000: residual 900 ->
+    // 600, a 33% reduction) to clear the SC-002 bar, so the verdict accepts and the
+    // accepted candidate carries the capped factor.
+    let (verdict, candidate) = compute_calibration_verdict(
+        &biased_corpus(TUNING_MIN_CORPUS, 100, 10.0),
+        NO_CORRECTION_FACTOR,
+    );
+    assert!(
+        matches!(verdict, CalibrationVerdict::Tuned { .. }),
+        "a 10x-biased corpus must tune (capped, but still a real improvement): {verdict:?}"
+    );
+    assert_eq!(
+        candidate.expect("candidate").response_correction_factor,
+        CORRECTION_FACTOR_CAP,
+        "the derived factor must clamp at the CAP, not admit a 10.0 swing"
+    );
 }
 
 #[test]
@@ -674,4 +698,211 @@ fn persisted_tuning_corrects_live_prediction_after_reload() {
     // Overheads remain fixed across the round-trip (D9).
     assert_eq!(tuned_econ.predicted_schema_tokens, COMPACT_SCHEMA_TOKENS);
     assert_eq!(tuned_econ.predicted_invoke_tokens, COMPACT_INVOKE_TOKENS);
+}
+
+// ===========================================================================
+// D15 — RE-TUNE CONSISTENCY: a SECOND tuning, recorded while a non-1.0 factor is
+// already in force, must stay consistent. This is the coverage that hid D15: it
+// goes through the REAL economics -> ledger record path (build_ledger_event from
+// estimate_economics_tuned), so the recorded `predicted_response_tokens` is
+// whatever the fix selects (RAW after fix, CORRECTED before). On the pre-fix,
+// record-CORRECTED code this test FAILS (the second tune under-corrects and its
+// before/after is a doubly-applied baseline); on the record-RAW fix it PASSES.
+//
+// Numbers (deterministic): byte-grounded raw prediction = 600 tok.
+//   - Tune #1: true served = 600*1.5 = 900 (systematic 1.5x under-prediction).
+//     in_force = 1.0 -> derive learns f_true = 1.5 -> live apply_factor(600,1.5)
+//     = 900 = actual (converged).
+//   - Tune #2 (drift): the codebase shifts so true served grows to 600*2.0 = 1200.
+//     The second-regime batch is recorded while f0 = 1.5 is in force and is large
+//     enough that the NEW regime dominates the recent window (the old 1.5x sample
+//     is a minority of BOTH out-of-time split halves, so the older/train half also
+//     derives ~2.0 — D11's split is honoured, not bypassed). Post-fix the recorded
+//     prediction is the RAW 600 (not the corrected 900), so derive learns the
+//     ABSOLUTE f_true = 2.0, live apply_factor(600,2.0) = 1200 = actual (converged),
+//     and the validate baseline error_before = |apply_factor(600,1.5) - 1200| =
+//     |900-1200| = 300 — the TRUE live residual under the active 1.5 tuning, NOT a
+//     doubly-applied fabrication.
+//
+// On the PRE-FIX record-CORRECTED code the second-regime samples record predicted =
+// apply_factor(600,1.5) = 900 (not 600), so derive learns median(1200/900) = 1.333
+// (a DELTA), live apply_factor(600,1.333) = 800 (under-corrected, NOT 1200), and the
+// in-force baseline scores |apply_factor(900,1.5)=1350 - 1200| = 150 (a doubly-
+// applied fabrication, NOT 300). The convergence + error_before assertions below
+// therefore FAIL pre-fix and PASS post-fix.
+// ===========================================================================
+
+/// A body whose `chars/4` token estimate is exactly `tokens` — lets the real
+/// ledger record path (`build_ledger_event`) produce a chosen `actual_response`.
+fn body_of_tokens(tokens: u32) -> String {
+    "x".repeat(tokens as usize * 4)
+}
+
+/// Record ONE event through the REAL production path: ground the live economics
+/// under the in-force tuning (`tuned`), then build the ledger event from that
+/// `EconomicsBreakdown` exactly as `finalize_symforge_with_ledger` does. The
+/// recorded `predicted_response_tokens` is therefore whichever field the D15 fix
+/// selects (RAW vs corrected) — this is what the test exercises. `actual_tokens`
+/// is realised as a body of the matching length so the residual is exact.
+fn record_live_event(
+    store: &StelLedgerStore,
+    ts_ms: u64,
+    plan: &StelPlan,
+    tuned: Option<&TunedEstimateConstants>,
+    actual_tokens: u32,
+) {
+    let request = StelRequest {
+        query: "trace a symbol".to_string(),
+        ..Default::default()
+    };
+    let decision = evaluate_plan_tuned(&request, plan, None, tuned);
+    let economics = estimate_economics_tuned(plan, tuned);
+    let body = body_of_tokens(actual_tokens);
+    let mut event = build_ledger_event(&LedgerCaptureInput {
+        plan,
+        decision: &decision,
+        economics: &economics,
+        selected_tool: "get_symbol",
+        tools_called: None,
+        legacy_executed: true,
+        output_body: &body,
+        surface: "symforge",
+    });
+    // Pin the timestamp so the out-of-time split is deterministic (the live path
+    // stamps wall-clock ms; the test fixes it for reproducibility, FR-012).
+    event.ts_ms = ts_ms;
+    store.record(&event);
+}
+
+/// Read the durable corpus and run the verdict against a given in-force factor —
+/// the exact computation the server performs each tuning pass.
+fn verdict_against(
+    store: &StelLedgerStore,
+    in_force_factor: f64,
+) -> (CalibrationVerdict, Option<TunedEstimateConstants>) {
+    let samples: Vec<PredictionSample> = store
+        .samples_for_estimator(CURRENT_ESTIMATOR_VERSION, 10_000)
+        .expect("samples")
+        .iter()
+        .map(PredictionSample::from)
+        .collect();
+    compute_calibration_verdict(&samples, in_force_factor)
+}
+
+#[test]
+fn second_tune_with_factor_in_force_stays_consistent() {
+    let store = StelLedgerStore::open_in_memory("sess-retune").expect("ledger store");
+    let plan = grounded_read_plan(40_000);
+    // The byte-grounded RAW prediction this plan produces, independent of tuning.
+    const RAW: u32 = 600;
+    assert_eq!(
+        estimate_economics(&plan).predicted_response_tokens,
+        RAW,
+        "fixture sanity: the grounded read predicts 600 raw tokens"
+    );
+
+    // ---- TUNE #1: no tuning in force (f0 = 1.0), true served = 1.5x = 900. ----
+    let mut ts = 1_000u64;
+    for _ in 0..TUNING_MIN_CORPUS {
+        record_live_event(&store, ts, &plan, None, 900);
+        ts += 1;
+    }
+    let (v1, c1) = verdict_against(&store, NO_CORRECTION_FACTOR);
+    assert!(
+        matches!(v1, CalibrationVerdict::Tuned { .. }),
+        "tune #1 must accept a 1.5x systematic bias: {v1:?}"
+    );
+    let tune1 = c1.expect("tune #1 candidate");
+    assert!(
+        (tune1.response_correction_factor - 1.5).abs() < 0.05,
+        "tune #1 must learn the ABSOLUTE factor ~1.5, got {}",
+        tune1.response_correction_factor
+    );
+    store.store_active_tuning(&tune1).expect("persist tune #1");
+
+    // (a) After tune #1 the LIVE prediction converges to the actual 900.
+    let live1 = apply_factor(RAW, tune1.response_correction_factor);
+    assert_eq!(
+        live1, 900,
+        "live apply_factor(600, f1) must converge to the actual 900 after tune #1"
+    );
+
+    // ---- TUNE #2: f0 = 1.5 is IN FORCE; the codebase drifts so true served ----
+    // ---- grows to 2.0x = 1200. Record the second regime WITH tune1 in force. ----
+    // Post-fix, the recorded prediction is the RAW 600 (not the corrected 900),
+    // so the next derive learns the ABSOLUTE 2.0 — not a 1200/900 = 1.333 delta.
+    // The new regime is recorded in volume (4*MIN_CORPUS) so it dominates the recent
+    // window: the older/train split half is majority 2.0x and derives ~2.0, honoring
+    // D11's out-of-time split (a stale 1.5x-only train half would correctly reject).
+    for _ in 0..(4 * TUNING_MIN_CORPUS) {
+        record_live_event(&store, ts, &plan, Some(&tune1), 1200);
+        ts += 1;
+    }
+
+    // The server validates the next pass against the in-force factor (1.5).
+    let in_force_factor = tune1.response_correction_factor;
+    let (v2, c2) = verdict_against(&store, in_force_factor);
+    assert!(
+        matches!(v2, CalibrationVerdict::Tuned { .. }),
+        "tune #2 must accept the drift to 2.0x against the in-force 1.5: {v2:?}"
+    );
+    let tune2 = c2.expect("tune #2 candidate");
+
+    // (a) tune #2 learns the ABSOLUTE drift factor ~2.0 (NOT the 1.333 delta the
+    // record-corrected bug would learn), and the LIVE prediction converges to 1200.
+    assert!(
+        (tune2.response_correction_factor - 2.0).abs() < 0.05,
+        "tune #2 must learn the ABSOLUTE factor ~2.0 (record-raw), got {} \
+         (the record-CORRECTED bug learns ~1.333 here)",
+        tune2.response_correction_factor
+    );
+    let live2 = apply_factor(RAW, tune2.response_correction_factor);
+    assert_eq!(
+        live2, 1200,
+        "live apply_factor(600, f2) must converge to the actual 1200 after tune #2 \
+         (the record-corrected bug under-corrects to apply_factor(600,1.333)=800)"
+    );
+
+    // (b) tune #2's error_before/error_after are the TRUE live residuals. Under the
+    // in-force 1.5 the live prediction is 900 vs an actual 1200 -> residual 300.
+    // The record-corrected bug instead reports |apply_factor(900,1.5)-1200| = 150,
+    // a doubly-applied fabrication. error_after under the absolute 2.0 is ~0.
+    if let CalibrationVerdict::Tuned {
+        error_before,
+        error_after,
+        ..
+    } = v2
+    {
+        assert!(
+            (error_before - 300.0).abs() < 1.0,
+            "error_before must be the TRUE live residual under f0=1.5 (300), got {error_before} \
+             (the record-corrected bug fabricates ~150)"
+        );
+        assert!(
+            error_after < 1.0,
+            "error_after under the absolute 2.0 correction must be ~0, got {error_after}"
+        );
+    } else {
+        panic!("tune #2 verdict must be Tuned");
+    }
+    store.store_active_tuning(&tune2).expect("persist tune #2");
+
+    // (c) A no-further-bias third pass STAYS at the current tuning (no spurious
+    // re-tune): record more events that the in-force 2.0 already predicts exactly
+    // (raw 600 -> corrected 1200 == actual), then re-run the verdict against the
+    // in-force 2.0. mae_before is ~0, so no candidate can clear the margin.
+    for _ in 0..TUNING_MIN_CORPUS {
+        record_live_event(&store, ts, &plan, Some(&tune2), 1200);
+        ts += 1;
+    }
+    let (v3, c3) = verdict_against(&store, tune2.response_correction_factor);
+    assert!(
+        matches!(v3, CalibrationVerdict::Accumulating { .. }),
+        "a no-further-bias third pass must STAY at the current tuning, not spuriously \
+         re-tune: {v3:?}"
+    );
+    assert!(
+        c3.is_none(),
+        "no candidate may be promoted when the in-force tuning is already exact"
+    );
 }

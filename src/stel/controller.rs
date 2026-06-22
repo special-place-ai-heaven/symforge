@@ -47,9 +47,24 @@ const GROUNDED_RESPONSE_FRACTION_DEN: u64 = 5;
 const EDIT_RESPONSE_FOOTER_TOKENS: u64 = 60;
 
 /// Token economics breakdown for one planned invocation.
+///
+/// D15: `predicted_response_tokens` is the CORRECTED response figure (the raw
+/// per-step sum scaled by any in-force `response_correction_factor`) — the number
+/// the served/decision economics (`predicted_net_vs_manual`) and the displayed
+/// envelope prediction use. `raw_predicted_response_tokens` is the SAME figure
+/// BEFORE the factor (the pure `grounded_step_tokens` sum, independent of any
+/// tuning) — the number the calibration ledger must record so `derive` learns the
+/// ABSOLUTE `f_true` and the held-out residual reconstructs the live residual
+/// under ANY active tuning. When no tuning is in force the two are identical, so
+/// the ledger sample is unchanged on the static path (golden-replay byte-exact).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EconomicsBreakdown {
+    /// CORRECTED predicted response (raw * in-force factor). Drives net + display.
     pub predicted_response_tokens: u32,
+    /// RAW predicted response (pre-factor). Recorded into the calibration ledger
+    /// so re-tunes learn the absolute factor (D15). Equals
+    /// `predicted_response_tokens` when no tuning is in force.
+    pub raw_predicted_response_tokens: u32,
     pub predicted_manual_tokens: u32,
     pub predicted_schema_tokens: u32,
     pub predicted_invoke_tokens: u32,
@@ -418,6 +433,11 @@ pub fn estimate_economics_tuned(
     let predicted_net_vs_manual = predicted_manual_tokens as i32 - predicted_symforge_tokens as i32;
     EconomicsBreakdown {
         predicted_response_tokens,
+        // D15: carry the RAW (pre-factor) prediction for the ledger. The summed
+        // `grounded_step_tokens` are pure of any tuning, so this is the absolute
+        // figure `derive` must see; `predicted_response_tokens` above is the same
+        // value scaled by the in-force factor (== this when `tuned` is `None`).
+        raw_predicted_response_tokens: predicted_response_raw,
         predicted_manual_tokens,
         predicted_schema_tokens: schema_tokens,
         predicted_invoke_tokens: invoke_tokens,
@@ -546,6 +566,10 @@ pub fn economics_for_bypass(bypass: &StelBypassBody) -> EconomicsBreakdown {
         bypass.predicted_manual_tokens as i32 - predicted_symforge_tokens as i32;
     EconomicsBreakdown {
         predicted_response_tokens: 0,
+        // A bypass serves no SymForge response (the agent host-reads directly), so
+        // both the corrected and the raw predicted response are 0 — there is no
+        // response output for a tuning factor to correct (D15).
+        raw_predicted_response_tokens: 0,
         predicted_manual_tokens: bypass.predicted_manual_tokens,
         predicted_schema_tokens: COMPACT_SCHEMA_TOKENS,
         predicted_invoke_tokens: COMPACT_INVOKE_TOKENS,

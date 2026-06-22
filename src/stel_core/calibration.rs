@@ -245,7 +245,18 @@ fn held_out_mae(samples: &[PredictionSample], factor: f64) -> Option<f64> {
 /// `error_before`/`error_after` are left at 0.0 here — they are the held-out
 /// artifact filled in by the verdict computation only AFTER validation accepts
 /// it; a bare candidate is never `tuned` on its own.
-pub fn derive_tuning_candidate(samples: &[PredictionSample]) -> Option<TunedEstimateConstants> {
+///
+/// D14 (hardening): this is `pub(crate)` — a TRAIN-SLICE-ONLY primitive. It
+/// derives a factor from WHATEVER corpus it is handed, with no leakage-free
+/// train/held-out split (that split lives only in [`compute_calibration_verdict`]).
+/// Exposing it publicly invited a caller deriving AND validating on the same full
+/// corpus — a leak that fabricates an optimistic verdict. Crate-internal callers
+/// (only [`compute_calibration_verdict`], which feeds it the OLDER half) cannot
+/// make that mistake; external callers must go through the verdict API, which owns
+/// the split. There is no live leak today; this prevents a future one.
+pub(crate) fn derive_tuning_candidate(
+    samples: &[PredictionSample],
+) -> Option<TunedEstimateConstants> {
     if samples.len() < TUNING_MIN_SAMPLES {
         return None;
     }
