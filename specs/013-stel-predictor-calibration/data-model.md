@@ -43,6 +43,8 @@ The honest state machine surfaced on `status detail: full` and the opt-in full e
 
 > **Name (collision avoided)**: this is a NEW type named `CalibrationVerdict` — NOT `CalibrationState`, which already exists at `types.rs:344` as an inert per-tool EMA struct. It lives in `calibration.rs` and, like the durable store, is reachable under `any(feature="server", feature="embed")` (rusqlite is an unconditional dep; no server/network stack enters embed).
 
+> **T007 (Foundational) verified note**: the Foundational phase (T004–T013) introduces NO honest-surface state type. The ONLY new public type it adds is the DB-layer storage primitive `TunedEstimateConstants` (a pure POD in `ledger_store.rs`, no I/O, no derivation); the honest `Deferred/Accumulating/Tuned` state machine lands later as `CalibrationVerdict` (US3), never overloading `CalibrationState`. `types::CalibrationState` (per-tool EMA) is left untouched and still compiles (`cargo check --features server` green). The `CalibrationVerdict` lives at `any(server, embed)` per US3; for the Foundational phase the durable store stays `#[cfg(feature="server")]` (the embed un-gate is US1 T018).
+
 ```text
 Deferred                       # no/insufficient samples for current estimator_version
   -> Accumulating { n, min }   # samples gathering toward the tuning minimum
