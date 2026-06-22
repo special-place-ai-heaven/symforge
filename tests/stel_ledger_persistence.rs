@@ -29,9 +29,10 @@
 
 use rusqlite::Connection;
 
+use symforge::paths::{STEL_LEDGER_DB_NAME, symforge_db_path};
 use symforge::stel::ledger_store::{
     CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX, LedgerStoreStatus, PRE_013_ESTIMATOR_SENTINEL,
-    SYMFORGE_STEL_LEDGER_DB_PATH, SqliteStelLedgerStore, StelLedgerStore, TunedEstimateConstants,
+    SqliteStelLedgerStore, StelLedgerStore, TunedEstimateConstants,
 };
 use symforge::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
 
@@ -503,7 +504,7 @@ fn corrupt_db_degrades_to_disabled_not_a_panic() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     // Write a non-SQLite file at the exact db path the store will open.
-    let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    let db_path = symforge_db_path(dir, STEL_LEDGER_DB_NAME);
     std::fs::create_dir_all(db_path.parent().unwrap()).expect("mkdir .symforge");
     std::fs::write(
         &db_path,
@@ -763,7 +764,7 @@ fn forced_open_failure_degrades_to_disabled_distinguishably_never_panics() {
     // Make the db path unopenable: pre-create the `.symforge` dir and write a
     // DIRECTORY where the db FILE must live, so `Connection::open` fails. This is
     // the "store cannot open" path (read-only FS / unwritable path analogue).
-    let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    let db_path = symforge_db_path(dir, STEL_LEDGER_DB_NAME);
     std::fs::create_dir_all(&db_path).expect("create a dir at the db file path");
 
     // The dir-entry open must NOT panic and must yield a distinguishable
@@ -962,12 +963,12 @@ fn open_under_project_root_lands_db_at_single_symforge_prefix_not_doubled() {
     drop(store);
 
     // The db must exist at exactly `<root>/.symforge/stel-ledger.db` — the
-    // single-prefix path the const encodes.
-    let expected = root.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    // single-prefix path the shared `symforge_db_path` helper builds.
+    let expected = symforge_db_path(root, STEL_LEDGER_DB_NAME);
     assert_eq!(
         expected,
         root.join(".symforge").join("stel-ledger.db"),
-        "the db-path const must encode a single .symforge prefix"
+        "the helper must build a single .symforge prefix"
     );
     assert!(
         expected.exists(),

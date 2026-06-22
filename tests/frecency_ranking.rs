@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::frecency::{FRECENCY_FLAG_ENV, FrecencyStore};
 use symforge::live_index::persist::init_frecency_store;
-use symforge::paths::SYMFORGE_FRECENCY_DB_PATH;
+use symforge::paths::{FRECENCY_DB_NAME, symforge_db_path};
 use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
@@ -68,7 +68,7 @@ impl Fixture {
     }
 
     fn db_path(&self) -> PathBuf {
-        self.root.join(SYMFORGE_FRECENCY_DB_PATH)
+        symforge_db_path(&self.root, FRECENCY_DB_NAME)
     }
 
     fn open_store(&self) -> FrecencyStore {
@@ -677,7 +677,7 @@ fn head_change_halves_scores_at_100_commits() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let first = init_repo_with_root_commit(root);
-    let db_path = root.join(SYMFORGE_FRECENCY_DB_PATH);
+    let db_path = symforge_db_path(root, FRECENCY_DB_NAME);
 
     // Seed: bump src/a.rs ten times, anchor HEAD.
     {
@@ -707,7 +707,7 @@ fn head_change_resets_scores_at_1000_commits() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let first = init_repo_with_root_commit(root);
-    let db_path = root.join(SYMFORGE_FRECENCY_DB_PATH);
+    let db_path = symforge_db_path(root, FRECENCY_DB_NAME);
 
     {
         let store = FrecencyStore::open(&db_path).expect("open");
@@ -749,7 +749,7 @@ fn ten_parallel_bumps_yield_hit_count_ten() {
         }
     });
 
-    let store = FrecencyStore::open(&root.join(SYMFORGE_FRECENCY_DB_PATH)).expect("open");
+    let store = FrecencyStore::open(&symforge_db_path(&root, FRECENCY_DB_NAME)).expect("open");
     let entries = store.last_10_bumps().expect("last_10_bumps");
     let entry = entries
         .iter()

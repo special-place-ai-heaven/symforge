@@ -1527,9 +1527,7 @@ fn frecency_health_status(repo_root: Option<&Path>) -> String {
     let Some(repo_root) = repo_root else {
         return "unavailable/no-repository-root".to_string();
     };
-    let has_persistent_history = repo_root
-        .join(crate::paths::SYMFORGE_FRECENCY_DB_PATH)
-        .is_file();
+    let has_persistent_history = crate::live_index::frecency::frecency_db_path(repo_root).is_file();
     match crate::live_index::frecency::collection_policy_from_env() {
         FrecencyCollectionPolicy::Disabled => "disabled by policy".to_string(),
         FrecencyCollectionPolicy::Session => {
@@ -5793,7 +5791,7 @@ impl SymForgeServer {
         if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
             && let Some(repo_root) = self.capture_repo_root()
             && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(
-                &repo_root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH),
+                &crate::live_index::frecency::frecency_db_path(&repo_root),
             )
         {
             let now_ts = std::time::SystemTime::now()
@@ -12073,10 +12071,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            !repo
-                .path()
-                .join(crate::paths::SYMFORGE_FRECENCY_DB_PATH)
-                .exists(),
+            !crate::live_index::frecency::frecency_db_path(repo.path()).exists(),
             "ambiguous selector must not bump frecency for an arbitrary first candidate"
         );
     }
@@ -14317,7 +14312,7 @@ mod tests {
     async fn test_search_files_path_cochange_env_unset_missing_store_reports_preparing() {
         let _env = EnvVarGuard::remove("SYMFORGE_COUPLING");
         let repo = init_git_repo();
-        let db_path = repo.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
         assert!(!db_path.exists(), "test starts without a coupling store");
         let server = make_server_with_root(
             make_live_index_ready(vec![
@@ -14358,7 +14353,7 @@ mod tests {
     async fn test_search_files_path_cochange_disabled_policy_reports_disabled() {
         let _env = EnvVarGuard::set("SYMFORGE_COUPLING", "disabled");
         let repo = init_git_repo();
-        let db_path = repo.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
         let server = make_server_with_root(
             make_live_index_ready(vec![
                 make_file("src/auth/routes.rs", b"fn auth_routes() {}", vec![]),
@@ -14506,7 +14501,7 @@ mod tests {
     async fn test_search_files_path_cochange_corrupt_store_reports_unavailable() {
         let _env = EnvVarGuard::remove("SYMFORGE_COUPLING");
         let repo = init_git_repo();
-        let db_path = repo.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"not sqlite").unwrap();
         let server = make_server_with_root(
@@ -16236,7 +16231,7 @@ mod tests {
             "src/lib.rs",
             "fn present() {\n    println!(\"old\");\n}\n",
         )]);
-        let db_path = _dir.path().join(".symforge").join("analytics.db");
+        let db_path = crate::paths::symforge_db_path(_dir.path(), crate::paths::ANALYTICS_DB_NAME);
         let store = AnalyticsStore::open(AnalyticsConfig::enabled(&db_path)).unwrap();
         server.set_analytics_recorder_for_tests(AnalyticsRecorder::start(
             store,

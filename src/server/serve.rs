@@ -360,24 +360,18 @@ fn build_serve_runtime(
     // observes exactly the rows the dispatcher wrote — surviving restart.
     let runtime_store = ledger_store.map(|store| (*store).clone());
 
-    // 006 G-039: open the hashed product API-key store under the same data dir.
-    // On failure it degrades to `Disabled` (bootstrap --api-key still works).
+    // 006 G-039: open the hashed product API-key store under the project ROOT.
+    // `ApiKeyStore::open` routes the path through `paths::symforge_db_path`, the
+    // single `.symforge` prefix owner, landing the db at `root/.symforge/api-keys.db`
+    // and creating the parent `.symforge` dir on demand. Pass the ROOT (NOT the
+    // `.symforge` data dir): passing the data dir here was the D7 double-prefix bug
+    // (`root/.symforge/.symforge/api-keys.db`, shipped in 8.5.0). On any failure it
+    // degrades to `Disabled` INSIDE `open` (bootstrap --api-key still works).
     // Shared by Arc into both the auth layer (minted keys authenticate at /mcp)
     // and the admin /api/v1/keys handlers.
-    let key_store: Option<Arc<ApiKeyStore>> =
-        repo_root
-            .as_ref()
-            .and_then(|root| match crate::paths::ensure_symforge_dir(root) {
-                Ok(dir) => Some(Arc::new(ApiKeyStore::open(&dir))),
-                Err(error) => {
-                    tracing::warn!(
-                        root = %root.display(),
-                        %error,
-                        "could not ensure symforge data dir; API-key store unavailable"
-                    );
-                    None
-                }
-            });
+    let key_store: Option<Arc<ApiKeyStore>> = repo_root
+        .as_ref()
+        .map(|root| Arc::new(ApiKeyStore::open(root)));
 
     let mut runtime = ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store);
     if let Some(store) = key_store {

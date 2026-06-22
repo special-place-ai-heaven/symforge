@@ -212,8 +212,12 @@ pub struct SymForgeServer {
 
 fn default_analytics_db_path(repo_root: Option<&Path>) -> PathBuf {
     repo_root
-        .map(|root| root.join(crate::paths::SYMFORGE_ANALYTICS_DB_PATH))
-        .unwrap_or_else(|| PathBuf::from(crate::paths::SYMFORGE_ANALYTICS_DB_PATH))
+        .map(|root| crate::paths::symforge_db_path(root, crate::paths::ANALYTICS_DB_NAME))
+        // No project root: fall back to a relative `.symforge/analytics.db`,
+        // byte-identical to the prior `PathBuf::from(SYMFORGE_ANALYTICS_DB_PATH)`.
+        .unwrap_or_else(|| {
+            Path::new(crate::paths::SYMFORGE_DIR_NAME).join(crate::paths::ANALYTICS_DB_NAME)
+        })
 }
 
 fn disabled_analytics_recorder(repo_root: Option<&Path>) -> crate::analytics::AnalyticsRecorder {

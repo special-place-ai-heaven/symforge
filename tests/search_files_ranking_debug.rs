@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::{AnchorKey, CouplingRow, CouplingStore};
 use symforge::live_index::frecency::FrecencyStore;
-use symforge::paths::{SYMFORGE_COUPLING_DB_PATH, SYMFORGE_FRECENCY_DB_PATH};
+use symforge::paths::{COUPLING_DB_NAME, FRECENCY_DB_NAME, symforge_db_path};
 use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
@@ -114,7 +114,7 @@ impl Fixture {
     }
 
     fn frecency_store(&self) -> FrecencyStore {
-        FrecencyStore::open(&self.root.join(SYMFORGE_FRECENCY_DB_PATH))
+        FrecencyStore::open(&symforge_db_path(&self.root, FRECENCY_DB_NAME))
             .expect("open frecency store")
     }
 }
@@ -149,8 +149,8 @@ fn init_git_repo(root: &Path) -> String {
 }
 
 fn seed_ready_coupling(root: &Path, head: &str) {
-    let store =
-        CouplingStore::open(&root.join(SYMFORGE_COUPLING_DB_PATH)).expect("open coupling store");
+    let store = CouplingStore::open(&symforge_db_path(root, COUPLING_DB_NAME))
+        .expect("open coupling store");
     store.set_last_head(head).expect("set last head");
     store
         .set_cold_built_at(1_700_000_000)

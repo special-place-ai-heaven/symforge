@@ -84,7 +84,7 @@ fn init_git_repo_with_workspace() -> TempDir {
 fn env_unset_startup_does_not_create_missing_coupling_store() {
     let _env = EnvGuard::remove("SYMFORGE_COUPLING");
     let tmp = init_git_repo_with_workspace();
-    let db_path = tmp.path().join(symforge::paths::SYMFORGE_COUPLING_DB_PATH);
+    let db_path = symforge::paths::symforge_db_path(tmp.path(), symforge::paths::COUPLING_DB_NAME);
 
     let shared = LiveIndex::load(tmp.path()).unwrap();
 
@@ -99,7 +99,7 @@ fn env_unset_startup_does_not_create_missing_coupling_store() {
 fn env_unset_startup_opens_existing_ready_coupling_store_without_warm_build() {
     let _env = EnvGuard::remove("SYMFORGE_COUPLING");
     let tmp = init_git_repo_with_workspace();
-    let db_path = tmp.path().join(symforge::paths::SYMFORGE_COUPLING_DB_PATH);
+    let db_path = symforge::paths::symforge_db_path(tmp.path(), symforge::paths::COUPLING_DB_NAME);
     let store = CouplingStore::open(&db_path).unwrap();
     let head = symforge::git::head_sha(tmp.path()).unwrap();
     store.set_last_head(&head).unwrap();

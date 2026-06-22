@@ -24,10 +24,14 @@ use serde::Serialize;
 use super::types::StelLedgerEvent;
 
 // ---------------------------------------------------------------------------
-// DB path constant (mirrors SYMFORGE_ANALYTICS_DB_PATH in paths.rs)
+// DB path
 // ---------------------------------------------------------------------------
-
-pub const SYMFORGE_STEL_LEDGER_DB_PATH: &str = ".symforge/stel-ledger.db";
+//
+// The bare db filename lives in `paths::STEL_LEDGER_DB_NAME`; the on-disk path is
+// built exclusively through `paths::symforge_db_path`, the single `.symforge`
+// prefix owner (D1-ROOT). There is no `.symforge/`-prefixed const here anymore:
+// the old `SYMFORGE_STEL_LEDGER_DB_PATH = ".symforge/stel-ledger.db"` hand-rolled
+// the prefix, which is exactly the foot-gun the helper removes.
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -317,20 +321,22 @@ impl StelLedgerStore {
     /// migration, set WAL + busy timeout. On any failure returns `Disabled`
     /// (logged, never panics) — FR-011.
     ///
-    /// `root` is the project ROOT, not the `.symforge` data dir: this joins the
-    /// `.symforge/`-prefixed [`SYMFORGE_STEL_LEDGER_DB_PATH`] against it itself,
-    /// matching every other store (analytics/coupling/frecency join their
-    /// prefixed const against the project root). The parent `.symforge` dir is
-    /// created on demand by [`SqliteStelLedgerStore::open`] (SQLite will NOT
-    /// create it). Passing the already-`.symforge` data dir here would double the
-    /// prefix to `root/.symforge/.symforge/...`.
+    /// `root` is the project ROOT, not the `.symforge` data dir: the path is
+    /// built via [`crate::paths::symforge_db_path`] (the single `.symforge` prefix
+    /// owner) with the BARE [`crate::paths::STEL_LEDGER_DB_NAME`], landing the db
+    /// at `root/.symforge/stel-ledger.db` — the same path as before, now routed
+    /// through the shared helper so it can never be hand-rolled and doubled
+    /// (D1-ROOT). The parent `.symforge` dir is created on demand by
+    /// [`SqliteStelLedgerStore::open`] (SQLite will NOT create it). Passing the
+    /// already-`.symforge` data dir here would double the prefix to
+    /// `root/.symforge/.symforge/...`.
     ///
     /// Migration note: any pre-fix doubled-path data at
     /// `root/.symforge/.symforge/stel-ledger.db` is orphaned, not migrated —
     /// economics rows are best-effort calibration input (pre-1.0), so a one-time
     /// reset of unpromoted, never-surfaced data is acceptable.
     pub fn open(root: &Path, session_id: impl Into<String>) -> Self {
-        let db_path = root.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+        let db_path = crate::paths::symforge_db_path(root, crate::paths::STEL_LEDGER_DB_NAME);
         match SqliteStelLedgerStore::open(&db_path, session_id) {
             Ok(store) => Self::Sqlite(store),
             Err(err) => {
@@ -984,6 +990,38 @@ mod tests {
             cache_hit: None,
             degrade_flags: vec![],
         }
+    }
+
+    /// D1-ROOT regression: `StelLedgerStore::open` takes the project ROOT (the
+    /// production convention used by `main.rs`) and lands the db at the SINGLE
+    /// prefixed `root/.symforge/stel-ledger.db` via `paths::symforge_db_path`. The
+    /// doubled `root/.symforge/.symforge/stel-ledger.db` must never be produced.
+    /// This is the on-disk check that the old per-store tests skipped (they passed
+    /// a different arg than production), which is how the D1/D7 class hid.
+    #[test]
+    fn open_writes_single_prefixed_db_path_not_doubled() {
+        use crate::paths::{STEL_LEDGER_DB_NAME, SYMFORGE_DIR_NAME};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let store = StelLedgerStore::open(root, "sess-d1root");
+        store.record(&sample_event("p-d1root"));
+
+        let single = root.join(SYMFORGE_DIR_NAME).join(STEL_LEDGER_DB_NAME);
+        let doubled = root
+            .join(SYMFORGE_DIR_NAME)
+            .join(SYMFORGE_DIR_NAME)
+            .join(STEL_LEDGER_DB_NAME);
+        assert!(
+            single.is_file(),
+            "stel ledger db must be written to the single-prefixed {}",
+            single.display()
+        );
+        assert!(
+            !doubled.exists(),
+            "stel ledger db must NOT be written to the doubled {}",
+            doubled.display()
+        );
     }
 
     #[test]

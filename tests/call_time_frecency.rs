@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::frecency::{self, FRECENCY_FLAG_ENV, FrecencyStore};
-use symforge::paths::SYMFORGE_FRECENCY_DB_PATH;
+use symforge::paths::{FRECENCY_DB_NAME, symforge_db_path};
 use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
@@ -61,7 +61,7 @@ impl Fixture {
     }
 
     fn db_path(&self) -> PathBuf {
-        self.root.join(SYMFORGE_FRECENCY_DB_PATH)
+        symforge_db_path(&self.root, FRECENCY_DB_NAME)
     }
 
     fn open_store(&self) -> FrecencyStore {

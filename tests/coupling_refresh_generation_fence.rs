@@ -80,9 +80,8 @@ fn stale_refresh_aborts_pre_flight() {
     let rejected_before = shared.current_rejected_stale_mutations();
     shared.reload(root_b.path()).unwrap();
 
-    let db_path = root_a
-        .path()
-        .join(symforge::paths::SYMFORGE_COUPLING_DB_PATH);
+    let db_path =
+        symforge::paths::symforge_db_path(root_a.path(), symforge::paths::COUPLING_DB_NAME);
     assert!(
         !db_path.exists(),
         "test setup must start without a coupling db"
@@ -112,7 +111,7 @@ fn current_refresh_proceeds_normally() {
     let shared = LiveIndex::empty();
     let expected_gen = shared.current_project_generation();
     let rejected_before = shared.current_rejected_stale_mutations();
-    let db_path = root.path().join(symforge::paths::SYMFORGE_COUPLING_DB_PATH);
+    let db_path = symforge::paths::symforge_db_path(root.path(), symforge::paths::COUPLING_DB_NAME);
     assert!(
         !db_path.exists(),
         "test setup must start without a coupling db"

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::{AnchorKey, CouplingRow, CouplingStore};
 use symforge::live_index::frecency::FrecencyStore;
-use symforge::paths::{SYMFORGE_COUPLING_DB_PATH, SYMFORGE_FRECENCY_DB_PATH};
+use symforge::paths::{COUPLING_DB_NAME, FRECENCY_DB_NAME, symforge_db_path};
 use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
@@ -114,7 +114,7 @@ impl Fixture {
     }
 
     fn frecency_store(&self) -> FrecencyStore {
-        FrecencyStore::open(&self.root.join(SYMFORGE_FRECENCY_DB_PATH))
+        FrecencyStore::open(&symforge_db_path(&self.root, FRECENCY_DB_NAME))
             .expect("open frecency store")
     }
 }
@@ -232,8 +232,8 @@ fn git_worktree_add(indexed_root: &Path, worktree_root: &Path, branch: &str) {
 }
 
 fn seed_ready_coupling(root: &Path, head: &str) {
-    let store =
-        CouplingStore::open(&root.join(SYMFORGE_COUPLING_DB_PATH)).expect("open coupling store");
+    let store = CouplingStore::open(&symforge_db_path(root, COUPLING_DB_NAME))
+        .expect("open coupling store");
     store.set_last_head(head).expect("set last head");
     store
         .set_cold_built_at(1_700_000_000)
@@ -373,8 +373,8 @@ async fn health_reports_ready_and_stale_cochange_store_states() {
     let ready = call(&fx.server, "health", json!({})).await;
     assert_contains(&ready, "co-change: ready/current");
 
-    let stale_store =
-        CouplingStore::open(&fx.root.join(SYMFORGE_COUPLING_DB_PATH)).expect("open coupling store");
+    let stale_store = CouplingStore::open(&symforge_db_path(&fx.root, COUPLING_DB_NAME))
+        .expect("open coupling store");
     stale_store.set_last_head("stale-head").expect("stale head");
 
     let stale = call(&fx.server, "health", json!({})).await;
