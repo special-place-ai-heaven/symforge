@@ -551,3 +551,297 @@ fn recorded_event_survives_abrupt_drop_without_clean_shutdown() {
         .expect("samples");
     assert_eq!(samples.len(), 1, "survivor stays in the active population");
 }
+
+// ===========================================================================
+// User Story 1 (feature 013): durable ledger reaches stdio/embed
+// ===========================================================================
+//
+// T014 durable-surface dependency-shape guard, T015 cross-session accumulation
+// + degrade-to-Disabled, T016 transport parity, T017 frecency non-bump.
+//
+// IMPORTANT honesty note on T014 / embed reachability: the durable `ledger_store`
+// inner module is un-gated to `any(feature="server", feature="embed")` (T018),
+// AND the protocol field/builder/write-through are un-gated likewise (T019).
+// However the PARENT modules are server-gated at the crate root
+// (`src/lib.rs`: `#[cfg(feature="server")] pub mod stel;` and `pub mod protocol;`),
+// and `stel::{controller,executor,planner,edit_apply}` hard-import
+// `crate::protocol::{format,session,smart_query,result_status,tools}`. So genuine
+// embed reachability of the durable store is BLOCKED at `lib.rs` and is NOT
+// delivered by the anchored T018/T019 edits alone — it needs a structural split
+// (a protocol-free ledger seam, out of focused-US1 scope). The inner gates are
+// kept as intent-documentation; `--no-default-features --features embed --lib`
+// stays green because the dead-under-embed module is simply never compiled. This
+// test therefore pins the durable SURFACE SHAPE the SERVER stdio path (T020)
+// relies on — feature-independent enum, no server-only type leak — not an
+// embed-build reachability it cannot honestly claim today.
+
+// ---------------------------------------------------------------------------
+// T014 — durable-surface dependency-shape guard: the dir-entry `open` returns a
+// feature-independent `StelLedgerStore` enum (no server-only type), and a
+// `Disabled` variant the stdio degrade path holds. This is the shape the
+// stdio wiring (T020) attaches and the `lib.rs` un-gate would later need.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn durable_store_surface_is_feature_independent_no_server_only_types() {
+    // The dir-entry `open` is the seam the stdio wiring calls (T020). It returns
+    // the feature-independent `StelLedgerStore` enum — NOT a server-only type —
+    // so the inner un-gate to `any(server, embed)` (T018) carries no server
+    // dependency. A `Disabled` value is constructible directly, which is the
+    // in-memory degrade state the stdio path holds when open fails (FR-003).
+    let disabled = StelLedgerStore::Disabled;
+    assert!(disabled.schema_version().is_none());
+    assert!(disabled.summary().is_none());
+
+    // The subsystem-state mapping the status surface consumes is reachable from
+    // the same enum, with no server-only import — this is what the un-gated
+    // `durable_ledger_summary_for_status` reads on the stdio/embed path.
+    match disabled.subsystem_state() {
+        symforge::stel::ledger_store::LedgerSubsystemState::Disabled { reason } => {
+            assert!(!reason.is_empty(), "Disabled must carry a non-empty reason");
+        }
+        other => panic!("a Disabled store must map to Disabled{{reason}}, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T015 — cross-session accumulation across >= 3 restarts is cumulative /
+// monotonic (non-reset); a forced open failure yields a distinguishable
+// `Disabled`, never a panic or silent zero. (FR-001/FR-003/SC-003)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cross_session_accumulation_is_cumulative_across_restarts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // Simulate >= 3 process restarts: each "session" opens the SAME dir via the
+    // dir-entry `open` (exactly what the stdio bootstrap calls), records a
+    // distinct number of events, then drops the handle (process exit).
+    let per_session = [2_u64, 3, 4, 5];
+    let mut expected_total = 0_u64;
+    let mut last_seen_total = 0_u64;
+
+    for (session_idx, count) in per_session.iter().enumerate() {
+        let store = StelLedgerStore::open(dir, format!("stdio-sess-{session_idx}"));
+        // On reopen, the prior sessions' events must already be counted — the
+        // store is restored, NOT reset to zero.
+        let on_open = store
+            .summary()
+            .expect("a healthy reopened store reports a summary")
+            .total_events;
+        assert_eq!(
+            on_open, expected_total,
+            "session {session_idx} must observe the cumulative prior total on open (non-reset)"
+        );
+
+        for i in 0..*count {
+            store.record(&sample_event(&format!("s{session_idx}-e{i}")));
+        }
+        expected_total += *count;
+
+        let after = store
+            .summary()
+            .expect("summary after recording")
+            .total_events;
+        assert_eq!(
+            after, expected_total,
+            "in-session total must include new events"
+        );
+        // Monotonic: the total never decreased across the restart boundary.
+        assert!(
+            after >= last_seen_total,
+            "total_events must be monotonic across restarts: {after} < {last_seen_total}"
+        );
+        last_seen_total = after;
+        // Handle dropped here = process exit between sessions.
+    }
+
+    // Final independent reopen confirms the durable cumulative count survived
+    // every restart (SC-003: >= 3 restarts, cumulative, non-reset).
+    let final_store = StelLedgerStore::open(dir, "stdio-sess-final");
+    assert_eq!(
+        final_store.summary().expect("final summary").total_events,
+        expected_total,
+        "the durable total must survive all restarts cumulatively"
+    );
+}
+
+#[test]
+fn forced_open_failure_degrades_to_disabled_distinguishably_never_panics() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // Make the db path unopenable: pre-create the `.symforge` dir and write a
+    // DIRECTORY where the db FILE must live, so `Connection::open` fails. This is
+    // the "store cannot open" path (read-only FS / unwritable path analogue).
+    let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    std::fs::create_dir_all(&db_path).expect("create a dir at the db file path");
+
+    // The dir-entry open must NOT panic and must yield a distinguishable
+    // `Disabled` (the stdio/embed in-memory degrade, FR-003) — never a silent
+    // zero-count that masquerades as durable accumulation.
+    let store = StelLedgerStore::open(dir, "stdio-degrade");
+    assert!(
+        matches!(store, StelLedgerStore::Disabled),
+        "an unopenable db must degrade to Disabled, not serve"
+    );
+
+    // Distinguishable: subsystem_state names the failure; summary is None (no
+    // durable accumulation is claimed).
+    match store.subsystem_state() {
+        symforge::stel::ledger_store::LedgerSubsystemState::Disabled { reason } => {
+            assert!(!reason.is_empty(), "degraded store must report a reason");
+        }
+        other => panic!("a degraded store must be Disabled{{reason}}, got {other:?}"),
+    }
+    assert!(
+        store.summary().is_none(),
+        "a Disabled store must not present a (zero) durable summary as real"
+    );
+    // Recording into a Disabled store is a silent no-op, never a panic.
+    store.record(&sample_event("into-the-void"));
+}
+
+// ---------------------------------------------------------------------------
+// T016 — transport parity: one db, session-spanning. The SAME db opened under a
+// second session_id sees the cumulative cross-session count. (Principle VII)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_db_spans_sessions_transport_parity() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // Session A (e.g. the serve surface) records two events, then exits.
+    {
+        let store_a = StelLedgerStore::open(dir, "serve-1234");
+        store_a.record(&sample_event("a-0"));
+        store_a.record(&sample_event("a-1"));
+        assert_eq!(store_a.summary().unwrap().total_events, 2);
+    }
+
+    // Session B (e.g. the stdio surface) under a DIFFERENT session_id opens the
+    // SAME dir and must see A's events — there is ONE durable db, one
+    // session-spanning count. stdio and serve back onto the same store.
+    let store_b = StelLedgerStore::open(dir, "stdio-5678");
+    assert_eq!(
+        store_b.summary().unwrap().total_events,
+        2,
+        "a second session_id over the same db sees the cumulative prior count"
+    );
+    store_b.record(&sample_event("b-0"));
+
+    // The count is the union across both sessions, and the session_count reflects
+    // both distinct writers — proving the rows are co-located in one store.
+    let summary = store_b.summary().unwrap();
+    assert_eq!(summary.total_events, 3, "stdio + serve rows live in one db");
+    assert_eq!(
+        summary.session_count, 2,
+        "both session_ids contributed to the single session-spanning store"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T017 — recording a durable ledger event does NOT bump discovery/search
+// frecency. (Principle V)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recording_durable_event_does_not_bump_frecency() {
+    use symforge::live_index::frecency::FrecencyStore;
+
+    // A live frecency store (the discovery/search ranking subsystem). Snapshot
+    // its bump list BEFORE any ledger activity.
+    let frecency = FrecencyStore::open_in_memory().expect("open frecency store");
+    let before = frecency.last_10_bumps().expect("frecency snapshot before");
+    assert!(before.is_empty(), "fresh frecency store has no bumps");
+
+    // Record several durable ledger events. The STEL ledger store has NO
+    // dependency on `live_index`/frecency (Principle V), so this must not touch
+    // discovery ranking at all.
+    let store = StelLedgerStore::open_in_memory("sess-frecency").expect("ledger store");
+    for i in 0..5 {
+        store.record(&sample_event(&format!("ledger-{i}")));
+    }
+    assert_eq!(
+        store.summary().unwrap().total_events,
+        5,
+        "ledger events were recorded"
+    );
+
+    // Frecency is unchanged — recording ledger events bumped nothing.
+    let after = frecency.last_10_bumps().expect("frecency snapshot after");
+    assert_eq!(
+        before, after,
+        "recording durable ledger events must NOT bump discovery/search frecency"
+    );
+
+    // Control: a real frecency bump DOES change the snapshot, proving the
+    // assertion above can detect a bump (the test is not vacuously true).
+    frecency
+        .bump(&[std::path::PathBuf::from("src/lib.rs")], 1_718_000_000)
+        .expect("control bump");
+    let bumped = frecency
+        .last_10_bumps()
+        .expect("frecency snapshot after bump");
+    assert_ne!(
+        after, bumped,
+        "a genuine frecency bump must change the snapshot (control)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T022 — HTTP-sidecar coexistence / single-process two-opener WAL concurrency.
+// The local stdio path spawns an HTTP sidecar on the SAME project root
+// (main.rs:408-410) while it holds the durable `StelLedgerStore`. The sidecar
+// does NOT itself open `stel-ledger.db` (it shares only the in-memory
+// `LiveIndex` + `TokenStats`), so the R4 risk reduces to: can ONE process hold
+// two openers of the same db without contention or lost writes? WAL +
+// busy_timeout must make that safe. (R4; FR-001; Principle IV)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn single_process_two_openers_coexist_without_contention_or_lost_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // Opener A is the stdio durable store; opener B is a second handle on the
+    // SAME db file within the SAME process (the worst case the sidecar topology
+    // could ever approximate). Both are live simultaneously.
+    let store_a = StelLedgerStore::open(dir, "stdio-A");
+    let store_b = StelLedgerStore::open(dir, "second-opener-B");
+    assert!(
+        matches!(store_a, StelLedgerStore::Sqlite(_)),
+        "opener A must open cleanly (WAL)"
+    );
+    assert!(
+        matches!(store_b, StelLedgerStore::Sqlite(_)),
+        "a second concurrent opener on the same db must also open (WAL), not contend to Disabled"
+    );
+
+    // Interleave writes through BOTH handles — WAL + busy_timeout serialize the
+    // writers; no write is lost and no open degrades to Disabled.
+    for i in 0..10 {
+        store_a.record(&sample_event(&format!("a-{i}")));
+        store_b.record(&sample_event(&format!("b-{i}")));
+    }
+
+    // Both handles observe the FULL union (20 rows) — the WAL makes each writer's
+    // commits visible to the other, so neither opener has a stale/partial view.
+    let total_a = store_a.summary().expect("A summary").total_events;
+    let total_b = store_b.summary().expect("B summary").total_events;
+    assert_eq!(total_a, 20, "opener A must see all 20 interleaved writes");
+    assert_eq!(total_b, 20, "opener B must see all 20 interleaved writes");
+
+    // A fresh reopen after both handles drop confirms all 20 durably landed
+    // (no lost write across the two-opener interleave).
+    drop(store_a);
+    drop(store_b);
+    let reopened = StelLedgerStore::open(dir, "verify");
+    assert_eq!(
+        reopened.summary().expect("reopen summary").total_events,
+        20,
+        "all interleaved two-opener writes must be durable"
+    );
+}

@@ -24,7 +24,13 @@ pub mod gates;
 pub mod golden_replay;
 pub mod handler;
 pub mod ledger;
-#[cfg(feature = "server")]
+// Feature 013 US1 (T018): the durable STEL ledger reaches the stdio/embed
+// dispatch path, so the store module is reachable under `any(server, embed)`,
+// not server-only. This adds NO server/network dependency — `rusqlite`
+// (Cargo.toml) is an UNCONDITIONAL dep, so embed isolation (Principle VI) holds:
+// `cargo build --no-default-features --features embed --lib` stays green and
+// pulls in no axum/rmcp/reqwest. Sole owner of the embed-gating decision.
+#[cfg(any(feature = "server", feature = "embed"))]
 pub mod ledger_store;
 pub mod planner;
 pub mod status;

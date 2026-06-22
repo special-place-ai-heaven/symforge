@@ -415,13 +415,42 @@ async fn run_local_mcp_server_async(
     let token_stats = Some(Arc::clone(&sidecar_handle.token_stats));
 
     // Create MCP server and serve on stdio transport.
-    let server = protocol::SymForgeServer::new(
+    let mut server = protocol::SymForgeServer::new(
         Arc::clone(&index),
         project_name,
         watcher_info,
         watcher_root.clone(),
         token_stats,
     );
+
+    // Feature 013 US1 (T020): attach the durable STEL economics ledger on the
+    // LOCAL stdio path so predicted-vs-actual events accumulate ACROSS restarts
+    // (FR-001/SC-003), not just in serve mode. Mirrors `serve::build_serve_runtime`
+    // (serve.rs:324-354): open under the project's `.symforge` data dir; a
+    // dir/open failure logs and proceeds in-memory (degrade to `Disabled`,
+    // FR-003) so stdio never fails to start over a ledger problem. The
+    // `symforge` compact tool's `finalize_symforge_with_ledger` write-through
+    // then persists each economics row to this store. This brings stdio to
+    // parity with serve (Principle VII) for the durable backing.
+    if let Some(root) = watcher_root.as_ref() {
+        match symforge::paths::ensure_symforge_dir(root) {
+            Ok(dir) => {
+                let store = symforge::stel::ledger_store::StelLedgerStore::open(
+                    &dir,
+                    format!("stdio-{}", std::process::id()),
+                );
+                server = server.with_stel_ledger_store(Arc::new(store));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    %error,
+                    "could not ensure symforge data dir; STEL ledger will not persist on stdio"
+                );
+            }
+        }
+    }
+
     tracing::info!("starting MCP server on stdio transport");
     let service = serve_server(server, transport::stdio()).await?;
 
