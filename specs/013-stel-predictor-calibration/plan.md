@@ -57,12 +57,16 @@ specs/013-stel-predictor-calibration/
 ```text
 src/stel/
 ├── ledger_store.rs   # EXTEND: estimator_version tagging; bounded retention (closes P3-B, ledger_store.rs:39); tuned-constant persistence
-├── calibration.rs    # EXTEND: from observational summary -> CalibrationState machine + auto-tune candidate derivation + held-out validation
+├── calibration.rs    # EXTEND: from observational summary -> CalibrationVerdict machine + auto-tune candidate derivation + held-out validation
 ├── controller.rs     # WIRE: estimate_economics() reads tuned constants when in force (falls back to 400/800 + 45/80 floors)
 └── status.rs         # SURFACE: honest deferred/accumulating/tuned + before/after error in `status detail: full`
 
-src/server/serve.rs   # reference wiring (durable store already opened here)
-src/server/<stdio entry>  # WIRE: open + share the same Arc<StelLedgerStore> on the stdio/embed dispatch path (today it is in-memory only)
+src/stel/mod.rs       # UN-GATE: ledger_store #[cfg(server)] -> #[cfg(any(server,embed))] so the durable store reaches embed/stdio (rusqlite is unconditional; no server deps) [US1 T018]
+src/server/serve.rs   # reference wiring (durable store already opened here, serve.rs:324-355 — the ONLY with_stel_ledger_store call today)
+src/main.rs           # WIRE both stdio paths (today both build in-memory SessionLedger, stel_ledger_store=None):
+                      #   - local stdio (run_local_mcp_server_async): attach durable store at main.rs:418-424 [US1 T020]
+                      #   - DEFAULT daemon-backed stdio (new_daemon_proxy, main.rs:257): the operator's REAL deployment — durable
+                      #     open must reach the daemon WORKER dispatch, not just the proxy, or US1 is fake-green [US1 T021]
 
 tests/
 ├── stel_calibration_tuning.rs   # NEW: deterministic corpus replay — tuning reduces held-out error; rejects worse-than-baseline; reproducible
@@ -70,18 +74,21 @@ tests/
 └── surface_honesty.rs           # EXTEND: tuned/accumulating states stay honest (no tuned without artifact)
 ```
 
-**Structure Decision**: single-crate, in-place extension of the existing `stel` ledger + economics path. No new modules/abstractions beyond a `CalibrationState` type and a tuned-constants record; the durable store, WAL concurrency, non-blocking write, and Disabled-degrade machinery already exist and are reused.
+**Structure Decision**: single-crate, in-place extension of the existing `stel` ledger + economics path. No new modules/abstractions beyond a `CalibrationVerdict` type and a tuned-constants record; the durable store, WAL concurrency, non-blocking write, and Disabled-degrade machinery already exist and are reused.
 
 ## Phases
 
 - **Phase 0 — Research (this plan):** resolve the 4 `[NEEDS CLARIFICATION]` items -> [research.md](./research.md). Outcome: per-project scope; retention cap; estimator-version sample tagging; WAL concurrency confirmed.
-- **Phase 1 — Design:** entities + schema deltas -> [data-model.md](./data-model.md). The `CalibrationState` machine, `PredictionErrorSample` (estimator-version-tagged), `TunedEstimateConstants` (persisted + audited), and the L2 read path.
+- **Phase 1 — Design:** entities + schema deltas -> [data-model.md](./data-model.md). The `CalibrationVerdict` machine, `PredictionErrorSample` (estimator-version-tagged), `TunedEstimateConstants` (persisted + audited), and the L2 read path.
 - **Phase 2 — Tasks (`/tasks`, not produced here):** ordered, independently-testable tasks per user story (US1 persistence -> US2 auto-tune -> US3 honest surfacing), each gated by the verification commands above. US1 is the MVP slice (durable accumulation in stdio) and is shippable alone.
 
 ## Complexity Tracking
 
 No constitution violations; no added abstractions requiring justification. (Empty by design — reuse over new structure.)
 
-## Open decision for confirmation
+## Resolved decisions
 
-Phase 0 recommends **per-project** calibration (follows the existing per-project store location). If a single global calibration across all indexed repos is preferred instead, say so before `/tasks` — it changes the store location and the retention model. All other clarifications are resolved as engineering defaults in research.md.
+- **Per-project calibration — CONFIRMED** (user, 2026-06-22): the durable store already lives per project data dir and response-size distributions are codebase-specific, so a global pool would tune worse. All four spec clarifications are resolved in research.md.
+- **Durable store embed-reachability** (from the `/tasks` adversarial pass): the `ledger_store` module is un-gated from `#[cfg(server)]` to `#[cfg(any(server, embed))]` so FR-001's stdio/embed durability holds, without pulling any server/network crate into embed (rusqlite is unconditional). Owner: US1 T018.
+- **Daemon-default deployment** (from the `/tasks` adversarial pass): the operator's real stdio is daemon-backed (`new_daemon_proxy`), so US1 must reach the daemon WORKER dispatch (T021), not only the `SYMFORGE_NO_DAEMON` local path (T020) — else US1 is fake-green in the very environment the spec targets.
+- **SC-002 margin**: set in research.md (R5) and asserted by US2 T024/T029.

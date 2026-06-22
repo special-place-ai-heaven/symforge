@@ -37,9 +37,11 @@ The calibrated replacements for the static floors, plus the evidence that justif
 
 **In-force rule**: `estimate_economics` (`controller.rs:319`) reads the active `TunedEstimateConstants` when present AND `estimator_version` matches current; otherwise falls back to the existing `400/800` + `45/80` floors. 010's byte-grounded path is unchanged — tuning corrects the FLOOR that applies when byte grounding is absent, and the schema/invoke constants.
 
-## Entity: CalibrationState
+## Entity: CalibrationVerdict
 
 The honest state machine surfaced on `status detail: full` and the opt-in full envelope. Replaces today's hard-coded `tuning_note` ("auto-tuning still deferred", `calibration.rs:74-80`).
+
+> **Name (collision avoided)**: this is a NEW type named `CalibrationVerdict` — NOT `CalibrationState`, which already exists at `types.rs:344` as an inert per-tool EMA struct. It lives in `calibration.rs` and, like the durable store, is reachable under `any(feature="server", feature="embed")` (rusqlite is an unconditional dep; no server/network stack enters embed).
 
 ```text
 Deferred                       # no/insufficient samples for current estimator_version
@@ -59,10 +61,10 @@ Deferred                       # no/insufficient samples for current estimator_v
 
 ## Internal contract (no external API change)
 
-This feature adds no MCP tool and no public schema. The internal seams:
+This feature adds no new public schema. The only MCP-surface change is the FR-011 operator reset/clear, exposed as a MODE/param on an existing tool (constitution II, MCP-native — `SYMFORGE_TOOL_NAMES` kept in sync), never injected context. The internal seams:
 
 - `calibration.rs`: `derive_tuning_candidate(samples) -> Option<TunedEstimateConstants>` and `validate_candidate(candidate, held_out) -> bool` (held-out MAE must drop). Pure + deterministic (FR-012) -> unit-testable on a fixed corpus without a live store.
 - `ledger_store.rs`: `samples_for_estimator(version, limit)`, `load_active_tuning()`, `store_active_tuning(constants)` (audited), plus retention in `record`.
 - `controller.rs`: `estimate_economics` consults `load_active_tuning()` (cheap, cached) before applying the static floor.
 
-The `surface_honesty` test corpus (010) is extended to assert every `CalibrationState` renders honestly; `stel_calibration_tuning.rs` asserts the held-out-error-reduction and worse-than-baseline-rejection on a deterministic fixture corpus; `stel_ledger_persistence.rs` asserts cross-restart accumulation and bounded retention.
+The `surface_honesty` test corpus (010) is extended to assert every `CalibrationVerdict` renders honestly; `stel_calibration_tuning.rs` asserts the held-out-error-reduction and worse-than-baseline-rejection on a deterministic fixture corpus; `stel_ledger_persistence.rs` asserts cross-restart accumulation and bounded retention.

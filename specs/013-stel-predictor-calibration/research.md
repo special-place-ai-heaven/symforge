@@ -40,3 +40,17 @@ Resolves the four `[NEEDS CLARIFICATION]` items from [spec.md](./spec.md). Each 
 - The result is still an estimate: tuned constants replace the static floor, but the served figure stays `(est.)` (FR-010). Grounding in history is not measurement.
 - Tuning is deterministic given a fixed corpus (FR-012) -> the held-out validation and tests are stable; same events in, same constants out.
 - Tuning never touches routing/policy/safety (FR-007); only `estimate_economics` reads the tuned constants, and only for token figures.
+
+## R5 — SC-002 numeric margin
+
+**Decision: tuned constants must reduce held-out mean absolute prediction error (MAE) by >= 20% (relative) versus the static `400/800` + `45/80` floors on a biased corpus; and must NOT increase held-out MAE on an unbiased corpus.** This is the "meaningful margin" SC-002 left to `/plan`.
+
+**Rationale**: dogfood observed predictor errors of 40-194% against actuals, so a calibration worth shipping should close a real fraction of that, not a rounding-error sliver. 20% relative MAE reduction is a defensible, deterministic, testable bar (the corpus is fixed, FR-012) that is well above noise yet not so aggressive it over-fits a small sample. US2's accept-path test (`tests/stel_calibration_tuning.rs`, task T024/T029) asserts this specific margin, not merely "strictly drops"; the reject gate (FR-005) rejects any candidate below it. The threshold is a tunable const so it can be raised once real per-project data accrues.
+
+**Alternatives rejected**: "strictly reduces" (any improvement) — rejected: too weak, would ship a 0.5% gain as `tuned` and over-promote the surface. A fixed absolute token margin — rejected: not comparable across codebases of different size (R1 per-project).
+
+## R6 — Deployment reality: daemon-default + embed reachability
+
+**Decision: durability must reach BOTH the local stdio path AND the default daemon-backed stdio worker; the durable store is embed-reachable via `any(server, embed)`.**
+
+**Rationale**: the operator's default stdio deployment is daemon-backed (`run_remote_mcp_server_async` -> `new_daemon_proxy`, main.rs:223/257); the daemon WORKER, not the proxy, executes tool calls. Wiring only the `SYMFORGE_NO_DAEMON` local path (main.rs:418) would pass US1's local test while the operator's real sessions still reset — fake-green against FR-001/SC-001/SC-003. So US1 owns both paths (T020 local, T021 daemon worker). Separately, the `ledger_store` module is `#[cfg(server)]` today, so the durable store does not exist in embed; FR-001 requires stdio/embed durability, so it is un-gated to `any(server, embed)`. rusqlite is an unconditional dependency (Cargo.toml), so this pulls in no server/network stack — Principle VI (embed isolation) holds.
