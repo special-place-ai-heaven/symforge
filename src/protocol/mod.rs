@@ -189,12 +189,18 @@ pub struct SymForgeServer {
     /// Bounded analytics queue. Disabled by default until an explicit local
     /// analytics configuration installs an enabled recorder.
     pub(crate) analytics_recorder: Arc<RwLock<crate::analytics::AnalyticsRecorder>>,
-    /// Durable STEL L4 economics ledger (US3). `None` on stdio/embed (no
-    /// persistence); `Some` only when `serve::run` wires the opened store in.
-    /// The same `Arc` is shared with `ServerRuntime` so there is exactly one
-    /// durable ledger path (no economics double-count). When `Some` it may be
-    /// [`crate::stel::ledger_store::StelLedgerStore::Disabled`] if the DB could
-    /// not open — write-through then degrades to a logged no-op (FR-011).
+    /// Durable STEL L4 economics ledger. `Some` when `serve::run` (US3) or the
+    /// stdio/daemon-proxy bootstrap (US1 T020/T021) wires the opened store in;
+    /// `None` otherwise. The same `Arc` is shared with `ServerRuntime` so there
+    /// is exactly one durable ledger path (no economics double-count). When
+    /// `Some` it may be [`crate::stel::ledger_store::StelLedgerStore::Disabled`]
+    /// if the DB could not open — write-through then degrades to a logged no-op
+    /// (FR-011).
+    ///
+    /// Server-gated: embed durability is DEFERRED — `protocol` is crate-root
+    /// server-gated (`src/lib.rs`), so an `any(server, embed)` cfg here would be
+    /// dead under embed. Reaching the store from embed needs a structural
+    /// protocol-free seam (out of US1 scope; spec FR-001 note).
     #[cfg(feature = "server")]
     pub(crate) stel_ledger_store: Option<Arc<crate::stel::ledger_store::StelLedgerStore>>,
     /// In-flight durable-ledger write tracker (P2-3): lets `serve::run` drain
@@ -370,18 +376,19 @@ impl SymForgeServer {
     ///
     /// Maps the wired durable store's [`subsystem_state`] onto the
     /// feature-independent surface enum. Reports `Unavailable` when no store is
-    /// attached (stdio), `Disabled { reason }` for a wired-but-failing store
-    /// (open failed at startup or live query failed — N-3, never swallowed), and
-    /// `Durable` otherwise. On stdio/embed builds (`server` feature off) this is
-    /// a compile-time `Unavailable`.
+    /// attached, `Disabled { reason }` for a wired-but-failing store (open failed
+    /// at startup or live query failed — N-3, never swallowed), and `Durable`
+    /// otherwise. On embed builds (`server` feature off) this is a compile-time
+    /// `Unavailable`.
     ///
-    /// Reachability note (honest scope of N-3/FR-008): a durable store is wired
-    /// only by `server::serve::run` (the operator `/mcp` surface). The daemon
-    /// per-session runtime and the stdio local-fallback server leave
-    /// `stel_ledger_store: None`, so over the daemon-proxy `status` path this is
-    /// structurally `Unavailable` — truthfully so (no durable store is attached
-    /// there). The `Durable` vs `Disabled { reason }` distinction is observable
-    /// on the `serve` surface, where a store is actually attached.
+    /// Reachability note (honest scope of N-3/FR-008): a durable store is wired by
+    /// `server::serve::run` (the `/mcp` surface) AND by the stdio + daemon-proxy
+    /// bootstrap (US1 T020/T021). On the daemon-proxy `status` path the proxy
+    /// itself holds the store, so `status_stel_tool` overlays THIS value onto the
+    /// proxied worker body (`overlay_proxy_durable_ledger_line`) — the operator
+    /// sees the proxy's real `Durable`/`Disabled` state, not the storeless
+    /// worker's `unavailable` (013 US1 review fix, MAJOR 2). It stays
+    /// `Unavailable` only when no store is attached anywhere.
     ///
     /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
     #[cfg(feature = "server")]
@@ -1208,6 +1215,88 @@ mod tests {
         assert!(
             !server.daemon_degraded.load(Ordering::Relaxed),
             "successful proxy call should clear daemon_degraded"
+        );
+    }
+
+    /// Feature 013 US1 (T021): a daemon-PROXY server with a durable
+    /// `StelLedgerStore` attached records the `symforge` economics event through
+    /// to that store. This is the load-bearing invariant the daemon-default
+    /// stdio wiring relies on: in the operator's real (daemon-backed) deployment
+    /// the `symforge` compact tool — the ONLY ledger-recording tool — runs on
+    /// the PROXY (the daemon worker's `execute_tool_call` has no `symforge`
+    /// arm), so the durable store must be attached on the proxy path
+    /// (`run_remote_mcp_server_async`) for durable accumulation to work. Here a
+    /// fake daemon returns the served body for proxied primitives; the proxy
+    /// itself captures the economics and write-throughs to the attached store.
+    ///
+    /// We call `symforge_stel_handler` directly (the inner handler, below the
+    /// `SYMFORGE_SURFACE` facade gate) so the test needs no process-global env
+    /// mutation and is deterministic under the parallel harness.
+    #[tokio::test]
+    async fn daemon_proxy_with_durable_store_records_symforge_event_through() {
+        // Fake daemon returns a non-empty body for any proxied primitive so the
+        // serve path produces a real served body to finalize.
+        let (base_url, shutdown, _calls) =
+            spawn_fake_tool_server("references to cfg_if:\n  src/lib.rs:1").await;
+        let daemon_client = crate::daemon::DaemonSessionClient::new_for_test(
+            base_url,
+            "project-id".to_string(),
+            "session-id".to_string(),
+            "project-name".to_string(),
+        );
+
+        // Attach an in-memory durable store on the PROXY path — exactly what
+        // `run_remote_mcp_server_async` does (T021), just in-memory for the test.
+        let store = Arc::new(
+            crate::stel::ledger_store::StelLedgerStore::open_in_memory("stdio-daemon-test")
+                .expect("in-memory durable store"),
+        );
+        let server = SymForgeServer::new_daemon_proxy(daemon_client)
+            .with_stel_ledger_store(Arc::clone(&store));
+
+        // The proxy holds the store; durable accumulation starts at zero.
+        assert_eq!(store.summary().expect("summary").total_events, 0);
+
+        // Drive a real economics invocation through the inner handler (skips the
+        // env-gated facade). The proxy fetches the served body from the fake
+        // daemon, then captures + write-throughs the economics event.
+        let request = crate::stel::StelRequest {
+            query: "who references cfg_if".to_string(),
+            ..Default::default()
+        };
+        let _ = server
+            .symforge_stel_handler(&request)
+            .await
+            .expect("symforge_stel_handler dispatch");
+        let _ = shutdown.send(());
+
+        // The in-memory ledger recorded one event synchronously...
+        assert_eq!(
+            server.stel_ledger().lock().len(),
+            1,
+            "the proxy's in-memory ledger must record the event"
+        );
+
+        // ...and the DURABLE store on the proxy eventually holds it (the write is
+        // offloaded onto spawn_blocking — poll briefly). This is the T021 proof:
+        // durable accumulation works on the daemon-backed stdio path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let total = loop {
+            let total = store.summary().map(|s| s.total_events).unwrap_or(0);
+            if total >= 1 || std::time::Instant::now() >= deadline {
+                break total;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            total, 1,
+            "the durable store attached on the daemon-proxy path must record the symforge event"
+        );
+        let recent = store.recent(10).expect("recent durable rows");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].session_id, "stdio-daemon-test",
+            "the durable row carries the proxy store's session id"
         );
     }
 

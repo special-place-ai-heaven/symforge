@@ -321,23 +321,18 @@ fn build_serve_runtime(
     // so the opened handle can be shared with both the dispatcher and the
     // runtime. A failure here degrades to Disabled inside `StelLedgerStore::open`,
     // so the server still starts (FR-011).
-    let ledger_store: Option<Arc<StelLedgerStore>> =
-        repo_root
-            .as_ref()
-            .and_then(|root| match crate::paths::ensure_symforge_dir(root) {
-                Ok(dir) => Some(Arc::new(StelLedgerStore::open(
-                    &dir,
-                    format!("serve-{}", std::process::id()),
-                ))),
-                Err(error) => {
-                    tracing::warn!(
-                        root = %root.display(),
-                        %error,
-                        "could not ensure symforge data dir; STEL ledger will not persist"
-                    );
-                    None
-                }
-            });
+    // Open under the project ROOT: `StelLedgerStore::open` joins the
+    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
+    // dir on demand (matching analytics/coupling/frecency). Passing the already-
+    // `.symforge` data dir here would double the prefix
+    // (`root/.symforge/.symforge/...`). A dir/open failure degrades to `Disabled`
+    // INSIDE `open` (logged, never panics), so the server still starts (FR-011).
+    let ledger_store: Option<Arc<StelLedgerStore>> = repo_root.as_ref().map(|root| {
+        Arc::new(StelLedgerStore::open(
+            root,
+            format!("serve-{}", std::process::id()),
+        ))
+    });
 
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
     let mut protocol = SymForgeServer::new(

@@ -3057,6 +3057,51 @@ fn append_daemon_staleness_warning(mut proxied_health: String, frontend_version:
     proxied_health
 }
 
+/// Overlay the proxy's OWN durable-ledger state onto a `status detail:full` body
+/// proxied from the daemon worker (013 US1 review fix, MAJOR 2).
+///
+/// In the daemon-backed stdio default, `status` is proxied to the daemon WORKER,
+/// which has NO durable store wired — so its `detail:full` body always renders
+/// `durable_ledger: unavailable`. But the PROXY owns the durable store (attached
+/// in `main.rs`), and economics events accumulate THERE. The operator's one
+/// observability window must show the proxy's truth, not the worker's blind spot.
+///
+/// This replaces the worker's single `durable_ledger:` line with the proxy's own
+/// rendering of `proxy_state`. If the proxy ALSO has no store
+/// (`DurableLedgerState::Unavailable`), the line stays `unavailable` honestly —
+/// the overlay never invents a durable figure. When the worker body has no
+/// `durable_ledger:` line (a `detail:compact` response, or an older worker
+/// without the line), the body is returned unchanged — there is nothing to
+/// overlay.
+fn overlay_proxy_durable_ledger_line(
+    worker_body: String,
+    proxy_state: &crate::stel::DurableLedgerState,
+) -> String {
+    let replacement = crate::stel::format_durable_ledger_line(proxy_state);
+    let mut replaced = false;
+    let mut out_lines: Vec<String> = Vec::with_capacity(worker_body.lines().count() + 1);
+    for line in worker_body.lines() {
+        if line.starts_with("durable_ledger:") {
+            out_lines.push(replacement.clone());
+            replaced = true;
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        // No durable_ledger line in the worker body (compact detail / older
+        // worker): nothing to overlay, return the original untouched.
+        return worker_body;
+    }
+    let mut out = out_lines.join("\n");
+    // Preserve a trailing newline if the original body had one (joining lines
+    // drops it), so the overlay is byte-faithful apart from the swapped line.
+    if worker_body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 fn symbol_candidate_paths(index: &crate::live_index::store::LiveIndex, name: &str) -> Vec<String> {
     let mut candidates: Vec<String> = index
         .all_files()
@@ -8386,7 +8431,11 @@ impl SymForgeServer {
     }
 
     /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.
-    async fn symforge_stel_handler(
+    ///
+    /// `pub(crate)` so the durable-ledger proxy test (feature 013 US1 T021) can
+    /// drive the economics path directly, below the `SYMFORGE_SURFACE` facade
+    /// gate, without a process-global env mutation. Not a public API change.
+    pub(crate) async fn symforge_stel_handler(
         &self,
         request: &crate::stel::StelRequest,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
@@ -8839,6 +8888,17 @@ impl SymForgeServer {
         // is unreachable (degraded fallback, where `ensure_local_index` has
         // populated `self.index`).
         if let Some(result) = self.proxy_tool_call("status", &params.0).await {
+            // 013 US1 review fix (MAJOR 2): the daemon worker has no durable store,
+            // so its proxied `detail:full` body reads `durable_ledger: unavailable`
+            // — but THIS proxy owns the store and events accumulate here. Overlay
+            // the proxy's OWN durable-ledger line onto the worker body so the
+            // operator's status window shows reality, not the worker's blind spot.
+            // No-op for `detail:compact` (no durable_ledger line to replace), and
+            // honestly stays `unavailable` if this proxy also has no store.
+            let result = overlay_proxy_durable_ledger_line(
+                result,
+                &self.durable_ledger_summary_for_status(),
+            );
             // Mirror `health`: warn loudly if the daemon we proxied to runs an
             // older binary than this front-end.
             let body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
@@ -9447,6 +9507,191 @@ mod tests {
         let proxied = proxied_health_with_version("unknown");
         let out = super::append_daemon_staleness_warning(proxied.clone(), "7.18.1");
         assert_eq!(out, proxied);
+    }
+
+    // ── 013 US1 review fix (MAJOR 2): daemon-proxy durable-ledger overlay ─────
+
+    /// A faithful worker `status detail:full` body: rendered by a storeless
+    /// server (no `with_stel_ledger_store`), exactly as the daemon worker
+    /// produces it — so its `durable_ledger:` line reads `unavailable`.
+    fn worker_full_status_body() -> String {
+        let server = make_server(make_live_index_ready(vec![]));
+        server.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+        })
+    }
+
+    #[test]
+    fn overlay_replaces_worker_unavailable_with_proxy_durable_line() {
+        use crate::stel::{DurableLedgerState, DurableLedgerSummary};
+
+        // The worker (storeless) body claims `unavailable`...
+        let worker = worker_full_status_body();
+        assert!(
+            worker.contains("durable_ledger: unavailable"),
+            "precondition: storeless worker body must read unavailable:\n{worker}"
+        );
+
+        // ...but the proxy owns a real durable store, so the overlay must swap in
+        // the proxy's true accumulation figure and erase the worker's blind spot.
+        let overlaid = super::overlay_proxy_durable_ledger_line(
+            worker,
+            &DurableLedgerState::Durable(DurableLedgerSummary {
+                total_events: 9,
+                total_net_vs_manual: 123,
+                session_count: 2,
+            }),
+        );
+        assert!(
+            overlaid.contains("durable_ledger: events=9 net_vs_manual=123 sessions=2"),
+            "overlay must show the proxy's real durable figure:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("durable_ledger: unavailable"),
+            "the worker's unavailable line must be replaced, not kept:\n{overlaid}"
+        );
+        // Exactly ONE durable_ledger line survives (no duplication).
+        assert_eq!(
+            overlaid
+                .lines()
+                .filter(|l| l.starts_with("durable_ledger:"))
+                .count(),
+            1,
+            "overlay must leave exactly one durable_ledger line:\n{overlaid}"
+        );
+    }
+
+    #[test]
+    fn overlay_keeps_unavailable_when_proxy_also_has_no_store() {
+        use crate::stel::DurableLedgerState;
+
+        // Honest no-store-anywhere case: the overlay must NOT invent a figure.
+        let worker = worker_full_status_body();
+        let overlaid =
+            super::overlay_proxy_durable_ledger_line(worker, &DurableLedgerState::Unavailable);
+        assert!(
+            overlaid.contains("durable_ledger: unavailable"),
+            "no store anywhere -> stays unavailable:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("durable_ledger: events="),
+            "an unavailable overlay must present no accumulation figure:\n{overlaid}"
+        );
+    }
+
+    #[test]
+    fn overlay_is_noop_when_body_has_no_durable_ledger_line() {
+        use crate::stel::{DurableLedgerState, DurableLedgerSummary};
+
+        // A `detail:compact` worker body carries no durable_ledger line; the
+        // overlay must return it byte-for-byte unchanged (nothing to replace).
+        let compact = make_server(make_live_index_ready(vec![]))
+            .render_stel_status_body(&crate::stel::StelStatusRequest { detail: None });
+        assert!(
+            !compact.contains("durable_ledger:"),
+            "precondition: compact body has no durable_ledger line:\n{compact}"
+        );
+        let out = super::overlay_proxy_durable_ledger_line(
+            compact.clone(),
+            &DurableLedgerState::Durable(DurableLedgerSummary {
+                total_events: 1,
+                total_net_vs_manual: 0,
+                session_count: 1,
+            }),
+        );
+        assert_eq!(out, compact, "no durable_ledger line -> unchanged body");
+    }
+
+    /// End-to-end at the proxy boundary: a `new_daemon_proxy` server WITH a
+    /// durable store attached must compute a real `Durable` overlay state, and a
+    /// no-store proxy must stay `Unavailable`. This pins the exact value
+    /// `status_stel_tool` overlays onto the proxied worker body (no live daemon
+    /// needed — only the proxy's own store read is exercised).
+    #[test]
+    fn daemon_proxy_with_store_overlays_real_durable_line_no_store_stays_unavailable() {
+        use crate::stel::ledger_store::StelLedgerStore;
+        use crate::stel::{DurableLedgerState, StelStatusDetail, StelStatusRequest};
+
+        fn fake_proxy() -> SymForgeServer {
+            // A dead URL is fine: this test never hits the network — it only reads
+            // the proxy's OWN attached store, exactly as the overlay does.
+            let client = crate::daemon::DaemonSessionClient::new_for_test(
+                "http://127.0.0.1:1".to_string(),
+                "p".to_string(),
+                "s".to_string(),
+                "proj".to_string(),
+            );
+            SymForgeServer::new_daemon_proxy(client)
+        }
+
+        // (1) Proxy WITH a durable store: events accumulate here. The overlay
+        // state it contributes must be `Durable` with its real figures, and
+        // applying it to a worker body must erase `unavailable`.
+        let store = StelLedgerStore::open_in_memory("proxy-sess").expect("in-memory store");
+        store.record(&sample_durable_event());
+        store.record(&sample_durable_event());
+        let proxy = fake_proxy().with_stel_ledger_store(Arc::new(store));
+        let state = proxy.durable_ledger_summary_for_status();
+        match &state {
+            DurableLedgerState::Durable(summary) => {
+                assert_eq!(
+                    summary.total_events, 2,
+                    "proxy store must report its real accumulation"
+                );
+            }
+            other => panic!("a proxy WITH a store must be Durable, got {other:?}"),
+        }
+        let overlaid = super::overlay_proxy_durable_ledger_line(worker_full_status_body(), &state);
+        assert!(
+            overlaid.contains("durable_ledger: events=2"),
+            "proxy-backed status must show the proxy's real durable line:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("durable_ledger: unavailable"),
+            "proxy-backed status must NOT read unavailable:\n{overlaid}"
+        );
+
+        // (2) Proxy with NO store: must stay Unavailable (honest), and the
+        // overlay leaves the worker's unavailable line in place.
+        let bare = fake_proxy();
+        assert_eq!(
+            bare.durable_ledger_summary_for_status(),
+            DurableLedgerState::Unavailable,
+            "a no-store proxy must report Unavailable"
+        );
+        let bare_body = bare.render_stel_status_body(&StelStatusRequest {
+            detail: Some(StelStatusDetail::Full),
+        });
+        let bare_overlaid = super::overlay_proxy_durable_ledger_line(
+            bare_body,
+            &bare.durable_ledger_summary_for_status(),
+        );
+        assert!(
+            bare_overlaid.contains("durable_ledger: unavailable"),
+            "a no-store proxy stays unavailable after overlay:\n{bare_overlaid}"
+        );
+    }
+
+    /// A minimal STEL ledger event for proxy-store accumulation tests.
+    fn sample_durable_event() -> crate::stel::types::StelLedgerEvent {
+        use crate::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence};
+        crate::stel::types::StelLedgerEvent {
+            ts_ms: 1_718_000_000_000,
+            plan_id: "p-overlay".to_string(),
+            surface: "symforge".to_string(),
+            intent: IntentBucket::Trace,
+            decision: AdmissionDecision::Serve,
+            tools_called: vec!["find_references".to_string()],
+            predicted_response_tokens: 400,
+            actual_response_tokens: 380,
+            manual_baseline_tokens: 800,
+            net_vs_manual: 420,
+            equivalence: None,
+            route_confidence: RouteConfidence::Exact,
+            pff_bypass: None,
+            cache_hit: None,
+            degrade_flags: vec![],
+        }
     }
 
     #[test]
