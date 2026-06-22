@@ -666,7 +666,7 @@ impl DaemonState {
         &self,
         project_id: &str,
         request: &OpenProjectRequest,
-        _canonical_root: &Path,
+        canonical_root: &Path,
     ) -> anyhow::Result<OpenProjectResponse> {
         let session_id = format!(
             "session-{}",
@@ -674,22 +674,27 @@ impl DaemonState {
         );
         let now = SystemTime::now();
 
-        // Feature 012, Phase 0+1: intern the project's base FIRST, holding no
-        // other daemon lock (`intern_base_for_project` takes `projects` then
-        // `bases` with no overlap, both released before we proceed). This seeds
-        // the per-session working set below and keeps the `bases -> projects ->
-        // sessions` order: every subsequent lock here is acquired AFTER `bases`
-        // is released.
-        let base = self.intern_base_for_project(project_id);
-
+        // D17 (atomic open, fail-never): ensure the project EXISTS and register
+        // this session's id under a SINGLE `projects.write()` hold, so a
+        // concurrent `close_session` cannot reap the project in a
+        // check-then-register window. If a concurrent close removed it between
+        // `open_project_session`'s probe and here, RECOVER by reloading +
+        // activating under the held write lock (rare path; load-under-lock is
+        // acceptable and is what makes open fail-never) instead of bailing
+        // "was removed between check and session registration". Once our
+        // `session_ids` entry is in, close will not reap the project.
         let (project_name, canonical_root_text, session_count) = {
             let mut projects = self.projects.write();
-            let project = projects.get_mut(project_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "project {} was removed between check and session registration",
-                    project_id
-                )
-            })?;
+            if !projects.contains_key(project_id) {
+                let mut reloaded = ProjectInstance::load(canonical_root)?;
+                if reloaded.activation_state == ActivationState::Inactive {
+                    reloaded.activate();
+                }
+                projects.insert(project_id.to_string(), reloaded);
+            }
+            let project = projects
+                .get_mut(project_id)
+                .expect("project present: inserted above under this same write lock when absent");
             project.session_ids.insert(session_id.clone());
             (
                 project.project_name.clone(),
@@ -698,12 +703,17 @@ impl DaemonState {
             )
         };
 
-        // Seed the session's working set with ONE entry: the active project, its
-        // interned shared base, and an EMPTY overlay (Phase 1). INERT: no route
-        // reads it yet, and no path writes the overlay (no-overlay-writes
-        // invariant). If interning returned `None` (project vanished mid-open) the
-        // working set stays empty; `session_runtime` still resolves via
+        // Intern the base AFTER the project is guaranteed present and the session
+        // is registered. `bases -> projects -> sessions` order holds: `bases` is
+        // acquired (inside `intern_base_for_project`) only after the
+        // `projects.write()` above is released, never while another daemon lock is
+        // held. Our `session_ids` entry already pins the project, so it cannot
+        // vanish during interning. Seed the session's working set with ONE entry:
+        // the active project, its interned shared base, and an EMPTY overlay
+        // (Phase 1, no-overlay-writes invariant). If interning returns `None` the
+        // working set stays empty and `session_runtime` still resolves via
         // `active_project_id`, so behavior is unchanged.
+        let base = self.intern_base_for_project(project_id);
         let mut working_set = WorkingSet::new();
         if let Some(base) = base {
             working_set.add(project_id.to_string(), base);
@@ -4353,48 +4363,23 @@ mod tests {
                         private_path.clone()
                     };
 
-                    // PRE-EXISTING benign race (NOT a Feature 012 regression): the
-                    // fast path of `open_project_session` checks `projects` under a
-                    // read lock, drops it, then re-acquires write to register the
-                    // session; a concurrent `close_session` can remove the project
-                    // (its last session closed) in that window, so the open fails
-                    // loud with "was removed between check and session registration".
-                    // This `Err` (confirmed present in `HEAD` before this branch)
-                    // is fail-LOUD, not a deadlock or corruption, so it is OUTSIDE
-                    // this test's mandate (no deadlock / no panic on the new
-                    // `bases -> projects -> sessions` locks). We tolerate it with a
-                    // bounded retry; if every attempt loses the race we skip the
-                    // iteration. A genuine lock-order inversion would instead HANG
-                    // (caught at join) and never reach this branch.
-                    let mut opened = None;
-                    for _ in 0..16 {
-                        match state.open_project_session(OpenProjectRequest {
+                    // D17 (atomic open, fail-never): `open_project_session` now
+                    // ensures the project AND registers the session under a single
+                    // `projects.write()` hold (recovering by reload if a concurrent
+                    // `close_session` removed it), so the former "was removed between
+                    // check and session registration" race CANNOT occur. Open MUST
+                    // succeed under contention — a failure is a real regression, not
+                    // a tolerated benign race. (A lock-order inversion would instead
+                    // HANG at join and never reach this assert.)
+                    let opened = state
+                        .open_project_session(OpenProjectRequest {
                             project_root: root.clone(),
                             client_name: "stress".to_string(),
                             pid: Some((t * 1000 + i) as u32),
-                        }) {
-                            Ok(resp) => {
-                                opened = Some(resp);
-                                break;
-                            }
-                            // Only the known open-vs-close race is tolerated; any
-                            // other error is a real failure and must surface.
-                            Err(err) => {
-                                let msg = err.to_string();
-                                assert!(
-                                    msg.contains(
-                                        "was removed between check and session registration"
-                                    ),
-                                    "unexpected open failure under contention: {msg}"
-                                );
-                                std::thread::yield_now();
-                            }
-                        }
-                    }
-                    let Some(opened) = opened else {
-                        // Lost the benign race on every attempt this iteration.
-                        continue;
-                    };
+                        })
+                        .expect(
+                            "open_project_session must succeed under contention (D17 fail-never)",
+                        );
 
                     // Hot read path: resolves the active project via the new field.
                     // (May be `None` if a concurrent close already tore the project
