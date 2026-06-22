@@ -125,6 +125,10 @@ async function runRepoBatch(corpusDirPath, tasks) {
       ...process.env,
       RUST_LOG: "off",
       SYMFORGE_SURFACE: "compact",
+      // The trust envelope is COMPACT by default and drops the per-call
+      // economics lines (`decision:`, `predicted:`, `ledger:`) this spike
+      // regex-parses. Force the FULL block so the economics measurement is real.
+      SYMFORGE_STEL_FULL: "1",
       SYMFORGE_NO_DAEMON: "1",
     },
   });

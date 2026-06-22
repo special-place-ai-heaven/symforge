@@ -144,6 +144,9 @@ fn row(anchor: &str, partner: &str, shared: u32, weighted: f64) -> CouplingRow {
 async fn run_find(server: &SymForgeServer, query: &str) -> String {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: this suite verifies the `── stel ──` header
+    // and the per-step economics, which the (now default) compact one-liner omits.
+    let _full = stel_surface_env::force_full_stel_envelope();
     let request = symforge::stel::StelRequest {
         query: query.to_string(),
         intent: None,
@@ -363,6 +366,9 @@ async fn fused_find_is_deterministic() {
 async fn run_find_outcome(server: &SymForgeServer, query: &str) -> String {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: this suite verifies the `── stel ──` header
+    // and the per-step economics, which the (now default) compact one-liner omits.
+    let _full = stel_surface_env::force_full_stel_envelope();
     let request = symforge::stel::StelRequest {
         query: query.to_string(),
         intent: None,

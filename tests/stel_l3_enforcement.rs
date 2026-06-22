@@ -87,6 +87,9 @@ async fn pff_golden_rows_bypass_without_legacy_tool_execution() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L3 enforcement asserts the `── stel ──`
+    // header, `decision: bypass|serve`, and validator-strict full contract.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let pff_ids = [
@@ -157,6 +160,9 @@ async fn serve_golden_row_still_executes_legacy_tool() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L3 enforcement asserts the `── stel ──`
+    // header, `decision: bypass|serve`, and validator-strict full contract.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");

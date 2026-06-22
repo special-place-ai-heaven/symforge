@@ -135,6 +135,9 @@ async fn serve_row_records_ledger_with_legacy_execution() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L4 ledger tests parse the `ledger:` line,
+    // which exists only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");
@@ -166,6 +169,9 @@ async fn pff_row_records_ledger_without_legacy_execution() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L4 ledger tests parse the `ledger:` line,
+    // which exists only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/pff_whole_lib");
@@ -199,6 +205,9 @@ async fn serve_invocation_writes_through_to_durable_store() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L4 ledger tests parse the `ledger:` line,
+    // which exists only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");
@@ -252,6 +261,9 @@ async fn durable_write_is_offloaded_off_the_request_path() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L4 ledger tests parse the `ledger:` line,
+    // which exists only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");
@@ -299,6 +311,9 @@ async fn serve_without_durable_store_keeps_in_memory_ledger_only() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: L4 ledger tests parse the `ledger:` line,
+    // which exists only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let row = row_by_id(&rows, "cfg-if/t4_refs");

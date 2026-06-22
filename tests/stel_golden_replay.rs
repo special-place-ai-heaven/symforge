@@ -147,6 +147,10 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: the replay validators assert the full
+    // contract (`── stel ──`, `decision: serve|bypass`, `ledger:`), which the
+    // live serve path generates only in full mode.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let exit_rows = stel::s4_exit_rows(&rows);
@@ -157,6 +161,10 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
 async fn multi_hop_golden_rows_replay_on_compact_symforge() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: the replay validators assert the full
+    // contract (`── stel ──`, `decision: serve|bypass`, `ledger:`), which the
+    // live serve path generates only in full mode.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let mut missing = Vec::new();
@@ -225,6 +233,10 @@ async fn supported_serve_rows_replay_with_envelope_and_ledger() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: the replay validators assert the full
+    // contract (`── stel ──`, `decision: serve|bypass`, `ledger:`), which the
+    // live serve path generates only in full mode.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let serve_rows: Vec<_> = stel::supported_serve_rows(&rows)
@@ -247,6 +259,10 @@ async fn supported_pff_rows_bypass_without_legacy_execution() {
 
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: the replay validators assert the full
+    // contract (`── stel ──`, `decision: serve|bypass`, `ledger:`), which the
+    // live serve path generates only in full mode.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let pff_rows: Vec<_> = stel::supported_pff_rows(&rows)

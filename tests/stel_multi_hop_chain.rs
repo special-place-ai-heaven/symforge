@@ -40,6 +40,9 @@ fn server_for_corpus(relative: &str, project: &str) -> SymForgeServer {
 async fn multi_hop_chain_rejects_when_inner_step_fails() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
+    // Force the FULL trust envelope: the chain regression asserts `decision:
+    // serve|reject` lines that appear only in the full block.
+    let _full = stel_surface_env::force_full_stel_envelope();
 
     let corpus = repo_root().join("tests/fixtures/stel_multi_hop/cfg-if-rust");
     assert!(

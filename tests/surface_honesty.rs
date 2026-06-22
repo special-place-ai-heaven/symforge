@@ -22,10 +22,26 @@ use symforge::stel::{
     metrics_for_decision, plan_summary_line, summarize_calibration,
 };
 
+// Shared env guard: `force_full_stel_envelope` opts these honesty regressions
+// back into the FULL trust envelope (the live default is now COMPACT). The
+// module carries `#![allow(unsafe_code)]` and an RAII restore-on-drop guard; the
+// suite runs `--test-threads=1`, so there is no cross-test env bleed.
+#[path = "support/stel_surface_env.rs"]
+mod stel_surface_env;
+
 /// Build the trust envelope exactly as the live `symforge` handler does, using
 /// the real planner + L2 controller (so the `400/800`-derived heuristic figures
 /// flow through unmodified) and a gross session running total.
+///
+/// Forces the FULL envelope: this exercises the live env-gated path and the
+/// honesty assertions target the full block, which compact (the new default)
+/// omits by design. The render runs on the live env-gated path, so it holds
+/// `COMPACT_ENV_LOCK` for the env-mutation window — deterministic even without
+/// `--test-threads=1`. The env guard and lock drop together once the (now
+/// immutable) `String` is captured for assertion.
 fn render_live_envelope(query: &str, session_tokens_served: i64) -> String {
+    let _env_lock = stel_surface_env::COMPACT_ENV_LOCK.blocking_lock();
+    let _full = stel_surface_env::force_full_stel_envelope();
     let request = symforge::stel::StelRequest {
         query: query.to_string(),
         ..Default::default()
@@ -112,6 +128,12 @@ fn envelope_calibration_is_deferred_not_pending() {
 #[test]
 fn rejected_decision_never_prints_a_positive_saving() {
     // TR-11: a positive predicted net on a reject must not read as a saving.
+    // This asserts the FULL block (`n/a (rejected) vs manual`), so force full —
+    // the compact default omits the per-call comparison. Live env-gated path, so
+    // hold `COMPACT_ENV_LOCK` for the env-mutation window (deterministic even
+    // without `--test-threads=1`); lock + env guard drop after the render.
+    let _env_lock = stel_surface_env::COMPACT_ENV_LOCK.blocking_lock();
+    let _full = stel_surface_env::force_full_stel_envelope();
     let envelope = format_trust_envelope(&TrustEnvelopeInput {
         plan_summary: "trace → find_references (exact)".to_string(),
         decision: AdmissionDecision::Reject,
