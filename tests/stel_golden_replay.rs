@@ -412,10 +412,7 @@ fn calibration_write_does_not_bump_frecency() {
     // discovery ranking at all.
     let store = StelLedgerStore::open_in_memory("sess-calib-frecency").expect("ledger store");
     let tuned = TunedEstimateConstants {
-        response_floor: 800,
-        manual_floor: 1600,
-        schema_tokens: 90,
-        invoke_tokens: 160,
+        response_correction_factor: 2.0,
         estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
         sample_size: 60,
         error_before: 300.0,

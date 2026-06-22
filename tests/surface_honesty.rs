@@ -455,10 +455,7 @@ fn served_figure_stays_estimate_under_tuned_constants() {
         suggested_followup: None,
     };
     let tuned = TunedEstimateConstants {
-        response_floor: 800,
-        manual_floor: 1600,
-        schema_tokens: 90,
-        invoke_tokens: 160,
+        response_correction_factor: 2.0,
         estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
         sample_size: 60,
         error_before: 300.0,
@@ -531,10 +528,7 @@ fn live_envelope_calibration_is_tuned_only_with_a_validated_tuning() {
     // A validated tuning in force -> the envelope reads `tuned` WITH the
     // before/after artifact (SC-005: never `tuned` without it).
     let tuned = TunedEstimateConstants {
-        response_floor: 800,
-        manual_floor: 1600,
-        schema_tokens: 90,
-        invoke_tokens: 160,
+        response_correction_factor: 2.0,
         estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
         sample_size: 60,
         error_before: 300.0,

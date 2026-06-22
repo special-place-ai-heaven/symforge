@@ -49,10 +49,11 @@ pub use a029::{
     classify_t2_equivalence, evaluate_a029_verdict, normalize_spike_results,
 };
 pub use calibration::{
-    CalibrationVerdict, PredictionSample, SC002_MAE_REDUCTION_MARGIN, StelCalibrationSummary,
-    TUNING_MIN_SAMPLES, TUNING_REVIEW_MIN_EVENTS, compute_calibration_verdict,
-    derive_tuning_candidate, format_calibration_section, render_calibration_verdict,
-    summarize_calibration, validate_candidate,
+    CORRECTION_FACTOR_CAP, CalibrationVerdict, NO_CORRECTION_FACTOR, PredictionSample,
+    SC002_MAE_REDUCTION_MARGIN, StelCalibrationSummary, TUNING_MIN_CORPUS, TUNING_MIN_SAMPLES,
+    TUNING_REVIEW_MIN_EVENTS, apply_factor, compute_calibration_verdict, derive_tuning_candidate,
+    format_calibration_section, render_calibration_verdict, summarize_calibration,
+    validate_candidate,
 };
 pub use controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, EconomicsBreakdown, SERVE_MARGIN_TOKENS,

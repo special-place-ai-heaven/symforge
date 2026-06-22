@@ -14,10 +14,14 @@ pub const COMPACT_SCHEMA_TOKENS: u32 = 45;
 pub const COMPACT_INVOKE_TOKENS: u32 = 80;
 /// Static per-step predicted-response floor used when a step carries no real
 /// byte sizes (plan-only callers / fixtures). Matches the planner's
-/// `est_response_tokens` (`planner.rs`); named here so the auto-tune (feature
-/// 013) can derive a corrected replacement and the wiring can fall back to it.
+/// `est_response_tokens` (`planner.rs`). The auto-tune (feature 013, D8-ROOT)
+/// does NOT replace this floor — it learns one multiplicative
+/// `response_correction_factor` applied to the predictor's response OUTPUT
+/// (byte-grounded OR this floor) after grounding-or-floor, so the floor stays the
+/// raw sub-model and the correction is layered on top.
 pub const STATIC_RESPONSE_FLOOR: u32 = 400;
 /// Static per-step manual-baseline floor (the `est_manual_tokens` counterpart to
-/// [`STATIC_RESPONSE_FLOOR`]); the auto-tune's `manual_floor` replaces it when a
-/// validated tuning is in force.
+/// [`STATIC_RESPONSE_FLOOR`]). The auto-tune leaves the manual baseline UNCHANGED
+/// (D9): only the predictor's response output is corrected, never the manual
+/// figure or the fixed schema/invoke overheads.
 pub const STATIC_MANUAL_FLOOR: u32 = 800;

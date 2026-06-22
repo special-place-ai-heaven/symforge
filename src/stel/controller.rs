@@ -366,16 +366,21 @@ pub fn active_tuning_in_force(
     tuned.filter(|c| c.estimator_version == current_version)
 }
 
-/// Economics with an optional validated tuning in force (feature 013, T032).
+/// Economics with an optional validated tuning in force (feature 013, T032,
+/// D8-ROOT).
 ///
-/// When `tuned` is `Some`, the per-step FLOOR path uses the tuned
-/// `response_floor`/`manual_floor` (replacing the static `400/800`) and the
-/// schema/invoke overhead uses the tuned `schema_tokens`/`invoke_tokens`
-/// (replacing `COMPACT_SCHEMA_TOKENS`/`COMPACT_INVOKE_TOKENS`). When `tuned` is
-/// `None` the static floors apply — byte-identical to the pre-013 path. The
-/// byte-grounded read/edit path (a step with `index_refs`) is UNCHANGED in both
-/// cases: tuning corrects only the floor that applies when byte grounding is
-/// absent, plus the schema/invoke constants. The served figure stays an estimate.
+/// When `tuned` is `Some`, the calibration's single
+/// `response_correction_factor` is applied to the FINAL `predicted_response`
+/// AFTER grounding-or-floor — so BOTH the byte-grounded read/edit path AND the
+/// plan-only floor path are corrected by the SAME factor the held-out validation
+/// scored against. The fixed `schema`(45) / `invoke`(80) overheads and the manual
+/// baseline are LEFT UNCHANGED (D9): they are not the predictor's response
+/// output and carry no validated correction. When `tuned` is `None` the factor is
+/// the identity and the result is byte-identical to the pre-013 path.
+///
+/// The correction is applied to the SUMMED per-step response (one factor over the
+/// whole plan's response output), mirroring `calibration::apply_factor`, so the
+/// live residual equals the validated residual.
 ///
 /// The caller is responsible for passing only an IN-FORCE tuning (matching the
 /// current estimator version) — see [`active_tuning_in_force`].
@@ -383,18 +388,30 @@ pub fn estimate_economics_tuned(
     plan: &StelPlan,
     tuned: Option<&TunedEstimateConstants>,
 ) -> EconomicsBreakdown {
-    let (predicted_response_tokens, predicted_manual_tokens) = plan
+    let (predicted_response_raw, predicted_manual_tokens) = plan
         .steps
         .iter()
-        .map(|step| grounded_step_tokens_tuned(step, tuned))
+        .map(grounded_step_tokens)
         .fold((0u32, 0u32), |(resp, manual), (step_resp, step_manual)| {
             (
                 resp.saturating_add(step_resp),
                 manual.saturating_add(step_manual),
             )
         });
-    let schema_tokens = tuned.map_or(COMPACT_SCHEMA_TOKENS, |c| c.schema_tokens);
-    let invoke_tokens = tuned.map_or(COMPACT_INVOKE_TOKENS, |c| c.invoke_tokens);
+
+    // D8-ROOT: apply the validated response-correction factor to the FINAL
+    // predicted response (byte-grounded OR floor — whichever produced it). The
+    // schema/invoke/manual figures are NOT scaled (D9).
+    let predicted_response_tokens = match tuned {
+        Some(c) => crate::stel_core::calibration::apply_factor(
+            predicted_response_raw,
+            c.response_correction_factor,
+        ),
+        None => predicted_response_raw,
+    };
+
+    let schema_tokens = COMPACT_SCHEMA_TOKENS;
+    let invoke_tokens = COMPACT_INVOKE_TOKENS;
     let predicted_symforge_tokens = predicted_response_tokens
         .saturating_add(schema_tokens)
         .saturating_add(invoke_tokens);
@@ -424,20 +441,18 @@ pub fn estimate_economics_tuned(
 ///
 /// Falls back to the plan-only `est_*` constants when no real size is known
 /// (preserves determinism for plan-only callers and existing fixtures).
-fn grounded_step_tokens_tuned(
-    step: &StelPlanStep,
-    tuned: Option<&TunedEstimateConstants>,
-) -> (u32, u32) {
+///
+/// D8-ROOT: this computes the predictor's RAW per-step output (byte-grounded or
+/// floor). The validated `response_correction_factor` is applied ONCE to the
+/// summed plan response in [`estimate_economics_tuned`], not per-step here, so
+/// both sub-models share the same single correction the held-out validation
+/// scored against. The manual baseline is never corrected (D9).
+fn grounded_step_tokens(step: &StelPlanStep) -> (u32, u32) {
     if step.index_refs.is_empty() {
-        // Plan-only floor path: this is the ONLY place a validated tuning
-        // replaces the static per-step floor. A tuned set overrides the planner's
-        // `est_*` constants with its derived `response_floor`/`manual_floor`; with
-        // no tuning the plan's own (static 400/800) floor is used, byte-exact with
-        // the pre-013 behaviour. The byte-grounded branches below are unchanged.
-        return match tuned {
-            Some(c) => (c.response_floor, c.manual_floor),
-            None => (step.est_response_tokens, step.est_manual_tokens),
-        };
+        // Plan-only FLOOR path: the static per-step `est_*` constants (400/800),
+        // byte-exact with the pre-013 behaviour. The response correction (if a
+        // tuning is in force) is applied to the plan sum by the caller.
+        return (step.est_response_tokens, step.est_manual_tokens);
     }
     let total_raw_chars: usize = step
         .index_refs

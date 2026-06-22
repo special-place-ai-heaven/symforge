@@ -33,7 +33,7 @@ pub const SYMFORGE_STEL_LEDGER_DB_PATH: &str = ".symforge/stel-ledger.db";
 // Schema
 // ---------------------------------------------------------------------------
 
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 const META_SCHEMA_VERSION: &str = "schema_version";
 
 /// Identifier of the prediction estimator in force (feature 013, R3).
@@ -101,15 +101,12 @@ CREATE INDEX IF NOT EXISTS idx_stel_ledger_events_ts
     ON stel_ledger_events (ts_ms);
 
 CREATE TABLE IF NOT EXISTS stel_calibration (
-    estimator_version   TEXT PRIMARY KEY,
-    response_floor      INTEGER NOT NULL,
-    manual_floor        INTEGER NOT NULL,
-    schema_tokens       INTEGER NOT NULL,
-    invoke_tokens       INTEGER NOT NULL,
-    sample_size         INTEGER NOT NULL,
-    error_before        REAL NOT NULL,
-    error_after         REAL NOT NULL,
-    tuned_at_ms         INTEGER NOT NULL
+    estimator_version           TEXT PRIMARY KEY,
+    response_correction_factor  REAL NOT NULL,
+    sample_size                 INTEGER NOT NULL,
+    error_before                REAL NOT NULL,
+    error_after                 REAL NOT NULL,
+    tuned_at_ms                 INTEGER NOT NULL
 );
 "#;
 
@@ -120,6 +117,17 @@ CREATE TABLE IF NOT EXISTS stel_calibration (
 /// column by the v1 DDL, then the column is added here exactly once.
 const ALTER_ADD_ESTIMATOR_VERSION: &str =
     "ALTER TABLE stel_ledger_events ADD COLUMN estimator_version TEXT";
+
+/// Schema v3 delta (feature 013, D8-ROOT): the `stel_calibration` table's column
+/// shape changed — the four `response_floor`/`manual_floor`/`schema_tokens`/
+/// `invoke_tokens` floor columns are REPLACED by a single
+/// `response_correction_factor REAL`. The table is NEW in this (013) branch and
+/// no released data exists, so a v2 database (which only ever held the old
+/// floor-based shape, never surfaced) drops and recreates the table rather than
+/// migrating data forward — an empty calibration table re-derives from the
+/// retained ledger samples on the next tuning pass. Guarded by a catalog probe
+/// for the obsolete column so it runs at most once and never on a fresh v3 DB.
+const DROP_OBSOLETE_CALIBRATION_TABLE: &str = "DROP TABLE IF EXISTS stel_calibration";
 
 // ---------------------------------------------------------------------------
 // Bounds helpers (mirrors analytics store)
@@ -213,33 +221,42 @@ pub struct StoredLedgerRecord {
     pub route_confidence: String,
 }
 
-/// The calibrated replacements for the static prediction floors, plus the
-/// evidence that justifies them (feature 013, data-model `TunedEstimateConstants`).
+/// The calibrated correction for the predictor's response output, plus the
+/// evidence that justifies it (feature 013, data-model `TunedEstimateConstants`).
+///
+/// D8-ROOT redesign: calibration learns ONE multiplicative
+/// `response_correction_factor` applied to the predictor's PREDICTED RESPONSE
+/// output — whatever sub-model produced it (byte-grounded read/edit OR the
+/// plan-only floor) — validated against the SAME residual the live predictor
+/// errs on. It does NOT replace the static floors and does NOT touch the fixed
+/// `schema`(45) / `invoke`(80) overheads or the manual baseline (D9): those are
+/// not the predictor's response output and have no validated correction.
 ///
 /// Persisted in `stel_calibration` (single active set per `estimator_version`)
 /// so tuning survives restart and stays auditable. This is a pure POD — the
 /// foundation stores and loads it; the derivation/validation math (US2) lives
 /// in `calibration.rs`. `error_before`/`error_after` are the held-out mean
-/// absolute error figures that let the surface honestly read `tuned`; storing
-/// constants without them is never enough to promote the surface.
+/// absolute error figures (against the real residual) that let the surface
+/// honestly read `tuned`; storing a factor without them is never enough to
+/// promote the surface.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TunedEstimateConstants {
-    /// Tuned replacement for the `400` plan-floor (`controller.rs`).
-    pub response_floor: u32,
-    /// Tuned replacement for the `800` manual baseline.
-    pub manual_floor: u32,
-    /// Tuned replacement for `COMPACT_SCHEMA_TOKENS` (`45`).
-    pub schema_tokens: u32,
-    /// Tuned replacement for `COMPACT_INVOKE_TOKENS` (`80`).
-    pub invoke_tokens: u32,
-    /// The estimator these were tuned for; must match [`CURRENT_ESTIMATOR_VERSION`]
+    /// Multiplicative correction applied to the predictor's PREDICTED RESPONSE
+    /// output (`predicted_response_final = round(predicted_response_raw * factor)`).
+    /// `1.0` means "no correction"; the derivation bounds it into
+    /// `[1/CAP, CAP]` (oscillation guard). This is the ONLY thing calibration
+    /// tunes — the static floors and the fixed schema/invoke/manual figures are
+    /// untouched (D9).
+    pub response_correction_factor: f64,
+    /// The estimator this was tuned for; must match [`CURRENT_ESTIMATOR_VERSION`]
     /// to be in force (R3 in-force rule).
     pub estimator_version: String,
-    /// Number of samples used to derive the constants.
+    /// Number of samples used to derive + validate the factor.
     pub sample_size: u32,
-    /// Held-out mean absolute prediction error BEFORE applying these constants.
+    /// Held-out mean absolute prediction error BEFORE applying the factor (the
+    /// raw predictor's residual on the held-out slice).
     pub error_before: f64,
-    /// Held-out mean absolute prediction error AFTER applying these constants.
+    /// Held-out mean absolute prediction error AFTER applying the factor.
     pub error_after: f64,
     /// Wall-clock timestamp (ms since epoch) the tuning was applied — audit.
     pub tuned_at_ms: u64,
@@ -524,6 +541,18 @@ impl SqliteStelLedgerStore {
         // poison as a panic on every subsequent lock.
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
+        // v3 (feature 013, D8-ROOT): the `stel_calibration` table's column shape
+        // changed (four floor columns -> one `response_correction_factor`). Drop
+        // the obsolete table BEFORE the v1 DDL recreates it with the new shape,
+        // but ONLY when the obsolete `response_floor` column is present — a fresh
+        // or already-v3 DB has no such column, so the probe makes this a no-op
+        // there. The table is new in this branch and never surfaced, so dropping
+        // it is a one-time reset of unpromoted data (re-derived on the next pass).
+        if column_exists(&conn, "stel_calibration", "response_floor")? {
+            conn.execute_batch(DROP_OBSOLETE_CALIBRATION_TABLE)
+                .context("dropping obsolete stel_calibration table (schema v3)")?;
+        }
+
         // v1 DDL: tables + indexes (all `IF NOT EXISTS`, idempotent).
         conn.execute_batch(SCHEMA_V1)
             .context("applying stel ledger schema v1")?;
@@ -779,21 +808,15 @@ impl SqliteStelLedgerStore {
         conn.execute(
             "INSERT OR REPLACE INTO stel_calibration (
                 estimator_version,
-                response_floor,
-                manual_floor,
-                schema_tokens,
-                invoke_tokens,
+                response_correction_factor,
                 sample_size,
                 error_before,
                 error_after,
                 tuned_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 c.estimator_version,
-                u32_to_i64(c.response_floor),
-                u32_to_i64(c.manual_floor),
-                u32_to_i64(c.schema_tokens),
-                u32_to_i64(c.invoke_tokens),
+                c.response_correction_factor,
                 u32_to_i64(c.sample_size),
                 c.error_before,
                 c.error_after,
@@ -819,10 +842,7 @@ impl SqliteStelLedgerStore {
             .query_row(
                 "SELECT
                     estimator_version,
-                    response_floor,
-                    manual_floor,
-                    schema_tokens,
-                    invoke_tokens,
+                    response_correction_factor,
                     sample_size,
                     error_before,
                     error_after,
@@ -831,21 +851,14 @@ impl SqliteStelLedgerStore {
                 WHERE estimator_version = ?1",
                 params![estimator_version],
                 |row| {
-                    let response_floor: i64 = row.get(1)?;
-                    let manual_floor: i64 = row.get(2)?;
-                    let schema_tokens: i64 = row.get(3)?;
-                    let invoke_tokens: i64 = row.get(4)?;
-                    let sample_size: i64 = row.get(5)?;
-                    let tuned_at_ms: i64 = row.get(8)?;
+                    let sample_size: i64 = row.get(2)?;
+                    let tuned_at_ms: i64 = row.get(5)?;
                     Ok(TunedEstimateConstants {
                         estimator_version: row.get(0)?,
-                        response_floor: u32::try_from(response_floor.max(0)).unwrap_or(u32::MAX),
-                        manual_floor: u32::try_from(manual_floor.max(0)).unwrap_or(u32::MAX),
-                        schema_tokens: u32::try_from(schema_tokens.max(0)).unwrap_or(u32::MAX),
-                        invoke_tokens: u32::try_from(invoke_tokens.max(0)).unwrap_or(u32::MAX),
+                        response_correction_factor: row.get(1)?,
                         sample_size: u32::try_from(sample_size.max(0)).unwrap_or(u32::MAX),
-                        error_before: row.get(6)?,
-                        error_after: row.get(7)?,
+                        error_before: row.get(3)?,
+                        error_after: row.get(4)?,
                         tuned_at_ms: i64_to_u64(tuned_at_ms),
                     })
                 },
@@ -1145,6 +1158,40 @@ mod tests {
         let summary = store.summary().expect("summary is Some for Sqlite variant");
         assert_eq!(summary.total_events, 1);
         assert_eq!(summary.total_net_vs_manual, 420);
+    }
+
+    /// D12 (feature 013) — embed DURABILITY behavioral proof, not just "compiles".
+    ///
+    /// This test lives in `stel_core` (gated `any(server, embed)`) so it RUNS under
+    /// `cargo test --no-default-features --features embed --lib`. It exercises the
+    /// public `StelLedgerStore` enum end-to-end on an embed-reachable build:
+    /// `open_in_memory` -> `record(event)` -> the recorded event is visible via
+    /// BOTH `recent()` and `summary()`. D3 proved the durable store COMPILES under
+    /// embed; this proves it WORKS — an embedder (e.g. AAP) that opens the store
+    /// and records an event can read it back.
+    #[test]
+    fn embed_open_record_roundtrip_is_durable() {
+        let store = StelLedgerStore::open_in_memory("sess-embed-proof").expect("embed store opens");
+        let ev = sample_event("plan-embed-proof");
+        store.record(&ev);
+
+        // recent() returns the recorded event (the row is durable, readable).
+        let recent = store.recent(10).expect("recent after embed record");
+        assert_eq!(
+            recent.len(),
+            1,
+            "embed store must return the recorded event"
+        );
+        assert_eq!(recent[0].plan_id, "plan-embed-proof");
+        assert_eq!(recent[0].session_id, "sess-embed-proof");
+        assert_eq!(recent[0].actual_response_tokens, 380);
+
+        // summary() aggregates it (the second read path the surface depends on).
+        let summary = store
+            .summary()
+            .expect("embed store summary is Some for a present store");
+        assert_eq!(summary.total_events, 1);
+        assert_eq!(summary.session_count, 1);
     }
 
     #[test]

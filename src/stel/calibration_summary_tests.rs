@@ -9,7 +9,7 @@
 //! `stel::calibration` test module; behavior-preserving.
 
 use crate::stel::calibration::{
-    CalibrationVerdict, TUNING_MIN_SAMPLES, format_calibration_section, summarize_calibration,
+    CalibrationVerdict, TUNING_MIN_CORPUS, format_calibration_section, summarize_calibration,
 };
 use crate::stel::controller::{
     COMPACT_INVOKE_TOKENS, COMPACT_SCHEMA_TOKENS, economics_for_bypass, estimate_economics,
@@ -115,12 +115,13 @@ fn serve_only_ledger_aggregates_economics() {
     assert!(summary.total_predicted_net != 0);
     assert!(summary.total_actual_response_tokens > 0);
     // T030: one event is below the tuning minimum -> `accumulating (1/min)`,
-    // never `tuned` and never a hard-coded "insufficient" string.
+    // never `tuned` and never a hard-coded "insufficient" string. D10: `min` is
+    // the TRUE 2*MIN corpus threshold, so n <= min always holds.
     assert_eq!(
         summary.verdict,
         CalibrationVerdict::Accumulating {
             n: 1,
-            min: TUNING_MIN_SAMPLES
+            min: TUNING_MIN_CORPUS
         }
     );
     assert!(summary.tuning_note.starts_with("accumulating (1/"));
