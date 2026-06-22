@@ -64,4 +64,24 @@ Last updated: 2026-06-22.
 - **Attack Culprit C:** per-connection session dimension on `/mcp` (stateful mode / per-connection proxy server).
 - Independent: D17 race hardening.
 
-Sequencing + the precise design of each attack = the culprit investigation workflow (next).
+## Attack sequence — vetted 2026-06-22 (adversarial critique wf_981b5b87, verdict REVISE→PROCEED w/ A1a)
+
+This ledger lives on `feat/012` (worktree); A1/A2/B1 all land here (the superset branch). The 013 lane keeps its own `013-findings-ledger.md` (root D3 = storage/transport coupling via `cfg(feature="server")`) — coordinate, out of this lane's scope but tracked.
+
+Sequence by (defects-killed ÷ effort), gated by file independence:
+1. **A1a** — `ParamDisposition` choke point in `build_plan_from_steps` + conformance test. Every `StelRequest` field resolves to `Routed|Forwarded|Refused|NotApplicable`; silent-absent is asserted-against. **Zero behavior change — `routes.golden.jsonl` does NOT move.** Erects the non-regressable guard against the silent-drop class (D-A0) at zero risk. **ATTACK FIRST.** Owner 012.
+2. **D17** — collapse the open-vs-close TOCTOU (single `projects.write()` entry). S/LOW, isolated. Owner 012.
+3. **B1** — thread caller options through the empty-overlay search path (`search_*_with_options` already exist) → honors D11 scoping + D14 ranking on the cross-project read path. S-M/LOW. Owner 012.
+4. **A1b** — gated per-tool forwarding (`max_tokens`→args, `path`→`path_prefix`); golden re-baselined. Owner 012.
+5. **C-stopgap** — `/mcp` loudly refuses `project`/`projects` (contain D16's silent-wrong half). Owner 012.
+6. **B2** — republish→rebase on HEAD/watcher advance (D12). Owner 012.
+
+A2 (`Figure` provenance enum) = DEMOTED to regression-guard (envelope already honest); low priority, owner 012.
+
+Tracked-LARGE (OPEN, real owner + blocked-on — NOT euphemized):
+- **D-B0** per-view derived index for non-empty overlays (K-delta trigram merge) — owner 012, blocked-on: cross-project-write track.
+- **D15** overlay edits in ordinary reads (Phase 5: ~20 `capture_*` port + read-path flip) — owner 012, blocked-on: read-path migration.
+- **D16** `/mcp` per-connection daemon session — owner 012, blocked-on: stateful-mode substrate + parity re-test.
+- **D13** xref recall ~29% (now: `parsing/xref.rs` extraction defect) — owner: recall/8.1 program.
+- **D2** gate decides on estimated economics for non-read routes — owner 013, blocked-on: grounding extension to search routes.
+- **D5/D6** false "VALIDATED"/"95% trajectory" claims — doc demotion, owner 012.

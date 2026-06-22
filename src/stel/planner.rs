@@ -19,6 +19,202 @@ struct PlannedStep {
     rationale: &'static str,
 }
 
+/// What the facade *actually does* with a caller-supplied [`StelRequest`] field,
+/// recorded at the single plan choke point (A1a — root D-A0 guard).
+///
+/// CULPRIT A is the lossy facade: it routes a curated subset of each call's
+/// params and *silently drops the rest*. This enum makes that class
+/// structurally visible — every field must resolve to one explicit variant, so
+/// "silently dropped" stops being a representable state. There is NO `Dropped`
+/// variant on purpose: an unaccounted-for field is a bug the conformance test
+/// catches, not a value this type can hold.
+///
+/// A1a is **assertion-only**: this records the CURRENT disposition of each
+/// field and asserts exhaustiveness. It does NOT newly forward or newly
+/// short-circuit anything (that is A1b). `Forwarded`/`Refused` here describe
+/// behavior the handler ALREADY performs downstream of the planner, not new
+/// routing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParamDisposition {
+    /// The field's value reaches a planned tool step (route selection or args).
+    Routed,
+    /// The field is consumed downstream of the planner (the handler layer),
+    /// not by the plan steps — named by where it lands today.
+    Forwarded { into_arg: String },
+    /// The field is loudly refused (the facade returns an error rather than a
+    /// silently-partial answer) — named by why.
+    Refused { reason: String },
+    /// The field carries no actionable caller value on this route today
+    /// (absent/blank, or a route the planner does not consume it on yet). An
+    /// explicit "the planner saw it and did not act on it", NOT a silent drop.
+    NotApplicable,
+}
+
+impl ParamDisposition {
+    /// True for any explicit disposition. Always true by construction — there is
+    /// no silent variant — but the conformance test asserts it per field so the
+    /// silent-drop class cannot regress if a future variant is ever added.
+    pub fn is_explicit(&self) -> bool {
+        matches!(
+            self,
+            Self::Routed | Self::Forwarded { .. } | Self::Refused { .. } | Self::NotApplicable
+        )
+    }
+}
+
+/// Every [`StelRequest`] field, classified to exactly one [`ParamDisposition`]
+/// reflecting the facade's CURRENT behavior, for the given finalized `plan`.
+///
+/// This is the structural lossless-or-loud guard (A1a): the returned slice is
+/// fixed-length and covers EVERY field of `StelRequest`, so a field cannot be
+/// absent from the accounting. Pure and side-effect-free — it observes the plan,
+/// it does not change it, so wiring it in is byte-identical to before.
+///
+/// Dispositions mirror today's code paths exactly:
+/// - `query`  → [`Routed`](ParamDisposition::Routed): always consumed by the planner.
+/// - `intent` → `Routed` when set (selects the route bucket), else `NotApplicable`.
+/// - `symbol` → `Refused` for prose (the handler's `symbol_contract_violation`
+///   precedent), `Routed` when a bare identifier reaches a plan step, else
+///   `NotApplicable` (set but not consumed on this route today).
+/// - `path`   → `Routed` when the finalized plan's args carry the path value,
+///   else `NotApplicable` (the planner does not forward it on this route yet —
+///   A1b is the forwarding step; A1a only records the gap).
+/// - `max_tokens` / `preview` → `Forwarded`: consumed by the handler AFTER the
+///   planner (CCR budget / preview-estimate branch), not by plan steps.
+/// - `project` / `projects` → `Refused` when meaningfully set: the handler
+///   already loudly refuses cross-project targeting through this facade (D9).
+pub fn classify_param_dispositions(
+    request: &StelRequest,
+    plan: &StelPlan,
+) -> [(&'static str, ParamDisposition); 8] {
+    let symbol_set = request
+        .symbol
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let path_set = request
+        .path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+
+    let query = ParamDisposition::Routed;
+
+    let intent = if request.intent.is_some() {
+        ParamDisposition::Routed
+    } else {
+        ParamDisposition::NotApplicable
+    };
+
+    let symbol = if !symbol_set {
+        ParamDisposition::NotApplicable
+    } else if symbol_contract_violation(request).is_some() {
+        ParamDisposition::Refused {
+            reason: "symbol must be a bare identifier, not prose".to_string(),
+        }
+    } else if plan_carries_symbol(plan, request) {
+        ParamDisposition::Routed
+    } else {
+        // A bare-identifier symbol the current route does not consume (e.g. an
+        // explicit routing phrase won, or a non-honored bucket). The planner saw
+        // it and chose not to act on it today — explicit, not silent.
+        ParamDisposition::NotApplicable
+    };
+
+    let path = if path_set && plan_carries_path(plan, request) {
+        ParamDisposition::Routed
+    } else {
+        // Set-but-unconsumed `path` (the A1b forwarding target) or absent: the
+        // planner does not thread it into this route's args today.
+        ParamDisposition::NotApplicable
+    };
+
+    let max_tokens = if request.max_tokens.is_some() {
+        ParamDisposition::Forwarded {
+            into_arg: "handler CCR budget (apply_ccr_budget) / preview estimate".to_string(),
+        }
+    } else {
+        ParamDisposition::NotApplicable
+    };
+
+    let preview = if request.preview.is_some() {
+        ParamDisposition::Forwarded {
+            into_arg: "handler preview-estimate branch".to_string(),
+        }
+    } else {
+        ParamDisposition::NotApplicable
+    };
+
+    let project = if request
+        .project
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        ParamDisposition::Refused {
+            reason: "cross-project targeting is not routed through the `symforge` facade"
+                .to_string(),
+        }
+    } else {
+        ParamDisposition::NotApplicable
+    };
+
+    let projects = if request
+        .projects
+        .as_deref()
+        .is_some_and(|ids| ids.iter().any(|id| !id.trim().is_empty()))
+    {
+        ParamDisposition::Refused {
+            reason: "cross-project targeting is not routed through the `symforge` facade"
+                .to_string(),
+        }
+    } else {
+        ParamDisposition::NotApplicable
+    };
+
+    [
+        ("query", query),
+        ("intent", intent),
+        ("symbol", symbol),
+        ("path", path),
+        ("max_tokens", max_tokens),
+        ("preview", preview),
+        ("project", project),
+        ("projects", projects),
+    ]
+}
+
+/// True when the finalized `plan` carries the caller's `symbol` value in any
+/// step's args (`name` or `query`) — i.e. the symbol was honored by the route.
+fn plan_carries_symbol(plan: &StelPlan, request: &StelRequest) -> bool {
+    let symbol = match request.symbol.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    plan.steps.iter().any(|step| {
+        ["name", "query"].iter().any(|key| {
+            step.args
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v == symbol)
+        })
+    })
+}
+
+/// True when the finalized `plan` carries the caller's `path` value in any
+/// step's args (`path` or `path_prefix`) — i.e. the route consumed `path`.
+fn plan_carries_path(plan: &StelPlan, request: &StelRequest) -> bool {
+    let path = match request.path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    plan.steps.iter().any(|step| {
+        ["path", "path_prefix"].iter().any(|key| {
+            step.args
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v == path)
+        })
+    })
+}
+
 /// Build a draft plan for compact `symforge` (L1 → L2).
 pub fn build_plan(request: &StelRequest) -> StelPlan {
     if let Some(steps) = plan_multi_hop_steps(request) {
@@ -242,14 +438,30 @@ fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> Stel
             index_refs: vec![],
         })
         .collect();
-    StelPlan {
+    let plan = StelPlan {
         plan_id: new_plan_id(request),
         intent,
         confidence,
         confidence_rationale,
         steps: stel_steps,
         suggested_followup: None,
-    }
+    };
+
+    // A1a lossless-or-loud guard (root D-A0): every `StelRequest` field MUST
+    // resolve to an explicit `ParamDisposition` at this single choke point — no
+    // field may be silently unaccounted-for. Assertion-only: this neither reads
+    // into nor mutates the returned plan, so output is byte-identical. The
+    // `debug_assert!` compiles out of release; the conformance test
+    // (`tests/stel_param_disposition.rs`) enforces the same invariant across the
+    // emittable surface in every build.
+    debug_assert!(
+        classify_param_dispositions(request, &plan)
+            .iter()
+            .all(|(_, disposition)| disposition.is_explicit()),
+        "A1a: a StelRequest field resolved to no explicit ParamDisposition (silent drop)"
+    );
+
+    plan
 }
 
 /// Envelope plan line: `trace → find_references (exact)` or multi-hop `find → search_symbols → get_symbol (inferred)`.
