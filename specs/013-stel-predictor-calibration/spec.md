@@ -131,7 +131,7 @@ tuned) the measured before/after error delta match the underlying data — and t
 
 ### Functional Requirements
 
-- **FR-001**: The system MUST persist predicted-vs-actual ledger events across process restarts in stdio/embed deployments, not only in serve mode, anchored to the deployment's state directory.
+- **FR-001**: The system MUST persist predicted-vs-actual ledger events across process restarts in stdio deployments (local AND daemon-backed), not only in serve mode, anchored to the deployment's state directory. **(US1 build finding: the `embed` library facade is DEFERRED — see "Build findings" — because `stel`/`protocol` are crate-root server-gated; stdio durability is delivered, embed needs a structural split.)**
 - **FR-002**: The durable ledger MUST be bounded by a documented retention policy (count and/or age); growth past the bound prunes oldest events.
 - **FR-003**: When a durable store is unavailable or fails to open, the system MUST degrade to in-memory observational calibration and report the degraded state distinguishably (broken vs. never-configured), never silently report durable accumulation it does not have.
 - **FR-004**: The system MUST derive corrected token-estimate constants (response-token floors and schema/invoke constants) from accumulated predicted-vs-actual error once a documented minimum sample size is reached.
@@ -167,6 +167,14 @@ tuned) the measured before/after error delta match the underlying data — and t
 - The serve-mode durable SQLite ledger (010 FR-004, `src/stel/ledger_store.rs`) is the basis to extend to stdio/embed; this feature does not rewrite the ledger schema beyond what persistence + sample tagging require.
 - Routing, policy, and safety guards are out of scope for calibration to modify (FR-007); this feature touches the economics/estimate path only.
 - `b_results` and `multi_step_planner` (the other `DEFERRED_ITEMS`) are out of scope for this feature and remain separately queued.
+
+## Build findings (US1, 2026-06-22)
+
+Discovered during US1 implementation + adversarial review; folded back here for honesty:
+
+- **Embed durability DEFERRED (FR-001 partial)**: `src/lib.rs` gates the whole `stel` and `protocol` modules behind `#[cfg(feature="server")]`, and `stel` hard-imports `crate::protocol::*` (which pulls `rmcp`/`axum`). The durable store cannot reach the `embed` facade without a structural protocol-free seam (un-gating would violate Principle VI / G-045). STDIO durability (the operator's deployment, `server` feature) IS delivered; `embed` durability is a separate, queued structural task. The dead `any(server,embed)` cfgs were reverted to `#[cfg(server)]` to avoid falsely signalling embed-capability.
+- **Daemon-backed stdio is the operator default**: the `symforge` compact tool (the only ledger-recording tool) records on the per-session PROXY front-end, not the daemon worker (whose `execute_tool_call` has no `symforge` arm). US1 attaches the durable store on the proxy (T021), so events accumulate across sessions in the shared per-project db. Since the daemon worker renders `status`, the proxy OVERLAYS its own `durable_ledger` line onto the proxied `status detail:full` body — the operator sees the true durable state, not the worker's `unavailable`.
+- **DB path convention fixed**: `StelLedgerStore::open` now takes the project ROOT and joins the `.symforge/`-prefixed const (matching analytics/coupling/frecency), correcting a pre-existing serve-mode doubling (`root/.symforge/.symforge/...`). A production-convention test guards it.
 
 ## Dependencies
 

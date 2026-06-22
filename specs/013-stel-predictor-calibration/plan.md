@@ -89,6 +89,6 @@ No constitution violations; no added abstractions requiring justification. (Empt
 ## Resolved decisions
 
 - **Per-project calibration — CONFIRMED** (user, 2026-06-22): the durable store already lives per project data dir and response-size distributions are codebase-specific, so a global pool would tune worse. All four spec clarifications are resolved in research.md.
-- **Durable store embed-reachability** (from the `/tasks` adversarial pass): the `ledger_store` module is un-gated from `#[cfg(server)]` to `#[cfg(any(server, embed))]` so FR-001's stdio/embed durability holds, without pulling any server/network crate into embed (rusqlite is unconditional). Owner: US1 T018.
+- **Durable store embed-reachability — DEFERRED** (corrected by the US1 build): the `any(server, embed)` un-gate does NOT work — `src/lib.rs` gates the whole `stel`/`protocol` modules behind `#[cfg(server)]` and `stel` hard-imports `protocol` (rmcp/axum), so the store cannot reach `embed` without a structural protocol-free seam (Principle VI). STDIO durability (the operator's `server`-feature deployment) IS delivered; embed durability is a separate queued structural task. See spec.md "Build findings".
 - **Daemon-default deployment** (from the `/tasks` adversarial pass): the operator's real stdio is daemon-backed (`new_daemon_proxy`), so US1 must reach the daemon WORKER dispatch (T021), not only the `SYMFORGE_NO_DAEMON` local path (T020) — else US1 is fake-green in the very environment the spec targets.
 - **SC-002 margin**: set in research.md (R5) and asserted by US2 T024/T029.
