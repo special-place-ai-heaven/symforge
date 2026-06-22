@@ -19,6 +19,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::live_index::view::{BaseKey, CommitId, IndexBase, WorkingSet};
 use crate::live_index::{self, SharedIndex};
 use crate::paths;
 use crate::protocol::SymForgeServer;
@@ -111,6 +112,27 @@ pub struct DaemonSessionClient {
 
 pub struct DaemonState {
     next_session_id: AtomicU64,
+    // LOCK ORDER (Feature 012): `bases` -> `projects` -> `sessions`.
+    // Acquire only DOWNWARD; never acquire an earlier lock while holding a later
+    // one. The pre-012 rule was `projects` -> `sessions` (see `close_session`,
+    // `index_folder_for_session`, `session_runtime`); 012 prepends `bases` at the
+    // top because base interning (`intern_base`) may run just before a project
+    // insert. `intern_base` itself acquires ONLY `bases` and touches no other
+    // lock, so call sites stay free to order the rest. Per-session `working_set`
+    // is an `Arc<RwLock<WorkingSet>>` OUTSIDE this hierarchy (its own lock, never
+    // held across a daemon-map lock), so it cannot participate in an inversion.
+    /// Per-daemon base intern table (Feature 012). Equal `(canonical_root,
+    /// commit)` keys MUST share ONE `Arc<IndexBase>` (SC-002): `intern_base`
+    /// returns the existing Arc on a key hit and only mints a new base (drawing a
+    /// generation from `base_generation_seq`) on a miss. Phase 0/1: populated on
+    /// project load/activate and seeded into per-session working sets, but no
+    /// query route reads it yet (cross-project routing is Phase 2/3).
+    bases: RwLock<HashMap<BaseKey, Arc<IndexBase>>>,
+    /// Monotonic source of `base_generation` fence tokens, minted only when
+    /// `intern_base` publishes a NEW base. Starts at 1; a shared (interned) base
+    /// keeps its original generation, so this is strictly increasing across
+    /// distinct published bases (the D2 fence the engine asserts on).
+    base_generation_seq: AtomicU64,
     projects: RwLock<HashMap<String, ProjectInstance>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
@@ -156,7 +178,21 @@ struct ProjectInstance {
 
 struct SessionRecord {
     session_id: String,
-    project_id: String,
+    /// The single active project this session resolves to (Feature 012: renamed
+    /// from `project_id`). `session_runtime` resolves the one active project via
+    /// this id, so single-project behavior is unchanged. Phases 2/3 will let a
+    /// session hold MULTIPLE projects in `working_set` with this field naming the
+    /// active/bound one; for Phase 0/1 it is the sole project, byte-for-byte the
+    /// prior `project_id`.
+    active_project_id: String,
+    /// Per-session copy-on-write working set (Feature 012, Phase 1). Seeded on
+    /// open with a SINGLE entry — the active project + its interned shared base +
+    /// an EMPTY overlay — and INERT: no query route reads it yet (Phase 2/3) and
+    /// NO code path writes into its overlay (the no-overlay-writes invariant that
+    /// keeps Principle I airtight). `Arc<RwLock>` is mandatory: `SessionRecord` is
+    /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
+    /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
+    working_set: Arc<RwLock<WorkingSet>>,
     client_name: String,
     pid: Option<u32>,
     opened_at: SystemTime,
@@ -168,7 +204,9 @@ impl Clone for SessionRecord {
     fn clone(&self) -> Self {
         Self {
             session_id: self.session_id.clone(),
-            project_id: self.project_id.clone(),
+            active_project_id: self.active_project_id.clone(),
+            // Share the SAME working-set lock across clones (O(1), singular state).
+            working_set: Arc::clone(&self.working_set),
             client_name: self.client_name.clone(),
             pid: self.pid,
             opened_at: self.opened_at,
@@ -561,12 +599,59 @@ impl DaemonState {
     fn with_token(auth_token: String) -> Self {
         Self {
             next_session_id: AtomicU64::new(1),
+            bases: RwLock::new(HashMap::new()),
+            base_generation_seq: AtomicU64::new(1),
             projects: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
             auth_token,
             governor: crate::sidecar::governor::RequestGovernor::new(),
         }
+    }
+
+    /// Intern `candidate` into the per-daemon base table, enforcing SC-002 (Feature
+    /// 012, Phase 0). Returns the SHARED `Arc<IndexBase>` for the candidate's
+    /// [`BaseKey`]: the existing allocation when an equal key is already present
+    /// (so two consumers at the same `(root, commit)` share ONE base, verified by
+    /// `Arc::ptr_eq`), otherwise the candidate re-stamped with a freshly minted
+    /// monotonic `base_generation` and published.
+    ///
+    /// LOCK ORDER: acquires ONLY `bases` (the top of the `bases -> projects ->
+    /// sessions` hierarchy) and touches no other daemon lock, so callers remain
+    /// free to acquire `projects`/`sessions` afterwards without risking an
+    /// inversion. Never call this while holding `projects` or `sessions`.
+    fn intern_base(&self, candidate: Arc<IndexBase>) -> Arc<IndexBase> {
+        let mut bases = self.bases.write();
+        if let Some(existing) = bases.get(&candidate.key) {
+            return Arc::clone(existing);
+        }
+        // Miss: re-stamp with the authoritative monotonic generation, then publish.
+        // `IndexBase: Clone` is cheap (it clones the `Arc<LiveIndex>` handle, never
+        // the file map), and the candidate is the sole owner here.
+        let generation = self.base_generation_seq.fetch_add(1, Ordering::Relaxed);
+        let mut published = (*candidate).clone();
+        published.base_generation = generation;
+        let published = Arc::new(published);
+        bases.insert(published.key.clone(), Arc::clone(&published));
+        published
+    }
+
+    /// Intern the base for `project_id` if the project is currently loaded
+    /// (Feature 012, Phase 0). Reads the project under `projects.read()` to build
+    /// the candidate base, releases that lock, then interns under `bases.write()`.
+    ///
+    /// LOCK ORDER NOTE: this takes `projects` THEN `bases`, which is the REVERSE
+    /// of the declared `bases -> projects` order. It is safe ONLY because the two
+    /// guards never overlap — the `projects` read guard is dropped at the end of
+    /// the inner block BEFORE `intern_base` acquires `bases`. The hierarchy
+    /// forbids HOLDING `projects` while acquiring `bases`, not acquiring them in
+    /// sequence with no overlap. Returns `None` if the project is not loaded.
+    fn intern_base_for_project(&self, project_id: &str) -> Option<Arc<IndexBase>> {
+        let candidate = {
+            let projects = self.projects.read();
+            projects.get(project_id).map(ProjectInstance::base)
+        }; // projects read guard dropped here, before bases.write() below
+        candidate.map(|candidate| self.intern_base(candidate))
     }
 
     fn register_session_for_existing_project(
@@ -580,6 +665,14 @@ impl DaemonState {
             self.next_session_id.fetch_add(1, Ordering::Relaxed)
         );
         let now = SystemTime::now();
+
+        // Feature 012, Phase 0+1: intern the project's base FIRST, holding no
+        // other daemon lock (`intern_base_for_project` takes `projects` then
+        // `bases` with no overlap, both released before we proceed). This seeds
+        // the per-session working set below and keeps the `bases -> projects ->
+        // sessions` order: every subsequent lock here is acquired AFTER `bases`
+        // is released.
+        let base = self.intern_base_for_project(project_id);
 
         let (project_name, canonical_root_text, session_count) = {
             let mut projects = self.projects.write();
@@ -597,9 +690,21 @@ impl DaemonState {
             )
         };
 
+        // Seed the session's working set with ONE entry: the active project, its
+        // interned shared base, and an EMPTY overlay (Phase 1). INERT: no route
+        // reads it yet, and no path writes the overlay (no-overlay-writes
+        // invariant). If interning returned `None` (project vanished mid-open) the
+        // working set stays empty; `session_runtime` still resolves via
+        // `active_project_id`, so behavior is unchanged.
+        let mut working_set = WorkingSet::new();
+        if let Some(base) = base {
+            working_set.add(project_id.to_string(), base);
+        }
+
         let session = SessionRecord {
             session_id: session_id.clone(),
-            project_id: project_id.to_string(),
+            active_project_id: project_id.to_string(),
+            working_set: Arc::new(RwLock::new(working_set)),
             client_name: request.client_name.clone(),
             pid: request.pid,
             opened_at: now,
@@ -801,7 +906,7 @@ impl DaemonState {
             .filter_map(|session_id| sessions.get(session_id))
             .map(|session| SessionSummary {
                 session_id: session.session_id.clone(),
-                project_id: session.project_id.clone(),
+                project_id: session.active_project_id.clone(),
                 client_name: session.client_name.clone(),
                 pid: session.pid,
                 opened_at_unix_secs: unix_seconds(session.opened_at),
@@ -845,7 +950,7 @@ impl DaemonState {
                 .get(session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
             projects
-                .get(&session.project_id)
+                .get(&session.active_project_id)
                 .map(|project| project.canonical_root.clone())
         };
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
@@ -876,7 +981,7 @@ impl DaemonState {
                 let sessions = self.sessions.read();
                 sessions
                     .get(session_id)
-                    .map(|s| s.project_id.clone())
+                    .map(|s| s.active_project_id.clone())
                     .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?
             };
             let needs_reassign = current_project_id != target_project_id;
@@ -930,8 +1035,14 @@ impl DaemonState {
 
         // Update the session's project association *after* the projects lock is
         // released to maintain lock order (projects before sessions everywhere).
+        // ponytail: Phase 1 retarget updates ONLY `active_project_id` (the field
+        // `session_runtime` resolves), leaving the seeded `working_set` entry
+        // pointing at the pre-retarget project. This is invisible in Phase 0/1
+        // because NO route reads the working set yet; Phase 2's additive
+        // `index_folder(add:true)` / `set_active_project` path owns re-seeding the
+        // working set on a project change. No overlay is written here (invariant).
         if needs_reassign && let Some(session) = self.sessions.write().get_mut(session_id) {
-            session.project_id = target_project_id;
+            session.active_project_id = target_project_id;
             session
                 .last_seen_at
                 .store(now_epoch_millis(), Ordering::Relaxed);
@@ -950,17 +1061,21 @@ impl DaemonState {
 
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
         // Acquire projects read lock BEFORE sessions read lock so that
-        // the project_id we read from the session is still valid while
-        // we look it up in the projects map.
+        // the active_project_id we read from the session is still valid while
+        // we look it up in the projects map. (Lock order: projects -> sessions;
+        // `bases` is not taken here.) Feature 012, Phase 1: resolution is via
+        // `active_project_id` — the single active project — so the single-project
+        // path is byte-for-byte unchanged; the session's `working_set` is NOT read
+        // here (cross-project routing is Phase 2/3).
         let projects = self.projects.read();
         let session = {
             let sessions = self.sessions.read();
             sessions.get(session_id)?.clone()
         };
-        let project = projects.get(&session.project_id)?;
+        let project = projects.get(&session.active_project_id)?;
         Some(SessionRuntime {
             canonical_root: project.canonical_root.clone(),
-            project_id: session.project_id.clone(),
+            project_id: session.active_project_id.clone(),
             session_id: session.session_id.clone(),
             index: Arc::clone(&project.index),
             token_stats: Arc::clone(&project.token_stats),
@@ -1695,6 +1810,32 @@ impl ProjectInstance {
             activation_state: ActivationState::Inactive,
             server,
         })
+    }
+
+    /// Build a candidate [`IndexBase`] for this project (Feature 012, Phase 0).
+    ///
+    /// Wraps the project's CURRENT published snapshot (`index.read()` ->
+    /// `Arc<LiveIndex>`, the SAME shared handle the project already serves, so no
+    /// second store and no `LiveIndex` change — Principle I) with a sharable
+    /// [`BaseKey`] = `(canonical_root, commit)`. `commit` is the git HEAD sha for
+    /// the root, or [`CommitId::Dirtyless`] when the root is not a git repository
+    /// (so a non-git tree still has a stable, shareable identity).
+    ///
+    /// The returned base carries `base_generation = 1` (the start value). This is
+    /// a CANDIDATE only: [`DaemonState::intern_base`] is the authority on
+    /// generation and identity. On an intern cache hit it returns the EXISTING
+    /// shared `Arc<IndexBase>` (SC-002) and discards this candidate; on a miss it
+    /// re-stamps the generation from the daemon's monotonic sequence before
+    /// publishing. Callers should therefore route every base through
+    /// `intern_base` rather than using this value directly.
+    fn base(&self) -> Arc<IndexBase> {
+        let index = Arc::clone(&self.index.read());
+        let commit = match crate::git::head_sha(&self.canonical_root) {
+            Ok(sha) => CommitId::Sha(sha),
+            Err(_) => CommitId::Dirtyless,
+        };
+        let key = BaseKey::new(self.canonical_root.clone(), commit);
+        Arc::new(IndexBase::new(key, index, 1))
     }
 
     /// Activate background tasks (watcher + git temporal) for this project.
@@ -2936,6 +3077,280 @@ mod tests {
         assert_eq!(state.health().session_count, 2);
     }
 
+    /// Test-only: pull the single interned `Arc<IndexBase>` a session's working
+    /// set was seeded with (Feature 012, Phase 0/1). Panics if the session or its
+    /// seeded entry is missing — both are invariants the open path guarantees.
+    fn session_seeded_base(state: &DaemonState, session_id: &str) -> Arc<IndexBase> {
+        let sessions = state.sessions.read();
+        let session = sessions.get(session_id).expect("session present");
+        let working_set = session.working_set.read();
+        assert_eq!(
+            working_set.len(),
+            1,
+            "Phase 1 seeds exactly one working-set entry"
+        );
+        let entry = working_set
+            .get(&session.active_project_id)
+            .expect("seeded entry for the active project");
+        Arc::clone(&entry.base)
+    }
+
+    // ── Feature 012 Phase 0 — base interning shares one Arc<IndexBase> (SC-002) ──
+    #[test]
+    fn test_open_same_root_twice_shares_interned_base() {
+        let project = project_dir("symforge-daemon-base-intern");
+        let state = DaemonState::new();
+
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(11),
+            })
+            .expect("first session");
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                // Same logical root via a `.` component -> same canonical root,
+                // same BaseKey -> MUST intern to the same Arc<IndexBase>.
+                project_root: project.path().join(".").display().to_string(),
+                client_name: "codex".to_string(),
+                pid: Some(22),
+            })
+            .expect("second session");
+
+        assert_eq!(
+            first.project_id, second.project_id,
+            "same canonical root -> same project"
+        );
+
+        let base_first = session_seeded_base(&state, &first.session_id);
+        let base_second = session_seeded_base(&state, &second.session_id);
+
+        // SC-002: two opens on the same (root, commit) share ONE base allocation.
+        assert!(
+            Arc::ptr_eq(&base_first, &base_second),
+            "two sessions on the same (root, commit) must share one Arc<IndexBase>"
+        );
+        // The intern table holds exactly one base for the single key.
+        assert_eq!(
+            state.bases.read().len(),
+            1,
+            "one canonical root -> one interned base"
+        );
+    }
+
+    // ── Feature 012 Phase 0 — distinct roots intern distinct bases ──────────────
+    #[test]
+    fn test_open_distinct_roots_intern_distinct_bases() {
+        let project_a = project_dir("symforge-daemon-base-distinct-a");
+        let project_b = project_dir("symforge-daemon-base-distinct-b");
+        let state = DaemonState::new();
+
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("project a session");
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_b.path().display().to_string(),
+                client_name: "codex".to_string(),
+                pid: None,
+            })
+            .expect("project b session");
+
+        let base_a = session_seeded_base(&state, &first.session_id);
+        let base_b = session_seeded_base(&state, &second.session_id);
+
+        assert!(
+            !Arc::ptr_eq(&base_a, &base_b),
+            "distinct roots must NOT share a base"
+        );
+        assert_ne!(
+            base_a.key, base_b.key,
+            "distinct roots -> distinct BaseKeys"
+        );
+        assert_eq!(
+            state.bases.read().len(),
+            2,
+            "two roots -> two interned bases"
+        );
+    }
+
+    // ── Feature 012 Phase 1 — seeded working set is single-entry with an EMPTY
+    //    overlay (the no-overlay-writes invariant) ───────────────────────────────
+    #[test]
+    fn test_session_working_set_seeded_single_entry_empty_overlay() {
+        let project = project_dir("symforge-daemon-ws-seed");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("session");
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session present");
+        assert_eq!(
+            session.active_project_id, opened.project_id,
+            "active project id is the opened project"
+        );
+        let working_set = session.working_set.read();
+        assert_eq!(working_set.len(), 1, "exactly one seeded entry");
+        let entry = working_set
+            .get(&opened.project_id)
+            .expect("seeded entry keyed by the active project");
+        // INVARIANT: the seeded overlay is EMPTY (no US1 code path writes one).
+        assert_eq!(
+            entry.overlay.delta_count(),
+            0,
+            "seeded overlay must be empty (no-overlay-writes invariant)"
+        );
+        // The seeded overlay is fenced to the seeded base.
+        assert!(
+            entry.overlay.is_valid_against(&entry.base),
+            "seeded overlay must be fenced to its base"
+        );
+    }
+
+    // ── Feature 012 Phase 0/1 — multi-threaded lock stress (critique #4) ─────────
+    //
+    // The mandated `--test-threads=1` suite CANNOT surface a deadlock on the new
+    // `bases -> projects -> sessions` hot path, so THIS test spins REAL OS threads
+    // that hammer the lock acquisition order concurrently. Threads churn:
+    //   * `open_project_session` (intern_base -> projects.write -> sessions.write),
+    //   * `session_runtime` (projects.read -> sessions.read, the hot read path),
+    //   * `close_session` (projects.write -> sessions.write),
+    //   * `health` / `list_projects` (independent reads),
+    // over a SHARED pool of roots so the SAME BaseKey is interned from many threads
+    // (the contended path) AND distinct roots are interned (table growth). A
+    // lock-order inversion would deadlock; a panic in any thread is propagated by
+    // `join().expect(..)`. The test passing == no deadlock and no panic under load.
+    #[test]
+    fn test_concurrent_session_lifecycle_no_deadlock_or_panic() {
+        use std::sync::Arc as StdArc;
+
+        // A shared pool of roots: same roots reused across threads force repeated
+        // interning of identical BaseKeys; the per-thread index adds fresh roots.
+        let shared_roots: Vec<TempDir> = (0..4)
+            .map(|i| project_dir(&format!("symforge-stress-shared-{i}")))
+            .collect();
+        let shared_root_paths: StdArc<Vec<String>> = StdArc::new(
+            shared_roots
+                .iter()
+                .map(|d| d.path().display().to_string())
+                .collect(),
+        );
+
+        let state = StdArc::new(DaemonState::new());
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 40;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let state = StdArc::clone(&state);
+            let shared_root_paths = StdArc::clone(&shared_root_paths);
+            // Each thread also owns a private root so distinct-root interning and
+            // project churn (load -> activate -> remove on last close) is exercised.
+            let private_root = project_dir(&format!("symforge-stress-private-{t}"));
+            let private_path = private_root.path().display().to_string();
+            handles.push(std::thread::spawn(move || {
+                // Keep the TempDir alive for the whole thread body.
+                let _private_root = private_root;
+                for i in 0..ITERS {
+                    // Alternate between a shared root (contended intern of the same
+                    // BaseKey) and this thread's private root (table growth/churn).
+                    let root = if i % 2 == 0 {
+                        shared_root_paths[(t + i) % shared_root_paths.len()].clone()
+                    } else {
+                        private_path.clone()
+                    };
+
+                    // PRE-EXISTING benign race (NOT a Feature 012 regression): the
+                    // fast path of `open_project_session` checks `projects` under a
+                    // read lock, drops it, then re-acquires write to register the
+                    // session; a concurrent `close_session` can remove the project
+                    // (its last session closed) in that window, so the open fails
+                    // loud with "was removed between check and session registration".
+                    // This `Err` (confirmed present in `HEAD` before this branch)
+                    // is fail-LOUD, not a deadlock or corruption, so it is OUTSIDE
+                    // this test's mandate (no deadlock / no panic on the new
+                    // `bases -> projects -> sessions` locks). We tolerate it with a
+                    // bounded retry; if every attempt loses the race we skip the
+                    // iteration. A genuine lock-order inversion would instead HANG
+                    // (caught at join) and never reach this branch.
+                    let mut opened = None;
+                    for _ in 0..16 {
+                        match state.open_project_session(OpenProjectRequest {
+                            project_root: root.clone(),
+                            client_name: "stress".to_string(),
+                            pid: Some((t * 1000 + i) as u32),
+                        }) {
+                            Ok(resp) => {
+                                opened = Some(resp);
+                                break;
+                            }
+                            // Only the known open-vs-close race is tolerated; any
+                            // other error is a real failure and must surface.
+                            Err(err) => {
+                                let msg = err.to_string();
+                                assert!(
+                                    msg.contains(
+                                        "was removed between check and session registration"
+                                    ),
+                                    "unexpected open failure under contention: {msg}"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                    let Some(opened) = opened else {
+                        // Lost the benign race on every attempt this iteration.
+                        continue;
+                    };
+
+                    // Hot read path: resolves the active project via the new field.
+                    // (May be `None` if a concurrent close already tore the project
+                    // down — also benign and not a deadlock.)
+                    let _ = state.session_runtime(&opened.session_id);
+
+                    // Independent reads exercised concurrently with writers.
+                    let _ = state.health();
+                    let _ = state.list_projects();
+                    let _ = state.list_sessions(&opened.project_id);
+
+                    // Close: projects.write -> sessions.write (the order under test).
+                    let _ = state.close_session(&opened.session_id);
+                }
+            }));
+        }
+
+        for handle in handles {
+            // A deadlock would hang here (caught by the harness/CI timeout); a panic
+            // in any worker is surfaced as a test failure via expect.
+            handle.join().expect("stress worker thread panicked");
+        }
+
+        // Keep the shared TempDirs alive until all threads have joined.
+        drop(shared_roots);
+
+        // After every session is closed, no projects or sessions should remain.
+        assert_eq!(
+            state.health().session_count,
+            0,
+            "all sessions closed after the stress loop"
+        );
+        assert!(
+            state.list_projects().is_empty(),
+            "all projects removed after their last session closed"
+        );
+    }
+
     #[test]
     fn test_index_folder_for_session_refuses_sensitive_root() {
         // Regression: the daemon path historically never called the sensitive
@@ -3056,7 +3471,8 @@ mod tests {
             session_id.clone(),
             SessionRecord {
                 session_id: session_id.clone(),
-                project_id: "missing-project".to_string(),
+                active_project_id: "missing-project".to_string(),
+                working_set: Arc::new(RwLock::new(WorkingSet::new())),
                 client_name: "codex".to_string(),
                 pid: Some(777),
                 opened_at: SystemTime::now(),
