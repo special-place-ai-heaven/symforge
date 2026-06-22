@@ -86,6 +86,7 @@ async fn repeated_index_folder_preserves_file_count() {
         .index_folder(Parameters(IndexFolderInput {
             path: project_a.path().display().to_string(),
             idempotency_key: None,
+            add: None,
         }))
         .await;
     assert!(
@@ -97,6 +98,7 @@ async fn repeated_index_folder_preserves_file_count() {
         .index_folder(Parameters(IndexFolderInput {
             path: project_b.path().display().to_string(),
             idempotency_key: None,
+            add: None,
         }))
         .await;
     assert!(

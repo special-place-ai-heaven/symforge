@@ -90,6 +90,19 @@ pub struct StelRequest {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
+    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias for the
+    /// underlying cross-project reads. Mutually exclusive with `projects`; must be
+    /// a project id/alias, never a path. Omitting both keeps today's active-project
+    /// behavior. Surface parity only (Principle VII): the compact facade carries
+    /// the param but does not yet route it into its planned read steps — direct
+    /// `search_symbols`/`search_text`/`find_references` are the Phase 3 vehicle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
+    /// id/alias, or `["*"]` for all. Mutually exclusive with `project`; an empty
+    /// list is rejected. Daemon-only; surface parity only (see `project`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<Vec<String>>,
 }
 
 /// MCP call input for `symforge` — production [`StelRequest`] plus optional Phase 0 harness fields.
@@ -387,10 +400,7 @@ impl GoldenRouteRow {
         StelRequest {
             query: self.query.clone(),
             intent: self.intent.or(Some(IntentBucket::Auto)),
-            path: None,
-            symbol: None,
-            max_tokens: None,
-            preview: None,
+            ..Default::default()
         }
     }
 }
@@ -432,6 +442,8 @@ mod tests {
             symbol: None,
             max_tokens: Some(1000),
             preview: Some(false),
+            project: None,
+            projects: None,
         };
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(value["query"], "who calls hard_link");

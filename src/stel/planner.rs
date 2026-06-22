@@ -1187,11 +1187,7 @@ mod tests {
     fn plan_summary_uses_planned_tool() {
         let plan = build_plan(&StelRequest {
             query: "who references cfg_if".to_string(),
-            intent: None,
-            path: None,
-            symbol: None,
-            max_tokens: None,
-            preview: None,
+            ..Default::default()
         });
         let summary = plan_summary_line(&plan);
         assert!(summary.contains("find_references"));

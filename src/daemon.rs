@@ -19,7 +19,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::live_index::view::{BaseKey, CommitId, IndexBase, WorkingSet};
+use crate::live_index::view::{BaseKey, CommitId, IndexBase, Targets, WorkingSet};
 use crate::live_index::{self, SharedIndex};
 use crate::paths;
 use crate::protocol::SymForgeServer;
@@ -577,6 +577,14 @@ struct SessionRuntime {
     symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
     /// Cached `SymForgeServer` clone — cheap because all inner state is `Arc`-wrapped.
     server: SymForgeServer,
+    /// Feature 012 (Phase 3): the session's working set, shared by `Arc` so the
+    /// cross-project read route (`search_symbols`/`search_text`/`find_references`
+    /// with `project`/`projects`) can read the open projects directly. The single
+    /// active-project path NEVER reads this (it dispatches to `server` as before),
+    /// so single-project behavior is byte-identical. No overlay is written. The
+    /// active project's id for the targeting contract is `project_id` above (the
+    /// default target when neither `project` nor `projects` is supplied).
+    working_set: Arc<RwLock<WorkingSet>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,66 +805,76 @@ impl DaemonState {
 
     pub fn close_session(&self, session_id: &str) -> Option<CloseSessionResponse> {
         // Lock ordering: projects write first, then sessions write.
-        // Scan all projects instead of relying on session.project_id,
-        // which can be stale if index_folder_for_session reassigned concurrently.
-        let mut project_removed = false;
-        let (project_id, remaining_sessions) = {
-            let mut projects = self.projects.write();
-            let owning_project_id = projects
-                .iter()
-                .find(|(_, project)| project.session_ids.contains(session_id))
-                .map(|(id, _)| id.clone());
+        // Scan ALL projects instead of relying on session.project_id, which can be
+        // stale if index_folder_for_session reassigned concurrently.
+        //
+        // Feature 012 (Phase 2): a session may now reference MORE THAN ONE project
+        // (the active one plus any additively-opened ones in its working set), so
+        // closing it must detach the session from EVERY project that lists it and
+        // tear down each whose `session_ids` then empties — not just the first
+        // match. Leaving an additively-opened project's `session_ids` pointing at a
+        // closed session would leak the project forever. The reported `project_id`
+        // / `remaining_sessions` / `project_removed` describe the session's ACTIVE
+        // project (its primary association), preserving the wire contract; sibling
+        // additive projects are reaped silently.
+        let active_project_id = self
+            .sessions
+            .read()
+            .get(session_id)
+            .map(|s| s.active_project_id.clone());
 
-            match owning_project_id {
-                Some(pid) => {
+        let mut active_remaining = 0usize;
+        let mut active_removed = false;
+        let mut active_pid_seen = false;
+        {
+            let mut projects = self.projects.write();
+            // All projects that list this session (active + additive siblings).
+            let owning: Vec<String> = projects
+                .iter()
+                .filter(|(_, project)| project.session_ids.contains(session_id))
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for pid in owning {
+                let is_active = active_project_id.as_deref() == Some(pid.as_str());
+                let remaining = {
                     let Some(project) = projects.get_mut(&pid) else {
-                        tracing::warn!(
-                            project_id = %pid,
-                            session_id,
-                            "daemon close observed stale owning project; returning orphan close response"
-                        );
-                        let session = self.sessions.write().remove(session_id)?;
-                        return Some(CloseSessionResponse {
-                            session_id: session.session_id,
-                            project_id: "orphan".to_string(),
-                            remaining_sessions: 0,
-                            project_removed: false,
-                        });
+                        continue;
                     };
                     project.session_ids.remove(session_id);
-                    let remaining = project.session_ids.len();
-                    if remaining == 0 {
-                        if let Some(mut removed) = projects.remove(&pid) {
-                            abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
-                        }
-                        project_removed = true;
+                    project.session_ids.len()
+                };
+                let removed = if remaining == 0 {
+                    if let Some(mut removed) = projects.remove(&pid) {
+                        abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
                     }
-                    (pid, remaining)
-                }
-                None => {
-                    // Session not found in any project -- it was never registered under
-                    // a project or its project was already removed. Clean up the session
-                    // record only. We return "orphan" as the project_id because
-                    // session.project_id may be stale (set at open time and never
-                    // updated if index_folder_for_session later reassigned it).
-                    let session = self.sessions.write().remove(session_id)?;
-                    return Some(CloseSessionResponse {
-                        session_id: session.session_id,
-                        project_id: "orphan".to_string(),
-                        remaining_sessions: 0,
-                        project_removed: false,
-                    });
+                    true
+                } else {
+                    false
+                };
+                if is_active {
+                    active_pid_seen = true;
+                    active_remaining = remaining;
+                    active_removed = removed;
                 }
             }
-        };
+        }
 
         let session = self.sessions.write().remove(session_id)?;
+
+        // If the session referenced no project, or its active project was already
+        // gone (e.g. concurrent reassignment), report an orphan close — the
+        // session record is still cleaned up above.
+        let project_id = match (active_project_id, active_pid_seen) {
+            (Some(pid), true) => pid,
+            _ => "orphan".to_string(),
+        };
 
         Some(CloseSessionResponse {
             session_id: session.session_id,
             project_id,
-            remaining_sessions,
-            project_removed,
+            remaining_sessions: active_remaining,
+            project_removed: active_removed,
         })
     }
 
@@ -943,6 +961,17 @@ impl DaemonState {
             ));
         }
         let target_project_id = project_key(&target_root);
+
+        // Feature 012 (Phase 2): ADDITIVE open. A NEW code path, distinct from
+        // the destructive `needs_reassign` retarget below: it adds `target_root`
+        // as a SECOND project in the session's working set (intern its base, join
+        // `session_ids` additively, `working_set.add(..)`) WITHOUT evicting the
+        // current project or changing `active_project_id`. This is what enables
+        // cross-project reads (Phase 3). No overlay is written (invariant).
+        if input.add == Some(true) {
+            return self.index_folder_additive(session_id, &target_project_id, &target_root);
+        }
+
         let current_session_root = {
             let projects = self.projects.read();
             let sessions = self.sessions.read();
@@ -1035,17 +1064,38 @@ impl DaemonState {
 
         // Update the session's project association *after* the projects lock is
         // released to maintain lock order (projects before sessions everywhere).
-        // ponytail: Phase 1 retarget updates ONLY `active_project_id` (the field
-        // `session_runtime` resolves), leaving the seeded `working_set` entry
-        // pointing at the pre-retarget project. This is invisible in Phase 0/1
-        // because NO route reads the working set yet; Phase 2's additive
-        // `index_folder(add:true)` / `set_active_project` path owns re-seeding the
-        // working set on a project change. No overlay is written here (invariant).
-        if needs_reassign && let Some(session) = self.sessions.write().get_mut(session_id) {
-            session.active_project_id = target_project_id;
-            session
-                .last_seen_at
-                .store(now_epoch_millis(), Ordering::Relaxed);
+        if needs_reassign {
+            // Feature 012 (Phase 2) — CLOSE THE RETARGET SEAM. Phase 0/1 updated
+            // ONLY `active_project_id`, leaving the seeded `working_set` entry
+            // pointing at the pre-retarget (now-evicted) project, so the working
+            // set was inconsistent with the active project. Now that Phase 3
+            // reads the working set, re-seed it: swap the OLD active entry for the
+            // freshly retargeted project + its interned base + a fresh EMPTY
+            // overlay. Additively-opened sibling projects (if any) are left
+            // intact — retarget only swaps the ACTIVE slot. The base is interned
+            // FIRST, holding no session lock (`intern_base_for_project` takes
+            // `projects` then `bases` with no overlap), then applied under
+            // `sessions.write()`. No overlay is written (invariant).
+            let new_base = self.intern_base_for_project(&target_project_id);
+            if let Some(session) = self.sessions.write().get_mut(session_id) {
+                let old_active =
+                    std::mem::replace(&mut session.active_project_id, target_project_id.clone());
+                if let Some(base) = new_base {
+                    let mut working_set = session.working_set.write();
+                    // Drop the stale active entry (its project was evicted on the
+                    // retarget) before adding the new active project. If `add`
+                    // already holds an entry for `target_project_id` (an additive
+                    // open that we are now promoting to active), it is replaced
+                    // with a fresh overlay — still single-overlay, still empty.
+                    if old_active != target_project_id {
+                        working_set.remove(&old_active);
+                    }
+                    working_set.add(target_project_id.clone(), base);
+                }
+                session
+                    .last_seen_at
+                    .store(now_epoch_millis(), Ordering::Relaxed);
+            }
         }
 
         let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
@@ -1059,14 +1109,184 @@ impl DaemonState {
         Ok(output)
     }
 
+    /// Feature 012 (Phase 2): the ADDITIVE `index_folder(add:true)` code path.
+    ///
+    /// Opens `target_root` as an ADDITIONAL project in `session_id`'s working set
+    /// without retargeting: the session keeps its active project and gains this
+    /// one, so a later cross-project read can target both. Concretely it
+    /// (1) loads+activates the target project if not already loaded and joins the
+    /// session to it additively (no evict, no `active_project_id` change), then
+    /// (2) interns the target base and `working_set.add(..)`s it with a fresh
+    /// EMPTY overlay. Re-adding an already-open project re-indexes it and refreshes
+    /// its working-set entry (fresh empty overlay) — idempotent at the open level.
+    ///
+    /// LOCK ORDER (`bases -> projects -> sessions`): the `projects` write guard is
+    /// fully released before `intern_base_for_project` (which takes `projects`
+    /// then `bases` with no overlap) and before `sessions.write()`. No overlay is
+    /// written (invariant). No idempotency-key replay here — additive opens are
+    /// not part of the retarget replay ledger.
+    fn index_folder_additive(
+        &self,
+        session_id: &str,
+        target_project_id: &str,
+        target_root: &Path,
+    ) -> anyhow::Result<String> {
+        // (1) Load/activate the target project if absent and join the session to
+        // it additively, then reload to index the current tree. All project-map
+        // mutation is scoped to this block so the write guard is released before
+        // we touch `bases`/`sessions` below (lock order).
+        let (file_count, symbol_count) = {
+            let mut projects = self.projects.write();
+
+            // Confirm the session exists (fail loud on an unknown session) under
+            // the same projects guard ordering used elsewhere.
+            {
+                let sessions = self.sessions.read();
+                if !sessions.contains_key(session_id) {
+                    return Err(anyhow::anyhow!("unknown session '{session_id}'"));
+                }
+            }
+
+            if !projects.contains_key(target_project_id) {
+                let mut project = ProjectInstance::load(target_root)?;
+                debug_assert_eq!(
+                    project.activation_state,
+                    ActivationState::Inactive,
+                    "freshly loaded project must be Inactive"
+                );
+                project.activate();
+                projects.insert(target_project_id.to_string(), project);
+            }
+
+            let target_project = projects
+                .get_mut(target_project_id)
+                .ok_or_else(|| anyhow::anyhow!("missing target project after load"))?;
+            // Additive join: the session now references this project too.
+            target_project.session_ids.insert(session_id.to_string());
+            target_project.reload(target_root)?
+        }; // projects write guard released here
+
+        // (2) Attach the freshly-indexed project to the session's working set
+        // (intern base under `bases`, join session_ids, add a fresh EMPTY overlay)
+        // via the shared `add_project_to_session` helper — same lock order, one
+        // implementation of the attach step.
+        if !self.add_project_to_session(session_id, target_project_id) {
+            return Err(anyhow::anyhow!(
+                "failed to attach project to session working set after additive load"
+            ));
+        }
+
+        Ok(format!(
+            "Indexed {file_count} files, {symbol_count} symbols (added to working set)."
+        ))
+    }
+
+    /// Feature 012 (Phase 2): add an already-loaded project to a session's working
+    /// set as an additional, non-active project. Returns `false` if the session or
+    /// the project is unknown. The base is interned FIRST (no session lock held)
+    /// to preserve the `bases -> projects -> sessions` order; a fresh EMPTY overlay
+    /// is attached (no overlay write). Idempotent: re-adding refreshes the entry.
+    fn add_project_to_session(&self, session_id: &str, project_id: &str) -> bool {
+        let Some(base) = self.intern_base_for_project(project_id) else {
+            return false;
+        };
+        {
+            let mut projects = self.projects.write();
+            let Some(project) = projects.get_mut(project_id) else {
+                return false;
+            };
+            project.session_ids.insert(session_id.to_string());
+        }
+        match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                session
+                    .working_set
+                    .write()
+                    .add(project_id.to_string(), base);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Feature 012 (Phase 2): set the session's ACTIVE project to one already in
+    /// its working set. Returns `false` if the session is unknown or `project_id`
+    /// is not an open working-set entry (cannot activate a project that is not
+    /// open). Only flips `active_project_id`; the working set is untouched (the
+    /// target entry already exists). No overlay is written.
+    //
+    // ponytail: explicit working-set management seam. It has no production route
+    // yet — the DEFERRED "dedicated working-set management tool" (US-follow-up)
+    // owns wiring it to an MCP verb. Exercised by daemon unit tests today; allow
+    // dead_code so the server build (dead-code-on) stays green until that tool
+    // lands, rather than deleting a vetted, tested primitive.
+    #[allow(dead_code)]
+    fn set_active_project(&self, session_id: &str, project_id: &str) -> bool {
+        match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                let is_open = session.working_set.read().get(project_id).is_some();
+                if !is_open {
+                    return false;
+                }
+                session.active_project_id = project_id.to_string();
+                session
+                    .last_seen_at
+                    .store(now_epoch_millis(), Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Feature 012 (Phase 2): remove a project from a session's working set.
+    /// Refuses (returns `false`) to remove the ACTIVE project — the active slot
+    /// always resolves to a live working-set entry — or when the session/entry is
+    /// unknown. Also drops the session from the project's `session_ids` (and tears
+    /// the project down if that was its last session, matching retarget eviction).
+    //
+    // ponytail: companion seam to `set_active_project`; same DEFERRED working-set
+    // management tool owns its route. Tested in the daemon module; allow dead_code
+    // until the tool wires it.
+    #[allow(dead_code)]
+    fn remove_project_from_session(&self, session_id: &str, project_id: &str) -> bool {
+        // First detach from the working set, refusing the active project.
+        let removed = match self.sessions.write().get_mut(session_id) {
+            Some(session) => {
+                if session.active_project_id == project_id {
+                    return false;
+                }
+                let mut working_set = session.working_set.write();
+                working_set.remove(project_id).is_some()
+            }
+            None => false,
+        };
+        if !removed {
+            return false;
+        }
+        // Detach the session from the project; tear the project down if this was
+        // its last session (mirrors the retarget eviction in
+        // `index_folder_for_session`).
+        let mut projects = self.projects.write();
+        if let Some(project) = projects.get_mut(project_id) {
+            project.session_ids.remove(session_id);
+            if project.session_ids.is_empty()
+                && let Some(mut evicted) = projects.remove(project_id)
+            {
+                abort_watcher_task(&mut evicted.watcher_task, &evicted.stop_token);
+            }
+        }
+        true
+    }
+
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
         // Acquire projects read lock BEFORE sessions read lock so that
         // the active_project_id we read from the session is still valid while
         // we look it up in the projects map. (Lock order: projects -> sessions;
-        // `bases` is not taken here.) Feature 012, Phase 1: resolution is via
+        // `bases` is not taken here.) Feature 012: resolution is via
         // `active_project_id` — the single active project — so the single-project
-        // path is byte-for-byte unchanged; the session's `working_set` is NOT read
-        // here (cross-project routing is Phase 2/3).
+        // path is byte-for-byte unchanged. Phase 3 ALSO carries the session's
+        // `working_set` handle (an `Arc` clone, O(1)) so the cross-project read
+        // route can read it; the single-active path never touches it.
         let projects = self.projects.read();
         let session = {
             let sessions = self.sessions.read();
@@ -1081,6 +1301,7 @@ impl DaemonState {
             token_stats: Arc::clone(&project.token_stats),
             symbol_cache: Arc::clone(&project.symbol_cache),
             server: project.server.clone(),
+            working_set: Arc::clone(&session.working_set),
         })
     }
 
@@ -2425,12 +2646,332 @@ async fn close_session_handler(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Feature 012 (Phase 3): resolve the cross-project `project` / `projects`
+/// params into a [`Targets`] selector, enforcing the surface contract.
+///
+/// CONTRACT (FR-004 / SC-001):
+/// * BOTH omitted -> `One(active_project_id)` -> today's exact single-project
+///   behavior (the caller dispatches it down the unchanged per-project path).
+/// * `project` AND `projects` both set -> error (mutually exclusive).
+/// * `projects: []` -> error (no silent "all"; `["*"]` is the explicit all).
+/// * `projects: ["*"]` -> `All`.
+/// * `project` containing a path separator -> corrective error (targets key on
+///   project id/alias, NEVER a filesystem path).
+/// * `project: id` -> `One(id)`; `projects: [ids..]` -> `Subset(ids)`.
+///
+/// Returns `Err(message)` for any contract violation; the message is surfaced to
+/// the caller as an `InvalidRequest`-class tool response.
+fn resolve_targets(
+    project: Option<&str>,
+    projects: Option<&[String]>,
+    active_project_id: &str,
+) -> Result<Targets, String> {
+    match (project, projects) {
+        (Some(_), Some(_)) => Err(
+            "project and projects are mutually exclusive: pass exactly one (a single \
+             id in `project`, or a list/`[\"*\"]` in `projects`)."
+                .to_string(),
+        ),
+        (Some(id), None) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err("project must be a non-empty project id/alias.".to_string());
+            }
+            // Target keys on project id/alias, NEVER a filesystem path. A path
+            // here is a usage mistake -> corrective error pointing at the open
+            // verb. `project-<hash>` ids and aliases never contain separators.
+            if id.contains('/') || id.contains('\\') {
+                return Err(format!(
+                    "project must be a project id/alias, not a filesystem path ('{id}'). \
+                     Open the folder first with index_folder(path=\"{id}\", add=true), \
+                     then target it by its returned project id."
+                ));
+            }
+            Ok(Targets::One(id.to_string()))
+        }
+        (None, Some(list)) => {
+            if list.is_empty() {
+                return Err(
+                    "projects must not be empty: pass [\"*\"] for all open projects or an \
+                     explicit list of project ids."
+                        .to_string(),
+                );
+            }
+            if list.iter().any(|id| id == "*") {
+                // Any `*` in the list means "all open projects".
+                return Ok(Targets::All);
+            }
+            for id in list {
+                if id.contains('/') || id.contains('\\') {
+                    return Err(format!(
+                        "projects entries must be project ids/aliases, not filesystem paths \
+                         ('{id}'). Open the folder first with \
+                         index_folder(path=\"{id}\", add=true)."
+                    ));
+                }
+            }
+            Ok(Targets::Subset(list.to_vec()))
+        }
+        (None, None) => Ok(Targets::One(active_project_id.to_string())),
+    }
+}
+
+/// Whether `targets` resolves to exactly the single active project — the
+/// no-regression fast path that dispatches down the UNCHANGED per-project route
+/// (byte-identical to pre-012). Any other shape (`Subset`, `All`, or a single
+/// NON-active project) is a cross-project read served from the working set.
+fn targets_is_single_active(targets: &Targets, active_project_id: &str) -> bool {
+    matches!(targets, Targets::One(id) if id == active_project_id)
+}
+
+/// Validate that every explicitly-named target is actually OPEN in the working
+/// set, returning a clear "project not open" error otherwise (FR-004). `All`
+/// needs no check (it selects whatever is open). Unknown ids are a usage error,
+/// not a silent empty result.
+fn ensure_targets_open(targets: &Targets, working_set: &WorkingSet) -> Result<(), String> {
+    let missing: Vec<&String> = match targets {
+        Targets::One(id) => {
+            if working_set.get(id).is_none() {
+                vec![id]
+            } else {
+                Vec::new()
+            }
+        }
+        Targets::Subset(ids) => ids
+            .iter()
+            .filter(|id| working_set.get(id).is_none())
+            .collect(),
+        Targets::All => Vec::new(),
+    };
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "project not open: {}. Open it in this session first with \
+             index_folder(path=..., add=true), then retarget.",
+            missing
+                .iter()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+/// Feature 012 (Phase 3): execute one of the three cross-project READ verbs
+/// against the session's working set and format the attributed [`ProjectHit`]
+/// results with `── project: <id> ──` section headers (flat, no header, when a
+/// single project is targeted). This is reached ONLY when `targets` is not the
+/// single active project; the active-project path never enters here.
+///
+/// Read-only by construction: it calls the overlay-aware `WorkingSet` search
+/// methods, which never mutate an overlay (the no-overlay-writes invariant).
+fn execute_cross_project_read(
+    tool_name: &str,
+    params: serde_json::Value,
+    targets: Targets,
+    working_set: &WorkingSet,
+) -> anyhow::Result<String> {
+    ensure_targets_open(&targets, working_set).map_err(|message| anyhow::anyhow!("{message}"))?;
+
+    // Whether to render per-project section headers: a single targeted project
+    // renders flat (one project's hits, no header); 2+ get headers.
+    let multi = match &targets {
+        Targets::One(_) => false,
+        Targets::Subset(ids) => ids.len() > 1,
+        Targets::All => working_set.len() > 1,
+    };
+
+    match tool_name {
+        "search_symbols" => {
+            let input: SearchSymbolsInput = decode_params(params)?;
+            let query = input.query.as_deref().unwrap_or("").trim();
+            if query.is_empty() {
+                anyhow::bail!(
+                    "cross-project search_symbols requires a non-empty query \
+                     (browse mode is single-project only)."
+                );
+            }
+            let hits = working_set.search_symbols(&targets, query, input.kind.as_deref());
+            Ok(format_cross_project_symbols(&hits, query, multi))
+        }
+        "search_text" => {
+            let input: SearchTextInput = decode_params(params)?;
+            let regex = input.regex.unwrap_or(false);
+            let results = working_set
+                .search_text(
+                    &targets,
+                    input.query.as_deref(),
+                    input.terms.as_deref(),
+                    regex,
+                )
+                .map_err(|error| anyhow::anyhow!("text search failed: {error:?}"))?;
+            Ok(format_cross_project_text(&results, multi))
+        }
+        "find_references" => {
+            let input: FindReferencesInput = decode_params(params)?;
+            let name = input.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("cross-project find_references requires a non-empty name.");
+            }
+            let kind_filter = match input.kind.as_deref() {
+                Some("call") => Some(crate::domain::ReferenceKind::Call),
+                Some("import") => Some(crate::domain::ReferenceKind::Import),
+                Some("type_usage") => Some(crate::domain::ReferenceKind::TypeUsage),
+                Some("macro_use") => Some(crate::domain::ReferenceKind::MacroUse),
+                Some("value_use") => Some(crate::domain::ReferenceKind::ValueUse),
+                _ => None,
+            };
+            let hits = working_set.find_references(&targets, name, kind_filter, false);
+            Ok(format_cross_project_references(&hits, name, multi))
+        }
+        other => anyhow::bail!("'{other}' is not a cross-project read verb"),
+    }
+}
+
+/// Format cross-project symbol hits, grouped by project (`── project: <id> ──`
+/// headers when `multi`). Within a project, hits arrive already tier-sorted from
+/// the view search.
+fn format_cross_project_symbols(
+    hits: &[crate::live_index::view::ProjectHit<crate::live_index::view::ViewSymbolHit>],
+    query: &str,
+    multi: bool,
+) -> String {
+    if hits.is_empty() {
+        return format!("No symbols matching '{query}' in the targeted project(s).");
+    }
+    let mut out = String::new();
+    let mut current: Option<&str> = None;
+    let total = hits.len();
+    out.push_str(&format!("{total} matches across projects\n"));
+    for ph in hits {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let h = &ph.hit;
+        out.push_str(&format!(
+            "  {}: {} {}  ({})\n",
+            h.line, h.kind, h.name, h.path
+        ));
+    }
+    out
+}
+
+/// Format cross-project text-search results, grouped by project. Each project's
+/// `TextSearchResult` renders its files and per-line matches.
+fn format_cross_project_text(
+    results: &[crate::live_index::view::ProjectHit<crate::live_index::search::TextSearchResult>],
+    multi: bool,
+) -> String {
+    let total: usize = results.iter().map(|ph| ph.hit.total_matches).sum();
+    if total == 0 {
+        return "No text matches in the targeted project(s).".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!("{total} text matches across projects\n"));
+    for ph in results {
+        if ph.hit.files.is_empty() {
+            continue;
+        }
+        if multi {
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        for file in &ph.hit.files {
+            out.push_str(&format!("{}\n", file.path));
+            for m in &file.matches {
+                out.push_str(&format!("  {}: {}\n", m.line_number, m.line));
+            }
+        }
+    }
+    out
+}
+
+/// Format cross-project reference hits, grouped by project.
+fn format_cross_project_references(
+    hits: &[crate::live_index::view::ProjectHit<(String, crate::domain::ReferenceRecord)>],
+    name: &str,
+    multi: bool,
+) -> String {
+    if hits.is_empty() {
+        return format!("No references to '{name}' in the targeted project(s).");
+    }
+    let mut out = String::new();
+    let mut current: Option<&str> = None;
+    out.push_str(&format!("{} references across projects\n", hits.len()));
+    for ph in hits {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let (path, reference) = &ph.hit;
+        // `line_range` is zero-indexed in the engine; display 1-based.
+        out.push_str(&format!(
+            "  {}:{} [{:?}] {}\n",
+            path,
+            reference.line_range.0 + 1,
+            reference.kind,
+            reference.name
+        ));
+    }
+    out
+}
+
 async fn execute_tool_call(
     runtime: SessionRuntime,
     tool_name: &str,
     params: serde_json::Value,
 ) -> anyhow::Result<String> {
     runtime.token_stats.record_tool_call(tool_name);
+
+    // Feature 012 (Phase 3): cross-project READ route. For the three read verbs
+    // ONLY, peek the `project`/`projects` params and resolve a `Targets`. When it
+    // is the single active project (the default — both params omitted — or an
+    // explicit `project=<active id>`), fall through to the UNCHANGED per-project
+    // dispatch below (byte-identical no-regression). Any other target shape
+    // (`Subset`, `All`, or a single non-active project) is served here from the
+    // session's working set with attributed `── project: <id> ──` output. Edits,
+    // analyze_file_impact, orient, and meta verbs are NEVER routed here — they
+    // stay single-project on the active project (cross-project writes deferred).
+    if matches!(
+        tool_name,
+        "search_symbols" | "search_text" | "find_references"
+    ) {
+        #[derive(serde::Deserialize)]
+        struct CrossProjectPeek {
+            #[serde(default)]
+            project: Option<String>,
+            #[serde(default)]
+            projects: Option<Vec<String>>,
+        }
+        // A lenient peek: unrelated/invalid sibling fields must NOT make the real
+        // tool call fail here, so only the two targeting fields are extracted.
+        let peek: CrossProjectPeek =
+            serde_json::from_value(params.clone()).unwrap_or(CrossProjectPeek {
+                project: None,
+                projects: None,
+            });
+        let targets = resolve_targets(
+            peek.project.as_deref(),
+            peek.projects.as_deref(),
+            &runtime.project_id,
+        )
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+        if !targets_is_single_active(&targets, &runtime.project_id) {
+            let working_set = runtime.working_set.read();
+            return execute_cross_project_read(tool_name, params, targets, &working_set);
+        }
+        // else: single active project -> fall through to the unchanged path.
+    }
 
     // Use the cached server from ProjectInstance (cloned cheaply via Arc internals)
     // instead of constructing a new SymForgeServer per tool call.
@@ -3217,13 +3758,299 @@ mod tests {
         );
     }
 
-    // ── Feature 012 Phase 0/1 — multi-threaded lock stress (critique #4) ─────────
+    // ── Feature 012 Phase 3 — resolve_targets contract (FR-004 / SC-001) ─────────
+    #[test]
+    fn test_resolve_targets_contract() {
+        let active = "project-active";
+
+        // Both omitted -> One(active) -> today's behavior.
+        assert_eq!(
+            resolve_targets(None, None, active).unwrap(),
+            Targets::One(active.to_string())
+        );
+
+        // A single explicit id (the active one) -> One(active) (still the fast path).
+        assert_eq!(
+            resolve_targets(Some(active), None, active).unwrap(),
+            Targets::One(active.to_string())
+        );
+
+        // A single explicit OTHER id -> One(other) (cross-project, single target).
+        assert_eq!(
+            resolve_targets(Some("project-other"), None, active).unwrap(),
+            Targets::One("project-other".to_string())
+        );
+
+        // ["*"] -> All.
+        assert_eq!(
+            resolve_targets(None, Some(&["*".to_string()]), active).unwrap(),
+            Targets::All
+        );
+
+        // An explicit subset -> Subset.
+        assert_eq!(
+            resolve_targets(
+                None,
+                Some(&["project-a".to_string(), "project-b".to_string()]),
+                active
+            )
+            .unwrap(),
+            Targets::Subset(vec!["project-a".to_string(), "project-b".to_string()])
+        );
+
+        // Mutually exclusive -> error.
+        assert!(
+            resolve_targets(Some("project-a"), Some(&["project-b".to_string()]), active).is_err()
+        );
+
+        // Empty projects -> error (no silent All).
+        assert!(resolve_targets(None, Some(&[]), active).is_err());
+
+        // A filesystem path in `project=` -> corrective error pointing at add:true.
+        let err = resolve_targets(Some("E:/project/symforge"), None, active).unwrap_err();
+        assert!(
+            err.contains("index_folder") && err.contains("add"),
+            "path-in-project error must point at index_folder(add:true): {err}"
+        );
+        assert!(resolve_targets(Some("/abs/path"), None, active).is_err());
+
+        // A path inside `projects=` -> error too.
+        assert!(resolve_targets(None, Some(&["src/lib.rs".to_string()]), active).is_err());
+
+        // Empty/whitespace project id -> error.
+        assert!(resolve_targets(Some("   "), None, active).is_err());
+    }
+
+    #[test]
+    fn test_targets_is_single_active() {
+        let active = "project-active";
+        assert!(targets_is_single_active(
+            &Targets::One(active.to_string()),
+            active
+        ));
+        assert!(!targets_is_single_active(
+            &Targets::One("project-other".to_string()),
+            active
+        ));
+        assert!(!targets_is_single_active(&Targets::All, active));
+        assert!(!targets_is_single_active(
+            &Targets::Subset(vec![active.to_string()]),
+            active
+        ));
+    }
+
+    // ── Feature 012 Phase 2 — set_active_project / remove_project_from_session ───
+    #[test]
+    fn test_set_active_and_remove_project_management() {
+        let project_a = project_dir("symforge-mgmt-a");
+        let project_b = project_dir("symforge-mgmt-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "mgmt".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        // Additively open B in the same session.
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Working set now holds both; A is still active.
+        {
+            let sessions = state.sessions.read();
+            let session = sessions.get(&opened.session_id).expect("session");
+            let ws = session.working_set.read();
+            assert_eq!(ws.len(), 2, "working set holds A and B");
+            assert_eq!(session.active_project_id, active_a, "A still active");
+            assert!(ws.get(&active_a).is_some());
+            assert!(ws.get(&project_b_id).is_some());
+        }
+
+        // Cannot activate a project that is not open.
+        assert!(
+            !state.set_active_project(&opened.session_id, "project-not-open"),
+            "activating a non-open project must fail"
+        );
+        // Activate B (it is open).
+        assert!(
+            state.set_active_project(&opened.session_id, &project_b_id),
+            "activating an open project must succeed"
+        );
+        assert_eq!(
+            state
+                .sessions
+                .read()
+                .get(&opened.session_id)
+                .unwrap()
+                .active_project_id,
+            project_b_id,
+            "B is now active"
+        );
+
+        // Cannot remove the ACTIVE project (B).
+        assert!(
+            !state.remove_project_from_session(&opened.session_id, &project_b_id),
+            "removing the active project must be refused"
+        );
+        // Remove A (now non-active) -> succeeds and drops it from the working set.
+        assert!(
+            state.remove_project_from_session(&opened.session_id, &active_a),
+            "removing a non-active open project must succeed"
+        );
+        {
+            let sessions = state.sessions.read();
+            let ws = sessions.get(&opened.session_id).unwrap().working_set.read();
+            assert_eq!(ws.len(), 1, "only B remains");
+            assert!(ws.get(&active_a).is_none(), "A removed");
+            assert!(ws.get(&project_b_id).is_some(), "B remains");
+        }
+        // A had only this session -> it should be torn down as a project.
+        assert!(
+            !state
+                .list_projects()
+                .iter()
+                .any(|p| p.project_id == active_a),
+            "project A removed after its last session reference dropped"
+        );
+
+        let _ = state.close_session(&opened.session_id);
+    }
+
+    // ── Feature 012 Phase 2 — additive open keeps active project + adds to WS ────
+    #[test]
+    fn test_index_folder_additive_keeps_active_and_adds_to_working_set() {
+        let project_a = project_dir("symforge-additive-a");
+        let project_b = project_dir("symforge-additive-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "additive".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        let output = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                },
+            )
+            .expect("additive open B");
+        assert!(
+            output.contains("added to working set"),
+            "additive open should report working-set addition: {output}"
+        );
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        // Active project UNCHANGED (still A) — additive does not retarget.
+        assert_eq!(session.active_project_id, active_a, "A still active");
+        let ws = session.working_set.read();
+        assert_eq!(ws.len(), 2, "working set has A and B after additive open");
+        // Both overlays remain EMPTY (no-overlay-writes invariant).
+        for entry in ws.iter() {
+            assert_eq!(
+                entry.overlay.delta_count(),
+                0,
+                "no overlay write on additive open (project {})",
+                entry.project_id
+            );
+        }
+    }
+
+    // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
+    #[test]
+    fn test_retarget_reseeds_working_set_active_entry() {
+        let project_a = project_dir("symforge-reseed-a");
+        let project_b = project_dir("symforge-reseed-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        let state = DaemonState::new();
+
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reseed".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let active_a = opened.project_id.clone();
+
+        // Retarget (add: None) to B — the destructive path.
+        state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("retarget to B");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        assert_eq!(session.active_project_id, project_b_id, "active is now B");
+        let ws = session.working_set.read();
+        // The working set's active entry was re-seeded to B (the retarget seam fix):
+        // the stale A entry is gone and B is present and consistent with active.
+        assert_eq!(ws.len(), 1, "single re-seeded active entry after retarget");
+        assert!(
+            ws.get(&active_a).is_none(),
+            "stale pre-retarget entry (A) must be dropped"
+        );
+        let entry = ws
+            .get(&project_b_id)
+            .expect("working set re-seeded with the new active project B");
+        assert_eq!(
+            entry.overlay.delta_count(),
+            0,
+            "re-seeded overlay must be empty"
+        );
+        assert!(
+            entry.overlay.is_valid_against(&entry.base),
+            "re-seeded overlay fenced to its base"
+        );
+    }
+
+    // ── Feature 012 Phase 0/1/2 — multi-threaded lock stress (critique #4) ───────
     //
     // The mandated `--test-threads=1` suite CANNOT surface a deadlock on the new
     // `bases -> projects -> sessions` hot path, so THIS test spins REAL OS threads
     // that hammer the lock acquisition order concurrently. Threads churn:
     //   * `open_project_session` (intern_base -> projects.write -> sessions.write),
     //   * `session_runtime` (projects.read -> sessions.read, the hot read path),
+    //   * `index_folder_for_session` BOTH ways — the destructive `needs_reassign`
+    //     RETARGET (alternating target roots: projects.write mid-function juggling
+    //     + working-set re-seed + sessions.write) AND the additive `add:true` path
+    //     (load/activate + additive session_ids join + intern + working_set.add) —
+    //     this file's trickiest lock juggling, now under contention,
     //   * `close_session` (projects.write -> sessions.write),
     //   * `health` / `list_projects` (independent reads),
     // over a SHARED pool of roots so the SAME BaseKey is interned from many threads
@@ -3259,9 +4086,14 @@ mod tests {
             // project churn (load -> activate -> remove on last close) is exercised.
             let private_root = project_dir(&format!("symforge-stress-private-{t}"));
             let private_path = private_root.path().display().to_string();
+            // A second per-thread root to retarget/additively-open INTO under
+            // contention (forces `needs_reassign` retarget + add:true paths).
+            let retarget_root = project_dir(&format!("symforge-stress-retarget-{t}"));
+            let retarget_path = retarget_root.path().display().to_string();
             handles.push(std::thread::spawn(move || {
-                // Keep the TempDir alive for the whole thread body.
+                // Keep the TempDirs alive for the whole thread body.
                 let _private_root = private_root;
+                let _retarget_root = retarget_root;
                 for i in 0..ITERS {
                     // Alternate between a shared root (contended intern of the same
                     // BaseKey) and this thread's private root (table growth/churn).
@@ -3324,6 +4156,27 @@ mod tests {
                     let _ = state.list_projects();
                     let _ = state.list_sessions(&opened.project_id);
 
+                    // Feature 012 — exercise the trickiest lock juggling under
+                    // contention. Alternate the two `index_folder_for_session`
+                    // code paths so both run concurrently across threads:
+                    //   * even i -> destructive RETARGET (add: None) into the
+                    //     per-thread retarget root: projects.write mid-function
+                    //     juggling + working-set re-seed + sessions.write;
+                    //   * odd  i -> ADDITIVE add:true into the same root: additive
+                    //     session_ids join + intern + working_set.add.
+                    // Both can legitimately fail loud (e.g. the session was closed
+                    // by a concurrent worker, or the open lost the benign race);
+                    // those errors are tolerated — only a deadlock (hang at join)
+                    // or a panic is a failure here.
+                    let _ = state.index_folder_for_session(
+                        &opened.session_id,
+                        IndexFolderInput {
+                            path: retarget_path.clone(),
+                            idempotency_key: None,
+                            add: Some(i % 2 == 1),
+                        },
+                    );
+
                     // Close: projects.write -> sessions.write (the order under test).
                     let _ = state.close_session(&opened.session_id);
                 }
@@ -3378,6 +4231,7 @@ mod tests {
                 IndexFolderInput {
                     path: sensitive.to_string(),
                     idempotency_key: None,
+                    add: None,
                 },
             )
             .expect("refusal must be a clean Ok response, never an Err or panic");
@@ -3861,6 +4715,184 @@ mod tests {
             .expect("authorized close request")
             .error_for_status()
             .expect("authorized close status");
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Feature 012 US1 — cross-project query, end-to-end on the DAEMON path.
+    ///
+    /// Drives the real production data path on loopback HTTP:
+    ///   1. spawn a daemon, open a session bound to project A;
+    ///   2. `index_folder(B, add:true)` -> B joins the session's working set
+    ///      ADDITIVELY (A stays active);
+    ///   3. a `search_symbols` with `projects:["*"]` returns ATTRIBUTED hits from
+    ///      BOTH A and B (each project's distinctly-named symbol, under its own
+    ///      `── project: <id> ──` header);
+    ///   4. a `search_symbols` with NO project params returns ONLY the active
+    ///      project A's symbol (the no-regression default target).
+    ///
+    /// This is the US1 acceptance gate at the daemon level. Honest coverage limit:
+    /// it exercises the in-process front-end-absent daemon HTTP route directly
+    /// (the production topology's data path); a full MCP-client dogfood against a
+    /// built binary is a separate live-verify step.
+    #[tokio::test]
+    async fn test_cross_project_query_returns_attributed_hits_from_both_projects() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        let project_a = project_dir("symforge-xproj-a");
+        let project_b = project_dir("symforge-xproj-b");
+        // Distinctly-named symbols so attribution is unambiguous. Both share the
+        // substring "xproj_marker" so one query matches across both projects.
+        std::fs::write(
+            project_a.path().join("src").join("a.rs"),
+            "pub fn xproj_marker_alpha() -> u32 { 1 }\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("b.rs"),
+            "pub fn xproj_marker_beta() -> u32 { 2 }\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        // (1) Open a session bound to A.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "xproj".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_a_id = opened.project_id.clone();
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Index A through the session so its index is warm (open does a load; a
+        // reload via the active path guarantees the file is indexed).
+        let index_a = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_a.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("index A request")
+            .error_for_status()
+            .expect("index A status")
+            .text()
+            .await
+            .expect("index A body");
+        assert!(index_a.contains("Indexed"), "index A: {index_a}");
+
+        // (2) Additively open B.
+        let index_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: Some(true),
+            })
+            .send()
+            .await
+            .expect("index B request")
+            .error_for_status()
+            .expect("index B status")
+            .text()
+            .await
+            .expect("index B body");
+        assert!(
+            index_b.contains("added to working set"),
+            "additive index B: {index_b}"
+        );
+
+        // (3) Cross-project query with projects:["*"] -> hits from BOTH projects.
+        let cross = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"]
+            }))
+            .send()
+            .await
+            .expect("cross query request")
+            .error_for_status()
+            .expect("cross query status")
+            .text()
+            .await
+            .expect("cross query body");
+        assert!(
+            cross.contains("xproj_marker_alpha"),
+            "cross-project query must surface A's symbol: {cross}"
+        );
+        assert!(
+            cross.contains("xproj_marker_beta"),
+            "cross-project query must surface B's symbol: {cross}"
+        );
+        // Both projects attributed with their own section headers (ProjectHit ids).
+        assert!(
+            cross.contains(&format!("project: {project_a_id}")),
+            "A must be attributed by project id: {cross}"
+        );
+        assert!(
+            cross.contains(&format!("project: {project_b_id}")),
+            "B must be attributed by project id: {cross}"
+        );
+
+        // (4) No-params query -> ONLY the active project A (no-regression default).
+        let active_only = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker"
+            }))
+            .send()
+            .await
+            .expect("active query request")
+            .error_for_status()
+            .expect("active query status")
+            .text()
+            .await
+            .expect("active query body");
+        assert!(
+            active_only.contains("xproj_marker_alpha"),
+            "active-only query must surface A's symbol: {active_only}"
+        );
+        assert!(
+            !active_only.contains("xproj_marker_beta"),
+            "active-only query must NOT surface B's symbol (single active project): {active_only}"
+        );
+        // Single active project renders flat — no cross-project section header.
+        assert!(
+            !active_only.contains("project: "),
+            "single-active query must render flat (no project header): {active_only}"
+        );
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
@@ -4661,6 +5693,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             })
             .send()
             .await
@@ -4800,6 +5833,7 @@ mod tests {
             .index_folder(Parameters(IndexFolderInput {
                 path: project.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -4948,6 +5982,7 @@ mod tests {
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -5051,6 +6086,7 @@ mod tests {
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -5153,6 +6189,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await
@@ -5178,6 +6215,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await
@@ -5197,6 +6235,7 @@ mod tests {
             .json(&IndexFolderInput {
                 path: project_a.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
+                add: None,
             })
             .send()
             .await

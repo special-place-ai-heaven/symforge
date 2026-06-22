@@ -388,6 +388,15 @@ pub struct IndexFolderInput {
     /// Optional key used to replay an identical `index_folder` request safely.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Feature 012 (Phase 2): when true, OPEN this folder ADDITIVELY in the
+    /// current session's working set instead of retargeting. The session keeps
+    /// its existing active project AND gains this one, enabling cross-project
+    /// reads (`project`/`projects` on `search_symbols`/`search_text`/
+    /// `find_references`). Default/omitted = the existing retarget behavior
+    /// (FR-006, byte-identical). Multi-project requires the daemon; on stdio/embed
+    /// (no daemon) an `add:true` call honestly refuses (Principle VII).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub add: Option<bool>,
 }
 
 /// Input for `checkpoint_now`.
@@ -2486,6 +2495,31 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
     anchored_search_evidence(anchors, "reference anchors")
 }
 
+/// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
+/// the daemon-owned working set, which does not exist on the local (stdio/embed
+/// or daemon-degraded) execution path. When a `project`/`projects` param is
+/// present and we are about to run LOCALLY, return an honest refusal instead of
+/// silently ignoring the target and serving the active project only. Returns the
+/// refusal message when the request is cross-project, else `None`.
+fn local_cross_project_refusal(
+    project: Option<&str>,
+    projects: Option<&[String]>,
+) -> Option<String> {
+    let has_project = project.map(|p| !p.trim().is_empty()).unwrap_or(false);
+    let has_projects = projects.map(|p| !p.is_empty()).unwrap_or(false);
+    if has_project || has_projects {
+        Some(
+            "Cross-project queries (project/projects) require the daemon: the \
+             working set of open projects lives on the daemon transport, not on \
+             stdio/embed or while the daemon is unreachable. Start the daemon to \
+             query across projects."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
     match kind_filter {
         Some("call") => Some(ReferenceKind::Call),
@@ -4376,6 +4410,13 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("search_symbols", &params.0).await {
             return result;
         }
+        // Feature 012 (Phase 3): no daemon here -> no working set. Honest refusal
+        // for a cross-project request instead of a silent single-project answer.
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
+        }
         let options = match search_symbols_options_from_input(&params.0) {
             Ok(options) => options,
             Err(message) => return message,
@@ -4570,6 +4611,13 @@ impl SymForgeServer {
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
+        }
+        // Feature 012 (Phase 3): honest refusal for a cross-project request with
+        // no daemon (no working set on the local path).
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let limit = params.0.limit.unwrap_or(50) as usize;
@@ -6125,7 +6173,17 @@ impl SymForgeServer {
         )
     )]
     pub async fn index_folder(&self, params: Parameters<IndexFolderInput>) -> String {
+        let is_additive = params.0.add == Some(true);
         if let Some(result) = self.proxy_tool_call("index_folder", &params.0).await {
+            // Feature 012 (Phase 2): an ADDITIVE open does NOT retarget the
+            // session — it adds a second project to the daemon-owned working set
+            // while the active project (and this front-end's `repo_root` /
+            // `self.index`) stays put. So skip the retarget bookkeeping below;
+            // resetting the local index here would wrongly drop the active
+            // project's local-fallback state.
+            if is_additive {
+                return result;
+            }
             // The daemon has rebound the session to the new project. Update our
             // local repo_root so that local-fallback tools (what_changed,
             // analyze_file_impact) and ensure_local_index use the correct root
@@ -6148,6 +6206,18 @@ impl SymForgeServer {
             return result;
         }
         let input = params.0;
+        // Feature 012 (Phase 2), Principle VII honesty: additive multi-project
+        // opens live ONLY in the daemon-owned working set. On stdio/embed (no
+        // daemon) or when the daemon is unreachable, there is no working set to
+        // add to — refuse honestly instead of silently falling back to a
+        // single-project retarget that would discard the active project.
+        if input.add == Some(true) {
+            return "index_folder(add:true) requires the daemon: additive \
+                multi-project opens are only available over the daemon transport, \
+                not on stdio/embed. Start the daemon (the default desktop topology) \
+                to open multiple projects in one session."
+                .to_string();
+        }
         let root = PathBuf::from(&input.path);
         if !root.exists() {
             return format!("Path does not exist: {}", input.path);
@@ -6887,6 +6957,13 @@ impl SymForgeServer {
     pub(crate) async fn find_references(&self, params: Parameters<FindReferencesInput>) -> String {
         if let Some(result) = self.proxy_tool_call("find_references", &params.0).await {
             return result;
+        }
+        // Feature 012 (Phase 3): honest refusal for a cross-project request with
+        // no daemon (no working set on the local path).
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
         }
         let input = &params.0;
         if let Some(path) = input.path.as_deref() {
@@ -9200,6 +9277,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -9216,6 +9295,8 @@ impl SymForgeServer {
                     include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.search_symbols(Parameters(input)).await
             }
@@ -9294,6 +9375,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -9322,6 +9405,8 @@ impl SymForgeServer {
                     estimate: None,
                     max_tokens: None,
                     structural: None,
+                    project: None,
+                    projects: None,
                 };
                 self.search_text(Parameters(input)).await
             }
@@ -9352,6 +9437,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -10094,6 +10181,8 @@ mod tests {
             include_personal_tooling: None,
             estimate: None,
             max_tokens: None,
+            project: None,
+            projects: None,
         }
     }
 
@@ -10128,6 +10217,8 @@ mod tests {
             direction: None,
             estimate: None,
             max_tokens: None,
+            project: None,
+            projects: None,
         }
     }
 
@@ -12169,6 +12260,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
 
@@ -12225,6 +12317,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12272,6 +12365,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12284,6 +12378,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12350,6 +12445,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
 
@@ -12408,6 +12504,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
+                add: None,
             }))
             .await;
         assert!(
@@ -12421,6 +12518,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
+                add: None,
             }))
             .await;
 
@@ -12449,6 +12547,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: first_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
+                add: None,
             }))
             .await;
         assert!(
@@ -12460,6 +12559,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: second_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
+                add: None,
             }))
             .await;
 
@@ -12491,6 +12591,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -12530,6 +12632,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -12575,6 +12679,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12624,6 +12730,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12670,6 +12778,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12711,6 +12821,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12787,6 +12899,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12833,6 +12947,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12883,6 +12999,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12934,6 +13052,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -12982,6 +13102,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13012,6 +13134,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13042,6 +13166,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13072,6 +13198,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13109,6 +13237,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13175,6 +13305,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13241,6 +13373,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13280,6 +13414,8 @@ mod tests {
                 structural: Some(true),
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13340,6 +13476,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13387,6 +13525,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13439,6 +13579,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13483,6 +13625,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13539,6 +13683,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13595,6 +13741,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13643,6 +13791,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13694,6 +13844,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13736,6 +13888,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13790,6 +13944,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13830,6 +13986,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -19815,6 +19973,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert_eq!(result, crate::protocol::format::empty_guard_message());
@@ -20076,6 +20236,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should get "No references found" not a guard message
@@ -20126,6 +20288,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20174,6 +20338,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20434,6 +20600,8 @@ mod tests {
                     include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 }))
                 .await;
             assert!(
@@ -20496,6 +20664,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -20541,6 +20711,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20593,6 +20765,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // With group_by: "symbol", should show symbol name and match count
@@ -20638,6 +20812,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20696,6 +20872,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should exclude the "use" import line
@@ -20740,6 +20918,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20794,6 +20974,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20884,6 +21066,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should show that connect() is called by handler() in src/api.rs
@@ -20930,6 +21114,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // follow_refs ran but found no cross-references — should signal this explicitly
@@ -22322,6 +22508,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                project: None,
+                projects: None,
             };
             let search_result = server.search_text(Parameters(search_input)).await;
             assert!(

@@ -44,6 +44,18 @@ pub struct SearchSymbolsInput {
     /// Optional maximum token budget for the response.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
+    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
+    /// the session's active project. Mutually exclusive with `projects`. Must be a
+    /// project id/alias, NEVER a filesystem path (a path is rejected with a
+    /// corrective error pointing at `index_folder(add:true)`). Omitting both
+    /// `project` and `projects` targets the active project (today's behavior).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
+    /// id/alias, or `["*"]` for every open project. Mutually exclusive with
+    /// `project`. An empty list is rejected (no silent "all"). Daemon-only.
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
 }
 
 /// Input for `search_text`.
@@ -120,6 +132,16 @@ pub struct SearchTextInput {
     /// and `$$$` for multi-node wildcards. Example: `fn $NAME($$$) { $$$ }`.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub structural: Option<bool>,
+    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
+    /// the session's active project. Mutually exclusive with `projects`; must be a
+    /// project id/alias, never a path. Omitting both targets the active project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
+    /// id/alias, or `["*"]` for every open project. Mutually exclusive with
+    /// `project`; an empty list is rejected. Daemon-only.
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
 }
 
 /// Input for `search_files`.
@@ -213,6 +235,16 @@ pub struct FindReferencesInput {
     /// Optional maximum token budget for the response.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
+    /// Feature 012 (Phase 3): target a SINGLE open project by id/alias instead of
+    /// the session's active project. Mutually exclusive with `projects`; must be a
+    /// project id/alias, never a path. Omitting both targets the active project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Feature 012 (Phase 3): target an EXPLICIT subset of open projects by
+    /// id/alias, or `["*"]` for every open project. Mutually exclusive with
+    /// `project`; an empty list is rejected. Daemon-only.
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
 }
 
 pub(crate) fn parse_language_filter(input: Option<&str>) -> Result<Option<LanguageId>, String> {

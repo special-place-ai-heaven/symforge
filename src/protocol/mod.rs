@@ -914,6 +914,7 @@ impl SymForgeServer {
         let input = crate::protocol::tools::IndexFolderInput {
             path: resolved.display().to_string(),
             idempotency_key: None,
+            add: None,
         };
         let result = self
             .index_folder(rmcp::handler::server::wrapper::Parameters(input))

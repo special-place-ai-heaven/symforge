@@ -30,6 +30,8 @@ async fn qualified_call_via_full_path_returned() {
             direction: None,
             estimate: None,
             max_tokens: None,
+            project: None,
+            projects: None,
         }))
         .await;
 
