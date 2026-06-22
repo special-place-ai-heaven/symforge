@@ -1232,8 +1232,8 @@ pub(super) fn current_code_search_keeps_file(
     let options = TextSearchOptions::for_current_code_search();
     options.search_scope.allows(classification)
         && options.noise_policy.allows(classification)
-        && !(!options.include_personal_tooling
-            && crate::live_index::query::is_personal_tooling_path(path))
+        && (options.include_personal_tooling
+            || !crate::live_index::query::is_personal_tooling_path(path))
 }
 
 /// Structural (AST-pattern) search across indexed files.

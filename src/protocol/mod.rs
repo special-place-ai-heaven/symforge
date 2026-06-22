@@ -804,6 +804,7 @@ impl SymForgeServer {
     ///     root with NO env override — there client roots are authoritative
     ///     (`roots > CWD`) and retarget the live session, fixing the wrong-repo
     ///     binding that a stale launch CWD would otherwise pin forever.
+    ///
     /// In both cases the resolved root drives the existing [`Self::index_folder`]
     /// path, which loads the local in-process index or, in a daemon-proxy server,
     /// proxies the rebind to `index_folder_for_session` (the per-session retarget).

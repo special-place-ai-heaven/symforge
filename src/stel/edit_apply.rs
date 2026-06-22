@@ -322,8 +322,7 @@ mod tests {
                 .unwrap()
                 .current_body
         };
-        let crlf_bom_if_match =
-            format!("\u{feff}{}", current_body.replace('\n', "\r\n"));
+        let crlf_bom_if_match = format!("\u{feff}{}", current_body.replace('\n', "\r\n"));
         assert_ne!(
             crlf_bom_if_match, current_body,
             "the test input must actually differ in raw bytes"

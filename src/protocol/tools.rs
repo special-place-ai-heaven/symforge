@@ -8473,9 +8473,8 @@ impl SymForgeServer {
         // deserialization with an opaque error — validate it explicitly here and
         // return a clean, actionable InvalidRequest instead.
         if params.0.request.query.trim().is_empty() {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
-                "query is required: pass a natural-language phrase",
-            ));
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result("query is required: pass a natural-language phrase"));
         }
 
         if super::surface_probe::surface_profile_from_env()
@@ -8528,18 +8527,18 @@ impl SymForgeServer {
         // with a clear message naming the bound root, mirroring the
         // `symbol_contract_violation` corrective pattern. Skipped when no root is
         // bound (nothing to verify against) or when `path` is blank.
-        if let Some(root) = self.capture_repo_root() {
-            if let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty()) {
-                if !path_is_within_bound_project(path, &root) {
-                    let root_display = root.display().to_string().replace('\\', "/");
-                    return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
-                        .into_call_tool_result(&format!(
-                            "path is outside the bound project {root_display}: \
+        if let Some(root) = self.capture_repo_root()
+            && let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty())
+            && !path_is_within_bound_project(path, &root)
+        {
+            let root_display = root.display().to_string().replace('\\', "/");
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(format!(
+                    "path is outside the bound project {root_display}: \
                              `path:` is a within-project filter, not a project selector \
                              (use `index_folder {{ path }}` to retarget the workspace)."
-                        )));
-                }
-            }
+                )),
+            );
         }
 
         let mut plan = build_plan(request);

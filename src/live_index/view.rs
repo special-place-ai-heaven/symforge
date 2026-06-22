@@ -31,8 +31,8 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    DEFAULT_MAX_PER_FILE, SymbolMatchTier, TextSearchError, TextSearchResult,
-    compute_test_ranges, current_code_search_keeps_file, search_symbols as base_search_symbols,
+    DEFAULT_MAX_PER_FILE, SymbolMatchTier, TextSearchError, TextSearchResult, compute_test_ranges,
+    current_code_search_keeps_file, search_symbols as base_search_symbols,
     search_text as base_search_text, truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
@@ -248,13 +248,13 @@ impl<'a> IndexView<'a> {
     /// Resolve a file by relative path: overlay shadows base; a tombstone hides
     /// the base file (returns `None`).
     pub fn get_file(&self, relative_path: &str) -> Option<&IndexedFile> {
-        if let Some(ov) = self.overlay {
-            if let Some(delta) = ov.deltas.get(relative_path) {
-                return match delta {
-                    FileDelta::Upsert(file) => Some(file.as_ref()),
-                    FileDelta::Tombstone => None,
-                };
-            }
+        if let Some(ov) = self.overlay
+            && let Some(delta) = ov.deltas.get(relative_path)
+        {
+            return match delta {
+                FileDelta::Upsert(file) => Some(file.as_ref()),
+                FileDelta::Tombstone => None,
+            };
         }
         self.base.get_file(relative_path)
     }
