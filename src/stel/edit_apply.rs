@@ -19,7 +19,7 @@ use super::types::StelEditRequest;
 /// splice guard (`protocol::edit::guarded_atomic_write_file`) is intentionally
 /// NOT normalized — it must compare the exact bytes being written so the
 /// optimistic-concurrency guarantee (Principle IV idempotency) is preserved.
-fn normalize_for_match(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn normalize_for_match(bytes: &[u8]) -> Vec<u8> {
     // Strip a single leading UTF-8 BOM (EF BB BF) if present.
     let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
 

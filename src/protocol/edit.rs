@@ -1403,17 +1403,18 @@ pub struct ReplaceSymbolBodyInput {
     /// Optimistic-concurrency guard (TR-06 / FR-009). Threaded from
     /// `StelEditRequest.if_match` through the edit planner.
     ///
-    /// At THIS (write) layer the field is a PRESENCE-triggered change-detection
-    /// guard, NOT a value comparison: the write path does not compare this
-    /// STRING against anything. Its presence (`Some`) turns on the write-time
-    /// re-read in `guarded_atomic_write_file`, which compares the whole-file
-    /// `base` (the bytes the splice was computed against) to the bytes actually
-    /// on disk and rejects the apply on divergence. The VALUE match
-    /// (`if_match == current_symbol_body`) is the STEL pre-flight's
-    /// responsibility (`run_pre_apply_gates`); `base == disk` is the stronger
-    /// splice-integrity invariant enforced here. On divergence the apply is
-    /// rejected without writing — a concurrent change between the caller's read
-    /// and this write is never silently clobbered.
+    /// This is enforced twice for committed writes:
+    /// - the value must match the currently resolved symbol body (normalized for
+    ///   BOM and line endings), so a stale guarded apply cannot overwrite a newer
+    ///   symbol after the daemon index has already refreshed;
+    /// - its presence (`Some`) turns on the write-time re-read in
+    ///   `guarded_atomic_write_file`, which compares the whole-file `base` (the
+    ///   bytes the splice was computed against) to the bytes actually on disk and
+    ///   rejects the apply on divergence.
+    ///
+    /// On either mismatch the apply is rejected without writing — a concurrent
+    /// change between the caller's read and this write is never silently
+    /// clobbered.
     #[serde(default)]
     pub if_match: Option<String>,
     /// Caller's working directory (absolute path). Consumed by the

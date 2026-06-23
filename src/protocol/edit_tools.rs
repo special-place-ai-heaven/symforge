@@ -667,6 +667,30 @@ impl SymForgeServer {
             Ok(s) => s,
             Err(e) => return fail_and_return_mutation_replay(&idempotency, e),
         };
+        if params.0.dry_run != Some(true)
+            && let Some(if_match) = params.0.if_match.as_deref()
+        {
+            let current_body = match file
+                .content
+                .get(sym.byte_range.0 as usize..sym.byte_range.1 as usize)
+            {
+                Some(bytes) => bytes,
+                None => {
+                    return fail_and_return_mutation_replay(
+                        &idempotency,
+                        "Error: symbol byte range out of bounds".to_string(),
+                    );
+                }
+            };
+            if crate::stel::edit_apply::normalize_for_match(if_match.as_bytes())
+                != crate::stel::edit_apply::normalize_for_match(current_body)
+            {
+                return fail_and_return_mutation_replay(
+                    &idempotency,
+                    "Error: if_match does not match current symbol body".to_string(),
+                );
+            }
+        }
         let evidence_anchor = symbol_anchor(&params.0.path, &sym);
         if params.0.dry_run == Some(true) {
             let old_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;

@@ -22091,6 +22091,40 @@ mod tests {
         assert!(file.symbols.iter().any(|s| s.name == "world"));
     }
 
+    #[tokio::test]
+    async fn test_replace_symbol_body_rejects_stale_if_match_value() {
+        let current = b"fn target() { concurrent_change }\n";
+        let (_dir, server, file_path) = setup_edit_test(current);
+
+        let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            path: "src/lib.rs".to_string(),
+            name: "target".to_string(),
+            kind: None,
+            symbol_line: None,
+            new_body: "fn target() { agent_edit }".to_string(),
+            dry_run: Some(false),
+            idempotency_key: None,
+            if_match: Some("fn target() { old }".to_string()),
+            working_directory: None,
+        };
+
+        let result = server.replace_symbol_body(Parameters(input)).await;
+        assert!(
+            result.contains("if_match does not match current symbol body"),
+            "stale if_match must reject before writing:\n{result}"
+        );
+        let on_disk = std::fs::read_to_string(&file_path).expect("read file after reject");
+        assert_eq!(
+            on_disk,
+            std::str::from_utf8(current).unwrap(),
+            "newer on-disk body must survive a stale guarded apply"
+        );
+        assert!(
+            !on_disk.contains("agent_edit"),
+            "stale guarded apply must not be written:\n{on_disk}"
+        );
+    }
+
     /// When `new_body` does NOT supply its own doc comment, the existing
     /// attached `/// ...` doc must be preserved. Previously the splice
     /// range extended past the doc unconditionally, silently deleting it.
