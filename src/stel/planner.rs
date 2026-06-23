@@ -76,9 +76,11 @@ impl ParamDisposition {
 /// - `symbol` → `Refused` for prose (the handler's `symbol_contract_violation`
 ///   precedent), `Routed` when a bare identifier reaches a plan step, else
 ///   `NotApplicable` (set but not consumed on this route today).
-/// - `path`   → `Routed` when the finalized plan's args carry the path value,
-///   else `NotApplicable` (the planner does not forward it on this route yet —
-///   A1b is the forwarding step; A1a only records the gap).
+/// - `path`   → `Routed` when the finalized plan's args carry the path value
+///   (A1b forwards it into `path_prefix` on scoped search routes), else
+///   `NotApplicable` (a route whose tool has no path scope, e.g. `get_repo_map`
+///   or `search_files`; NOT `get_symbol`/`get_file_content`, which DO consume
+///   `path` as a selector and are therefore `Routed`).
 /// - `max_tokens` / `preview` → `Forwarded`: consumed by the handler AFTER the
 ///   planner (CCR budget / preview-estimate branch), not by plan steps.
 /// - `project` / `projects` → `Refused` when meaningfully set: the handler
@@ -122,8 +124,11 @@ pub fn classify_param_dispositions(
     let path = if path_set && plan_carries_path(plan, request) {
         ParamDisposition::Routed
     } else {
-        // Set-but-unconsumed `path` (the A1b forwarding target) or absent: the
-        // planner does not thread it into this route's args today.
+        // `path` absent, or a route whose tool carries no path scope and no path
+        // selector (so neither A1b's forwarding nor a target arg applies — e.g.
+        // `get_repo_map`, `context_inventory`, or `search_files`, which has no
+        // `path_prefix` field at all; tracked as D20): explicit NotApplicable,
+        // not a silent drop.
         ParamDisposition::NotApplicable
     };
 
@@ -421,12 +426,50 @@ fn is_orient_query(lower: &str) -> bool {
         || lower.contains("orient:")
 }
 
+/// Tools whose schema accepts a `path_prefix` SCOPE argument — the caller's
+/// `path` forwards into it (A1b gated per-tool forwarding). Tools where `path`
+/// is a TARGET/selector (e.g. `get_file_content`, `find_references`) are
+/// intentionally excluded: there the target comes from the query, not a scope
+/// hint, so forwarding the caller's `path` would be wrong.
+const PATH_PREFIX_FORWARD_TOOLS: &[&str] = &["search_symbols", "search_text", "explore"];
+
+/// A1b gated per-tool forwarding: thread the caller's `path` into each plan
+/// step's `path_prefix` arg where that tool accepts a path scope (and the caller
+/// supplied a non-blank `path`), UNLESS the route already set `path_prefix`
+/// (idempotent — a route that parsed its own scope from the query is left
+/// untouched). This closes the `path` silent-drop on scoped search routes
+/// (lossless-or-loud, root D-A0): after this pass `plan_carries_path` is true on
+/// those routes, so [`classify_param_dispositions`] records `path` as `Routed`.
+///
+/// `max_tokens` is deliberately NOT forwarded here: it is already honored as a
+/// handler-layer CCR budget on the final envelope (`Forwarded`), so it is not a
+/// silent drop, and pushing it into plan-step args would violate the `Forwarded`
+/// disposition contract ("consumed downstream of the planner, not by the plan
+/// steps").
+fn forward_caller_path(request: &StelRequest, steps: &mut [StelPlanStep]) {
+    let Some(path) = request
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return;
+    };
+    for step in steps.iter_mut() {
+        if PATH_PREFIX_FORWARD_TOOLS.contains(&step.tool.as_str())
+            && step.args.get("path_prefix").is_none()
+        {
+            step.args["path_prefix"] = json!(path);
+        }
+    }
+}
+
 fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> StelPlan {
     let primary = steps.first().expect("plan must have at least one step");
     let intent = primary.intent;
     let confidence = primary.confidence;
     let confidence_rationale = primary.rationale.to_string();
-    let stel_steps: Vec<StelPlanStep> = steps
+    let mut stel_steps: Vec<StelPlanStep> = steps
         .into_iter()
         .enumerate()
         .map(|(index, step)| StelPlanStep {
@@ -438,6 +481,9 @@ fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> Stel
             index_refs: vec![],
         })
         .collect();
+    // A1b gated per-tool forwarding: thread the caller's `path` into scoped
+    // search routes' `path_prefix`, closing the `path` silent-drop (root D-A0).
+    forward_caller_path(request, &mut stel_steps);
     let plan = StelPlan {
         plan_id: new_plan_id(request),
         intent,
@@ -447,13 +493,16 @@ fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> Stel
         suggested_followup: None,
     };
 
-    // A1a lossless-or-loud guard (root D-A0): every `StelRequest` field MUST
-    // resolve to an explicit `ParamDisposition` at this single choke point — no
-    // field may be silently unaccounted-for. Assertion-only: this neither reads
-    // into nor mutates the returned plan, so output is byte-identical. The
-    // `debug_assert!` compiles out of release; the conformance test
-    // (`tests/stel_param_disposition.rs`) enforces the same invariant across the
-    // emittable surface in every build.
+    // Lossless-or-loud STRUCTURAL guard (root D-A0): every `StelRequest` field
+    // MUST resolve to an explicit `ParamDisposition` at this single choke point —
+    // no field may be silently unaccounted-for. This is a COMPILE-TIME / TEST-TIME
+    // completeness invariant over field accounting, NOT a runtime loud refusal:
+    // the `debug_assert!` compiles out of release, the conformance test
+    // (`tests/stel_param_disposition.rs`) enforces it in every build, and only
+    // `Refused` params (project/projects) reach the caller loudly — via a separate
+    // handler path (D9), not this classifier. `classify_param_dispositions` is
+    // pure (it audits the finalized `plan`, never mutates it); the behavioral
+    // change is the `forward_caller_path` pass above (A1b), which the guard audits.
     debug_assert!(
         classify_param_dispositions(request, &plan)
             .iter()
