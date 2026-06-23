@@ -1,6 +1,6 @@
 # HANDOFF — SymForge trust campaign (resume here)
 
-**As of:** 2026-06-23. **Branch state:** everything below is merged to `main` (released as **v8.6.0**).
+**As of:** 2026-06-23. **Branch state:** everything below is merged to `main` (released as **v8.8.0**).
 **Mission:** make SymForge trustworthy for the LLMs that call it and robust for users — by attacking ROOT causes of its trust defects, not patching symptoms. Engine-first: the facade is a thin honest layer; AAP consumes the engine via the `embed` feature (NOT the MCP server).
 
 ## How we work (durable rules — honor these)
@@ -30,13 +30,13 @@
 
 ## REMAINING — the attack sequence (do in this order)
 
-**B1 — DONE** (implemented, full-gate-green, adversarially reviewed; D11 scoping **FIXED**, D14 ranking **PARTIAL** — per-project ranked+bounded, global cross-project interleave deferred). **NEXT = A1b** (gated per-tool forwarding). The original B1 recipe is retained below for reference:
+**B1 — DONE** (implemented, full-gate-green, adversarially reviewed; D11 scoping **FIXED**, D14 ranking **PARTIAL** — per-project ranked+bounded, global cross-project interleave deferred). **A1b — DONE** (PR #358). **C-stopgap — DONE** (012d; D16 silent-wrong half CONTAINED — `/mcp` already refused cross-project via `local_cross_project_refusal`, the gap was a missing regression lock + the message not naming the `/mcp` transport, both now closed). **NEXT = B2/D12.** The original B1 recipe is retained below for reference:
 - The empty-overlay fast path `IndexView::search_symbols` (`view.rs:341`) calls the **preset-only** `base_search_symbols(... usize::MAX)` (hardcodes path_scope=Any, language=None). The option-honoring `search_symbols_with_options` / `search_text_with_options` (`search.rs:808/943`) ALREADY EXIST.
 - Thread the caller's scoping/limit options through `IndexView`'s search methods → `WorkingSet` cross-project query passes them down → daemon `execute_cross_project_read` builds the options from `SearchSymbolsInput/SearchTextInput/FindReferencesInput` AND **removes `reject_unsupported_cross_project_scoping`** (the honesty-pass guard that loudly refuses path/language/etc.).
 - Overlays are EMPTY in US1 (no-overlay-writes invariant) so the empty-overlay path is the cross-project path. Per-overlay derived index for NON-empty overlays is the deferred large item **D-B0**.
 - Update the rejection tests (they assert refusal) → assert honoring; add scoping-honored cross-project tests.
 
-Then: **A1b** (gated per-tool forwarding: `max_tokens`→args, `path`→`path_prefix`; golden re-baselined) · **C-stopgap** (`/mcp` loudly refuses `project`/`projects`) · **B2/D12** (republish→rebase on HEAD/watcher advance; mechanism `Overlay::rebase` + `StaleOverlay` fence exist).
+Then: **A1b** — DONE (PR #358) · **C-stopgap** — DONE (012d — the `/mcp` refusal was already wired since Phase 3; 012d added the regression lock `tests/serve_http_attach.rs` + named the `/mcp` transport in the refusal) · **B2/D12** — **NEXT** (republish→rebase on HEAD/watcher advance; mechanism `Overlay::rebase` + `StaleOverlay` fence exist).
 
 **Tracked-large (OPEN, owners, blocked-on — NOT deferred-as-acceptable):** D-B0 (per-view derived index, after cross-project writes) · D15 (overlay edits in ordinary reads — Phase 5 read-path flip, ~64 `self.index.read()` + ~20 `capture_*`) · D16 (`/mcp` per-connection daemon session) · D13 (xref recall ~29% — `parsing/xref.rs` qualified-call extraction, NOT a view defect) · D2 (gate decides on estimated economics — owner 013 lane) · serve_port test-fragility (local Docker-Desktop port collisions).
 
@@ -50,4 +50,6 @@ Then: **A1b** (gated per-tool forwarding: `max_tokens`→args, `path`→`path_pr
 - A2 (`Figure` provenance enum) was DEMOTED to regression-guard (envelope already honest); don't prioritize it.
 
 ## Immediate first action for the next session
-B1 is landed (cross-project `path_prefix`/`language`/noise scoping honored via the engine's option path; reject guard narrowed to `structural` + find_references selectors; per-project ranked+bounded). Read `docs/reviews/symforge-defect-ledger.md`, branch a fresh `feat/012c-a1b-gated-forwarding` (or similar) off `main` in `E:\project\symforge-012`, and implement **A1b** (gated per-tool forwarding: `max_tokens`→args, `path`→`path_prefix`; golden re-baselined) → full gate → PR → merge yourself. Then C-stopgap/D16, then B2/D12.
+A1b (PR #358) and C-stopgap (012d) are landed. **C-stopgap TRACE FINDING** (the prior handoff left this trace unfinished and ASSUMED a silent drop): the `/mcp` cross-project refusal was ALREADY wired since Phase 3 — `local_cross_project_refusal` fires on `/mcp` because that transport's `SymForgeServer::new` leaves `daemon_client=None`, so `proxy_tool_call` short-circuits to `None` before any single-project answer. 012d closed the real gaps: a missing regression lock (`tests/serve_http_attach.rs::cross_project_targeting_is_refused_over_http` — real HTTP transport; all three cross-project tools refuse + name the `/mcp` transport; a no-params control does NOT refuse) and the refusal message now naming the `/mcp` transport. NO new refusal logic. D16's silent-wrong half is CONTAINED; the ROOT (per-connection `/mcp` daemon session) stays tracked-large.
+
+**NEXT:** Read `docs/reviews/symforge-defect-ledger.md`, branch a fresh `feat/012e-b2-rebase` (or similar) off `main` in `E:\project\symforge-012`, and implement **B2/D12** (republish→rebase on HEAD/watcher advance; `Overlay::rebase` + `StaleOverlay` fence already exist) → full gate → PR → merge yourself.

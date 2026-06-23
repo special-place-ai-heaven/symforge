@@ -2500,11 +2500,17 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
 }
 
 /// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
-/// the daemon-owned working set, which does not exist on the local (stdio/embed
-/// or daemon-degraded) execution path. When a `project`/`projects` param is
-/// present and we are about to run LOCALLY, return an honest refusal instead of
-/// silently ignoring the target and serving the active project only. Returns the
-/// refusal message when the request is cross-project, else `None`.
+/// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
+/// stdio/embed, or daemon-degraded) execution path. When a `project`/`projects`
+/// param is present and we are about to run LOCALLY, return an honest refusal
+/// instead of silently ignoring the target and serving the active project only.
+/// Returns the refusal message when the request is cross-project, else `None`.
+///
+/// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
+/// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
+/// is `None`), so this is the guard that contains D16's silent-wrong half —
+/// `/mcp` loudly refuses cross-project targeting rather than silently serving the
+/// single bound index. `tests/serve_http_attach.rs` locks it end-to-end.
 fn local_cross_project_refusal(
     project: Option<&str>,
     projects: Option<&[String]>,
@@ -2515,8 +2521,8 @@ fn local_cross_project_refusal(
         Some(
             "Cross-project queries (project/projects) require the daemon: the \
              working set of open projects lives on the daemon transport, not on \
-             stdio/embed or while the daemon is unreachable. Start the daemon to \
-             query across projects."
+             the /mcp HTTP transport, stdio/embed, or while the daemon is \
+             unreachable. Start the daemon to query across projects."
                 .to_string(),
         )
     } else {

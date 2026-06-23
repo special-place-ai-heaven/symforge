@@ -331,3 +331,102 @@ async fn bypass_at_dispatch_returns_structured_envelope() {
     let text = result_text(&json);
     assert_structured_bypass(&text);
 }
+
+// ---------------------------------------------------------------------------
+// C-stopgap (D16): /mcp loudly REFUSES cross-project targeting
+// ---------------------------------------------------------------------------
+
+/// The cross-project working set lives only on the stdio daemon. On the `/mcp`
+/// HTTP transport there is NO daemon behind the shared `SymForgeServer`
+/// (`test_runtime` builds it via `SymForgeServer::new`, so `daemon_client` is
+/// `None`, and `proxy_tool_call` short-circuits to `None`). The three
+/// cross-project-capable tools (`search_symbols`/`search_text`/`find_references`,
+/// whose inputs carry `project`/`projects`) must therefore LOUDLY REFUSE a
+/// cross-project target over `/mcp` instead of silently dropping it and serving
+/// the single bound index — D16's silent-wrong half, contained by
+/// `local_cross_project_refusal`.
+///
+/// The complementary stdio+daemon HONOR path is proven by
+/// `daemon::tests::test_cross_project_query_returns_attributed_hits_from_both_projects`
+/// (attributed cross-project hits; a no-params call stays single-project). This
+/// test locks the `/mcp` refusal end-to-end over the real HTTP transport.
+#[tokio::test]
+async fn cross_project_targeting_is_refused_over_http() {
+    // The individual cross-project-capable tools are only advertised + dispatched
+    // on the FULL surface; the compact surface exposes only the `symforge` facade
+    // (which refuses cross-project via its own guard, D9). The compact-surface
+    // `/mcp` path is thus covered transitively by that facade refusal, which has
+    // its own test (`tools::tests::symforge_facade_rejects_cross_project_targeting`).
+    // Hold the process-global surface lock so the env opt-in is deterministic.
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full");
+
+    let runtime = test_runtime(); // SymForgeServer::new -> daemon_client = None (the /mcp shape)
+    let server = start_server(runtime).await;
+    let url = server.mcp_url();
+
+    // The refusal prefix emitted by `local_cross_project_refusal`.
+    const REFUSAL_PREFIX: &str = "Cross-project queries (project/projects) require";
+
+    let cross_project_calls = [
+        (
+            10u32,
+            "search_symbols",
+            serde_json::json!({ "query": "thing", "projects": ["*"] }),
+        ),
+        (
+            11,
+            "search_text",
+            serde_json::json!({ "query": "thing", "project": "other-proj" }),
+        ),
+        (
+            12,
+            "find_references",
+            serde_json::json!({ "name": "thing", "projects": ["a", "b"] }),
+        ),
+    ];
+
+    for (id, name, arguments) in cross_project_calls {
+        let response = mcp_call(
+            &url,
+            jsonrpc(
+                id,
+                "tools/call",
+                serde_json::json!({ "name": name, "arguments": arguments }),
+            ),
+        )
+        .await;
+        let text = result_text(&response["result"]);
+        assert!(
+            text.contains(REFUSAL_PREFIX),
+            "{name} over /mcp must LOUDLY refuse cross-project targeting (no silent \
+             single-project drop), got:\n{text}"
+        );
+        // The refusal must name the /mcp transport so it is honest for the caller.
+        assert!(
+            text.contains("/mcp HTTP transport"),
+            "{name} refusal should name the /mcp transport, got:\n{text}"
+        );
+    }
+
+    // Control: the SAME tool with NO project/projects must NOT trip the refusal —
+    // it serves the single bound index on the normal path (no false refusal on the
+    // default single-project route).
+    let response = mcp_call(
+        &url,
+        jsonrpc(
+            13,
+            "tools/call",
+            serde_json::json!({ "name": "search_symbols", "arguments": { "query": "thing" } }),
+        ),
+    )
+    .await;
+    let text = result_text(&response["result"]);
+    assert!(
+        !text.contains(REFUSAL_PREFIX),
+        "a single-project search_symbols (no project/projects) must NOT trip the \
+         cross-project refusal, got:\n{text}"
+    );
+
+    server.shutdown().await;
+}
