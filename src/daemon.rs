@@ -34,6 +34,7 @@ use crate::protocol::tools::{
     GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, HealthInput, IndexFolderInput,
     InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
     SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
+    search_symbols_options_from_input, search_text_options_from_input,
 };
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
@@ -2856,17 +2857,21 @@ fn apply_cross_project_token_budget(body: String, max_tokens: Option<u64>) -> St
     truncated
 }
 
-/// Honest refusal of the DEFERRED per-project derived-index scoping when combined
-/// with cross-project targeting (Principle VII). The cross-project read serves
-/// from each project's interned base via the overlay-aware `WorkingSet` search,
-/// which does NOT honor the per-project derived-index scoping params
-/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
-/// Rather than silently ignore such a param (handing back results that look
-/// scoped but are not), return a clear error naming the offending param. Returns
-/// `Err(message)` for the FIRST unsupported scoping param present, else `Ok(())`.
+/// Honest refusal of the cross-project params that are genuinely NOT supported
+/// on the cross-project read path — as distinct from the scoping that IS now
+/// honored. B1 threads `path_prefix`/`language`/noise/`limit` through the
+/// engine's option-honoring `search_*_with_options` (so cross-project scoping
+/// behaves identically to single-project; D11 + D14), and those are NO LONGER
+/// refused here. What remains unsupported, and is therefore still refused
+/// loudly rather than silently ignored:
+/// * `search_text` `structural` — ast-grep runs a separate single-project
+///   pipeline, not `search_text_with_options`, so it has no cross-project path;
+/// * `find_references` `path`/`symbol_kind`/`direction` — single-project symbol
+///   SELECTORS / implementations-mode direction, which have no cross-project
+///   meaning and no option-honoring engine entry point.
 ///
-/// `kind` (symbol/reference kind filter) IS honored cross-project and is NOT
-/// rejected here; only the deferred derived-index scoping is refused.
+/// Returns `Err(message)` for the FIRST still-unsupported param present, else
+/// `Ok(())`. `kind`, `path_prefix`, and `language` are honored and not rejected.
 fn reject_unsupported_cross_project_scoping(
     tool_name: &str,
     params: &serde_json::Value,
@@ -2877,17 +2882,13 @@ fn reject_unsupported_cross_project_scoping(
              query a single project for scoped results."
         );
     }
-    // A lenient peek of ONLY the deferred scoping fields; unrelated/invalid
+    // A lenient peek of ONLY the still-unsupported fields; unrelated/invalid
     // sibling fields must not make this check fail (the real decode happens in
     // the per-tool branch). `null`/absent fields deserialize to `None`.
     #[derive(serde::Deserialize, Default)]
     struct ScopePeek {
         #[serde(default)]
         path: Option<String>,
-        #[serde(default)]
-        path_prefix: Option<String>,
-        #[serde(default)]
-        language: Option<String>,
         #[serde(default)]
         symbol_kind: Option<String>,
         #[serde(default)]
@@ -2899,21 +2900,7 @@ fn reject_unsupported_cross_project_scoping(
     let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
 
     match tool_name {
-        "search_symbols" => {
-            if present(&peek.path_prefix) {
-                return refuse("path_prefix");
-            }
-            if present(&peek.language) {
-                return refuse("language");
-            }
-        }
         "search_text" => {
-            if present(&peek.path_prefix) {
-                return refuse("path_prefix");
-            }
-            if present(&peek.language) {
-                return refuse("language");
-            }
             if peek.structural == Some(true) {
                 return refuse("structural");
             }
@@ -2943,14 +2930,18 @@ fn reject_unsupported_cross_project_scoping(
 /// Read-only by construction: it calls the overlay-aware `WorkingSet` search
 /// methods, which never mutate an overlay (the no-overlay-writes invariant).
 ///
-/// HONESTY (012 hardening): unlike the single-project path, the cross-project
-/// path does NOT honor the per-project derived-index scoping params
-/// (`path`/`path_prefix`/`language`/`symbol_kind`/`direction`/`structural`).
-/// Rather than silently drop them, every such param is REFUSED up front
-/// ([`reject_unsupported_cross_project_scoping`]). The output is also BOUNDED: a
-/// total-hit cap (caller `limit`, else [`CROSS_PROJECT_DEFAULT_RESULT_CAP`]) and
-/// the caller's optional `max_tokens` budget are applied by the formatters, which
-/// disclose any truncation.
+/// SCOPING (B1): the cross-project path builds the SAME `SymbolSearchOptions`/
+/// `TextSearchOptions` the single-project path builds (via
+/// `search_symbols_options_from_input` / `search_text_options_from_input`) and
+/// threads them through the engine's option-honoring `WorkingSet` search, so
+/// `path_prefix`/`language`/noise/`limit` ARE honored cross-project (D11) and
+/// each project's hits are `result_limit`-bounded and tier-ranked (D14). The
+/// params that genuinely have no cross-project path are still REFUSED up front
+/// ([`reject_unsupported_cross_project_scoping`]): `search_text` `structural`
+/// and `find_references` `path`/`symbol_kind`/`direction`. The output is also
+/// BOUNDED: a total-hit cap (caller `limit`, else
+/// [`CROSS_PROJECT_DEFAULT_RESULT_CAP`]) and the caller's optional `max_tokens`
+/// budget are applied by the formatters, which disclose any truncation.
 fn execute_cross_project_read(
     tool_name: &str,
     params: serde_json::Value,
@@ -2981,14 +2972,31 @@ fn execute_cross_project_read(
                      (browse mode is single-project only)."
                 );
             }
+            // Build the SAME options the single-project path builds, so cross-
+            // project scoping (path_prefix, language, noise) + per-project
+            // result_limit ranking behave identically (B1: D11 + D14). An unknown
+            // language is an honest error, not a silent drop.
+            let options = search_symbols_options_from_input(&input)
+                .map_err(|message| anyhow::anyhow!(message))?;
             let cap = cross_project_result_cap(input.limit);
-            let hits = working_set.search_symbols(&targets, query, input.kind.as_deref());
+            let hits = working_set.search_symbols(&targets, query, input.kind.as_deref(), &options);
             let body = format_cross_project_symbols(&hits, query, multi, cap);
             Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
         "search_text" => {
             let input: SearchTextInput = decode_params(params)?;
             let regex = input.regex.unwrap_or(false);
+            // Same options the single-project path builds (path_prefix, language,
+            // noise, max_per_file, case/word, glob, ranked) so cross-project text
+            // scoping is honored (B1: D11). `structural` was already refused above
+            // (it runs a separate ast-grep pipeline).
+            let mut options = search_text_options_from_input(&input)
+                .map_err(|message| anyhow::anyhow!(message))?;
+            // `context` (surrounding lines) is NOT rendered by the cross-project
+            // text formatter, so drop it rather than compute-and-discard it or
+            // imply it is honored. Rendering context / group_by / follow_refs
+            // cross-project is a display concern tracked under A1b, not B1 scoping.
+            options.context = None;
             let cap = cross_project_result_cap(input.limit);
             let results = working_set
                 .search_text(
@@ -2996,6 +3004,7 @@ fn execute_cross_project_read(
                     input.query.as_deref(),
                     input.terms.as_deref(),
                     regex,
+                    &options,
                 )
                 .map_err(|error| anyhow::anyhow!("text search failed: {error:?}"))?;
             let body = format_cross_project_text(&results, multi, cap);
@@ -5230,6 +5239,134 @@ mod tests {
             "single-active query must render flat (no project header): {active_only}"
         );
 
+        // (5) B1 — cross-project scoping is now HONORED over the wire, not
+        // refused (D11). These params previously returned a 400 "scoping is not
+        // supported with cross-project targeting"; now they filter the results.
+        //
+        // 5a — a path_prefix matching NEITHER project's files scopes BOTH out
+        //      (honored as a real filter, not silently ignored, not refused).
+        let scoped_out = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"],
+                "path_prefix": "no_such_dir"
+            }))
+            .send()
+            .await
+            .expect("scoped query request")
+            .error_for_status()
+            .expect("B1: path_prefix must NOT be refused (HTTP 200, not 400)")
+            .text()
+            .await
+            .expect("scoped query body");
+        assert!(
+            !scoped_out.contains("xproj_marker_alpha") && !scoped_out.contains("xproj_marker_beta"),
+            "B1: a non-matching path_prefix must scope BOTH projects out \
+             (honored, not ignored): {scoped_out}"
+        );
+
+        // 5b — language=Python excludes both Rust symbols (honored language filter).
+        let lang_python = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"],
+                "language": "Python"
+            }))
+            .send()
+            .await
+            .expect("python query request")
+            .error_for_status()
+            .expect("B1: language must NOT be refused (HTTP 200, not 400)")
+            .text()
+            .await
+            .expect("python query body");
+        assert!(
+            !lang_python.contains("xproj_marker_alpha")
+                && !lang_python.contains("xproj_marker_beta"),
+            "B1: language=Python must scope out the Rust symbols cross-project: {lang_python}"
+        );
+
+        // 5c — language=Rust keeps BOTH (the filter scopes; it does not break the
+        // query) — proves the scope-outs above are real filtering, not breakage.
+        let lang_rust = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"],
+                "language": "Rust"
+            }))
+            .send()
+            .await
+            .expect("rust query request")
+            .error_for_status()
+            .expect("rust query status")
+            .text()
+            .await
+            .expect("rust query body");
+        assert!(
+            lang_rust.contains("xproj_marker_alpha") && lang_rust.contains("xproj_marker_beta"),
+            "B1: language=Rust keeps both Rust symbols cross-project: {lang_rust}"
+        );
+
+        // (6) B1 — cross-project search_text scoping is ALSO honored over the wire
+        // (closes the symbols-only coverage gap from the adversarial review). The
+        // source text "xproj_marker_*" lives in both projects' .rs files.
+        // 6-control: an unscoped cross-project text search finds BOTH.
+        let text_all = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_text",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({ "query": "xproj_marker", "projects": ["*"] }))
+            .send()
+            .await
+            .expect("text all request")
+            .error_for_status()
+            .expect("text all status")
+            .text()
+            .await
+            .expect("text all body");
+        assert!(
+            text_all.contains("xproj_marker_alpha") && text_all.contains("xproj_marker_beta"),
+            "B1 control: unscoped cross-project text search finds both projects: {text_all}"
+        );
+        // 6-scoped: a non-matching path_prefix scopes BOTH out — honored as a
+        // filter (HTTP 200), not refused (this was HTTP 400 before B1).
+        let text_scoped = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_text",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "projects": ["*"],
+                "path_prefix": "no_such_dir"
+            }))
+            .send()
+            .await
+            .expect("text scoped request")
+            .error_for_status()
+            .expect("B1: search_text path_prefix must NOT be refused (200, not 400)")
+            .text()
+            .await
+            .expect("text scoped body");
+        assert!(
+            !text_scoped.contains("xproj_marker_alpha")
+                && !text_scoped.contains("xproj_marker_beta"),
+            "B1: non-matching path_prefix must scope BOTH projects' text out (honored): {text_scoped}"
+        );
+
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
@@ -5345,35 +5482,35 @@ mod tests {
         );
     }
 
-    // ── Feature 012 hardening — cross-project REFUSES deferred scoping params ─────
+    // ── B1 — cross-project HONORS path_prefix/language, still REFUSES the params
+    // with no cross-project path ─────────────────────────────────────────────
     //
-    // The per-project derived-index scoping (path/path_prefix/language/symbol_kind/
-    // direction/structural) is NOT honored cross-project. Prove each is REFUSED
-    // (honest, not silently dropped) with the corrective message, and that `kind`
-    // (which IS honored) is NOT refused.
+    // `path_prefix`/`language`/noise/`limit` are now threaded through the
+    // engine's option-honoring search (D11 + D14), so they are NO LONGER refused.
+    // `structural` (search_text) and `path`/`symbol_kind`/`direction`
+    // (find_references) have no cross-project entry point and are still refused
+    // (honest, not silently dropped).
     #[test]
     fn test_reject_unsupported_cross_project_scoping_per_tool() {
         use serde_json::json;
 
-        // search_symbols: path_prefix + language refused; kind allowed.
-        let err = reject_unsupported_cross_project_scoping(
-            "search_symbols",
-            &json!({ "query": "x", "path_prefix": "src/" }),
-        )
-        .expect_err("path_prefix must be refused");
-        let msg = err.to_string();
+        // search_symbols: path_prefix + language are now HONORED (not refused);
+        // kind always allowed.
         assert!(
-            msg.contains("path_prefix scoping is not supported with cross-project targeting")
-                && msg.contains("query a single project for scoped results"),
-            "refusal message must name the param + corrective hint: {msg}"
+            reject_unsupported_cross_project_scoping(
+                "search_symbols",
+                &json!({ "query": "x", "path_prefix": "src/" }),
+            )
+            .is_ok(),
+            "path_prefix is now honored cross-project and must NOT be refused"
         );
         assert!(
             reject_unsupported_cross_project_scoping(
                 "search_symbols",
                 &json!({ "query": "x", "language": "Rust" }),
             )
-            .is_err(),
-            "language must be refused on search_symbols"
+            .is_ok(),
+            "language is now honored cross-project and must NOT be refused"
         );
         assert!(
             reject_unsupported_cross_project_scoping(
@@ -5384,19 +5521,32 @@ mod tests {
             "kind IS honored cross-project and must NOT be refused"
         );
 
-        // search_text: structural refused.
+        // search_text: path_prefix/language honored; structural still refused.
         assert!(
             reject_unsupported_cross_project_scoping(
                 "search_text",
-                &json!({ "query": "x", "structural": true }),
+                &json!({ "query": "x", "path_prefix": "src/", "language": "Rust" }),
             )
-            .unwrap_err()
-            .to_string()
-            .contains("structural scoping is not supported"),
-            "structural must be refused on search_text"
+            .is_ok(),
+            "search_text path_prefix/language are now honored cross-project"
+        );
+        let structural_err = reject_unsupported_cross_project_scoping(
+            "search_text",
+            &json!({ "query": "x", "structural": true }),
+        )
+        .expect_err("structural must be refused");
+        assert!(
+            structural_err
+                .to_string()
+                .contains("structural scoping is not supported")
+                && structural_err
+                    .to_string()
+                    .contains("query a single project for scoped results"),
+            "structural refusal must name the param + corrective hint: {structural_err}"
         );
 
-        // find_references: path / symbol_kind / direction refused.
+        // find_references: path / symbol_kind / direction still refused (no
+        // cross-project meaning).
         for (field, value) in [
             ("path", json!("src/db.rs")),
             ("symbol_kind", json!("fn")),
@@ -5414,14 +5564,14 @@ mod tests {
             );
         }
 
-        // Blank/empty values are treated as not-set (no false refusal).
+        // A blank still-refused value is treated as not-set (no false refusal).
         assert!(
             reject_unsupported_cross_project_scoping(
-                "search_symbols",
-                &json!({ "query": "x", "path_prefix": "  " }),
+                "find_references",
+                &json!({ "name": "x", "path": "  " }),
             )
             .is_ok(),
-            "blank scoping value must not trip the refusal"
+            "blank path value must not trip the refusal"
         );
     }
 
@@ -5443,17 +5593,21 @@ mod tests {
         let mut ws = WorkingSet::new();
         ws.add("proj-x", base);
 
+        // A still-unsupported param (find_references `direction`) is refused up
+        // front, before any query runs. (`path_prefix`/`language` are now honored,
+        // so they no longer exercise this guard — `direction` still has no
+        // cross-project path.)
         let err = execute_cross_project_read(
-            "search_symbols",
-            json!({ "query": "anything", "language": "Rust" }),
+            "find_references",
+            json!({ "name": "anything", "direction": "trait" }),
             Targets::Subset(vec!["proj-x".to_string()]),
             &ws,
         )
         .expect_err("scoping param must be refused");
         assert!(
             err.to_string()
-                .contains("language scoping is not supported with cross-project targeting"),
-            "cross-project read must refuse the deferred scoping param: {err}"
+                .contains("direction scoping is not supported with cross-project targeting"),
+            "cross-project read must refuse the unsupported scoping param: {err}"
         );
     }
 

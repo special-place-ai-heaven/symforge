@@ -31,10 +31,10 @@ Last updated: 2026-06-22.
 | ID | Defect (plain) | Root/Symptom | Status | Owner |
 |----|----------------|--------------|--------|-------|
 | D-B0 | `WorkingSet`/`IndexView` `search_text`/`find_references` run base-only + overlay post-filter; no per-view derived (trigram/reverse) index; no live rebase on change. | **ROOT (Culprit B)** | OPEN | new |
-| D11 | Cross-project scoping (`path`/`language`/`symbol_kind`/`direction`/`structural`) is broken — currently **loudly refused**, not honored. | SYMPTOM(B) | LOUD-ONLY | 012 |
+| D11 | Cross-project scoping — `path_prefix`/`language`/noise now **HONORED** (B1): threaded through the engine's option-honoring `search_*_with_options` on the empty-overlay cross-project path, built via the SAME helpers as single-project (identical behavior; proven by engine unit test + live daemon-HTTP test). `structural` (separate ast-grep pipeline) and `find_references` `path`/`symbol_kind`/`direction` (selectors / implementations-mode) remain honest capability-refusals — no cross-project entry point. Cross-project rendering of display params (`context`/`group_by`/`follow_refs`) is deferred to A1b (display, NOT scoping). | SYMPTOM(B) | FIXED | 012 |
 | D12 | Cross-project base is a frozen snapshot from open time; results go stale after ANY watched change (not just commits). No republish→rebase. | SYMPTOM(B) | OPEN | 012 |
 | D13 | Reference trace recall ~29% on type/value usages (`find_references` misses value sites). | SYMPTOM(B) | OPEN | new |
-| D14 | Cross-project output ranking is working-set/tier order, not real relevance ranking (capped, but not ranked). | SYMPTOM(B) | LOUD-ONLY | 012 |
+| D14 | Cross-project results are now per-project `result_limit`-bounded + tier-RANKED before the cap (B1; was an unbounded `usize::MAX` dump then truncate). Output stays grouped-by-project in working-set order; a single GLOBAL relevance interleave across projects is still deferred (adversarial review wf a2eac32 — honest scope). | SYMPTOM(B) | PARTIAL | 012 |
 | D15 | Single-project overlay edits are NOT visible in ordinary reads (read path uses `self.index`, not `IndexView`). | SYMPTOM(B) | OPEN | 012 |
 
 ## Defects — CULPRIT C (transport) + independent
@@ -56,6 +56,7 @@ Last updated: 2026-06-22.
 - close_session multi-project leak → reaper + regression test.
 - Strict-MCP-client schema rejection of Phase 3 `projects` fields → `schemars(with=...)`.
 - Base+overlay engine primitive + cross-project query (US1) — live-verified.
+- B1 cross-project scoping HONORED (D11): `path_prefix`/`language`/noise threaded through the option-honoring engine search via the single-project helpers; reject guard narrowed to the genuinely-unsupported params (`structural`, `find_references` selectors). Per-project ranked+bounded (D14 PARTIAL — global interleave deferred). Aligns cross-project text defaults with single-project (`include_vendor=false`); `ranked` is churn-blind cross-project (noted). Engine unit test + live daemon-HTTP scoping assertions (symbols + text); adversarial review wf a2eac32.
 
 ## Attack plan (roots, not holes)
 
@@ -71,7 +72,7 @@ This ledger lives on `feat/012` (worktree); A1/A2/B1 all land here (the superset
 Sequence by (defects-killed ÷ effort), gated by file independence:
 1. **A1a** — `ParamDisposition` choke point in `build_plan_from_steps` + conformance test. Every `StelRequest` field resolves to `Routed|Forwarded|Refused|NotApplicable`; silent-absent is asserted-against. **Zero behavior change — `routes.golden.jsonl` does NOT move.** Erects the non-regressable guard against the silent-drop class (D-A0) at zero risk. **ATTACK FIRST.** Owner 012.
 2. **D17** — collapse the open-vs-close TOCTOU (single `projects.write()` entry). S/LOW, isolated. Owner 012.
-3. **B1** — thread caller options through the empty-overlay search path (`search_*_with_options` already exist) → honors D11 scoping + D14 ranking on the cross-project read path. S-M/LOW. Owner 012.
+3. **B1** — DONE (implemented, gate-green): threaded caller options through the empty-overlay search path → D11 scoping FIXED, D14 ranking PARTIAL (per-project ranked+bounded; global interleave deferred). Owner 012.
 4. **A1b** — gated per-tool forwarding (`max_tokens`→args, `path`→`path_prefix`); golden re-baselined. Owner 012.
 5. **C-stopgap** — `/mcp` loudly refuses `project`/`projects` (contain D16's silent-wrong half). Owner 012.
 6. **B2** — republish→rebase on HEAD/watcher advance (D12). Owner 012.
