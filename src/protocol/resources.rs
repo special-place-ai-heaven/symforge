@@ -17,6 +17,7 @@ pub(crate) const REPO_OUTLINE_URI: &str = "symforge://repo/outline";
 pub(crate) const REPO_MAP_URI: &str = "symforge://repo/map";
 pub(crate) const REPO_CHANGES_URI: &str = "symforge://repo/changes/uncommitted";
 pub(crate) const TOOLS_CATALOG_URI: &str = "symforge://tools/catalog";
+pub(crate) const GLOSSARY_URI: &str = "symforge://glossary";
 
 pub(crate) const FILE_CONTEXT_TEMPLATE: &str =
     "symforge://file/context?path={path}&max_tokens={max_tokens}";
@@ -32,6 +33,7 @@ enum ResourceRequest {
     RepoMap,
     RepoChangesUncommitted,
     ToolsCatalog,
+    Glossary,
     FileContext {
         path: String,
         max_tokens: Option<u64>,
@@ -90,6 +92,12 @@ impl SymForgeServer {
                 "tools-catalog",
                 "Tool catalog",
                 "Workflow-grouped index of SymForge's tools.",
+            ),
+            make_resource(
+                GLOSSARY_URI,
+                "glossary",
+                "SymForge glossary",
+                "Definitions of SymForge concepts: project-target vs within-project filter, intents, server/background-service/install, base+overlay, that economy figures are estimates, and status fields.",
             ),
         ]
     }
@@ -182,6 +190,7 @@ impl SymForgeServer {
                 .await
             }
             ResourceRequest::ToolsCatalog => crate::protocol::smart_query::render_tool_catalog(),
+            ResourceRequest::Glossary => render_glossary(),
             ResourceRequest::FileContext { path, max_tokens } => {
                 self.get_file_context(Parameters(GetFileContextInput {
                     path,
@@ -321,6 +330,49 @@ pub(crate) fn file_context_resource(path: &str, max_tokens: Option<u64>) -> Reso
     )
 }
 
+/// Render the `symforge://glossary` resource: a concise legend of the surface
+/// vocabulary so callers stop misusing it (e.g. treating the within-project
+/// `path:` filter as a project selector). Static markdown; no index access.
+fn render_glossary() -> String {
+    String::from(
+        "SymForge glossary — surface vocabulary.\n\
+         \n\
+         ## Query parameters (`symforge` tool)\n\
+         - `query` (required): a natural-language phrase to route. Omitting it returns a clean\n\
+           \"query is required\" error.\n\
+         - `intent` (optional hint): orient | find | read | trace | impact | edit | meta | auto.\n\
+           Routes to the matching tool family; `auto` infers from the query.\n\
+         - `path` (optional): a WITHIN-PROJECT file/dir FILTER. It does NOT select or switch the\n\
+           project; a path outside the bound project is rejected. To answer about a different\n\
+           project, retarget the connection (declare workspace roots, or `index_folder`).\n\
+         - `symbol` (optional): when set, it is the symbol to read/trace; it is honored over\n\
+           query-token extraction.\n\
+         \n\
+         ## Project binding\n\
+         - A connection is bound to ONE project, derived from its declared workspace roots (not the\n\
+           server's launch directory). Every `status`/`symforge` response surfaces the bound\n\
+           `project_root` so a stale/wrong binding is visible, not silent.\n\
+         - `base + overlay` index model: an immutable base (shared, keyed by canonical-root + commit)\n\
+           plus a per-connection copy-on-write overlay of uncommitted edits; one connection's edits\n\
+           are never visible to another.\n\
+         \n\
+         ## Run modes\n\
+         - `stdio` — one MCP process per client over stdin/stdout (the usual editor attach).\n\
+         - `daemon` — a shared background process holding warm indexes; stdio front-ends proxy to it.\n\
+         - `serve` — an operator HTTP server exposing `/mcp` and `/admin`.\n\
+         - `init` — writes MCP attach config into a client; it does not index.\n\
+         \n\
+         ## Economy figures (trust envelope)\n\
+         - `saved`/`predicted`/`net` token numbers are ESTIMATES from heuristics, not measured\n\
+           savings. Treat them as indicative, not as a billing-grade measurement.\n\
+         \n\
+         ## Status fields\n\
+         - `index_ready` / `index_files` / `index_symbols`: the bound project's in-memory index.\n\
+         - `project_root`: the canonical root currently answering (see Project binding).\n\
+         - `deferred`: capabilities present in the surface but not yet wired.\n",
+    )
+}
+
 fn make_resource(uri: &str, name: &str, title: &str, description: &str) -> Resource {
     RawResource::new(uri.to_string(), name.to_string())
         .with_title(title.to_string())
@@ -369,6 +421,8 @@ fn parse_resource_uri(uri: &str) -> Result<ResourceRequest, String> {
         (Some("repo"), "/map") => Ok(ResourceRequest::RepoMap),
         (Some("repo"), "/changes/uncommitted") => Ok(ResourceRequest::RepoChangesUncommitted),
         (Some("tools"), "/catalog") => Ok(ResourceRequest::ToolsCatalog),
+        // `symforge://glossary` has an empty path (the concept is the host).
+        (Some("glossary"), "" | "/") => Ok(ResourceRequest::Glossary),
         (Some("file"), "/context") => Ok(ResourceRequest::FileContext {
             path: required_query(&query, "path")?,
             max_tokens: optional_query(&query, "max_tokens").transpose()?,

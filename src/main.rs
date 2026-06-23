@@ -218,6 +218,19 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
         .map(|v| v == "0" || v.is_empty())
         .unwrap_or(true);
 
+    // 012 D4-B (defer launch pin): the launch-CWD bind fires ONLY when
+    // `find_project_root()` resolved a usable root (env override or a safe CWD
+    // walk). That is the single-harness happy path and stays byte-for-byte
+    // unchanged — a found root pins the daemon session here, before the
+    // transport comes up.
+    //
+    // When `resolved_root` is `None` (home-CWD launchers such as Cursor, or a
+    // forbidden/too-broad CWD) we deliberately do NOT pin anything: we fall
+    // through to the local empty-index startup and let the client's declared
+    // `roots` bind the workspace at `on_initialized`
+    // (`bind_workspace_from_client_roots`). Eagerly pinning a home/forbidden CWD
+    // is exactly the wrong-repo binding C4 fixes, so deferring on `None` is the
+    // fix, not a regression.
     if use_daemon && let Some(root) = resolved_root.clone() {
         match daemon::connect_or_spawn_session(&root, "mcp-stdio", Some(std::process::id())).await {
             Ok(session) => return run_remote_mcp_server_async(session).await,

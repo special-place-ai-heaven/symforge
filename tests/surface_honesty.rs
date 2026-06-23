@@ -56,7 +56,16 @@ fn render_live_envelope(query: &str, session_tokens_served: i64) -> String {
 
 fn render_full_status() -> String {
     let ledger = SessionLedger::new();
-    let ctx = StelStatusContext::from_server("compact", "symforge", true, 128, 512, &ledger, 4096);
+    let ctx = StelStatusContext::from_server(
+        "compact",
+        "symforge",
+        Some("E:/project/symforge".to_string()),
+        true,
+        128,
+        512,
+        &ledger,
+        4096,
+    );
     format_stel_status(
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
@@ -72,8 +81,17 @@ fn render_full_status() -> String {
 /// mirroring `durable_ledger_summary_for_status` on the live server.
 fn render_full_status_with_durable(state: symforge::stel::DurableLedgerState) -> String {
     let ledger = SessionLedger::new();
-    let ctx = StelStatusContext::from_server("compact", "symforge", true, 128, 512, &ledger, 4096)
-        .with_durable_ledger(state);
+    let ctx = StelStatusContext::from_server(
+        "compact",
+        "symforge",
+        Some("E:/project/symforge".to_string()),
+        true,
+        128,
+        512,
+        &ledger,
+        4096,
+    )
+    .with_durable_ledger(state);
     format_stel_status(
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
@@ -383,8 +401,9 @@ fn full_status_calibration_section_is_honest_for_each_verdict() {
 
     let make = |verdict: CalibrationVerdict| {
         let ledger = SessionLedger::new();
-        let ctx = StelStatusContext::from_server("compact", "symforge", true, 1, 1, &ledger, 0)
-            .with_calibration_verdict(verdict);
+        let ctx =
+            StelStatusContext::from_server("compact", "symforge", None, true, 1, 1, &ledger, 0)
+                .with_calibration_verdict(verdict);
         format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),

@@ -19,6 +19,14 @@
 //! via full-signature fn-pointer bindings) so a rename, removal, or
 //! signature-drift becomes a COMPILE FAILURE in SymForge's own embed test
 //! suite rather than a downstream AAP surprise.
+//!
+//! UNSTABLE OPT-IN: the base+overlay multi-project primitive in
+//! `live_index::view::*` (reachable via the deep-path re-export below, e.g.
+//! `symforge::embed::live_index::view::WorkingSet`) is **opt-in and unstable**
+//! and is intentionally **NOT** part of the frozen contract above. Its
+//! overlay-invalidation internals may churn at MINOR; it is deliberately absent
+//! from the `contract` test (research D3 / SC-011). Do not add `view::*` types
+//! to the flat facade or the contract test.
 
 // ---------------------------------------------------------------------------
 // Flat, semver-public facade. Re-exports ITEMS (types + free functions).

@@ -249,6 +249,8 @@ mod tests {
             symbol: None,
             max_tokens: None,
             preview: Some(true),
+            project: None,
+            projects: None,
         };
         let body = format_preview_body(&request);
         let parsed: StelEstimate = serde_json::from_str(&body).expect("preview JSON");

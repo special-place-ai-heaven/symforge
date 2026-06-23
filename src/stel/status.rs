@@ -61,6 +61,11 @@ pub struct StelStatusContext<'a> {
     pub surface: &'static str,
     pub version: &'static str,
     pub project_name: &'a str,
+    /// Bound workspace root that ANSWERED this request (012 D6-a bound-root
+    /// visibility). Forward-slash normalized for cross-platform stability.
+    /// `None` when no workspace is bound (cold start / never retargeted) — a
+    /// LOUD signal so a stale or wrong binding can never read as a working one.
+    pub project_root: Option<String>,
     pub index_ready: bool,
     pub index_files: usize,
     pub index_symbols: usize,
@@ -76,9 +81,11 @@ pub struct StelStatusContext<'a> {
 }
 
 impl<'a> StelStatusContext<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_server(
         surface: &'static str,
         project_name: &'a str,
+        project_root: Option<String>,
         index_ready: bool,
         index_files: usize,
         index_symbols: usize,
@@ -96,6 +103,7 @@ impl<'a> StelStatusContext<'a> {
             surface,
             version: env!("CARGO_PKG_VERSION"),
             project_name,
+            project_root,
             index_ready,
             index_files,
             index_symbols,
@@ -272,6 +280,13 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         "handler_status: wired".to_string(),
         "handler_symforge_edit: preview-and-apply".to_string(),
         format!("ledger_events: {}", ctx.ledger_events),
+        // 012 D6-a bound-root visibility: surface WHICH project answered so a
+        // stale/wrong binding is loud, not silent. `(unbound)` when no workspace
+        // is bound (cold start / never retargeted).
+        format!(
+            "project_root: {}",
+            ctx.project_root.as_deref().unwrap_or("(unbound)")
+        ),
         format!("index_ready: {}", ctx.index_ready),
         format!("index_files: {}", ctx.index_files),
         format!("deferred: {DEFERRED_ITEMS}"),
@@ -313,6 +328,7 @@ mod tests {
             surface: "compact",
             version: "0.0.0-test",
             project_name: "symforge-test",
+            project_root: Some("E:/project/symforge-test".to_string()),
             index_ready: true,
             index_files: 12,
             index_symbols: 48,
@@ -341,6 +357,9 @@ mod tests {
             "handler_status: wired",
             "handler_symforge_edit: preview-and-apply",
             "ledger_events: 2",
+            // 012 D6-a: bound-root visibility line is present on the compact
+            // surface so the answering project is never silent.
+            "project_root: E:/project/symforge-test",
             "index_ready: true",
             "index_files: 12",
             "deferred: b_results,multi_step_planner",
@@ -459,11 +478,48 @@ mod tests {
     #[test]
     fn from_server_reflects_empty_ledger() {
         let ledger = SessionLedger::new();
-        let ctx = StelStatusContext::from_server("compact", "proj", false, 0, 0, &ledger, 0);
+        let ctx = StelStatusContext::from_server("compact", "proj", None, false, 0, 0, &ledger, 0);
         assert_eq!(ctx.ledger_events, 0);
         assert_eq!(ctx.last_ledger_decision, None);
+        assert_eq!(ctx.project_root, None);
         let body = format_stel_status(&StelStatusRequest::default(), &ctx);
         assert!(body.contains("ledger_events: 0"));
         assert!(body.contains("index_ready: false"));
+    }
+
+    #[test]
+    fn unbound_project_root_reads_loudly_not_silently() {
+        // 012 D6-a: a cold-start / never-retargeted session has no bound root.
+        // The status MUST say so explicitly, never omit the line (silence would
+        // let a wrong/empty binding masquerade as healthy).
+        let ledger = SessionLedger::new();
+        let ctx = StelStatusContext::from_server("compact", "proj", None, false, 0, 0, &ledger, 0);
+        let body = format_stel_status(&StelStatusRequest::default(), &ctx);
+        assert!(
+            body.contains("project_root: (unbound)"),
+            "an unbound session must surface `project_root: (unbound)`:\n{body}"
+        );
+    }
+
+    #[test]
+    fn bound_project_root_is_surfaced() {
+        // 012 D6-a: when a workspace is bound, the answering root is visible so a
+        // consumer can confirm which project produced the result.
+        let ledger = SessionLedger::new();
+        let ctx = StelStatusContext::from_server(
+            "compact",
+            "proj",
+            Some("/home/u/repo".to_string()),
+            true,
+            10,
+            40,
+            &ledger,
+            0,
+        );
+        let body = format_stel_status(&StelStatusRequest::default(), &ctx);
+        assert!(
+            body.contains("project_root: /home/u/repo"),
+            "bound root must be surfaced verbatim:\n{body}"
+        );
     }
 }

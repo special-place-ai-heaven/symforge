@@ -70,6 +70,100 @@ fn statused_tool_result(
     Ok(ResultStatus::new(outcome_class).into_call_tool_result(text))
 }
 
+/// Lexically normalize a path, resolving `.`/`..` segments WITHOUT touching the
+/// filesystem (so a not-yet-existing within-project filter path can still be
+/// checked for `..` escapes). Absolute prefixes and the path root are preserved.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                // Pop a normal segment if there is one; never pop past the root
+                // or a prefix (drive/UNC) component.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `path` (a `symforge` `path:` filter) resolves WITHIN the bound
+/// project `root` (012 D6 / contracts §3c). `path:` is a within-project filter,
+/// never a project selector, so a path that escapes the bound root is a caller
+/// error.
+///
+/// Resolution: a relative `path` is joined onto `root`; an absolute `path` is
+/// used as-is. Both the resolved target and the root are canonicalized when they
+/// exist on disk (resolving symlinks/`..`); when the target does not exist yet,
+/// we fall back to a lexical normalization so a `../../escape` filter is still
+/// rejected. Containment is the canonical/normalized-root being a prefix of the
+/// canonical/normalized target (equal counts as within).
+fn path_is_within_bound_project(path: &str, root: &Path) -> bool {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    let raw = Path::new(path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        canonical_root.join(raw)
+    };
+    let resolved = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexically(&resolved));
+
+    // Compare with the Windows verbatim (`\\?\`) prefix stripped from BOTH sides
+    // so a canonicalized root (which gains `\\?\`) and a lexically-normalized
+    // not-yet-existing target (which does not) still compare correctly.
+    let resolved_cmp = strip_verbatim_prefix(&resolved);
+    let root_cmp = strip_verbatim_prefix(&canonical_root);
+    resolved_cmp.starts_with(&root_cmp)
+}
+
+/// Strip the Windows verbatim/UNC `\\?\` prefix from a path for comparison,
+/// returning a plain comparable `PathBuf`. On a path without the prefix (or on
+/// non-Windows) this is an allocation-light passthrough.
+///
+/// We rebuild the path from its components: a `Prefix` component that is verbatim
+/// (`\\?\C:`, `\\?\UNC\...`) is replaced by its plain disk/UNC form so it lines
+/// up with a non-canonicalized (lexically normalized) sibling path.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::VerbatimDisk(disk) => {
+                    out.push(format!("{}:\\", disk as char));
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut unc = std::ffi::OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    out.push(unc);
+                }
+                _ => out.push(component.as_os_str()),
+            },
+            Component::RootDir => {
+                // Disk prefixes above already include the root separator; only
+                // push a bare root when there is no preceding prefix.
+                if out.as_os_str().is_empty() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 pub(super) fn is_index_unavailable_output(text: &str) -> bool {
     text.starts_with("Index not loaded.")
         || text.starts_with("Index is loading")
@@ -294,6 +388,15 @@ pub struct IndexFolderInput {
     /// Optional key used to replay an identical `index_folder` request safely.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Feature 012 (Phase 2): when true, OPEN this folder ADDITIVELY in the
+    /// current session's working set instead of retargeting. The session keeps
+    /// its existing active project AND gains this one, enabling cross-project
+    /// reads (`project`/`projects` on `search_symbols`/`search_text`/
+    /// `find_references`). Default/omitted = the existing retarget behavior
+    /// (FR-006, byte-identical). Multi-project requires the daemon; on stdio/embed
+    /// (no daemon) an `add:true` call honestly refuses (Principle VII).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub add: Option<bool>,
 }
 
 /// Input for `checkpoint_now`.
@@ -2390,6 +2493,31 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
     anchored_search_evidence(anchors, "reference anchors")
 }
 
+/// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
+/// the daemon-owned working set, which does not exist on the local (stdio/embed
+/// or daemon-degraded) execution path. When a `project`/`projects` param is
+/// present and we are about to run LOCALLY, return an honest refusal instead of
+/// silently ignoring the target and serving the active project only. Returns the
+/// refusal message when the request is cross-project, else `None`.
+fn local_cross_project_refusal(
+    project: Option<&str>,
+    projects: Option<&[String]>,
+) -> Option<String> {
+    let has_project = project.map(|p| !p.trim().is_empty()).unwrap_or(false);
+    let has_projects = projects.map(|p| !p.is_empty()).unwrap_or(false);
+    if has_project || has_projects {
+        Some(
+            "Cross-project queries (project/projects) require the daemon: the \
+             working set of open projects lives on the daemon transport, not on \
+             stdio/embed or while the daemon is unreachable. Start the daemon to \
+             query across projects."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
     match kind_filter {
         Some("call") => Some(ReferenceKind::Call),
@@ -4371,6 +4499,13 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("search_symbols", &params.0).await {
             return result;
         }
+        // Feature 012 (Phase 3): no daemon here -> no working set. Honest refusal
+        // for a cross-project request instead of a silent single-project answer.
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
+        }
         let options = match search_symbols_options_from_input(&params.0) {
             Ok(options) => options,
             Err(message) => return message,
@@ -4565,6 +4700,13 @@ impl SymForgeServer {
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
+        }
+        // Feature 012 (Phase 3): honest refusal for a cross-project request with
+        // no daemon (no working set on the local path).
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let limit = params.0.limit.unwrap_or(50) as usize;
@@ -6120,7 +6262,17 @@ impl SymForgeServer {
         )
     )]
     pub async fn index_folder(&self, params: Parameters<IndexFolderInput>) -> String {
+        let is_additive = params.0.add == Some(true);
         if let Some(result) = self.proxy_tool_call("index_folder", &params.0).await {
+            // Feature 012 (Phase 2): an ADDITIVE open does NOT retarget the
+            // session — it adds a second project to the daemon-owned working set
+            // while the active project (and this front-end's `repo_root` /
+            // `self.index`) stays put. So skip the retarget bookkeeping below;
+            // resetting the local index here would wrongly drop the active
+            // project's local-fallback state.
+            if is_additive {
+                return result;
+            }
             // The daemon has rebound the session to the new project. Update our
             // local repo_root so that local-fallback tools (what_changed,
             // analyze_file_impact) and ensure_local_index use the correct root
@@ -6143,6 +6295,18 @@ impl SymForgeServer {
             return result;
         }
         let input = params.0;
+        // Feature 012 (Phase 2), Principle VII honesty: additive multi-project
+        // opens live ONLY in the daemon-owned working set. On stdio/embed (no
+        // daemon) or when the daemon is unreachable, there is no working set to
+        // add to — refuse honestly instead of silently falling back to a
+        // single-project retarget that would discard the active project.
+        if input.add == Some(true) {
+            return "index_folder(add:true) requires the daemon: additive \
+                multi-project opens are only available over the daemon transport, \
+                not on stdio/embed. Start the daemon (the default desktop topology) \
+                to open multiple projects in one session."
+                .to_string();
+        }
         let root = PathBuf::from(&input.path);
         if !root.exists() {
             return format!("Path does not exist: {}", input.path);
@@ -6882,6 +7046,13 @@ impl SymForgeServer {
     pub(crate) async fn find_references(&self, params: Parameters<FindReferencesInput>) -> String {
         if let Some(result) = self.proxy_tool_call("find_references", &params.0).await {
             return result;
+        }
+        // Feature 012 (Phase 3): honest refusal for a cross-project request with
+        // no daemon (no working set on the local path).
+        if let Some(refusal) =
+            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
         }
         let input = &params.0;
         if let Some(path) = input.path.as_deref() {
@@ -8463,6 +8634,15 @@ impl SymForgeServer {
             return statused_tool_result(output, outcome_class);
         }
 
+        // Surface-honesty (012 D6 / contracts §3c): with `query` now
+        // `#[serde(default)]`, an omitted/blank `query` no longer fails rmcp
+        // deserialization with an opaque error — validate it explicitly here and
+        // return a clean, actionable InvalidRequest instead.
+        if params.0.request.query.trim().is_empty() {
+            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                .into_call_tool_result("query is required: pass a natural-language phrase"));
+        }
+
         if super::surface_probe::surface_profile_from_env()
             != super::surface_probe::SurfaceProfile::Compact
         {
@@ -8510,6 +8690,53 @@ impl SymForgeServer {
             );
         }
 
+        // Surface-honesty (012 Phase 3 / Principle VII): `StelRequest` carries
+        // `project`/`projects` for schema parity with the direct tools, but the L1
+        // planner does NOT route them into its read steps. Accepting them silently
+        // would single-project-resolve a `projects:["*"]` caller and hand back
+        // partial results that LOOK cross-project — a silent drop. Refuse honestly
+        // instead: name the supported vehicle. A blank `project` / empty `projects`
+        // is treated as "not set" (it would target the active project anyway), so
+        // the refusal fires only on a meaningful cross-project request.
+        let has_project = request
+            .project
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        let has_projects = request
+            .projects
+            .as_deref()
+            .is_some_and(|ids| ids.iter().any(|id| !id.trim().is_empty()));
+        if has_project || has_projects {
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
+                    "cross-project targeting is not routed through the `symforge` facade; \
+                 call search_symbols / search_text / find_references directly with \
+                 project/projects.",
+                ),
+            );
+        }
+
+        // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
+        // filter, not a project selector. A `path:` that resolves outside the
+        // bound project would silently match nothing (or, for an absolute path,
+        // mislead the caller into thinking they retargeted). Reject it up front
+        // with a clear message naming the bound root, mirroring the
+        // `symbol_contract_violation` corrective pattern. Skipped when no root is
+        // bound (nothing to verify against) or when `path` is blank.
+        if let Some(root) = self.capture_repo_root()
+            && let Some(path) = request.path.as_deref().filter(|p| !p.trim().is_empty())
+            && !path_is_within_bound_project(path, &root)
+        {
+            let root_display = root.display().to_string().replace('\\', "/");
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(format!(
+                    "path is outside the bound project {root_display}: \
+                             `path:` is a within-project filter, not a project selector \
+                             (use `index_folder {{ path }}` to retarget the workspace)."
+                )),
+            );
+        }
+
         let mut plan = build_plan(request);
         // US5 (010 FR-014, D2): ground the plan's economics in the real target
         // byte sizes from the index before the L2 gate runs, so `predicted_net`
@@ -8544,6 +8771,11 @@ impl SymForgeServer {
                 tuned.as_ref(),
             );
             let envelope = handler::envelope_for_decision(&metrics);
+            // 012 D6-a: the preview body is `envelope + "\n\n" + StelEstimate JSON`
+            // that consumers parse to the end of the string, so a trailing
+            // free-text bound-root line would corrupt the JSON tail. Preview is a
+            // pre-flight estimate, not a served result; bound-root visibility is
+            // attached to the actual served/bypass responses below instead.
             let output = handler::prepend_envelope(&envelope, &body);
             return statused_tool_result(output, OutcomeClass::Found);
         }
@@ -8567,6 +8799,8 @@ impl SymForgeServer {
                 None,
                 tuned.as_ref(),
             );
+            // 012 D6-a: surface the bound project on every `symforge` response.
+            let output = self.with_bound_root_visibility(output);
             self.session_context
                 .record_summary_output("symforge", handler::estimate_tokens(&output));
             return statused_tool_result(output, OutcomeClass::Found);
@@ -8688,6 +8922,8 @@ impl SymForgeServer {
             tools_called,
             tuned.as_ref(),
         );
+        // 012 D6-a: surface the bound project on every `symforge` response.
+        let output = self.with_bound_root_visibility(output);
         self.session_context
             .record_summary_output("symforge", handler::estimate_tokens(&output));
         statused_tool_result(output, outcome_class)
@@ -9014,9 +9250,19 @@ impl SymForgeServer {
 
         let guard = self.index.read();
         let ledger = self.stel_ledger.lock();
+        // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
+        // is the root bound on THIS server — on the daemon side it is the warm
+        // project's root (TR-01), on the front-end fallback it is the proxy's
+        // bound root. Normalized to forward slashes to match `runtime_status_for`.
+        let project_root = self
+            .capture_repo_root()
+            .map(|root| root.to_string_lossy().replace('\\', "/"));
+        // 013: `mut` — line below reassigns `ctx` with the durable calibration
+        // verdict override (T033/FR-009).
         let mut ctx = crate::stel::StelStatusContext::from_server(
             "compact",
             &self.project_name,
+            project_root,
             guard.is_ready(),
             guard.file_count(),
             guard.symbol_count(),
@@ -9071,6 +9317,9 @@ impl SymForgeServer {
         let mut ctx = crate::stel::StelStatusContext::from_server(
             "compact",
             &self.project_name,
+            // 012 project_root: unused here — render_proxy_owned_lines omits the
+            // project/index lines (they stay the worker's, TR-01).
+            None,
             false,
             0,
             0,
@@ -9101,6 +9350,34 @@ impl SymForgeServer {
         request: &crate::stel::StelStatusRequest,
     ) -> String {
         self.render_stel_status_body(request)
+    }
+
+    /// Bound-root visibility line for the `symforge` response envelope (012 D6-a).
+    ///
+    /// Reuses [`Self::runtime_status_for`] (the same accessor `health` uses) so
+    /// the surfaced root carries the identical backslash normalization and
+    /// `project_root` derivation — a single source of truth for "which workspace
+    /// answered". Returns `project_root: (unbound)` when nothing is bound so a
+    /// stale or wrong binding is LOUD in every facade response, never silent.
+    fn stel_bound_root_line(&self) -> String {
+        let published = self.index.published_state();
+        let status =
+            self.runtime_status_for(&published, self.local_runtime_mode(), None, None, None);
+        format!(
+            "project_root: {}",
+            status.project_root.as_deref().unwrap_or("(unbound)")
+        )
+    }
+
+    /// Attach the bound-root visibility line to a finished `symforge` response so
+    /// the answering project is always observable (012 D6-a).
+    ///
+    /// Appended as a trailing line rather than prepended so the trust envelope
+    /// stays the FIRST block of the response — a contract relied on by consumers
+    /// and by the facade tests (`output.starts_with("── stel")`). The bound-root
+    /// line is still unconditionally present, so a stale/wrong binding is loud.
+    fn with_bound_root_visibility(&self, output: String) -> String {
+        format!("{output}\n{}", self.stel_bound_root_line())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9239,6 +9516,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -9255,6 +9534,8 @@ impl SymForgeServer {
                     include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.search_symbols(Parameters(input)).await
             }
@@ -9333,6 +9614,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -9361,6 +9644,8 @@ impl SymForgeServer {
                     estimate: None,
                     max_tokens: None,
                     structural: None,
+                    project: None,
+                    projects: None,
                 };
                 self.search_text(Parameters(input)).await
             }
@@ -9391,6 +9676,8 @@ impl SymForgeServer {
                     direction: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 };
                 self.find_references(Parameters(input)).await
             }
@@ -9680,9 +9967,10 @@ mod tests {
         state: crate::stel::DurableLedgerState,
     ) -> crate::stel::ProxyOwnedStatusLines {
         let ledger = crate::stel::SessionLedger::new();
-        let ctx =
-            crate::stel::StelStatusContext::from_server("compact", "proj", false, 0, 0, &ledger, 0)
-                .with_durable_ledger(state);
+        let ctx = crate::stel::StelStatusContext::from_server(
+            "compact", "proj", None, false, 0, 0, &ledger, 0,
+        )
+        .with_durable_ledger(state);
         crate::stel::render_proxy_owned_lines(&ctx)
     }
 
@@ -10521,6 +10809,8 @@ mod tests {
             include_personal_tooling: None,
             estimate: None,
             max_tokens: None,
+            project: None,
+            projects: None,
         }
     }
 
@@ -10555,6 +10845,8 @@ mod tests {
             direction: None,
             estimate: None,
             max_tokens: None,
+            project: None,
+            projects: None,
         }
     }
 
@@ -12593,6 +12885,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
 
@@ -12649,6 +12942,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12696,6 +12990,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12708,6 +13003,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
         assert!(
@@ -12774,6 +13070,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
+                add: None,
             }))
             .await;
 
@@ -12832,6 +13129,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
+                add: None,
             }))
             .await;
         assert!(
@@ -12845,6 +13143,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
+                add: None,
             }))
             .await;
 
@@ -12873,6 +13172,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: first_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
+                add: None,
             }))
             .await;
         assert!(
@@ -12884,6 +13184,7 @@ mod tests {
             .index_folder(Parameters(super::IndexFolderInput {
                 path: second_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
+                add: None,
             }))
             .await;
 
@@ -12915,6 +13216,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -12954,6 +13257,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -12999,6 +13304,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13048,6 +13355,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13094,6 +13403,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13135,6 +13446,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13211,6 +13524,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13257,6 +13572,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13307,6 +13624,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13358,6 +13677,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13406,6 +13727,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13436,6 +13759,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13466,6 +13791,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13496,6 +13823,8 @@ mod tests {
                 include_personal_tooling: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13533,6 +13862,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13599,6 +13930,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13665,6 +13998,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13704,6 +14039,8 @@ mod tests {
                 structural: Some(true),
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13764,6 +14101,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13811,6 +14150,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -13863,6 +14204,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13907,6 +14250,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -13963,6 +14308,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14019,6 +14366,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14067,6 +14416,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14118,6 +14469,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14160,6 +14513,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14214,6 +14569,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -14254,6 +14611,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20239,6 +20598,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert_eq!(result, crate::protocol::format::empty_guard_message());
@@ -20500,6 +20861,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should get "No references found" not a guard message
@@ -20550,6 +20913,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20598,6 +20963,8 @@ mod tests {
                 direction: None,
                 estimate: None,
                 max_tokens: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -20858,6 +21225,8 @@ mod tests {
                     include_personal_tooling: None,
                     estimate: None,
                     max_tokens: None,
+                    project: None,
+                    projects: None,
                 }))
                 .await;
             assert!(
@@ -20920,6 +21289,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         assert!(
@@ -20965,6 +21336,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -21017,6 +21390,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // With group_by: "symbol", should show symbol name and match count
@@ -21062,6 +21437,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -21120,6 +21497,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should exclude the "use" import line
@@ -21164,6 +21543,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -21218,6 +21599,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
 
@@ -21308,6 +21691,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // Should show that connect() is called by handler() in src/api.rs
@@ -21354,6 +21739,8 @@ mod tests {
                 structural: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                project: None,
+                projects: None,
             }))
             .await;
         // follow_refs ran but found no cross-references — should signal this explicitly
@@ -22746,6 +23133,8 @@ mod tests {
                 estimate: None,
                 max_tokens: None,
                 structural: None,
+                project: None,
+                projects: None,
             };
             let search_result = server.search_text(Parameters(search_input)).await;
             assert!(
@@ -24067,6 +24456,85 @@ mod tests {
         assert!(
             !on_disk.contains("old"),
             "negative control must replace the old body:\n{on_disk}"
+        );
+    }
+
+    // ── Feature 012 hardening — `symforge` facade REFUSES cross-project targeting ─
+    //
+    // `StelRequest` carries `project`/`projects` for schema parity, but the L1
+    // planner does not route them, so accepting one would silently single-project-
+    // resolve a `projects:["*"]` caller (a silent drop, Principle VII). The facade
+    // must refuse honestly with an InvalidRequest naming the direct-tool vehicle.
+    #[tokio::test]
+    async fn symforge_facade_rejects_cross_project_targeting() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
+        let content = medium_test_source("pub fn thing() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        // `projects: ["*"]` -> refused (not silently single-project resolved).
+        let projects_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                projects: Some(vec!["*".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(projects_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("cross-project targeting is not routed through the `symforge` facade")
+                && text.contains("search_symbols")
+                && text.contains("find_references"),
+            "refusal must name the direct-tool vehicle: {text}"
+        );
+
+        // `project: "proj-x"` -> refused identically.
+        let project_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("proj-x".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(project_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+
+        // A blank `project` is treated as not-set: the facade must NOT refuse on it
+        // (it would target the active project anyway). It proceeds past the
+        // cross-project guard (whatever the downstream outcome, it is NOT the
+        // cross-project refusal message).
+        let blank_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("   ".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(blank_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(
+            !text.contains("cross-project targeting is not routed"),
+            "a blank `project` must not trip the cross-project refusal: {text}"
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "8.5.0"
+version = "8.6.0"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
@@ -44,7 +44,7 @@ embed = []
 aho-corasick = "1.1"
 anyhow = "1.0"
 arc-swap = "1"
-ast-grep-core = "0.43"
+ast-grep-core = "0.44"
 automod = "1"
 sha2 = "0.11"
 parking_lot = "0.12"

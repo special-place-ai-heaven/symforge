@@ -543,7 +543,14 @@ pub fn find_project_root() -> Option<PathBuf> {
 /// CWD-based discovery — so the override can never index a sensitive or overly
 /// broad tree. Any failure logs and returns `None`, letting `find_project_root`
 /// fall back to its normal CWD walk (the override is a hint, never a bypass).
-fn workspace_root_env_override() -> Option<PathBuf> {
+///
+/// Public so the per-connection retarget gate
+/// (`SymForgeServer::bind_workspace_from_client_roots`, feature 012 D4-A) can ask
+/// "did the bound root come from the env override?" — when it did, `env > roots`
+/// precedence requires the env decision to win and client-roots retarget is
+/// skipped; when it did not, the bound root came from the CWD walk and declared
+/// client roots are allowed to retarget the session (`roots > CWD`).
+pub fn workspace_root_env_override() -> Option<PathBuf> {
     let raw = std::env::var(WORKSPACE_ROOT_ENV).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {

@@ -105,7 +105,10 @@ pub use ledger::{
     LedgerCaptureInput, LedgerEnvelopeMeta, SessionLedger, build_ledger_event, capture_ledger,
     format_ledger_envelope_line,
 };
-pub use planner::{build_plan, confidence_label, is_find_fusion_plan, plan_summary_line};
+pub use planner::{
+    ParamDisposition, build_plan, classify_param_dispositions, confidence_label,
+    is_find_fusion_plan, plan_summary_line,
+};
 pub use status::{
     DEFERRED_ITEMS, DurableLedgerState, DurableLedgerSummary, PHASE0_EVIDENCE_COMMIT,
     PHASE0_GO_COMMIT, ProxyOwnedStatusLines, StelStatusContext, format_durable_ledger_line,
