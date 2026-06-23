@@ -6607,6 +6607,92 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
+    #[tokio::test]
+    async fn test_symforge_edit_apply_commits_through_daemon_proxy() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "compact");
+
+        let project = project_dir("symforge-edit-proxy");
+        let file_path = project.path().join("src").join("lib.rs");
+        std::fs::write(&file_path, "pub fn proxy_edit() -> u32 { 1 }\n").expect("write source");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "edit-proxy".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon proxy index_folder must succeed, got: {indexed}"
+        );
+        assert_eq!(
+            server.index().published_state().file_count,
+            0,
+            "front-end proxy index is intentionally empty"
+        );
+
+        let result = server
+            .symforge_edit_facade_tool(Parameters(crate::stel::StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("proxy_edit".to_string()),
+                body: Some("pub fn proxy_edit() -> u32 { 2 }".to_string()),
+                apply: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .expect("symforge_edit dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize symforge_edit result");
+        let body = serialized["content"][0]["text"]
+            .as_str()
+            .expect("symforge_edit result text");
+        assert!(
+            !body.starts_with("Index not loaded."),
+            "daemon-proxy apply must not inspect the empty front-end index:\n{body}"
+        );
+
+        let on_disk = std::fs::read_to_string(&file_path).expect("read edited file");
+        assert!(
+            on_disk.contains("{ 2 }"),
+            "symforge_edit apply must commit through the daemon proxy, got:\n{on_disk}\n\nbody:\n{body}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
     /// Regression: a daemon-proxy `index_folder` switch must invalidate any
     /// stale in-process index that a prior local fallback populated for the OLD
     /// project. Without the fix, the server keeps serving the old project from

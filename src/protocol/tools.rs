@@ -170,10 +170,14 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
         || text.starts_with("Index degraded:")
 }
 
+fn is_error_output(text: &str) -> bool {
+    text.starts_with("Error:") || text.starts_with("Error in ")
+}
+
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Error:") {
+    } else if is_error_output(text) {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous:") {
         OutcomeClass::Ambiguous
@@ -187,7 +191,7 @@ fn classify_get_symbol_output(text: &str) -> OutcomeClass {
 fn classify_get_symbol_context_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Error:") {
+    } else if is_error_output(text) {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous symbol selector") || text.starts_with("Ambiguous:") {
         OutcomeClass::Ambiguous
@@ -242,7 +246,7 @@ fn classify_get_file_content_output(text: &str) -> OutcomeClass {
 fn classify_search_symbols_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("search_symbols requires") {
+    } else if is_error_output(text) || text.starts_with("search_symbols requires") {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("No symbols matching") {
         OutcomeClass::EmptyResult
@@ -254,7 +258,7 @@ fn classify_search_symbols_output(text: &str) -> OutcomeClass {
 fn classify_search_text_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Error:")
+    } else if is_error_output(text)
         || text.starts_with("Regex search requires")
         || text.starts_with("Search requires")
         || text.starts_with("Invalid regex")
@@ -295,6 +299,8 @@ fn classify_search_files_output(text: &str) -> OutcomeClass {
 fn classify_find_references_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
+    } else if is_error_output(text) {
+        OutcomeClass::InvalidRequest
     } else if text.starts_with("Ambiguous symbol selector") {
         OutcomeClass::Ambiguous
     } else if text.starts_with("File not found:")
@@ -314,7 +320,7 @@ fn classify_find_references_output(text: &str) -> OutcomeClass {
 fn classify_get_file_context_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Error:") || text.starts_with("Invalid get_file_context") {
+    } else if is_error_output(text) || text.starts_with("Invalid get_file_context") {
         OutcomeClass::InvalidRequest
     } else if text.starts_with("File not found:")
         || text.starts_with("File not found on disk:")
@@ -342,7 +348,7 @@ pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeCla
         _ => {
             if is_index_unavailable_output(text) {
                 OutcomeClass::InternalFailure
-            } else if text.starts_with("Error:") || text.starts_with("Invalid") {
+            } else if is_error_output(text) || text.starts_with("Invalid") {
                 OutcomeClass::InvalidRequest
             } else {
                 OutcomeClass::Found
@@ -8580,7 +8586,7 @@ impl SymForgeServer {
                 }
             };
             let output = self.dispatch_tool_for_tests(legacy_tool, legacy_args).await;
-            let outcome_class = if output.starts_with("Error:") || output.starts_with("Invalid") {
+            let outcome_class = if is_error_output(&output) || output.starts_with("Invalid") {
                 OutcomeClass::InvalidRequest
             } else if output.starts_with("Index not loaded.") {
                 OutcomeClass::InternalFailure
@@ -8966,7 +8972,10 @@ impl SymForgeServer {
         let apply = apply_requested(request);
         let mut resolved_symbol = None;
 
-        if apply {
+        // In daemon-proxy stdio, this front-end intentionally holds
+        // LiveIndex::empty(); the proxied edit tool runs these gates against the
+        // daemon's populated index.
+        if apply && self.daemon_client.is_none() {
             let abs_path =
                 match super::edit_tools::prepare_exact_path_for_edit(self, request.path.trim()) {
                     Ok((path, _)) => path,
@@ -9089,7 +9098,7 @@ impl SymForgeServer {
         full_body: &str,
     ) -> OutcomeClass {
         use super::edit_format::symforge_edit_internal_failure;
-        if tool_body.starts_with("Error:") || tool_body.starts_with("Invalid") {
+        if is_error_output(tool_body) || tool_body.starts_with("Invalid") {
             OutcomeClass::InvalidRequest
         } else if symforge_edit_internal_failure(tool_body, apply, full_body) {
             OutcomeClass::InternalFailure
@@ -16194,6 +16203,27 @@ mod tests {
         assert_eq!(
             super::classify_get_file_content_output("1: let s = \"No matches for 'x'\";"),
             OutcomeClass::Found
+        );
+    }
+
+    #[test]
+    fn daemon_wrapped_tool_errors_classify_as_invalid_request() {
+        assert_eq!(
+            super::classify_compact_tool_output(
+                "search_symbols",
+                "Error in search_symbols: projects must not be empty"
+            ),
+            OutcomeClass::InvalidRequest
+        );
+        assert_eq!(
+            super::classify_search_text_output("Error in search_text: text search failed"),
+            OutcomeClass::InvalidRequest
+        );
+        assert_eq!(
+            super::classify_find_references_output(
+                "Error in find_references: project 'missing' is not open"
+            ),
+            OutcomeClass::InvalidRequest
         );
     }
 
