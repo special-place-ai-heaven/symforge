@@ -31,9 +31,9 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    DEFAULT_MAX_PER_FILE, SymbolMatchTier, TextSearchError, TextSearchResult, compute_test_ranges,
-    current_code_search_keeps_file, search_symbols as base_search_symbols,
-    search_text as base_search_text, truncate_display_line,
+    DEFAULT_MAX_PER_FILE, SymbolMatchTier, SymbolSearchOptions, TextSearchError, TextSearchOptions,
+    TextSearchResult, compute_test_ranges, current_code_search_keeps_file,
+    search_symbols_with_options, search_text_with_options, truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
 use crate::live_index::query::is_filtered_name;
@@ -318,28 +318,40 @@ impl<'a> IndexView<'a> {
     /// Symbol-name search resolved THROUGH the overlay (research D1: symbol-name
     /// search resolves through the overlay, not via the base's derived indices).
     ///
-    /// For a base-only view this delegates straight to the engine's
-    /// [`base_search_symbols`] over the base index (byte-for-byte today's
-    /// behavior). When an overlay is present we cannot call the base function
-    /// (it would scan the stale base file map), so we scan the OVERLAY-RESOLVED
-    /// file set ([`all_files`]) directly with the same name-match + tiering rules
-    /// the engine search uses, then sort and bound identically. Correctness over
-    /// speed: this is a linear scan of the resolved file set.
+    /// For a view with NO live deltas (base-only, OR an empty overlay — the US1
+    /// cross-project case, since overlays are never written there) this delegates
+    /// straight to the engine's option-honoring [`search_symbols_with_options`]
+    /// over the base, so the caller's `options` (path scope, language filter,
+    /// noise policy, and the `result_limit` ranking) ARE honored on the
+    /// cross-project read path (D11 scoping + D14 ranking). When live overlay
+    /// deltas ARE present we cannot call the base function (it would scan the
+    /// stale base file map), so we scan the OVERLAY-RESOLVED file set
+    /// ([`all_files`]) directly with the name-match + tiering rules the engine
+    /// uses. Correctness over speed: this is a linear scan of the resolved set.
     ///
-    /// `// DEFERRED (012 full tier):` the engine's richer
-    /// `search_symbols_with_options` (noise policy, test-module suppression,
-    /// path scope, language filter) is intentionally NOT reproduced here — the
-    /// overlay path applies only the name/kind tiering needed for cross-project
-    /// attribution. Wiring the full option surface through the overlay is the
-    /// deferred derived-index work; until then the overlay symbol search is a
-    /// minimal, correct superset (it may include hits the option-filtered base
-    /// path would suppress).
+    /// `// DEFERRED (D-B0):` the overlay-present scan applies only the name/kind
+    /// tiering needed for cross-project attribution; honoring the full option
+    /// surface (path scope, language, noise) over the dirty set is the deferred
+    /// per-overlay derived-index work. That branch is unreached on the US1
+    /// cross-project path (overlays are empty there); until then the overlay
+    /// symbol search is a minimal, correct superset.
     ///
     /// [`all_files`]: IndexView::all_files
-    pub fn search_symbols(&self, query: &str, kind_filter: Option<&str>) -> Vec<ViewSymbolHit> {
-        // Fast path: no overlay -> reuse the engine search verbatim over the base.
-        if self.overlay.is_none() {
-            let result = base_search_symbols(self.base, query, kind_filter, usize::MAX);
+    pub fn search_symbols(
+        &self,
+        query: &str,
+        kind_filter: Option<&str>,
+        options: &SymbolSearchOptions,
+    ) -> Vec<ViewSymbolHit> {
+        // No live deltas (absent OR empty overlay) -> reuse the engine's
+        // option-honoring search verbatim over the base. This IS the US1
+        // cross-project path; caller scoping + result_limit ranking are honored.
+        let no_deltas = match self.overlay_deltas() {
+            None => true,
+            Some(deltas) => deltas.is_empty(),
+        };
+        if no_deltas {
+            let result = search_symbols_with_options(self.base, query, kind_filter, options);
             return result
                 .hits
                 .into_iter()
@@ -403,7 +415,9 @@ impl<'a> IndexView<'a> {
     /// `search_text` depends on the base's repo-wide `trigram_index`, which the
     /// overlay does NOT re-derive (that is the DEFERRED per-consumer derived
     /// index). So we:
-    /// 1. run the engine [`base_search_text`] against the immutable base index;
+    /// 1. run the engine [`search_text_with_options`] against the immutable base
+    ///    index (honoring the caller's `options` — path scope, language, noise,
+    ///    limits — so cross-project text scoping is honored, D11);
     /// 2. DROP every base file-result whose path is a live overlay delta — its
     ///    base content is stale (the consumer edited or deleted that file);
     /// 3. directly SCAN each overlay `Upsert`'s current content for the same
@@ -440,8 +454,9 @@ impl<'a> IndexView<'a> {
         query: Option<&str>,
         terms: Option<&[String]>,
         regex: bool,
+        options: &TextSearchOptions,
     ) -> Result<TextSearchResult, TextSearchError> {
-        let mut result = base_search_text(self.base, query, terms, regex)?;
+        let mut result = search_text_with_options(self.base, query, terms, regex, options)?;
 
         let Some(deltas) = self.overlay_deltas() else {
             return Ok(result);
@@ -958,6 +973,7 @@ impl WorkingSet {
         targets: &Targets,
         query: &str,
         kind_filter: Option<&str>,
+        options: &SymbolSearchOptions,
     ) -> Vec<ProjectHit<ViewSymbolHit>> {
         let mut out = Vec::new();
         for entry in self
@@ -968,7 +984,7 @@ impl WorkingSet {
             let Ok(view) = Self::view_for(entry) else {
                 continue;
             };
-            for hit in view.search_symbols(query, kind_filter) {
+            for hit in view.search_symbols(query, kind_filter, options) {
                 out.push(ProjectHit {
                     project_id: entry.project_id.clone(),
                     hit,
@@ -988,6 +1004,7 @@ impl WorkingSet {
         query: Option<&str>,
         terms: Option<&[String]>,
         regex: bool,
+        options: &TextSearchOptions,
     ) -> Result<Vec<ProjectHit<TextSearchResult>>, TextSearchError> {
         let mut out = Vec::new();
         for entry in self
@@ -998,7 +1015,7 @@ impl WorkingSet {
             let Ok(view) = Self::view_for(entry) else {
                 continue;
             };
-            let result = view.search_text(query, terms, regex)?;
+            let result = view.search_text(query, terms, regex, options)?;
             out.push(ProjectHit {
                 project_id: entry.project_id.clone(),
                 hit: result,
@@ -1540,7 +1557,12 @@ mod tests {
             base_with_symbol("/c", "c0", "shared_c", "fn shared_c() {}"),
         );
 
-        let hits = ws.search_symbols(&Targets::All, "shared", None);
+        let hits = ws.search_symbols(
+            &Targets::All,
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert_eq!(hits.len(), 3, "one hit per project");
 
         // Every hit is attributed to its source project, and the project's own
@@ -1572,7 +1594,12 @@ mod tests {
         );
 
         // Single.
-        let one = ws.search_symbols(&Targets::One("B".to_string()), "shared", None);
+        let one = ws.search_symbols(
+            &Targets::One("B".to_string()),
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].project_id, "B");
         assert_eq!(one[0].hit.name, "shared_b");
@@ -1582,6 +1609,7 @@ mod tests {
             &Targets::Subset(vec!["A".to_string(), "C".to_string()]),
             "shared",
             None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
         );
         let projects: std::collections::BTreeSet<&str> =
             subset.iter().map(|h| h.project_id.as_str()).collect();
@@ -1595,7 +1623,12 @@ mod tests {
         // A target naming a project not in the set yields no hits (the caller
         // layer turns "project not open" into an explicit error; the primitive
         // simply does not match it).
-        let none = ws.search_symbols(&Targets::One("Z".to_string()), "shared", None);
+        let none = ws.search_symbols(
+            &Targets::One("Z".to_string()),
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert!(none.is_empty());
     }
 
@@ -1634,7 +1667,12 @@ mod tests {
         // Sanity: base-only view finds the base hit.
         let base_view = IndexView::new(&base, None).unwrap();
         let base_hits = base_view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("base text search");
         assert_eq!(base_hits.total_matches, 1);
         assert_eq!(base_hits.files.len(), 1);
@@ -1646,7 +1684,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("overlay text search");
 
         let paths: std::collections::BTreeSet<&str> =
@@ -1673,7 +1716,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("text search");
         assert_eq!(
             result.total_matches, 0,
@@ -1767,7 +1815,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("overlay text search");
 
         let added = result
@@ -1818,7 +1871,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("overlay text search");
         let paths: std::collections::BTreeSet<&str> =
             result.files.iter().map(|f| f.path.as_str()).collect();
@@ -1857,7 +1915,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("overlay text search");
         let code = result
             .files
@@ -1934,7 +1997,12 @@ mod tests {
 
         let view = IndexView::new(&base, Some(&overlay)).unwrap();
         let result = view
-            .search_text(Some("NEEDLE"), None, false)
+            .search_text(
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("overlay text search");
         let ordered: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
         let mut expected = names.to_vec();
@@ -1976,7 +2044,13 @@ mod tests {
         ws.add("C", base_with_symbol("/c", "c0", "h", "let NEEDLE = 3;"));
 
         let results = ws
-            .search_text(&Targets::All, Some("NEEDLE"), None, false)
+            .search_text(
+                &Targets::All,
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("cross-project text search");
         // Only projects whose content has NEEDLE produce non-empty results, but
         // every targeted project yields a (possibly empty) attributed result.
@@ -2000,10 +2074,108 @@ mod tests {
         // rebase). The query must SKIP it (never serve stale) rather than panic.
         ws.get_mut("A").unwrap().overlay.base_generation = 999;
 
-        let hits = ws.search_symbols(&Targets::All, "shared", None);
+        let hits = ws.search_symbols(
+            &Targets::All,
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert!(
             hits.is_empty(),
             "a stale-overlay entry must be skipped, not served"
+        );
+    }
+
+    /// Build a base from explicit (path, language, symbol_name) tuples, each file
+    /// defining one function named `symbol_name`. Used to prove the cross-project
+    /// search HONORS caller options (path scope, language, result_limit) on the
+    /// empty-overlay path (B1 / D11 + D14).
+    fn base_with_files(
+        root: &str,
+        commit: &str,
+        files: &[(&str, LanguageId, &str)],
+    ) -> Arc<IndexBase> {
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+        for (path, lang, sym) in files {
+            let mut file = make_file_with_symbol(path, sym, &format!("fn {sym}() {{}}"));
+            file.language = lang.clone();
+            map.insert((*path).to_string(), Arc::new(file));
+        }
+        idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);
+        idx.files = map;
+        idx.rebuild_reverse_index();
+        Arc::new(IndexBase::new(
+            BaseKey::new(root, CommitId::Sha(commit.to_string())),
+            Arc::new(idx),
+            1,
+        ))
+    }
+
+    // ── B1: cross-project search HONORS caller scoping + limit (D11 + D14) ─────
+    // These options were previously LOUDLY REFUSED at the daemon guard; now they
+    // are threaded through the engine's option-honoring search.
+    #[test]
+    fn cross_project_search_honors_scoping_options() {
+        use crate::live_index::search::PathScope;
+
+        let mut ws = WorkingSet::new();
+        // One project; three files all defining `widget`: two Rust (src/, other/)
+        // and one Python under src/.
+        ws.add(
+            "A",
+            base_with_files(
+                "/a",
+                "c0",
+                &[
+                    ("src/keep.rs", LanguageId::Rust, "widget"),
+                    ("other/skip.rs", LanguageId::Rust, "widget"),
+                    ("src/also.py", LanguageId::Python, "widget"),
+                ],
+            ),
+        );
+
+        // path_scope = src/ -> the other/ file is EXCLUDED (D11 path scoping).
+        let mut scoped = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        scoped.path_scope = PathScope::prefix("src");
+        let hits = ws.search_symbols(&Targets::All, "widget", None, &scoped);
+        let paths: std::collections::BTreeSet<&str> =
+            hits.iter().map(|h| h.hit.path.as_str()).collect();
+        assert!(
+            paths.contains("src/keep.rs") && paths.contains("src/also.py"),
+            "src/-scoped search must include the src/ hits: {paths:?}"
+        );
+        assert!(
+            !paths.contains("other/skip.rs"),
+            "src/-scoped search must EXCLUDE other/ hits (path scoping honored): {paths:?}"
+        );
+
+        // language = Rust -> the Python file is EXCLUDED (D11 language scoping).
+        let mut rust_only = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        rust_only.language_filter = Some(LanguageId::Rust);
+        let rust_hits = ws.search_symbols(&Targets::All, "widget", None, &rust_only);
+        let rust_paths: std::collections::BTreeSet<&str> =
+            rust_hits.iter().map(|h| h.hit.path.as_str()).collect();
+        assert!(
+            rust_paths.contains("src/keep.rs") && rust_paths.contains("other/skip.rs"),
+            "Rust-filtered search keeps the Rust files: {rust_paths:?}"
+        );
+        assert!(
+            !rust_paths.contains("src/also.py"),
+            "Rust-filtered search must EXCLUDE the Python file (language scoping honored): {rust_paths:?}"
+        );
+
+        // result_limit = 1 -> the per-project hits are bounded + tier-ranked, not
+        // an unbounded usize::MAX dump (D14).
+        let bounded = SymbolSearchOptions::for_current_code_search(1);
+        let bounded_hits = ws.search_symbols(&Targets::All, "widget", None, &bounded);
+        assert_eq!(
+            bounded_hits.len(),
+            1,
+            "result_limit=1 bounds the per-project hits (D14): got {}",
+            bounded_hits.len()
         );
     }
 }
