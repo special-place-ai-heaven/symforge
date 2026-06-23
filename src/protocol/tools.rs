@@ -10151,6 +10151,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durable_calibration_status_accumulates_against_full_corpus_threshold() {
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS, TUNING_MIN_SAMPLES};
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let store =
+            StelLedgerStore::open_in_memory("proxy-accumulating").expect("in-memory durable store");
+        for _ in 0..(TUNING_MIN_SAMPLES + 1) {
+            store.record(&sample_durable_event());
+        }
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+        match proxy.durable_calibration_verdict() {
+            Some(CalibrationVerdict::Accumulating { n, min }) => {
+                assert_eq!(n, TUNING_MIN_SAMPLES + 1);
+                assert_eq!(min, TUNING_MIN_CORPUS);
+                assert!(
+                    n <= min,
+                    "status must never render accumulating ({n}/{min})"
+                );
+            }
+            other => panic!("expected durable accumulating verdict, got {other:?}"),
+        }
+
+        let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
+        });
+        let expected = format!(
+            "calibration: accumulating ({}/{})",
+            TUNING_MIN_SAMPLES + 1,
+            TUNING_MIN_CORPUS
+        );
+        assert!(
+            body.contains(&expected),
+            "full status must render the true full-corpus threshold {expected:?}:\n{body}"
+        );
+    }
+
     /// D2-ROOT: a `new_daemon_proxy` server WITH a populated session ledger AND a
     /// durable store (samples + a validated `tuned` artifact) must overlay ALL of
     /// its proxy-owned `status detail:full` lines — `ledger_events` (non-zero),

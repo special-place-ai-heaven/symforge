@@ -500,7 +500,7 @@ impl SymForgeServer {
     pub(crate) fn durable_calibration_verdict(
         &self,
     ) -> Option<crate::stel::calibration::CalibrationVerdict> {
-        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_SAMPLES};
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS};
         use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
 
         let store = self.stel_ledger_store.as_ref()?;
@@ -526,7 +526,7 @@ impl SymForgeServer {
         } else {
             Some(CalibrationVerdict::Accumulating {
                 n,
-                min: TUNING_MIN_SAMPLES,
+                min: TUNING_MIN_CORPUS,
             })
         }
     }
