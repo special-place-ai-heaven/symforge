@@ -46,6 +46,22 @@ impl ProjectConfigTrustMode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{EditResultStatus, classify_edit_output};
+
+    #[test]
+    fn daemon_wrapped_edit_errors_classify_as_invalid_request() {
+        assert_eq!(
+            classify_edit_output(
+                "Error in replace_symbol_body: projects must not be empty",
+                false
+            ),
+            EditResultStatus::InvalidRequest
+        );
+    }
+}
+
 fn project_config_trust_inputs_exist(repo_root: &Path) -> bool {
     let symforge_dir = repo_root.join(".symforge");
     symforge_dir.join("config.toml").exists() || symforge_dir.join("config").exists()
@@ -189,6 +205,10 @@ fn is_index_unavailable_output(text: &str) -> bool {
         || text.starts_with("Index degraded:")
 }
 
+fn is_error_output(text: &str) -> bool {
+    text.starts_with("Error:") || text.starts_with("Error in ")
+}
+
 fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
     if is_index_unavailable_output(text) {
         EditResultStatus::InternalFailure
@@ -211,7 +231,7 @@ fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
         || text.contains("Session stale")
     {
         EditResultStatus::InternalFailure
-    } else if text.starts_with("Error:")
+    } else if is_error_output(text)
         || text.starts_with("ProjectConfigTrustEnforced:")
         || text.starts_with("Overlapping edits")
         || text.contains("path escapes repo root")
