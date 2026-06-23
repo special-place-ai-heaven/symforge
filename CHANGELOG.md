@@ -26,6 +26,22 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.7.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.6.0...v8.7.0) (2026-06-23)
+
+
+### Features
+
+* **stel:** 013 predictor calibration (complete) — US2 auto-tune + systemic fixes ([e9e7760](https://github.com/special-place-ai-heaven/symforge/commit/e9e776000503c2f8e271209fbaa929843e349931))
+
+
+### Bug Fixes
+
+* **paths:** single symforge_db_path helper; fix live api-keys doubled path (D1-ROOT/D7) ([2cacda1](https://github.com/special-place-ai-heaven/symforge/commit/2cacda13a91dc79399d2e63454214beb6122edef))
+* route daemon-proxy symforge edit applies ([396c38a](https://github.com/special-place-ai-heaven/symforge/commit/396c38a3f7502686d4c0792ef3bdca2632173a62))
+* **stel:** calibrate predictor output vs real residual (D8-ROOT) + D9-D13 ([6eeaf96](https://github.com/special-place-ai-heaven/symforge/commit/6eeaf96946a11ff5a0c872df931694151409f4ba))
+* **stel:** overlay all proxy-owned status lines on daemon-backed stdio (D2-ROOT) ([def21a3](https://github.com/special-place-ai-heaven/symforge/commit/def21a30e65be1ffc9f8fc0075ac91cc399503de))
+* **stel:** record raw prediction so re-tunes stay consistent (D15) + D14 hardening ([8963193](https://github.com/special-place-ai-heaven/symforge/commit/89631934783381c68ddef44a795be41af5817ead))
+
 ## [8.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.5.0...v8.6.0) (2026-06-22)
 
 
