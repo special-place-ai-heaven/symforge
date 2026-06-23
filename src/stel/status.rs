@@ -14,9 +14,13 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 /// Stable comma-separated deferred-work list (sorted for test stability).
 ///
 /// `ledger_persistence` was removed (010 FR-004): the durable SQLite ledger
-/// store DOES ship in serve mode, so listing it as deferred was false. The
-/// remaining items are genuinely not-yet-implemented seams.
-pub const DEFERRED_ITEMS: &str = "b_results,calibration_auto_tune,multi_step_planner";
+/// store DOES ship in serve mode, so listing it as deferred was false.
+/// `calibration_auto_tune` was removed (013 US2, T038): the auto-tune now
+/// DERIVES, held-out-VALIDATES, and APPLIES corrected token-estimate constants
+/// (the `tuned` state is reachable with a before/after error artifact), so
+/// listing it as deferred would be false. The remaining items are genuinely
+/// not-yet-implemented seams.
+pub const DEFERRED_ITEMS: &str = "b_results,multi_step_planner";
 
 /// Restart-survival view of the durable STEL ledger store (US3/T029).
 ///
@@ -49,7 +53,10 @@ pub enum DurableLedgerState {
 }
 
 /// Inputs collected from the live server when formatting a status response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `PartialEq` (not `Eq`): the embedded calibration summary carries `f64`
+/// held-out error figures in its verdict (feature 013 US2).
+#[derive(Clone, Debug, PartialEq)]
 pub struct StelStatusContext<'a> {
     pub surface: &'static str,
     pub version: &'static str,
@@ -119,6 +126,26 @@ impl<'a> StelStatusContext<'a> {
         self.durable_ledger = state;
         self
     }
+
+    /// Override the calibration verdict with the DURABLE one (feature 013, T033 /
+    /// FR-009), so `status detail:full` reflects the persisted calibration state
+    /// (cross-session samples + active tuning), not only this session's in-memory
+    /// events. Also re-renders the `tuning_note` from the new verdict so the
+    /// section's two calibration lines stay consistent.
+    ///
+    /// Honesty invariant (data-model): a `Disabled`/`Unavailable` durable store
+    /// pins the state at in-memory-only — callers pass `None` (keeping the
+    /// in-memory verdict, which is `Deferred`/`Accumulating`, never a false
+    /// `Tuned`). Only a `Durable` store with a real artifact yields `Tuned` here.
+    pub fn with_calibration_verdict(
+        mut self,
+        verdict: crate::stel::calibration::CalibrationVerdict,
+    ) -> Self {
+        self.calibration.tuning_note =
+            crate::stel::calibration::render_calibration_verdict(&verdict);
+        self.calibration.verdict = verdict;
+        self
+    }
 }
 
 /// Render the single `durable_ledger:` line for a [`DurableLedgerState`].
@@ -141,6 +168,84 @@ pub fn format_durable_ledger_line(state: &DurableLedgerState) -> String {
             format!("durable_ledger: disabled ({reason})")
         }
         DurableLedgerState::Unavailable => "durable_ledger: unavailable".to_string(),
+    }
+}
+
+/// Render the two `last_ledger_decision:` / `last_ledger_route:` lines for a
+/// status context.
+///
+/// Single source of truth for the format so the full-status formatter and the
+/// daemon-proxy status overlay ([`crate::protocol`]) never drift. Returns a
+/// 2-element array `[decision_line, route_line]`:
+/// - `last_ledger_decision: {decision}` / `last_ledger_route: {route}` when the
+///   session ledger has a last event (route falls back to `none` when the event
+///   recorded no tool),
+/// - `last_ledger_decision: none` / `last_ledger_route: none` when the ledger is
+///   empty.
+pub fn format_last_ledger_lines(ctx: &StelStatusContext<'_>) -> [String; 2] {
+    match (&ctx.last_ledger_decision, &ctx.last_ledger_route) {
+        (Some(decision), route) => {
+            let route = route.as_deref().unwrap_or("none");
+            [
+                format!("last_ledger_decision: {decision}"),
+                format!("last_ledger_route: {route}"),
+            ]
+        }
+        (None, _) => [
+            "last_ledger_decision: none".to_string(),
+            "last_ledger_route: none".to_string(),
+        ],
+    }
+}
+
+/// The set of `status` body lines/blocks DERIVED from proxy-owned state (the
+/// session ledger + durable store), as the proxy itself would render them.
+///
+/// On the daemon-backed stdio default, `status` is proxied to the daemon WORKER
+/// (which owns the populated INDEX but has an EMPTY ledger + no durable store),
+/// while the PROXY owns `stel_ledger` + `stel_ledger_store`. So every line below
+/// reads the worker's blind zero unless the proxy overlays its OWN rendering.
+/// This struct is that rendering — built from a proxy-side [`StelStatusContext`]
+/// via [`render_proxy_owned_lines`] so the overlay reuses the EXACT formatters
+/// the worker uses (no divergent formatting), and consumed by
+/// `crate::protocol`'s `overlay_proxy_status_lines`.
+///
+/// It deliberately does NOT carry the INDEX lines (`index_ready`/`index_files`/
+/// `index_symbols`/`project`): the worker owns the warm index (TR-01), so those
+/// stay the worker's and must never be overlaid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyOwnedStatusLines {
+    /// `ledger_events: {n}` — the proxy session ledger length.
+    pub ledger_events: String,
+    /// `last_ledger_decision: {..}` — full-detail only.
+    pub last_ledger_decision: String,
+    /// `last_ledger_route: {..}` — full-detail only.
+    pub last_ledger_route: String,
+    /// `durable_ledger: {..}` — full-detail only.
+    pub durable_ledger: String,
+    /// The whole `── calibration (observational) ──` … `──` block, rendered from
+    /// the proxy's calibration summary/verdict — full-detail only.
+    pub calibration_section: String,
+}
+
+/// Render the proxy-owned `status` line-set from a proxy-side context.
+///
+/// The SINGLE place that maps a [`StelStatusContext`] onto the exact line/block
+/// strings the proxy must overlay. Reuses the same `format_*` helpers the
+/// worker-side formatter calls, so the overlaid lines are byte-identical to what
+/// a worker WOULD render if it had the proxy's ledger/store. Honesty: an empty
+/// proxy ledger yields `ledger_events: 0` / `last_ledger_*: none`, an
+/// `Unavailable`/`Disabled` store yields the truthful durable line, and a
+/// `Deferred`/`Accumulating` verdict yields that calibration section — the
+/// overlay never invents state.
+pub fn render_proxy_owned_lines(ctx: &StelStatusContext<'_>) -> ProxyOwnedStatusLines {
+    let [last_ledger_decision, last_ledger_route] = format_last_ledger_lines(ctx);
+    ProxyOwnedStatusLines {
+        ledger_events: format!("ledger_events: {}", ctx.ledger_events),
+        last_ledger_decision,
+        last_ledger_route,
+        durable_ledger: format_durable_ledger_line(&ctx.durable_ledger),
+        calibration_section: format_calibration_section(&ctx.calibration),
     }
 }
 
@@ -197,17 +302,10 @@ fn format_full_status(ctx: &StelStatusContext<'_>) -> String {
         format!("index_symbols: {}", ctx.index_symbols),
         format!("session_tokens: {}", ctx.session_tokens),
     ];
-    match (&ctx.last_ledger_decision, &ctx.last_ledger_route) {
-        (Some(decision), route) => {
-            extra.push(format!("last_ledger_decision: {decision}"));
-            let route = route.as_deref().unwrap_or("none");
-            extra.push(format!("last_ledger_route: {route}"));
-        }
-        (None, _) => {
-            extra.push("last_ledger_decision: none".to_string());
-            extra.push("last_ledger_route: none".to_string());
-        }
-    }
+    // Single source of truth for the two last-ledger lines (shared with the
+    // daemon-proxy overlay via `format_last_ledger_lines`), so the worker-side
+    // formatter and the proxy overlay can never drift in format.
+    extra.extend(format_last_ledger_lines(ctx));
     extra.push(format_durable_ledger_line(&ctx.durable_ledger));
     extra.push(format_calibration_section(&ctx.calibration));
     // Insert full-only lines before the closing banner.
@@ -264,7 +362,7 @@ mod tests {
             "project_root: E:/project/symforge-test",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,calibration_auto_tune,multi_step_planner",
+            "deferred: b_results,multi_step_planner",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");
@@ -279,6 +377,11 @@ mod tests {
             !body.contains("ledger_persistence"),
             "ledger_persistence ships in serve mode; not deferred:\n{body}"
         );
+        // 013 T038: the auto-tune ships (tuned state reachable); not deferred.
+        assert!(
+            !body.contains("calibration_auto_tune"),
+            "calibration_auto_tune ships in 013 US2; not deferred:\n{body}"
+        );
         assert!(
             !body.contains("── calibration (observational) ──"),
             "compact detail must not include calibration section"
@@ -290,6 +393,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &sample_context(),
         );
@@ -320,6 +424,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &ctx,
         );
@@ -335,6 +440,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &sample_context(),
         );
@@ -354,6 +460,7 @@ mod tests {
         let body = format_stel_status(
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
             },
             &ctx,
         );

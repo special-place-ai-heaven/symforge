@@ -68,7 +68,7 @@ pub struct FrecencyRankingSnapshot {
 
 /// SQLite-backed per-workspace frecency store.
 ///
-/// Persists to `.symforge/frecency.db` (see `paths::SYMFORGE_FRECENCY_DB_PATH`)
+/// Persists to `.symforge/frecency.db` (built via [`frecency_db_path`])
 /// or an in-memory DB for tests. All access routes through an internal `Mutex`
 /// so the store is `Sync` and safe to share across concurrent bump callers.
 pub struct FrecencyStore {
@@ -447,7 +447,7 @@ pub fn ranking_scores_for_paths(
         );
         sources.push("persistent (cached)");
     } else {
-        let db_path = repo_root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH);
+        let db_path = frecency_db_path(repo_root);
         match FrecencyStore::open_existing_readonly(&db_path) {
             Ok(Some(store)) => {
                 scores.extend(
@@ -486,6 +486,17 @@ fn persistent_cache() -> &'static Mutex<HashMap<PathBuf, Arc<FrecencyStore>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The on-disk frecency db path for `repo_root`: `repo_root/.symforge/frecency.db`.
+///
+/// The single construction point for the frecency db path. Routes through
+/// [`crate::paths::symforge_db_path`] (the lone `.symforge` prefix owner) so the
+/// path can never be hand-rolled and doubled (D1-ROOT). All frecency call sites
+/// — cache key, readonly open, init, health probe — go through here so they all
+/// agree byte-for-byte.
+pub(crate) fn frecency_db_path(repo_root: &Path) -> PathBuf {
+    crate::paths::symforge_db_path(repo_root, crate::paths::FRECENCY_DB_NAME)
+}
+
 /// Look up (or lazily create) the cached [`FrecencyStore`] for `repo_root`.
 ///
 /// All same-process callers for a given workspace share the same `Arc` and
@@ -500,7 +511,7 @@ fn persistent_cache() -> &'static Mutex<HashMap<PathBuf, Arc<FrecencyStore>>> {
 /// application.
 fn cached_store_for(repo_root: &Path) -> Option<std::sync::Arc<FrecencyStore>> {
     let cache = persistent_cache();
-    let key = repo_root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH);
+    let key = frecency_db_path(repo_root);
     let mut guard = cache.lock().ok()?;
     if let Some(existing) = guard.get(&key) {
         return Some(Arc::clone(existing));
@@ -515,7 +526,7 @@ fn cached_store_for(repo_root: &Path) -> Option<std::sync::Arc<FrecencyStore>> {
 
 fn cached_persistent_for(repo_root: &Path) -> Option<Arc<FrecencyStore>> {
     let cache = persistent_cache();
-    let key = repo_root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH);
+    let key = frecency_db_path(repo_root);
     let guard = cache.lock().ok()?;
     guard.get(&key).map(Arc::clone)
 }
@@ -950,7 +961,10 @@ mod tests {
     }
 
     fn db_path_for(root: &Path) -> PathBuf {
-        root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH)
+        // Route the test path through the production helper so the test exercises
+        // the SAME construction production uses (the blind spot that hid D1/D7
+        // was a test computing a DIFFERENT path than production).
+        super::frecency_db_path(root)
     }
 
     #[test]

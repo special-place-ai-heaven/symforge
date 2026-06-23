@@ -47,6 +47,31 @@ pub use crate::live_index::store::{
 pub use crate::parsing::process_file;
 
 // ---------------------------------------------------------------------------
+// STEL durable economics ledger + calibration (FR-001 embed durability).
+//
+// D3-ROOT extract-up: the durable per-project ledger store and the calibration
+// math are protocol-free (`crate::stel_core`, gated `any(server, embed)`), so an
+// embedder can now OPEN the durable store, RECORD economics events, READ them
+// back, and summarize calibration — WITHOUT the server/transport stack. These
+// re-exports are SEMVER-PUBLIC (see the file header) and are pinned by the
+// `contract` module below.
+//
+// Open + use:  `StelLedgerStore::open(project_root, session_id)` →
+// `.record(&event)` (degrade-silently, never panics) → `.recent(limit)` /
+// `.summary()`. Build an event from the POD enums (`IntentBucket` /
+// `AdmissionDecision` / `RouteConfidence`).
+// ---------------------------------------------------------------------------
+pub use crate::stel_core::calibration::{
+    CalibrationVerdict, StelCalibrationSummary, format_calibration_section, summarize_calibration,
+};
+pub use crate::stel_core::ledger_store::{
+    LedgerStoreStatus, LedgerSubsystemState, LedgerSummary, StelLedgerStore, StoredLedgerRecord,
+};
+pub use crate::stel_core::types::{
+    AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent,
+};
+
+// ---------------------------------------------------------------------------
 // Back-compat MODULE re-exports. AAP currently imports via deep module paths
 // (e.g. `symforge::embed::parsing::process_file`). These re-export the MODULES
 // `domain / git / live_index / parsing` — distinct names from every flat item
@@ -79,6 +104,16 @@ mod contract {
         LanguageId, LiveIndex, ParseStatus, PublishedIndexState, PublishedIndexStatus,
         ReferenceKind, SearchFilesTier, SearchFilesView, SharedIndex, SnapshotVerifyState,
         SymbolKind, SymbolRecord, SymbolSearchResult, TextSearchError, TextSearchResult,
+    };
+
+    // D3-ROOT extract-up: the STEL durable-ledger + calibration embed surface is
+    // a NEW semver-public contract (the embed public surface WIDENS). Name every
+    // contracted item so a rename/removal/signature-drift trips compilation here.
+    #[allow(unused_imports)]
+    use crate::embed::{
+        AdmissionDecision, CalibrationVerdict, IntentBucket, LedgerStoreStatus,
+        LedgerSubsystemState, LedgerSummary, RouteConfidence, StelCalibrationSummary,
+        StelLedgerEvent, StelLedgerStore, StoredLedgerRecord,
     };
 
     // Also name the back-compat MODULE re-exports so their removal trips too.

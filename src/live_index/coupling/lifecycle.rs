@@ -47,7 +47,7 @@ fn is_git_repo(root: &Path) -> bool {
 }
 
 pub fn coupling_db_path(project_root: &Path) -> PathBuf {
-    project_root.join(crate::paths::SYMFORGE_COUPLING_DB_PATH)
+    crate::paths::symforge_db_path(project_root, crate::paths::COUPLING_DB_NAME)
 }
 
 pub fn open_existing_coupling_store(
@@ -336,7 +336,7 @@ mod tests {
 
         init_coupling_store(tmp.path());
 
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         assert!(
             !db_path.exists(),
             "no db should be created with SYMFORGE_COUPLING unset"
@@ -352,7 +352,7 @@ mod tests {
 
         init_coupling_store(tmp.path());
 
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         assert!(
             !db_path.exists(),
             "no db should be created on non-git project"
@@ -371,7 +371,7 @@ mod tests {
 
         refresh_on_reconcile_tick(tmp.path(), expected_gen, &shared);
 
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         assert!(!db_path.exists(), "no db touch on tick with flag unset");
     }
 
@@ -387,7 +387,7 @@ mod tests {
         let outcome = start_lazy_prepare(tmp.path()).expect("lazy prepare request");
 
         assert_eq!(outcome, LazyPrepareOutcome::AlreadyRunning);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         assert!(
             !db_path.exists(),
             "contested lazy prepare must not start a duplicate builder"
@@ -402,7 +402,7 @@ mod tests {
         init_repo_with_root_commit(tmp.path());
         let head = add_commit(tmp.path(), "pair", &[("a.txt", "a"), ("b.txt", "b")]);
 
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         run_init(&db_path, tmp.path()).expect("run_init ok");
 
         let store = CouplingStore::open(&db_path).expect("open");
@@ -422,7 +422,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         add_commit(tmp.path(), "pair", &[("a.txt", "a"), ("b.txt", "b")]);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         run_init(&db_path, tmp.path()).expect("first");
         let (cbat_before, lrt_before) = {
@@ -449,7 +449,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         run_init(&db_path, tmp.path()).expect("cold");
         let cbat_before = CouplingStore::open(&db_path)
@@ -478,7 +478,7 @@ mod tests {
     fn run_init_handles_empty_repo_no_head() {
         let tmp = TempDir::new().unwrap();
         git2::Repository::init(tmp.path()).expect("init bare repo");
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         run_init(&db_path, tmp.path()).expect("run_init ok on no-HEAD repo");
 
@@ -503,7 +503,7 @@ mod tests {
         let symforge_path = tmp.path().join(crate::paths::SYMFORGE_DIR_NAME);
         std::fs::write(&symforge_path, b"blocker").expect("write blocker file");
 
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
         let result = run_init(&db_path, tmp.path());
         assert!(
             result.is_err(),
@@ -520,7 +520,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         add_commit(tmp.path(), "seed", &[("a.txt", "a"), ("b.txt", "b")]);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         run_init(&db_path, tmp.path()).expect("seed store");
         let lrt_before = CouplingStore::open(&db_path)
@@ -550,7 +550,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         run_init(&db_path, tmp.path()).expect("seed");
         let head_b = add_commit(tmp.path(), "b", &[("z.txt", "z"), ("w.txt", "w")]);
@@ -578,7 +578,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = coupling_db_path(tmp.path());
 
         // Seed at A.
         run_init(&db_path, tmp.path()).expect("seed");

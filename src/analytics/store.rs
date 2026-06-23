@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn disabled_store_reports_status_and_keeps_filesystem_footprint_free() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_ANALYTICS_DB_PATH);
+        let db_path = crate::paths::symforge_db_path(tmp.path(), crate::paths::ANALYTICS_DB_NAME);
         let store = AnalyticsStore::open(AnalyticsConfig::disabled(&db_path)).expect("disabled");
 
         assert!(store.status().expect("status").is_disabled());
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn enabled_store_creates_db_and_records_bounded_local_metadata() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_ANALYTICS_DB_PATH);
+        let db_path = crate::paths::symforge_db_path(tmp.path(), crate::paths::ANALYTICS_DB_NAME);
         let store = SqliteAnalyticsStore::open(&db_path).expect("analytics store");
 
         assert!(db_path.exists(), "enabled analytics creates the database");

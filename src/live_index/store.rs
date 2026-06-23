@@ -2711,7 +2711,7 @@ mod tests {
         write_file(tmp.path(), "src/lib.rs", "pub fn alpha() {}");
 
         let shared = LiveIndex::load(tmp.path()).unwrap();
-        let db_path = tmp.path().join(crate::paths::SYMFORGE_COUPLING_DB_PATH);
+        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(tmp.path());
         assert!(shared.read().coupling_store().is_none());
         assert!(
             !db_path.exists(),

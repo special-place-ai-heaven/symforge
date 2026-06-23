@@ -6,11 +6,12 @@
 //! compiling.
 #![cfg(feature = "server")]
 
-//! Asserts the v2-migration + retention + tuned-constant + crash-durability
-//! contract the Foundational storage primitives must satisfy:
+//! Asserts the migration, retention, tuned-constant, and crash-durability
+//! contract the Foundational storage primitives must satisfy (the migration
+//! covers the v2 estimator-version column and the v3 calibration reshape):
 //!
-//! - (a) a fresh store opens at `schema_version == 2` with an `estimator_version`
-//!   column present (T004);
+//! - (a) a fresh store opens at `schema_version == 3` with an `estimator_version`
+//!   column present (T004; D8-ROOT bumped the calibration table to v3);
 //! - (b) a row written before the column-add reads back the `pre-013` backfill
 //!   sentinel (T004);
 //! - (c) inserting `LEDGER_RETENTION_MAX + N` events leaves exactly
@@ -19,7 +20,7 @@
 //!   `TunedEstimateConstants` after reopen (T004/T005 byte-stable);
 //! - (e) a second `store_active_tuning` for the same `estimator_version`
 //!   REPLACES (not appends) the active set (T004);
-//! - (f) `migrate()` is idempotent — twice leaves v2, no dup column, no
+//! - (f) `migrate()` is idempotent — twice leaves v3, no dup column, no
 //!   re-backfill of non-sentinel rows (T005);
 //! - (g) a store whose open/migrate fails degrades to `Disabled`, distinct from
 //!   `Unavailable` (T005, constitution IV corruption-quarantine);
@@ -28,9 +29,10 @@
 
 use rusqlite::Connection;
 
+use symforge::paths::{STEL_LEDGER_DB_NAME, symforge_db_path};
 use symforge::stel::ledger_store::{
     CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX, LedgerStoreStatus, PRE_013_ESTIMATOR_SENTINEL,
-    SYMFORGE_STEL_LEDGER_DB_PATH, SqliteStelLedgerStore, StelLedgerStore, TunedEstimateConstants,
+    SqliteStelLedgerStore, StelLedgerStore, TunedEstimateConstants,
 };
 use symforge::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, StelLedgerEvent};
 
@@ -60,10 +62,7 @@ fn sample_event(plan_id: &str) -> StelLedgerEvent {
 
 fn sample_tuning() -> TunedEstimateConstants {
     TunedEstimateConstants {
-        response_floor: 512,
-        manual_floor: 1024,
-        schema_tokens: 50,
-        invoke_tokens: 88,
+        response_correction_factor: 1.4231,
         estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
         sample_size: 137,
         error_before: 0.4231,
@@ -117,23 +116,23 @@ fn estimator_versions(db_path: &std::path::Path) -> Vec<Option<String>> {
 }
 
 // ---------------------------------------------------------------------------
-// T004(a) — fresh store opens at v2 with the estimator_version column
+// T004(a) — fresh store opens at v3 with the estimator_version column
 // ---------------------------------------------------------------------------
 
 #[test]
-fn fresh_store_opens_at_schema_v2_with_estimator_version_column() {
+fn fresh_store_opens_at_schema_v3_with_estimator_version_column() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("stel-ledger.db");
-    let store = SqliteStelLedgerStore::open(&db_path, "sess-v2").expect("open");
+    let store = SqliteStelLedgerStore::open(&db_path, "sess-v3").expect("open");
 
     assert_eq!(
         store.schema_version().expect("schema_version"),
-        2,
-        "a fresh store must open at schema_version == 2"
+        3,
+        "a fresh store must open at schema_version == 3 (D8-ROOT calibration shape)"
     );
     match store.status() {
         LedgerStoreStatus::Enabled { schema_version, .. } => {
-            assert_eq!(schema_version, 2, "status must report v2");
+            assert_eq!(schema_version, 3, "status must report v3");
         }
         LedgerStoreStatus::Disabled => panic!("fresh store must be Enabled"),
     }
@@ -219,8 +218,8 @@ fn pre_column_row_backfills_to_pre_013_sentinel_and_is_excluded() {
     let store = SqliteStelLedgerStore::open(&db_path, "sess-upgrade").expect("open upgrades");
     assert_eq!(
         store.schema_version().expect("schema_version"),
-        2,
-        "opening a v1 db must upgrade it to v2"
+        3,
+        "opening a v1 db must upgrade it to the current v3"
     );
 
     let versions = estimator_versions(&db_path);
@@ -331,11 +330,11 @@ fn second_store_active_tuning_replaces_not_appends() {
     let store = SqliteStelLedgerStore::open_in_memory("sess-replace").expect("open");
 
     let mut first = sample_tuning();
-    first.response_floor = 500;
+    first.response_correction_factor = 1.5;
     store.store_active_tuning(&first).expect("store first");
 
     let mut second = sample_tuning();
-    second.response_floor = 999;
+    second.response_correction_factor = 2.25;
     second.sample_size = 200;
     store.store_active_tuning(&second).expect("store second");
 
@@ -345,7 +344,7 @@ fn second_store_active_tuning_replaces_not_appends() {
         .expect("load")
         .expect("present");
     assert_eq!(
-        loaded.response_floor, 999,
+        loaded.response_correction_factor, 2.25,
         "second store must win (REPLACE)"
     );
     assert_eq!(loaded.sample_size, 200);
@@ -357,13 +356,99 @@ fn second_store_active_tuning_replaces_not_appends() {
         .expect("load again")
         .expect("present");
     assert_eq!(
-        again.response_floor, 999,
+        again.response_correction_factor, 2.25,
         "idempotent: still the second set"
     );
 }
 
+/// D8-ROOT (schema v3): a v2 database whose `stel_calibration` table still has the
+/// OLD floor-based column shape (`response_floor`/`manual_floor`/`schema_tokens`/
+/// `invoke_tokens`) must upgrade cleanly to the v3 single-`response_correction_factor`
+/// shape — the obsolete table is dropped + recreated (the table is new in this
+/// branch and never surfaced, so no data migration is owed). After upgrade,
+/// store/load round-trips the factor.
+#[test]
+fn v2_floor_shaped_calibration_table_upgrades_to_v3_factor_shape() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("stel-ledger.db");
+
+    // Build a v2-shaped DB whose stel_calibration carries the OBSOLETE columns.
+    {
+        let conn = Connection::open(&db_path).expect("create v2 db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE stel_ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE stel_ledger_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                session_id TEXT NOT NULL, plan_id TEXT NOT NULL, surface TEXT NOT NULL,
+                intent TEXT NOT NULL, decision TEXT NOT NULL, tools_called_json TEXT NOT NULL,
+                predicted_response_tokens INTEGER NOT NULL, actual_response_tokens INTEGER NOT NULL,
+                manual_baseline_tokens INTEGER NOT NULL, net_vs_manual INTEGER NOT NULL,
+                route_confidence TEXT NOT NULL, pff_bypass INTEGER, cache_hit INTEGER,
+                degrade_flags_json TEXT NOT NULL, accepted INTEGER, eligible_h6 INTEGER,
+                estimator_version TEXT
+            );
+            CREATE TABLE stel_calibration (
+                estimator_version TEXT PRIMARY KEY,
+                response_floor INTEGER NOT NULL, manual_floor INTEGER NOT NULL,
+                schema_tokens INTEGER NOT NULL, invoke_tokens INTEGER NOT NULL,
+                sample_size INTEGER NOT NULL, error_before REAL NOT NULL,
+                error_after REAL NOT NULL, tuned_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO stel_ledger_meta (key, value) VALUES ('schema_version', '2');
+            INSERT INTO stel_calibration VALUES ('010-byte-grounded', 800, 1600, 90, 160, 60, 300.0, 12.0, 1);
+            "#,
+        )
+        .expect("apply v2 schema with obsolete calibration shape");
+    }
+
+    // Open via the real store: migrate() must drop the obsolete table + recreate.
+    let store = SqliteStelLedgerStore::open(&db_path, "sess-v3-upgrade").expect("open upgrades");
+    assert_eq!(store.schema_version().expect("schema_version"), 3);
+
+    // The obsolete floor row is gone (table was dropped + recreated empty).
+    assert!(
+        store
+            .load_active_tuning(CURRENT_ESTIMATOR_VERSION)
+            .expect("load")
+            .is_none(),
+        "the obsolete floor-shaped tuning must NOT survive the v3 reshape"
+    );
+
+    // The new factor shape round-trips on the upgraded table.
+    let tuning = sample_tuning();
+    store
+        .store_active_tuning(&tuning)
+        .expect("store on v3 table");
+    let loaded = store
+        .load_active_tuning(CURRENT_ESTIMATOR_VERSION)
+        .expect("load")
+        .expect("present");
+    assert_eq!(loaded, tuning);
+
+    // The physical column is the new one, and the obsolete column is gone.
+    let conn = Connection::open(&db_path).expect("raw conn");
+    let cols: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(stel_calibration)")
+            .expect("pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query cols");
+        rows.collect::<rusqlite::Result<Vec<_>>>().expect("collect")
+    };
+    assert!(
+        cols.iter().any(|c| c == "response_correction_factor"),
+        "v3 table must carry response_correction_factor: {cols:?}"
+    );
+    assert!(
+        !cols.iter().any(|c| c == "response_floor"),
+        "v3 table must NOT carry the obsolete response_floor: {cols:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
-// T005(f) — migrate() is idempotent: twice -> v2, no dup column, no re-backfill
+// T005(f) — migrate() is idempotent: twice -> v3, no dup column, no re-backfill
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -381,8 +466,8 @@ fn migrate_is_idempotent_no_dup_column_no_rebackfill() {
 
     assert_eq!(
         store.schema_version().expect("schema_version"),
-        2,
-        "repeated migrate stays at v2"
+        3,
+        "repeated migrate stays at v3"
     );
 
     // The column is not duplicated: PRAGMA shows exactly one estimator_version.
@@ -419,7 +504,7 @@ fn corrupt_db_degrades_to_disabled_not_a_panic() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     // Write a non-SQLite file at the exact db path the store will open.
-    let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    let db_path = symforge_db_path(dir, STEL_LEDGER_DB_NAME);
     std::fs::create_dir_all(db_path.parent().unwrap()).expect("mkdir .symforge");
     std::fs::write(
         &db_path,
@@ -679,7 +764,7 @@ fn forced_open_failure_degrades_to_disabled_distinguishably_never_panics() {
     // Make the db path unopenable: pre-create the `.symforge` dir and write a
     // DIRECTORY where the db FILE must live, so `Connection::open` fails. This is
     // the "store cannot open" path (read-only FS / unwritable path analogue).
-    let db_path = dir.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    let db_path = symforge_db_path(dir, STEL_LEDGER_DB_NAME);
     std::fs::create_dir_all(&db_path).expect("create a dir at the db file path");
 
     // The dir-entry open must NOT panic and must yield a distinguishable
@@ -878,12 +963,12 @@ fn open_under_project_root_lands_db_at_single_symforge_prefix_not_doubled() {
     drop(store);
 
     // The db must exist at exactly `<root>/.symforge/stel-ledger.db` — the
-    // single-prefix path the const encodes.
-    let expected = root.join(SYMFORGE_STEL_LEDGER_DB_PATH);
+    // single-prefix path the shared `symforge_db_path` helper builds.
+    let expected = symforge_db_path(root, STEL_LEDGER_DB_NAME);
     assert_eq!(
         expected,
         root.join(".symforge").join("stel-ledger.db"),
-        "the db-path const must encode a single .symforge prefix"
+        "the helper must build a single .symforge prefix"
     );
     assert!(
         expected.exists(),

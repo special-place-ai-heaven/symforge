@@ -29,8 +29,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// DB path constant (mirrors `SYMFORGE_STEL_LEDGER_DB_PATH`).
-pub const SYMFORGE_API_KEYS_DB_PATH: &str = ".symforge/api-keys.db";
+use crate::paths::{API_KEYS_DB_NAME, symforge_db_path};
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -96,11 +95,22 @@ pub enum ApiKeyStore {
 }
 
 impl ApiKeyStore {
-    /// Open or create `api-keys.db` under `dir`. On any failure returns
-    /// `Disabled` (logged, never panics) — the bootstrap `--api-key` still
-    /// works regardless (FR-011 / spec edge case).
-    pub fn open(dir: &Path) -> Self {
-        let db_path = dir.join(SYMFORGE_API_KEYS_DB_PATH);
+    /// Open or create `api-keys.db` under the project `root`. On any failure
+    /// returns `Disabled` (logged, never panics) — the bootstrap `--api-key`
+    /// still works regardless (FR-011 / spec edge case).
+    ///
+    /// `root` is the project ROOT, NOT the `.symforge` data dir. The path is
+    /// built through [`symforge_db_path`] (the single `.symforge` prefix owner),
+    /// so the db lands at `root/.symforge/api-keys.db`. Before this routed through
+    /// the helper, `open` took the already-`.symforge` data dir AND joined a
+    /// `.symforge/`-prefixed const, doubling the prefix to
+    /// `root/.symforge/.symforge/api-keys.db` (D7, shipped in 8.5.0). Any data at
+    /// that pre-fix doubled path is orphaned, not migrated — the store degrades to
+    /// `Disabled`/recreates and the bootstrap `--api-key` keeps working, so there
+    /// is no data loss for a never-1.0 key store (a stale doubled-path file is
+    /// simply unreferenced).
+    pub fn open(root: &Path) -> Self {
+        let db_path = symforge_db_path(root, API_KEYS_DB_NAME);
         match SqliteApiKeyStore::open(&db_path) {
             Ok(store) => Self::Sqlite(store),
             Err(err) => {
@@ -543,6 +553,39 @@ mod tests {
         let store2 = ApiKeyStore::open(tmp.path());
         assert!(store2.verify(&raw), "reopened store verifies persisted key");
         assert_eq!(store2.list().expect("list").len(), 1);
+    }
+
+    /// D7 regression: `ApiKeyStore::open` takes the project ROOT (the production
+    /// convention) and lands the db at the SINGLE-prefixed
+    /// `root/.symforge/api-keys.db`. Before the fix, `serve.rs` passed the already
+    /// `.symforge` data dir AND `open` joined a `.symforge/`-prefixed const,
+    /// doubling the prefix to `root/.symforge/.symforge/api-keys.db` (shipped in
+    /// 8.5.0). Assert the single path exists after a mint and the doubled path does
+    /// NOT — the on-disk check the old test skipped by never inspecting the file.
+    #[test]
+    fn open_writes_single_prefixed_db_path_not_doubled() {
+        use crate::paths::{API_KEYS_DB_NAME, SYMFORGE_DIR_NAME};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let store = ApiKeyStore::open(root);
+        store.mint("d7").expect("mint writes the db file");
+
+        let single = root.join(SYMFORGE_DIR_NAME).join(API_KEYS_DB_NAME);
+        let doubled = root
+            .join(SYMFORGE_DIR_NAME)
+            .join(SYMFORGE_DIR_NAME)
+            .join(API_KEYS_DB_NAME);
+        assert!(
+            single.is_file(),
+            "api-keys db must be written to the single-prefixed {}",
+            single.display()
+        );
+        assert!(
+            !doubled.exists(),
+            "api-keys db must NOT be written to the doubled {}",
+            doubled.display()
+        );
     }
 
     #[test]

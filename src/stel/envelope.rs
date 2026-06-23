@@ -32,7 +32,13 @@ pub struct TrustEnvelopeInput {
     /// Monotonic gross total of tokens served this session (only ever grows;
     /// NOT a net saving). Named for what it is (010 FR-002, TR-05/TR-11).
     pub session_tokens_served: i64,
-    pub calibration: &'static str,
+    /// Honest calibration verdict rendering (feature 013 US2/FR-009): `deferred`
+    /// / `accumulating (n/min)` / `tuned (error: before -> after ...)`. Owned (not
+    /// `&'static str`) so the LIVE verdict — including the before/after artifact
+    /// when a validated tuning is in force — can flow into the envelope. The word
+    /// `tuned` is only ever produced with its artifact (the renderer guarantees
+    /// it), so the envelope never claims `tuned` without evidence (SC-005).
+    pub calibration: String,
     pub ledger_line: Option<String>,
 }
 
@@ -198,7 +204,7 @@ mod tests {
             predicted_tokens: 400,
             predict_error_pct: 5.0,
             session_tokens_served: 1240,
-            calibration: "deferred",
+            calibration: "deferred".to_string(),
             ledger_line: Some("ledger: {}".to_string()),
         }
     }
@@ -218,7 +224,7 @@ mod tests {
                 predicted_tokens: 400,
                 predict_error_pct: 5.0,
                 session_tokens_served: 1240,
-                calibration: "ok",
+                calibration: "ok".to_string(),
                 ledger_line: None,
             },
             false,
@@ -252,7 +258,7 @@ mod tests {
                 predicted_tokens: 400,
                 predict_error_pct: 0.0,
                 session_tokens_served: 213,
-                calibration: "deferred",
+                calibration: "deferred".to_string(),
                 ledger_line: None,
             },
             false,
@@ -279,7 +285,7 @@ mod tests {
             predicted_tokens: 800,
             predict_error_pct: 12.0,
             session_tokens_served: 5000,
-            calibration: "deferred",
+            calibration: "deferred".to_string(),
             ledger_line: Some("ledger: {}".to_string()),
         };
         let compact = format_trust_envelope_inner(&input, true);
@@ -321,7 +327,7 @@ mod tests {
             predicted_tokens: 400,
             predict_error_pct: 5.0,
             session_tokens_served: 1240,
-            calibration: "deferred",
+            calibration: "deferred".to_string(),
             ledger_line: Some("ledger: {}".to_string()),
         };
         let default_render = format_trust_envelope_inner(&input, true);

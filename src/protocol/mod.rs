@@ -212,8 +212,12 @@ pub struct SymForgeServer {
 
 fn default_analytics_db_path(repo_root: Option<&Path>) -> PathBuf {
     repo_root
-        .map(|root| root.join(crate::paths::SYMFORGE_ANALYTICS_DB_PATH))
-        .unwrap_or_else(|| PathBuf::from(crate::paths::SYMFORGE_ANALYTICS_DB_PATH))
+        .map(|root| crate::paths::symforge_db_path(root, crate::paths::ANALYTICS_DB_NAME))
+        // No project root: fall back to a relative `.symforge/analytics.db`,
+        // byte-identical to the prior `PathBuf::from(SYMFORGE_ANALYTICS_DB_PATH)`.
+        .unwrap_or_else(|| {
+            Path::new(crate::paths::SYMFORGE_DIR_NAME).join(crate::paths::ANALYTICS_DB_NAME)
+        })
 }
 
 fn disabled_analytics_recorder(repo_root: Option<&Path>) -> crate::analytics::AnalyticsRecorder {
@@ -349,6 +353,11 @@ impl SymForgeServer {
                 handle.spawn_blocking(move || {
                     let _guard = guard; // decrements the in-flight count on completion
                     store.record(&event);
+                    // T031: after the new sample lands, run the tuning pass and
+                    // persist an accepted candidate — off the hot path, in the
+                    // same blocking task, so the auto-tune never stalls the MCP
+                    // worker. Degrades silently on any store error.
+                    Self::maybe_persist_tuning(&store);
                 });
             }
             Err(_) => {
@@ -356,6 +365,7 @@ impl SymForgeServer {
                 // events are never dropped. There is no async worker to protect
                 // here, so blocking is acceptable.
                 store.record(event);
+                Self::maybe_persist_tuning(store);
             }
         }
     }
@@ -365,6 +375,172 @@ impl SymForgeServer {
     #[cfg(feature = "server")]
     pub(crate) fn ledger_write_tracker(&self) -> &Arc<LedgerWriteTracker> {
         &self.ledger_writes
+    }
+
+    /// Run a tuning pass over the durable samples and persist an accepted
+    /// candidate (feature 013, T031 / FR-008 audited gated action).
+    ///
+    /// Reads the current-estimator samples, derives + held-out-validates a
+    /// candidate `response_correction_factor` against the correction currently in
+    /// force (identity `1.0`, or the active tuning's factor — the D13 hysteresis
+    /// anchor), and on an accepted `Tuned` verdict writes it via
+    /// `store_active_tuning` with the audit fields (factor, sample_size,
+    /// error_before/after, tuned_at). Idempotent: when the accepted candidate's
+    /// factor equals the already-stored one, it is NOT re-written (no SQLite
+    /// churn, no oscillation). Non-blocking off the hot path (called inside the durable
+    /// write's `spawn_blocking`); a `Disabled`/absent store degrades to a no-op
+    /// and never serves a bad tuning. NO frecency bump (Principle V).
+    #[cfg(feature = "server")]
+    fn maybe_persist_tuning(store: &crate::stel::ledger_store::StelLedgerStore) {
+        use crate::stel::calibration::{
+            CalibrationVerdict, NO_CORRECTION_FACTOR, PredictionSample, compute_calibration_verdict,
+        };
+        use crate::stel::controller::active_tuning_in_force;
+        use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
+
+        // Newest-first current-version samples (excludes pre-013). Bounded by the
+        // retention cap so the pass is O(cap) at worst.
+        let Ok(records) =
+            store.samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX)
+        else {
+            return;
+        };
+        let samples: Vec<PredictionSample> = records.iter().map(PredictionSample::from).collect();
+
+        // In-force correction factor = the active tuning's if present (D13
+        // hysteresis anchor: a re-tune must beat the correction already LIVE),
+        // else the identity 1.0 (no tuning). The validate gate scores a candidate
+        // against this, so a re-tune must out-perform what is already applied.
+        let active = store
+            .load_active_tuning(CURRENT_ESTIMATOR_VERSION)
+            .ok()
+            .flatten();
+        let in_force = active_tuning_in_force(active.clone(), CURRENT_ESTIMATOR_VERSION);
+        let in_force_factor = in_force
+            .as_ref()
+            .map_or(NO_CORRECTION_FACTOR, |c| c.response_correction_factor);
+
+        let (verdict, candidate) = compute_calibration_verdict(&samples, in_force_factor);
+        if !matches!(verdict, CalibrationVerdict::Tuned { .. }) {
+            return;
+        }
+        let Some(mut candidate) = candidate else {
+            return;
+        };
+
+        // Idempotence / oscillation guard: if the accepted candidate's correction
+        // equals what is already stored, do not re-write (the validate gate already
+        // requires a >= margin beat over the in-force factor, so this only fires on
+        // an exact-equal stored factor — pure churn avoidance).
+        if let Some(existing) = active.as_ref()
+            && existing.response_correction_factor == candidate.response_correction_factor
+        {
+            return;
+        }
+
+        candidate.tuned_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Audited gated action (FR-008): store_active_tuning persists the new
+        // correction factor, sample_size, error_before/after (the held-out real
+        // residual baseline + corrected), tuned_at. Degrades silently on a store
+        // error (never fails a request; never a bad tuning).
+        if let Err(error) = store.store_active_tuning(&candidate) {
+            tracing::warn!(error = %error, "stel tuning persist failed; keeping prior constants");
+        } else {
+            tracing::info!(
+                response_correction_factor = candidate.response_correction_factor,
+                sample_size = candidate.sample_size,
+                error_before = candidate.error_before,
+                error_after = candidate.error_after,
+                "stel auto-tune accepted: persisted calibrated correction (013 US2)"
+            );
+        }
+    }
+
+    /// The validated tuned-constant set currently IN FORCE for the current
+    /// estimator version (feature 013, T032 / FR-006), or `None`.
+    ///
+    /// Loads the active tuning from the durable store and applies the R3 in-force
+    /// rule via [`active_tuning_in_force`]: a tuning whose `estimator_version`
+    /// does not match the current estimator is NOT returned, so a stale-version
+    /// set never silently applies. A `Disabled`/absent store yields `None` and
+    /// the economics fall back to the static floors — never serves a bad tuning
+    /// (FR-003). Read-only; no frecency bump (Principle V).
+    ///
+    /// [`active_tuning_in_force`]: crate::stel::controller::active_tuning_in_force
+    #[cfg(feature = "server")]
+    pub(crate) fn active_tuning_for_economics(
+        &self,
+    ) -> Option<crate::stel::ledger_store::TunedEstimateConstants> {
+        use crate::stel::controller::active_tuning_in_force;
+        use crate::stel::ledger_store::CURRENT_ESTIMATOR_VERSION;
+
+        let store = self.stel_ledger_store.as_ref()?;
+        let loaded = store.load_active_tuning(CURRENT_ESTIMATOR_VERSION).ok()?;
+        active_tuning_in_force(loaded, CURRENT_ESTIMATOR_VERSION)
+    }
+
+    /// Compute the honest [`CalibrationVerdict`] from the DURABLE calibration
+    /// state for the `status` surface (feature 013, T033 / FR-009).
+    ///
+    /// `Tuned` is returned ONLY when an active tuning is in force AND it carries a
+    /// before/after held-out error artifact (`error_before > error_after`),
+    /// reading the artifact straight off the persisted set so the surface never
+    /// claims `tuned` without it. Otherwise the verdict reflects the durable
+    /// sample count (`Deferred` / `Accumulating(n/min)`). When no durable store is
+    /// wired (or it is `Disabled`/errors), returns `None` so the caller keeps the
+    /// in-memory verdict (which pins `Deferred`/`Accumulating` — never a false
+    /// `Tuned`). Read-only; no frecency bump.
+    ///
+    /// [`CalibrationVerdict`]: crate::stel::calibration::CalibrationVerdict
+    #[cfg(feature = "server")]
+    pub(crate) fn durable_calibration_verdict(
+        &self,
+    ) -> Option<crate::stel::calibration::CalibrationVerdict> {
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_SAMPLES};
+        use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
+
+        let store = self.stel_ledger_store.as_ref()?;
+        // A wired but failing store -> keep the in-memory verdict (None here).
+        let records = store
+            .samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX)
+            .ok()?;
+        let n = records.len();
+
+        // An active, in-force tuning with a real reduction artifact reads `Tuned`.
+        if let Some(active) = self.active_tuning_for_economics()
+            && active.error_before > active.error_after
+        {
+            return Some(CalibrationVerdict::Tuned {
+                sample_size: active.sample_size as usize,
+                error_before: active.error_before,
+                error_after: active.error_after,
+            });
+        }
+
+        if n == 0 {
+            Some(CalibrationVerdict::Deferred)
+        } else {
+            Some(CalibrationVerdict::Accumulating {
+                n,
+                min: TUNING_MIN_SAMPLES,
+            })
+        }
+    }
+
+    /// Clear accumulated calibration for the current estimator (feature 013,
+    /// T037 / FR-011 operator reset). Returns the number of sample rows cleared,
+    /// or `None` when no durable store is wired. Never rebuilds the index.
+    #[cfg(feature = "server")]
+    pub(crate) fn reset_calibration(&self) -> Option<usize> {
+        use crate::stel::ledger_store::CURRENT_ESTIMATOR_VERSION;
+        let store = self.stel_ledger_store.as_ref()?;
+        store
+            .clear_calibration_for_estimator(CURRENT_ESTIMATOR_VERSION)
+            .ok()
     }
 
     #[cfg(not(feature = "server"))]
@@ -384,11 +560,11 @@ impl SymForgeServer {
     /// Reachability note (honest scope of N-3/FR-008): a durable store is wired by
     /// `server::serve::run` (the `/mcp` surface) AND by the stdio + daemon-proxy
     /// bootstrap (US1 T020/T021). On the daemon-proxy `status` path the proxy
-    /// itself holds the store, so `status_stel_tool` overlays THIS value onto the
-    /// proxied worker body (`overlay_proxy_durable_ledger_line`) — the operator
-    /// sees the proxy's real `Durable`/`Disabled` state, not the storeless
-    /// worker's `unavailable` (013 US1 review fix, MAJOR 2). It stays
-    /// `Unavailable` only when no store is attached anywhere.
+    /// itself holds the store, so `status_stel_tool` overlays THIS value (among
+    /// all proxy-owned lines) onto the proxied worker body
+    /// (`overlay_proxy_status_lines`) — the operator sees the proxy's real
+    /// `Durable`/`Disabled` state, not the storeless worker's `unavailable`
+    /// (D2-ROOT). It stays `Unavailable` only when no store is attached anywhere.
     ///
     /// [`subsystem_state`]: crate::stel::ledger_store::StelLedgerStore::subsystem_state
     #[cfg(feature = "server")]

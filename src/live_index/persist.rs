@@ -583,7 +583,7 @@ pub fn init_frecency_store(project_root: &Path) {
     {
         return;
     }
-    let db_path = project_root.join(crate::paths::SYMFORGE_FRECENCY_DB_PATH);
+    let db_path = crate::live_index::frecency::frecency_db_path(project_root);
     let _ = run_frecency_init(&db_path, project_root);
 }
 
@@ -2087,7 +2087,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_frecency_store(tmp.path());
         assert!(
-            !tmp.path().join(paths::SYMFORGE_FRECENCY_DB_PATH).exists(),
+            !crate::live_index::frecency::frecency_db_path(tmp.path()).exists(),
             "init must not create the frecency database when flag is unset"
         );
         assert!(
@@ -2204,7 +2204,7 @@ mod tests {
         unsafe { std::env::set_var(FRECENCY_FLAG_ENV, "1") };
         init_frecency_store(tmp.path());
         clear_frecency_flag();
-        let db_path = tmp.path().join(paths::SYMFORGE_FRECENCY_DB_PATH);
+        let db_path = crate::live_index::frecency::frecency_db_path(tmp.path());
         assert!(
             db_path.exists(),
             "flag=1 init must create the frecency database"

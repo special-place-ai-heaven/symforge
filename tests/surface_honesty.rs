@@ -69,6 +69,7 @@ fn render_full_status() -> String {
     format_stel_status(
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
+            reset_calibration: None,
         },
         &ctx,
     )
@@ -94,6 +95,7 @@ fn render_full_status_with_durable(state: symforge::stel::DurableLedgerState) ->
     format_stel_status(
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
+            reset_calibration: None,
         },
         &ctx,
     )
@@ -178,7 +180,7 @@ fn rejected_decision_never_prints_a_positive_saving() {
         predicted_tokens: 400,
         predict_error_pct: 0.0,
         session_tokens_served: 213,
-        calibration: "deferred",
+        calibration: "deferred".to_string(),
         ledger_line: None,
     });
     assert!(envelope.contains("decision: reject"));
@@ -346,4 +348,222 @@ fn durable_ledger_unavailable_is_distinct_from_disabled() {
     assert_ne!(durable_line, disabled_line);
     assert_ne!(durable_line, unavailable_line);
     assert_ne!(disabled_line, unavailable_line);
+}
+
+// ===========================================================================
+// T034 (feature 013 US2) — every CalibrationVerdict renders honestly: `tuned`
+// carries before/after error + sample size, no surface reads
+// `validated`/`saved`/`active`, and the served figure stays `(est.)` even when
+// tuned constants are in force. (FR-009, FR-010, SC-005)
+// ===========================================================================
+
+#[test]
+fn calibration_verdict_renders_honestly_in_every_state() {
+    use symforge::stel::{CalibrationVerdict, render_calibration_verdict};
+
+    // Deferred / Accumulating must NOT read `tuned`/`validated`/`saved`/`active`.
+    for verdict in [
+        CalibrationVerdict::Deferred,
+        CalibrationVerdict::Accumulating { n: 4, min: 12 },
+    ] {
+        let line = render_calibration_verdict(&verdict);
+        for forbidden in ["tuned", "validated", "saved", "active"] {
+            assert!(
+                !line.contains(forbidden),
+                "non-tuned verdict must not read `{forbidden}`: {line}"
+            );
+        }
+    }
+
+    // Tuned MUST carry the before/after error artifact and the sample size — the
+    // word `tuned` never appears without it (SC-005).
+    let tuned = render_calibration_verdict(&CalibrationVerdict::Tuned {
+        sample_size: 60,
+        error_before: 400.0,
+        error_after: 12.0,
+    });
+    assert!(tuned.starts_with("tuned (error: 400.0 -> 12.0 tok"));
+    assert!(
+        tuned.contains("n=60"),
+        "tuned must surface the sample size: {tuned}"
+    );
+    for forbidden in ["validated", "saved", "active"] {
+        assert!(
+            !tuned.contains(forbidden),
+            "tuned must not read `{forbidden}`: {tuned}"
+        );
+    }
+}
+
+#[test]
+fn full_status_calibration_section_is_honest_for_each_verdict() {
+    use symforge::stel::{CalibrationVerdict, StelStatusContext};
+
+    let make = |verdict: CalibrationVerdict| {
+        let ledger = SessionLedger::new();
+        let ctx =
+            StelStatusContext::from_server("compact", "symforge", None, true, 1, 1, &ledger, 0)
+                .with_calibration_verdict(verdict);
+        format_stel_status(
+            &StelStatusRequest {
+                detail: Some(StelStatusDetail::Full),
+                reset_calibration: None,
+            },
+            &ctx,
+        )
+    };
+
+    let deferred = make(CalibrationVerdict::Deferred);
+    assert!(deferred.contains("calibration: deferred"), "{deferred}");
+    assert!(
+        !deferred.contains("tuned"),
+        "deferred never reads tuned:\n{deferred}"
+    );
+
+    let accumulating = make(CalibrationVerdict::Accumulating { n: 3, min: 12 });
+    assert!(
+        accumulating.contains("calibration: accumulating (3/12)"),
+        "{accumulating}"
+    );
+    assert!(
+        !accumulating.contains("tuned"),
+        "accumulating never reads tuned:\n{accumulating}"
+    );
+
+    let tuned = make(CalibrationVerdict::Tuned {
+        sample_size: 50,
+        error_before: 300.0,
+        error_after: 40.0,
+    });
+    assert!(
+        tuned.contains("calibration: tuned (error: 300.0 -> 40.0 tok"),
+        "tuned section must carry the before/after artifact:\n{tuned}"
+    );
+    assert!(tuned.contains("n=50"), "{tuned}");
+    // Never `validated`/`saved`/`active` in any rendered state.
+    for forbidden in [": validated", ": saved", ": active"] {
+        assert!(
+            !tuned.contains(forbidden),
+            "tuned section must not read `{forbidden}`:\n{tuned}"
+        );
+    }
+}
+
+#[test]
+fn served_figure_stays_estimate_under_tuned_constants() {
+    use symforge::stel::controller::estimate_economics_tuned;
+    use symforge::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, TunedEstimateConstants};
+    use symforge::stel::{
+        AdmissionDecision, IntentBucket, RouteConfidence, StelPlan, StelPlanStep,
+    };
+
+    // A plan-only step whose floor a validated tuning replaces.
+    let plan = StelPlan {
+        plan_id: "p".to_string(),
+        intent: IntentBucket::Trace,
+        confidence: RouteConfidence::Exact,
+        confidence_rationale: "t".to_string(),
+        steps: vec![StelPlanStep {
+            order: 1,
+            tool: "find_references".to_string(),
+            args: serde_json::json!({"name": "x"}),
+            est_response_tokens: 400,
+            est_manual_tokens: 800,
+            index_refs: vec![],
+        }],
+        suggested_followup: None,
+    };
+    let tuned = TunedEstimateConstants {
+        response_correction_factor: 2.0,
+        estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
+        sample_size: 60,
+        error_before: 300.0,
+        error_after: 12.0,
+        tuned_at_ms: 1,
+    };
+    let econ = estimate_economics_tuned(&plan, Some(&tuned));
+
+    // The envelope built from tuned economics still labels the served figure an
+    // estimate — grounding in history is not measurement (FR-010).
+    let _env_lock = stel_surface_env::COMPACT_ENV_LOCK.blocking_lock();
+    let _full = stel_surface_env::force_full_stel_envelope();
+    let envelope = format_trust_envelope(&TrustEnvelopeInput {
+        plan_summary: "trace → find_references (exact)".to_string(),
+        decision: AdmissionDecision::Serve,
+        response_tokens: econ.predicted_response_tokens,
+        est_net_vs_manual: econ.predicted_net_vs_manual,
+        schema_tokens: econ.predicted_schema_tokens,
+        invoke_tokens: econ.predicted_invoke_tokens,
+        predicted_tokens: econ.predicted_response_tokens,
+        predict_error_pct: 0.0,
+        session_tokens_served: 0,
+        calibration: "tuned".to_string(),
+        ledger_line: None,
+    });
+    assert!(
+        envelope.contains("(est. chars/4)"),
+        "served figure must stay an estimate even under tuned constants:\n{envelope}"
+    );
+    assert!(
+        envelope.contains("(heuristic)"),
+        "predicted figure stays heuristic under tuned constants:\n{envelope}"
+    );
+    assert!(
+        !envelope.contains(" saved vs manual"),
+        "no measured-saving claim under tuned constants:\n{envelope}"
+    );
+}
+
+#[test]
+fn live_envelope_calibration_is_tuned_only_with_a_validated_tuning() {
+    use symforge::stel::handler::metrics_for_decision_tuned;
+    use symforge::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, TunedEstimateConstants};
+    use symforge::stel::{build_plan, envelope_for_decision, evaluate_plan};
+
+    let request = symforge::stel::StelRequest {
+        query: "who references cfg_if".to_string(),
+        ..Default::default()
+    };
+    let plan = build_plan(&request);
+    let decision = evaluate_plan(&request, &plan);
+    let summary = plan_summary_line(&plan);
+
+    let _env_lock = stel_surface_env::COMPACT_ENV_LOCK.blocking_lock();
+    let _full = stel_surface_env::force_full_stel_envelope();
+
+    // No tuning in force -> the envelope honestly reads `deferred`, never `tuned`.
+    let deferred_metrics =
+        metrics_for_decision_tuned(summary.clone(), &decision, &plan, 420, 0, None);
+    let deferred_env = envelope_for_decision(&deferred_metrics);
+    assert!(
+        deferred_env.contains("calibration: deferred"),
+        "no tuning in force must read deferred:\n{deferred_env}"
+    );
+    assert!(
+        !deferred_env.contains("calibration: tuned"),
+        "the envelope must never read tuned without a tuning in force:\n{deferred_env}"
+    );
+
+    // A validated tuning in force -> the envelope reads `tuned` WITH the
+    // before/after artifact (SC-005: never `tuned` without it).
+    let tuned = TunedEstimateConstants {
+        response_correction_factor: 2.0,
+        estimator_version: CURRENT_ESTIMATOR_VERSION.to_string(),
+        sample_size: 60,
+        error_before: 300.0,
+        error_after: 12.0,
+        tuned_at_ms: 1,
+    };
+    let tuned_metrics = metrics_for_decision_tuned(summary, &decision, &plan, 420, 0, Some(&tuned));
+    let tuned_env = envelope_for_decision(&tuned_metrics);
+    assert!(
+        tuned_env.contains("calibration: tuned (error: 300.0 -> 12.0 tok"),
+        "a validated tuning must read tuned WITH the before/after artifact:\n{tuned_env}"
+    );
+    assert!(
+        tuned_env.contains("n=60"),
+        "tuned envelope line carries the sample size:\n{tuned_env}"
+    );
+    // Even under tuned constants, the served figure stays an estimate (FR-010).
+    assert!(tuned_env.contains("(est. chars/4)"), "{tuned_env}");
 }

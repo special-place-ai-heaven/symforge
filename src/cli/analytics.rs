@@ -110,7 +110,10 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
             std::env::current_dir().context("resolving current directory for analytics path")?
         }
     };
-    Ok(root.join(crate::paths::SYMFORGE_ANALYTICS_DB_PATH))
+    Ok(crate::paths::symforge_db_path(
+        &root,
+        crate::paths::ANALYTICS_DB_NAME,
+    ))
 }
 
 fn status_output(db_path: PathBuf) -> Result<AnalyticsStatusOutput> {

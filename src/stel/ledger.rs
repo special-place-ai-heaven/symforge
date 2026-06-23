@@ -102,7 +102,17 @@ pub fn build_ledger_event(input: &LedgerCaptureInput<'_>) -> StelLedgerEvent {
         } else {
             vec![]
         },
-        predicted_response_tokens: input.economics.predicted_response_tokens,
+        // D15: record the RAW (pre-correction-factor) prediction, NOT the
+        // corrected one. The calibration learns `median(actual / recorded)`; if the
+        // recorded figure were already `raw * f0` (the corrected value), tune #2+
+        // would learn a DELTA (`f_true / f0`) the live path then under-applies to
+        // RAW, and the held-out baseline would double-apply `f0` → false re-accept
+        // (D15, same class as D8). Recording RAW makes `derive` learn the ABSOLUTE
+        // `f_true` so `apply_factor(raw, f_true)` is exact and
+        // `held_out_mae(_, in_force_factor)` reconstructs the true live residual
+        // under ANY active tuning. When no tuning is in force `raw == corrected`,
+        // so the static path (and golden-replay) is byte-identical.
+        predicted_response_tokens: input.economics.raw_predicted_response_tokens,
         actual_response_tokens: output_tokens,
         manual_baseline_tokens: input.economics.predicted_manual_tokens,
         net_vs_manual,

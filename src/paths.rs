@@ -2,9 +2,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub const SYMFORGE_DIR_NAME: &str = ".symforge";
-pub const SYMFORGE_FRECENCY_DB_PATH: &str = ".symforge/frecency.db";
-pub const SYMFORGE_COUPLING_DB_PATH: &str = ".symforge/coupling.db";
-pub const SYMFORGE_ANALYTICS_DB_PATH: &str = ".symforge/analytics.db";
+
+/// Bare db filenames (no `.symforge/` prefix). These are the `name` argument to
+/// [`symforge_db_path`] — the ONLY sanctioned way to build a `.symforge/<name>.db`
+/// on-disk path. Keeping them bare is the whole point: the prefix lives in exactly
+/// one place (the helper), so no store can hand-roll a path and double the prefix
+/// (D1-ROOT — the defect that shipped a doubled `root/.symforge/.symforge/...` path).
+pub const FRECENCY_DB_NAME: &str = "frecency.db";
+pub const COUPLING_DB_NAME: &str = "coupling.db";
+pub const ANALYTICS_DB_NAME: &str = "analytics.db";
+pub const API_KEYS_DB_NAME: &str = "api-keys.db";
+pub const STEL_LEDGER_DB_NAME: &str = "stel-ledger.db";
+
 pub const SYMFORGE_IDEMPOTENCY_DIR_PATH: &str = ".symforge/idempotency";
 pub const SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH: &str = ".symforge/idempotency/records";
 pub const SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH: &str = ".symforge/idempotency/quarantine";
@@ -56,6 +65,40 @@ pub fn ensure_symforge_dir(base: &Path) -> io::Result<PathBuf> {
         )
     })?;
     Ok(dir)
+}
+
+/// Build the canonical on-disk path for a symforge db: `root/.symforge/<name>`.
+///
+/// `root` is the project ROOT, NOT the `.symforge` data dir. `name` MUST be a
+/// BARE filename (e.g. `"api-keys.db"`) with NO `.symforge/` prefix — this helper
+/// owns the single `.symforge` segment. Passing a `.symforge/`-prefixed name, or
+/// passing the already-`.symforge` data dir as `root`, would double the prefix to
+/// `root/.symforge/.symforge/<name>` — exactly the D1-ROOT defect this helper
+/// exists to make impossible. Every db store builds its path through here so the
+/// prefix lives in exactly one place.
+///
+/// This does NOT create the parent directory (SQLite will not create it either);
+/// callers that open for write must first run [`ensure_symforge_dir`] (or use
+/// [`ensure_symforge_db_path`], which does both).
+#[must_use]
+pub fn symforge_db_path(root: &Path, name: &str) -> PathBuf {
+    debug_assert!(
+        !name.contains('/') && !name.contains('\\'),
+        "symforge_db_path `name` must be a BARE filename (got {name:?}); \
+         the `.symforge/` prefix is owned by this helper"
+    );
+    root.join(SYMFORGE_DIR_NAME).join(name)
+}
+
+/// Ensure `root/.symforge` exists, then return the db path `root/.symforge/<name>`.
+///
+/// The write-side companion of [`symforge_db_path`]: SQLite will NOT create the
+/// parent `.symforge` directory, so a store that opens a db for write calls this
+/// to guarantee the parent exists before `Connection::open`. `name` MUST be a
+/// BARE filename (same rule as [`symforge_db_path`]).
+pub fn ensure_symforge_db_path(root: &Path, name: &str) -> io::Result<PathBuf> {
+    ensure_symforge_dir(root)?;
+    Ok(symforge_db_path(root, name))
 }
 
 /// Resolve the canonical idempotency replay directory under `base`.
@@ -347,13 +390,52 @@ mod tests {
         assert!(dir.exists(), "canonical directory should be created");
     }
 
+    /// D1-ROOT regression: every db store now builds its on-disk path through
+    /// [`symforge_db_path`] with a BARE filename. Under the PRODUCTION calling
+    /// convention (pass the project ROOT, not the `.symforge` data dir) the path
+    /// is the SINGLE-prefixed `root/.symforge/<name>.db`, and the DOUBLED
+    /// `root/.symforge/.symforge/<name>.db` is never produced. This is the check
+    /// the old per-store tests skipped — they passed a different arg than the
+    /// production caller, which is exactly how the doubled-path bug hid (D1/D7).
     #[test]
-    fn test_analytics_db_path_stays_under_canonical_symforge_dir() {
+    fn symforge_db_path_is_single_prefixed_never_doubled() {
         let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for name in [
+            FRECENCY_DB_NAME,
+            COUPLING_DB_NAME,
+            ANALYTICS_DB_NAME,
+            API_KEYS_DB_NAME,
+            STEL_LEDGER_DB_NAME,
+        ] {
+            let got = symforge_db_path(root, name);
+            assert_eq!(
+                got,
+                root.join(SYMFORGE_DIR_NAME).join(name),
+                "{name}: production path must be single-prefixed root/.symforge/<name>"
+            );
+            let doubled = root
+                .join(SYMFORGE_DIR_NAME)
+                .join(SYMFORGE_DIR_NAME)
+                .join(name);
+            assert_ne!(
+                got, doubled,
+                "{name}: helper must never produce the doubled root/.symforge/.symforge/<name> path"
+            );
+        }
+    }
 
-        assert_eq!(
-            tmp.path().join(SYMFORGE_ANALYTICS_DB_PATH),
-            tmp.path().join(SYMFORGE_DIR_NAME).join("analytics.db")
+    /// `ensure_symforge_db_path` creates the parent `.symforge` dir (SQLite will
+    /// not) and returns the same single-prefixed path as `symforge_db_path`.
+    #[test]
+    fn ensure_symforge_db_path_creates_parent_and_returns_single_prefixed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let db = ensure_symforge_db_path(root, ANALYTICS_DB_NAME).unwrap();
+        assert_eq!(db, root.join(SYMFORGE_DIR_NAME).join(ANALYTICS_DB_NAME));
+        assert!(
+            db.parent().unwrap().is_dir(),
+            "parent .symforge dir must exist after ensure_symforge_db_path"
         );
     }
 
