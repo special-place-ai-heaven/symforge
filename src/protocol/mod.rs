@@ -491,9 +491,10 @@ impl SymForgeServer {
     /// reading the artifact straight off the persisted set so the surface never
     /// claims `tuned` without it. Otherwise the verdict reflects the durable
     /// sample count (`Deferred` / `Accumulating(n/min)`). When no durable store is
-    /// wired (or it is `Disabled`/errors), returns `None` so the caller keeps the
-    /// in-memory verdict (which pins `Deferred`/`Accumulating` — never a false
-    /// `Tuned`). Read-only; no frecency bump.
+    /// wired, returns `None` so the caller keeps the in-memory view. When a wired
+    /// store cannot answer the sample query, pins the verdict to `Deferred` so a
+    /// stale in-memory session cannot claim `Tuned` while no validated tuning is
+    /// readable. Read-only; no frecency bump.
     ///
     /// [`CalibrationVerdict`]: crate::stel::calibration::CalibrationVerdict
     #[cfg(feature = "server")]
@@ -504,10 +505,12 @@ impl SymForgeServer {
         use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
 
         let store = self.stel_ledger_store.as_ref()?;
-        // A wired but failing store -> keep the in-memory verdict (None here).
-        let records = store
-            .samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX)
-            .ok()?;
+        // A wired but failing store cannot prove any tuning is in force.
+        let records =
+            match store.samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX) {
+                Ok(records) => records,
+                Err(_) => return Some(CalibrationVerdict::Deferred),
+            };
         let n = records.len();
 
         // An active, in-force tuning with a real reduction artifact reads `Tuned`.
