@@ -3,7 +3,7 @@
 Plain-named defects (no euphemisms — a missing/broken/wrong feature is a DEFECT, not an "honest gap"). Each is tagged ROOT or SYMPTOM and clustered to its culprit. "Loudly refused / disclosed" means we stopped a *silent* wrong answer — it does NOT mean the defect is resolved.
 
 Status: OPEN | IN-PROGRESS | FIXED. Owner: 012 (this lane) | 013 (predictor lane) | new.
-Last updated: 2026-06-22.
+Last updated: 2026-06-23.
 
 ## CULPRITS (root causes — these get attacked, not their symptoms)
 
@@ -42,7 +42,7 @@ Last updated: 2026-06-22.
 
 | ID | Defect (plain) | Root/Symptom | Status | Owner |
 |----|----------------|--------------|--------|-------|
-| D16 | `/mcp` is a stateless single-`SymForgeServer`-over-one-index; remote multi-tenant/multi-project impossible. | **ROOT (Culprit C)** | OPEN | new |
+| D16 | `/mcp` is a stateless single-`SymForgeServer`-over-one-index; remote multi-tenant/multi-project impossible. **C-stopgap (012d): the silent-wrong HALF is CONTAINED** — `/mcp` loudly refuses `project`/`projects` on the three cross-project tools via `local_cross_project_refusal` (no daemon behind the handler → `proxy_tool_call`=`None` because `/mcp`'s `SymForgeServer::new` leaves `daemon_client=None`). Already wired since Phase 3 (`278864c`); 012d adds the missing regression lock (`tests/serve_http_attach.rs`) + names the `/mcp` transport in the refusal. The ROOT (per-connection `/mcp` daemon session) stays OPEN/tracked-large. | **ROOT (Culprit C)** | OPEN (silent-half CONTAINED) | new |
 | D17 | open-vs-close TOCTOU race in the daemon (fail-loud, pre-existing on main). | ROOT (independent) | OPEN | new |
 | D18 | Reading a missing symbol silently returns the parent file outline instead of a not-found error. | SYMPTOM(A) | OPEN | new |
 | D19 | No multi-step query decomposition (only the 3 hardcoded multi-hop strings). | SYMPTOM(A) | OPEN | new |
@@ -59,6 +59,7 @@ Last updated: 2026-06-22.
 - Base+overlay engine primitive + cross-project query (US1) — live-verified.
 - B1 cross-project scoping HONORED (D11): `path_prefix`/`language`/noise threaded through the option-honoring engine search via the single-project helpers; reject guard narrowed to the genuinely-unsupported params (`structural`, `find_references` selectors). Per-project ranked+bounded (D14 PARTIAL — global interleave deferred). Aligns cross-project text defaults with single-project (`include_vendor=false`); `ranked` is churn-blind cross-project (noted). Engine unit test + live daemon-HTTP scoping assertions (symbols + text); adversarial review wf a2eac32.
 - A1b `path` forwarding (D-A0 / lossless-or-loud): `forward_caller_path` in the single plan choke point (`src/stel/planner.rs`) threads the caller's `path` into `path_prefix` on the path_prefix-capable search routes (`search_symbols`/`search_text`/`explore`), closing the `path` silent-drop there; `path`-as-selector routes (`get_symbol`/`get_file_content`/`find_references`/`find_dependents`) already carry it (Routed). `max_tokens` left as handler-`Forwarded` (already honored; injecting it would fight the degrade-cap logic and violate the `Forwarded` contract). Golden unaffected (tool-shape unchanged). Conformance test re-baselined NotApplicable→Routed + behavioral forwarding proof. Adversarial review wf a9b73e8 (verdict: correct + honest); newly-found `search_files` scope gap tracked as D20.
+- C-stopgap (D16 silent-half): `/mcp` loudly REFUSES `project`/`projects` on the three cross-project tools (`search_symbols`/`search_text`/`find_references`). TRACE FINDING (the handoff left this trace unfinished and ASSUMED a silent drop): the refusal was ALREADY wired since Phase 3 (`local_cross_project_refusal`, commit `278864c`) — it fires on `/mcp` because that transport's `SymForgeServer::new` leaves `daemon_client=None`, so `proxy_tool_call` short-circuits to `None` BEFORE any single-project answer. The genuine gaps closed by 012d: (1) NO regression test guarded the no-daemon refusal (only the facade D9 path was tested) — now locked by `tests/serve_http_attach.rs::cross_project_targeting_is_refused_over_http` (real HTTP transport: all three tools refuse + name the `/mcp` transport; a no-params control does NOT refuse); (2) the refusal message now names the `/mcp` HTTP transport so it is honest for that caller. NO new refusal logic — the containment existed but was unguarded. Daemon HONOR path unchanged (`daemon::tests::test_cross_project_query_returns_attributed_hits_from_both_projects`).
 
 ## Attack plan (roots, not holes)
 
@@ -76,15 +77,15 @@ Sequence by (defects-killed ÷ effort), gated by file independence:
 2. **D17** — collapse the open-vs-close TOCTOU (single `projects.write()` entry). S/LOW, isolated. Owner 012.
 3. **B1** — DONE (implemented, gate-green): threaded caller options through the empty-overlay search path → D11 scoping FIXED, D14 ranking PARTIAL (per-project ranked+bounded; global interleave deferred). Owner 012.
 4. **A1b** — DONE (implemented, gate-green, adversarially reviewed wf a9b73e8): `forward_caller_path` threads caller `path`→`path_prefix` on path_prefix-capable search routes (the real `path` silent-drop). HONEST refinement of the forecast: `max_tokens` was already honored (handler CCR `Forwarded`), so it is NOT forwarded into plan args (would violate the `Forwarded` contract); golden needed NO re-baseline (it asserts tool-shape only). New defect found: D20 (`search_files` unscoped). Owner 012.
-5. **C-stopgap** — `/mcp` loudly refuses `project`/`projects` (contain D16's silent-wrong half). Owner 012.
-6. **B2** — republish→rebase on HEAD/watcher advance (D12). Owner 012.
+5. **C-stopgap** — DONE (012d, behaviorally verified over the real `/mcp` HTTP transport). TRACE FINDING: the `/mcp` refusal was ALREADY wired since Phase 3 (`local_cross_project_refusal` fires because `/mcp`'s `SymForgeServer::new` has `daemon_client=None`); the real gaps were the missing regression lock (now `tests/serve_http_attach.rs`) + the message not naming the `/mcp` transport (now fixed). NO new refusal logic. D16's silent-wrong half is CONTAINED; the ROOT (per-connection `/mcp` session) stays tracked-large. Owner 012.
+6. **B2** — republish→rebase on HEAD/watcher advance (D12). **NEXT.** Owner 012.
 
 A2 (`Figure` provenance enum) = DEMOTED to regression-guard (envelope already honest); low priority, owner 012.
 
 Tracked-LARGE (OPEN, real owner + blocked-on — NOT euphemized):
 - **D-B0** per-view derived index for non-empty overlays (K-delta trigram merge) — owner 012, blocked-on: cross-project-write track.
 - **D15** overlay edits in ordinary reads (Phase 5: ~20 `capture_*` port + read-path flip) — owner 012, blocked-on: read-path migration.
-- **D16** `/mcp` per-connection daemon session — owner 012, blocked-on: stateful-mode substrate + parity re-test.
+- **D16** `/mcp` per-connection daemon session (the ROOT; silent-wrong half already CONTAINED by C-stopgap/012d) — owner 012, blocked-on: stateful-mode substrate + parity re-test.
 - **D13** xref recall ~29% (now: `parsing/xref.rs` extraction defect) — owner: recall/8.1 program.
 - **D2** gate decides on estimated economics for non-read routes — owner 013, blocked-on: grounding extension to search routes.
 - **D5/D6** false "VALIDATED"/"95% trajectory" claims — doc demotion, owner 012.
