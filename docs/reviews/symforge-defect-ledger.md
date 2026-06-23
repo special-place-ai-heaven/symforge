@@ -25,6 +25,7 @@ Last updated: 2026-06-22.
 | D7 | `symbol` param ignored on read/impact/orient (query token taken as the symbol name). | SYMPTOM(A) | VERIFY | 012/branch |
 | D8 | `path:` reads as a project selector but is a within-project filter; vocabulary trap. Glossary + error added (loud), facade vocabulary still lossy. | SYMPTOM(A) | LOUD-ONLY | new |
 | D9 | The `symforge` facade silently dropped `project`/`projects`. Now **loudly refused** — but the defect (facade does not route cross-project) is unfixed. | SYMPTOM(A) | LOUD-ONLY | new |
+| D20 | `search_files` is planner-reachable + scope-capable but its input has NO `path_prefix` field, so a caller's `path` is silently dropped on `search_files` routes (path/file ranking runs repo-wide despite the caller scoping). A1b's planner forwarding cannot reach it (no arg to forward into). Found by adversarial review wf a9b73e8. Fix path: add `path_prefix` to `SearchFilesInput` + scope the handler, then add `search_files` to `PATH_PREFIX_FORWARD_TOOLS`. | SYMPTOM(A) | OPEN | 012 |
 
 ## Defects — CULPRIT B (engine multi-view search: no per-view derived index, no live rebase)
 
@@ -57,6 +58,7 @@ Last updated: 2026-06-22.
 - Strict-MCP-client schema rejection of Phase 3 `projects` fields → `schemars(with=...)`.
 - Base+overlay engine primitive + cross-project query (US1) — live-verified.
 - B1 cross-project scoping HONORED (D11): `path_prefix`/`language`/noise threaded through the option-honoring engine search via the single-project helpers; reject guard narrowed to the genuinely-unsupported params (`structural`, `find_references` selectors). Per-project ranked+bounded (D14 PARTIAL — global interleave deferred). Aligns cross-project text defaults with single-project (`include_vendor=false`); `ranked` is churn-blind cross-project (noted). Engine unit test + live daemon-HTTP scoping assertions (symbols + text); adversarial review wf a2eac32.
+- A1b `path` forwarding (D-A0 / lossless-or-loud): `forward_caller_path` in the single plan choke point (`src/stel/planner.rs`) threads the caller's `path` into `path_prefix` on the path_prefix-capable search routes (`search_symbols`/`search_text`/`explore`), closing the `path` silent-drop there; `path`-as-selector routes (`get_symbol`/`get_file_content`/`find_references`/`find_dependents`) already carry it (Routed). `max_tokens` left as handler-`Forwarded` (already honored; injecting it would fight the degrade-cap logic and violate the `Forwarded` contract). Golden unaffected (tool-shape unchanged). Conformance test re-baselined NotApplicable→Routed + behavioral forwarding proof. Adversarial review wf a9b73e8 (verdict: correct + honest); newly-found `search_files` scope gap tracked as D20.
 
 ## Attack plan (roots, not holes)
 
@@ -73,7 +75,7 @@ Sequence by (defects-killed ÷ effort), gated by file independence:
 1. **A1a** — `ParamDisposition` choke point in `build_plan_from_steps` + conformance test. Every `StelRequest` field resolves to `Routed|Forwarded|Refused|NotApplicable`; silent-absent is asserted-against. **Zero behavior change — `routes.golden.jsonl` does NOT move.** Erects the non-regressable guard against the silent-drop class (D-A0) at zero risk. **ATTACK FIRST.** Owner 012.
 2. **D17** — collapse the open-vs-close TOCTOU (single `projects.write()` entry). S/LOW, isolated. Owner 012.
 3. **B1** — DONE (implemented, gate-green): threaded caller options through the empty-overlay search path → D11 scoping FIXED, D14 ranking PARTIAL (per-project ranked+bounded; global interleave deferred). Owner 012.
-4. **A1b** — gated per-tool forwarding (`max_tokens`→args, `path`→`path_prefix`); golden re-baselined. Owner 012.
+4. **A1b** — DONE (implemented, gate-green, adversarially reviewed wf a9b73e8): `forward_caller_path` threads caller `path`→`path_prefix` on path_prefix-capable search routes (the real `path` silent-drop). HONEST refinement of the forecast: `max_tokens` was already honored (handler CCR `Forwarded`), so it is NOT forwarded into plan args (would violate the `Forwarded` contract); golden needed NO re-baseline (it asserts tool-shape only). New defect found: D20 (`search_files` unscoped). Owner 012.
 5. **C-stopgap** — `/mcp` loudly refuses `project`/`projects` (contain D16's silent-wrong half). Owner 012.
 6. **B2** — republish→rebase on HEAD/watcher advance (D12). Owner 012.
 
