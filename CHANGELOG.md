@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.8.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.0...v8.8.1) (2026-06-23)
+
+
+### Bug Fixes
+
+* **stel:** report full calibration accumulation threshold ([fdeae50](https://github.com/special-place-ai-heaven/symforge/commit/fdeae508fda51dd4493d41dbfe405e9fd608d05f))
+
 ## [8.8.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.7.0...v8.8.0) (2026-06-23)
 
 
