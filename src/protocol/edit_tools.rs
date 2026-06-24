@@ -794,12 +794,19 @@ impl SymForgeServer {
                 &new_content,
                 file.language.clone(),
             );
-            // D15 overlay-WRITER: also upsert the freshly parsed content into the
-            // session's per-project overlay so a subsequent single-mode get_symbol
-            // in the SAME session reads-your-writes. `None` on the shared instance
-            // and in local-stdio mode — byte-identical fall-through. The overlay
-            // lock is taken AFTER reindex_after_write returned (no index-lock
-            // nesting, I2) and while holding NO daemon-map lock (I1).
+            // DORMANT SEAM (012 US3/SC-003/FR-005). This populates the per-session
+            // overlay, but NO production read path consumes the delta today: the
+            // get_symbol overlay read was removed (redundant), and cross-project
+            // refresh_working_set_bases re-interns the base from the live index and
+            // attaches a fresh EMPTY overlay. The base is already updated by
+            // reindex_after_write above, so every read sees the edit via the base.
+            // The writer is kept as a deliberate seam for FUTURE commit-gated
+            // session-private edits (precondition #1 in
+            // docs/reviews/overlay-redundancy-decision.md): until edits stop writing
+            // through to the shared base, the overlay can only ever duplicate it.
+            // `None` on the shared instance and in local-stdio mode — byte-identical.
+            // The overlay lock is taken AFTER reindex_after_write returned (no
+            // index-lock nesting, I2) and while holding NO daemon-map lock (I1).
             if let Some(ov) = &self.session_working_set
                 && let Some(parsed) = edit::parse_indexed_for_overlay(
                     &resolved_path,

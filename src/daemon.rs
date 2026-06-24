@@ -4289,15 +4289,19 @@ mod tests {
         )
     }
 
-    /// AC1 + AC2: PRODUCTION-PATH read-your-writes through the real C2 wiring.
-    /// Edit a function via `execute_tool_call(replace_symbol_body)`, then read it
-    /// via `execute_tool_call(get_symbol)` in the SAME session and assert the
-    /// EDITED body is returned AND the overlay carries an `Upsert` delta for the
-    /// path (proves the read came from the overlay branch, not incidentally from
-    /// the base). The runtime is obtained from `session_runtime()`, so a `None`
-    /// field (C2 not wired) would leave the overlay empty and AC2 would FAIL.
+    /// AC1 + AC2: the WRITER populates the dormant overlay seam; `get_symbol`
+    /// returns the edit via the BASE. Edit a function via
+    /// `execute_tool_call(replace_symbol_body)` through the real C2 wiring, then:
+    /// (AC2) assert the per-session overlay carries an `Upsert` delta for the path
+    /// — this proves the write-seam works — and (AC1) assert a subsequent
+    /// `execute_tool_call(get_symbol)` in the SAME session returns the EDITED body.
+    /// The read no longer consults the overlay (that branch was removed as
+    /// redundant); it returns the edit via the shared live index (the base), which
+    /// `reindex_after_write` already advanced. The runtime is obtained from
+    /// `session_runtime()`, so a `None` field (C2 not wired) would leave the overlay
+    /// empty and AC2 would FAIL.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_d15_overlay_read_your_writes_via_execute_tool_call() {
+    async fn test_d15_overlay_writer_populates_seam_read_via_base() {
         let project = project_dir("symforge-d15-rww");
         let rel = write_overlay_fixture(&project, "src/lib.rs", "pub fn target() -> u32 { 1 }\n");
 
@@ -4351,14 +4355,16 @@ mod tests {
             "edit must succeed, got: {edit_out}"
         );
 
-        // AC2: the overlay branch is live — an Upsert delta exists for the path.
+        // AC2: the WRITER seam is live — an Upsert delta exists for the path.
         assert!(
             session_overlay_has_upsert(&state, &opened.session_id, &rel),
-            "overlay must carry an Upsert delta after the edit (AC2)"
+            "overlay writer must carry an Upsert delta after the edit (AC2)"
         );
 
-        // AC1: a fresh runtime in the SAME session reads-your-writes. force_refresh
-        // bypasses the session symbol cache so the overlay branch is genuinely hit.
+        // AC1: a fresh runtime in the SAME session returns the edit via the BASE
+        // (the shared live index, advanced by reindex_after_write). The overlay read
+        // branch was removed as redundant; force_refresh bypasses the session symbol
+        // cache so the base read is genuinely exercised.
         let runtime_read = state
             .session_runtime(&opened.session_id)
             .expect("session runtime 2");
@@ -4375,7 +4381,7 @@ mod tests {
         .expect("get_symbol dispatch");
         assert!(
             read_out.contains("999"),
-            "get_symbol must return the EDITED body (read-your-writes), got: {read_out}"
+            "get_symbol must return the EDITED body via the base, got: {read_out}"
         );
     }
 

@@ -141,7 +141,11 @@ mod ledger_write_tracker_tests {
         assert_eq!(tracker.pending(), 1, "stuck write must still be counted");
     }
 }
-/// Per-session read-your-writes overlay handle (D15).
+/// Per-session overlay handle (D15) — DORMANT WRITE SEAM. The writer in
+/// `edit_tools.rs` populates it, but NO production read path consumes the delta
+/// today (the get_symbol overlay read was removed as redundant; cross-project
+/// refresh empties it). Kept for FUTURE commit-gated session-private edits (012
+/// US3/SC-003); see docs/reviews/overlay-redundancy-decision.md.
 ///
 /// Carries BOTH the WorkingSet lookup key (the HASH `project_id`, i.e. the
 /// `project_key` result — NOT the display `project_name`) and the session's
@@ -192,8 +196,9 @@ pub struct SymForgeServer {
     /// Set to `true` after a failed reconnection attempt. While degraded,
     /// calls make one success probe but avoid repeated reconnect attempts.
     pub(crate) daemon_degraded: Arc<AtomicBool>,
-    /// Per-session read-your-writes overlay handle (D15). `None` on the shared
-    /// `project.server` instance and in local-stdio mode; `Some` ONLY on the
+    /// Per-session overlay handle (D15) — DORMANT WRITE SEAM (no production read
+    /// consumer; see docs/reviews/overlay-redundancy-decision.md). `None` on the
+    /// shared `project.server` instance and in local-stdio mode; `Some` ONLY on the
     /// per-session clone built in `daemon::session_runtime()`. Plain `Option`
     /// (the `Arc` is INSIDE `SessionOverlay`) so `#[derive(Clone)]` gives each
     /// clone its own slot — setting it on the local clone never mutates the

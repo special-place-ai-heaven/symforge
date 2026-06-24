@@ -3567,31 +3567,15 @@ impl SymForgeServer {
         }
 
         let file = {
-            // D15 overlay-WRITER read path: consult the session's per-project
-            // overlay FIRST (read-your-writes). `None` on the shared instance and
-            // in local-stdio mode → byte-identical fall-through to the base. The
-            // overlay `read()` is taken and DROPPED (the `and_then` closure returns)
-            // BEFORE `self.index.read()` on the miss path, so there is no
-            // index-lock / ws-lock nesting (I2), and no daemon-map lock is held (I1).
-            // Reading the delta map directly (not via `IndexView`) is deliberate: a
-            // stale overlay falls through to the base, which already holds the
-            // edit via reindex_after_write (I4).
-            let overlay_hit = self.session_working_set.as_ref().and_then(|ov| {
-                let ws = ov.working_set.read();
-                let entry = ws.get(&ov.project_id)?;
-                match entry.overlay.deltas.get(&params.0.path)? {
-                    crate::live_index::view::FileDelta::Upsert(f) => Some(Arc::clone(f)),
-                    crate::live_index::view::FileDelta::Tombstone => None,
-                }
-            });
-            match overlay_hit {
-                Some(f) => Some(f),
-                None => {
-                    let guard = self.index.read();
-                    loading_guard!(guard);
-                    guard.capture_shared_file(&params.0.path)
-                }
-            }
+            // The single-project overlay READ was REMOVED: it was redundant (the
+            // shared live index already holds the edit via reindex_after_write) and
+            // carried a narrow staleness shadow risk (overlay-first with no freshness
+            // gate could shadow a base advanced by a watcher event). The base read is
+            // always at-least-as-fresh. See
+            // docs/reviews/overlay-redundancy-decision.md.
+            let guard = self.index.read();
+            loading_guard!(guard);
+            guard.capture_shared_file(&params.0.path)
         };
 
         // Honest Tier-2/Tier-3 response before any miss handling: a path like

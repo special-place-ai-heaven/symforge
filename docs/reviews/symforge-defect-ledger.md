@@ -5,11 +5,23 @@ Plain-named defects (no euphemisms — a missing/broken/wrong feature is a DEFEC
 Status: OPEN | IN-PROGRESS | FIXED. Owner: 012 (this lane) | 013 (predictor lane) | new.
 Last updated: 2026-06-24.
 
+> **as_of 2026-06-24 — Overlay redundancy (new finding).** The per-session
+> base+overlay `IndexView` overlay is REDUNDANT in production. Every read sees
+> edits via the shared live index (single-project `self.index`, `daemon.rs:1446`)
+> or the refreshed `entry.base` (cross-project — `refresh_working_set_bases`
+> empties the overlay, `daemon.rs:790-798`). Verified @086d6c4. The overlay is a
+> deliberate vision seam (012 US3/SC-003), NOT obsolete, but has NO production
+> consumer. Decision: `docs/reviews/overlay-redundancy-decision.md`. Honesty
+> caveat: low-recall type-usage traces ship no incompleteness signal — add a
+> recall-confidence caveat on partial type-usage traces (cheap interim honesty
+> win before D13 lands).
+
 ## CULPRITS (root causes — these get attacked, not their symptoms)
 
 - **CULPRIT A — the STEL facade is a lossy, fabricating router.** It (1) emits numbers it never measured, (2) silently drops caller params it didn't curate, (3) makes claims it never validated. Every facade trust defect below is a symptom of this one design.
 - **CULPRIT B — the engine's multi-view search has no per-view live derived indices and no live rebase.** `WorkingSet`/`IndexView` search runs base-only + overlay post-filter, so cross-project/overlay search is scoping-less, stale, and low-recall.
 - **CULPRIT C — `/mcp` is a stateless single-index singleton.** No per-connection session state on the HTTP transport.
+- **CULPRIT D — xref extraction incompleteness (`parsing/xref.rs`).** Qualified calls key under the inner identifier (not the type head) and struct/composite literals are never captured, so `find_references` on a type silently misses value/constructor/struct-literal usages. Single-project, ordinary read path — NO overlay/view involvement. (Was mis-filed under Culprit B / per-IndexView derived index; decoupled 2026-06-24, see `docs/reviews/overlay-redundancy-decision.md`.)
 
 ## Defects — CULPRIT A (lossy/fabricating facade)
 
@@ -31,12 +43,17 @@ Last updated: 2026-06-24.
 
 | ID | Defect (plain) | Root/Symptom | Status | Owner |
 |----|----------------|--------------|--------|-------|
-| D-B0 | `WorkingSet`/`IndexView` `search_text`/`find_references` run base-only + overlay post-filter; no per-view derived (trigram/reverse) index; no live rebase on change. | **ROOT (Culprit B)** | OPEN | new |
+| D-B0 | `WorkingSet`/`IndexView` `search_text`/`find_references` run base-only + overlay post-filter; no per-view derived (trigram/reverse) index; no live rebase on change. **MOOT under the current single-shared-index architecture: no production overlay carries deltas no other path sees (every IndexView branch takes the base-only path under `deltas.is_empty()`; refresh empties overlays). Reframed: BLOCKED on precondition #1 (a real overlay WRITER — write-to-overlay-not-base), NOT on its own implementation. Do NOT build under the single shared live index. DECOUPLED from D13** (D13 is a single-project `xref.rs` defect, now Culprit D). See `docs/reviews/overlay-redundancy-decision.md`. | **ROOT (Culprit B)** | OPEN (blocked) | 012 |
 | D11 | Cross-project scoping — `path_prefix`/`language`/noise now **HONORED** (B1): threaded through the engine's option-honoring `search_*_with_options` on the empty-overlay cross-project path, built via the SAME helpers as single-project (identical behavior; proven by engine unit test + live daemon-HTTP test). `structural` (separate ast-grep pipeline) and `find_references` `path`/`symbol_kind`/`direction` (selectors / implementations-mode) remain honest capability-refusals — no cross-project entry point. Cross-project rendering of display params (`context`/`group_by`/`follow_refs`) is deferred to A1b (display, NOT scoping). | SYMPTOM(B) | FIXED | 012 |
 | D12 | Cross-project reads now stay FRESH after ANY watched change (B2): a LAZY re-intern on the cross-project read path detects a stale interned base (`Arc::ptr_eq` of the entry's snapshot vs the project's current published index) and force-replaces it (`intern_base_refresh`, SC-002-preserving), re-fencing the entry's empty overlay. Proven by a daemon regression test (add/delete freshness, mismatch-gate, lone-non-active, SC-002) + a real-watcher live daemon-HTTP transcript; single-project parity byte-identical + frecency-neutral. PR #369 (745313d). | SYMPTOM(B) | FIXED | 012 |
-| D13 | Reference trace recall ~29% on type/value usages (`find_references` misses value sites). | SYMPTOM(B) | OPEN | new |
 | D14 | Cross-project results are now per-project `result_limit`-bounded + tier-RANKED before the cap (B1; was an unbounded `usize::MAX` dump then truncate). Output stays grouped-by-project in working-set order; a single GLOBAL relevance interleave across projects is still deferred (adversarial review wf a2eac32 — honest scope). | SYMPTOM(B) | PARTIAL | 012 |
-| D15 | Single-project overlay edits are NOT visible in ordinary reads (read path uses `self.index`, not `IndexView`). Investigation (012e): NOT live-verifiable this sprint — there is NO production single-project overlay-WRITE path (every `overlay.upsert` is test-only; `SymForgeServer` holds only `index`), so flipping reads to `IndexView` is byte-identical (parity refactor, zero observable effect). ROOT = the missing overlay-WRITER, OUT of D15's read-migration scope. Phased plan: `docs/reviews/D15-readpath-coherence-migration-plan.md`. | SYMPTOM(B) | OPEN (plan) | 012 |
+| D15 | Single-project overlay edits in ordinary reads. **DORMANT SEAM (redundant in production), NOT "done."** PR #372 (`22e66ca`, merged) landed the single-project overlay-WRITER. as_of 2026-06-24: the writer is KEPT (gated `None` on the shared instance / local-stdio — byte-identical) as a deliberate 012-spec seam (US3/SC-003); the single-project overlay READ was REMOVED (`tools.rs` get_symbol) because it was redundant (the shared live index already holds the edit via `reindex_after_write`) AND carried a narrow staleness shadow risk (overlay-first, no freshness gate could shadow a base advanced by a watcher event). Read-migration Phases 2-5 PAUSED (no-op parity refactor until edits stop writing through to the shared base). Owner 012. Path to load-bearing = precondition #1 (commit-gated edits) + D16 + D-B0. See `docs/reviews/overlay-redundancy-decision.md`. Phased plan (paused): `docs/reviews/D15-readpath-coherence-migration-plan.md`. | SYMPTOM(B) | DORMANT SEAM | 012 |
+
+## Defects — CULPRIT D (xref extraction incompleteness)
+
+| ID | Defect (plain) | Root/Symptom | Status | Owner |
+|----|----------------|--------------|--------|-------|
+| D13 | Reference trace recall ~29% on type/value usages — `find_references` misses value/constructor/struct-literal sites. **#1 OPEN trust defect (HIGH impact x STRONGEST field evidence):** `find_references(MinimalFilter)` returned 2 definition lines, missed all 5 usages. Root cause (verified @086d6c4): `parsing/xref.rs:18` keys qualified calls (`MinimalFilter::new()`) under the inner identifier (`new`), not the type head; `struct_expression` is never captured (`grep struct_expression src/parsing/xref.rs` -> EMPTY). Scope: `parsing/xref.rs` + one `find_references` lookup branch (match `qualified_name` head == searched name). Reclassified out of Culprit B (per-IndexView derived index) on 2026-06-24 — single-project, ordinary read path, NO overlay/view involvement. | **ROOT (Culprit D)** | OPEN (#1) | new |
 
 ## Defects — CULPRIT C (transport) + independent
 
@@ -44,7 +61,7 @@ Last updated: 2026-06-24.
 |----|----------------|--------------|--------|-------|
 | D16 | `/mcp` is a stateless single-`SymForgeServer`-over-one-index; remote multi-tenant/multi-project impossible. **C-stopgap (012d): the silent-wrong HALF is CONTAINED** — `/mcp` loudly refuses `project`/`projects` on the three cross-project tools via `local_cross_project_refusal` (no daemon behind the handler → `proxy_tool_call`=`None` because `/mcp`'s `SymForgeServer::new` leaves `daemon_client=None`). Already wired since Phase 3 (`278864c`); 012d adds the missing regression lock (`tests/serve_http_attach.rs`) + names the `/mcp` transport in the refusal. The ROOT (per-connection `/mcp` daemon session) stays OPEN/tracked-large. | **ROOT (Culprit C)** | OPEN (silent-half CONTAINED) | new |
 | D17 | open-vs-close TOCTOU race in the daemon (fail-loud, pre-existing on main). | ROOT (independent) | OPEN | new |
-| D18 | Reading a missing symbol silently returns the parent file outline instead of a not-found error. | SYMPTOM(A) | OPEN | new |
+| D18 | Reading a missing symbol silently returns the parent file outline instead of a not-found error (D18/R3). **#2 frontier** (silent-wrong family, same as the fixed R1/C4 wins): `get_symbol(TotallyFake, src/main.rs)` returns the full main.rs outline. Small isolated guard at the get_symbol read choke point; high impact, low effort. See `docs/reviews/overlay-redundancy-decision.md`. | SYMPTOM(A) | OPEN (#2) | new |
 | D19 | No multi-step query decomposition (only the 3 hardcoded multi-hop strings). | SYMPTOM(A) | OPEN | new |
 
 ## FIXED this engagement (012 lane, verified green)
@@ -65,7 +82,8 @@ Last updated: 2026-06-24.
 ## Attack plan (roots, not holes)
 
 - **Attack Culprit A:** a structurally-enforced facade contract — **lossless-or-loud** (every caller param is routed, forwarded, or explicitly refused — never silently dropped) + **honest-envelope** (only measured or explicitly-`est.`-labeled values reach the wire), with a conformance test so the class cannot regress. Dissolves D-A0, D3, D5, D6, D8, D9, D18, D19 and removes the fabrication behind D1/D2.
-- **Attack Culprit B:** per-`IndexView` derived indices + republish→rebase in the engine, so cross-project/overlay search honors scoping (D11), stays fresh (D12), ranks (D14), recalls value usages (D13), and ordinary reads see overlay edits (D15).
+- **Attack Culprit B:** per-`IndexView` derived indices + republish→rebase in the engine, so cross-project/overlay search honors scoping (D11), stays fresh (D12), ranks (D14). (D13 reclassified to Culprit D — NOT a view-index defect. D15 is a DORMANT SEAM, D-B0 is MOOT until a real overlay writer lands — see `docs/reviews/overlay-redundancy-decision.md`.)
+- **Attack Culprit D:** `parsing/xref.rs` struct/composite-literal capture + a `find_references` lookup branch matching `qualified_name` head segments, closing value/constructor/struct-literal recall (D13) on the ordinary single-project read path.
 - **Attack Culprit C:** per-connection session dimension on `/mcp` (stateful mode / per-connection proxy server).
 - Independent: D17 race hardening.
 
@@ -81,15 +99,15 @@ Sequence by (defects-killed ÷ effort), gated by file independence:
 5. **C-stopgap** — DONE (012d, behaviorally verified over the real `/mcp` HTTP transport). TRACE FINDING: the `/mcp` refusal was ALREADY wired since Phase 3 (`local_cross_project_refusal` fires because `/mcp`'s `SymForgeServer::new` has `daemon_client=None`); the real gaps were the missing regression lock (now `tests/serve_http_attach.rs`) + the message not naming the `/mcp` transport (now fixed). NO new refusal logic. D16's silent-wrong half is CONTAINED; the ROOT (per-connection `/mcp` session) stays tracked-large. Owner 012.
 6. **B2** — DONE (012e, merged PR #369): LAZY re-intern/force-replace of the stale cross-project base on the read path → **D12 FIXED**. Full CI green, unanimous adversarial review, real-watcher live daemon-HTTP SC-1/SC-2 proof. Owner 012.
 
-**NEXT frontier** (after 012e): the remaining Culprit-B engine items — **D15** overlay-WRITER (the real root behind read-path coherence; the read-flip alone is a no-op — see the phased plan) and **D-B0** per-view derived index for non-empty overlays — both blocked-on the cross-project-WRITE track; plus **D16-full** (`/mcp` per-connection daemon session). Owner 012.
+**NEXT frontier** (after 012f overlay-redundancy decision): **D13** (Culprit D — `parsing/xref.rs` value/constructor/struct-literal recall) is the #1 OPEN trust defect and the real frontier — line-pinned, reproduced FIELD evidence of a silent wrong answer on "who uses X", NOT view/overlay-dependent. **D18/R3** (loud not-found on missing symbol) is #2 (small guard, high impact). The overlay/IndexView track is PARKED: **D15** is a DORMANT SEAM (writer kept, redundant read removed), **D-B0** is MOOT until precondition #1 (a real overlay writer) lands — neither is built under the single shared live index. **D16-full** (`/mcp` per-connection daemon session) stays tracked-large. Owner 012. Decision: `docs/reviews/overlay-redundancy-decision.md`.
 
 A2 (`Figure` provenance enum) = DEMOTED to regression-guard (envelope already honest); low priority, owner 012.
 
 Tracked-LARGE (OPEN, real owner + blocked-on — NOT euphemized):
-- **D-B0** per-view derived index for non-empty overlays (K-delta trigram merge) — owner 012, blocked-on: cross-project-write track.
-- **D15** overlay edits in ordinary reads — owner 012, blocked-on: a production single-project overlay-WRITER (the real root; the read-path flip alone is a no-op byte-identical parity refactor — investigation 012e). Phased migration plan: `docs/reviews/D15-readpath-coherence-migration-plan.md`.
+- **D-B0** per-view derived index for non-empty overlays (K-delta trigram merge) — owner 012, **MOOT under single-shared-index; BLOCKED on precondition #1 (a real overlay WRITER — write-to-overlay-not-base). Do not build until that lands. DECOUPLED from D13.** See `docs/reviews/overlay-redundancy-decision.md`.
+- **D15** overlay edits in ordinary reads — owner 012, **DORMANT SEAM:** writer landed (PR #372) and KEPT (gated None, byte-identical) as a 012-spec seam; the redundant overlay READ was REMOVED (012f); read-migration Phases 2-5 PAUSED. Path to load-bearing = precondition #1 (commit-gated edits) + D16 + D-B0. See `docs/reviews/overlay-redundancy-decision.md`; phased plan (paused): `docs/reviews/D15-readpath-coherence-migration-plan.md`.
 - **bases-table orphan GC** (tracked-MINOR, pre-existing, surfaced by the B2 review): the per-daemon `bases` intern table has no removal path; a genuine git-commit advance mints a NEW `BaseKey` and orphans the old key's `Arc` (unbounded only over a very-long-lived MULTI-COMMIT session; the common no-commit watcher path force-replaces the SAME key, so no growth). NOT a B2 regression (identical to pre-existing `intern_base`/retarget behavior). Owner 012, low priority.
 - **D16** `/mcp` per-connection daemon session (the ROOT; silent-wrong half already CONTAINED by C-stopgap/012d) — owner 012, blocked-on: stateful-mode substrate + parity re-test.
-- **D13** xref recall ~29% (now: `parsing/xref.rs` extraction defect) — owner: recall/8.1 program.
+- **D13** xref recall ~29% (`parsing/xref.rs` extraction defect — Culprit D, reclassified out of Culprit B 2026-06-24) — **#1 OPEN trust defect / the real frontier**, NOT view/overlay-dependent. Owner: recall/8.1 program.
 - **D2** gate decides on estimated economics for non-read routes — owner 013, blocked-on: grounding extension to search routes.
 - **D5/D6** false "VALIDATED"/"95% trajectory" claims — doc demotion, owner 012.
