@@ -2397,13 +2397,22 @@ impl LiveIndex {
 
             // D13 recall: qualified-call construction sites (`Foo::new()`,
             // `Foo::default()`, C++ `Foo::method()`) are keyed in `reverse_index`
-            // under the leaf segment (`new`), not the type head (`Foo`). They DO
-            // retain the full `qualified_name` (`Foo::new`), so also match any ref
-            // whose qualified-name HEAD segment == `name`. This closes the
-            // constructor class for ALL types at once, for every grammar that
-            // emits a qualified_name. Struct/composite literals already land under
-            // the head via the unscoped `(type_identifier)` capture, so they need
-            // nothing here.
+            // under the leaf segment (`new`), not the qualifier (`Foo`). They DO
+            // retain the full `qualified_name` (`Foo::new`, `a::b::Foo::new`), so
+            // also match any ref whose IMMEDIATE QUALIFIER (the segment directly
+            // before the leaf) == `name`. So `find_references(X)` surfaces every
+            // qualified-call site where X is the immediate qualifier of the call,
+            // at any path depth: `X::method()`, `a::b::X::method()`,
+            // `Color::Red`. Struct/composite literals already land under the head
+            // via the unscoped `(type_identifier)` capture, so they need nothing
+            // here.
+            //
+            // Limitation: it matches the IMMEDIATE qualifier only. In
+            // `X::Inner::method()` the immediate qualifier is `Inner`, so the
+            // site is recalled by `find_references("Inner")`, NOT
+            // `find_references("X")` (X is an outer module/type, not the
+            // call's receiver). This is the correct receiver-of-the-call
+            // semantics, not a recall gap for the constructed type.
             // ponytail: O(all refs) scan, mirroring the qualified branch above; an
             // explicit head index would make it O(1) if find_references is ever hot.
             //
@@ -2429,7 +2438,20 @@ impl LiveIndex {
                     let Some(qn) = reference.qualified_name.as_deref() else {
                         continue;
                     };
-                    let head = qn.split(['.', ':']).next().unwrap_or(qn).trim();
+                    // Immediate qualifier = the segment right before the leaf.
+                    // Split on `.`/`:`, drop empties (Rust/C++ `::` yields an
+                    // empty between the colons), and take the second-to-last
+                    // segment; single-segment names use themselves.
+                    let segs: Vec<&str> = qn
+                        .split(['.', ':'])
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let head = match segs.len() {
+                        0 => continue,
+                        1 => segs[0],
+                        n => segs[n - 2],
+                    };
                     if head != name || reference.name == name {
                         // `reference.name == name` was already covered by the
                         // reverse-index hit above; skip to avoid duplicates.
@@ -5306,6 +5328,72 @@ impl Actor for MyActor {
             results[0].1.qualified_name.as_deref(),
             Some("MinimalFilter::new")
         );
+    }
+
+    /// Path-qualified construction recall: `a::b::Widget::new()` is keyed under
+    /// the leaf "new" with qn "a::b::Widget::new". The immediate qualifier is
+    /// "Widget", so `find_references("Widget")` must return it.
+    ///
+    /// Non-vacuity: the pre-fix first-segment head was "a" (qn.split.next),
+    /// which != "Widget", so this returned 0. The immediate-qualifier head is
+    /// the second-to-last non-empty segment ("Widget"), so it now returns 1.
+    #[test]
+    fn test_d13_path_qualified_construction_recall() {
+        let refs = vec![make_ref(
+            "new",
+            Some("a::b::Widget::new"),
+            ReferenceKind::Call,
+            None,
+            0,
+        )];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("Widget", None, false);
+        assert_eq!(
+            results.len(),
+            1,
+            "path-qualified a::b::Widget::new() must be recalled by find_references(Widget); got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results[0].1.qualified_name.as_deref(),
+            Some("a::b::Widget::new")
+        );
+    }
+
+    /// Precision lock: intermediate path segments ("a", "b") must NOT head-match
+    /// `a::b::Widget::new()`. Only the immediate qualifier "Widget" does. The
+    /// pre-fix first-segment head WOULD have matched "a" (a false positive that
+    /// labels a module path component as the call receiver).
+    #[test]
+    fn test_d13_path_qualified_no_false_positive_from_intermediate_segments() {
+        let refs = vec![make_ref(
+            "new",
+            Some("a::b::Widget::new"),
+            ReferenceKind::Call,
+            None,
+            0,
+        )];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        for seg in ["a", "b"] {
+            let results = index.find_references_for_name(seg, None, false);
+            assert!(
+                results
+                    .iter()
+                    .all(|(_, r)| r.qualified_name.as_deref() != Some("a::b::Widget::new")),
+                "intermediate segment {seg:?} must not head-match a::b::Widget::new(); got: {:?}",
+                results
+                    .iter()
+                    .map(|(_, r)| &r.qualified_name)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Head-match must NOT pull in `Implements` refs. `impl Trait for MyStruct`
