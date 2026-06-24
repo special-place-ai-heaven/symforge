@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "8.9.0"
+version = "8.9.1"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"

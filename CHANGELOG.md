@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.0...v8.9.1) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f:** remove redundant D15 overlay read; mark writer as dormant seam ([5070f14](https://github.com/special-place-ai-heaven/symforge/commit/5070f14df182b810f4182f84975deb8586b44f42))
+
 ## [8.9.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.4...v8.9.0) (2026-06-24)
 
 
