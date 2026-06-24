@@ -227,6 +227,17 @@ impl UpdateOps for RealUpdateOps {
             stopped.push(sidecar);
         }
 
+        // Stop every OTHER symforge process running from the SAME executable path
+        // as this one — the binary npm is about to overwrite. On Windows a live
+        // holder keeps an exclusive image handle and blocks the swap (EBUSY), so
+        // clearing the holders BEFORE npm runs is what lets the swap proceed. The
+        // set is scoped by ExecutablePath (never by image name) and excludes THIS
+        // process, so unrelated installs at other paths are never touched
+        // (SELF_UPDATE_PROCEDURE.md, Invariant 1).
+        for line in stop_other_inscope_holders() {
+            stopped.push(line);
+        }
+
         if stopped.is_empty() {
             "no running daemon found".to_string()
         } else {
@@ -388,13 +399,39 @@ pub(crate) fn orchestrate_update(
         .collect();
 
     if !ops.npm_install(program, &args)? {
-        bail!(
-            "symforge update failed: `{}` exited unsuccessfully.\n\
-             On Windows this is usually a running symforge or MCP client (Cursor, Claude) \
-             holding the binary (EBUSY). Close your MCP clients and rerun `symforge update`. \
-             (The version registry was already pruned.)",
-            invocation_text(program, &args)
-        );
+        // Any OTHER in-scope holders were already stopped in `stop_processes`
+        // (their count, if any were found, was printed above). The message stays
+        // honest when enumeration found/stopped nothing: it does NOT assert "all
+        // holders were stopped", and the closing hint covers an un-enumerable
+        // holder. The remediation runs from a PLAIN shell — not the `symforge`
+        // binary that self-locks on Windows.
+        let plain_cmd = format!("npm install -g {}", specs.join(" "));
+        let init_cmd = format!("{} init --client all", symforge_launcher());
+        if os == "windows" {
+            bail!(
+                "symforge update failed: `{}` exited unsuccessfully.\n\
+                 On Windows the `symforge update` process runs from the very binary npm \
+                 replaces and cannot overwrite a running .exe. Any OTHER in-scope holders \
+                 were stopped above (if any were found), so finish the swap from a PLAIN \
+                 shell (NOT via `symforge`):\n  {}\n\
+                 then re-point your MCP clients onto the new binary:\n  {}\n\
+                 If it STILL fails, an MCP client (Cursor, Claude) or another symforge \
+                 process is holding the binary — close them and rerun the command above.\n\
+                 (The version registry was already pruned.)",
+                invocation_text(program, &args),
+                plain_cmd,
+                init_cmd
+            );
+        } else {
+            bail!(
+                "symforge update failed: `{}` exited unsuccessfully.\n\
+                 Ensure no running symforge process is holding the binary, then rerun, or \
+                 install directly from a plain shell:\n  {}\n\
+                 (The version registry was already pruned.)",
+                invocation_text(program, &args),
+                plain_cmd
+            );
+        }
     }
 
     // Verify the install actually took effect. npm can report success while the
@@ -501,6 +538,189 @@ fn invocation_text(program: &str, args: &[&str]) -> String {
     parts.push(program.to_string());
     parts.extend(args.iter().map(|arg| (*arg).to_string()));
     parts.join(" ")
+}
+
+/// Normalize a Windows executable path for identity comparison: strip the
+/// extended-length verbatim prefix (`\\?\`), unify slashes, and lowercase. This
+/// path is Windows-only (a case-insensitive filesystem), so always lowercasing is
+/// correct AND keeps the comparison deterministic under cross-platform test
+/// builds. Mirrors the slash+lowercase normalization `daemon::stable_path_identity`
+/// applies, plus a verbatim-prefix strip so a `\\?\C:\..` `current_exe()` lines up
+/// with WMI's plain `C:\..` `ExecutablePath`.
+#[cfg(any(windows, test))]
+fn normalize_exe_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let stripped = trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed);
+    stripped.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Pure selection of the in-scope holder PIDs to stop before the npm swap. Given
+/// a snapshot of running symforge processes as `(pid, executable_path)`, returns
+/// the PIDs whose executable path identifies the SAME binary as `self_exe` (the
+/// binary npm will overwrite) EXCLUDING `self_pid` (this process). Paths are
+/// compared after [`normalize_exe_path`] (verbatim-strip + slash-unify +
+/// lowercase) so a divergent path FORM (extended-length prefix, slash style,
+/// casing) cannot silently skip a genuine holder. Scoping by executable PATH —
+/// never by image name — is Invariant 1 of `SELF_UPDATE_PROCEDURE.md`: an
+/// unrelated symforge install at a different path is never stopped.
+#[cfg(any(windows, test))]
+fn select_inscope_holder_pids(
+    processes: &[(u32, String)],
+    self_exe: &str,
+    self_pid: u32,
+) -> Vec<u32> {
+    let target = normalize_exe_path(self_exe);
+    processes
+        .iter()
+        .filter(|(pid, path)| *pid != self_pid && normalize_exe_path(path) == target)
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Parse the `"<pid>|<executable_path>"` lines emitted by the CIM process query
+/// into `(pid, path)` pairs. Malformed lines and rows with an empty path (access
+/// denied / system rows) are skipped. Pure, so parsing is unit-tested without
+/// spawning PowerShell.
+#[cfg(any(windows, test))]
+fn parse_symforge_process_lines(text: &str) -> Vec<(u32, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (pid, path) = line.trim().split_once('|')?;
+            let pid: u32 = pid.trim().parse().ok()?;
+            let path = path.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some((pid, path.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Stop every OTHER symforge process running from this process's own executable
+/// path (the binary npm will overwrite), graceful-then-forced, so the Windows
+/// image lock is released before the npm swap. Excludes this process. Returns a
+/// summary line when any holder was stopped.
+#[cfg(windows)]
+fn stop_other_inscope_holders() -> Vec<String> {
+    let Ok(self_exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let self_exe = self_exe.to_string_lossy().to_string();
+    let self_pid = std::process::id();
+
+    let snapshot = enumerate_symforge_processes();
+    let pids = select_inscope_holder_pids(&snapshot, &self_exe, self_pid);
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    for pid in &pids {
+        graceful_then_forced_stop(*pid);
+    }
+    vec![format!(
+        "{} other in-scope symforge holder(s) (pid {})",
+        pids.len(),
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+}
+
+/// Unix can replace a running binary's file (the open binary keeps the old inode
+/// while the path takes the new file), so there is no EBUSY holder lock to clear
+/// before the swap — the daemon stop in `stop_processes` is sufficient.
+#[cfg(not(windows))]
+fn stop_other_inscope_holders() -> Vec<String> {
+    Vec::new()
+}
+
+/// Enumerate every running `symforge.exe` as `(pid, executable_path)` via CIM
+/// (`ExecutablePath` is required to scope by path per Invariant 1; `tasklist`
+/// does not expose it). Tries Windows PowerShell (`powershell`, the 5.1 default)
+/// and falls back to PowerShell 7 (`pwsh`) when the former is not installed.
+/// Returns an empty list when neither shell can be spawned — a safe no-op that
+/// degrades to the staged-guidance bail rather than killing nothing silently.
+#[cfg(windows)]
+fn enumerate_symforge_processes() -> Vec<(u32, String)> {
+    let script = "Get-CimInstance Win32_Process -Filter \"name='symforge.exe'\" | \
+                  ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }";
+    for shell in ["powershell", "pwsh"] {
+        match crate::process_util::hidden_command(shell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            // The shell ran: trust its output (an empty list is a valid answer —
+            // genuinely no other holders — so do NOT retry the next shell).
+            Ok(out) => return parse_symforge_process_lines(&String::from_utf8_lossy(&out.stdout)),
+            // This shell is not installed: try the next one.
+            Err(_) => continue,
+        }
+    }
+    Vec::new()
+}
+
+/// Graceful stop (`taskkill /PID`, a WM_CLOSE that lets a daemon flush its index
+/// checkpoint), a short grace window, then a forced stop (`/F`) only if the
+/// process ignored the graceful close (Invariant 2: graceful before forced).
+#[cfg(windows)]
+fn graceful_then_forced_stop(pid: u32) {
+    use std::time::{Duration, Instant};
+
+    let _ = crate::process_util::hidden_command("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    // 5s grace window (matches SELF_UPDATE_PROCEDURE.md Step 3) so a daemon can
+    // flush its index checkpoint before a forced kill.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && process_is_alive(pid) {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // Forced only if it ignored the graceful close. `process_is_alive` re-confirms
+    // the pid is STILL a live symforge.exe, so a recycled pid (now owned by an
+    // unrelated process) is never force-killed.
+    if process_is_alive(pid) {
+        let _ = crate::process_util::hidden_command("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Whether `pid` is still running AND still a `symforge.exe`. The `tasklist`
+/// query filters server-side to that exact pid + image name and emits one CSV row
+/// (which echoes the pid as a quoted token) when alive, or "No tasks" otherwise.
+/// Constraining to `symforge.exe` means a recycled pid now owned by an unrelated
+/// process reads as NOT alive, so the forced-kill path never targets it.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    let needle = pid.to_string();
+    let output = crate::process_util::hidden_command("tasklist")
+        .args([
+            "/FI",
+            &format!("PID eq {pid}"),
+            "/FI",
+            "IMAGENAME eq symforge.exe",
+            "/NH",
+            "/FO",
+            "CSV",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(needle.as_str()),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -740,8 +960,15 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("exited unsuccessfully"), "{msg}");
-        // The new actionable hint for the Windows EBUSY (locked .exe) case.
-        assert!(msg.contains("Close your MCP clients"), "{msg}");
+        // The actionable hint: clear any holder, then the exact one-step install.
+        assert!(
+            msg.contains("Ensure no running symforge process is holding the binary"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("npm install -g symforge@latest symforge-linux-x64@latest"),
+            "{msg}"
+        );
         // The registry prune must run UNCONDITIONALLY and BEFORE the (blocked) swap,
         // so a blocked update still cleans cruft.
         assert_eq!(
@@ -755,6 +982,116 @@ mod tests {
         );
         assert!(!ops.reregistered_after_install);
         assert_eq!(ops.reconciled_with, None, "no reconcile on failed install");
+    }
+
+    #[test]
+    fn orchestrate_update_windows_failure_gives_staged_self_lock_guidance() {
+        // On Windows the remaining lock after stopping other holders is normally
+        // the update process's OWN binary. The failure must name that self-lock and
+        // give the exact one-step remediation for a plain shell — while staying
+        // HONEST about other holders (it must not claim it stopped all of them).
+        let mut ops = FakeOps {
+            install_result: false,
+            ..Default::default()
+        };
+
+        let err = orchestrate_update("windows", "x86_64", &mut ops)
+            .expect_err("a blocked Windows swap must fail with staged guidance");
+
+        let msg = err.to_string();
+        assert!(msg.contains("exited unsuccessfully"), "{msg}");
+        assert!(
+            msg.contains("running .exe") && msg.contains("PLAIN shell"),
+            "must name the self-lock + a plain-shell remediation: {msg}"
+        );
+        assert!(
+            msg.contains("npm install -g symforge@latest symforge-windows-x64@latest"),
+            "must print the exact install command: {msg}"
+        );
+        assert!(
+            msg.contains("init --client all"),
+            "must print the client re-registration step: {msg}"
+        );
+        // Honesty (M2): never claim ALL holders were stopped (enumeration may find
+        // or stop none), and always cover an un-enumerable holder (an MCP client).
+        assert!(
+            !msg.contains("All OTHER"),
+            "must not over-claim that all holders were stopped: {msg}"
+        );
+        assert!(
+            msg.contains("close them and rerun"),
+            "must cover an un-enumerated holder (MCP client) case: {msg}"
+        );
+        assert!(
+            !ops.reregistered_after_install,
+            "a blocked swap must not re-register clients"
+        );
+    }
+
+    #[test]
+    fn select_inscope_holder_pids_matches_same_path_excludes_self_and_other_installs() {
+        let procs = vec![
+            (100u32, r"C:\npm\symforge.exe".to_string()), // in scope
+            (200u32, r"C:\NPM\SYMFORGE.EXE".to_string()), // same path, case-insensitive -> in scope
+            (300u32, r"D:\other\symforge.exe".to_string()), // different install -> OUT of scope (Invariant 1)
+            (999u32, r"C:\npm\symforge.exe".to_string()),   // self -> excluded
+        ];
+        let pids = select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 999);
+        assert_eq!(
+            pids,
+            vec![100, 200],
+            "only OTHER processes at the same executable path are in scope"
+        );
+    }
+
+    #[test]
+    fn select_inscope_holder_pids_empty_when_only_self_runs() {
+        let procs = vec![(999u32, r"C:\npm\symforge.exe".to_string())];
+        assert!(
+            select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 999).is_empty(),
+            "nothing to stop when this process is the only holder"
+        );
+    }
+
+    #[test]
+    fn select_inscope_holder_pids_normalizes_slash_and_verbatim_path_forms() {
+        // M1: a genuine holder must be matched even when its path FORM differs from
+        // current_exe() — forward vs back slash, or the extended-length verbatim
+        // (\\?\) prefix that current_exe() can return on Windows.
+        let procs = vec![
+            (100u32, r"C:\npm\symforge.exe".to_string()), // back slashes
+            (200u32, "C:/npm/symforge.exe".to_string()),  // forward slashes
+            (300u32, r"\\?\C:\npm\symforge.exe".to_string()), // verbatim prefix
+            (400u32, r"C:\other\symforge.exe".to_string()), // different install -> excluded
+        ];
+        // self_exe given in the verbatim + upper-case form; all three same-binary
+        // rows (100/200/300) must still be selected, the different install excluded.
+        let pids = select_inscope_holder_pids(&procs, r"\\?\C:\NPM\symforge.exe", 999);
+        assert_eq!(
+            pids,
+            vec![100, 200, 300],
+            "path-form variants of the same binary are all in scope (M1)"
+        );
+    }
+
+    #[test]
+    fn parse_symforge_process_lines_parses_pid_path_and_skips_malformed() {
+        let text = "100|C:\\npm\\symforge.exe\r\n\
+                    200|C:\\other\\symforge.exe\n\
+                    notapid|C:\\x\\symforge.exe\n\
+                    300|\n\
+                    \n\
+                    400|C:\\a b\\symforge.exe";
+        let parsed = parse_symforge_process_lines(text);
+        assert_eq!(
+            parsed,
+            vec![
+                (100, "C:\\npm\\symforge.exe".to_string()),
+                (200, "C:\\other\\symforge.exe".to_string()),
+                (400, "C:\\a b\\symforge.exe".to_string()),
+            ],
+            "malformed pid, empty path, and blank lines are skipped"
+        );
     }
 
     #[test]
