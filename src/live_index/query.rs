@@ -2425,13 +2425,20 @@ impl LiveIndex {
                 results.iter().map(|(p, r)| (*p, r.byte_range)).collect();
             for (file_path, file) in &self.files {
                 for reference in &file.references {
-                    // Implements refs carry qualified_name = the bare implementor
-                    // type (`impl Trait for Foo` => name="Trait", qn="Foo") with a
-                    // byte_range pointing at the TRAIT token, not the type head. A
-                    // head-match on those would add a same-line entry pointing at the
-                    // wrong token. The implementor is already discoverable as its own
-                    // `type_identifier` TypeUsage ref, so skip Implements here; this
-                    // branch is for qualified CALLS only.
+                    // Skip Implements refs: `impl Trait for Foo` carries
+                    // name="Trait", qualified_name="Foo" with a byte_range at the
+                    // TRAIT token, so a head-match would add a same-line entry
+                    // pointing at the WRONG token (the implementor is already found
+                    // as its own `type_identifier` ref). Other multi-segment-qn
+                    // kinds DO flow through this branch, not calls only: imports
+                    // (`use a::b::C`) and type usages also head-match on their
+                    // immediate qualifier (e.g. `find_references("collections")`
+                    // surfaces `use std::collections::HashMap`). That is
+                    // count-neutral vs the prior first-segment match (one head
+                    // either way) and a defensible "who uses <segment>" result,
+                    // though its byte_range points at the leaf token. Tracked as a
+                    // minor head-match noise class in the defect ledger; tighten by
+                    // gating to call kinds if it ever matters.
                     if reference.kind == ReferenceKind::Implements {
                         continue;
                     }
