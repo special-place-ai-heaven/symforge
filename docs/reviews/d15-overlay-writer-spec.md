@@ -1,9 +1,20 @@
 # D15 Overlay-WRITER — Mini-Spec (CORRECTED v2)
 
+> **SUPERSEDED (2026-06-24, post-merge).** The single-project overlay READ this
+> spec describes (get_symbol serving overlay content as "read-your-writes",
+> sections C4 / objective / C1) was REMOVED in `fix/012f-overlay-redundancy`: it
+> is redundant (the shared live index already holds the edit via
+> `reindex_after_write`) and carried a narrow staleness shadow risk. The overlay
+> WRITER is kept as a dormant 012-spec seam with no production read consumer.
+> See `docs/reviews/overlay-redundancy-decision.md` for the verified finding and
+> disposition. This document is retained as the historical write-seam design;
+> treat any read-path claim below as HISTORICAL, not current behavior.
+
 **Date:** 2026-06-24
-**Status:** REDESIGN — supersedes the prior NEEDS_REDESIGN draft. Two flaws fixed:
-the CRACK (Attack 4, project_id vs project_name key) and the FATAL (Attack 6,
-shared-server overlay leak / false-success).
+**Status:** SUPERSEDED — write-seam landed (dormant); the single-project overlay
+READ was removed (redundant + staleness). Originally a REDESIGN of the prior
+NEEDS_REDESIGN draft (fixed the CRACK — Attack 4, project_id vs project_name key —
+and the FATAL — Attack 6, shared-server overlay leak / false-success).
 **Owner:** 012
 
 ---
