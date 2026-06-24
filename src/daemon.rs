@@ -806,8 +806,9 @@ impl DaemonState {
         // clone of the SAME map Arc, so the map value's `strong_count == 1` iff no
         // live consumer references it. Retain everything still referenced; drop the
         // orphans. No `Weak<IndexBase>` exists and no other Arc<IndexBase> holder
-        // exists, so the count is exact. This is the ONLY path that orphans a base
-        // (the no-commit watcher path force-replaces the SAME key — no orphan).
+        // exists, so the count is exact. Commit-advance is ONE orphan source; the
+        // other is the last session on a BaseKey closing (swept in close_session).
+        // The no-commit watcher path force-replaces the SAME key — no orphan.
         // ponytail: full-map retain is O(bases); fine — table is tiny per daemon.
         // Add a threshold only if base count ever grows large.
         self.gc_orphaned_bases();
@@ -1043,6 +1044,19 @@ impl DaemonState {
         }
 
         let session = self.sessions.write().remove(session_id)?;
+        // Take only what the response needs, then DROP the rest of the session —
+        // critically its `working_set`, which holds the `Arc<IndexBase>` clones.
+        // The GC below relies on those being released first; keeping `session`
+        // live across the sweep would keep its bases at strong_count >= 2 and
+        // defeat the reclaim (the base would never look orphaned).
+        let closed_session_id = session.session_id.clone();
+        drop(session);
+
+        // If this was the last session on a BaseKey, that map value is now a
+        // map-only orphan (strong_count == 1) — the same unbounded-growth defect
+        // class as commit-advance, via a parallel path. Sweep it. LOCK ORDER safe:
+        // `gc_orphaned_bases` takes ONLY `bases.write()`, no other map lock held.
+        self.gc_orphaned_bases();
 
         // If the session referenced no project, or its active project was already
         // gone (e.g. concurrent reassignment), report an orphan close — the
@@ -1053,7 +1067,7 @@ impl DaemonState {
         };
 
         Some(CloseSessionResponse {
-            session_id: session.session_id,
+            session_id: closed_session_id,
             project_id,
             remaining_sessions: active_remaining,
             project_removed: active_removed,
@@ -4346,6 +4360,44 @@ mod tests {
         assert!(
             Arc::ptr_eq(table_live, &entry.base),
             "SC-002: survivor is the same shared Arc the working set holds"
+        );
+    }
+
+    // ── Feature 012f — close_session sweeps last-holder orphans (the parallel
+    //    orphan path the commit-advance trigger misses) ─────────────────────────
+    //
+    // Opening the only session on a root interns its base (map + working-set =
+    // strong_count 2). Closing that last session drops the working_set, leaving
+    // the base map-only — an orphan the GC must reclaim from close_session.
+    #[test]
+    fn test_close_last_session_gcs_orphaned_base() {
+        let project = project_dir("symforge-daemon-close-gc");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: None,
+            })
+            .expect("session");
+
+        // Precondition: the open interned exactly one base, held by map + session.
+        assert_eq!(
+            state.bases.read().len(),
+            1,
+            "open interns one base for the root"
+        );
+
+        state
+            .close_session(&opened.session_id)
+            .expect("close the only session");
+
+        // The last (only) session closed -> its working_set dropped -> the base is
+        // a map-only orphan -> close_session's GC sweep reclaims it.
+        assert_eq!(
+            state.bases.read().len(),
+            0,
+            "close_session must GC the base no session references anymore"
         );
     }
 
