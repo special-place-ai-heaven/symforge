@@ -4379,6 +4379,78 @@ mod tests {
         );
     }
 
+    /// Regression: an overlay upsert is a read-your-writes bridge, not a permanent
+    /// shadow of the live index. If the same file changes again and the live index
+    /// advances, the same session must not keep returning the stale overlay body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_d15_overlay_does_not_shadow_newer_live_index() {
+        let project = project_dir("symforge-d15-stale");
+        let rel = write_overlay_fixture(&project, "src/lib.rs", "pub fn target() -> u32 { 1 }\n");
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(1),
+            })
+            .expect("open session");
+
+        let runtime_edit = state.session_runtime(&opened.session_id).expect("runtime");
+        execute_tool_call(
+            runtime_edit,
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "new_body": "pub fn target() -> u32 { 999 }",
+            }),
+        )
+        .await
+        .expect("replace_symbol_body dispatch");
+        assert!(
+            session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "overlay must carry the edit before the external update"
+        );
+
+        let external_content = b"pub fn target() -> u32 { 123 }\n";
+        let abs = project.path().join(&rel);
+        std::fs::write(&abs, external_content).expect("external write");
+        let runtime_reindex = state
+            .session_runtime(&opened.session_id)
+            .expect("runtime 2");
+        crate::protocol::edit::reindex_after_write(
+            &runtime_reindex.index,
+            &abs,
+            &rel,
+            external_content,
+            crate::domain::LanguageId::Rust,
+        );
+
+        let runtime_read = state
+            .session_runtime(&opened.session_id)
+            .expect("runtime 3");
+        let read_out = execute_tool_call(
+            runtime_read,
+            "get_symbol",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "force_refresh": true,
+            }),
+        )
+        .await
+        .expect("get_symbol dispatch");
+        assert!(
+            read_out.contains("123"),
+            "get_symbol must return the newer live-index body, got: {read_out}"
+        );
+        assert!(
+            !read_out.contains("999"),
+            "stale overlay body must not shadow the newer live index, got: {read_out}"
+        );
+    }
+
     /// AC5: no cross-session leak. Two sessions on the SAME project; edit in A;
     /// assert B's working set carries NO Upsert delta for the path (the FATAL fix
     /// / SC-003). B sees the base content via the shared index, but the OVERLAY
