@@ -3567,15 +3567,11 @@ impl SymForgeServer {
         }
 
         let file = {
-            // D15 overlay-WRITER read path: consult the session's per-project
-            // overlay FIRST (read-your-writes). `None` on the shared instance and
-            // in local-stdio mode → byte-identical fall-through to the base. The
-            // overlay `read()` is taken and DROPPED (the `and_then` closure returns)
-            // BEFORE `self.index.read()` on the miss path, so there is no
-            // index-lock / ws-lock nesting (I2), and no daemon-map lock is held (I1).
-            // Reading the delta map directly (not via `IndexView`) is deliberate: a
-            // stale overlay falls through to the base, which already holds the
-            // edit via reindex_after_write (I4).
+            // D15 overlay-WRITER read path: capture the session's per-project
+            // overlay before the live index, then only use it while it still
+            // matches the current live file. If a watcher or another writer has
+            // advanced the live index, the base wins so get_symbol does not pin
+            // this session to stale post-edit content.
             let overlay_hit = self.session_working_set.as_ref().and_then(|ov| {
                 let ws = ov.working_set.read();
                 let entry = ws.get(&ov.project_id)?;
@@ -3584,13 +3580,19 @@ impl SymForgeServer {
                     crate::live_index::view::FileDelta::Tombstone => None,
                 }
             });
+            let guard = self.index.read();
+            loading_guard!(guard);
+            let base = guard.capture_shared_file(&params.0.path);
             match overlay_hit {
-                Some(f) => Some(f),
-                None => {
-                    let guard = self.index.read();
-                    loading_guard!(guard);
-                    guard.capture_shared_file(&params.0.path)
+                Some(f)
+                    if base.as_ref().is_some_and(|current| {
+                        current.as_ref().content_hash.as_str() == f.as_ref().content_hash.as_str()
+                            && current.as_ref().byte_len == f.as_ref().byte_len
+                    }) =>
+                {
+                    Some(f)
                 }
+                _ => base,
             }
         };
 
