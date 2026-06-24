@@ -208,6 +208,8 @@ pub struct SearchFilesInput {
     /// Default false -- personal sidecars rarely answer codebase path questions.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_personal_tooling: Option<bool>,
+    /// Optional relative path prefix scope, for example `src/` or `src/protocol`.
+    pub path_prefix: Option<String>,
 }
 
 /// Input for `find_references`.
@@ -301,7 +303,7 @@ pub(crate) fn parse_language_filter(input: Option<&str>) -> Result<Option<Langua
     })
 }
 
-fn normalize_path_prefix(input: Option<&str>) -> search::PathScope {
+pub(crate) fn normalize_path_prefix(input: Option<&str>) -> search::PathScope {
     let Some(prefix) = input.map(str::trim).filter(|prefix| !prefix.is_empty()) else {
         return search::PathScope::any();
     };

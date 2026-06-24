@@ -1270,6 +1270,7 @@ impl LiveIndex {
             coupling_context,
             true,
             true,
+            &PathScope::Any,
         )
     }
 
@@ -1279,6 +1280,10 @@ impl LiveIndex {
     /// for tests and internal callers. Public tool entry points should call this
     /// variant so advertised vendor/personal-tooling defaults apply before
     /// ranking and total-match counts are computed.
+    // ponytail: 8 positional args on one internal capture API; an options
+    // struct would be the upgrade if a 9th axis appears, but not worth the
+    // churn for one scope param.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture_search_files_view_with_noise(
         &self,
         query: &str,
@@ -1287,14 +1292,21 @@ impl LiveIndex {
         coupling_context: Option<(&str, &SearchFilesCouplingNeighbors)>,
         include_vendor: bool,
         include_personal_tooling: bool,
+        path_scope: &PathScope,
     ) -> SearchFilesView {
         let limit = limit.clamp(1, 50);
         let normalized_query = normalize_path_query(query);
         if normalized_query.is_empty() {
             return SearchFilesView::EmptyQuery;
         }
+        // `path_scope` mirrors the `path_scope` axis of `search_symbols`/`search_text`:
+        // it filters candidates BEFORE counting/limiting, so total_matches,
+        // overflow_count, and hits are all consistently scoped. Folding it into
+        // `path_allowed` reuses the one pre-count predicate every tier funnels
+        // through (strong/basename/prefix/loose/glob/metadata).
         let path_allowed = |path: &str| -> bool {
-            (include_vendor || !is_vendor_path(path))
+            path_scope.matches(path)
+                && (include_vendor || !is_vendor_path(path))
                 && (include_personal_tooling || !is_personal_tooling_path(path))
         };
 
@@ -3527,16 +3539,30 @@ mod tests {
         );
 
         // Default (vendor hidden): the vendored lockfile must NOT surface.
-        let hidden =
-            index.capture_search_files_view_with_noise("package-lock", 20, None, None, false, true);
+        let hidden = index.capture_search_files_view_with_noise(
+            "package-lock",
+            20,
+            None,
+            None,
+            false,
+            true,
+            &super::PathScope::Any,
+        );
         assert!(
             matches!(hidden, SearchFilesView::NotFound { .. }),
             "vendored Tier-2 path must be suppressed by default: {hidden:?}"
         );
 
         // include_vendor=true: now it surfaces as metadata-only.
-        let shown =
-            index.capture_search_files_view_with_noise("package-lock", 20, None, None, true, true);
+        let shown = index.capture_search_files_view_with_noise(
+            "package-lock",
+            20,
+            None,
+            None,
+            true,
+            true,
+            &super::PathScope::Any,
+        );
         match shown {
             SearchFilesView::Found { hits, .. } => {
                 assert_eq!(hits.len(), 1);
@@ -3914,6 +3940,7 @@ mod tests {
             Some(("wiki/notes.md", &neighbors)),
             true,
             false,
+            &super::PathScope::Any,
         );
 
         assert_eq!(

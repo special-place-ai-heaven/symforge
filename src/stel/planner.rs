@@ -126,9 +126,9 @@ pub fn classify_param_dispositions(
     } else {
         // `path` absent, or a route whose tool carries no path scope and no path
         // selector (so neither A1b's forwarding nor a target arg applies — e.g.
-        // `get_repo_map`, `context_inventory`, or `search_files`, which has no
-        // `path_prefix` field at all; tracked as D20): explicit NotApplicable,
-        // not a silent drop.
+        // `get_repo_map` or `context_inventory`): explicit NotApplicable, not a
+        // silent drop. (search_files now has a `path_prefix` field and is in
+        // PATH_PREFIX_FORWARD_TOOLS, so it routes via the branch above.)
         ParamDisposition::NotApplicable
     };
 
@@ -431,7 +431,8 @@ fn is_orient_query(lower: &str) -> bool {
 /// is a TARGET/selector (e.g. `get_file_content`, `find_references`) are
 /// intentionally excluded: there the target comes from the query, not a scope
 /// hint, so forwarding the caller's `path` would be wrong.
-const PATH_PREFIX_FORWARD_TOOLS: &[&str] = &["search_symbols", "search_text", "explore"];
+const PATH_PREFIX_FORWARD_TOOLS: &[&str] =
+    &["search_symbols", "search_text", "explore", "search_files"];
 
 /// A1b gated per-tool forwarding: thread the caller's `path` into each plan
 /// step's `path_prefix` arg where that tool accepts a path scope (and the caller
