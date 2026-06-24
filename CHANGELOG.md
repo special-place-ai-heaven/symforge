@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.8.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.3...v8.8.4) (2026-06-24)
+
+
+### Bug Fixes
+
+* **daemon:** cross-project reads stay fresh after watcher reindex (B2/D12) ([745313d](https://github.com/special-place-ai-heaven/symforge/commit/745313d2963cb3215633fec6daa2a572805cea9f))
+
 ## [8.8.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.2...v8.8.3) (2026-06-24)
 
 
