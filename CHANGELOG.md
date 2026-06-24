@@ -26,6 +26,15 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.1...v8.9.2) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d13:** address review -- C++ qualified-call recall + Implements precision + dedup guard ([f32c9d9](https://github.com/special-place-ai-heaven/symforge/commit/f32c9d91e480e83f7cf7c5616a79a8feaeda5fcc))
+* **012f/d13:** head-match the immediate qualifier (path-qualified recall) ([984d452](https://github.com/special-place-ai-heaven/symforge/commit/984d452656468675b6223697919ac8ff68db18a9))
+* **012f/d13:** xref recall -- match qualified-call type heads in find_references ([b4f6239](https://github.com/special-place-ai-heaven/symforge/commit/b4f62395cbbb0be79c52ab1fa9be61403b35c009))
+
 ## [8.9.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.0...v8.9.1) (2026-06-24)
 
 
