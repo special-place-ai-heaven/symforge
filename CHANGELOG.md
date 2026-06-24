@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.3...v8.9.4) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d20:** path_prefix scoping for search_files ([c2fd24e](https://github.com/special-place-ai-heaven/symforge/commit/c2fd24e2a4f9a5d440d1ee8bd350b91a5c0b0649))
+* **012f/d20:** thread search_files path_prefix into capture (pre-count scope) ([dc0e814](https://github.com/special-place-ai-heaven/symforge/commit/dc0e814b7bf1d4af827b5791683f0957ab79af18))
+
 ## [8.9.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.2...v8.9.3) (2026-06-24)
 
 
