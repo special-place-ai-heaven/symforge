@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.2...v8.9.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d18:** loud not-found for missing symbols in get_symbol ([17b750d](https://github.com/special-place-ai-heaven/symforge/commit/17b750d7a37ac65991c0a0439e3ce72dd351bbd2))
+
 ## [8.9.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.1...v8.9.2) (2026-06-24)
 
 
