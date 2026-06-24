@@ -794,6 +794,28 @@ impl SymForgeServer {
                 &new_content,
                 file.language.clone(),
             );
+            // D15 overlay-WRITER: also upsert the freshly parsed content into the
+            // session's per-project overlay so a subsequent single-mode get_symbol
+            // in the SAME session reads-your-writes. `None` on the shared instance
+            // and in local-stdio mode — byte-identical fall-through. The overlay
+            // lock is taken AFTER reindex_after_write returned (no index-lock
+            // nesting, I2) and while holding NO daemon-map lock (I1).
+            if let Some(ov) = &self.session_working_set
+                && let Some(parsed) = edit::parse_indexed_for_overlay(
+                    &resolved_path,
+                    &params.0.path,
+                    file.language.clone(),
+                )
+            {
+                let mut ws = ov.working_set.write();
+                if let Some(entry) = ws.get_mut(&ov.project_id) {
+                    entry.overlay.upsert(params.0.path.clone(), parsed);
+                }
+                // entry `None`: the active project was not seeded into this
+                // session's working set (a wiring bug — see spec stop_conditions).
+                // Best-effort: the base was already updated by reindex_after_write,
+                // so reads still see the edit via the base fall-through.
+            }
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let warnings = edit::detect_stale_references(

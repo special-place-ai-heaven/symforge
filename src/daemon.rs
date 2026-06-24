@@ -1446,7 +1446,21 @@ impl DaemonState {
             index: Arc::clone(&project.index),
             token_stats: Arc::clone(&project.token_stats),
             symbol_cache: Arc::clone(&project.symbol_cache),
-            server: project.server.clone(),
+            // D15 overlay-WRITER (Option 3, FATAL fix): set the per-session
+            // overlay handle on an OWNED clone of the shared server. `SymForgeServer`
+            // is `#[derive(Clone)]` with a plain `Option<SessionOverlay>` field, so
+            // this mutates only the local copy — `project.server` keeps `None`, and
+            // no overlay leaks across sessions (SC-003). The lookup key is the HASH
+            // `active_project_id` (CRACK fix), and the handle is the session's OWN
+            // `working_set` Arc.
+            server: {
+                let mut s = project.server.clone();
+                s.session_working_set = Some(crate::protocol::SessionOverlay {
+                    project_id: session.active_project_id.clone(),
+                    working_set: Arc::clone(&session.working_set),
+                });
+                s
+            },
             working_set: Arc::clone(&session.working_set),
         })
     }
@@ -4240,6 +4254,293 @@ mod tests {
         assert!(
             entry.overlay.is_valid_against(&entry.base),
             "seeded overlay must be fenced to its base"
+        );
+    }
+
+    // ── Feature 012f D15 overlay-WRITER tests ───────────────────────────────────
+    //
+    // These drive the REAL daemon dispatch path: `DaemonState::new()` ->
+    // `open_project_session` -> `session_runtime()` (the C2 wiring under test) ->
+    // `execute_tool_call`. A test that hand-built a `SymForgeServer` and set
+    // `session_working_set` directly would bypass C2 and be a false-green (AC1).
+
+    /// Write a project source file under `src/` and return the relative path.
+    fn write_overlay_fixture(dir: &TempDir, rel: &str, content: &str) -> String {
+        let abs = dir.path().join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent dir");
+        }
+        std::fs::write(&abs, content).expect("write fixture source");
+        rel.to_string()
+    }
+
+    /// Read the overlay `Upsert` delta (if any) for `rel_path` under a session's
+    /// own working set. Returns `true` when an `Upsert` delta is present.
+    fn session_overlay_has_upsert(state: &DaemonState, session_id: &str, rel_path: &str) -> bool {
+        let sessions = state.sessions.read();
+        let session = sessions.get(session_id).expect("session present");
+        let working_set = session.working_set.read();
+        let Some(entry) = working_set.get(&session.active_project_id) else {
+            return false;
+        };
+        matches!(
+            entry.overlay.deltas.get(rel_path),
+            Some(crate::live_index::view::FileDelta::Upsert(_))
+        )
+    }
+
+    /// AC1 + AC2: PRODUCTION-PATH read-your-writes through the real C2 wiring.
+    /// Edit a function via `execute_tool_call(replace_symbol_body)`, then read it
+    /// via `execute_tool_call(get_symbol)` in the SAME session and assert the
+    /// EDITED body is returned AND the overlay carries an `Upsert` delta for the
+    /// path (proves the read came from the overlay branch, not incidentally from
+    /// the base). The runtime is obtained from `session_runtime()`, so a `None`
+    /// field (C2 not wired) would leave the overlay empty and AC2 would FAIL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_d15_overlay_read_your_writes_via_execute_tool_call() {
+        let project = project_dir("symforge-d15-rww");
+        let rel = write_overlay_fixture(&project, "src/lib.rs", "pub fn target() -> u32 { 1 }\n");
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(1),
+            })
+            .expect("open session");
+
+        // Sanity: the seeded overlay starts empty (no Upsert yet).
+        assert!(
+            !session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "overlay must be empty before the edit"
+        );
+
+        // Prove C2 wiring is LIVE: the per-session runtime carries Some, while the
+        // shared instance keeps None.
+        let runtime_edit = state
+            .session_runtime(&opened.session_id)
+            .expect("session runtime");
+        assert!(
+            runtime_edit.server.session_working_set.is_some(),
+            "session_runtime() must set session_working_set (C2 wiring)"
+        );
+        {
+            let projects = state.projects.read();
+            let project_inst = projects.get(&opened.project_id).expect("project instance");
+            assert!(
+                project_inst.server.session_working_set.is_none(),
+                "shared project.server must stay None (no cross-session leak, SC-003)"
+            );
+        }
+
+        let edited_body = "pub fn target() -> u32 { 999 }";
+        let edit_out = execute_tool_call(
+            runtime_edit,
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "new_body": edited_body,
+            }),
+        )
+        .await
+        .expect("replace_symbol_body dispatch");
+        assert!(
+            !edit_out.contains("Error"),
+            "edit must succeed, got: {edit_out}"
+        );
+
+        // AC2: the overlay branch is live — an Upsert delta exists for the path.
+        assert!(
+            session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "overlay must carry an Upsert delta after the edit (AC2)"
+        );
+
+        // AC1: a fresh runtime in the SAME session reads-your-writes. force_refresh
+        // bypasses the session symbol cache so the overlay branch is genuinely hit.
+        let runtime_read = state
+            .session_runtime(&opened.session_id)
+            .expect("session runtime 2");
+        let read_out = execute_tool_call(
+            runtime_read,
+            "get_symbol",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "force_refresh": true,
+            }),
+        )
+        .await
+        .expect("get_symbol dispatch");
+        assert!(
+            read_out.contains("999"),
+            "get_symbol must return the EDITED body (read-your-writes), got: {read_out}"
+        );
+    }
+
+    /// AC5: no cross-session leak. Two sessions on the SAME project; edit in A;
+    /// assert B's working set carries NO Upsert delta for the path (the FATAL fix
+    /// / SC-003). B sees the base content via the shared index, but the OVERLAY
+    /// delta must never appear in B's per-session working set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_d15_overlay_no_cross_session_leak() {
+        let project = project_dir("symforge-d15-leak");
+        let rel = write_overlay_fixture(&project, "src/lib.rs", "pub fn shared() -> u32 { 1 }\n");
+
+        let state = DaemonState::new();
+        let session_a = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "session-a".to_string(),
+                pid: Some(1),
+            })
+            .expect("session a");
+        let session_b = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().join(".").display().to_string(),
+                client_name: "session-b".to_string(),
+                pid: Some(2),
+            })
+            .expect("session b");
+        assert_eq!(
+            session_a.project_id, session_b.project_id,
+            "both sessions share the same project"
+        );
+        assert_ne!(session_a.session_id, session_b.session_id);
+
+        let runtime_a = state
+            .session_runtime(&session_a.session_id)
+            .expect("runtime a");
+        execute_tool_call(
+            runtime_a,
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": rel,
+                "name": "shared",
+                "new_body": "pub fn shared() -> u32 { 777 }",
+            }),
+        )
+        .await
+        .expect("edit in session a");
+
+        // Session A's overlay HAS the upsert.
+        assert!(
+            session_overlay_has_upsert(&state, &session_a.session_id, &rel),
+            "session A overlay must carry the edit"
+        );
+        // Session B's overlay must NOT (the leak guard).
+        assert!(
+            !session_overlay_has_upsert(&state, &session_b.session_id, &rel),
+            "session B overlay must NOT see session A's edit (SC-003)"
+        );
+    }
+
+    /// AC6: partial-parse case. Edit one function, but leave a syntactically broken
+    /// region elsewhere in the file so the parse is partial. The overlay upsert
+    /// must still happen (PartialParse yields a valid IndexedFile, never an error),
+    /// and `get_symbol` for the cleanly-parsed edited symbol must return the edited
+    /// body. The fixture is NOT clean-parsing — it ends with a broken fragment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_d15_overlay_partial_parse_still_upserts() {
+        let project = project_dir("symforge-d15-partial");
+        // Two functions plus a trailing broken region. After editing `good`, the
+        // file still contains the broken tail, forcing a partial parse.
+        let rel = write_overlay_fixture(
+            &project,
+            "src/lib.rs",
+            "pub fn good() -> u32 { 1 }\n\nfn broken( {\n",
+        );
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(1),
+            })
+            .expect("open session");
+
+        let runtime_edit = state.session_runtime(&opened.session_id).expect("runtime");
+        let edit_out = execute_tool_call(
+            runtime_edit,
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": rel,
+                "name": "good",
+                "new_body": "pub fn good() -> u32 { 424242 }",
+            }),
+        )
+        .await
+        .expect("edit dispatch");
+        assert!(
+            !edit_out.contains("Error writing"),
+            "edit must commit despite the partial-parse tail, got: {edit_out}"
+        );
+
+        // The upsert must NOT be skipped just because the file partially failed.
+        assert!(
+            session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "overlay upsert must happen on a partial parse (AC6)"
+        );
+
+        let runtime_read = state
+            .session_runtime(&opened.session_id)
+            .expect("runtime 2");
+        let read_out = execute_tool_call(
+            runtime_read,
+            "get_symbol",
+            serde_json::json!({
+                "path": rel,
+                "name": "good",
+                "force_refresh": true,
+            }),
+        )
+        .await
+        .expect("read dispatch");
+        assert!(
+            read_out.contains("424242"),
+            "get_symbol must return the edited body of the cleanly-parsed symbol (AC6), got: {read_out}"
+        );
+    }
+
+    /// AC3 + AC4: local-stdio parity / unedited-file fall-through. With the field
+    /// `None` (a bare in-process server — the local-stdio shape), `get_symbol`
+    /// falls through to the base unchanged. Drives the SAME `get_symbol` method
+    /// the daemon path uses, proving the `None` branch is byte-identical.
+    #[tokio::test]
+    async fn test_d15_overlay_none_falls_through_to_base() {
+        let project = project_dir("symforge-d15-none");
+        let rel =
+            write_overlay_fixture(&project, "src/lib.rs", "pub fn base_only() -> u32 { 55 }\n");
+
+        // Build a real local index over the fixture, then a server with the field
+        // left at its `None` default (local-stdio shape).
+        let index = crate::live_index::LiveIndex::load(project.path()).expect("load index");
+        let server = crate::protocol::SymForgeServer::new(
+            index,
+            "d15-none".to_string(),
+            Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(project.path().to_path_buf()),
+            None,
+        );
+        assert!(
+            server.session_working_set.is_none(),
+            "default server must have a None overlay (local-stdio parity)"
+        );
+
+        let input: GetSymbolInput = serde_json::from_value(serde_json::json!({
+            "path": rel,
+            "name": "base_only",
+            "force_refresh": true,
+        }))
+        .expect("decode get_symbol input");
+        let out = server.get_symbol(Parameters(input)).await;
+        assert!(
+            out.contains("55"),
+            "None overlay must fall through to the base (AC3/AC4), got: {out}"
         );
     }
 
