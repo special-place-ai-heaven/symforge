@@ -19,6 +19,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::live_index::store::LiveIndex;
 use crate::live_index::view::{BaseKey, CommitId, IndexBase, Targets, WorkingSet};
 use crate::live_index::{self, SharedIndex};
 use crate::paths;
@@ -125,9 +126,11 @@ pub struct DaemonState {
     /// Per-daemon base intern table (Feature 012). Equal `(canonical_root,
     /// commit)` keys MUST share ONE `Arc<IndexBase>` (SC-002): `intern_base`
     /// returns the existing Arc on a key hit and only mints a new base (drawing a
-    /// generation from `base_generation_seq`) on a miss. Phase 0/1: populated on
-    /// project load/activate and seeded into per-session working sets, but no
-    /// query route reads it yet (cross-project routing is Phase 2/3).
+    /// generation from `base_generation_seq`) on a miss. Populated on project
+    /// load/activate and seeded into per-session working sets; the cross-project
+    /// read route reads those bases and `intern_base_refresh` FORCE-REPLACES the
+    /// value for a key when a watched change has advanced the project's published
+    /// index (B2/D12) — still one Arc per `BaseKey` (SC-002).
     bases: RwLock<HashMap<BaseKey, Arc<IndexBase>>>,
     /// Monotonic source of `base_generation` fence tokens, minted only when
     /// `intern_base` publishes a NEW base. Starts at 1; a shared (interned) base
@@ -186,10 +189,13 @@ struct SessionRecord {
     /// active/bound one; for Phase 0/1 it is the sole project, byte-for-byte the
     /// prior `project_id`.
     active_project_id: String,
-    /// Per-session copy-on-write working set (Feature 012, Phase 1). Seeded on
-    /// open with a SINGLE entry — the active project + its interned shared base +
-    /// an EMPTY overlay — and INERT: no query route reads it yet (Phase 2/3) and
-    /// NO code path writes into its overlay (the no-overlay-writes invariant that
+    /// Per-session copy-on-write working set (Feature 012). Seeded on open with a
+    /// SINGLE entry — the active project + its interned shared base + an EMPTY
+    /// overlay — and grown by additive opens. The CROSS-PROJECT read route reads
+    /// it (Phase 3) and LAZILY REFRESHES each targeted entry's base when the
+    /// project's published index has advanced (B2/D12,
+    /// `refresh_working_set_bases`); the single-active path never touches it. NO
+    /// code path writes into its overlay (the no-overlay-writes invariant that
     /// keeps Principle I airtight). `Arc<RwLock>` is mandatory: `SessionRecord` is
     /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
     /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
@@ -580,11 +586,14 @@ struct SessionRuntime {
     server: SymForgeServer,
     /// Feature 012 (Phase 3): the session's working set, shared by `Arc` so the
     /// cross-project read route (`search_symbols`/`search_text`/`find_references`
-    /// with `project`/`projects`) can read the open projects directly. The single
-    /// active-project path NEVER reads this (it dispatches to `server` as before),
-    /// so single-project behavior is byte-identical. No overlay is written. The
-    /// active project's id for the targeting contract is `project_id` above (the
-    /// default target when neither `project` nor `projects` is supplied).
+    /// with `project`/`projects`) can read the open projects directly AND lazily
+    /// refresh each targeted base when the project's published index has advanced
+    /// (B2/D12, `DaemonState::refresh_working_set_bases`, called from
+    /// `call_tool_handler` before the read). The single active-project path NEVER
+    /// reads or refreshes this (it dispatches to `server` as before), so
+    /// single-project behavior is byte-identical and frecency-neutral. No overlay
+    /// is written. The active project's id for the targeting contract is
+    /// `project_id` above (the default target when neither param is supplied).
     working_set: Arc<RwLock<WorkingSet>>,
 }
 
@@ -645,6 +654,29 @@ impl DaemonState {
         published
     }
 
+    /// FORCE-REPLACE the interned base for `candidate`'s [`BaseKey`] with a
+    /// freshly-stamped base wrapping `candidate`'s (current) snapshot — the B2/D12
+    /// refresh primitive. Unlike [`DaemonState::intern_base`], it does NOT return
+    /// the cached Arc on a key hit: a watcher reindex keeps `BaseKey=(root,commit)`
+    /// unchanged (no commit advance), so the plain intern would CACHE-HIT and hand
+    /// back the STALE `Arc<LiveIndex>`. This always re-stamps a new monotonic
+    /// `base_generation` and overwrites the map VALUE for the key, so SC-002 holds
+    /// (exactly ONE `Arc<IndexBase>` per `BaseKey` after the replace — the value is
+    /// replaced, never duplicated).
+    ///
+    /// LOCK ORDER: acquires ONLY `bases` (top of `bases -> projects -> sessions`),
+    /// like `intern_base`. Never call while holding `projects`/`sessions`.
+    fn intern_base_refresh(&self, candidate: Arc<IndexBase>) -> Arc<IndexBase> {
+        let mut bases = self.bases.write();
+        let generation = self.base_generation_seq.fetch_add(1, Ordering::Relaxed);
+        let mut published = (*candidate).clone();
+        published.base_generation = generation;
+        let published = Arc::new(published);
+        // Overwrite (not insert-if-absent): one Arc per BaseKey is preserved.
+        bases.insert(published.key.clone(), Arc::clone(&published));
+        published
+    }
+
     /// Intern the base for `project_id` if the project is currently loaded
     /// (Feature 012, Phase 0). Reads the project under `projects.read()` to build
     /// the candidate base, releases that lock, then interns under `bases.write()`.
@@ -661,6 +693,109 @@ impl DaemonState {
             projects.get(project_id).map(ProjectInstance::base)
         }; // projects read guard dropped here, before bases.write() below
         candidate.map(|candidate| self.intern_base(candidate))
+    }
+
+    /// B2/D12 freshness refresh: lazily re-intern + replace the working-set base
+    /// for every TARGETED project whose interned snapshot has gone stale relative
+    /// to the project's CURRENT published index, BEFORE a cross-project read.
+    ///
+    /// THE DEFECT it closes: a working-set entry holds an `Arc<IndexBase>` captured
+    /// at open time. The watcher swaps a NEW `Arc<LiveIndex>` into the project's
+    /// `ArcSwap` on every observed change, but a watcher edit does NOT change the
+    /// git commit, so the `BaseKey=(root,commit)` is unchanged and the interned
+    /// base is never refreshed — cross-project reads go stale after any watched
+    /// change. This re-captures the current snapshot on the next cross-project read.
+    ///
+    /// FRESHNESS SIGNAL: `Arc::ptr_eq(&project.index.read(), &entry.base.index)`.
+    /// Every publish does `live.store(Arc::new(..))`, so a changed pointer means
+    /// the published index advanced. HONEST LIMITATION: this OVER-triggers on
+    /// mtime-only touches (`touch_mtime` stores a fresh `Arc<LiveIndex>` without
+    /// bumping published state), so a touch that changed no symbols can still cause
+    /// one spurious re-intern. That is SAFE — it re-captures an equal-or-fresher
+    /// snapshot — and merely mild churn on the rare cross-project read path; it is
+    /// NOT an exact signal. (Upgrade path if churn ever matters: compare a
+    /// `published_state().generation` stamped into `IndexBase`; not taken now.)
+    ///
+    /// MISMATCH-GATED: the warm path takes NO write lock. It snapshots the targeted
+    /// entries' base pointers under `working_set.read()`, compares them under
+    /// `projects.read()`, and returns early if all are fresh. Only when ≥1 entry is
+    /// stale does it intern fresh bases and take `working_set.write()`.
+    ///
+    /// LOCK ORDER (`bases -> projects -> sessions`; `working_set` is outside the
+    /// hierarchy, never held across a daemon-map lock): snapshot under
+    /// `working_set.read()` -> drop; compare + build candidates under
+    /// `projects.read()` -> drop; `intern_base_refresh` under `bases.write()` ->
+    /// drop; finally `working_set.write()` with NO daemon-map lock held — the same
+    /// intern-then-`working_set.add` sequence the retarget/additive paths use.
+    ///
+    /// SC-002 preserved: `intern_base_refresh` REPLACES the map value for the key
+    /// (one Arc per `BaseKey`). FRECENCY-NEUTRAL: no edit-commit hook fires on this
+    /// read path. `working_set.add` re-attaches a fresh empty overlay fenced to the
+    /// new base, so no `StaleOverlay` skip (US1 overlays are empty).
+    fn refresh_working_set_bases(&self, working_set: &Arc<RwLock<WorkingSet>>, targets: &Targets) {
+        // (1) Snapshot the targeted entries' (project_id, base-index Arc) under the
+        // session's own working_set read lock, then DROP it before any daemon lock.
+        let targeted: Vec<(String, Arc<LiveIndex>)> = {
+            let ws = working_set.read();
+            ws.iter()
+                .filter(|entry| targets_selects(targets, &entry.project_id))
+                .map(|entry| (entry.project_id.clone(), Arc::clone(&entry.base.index)))
+                .collect()
+        };
+        if targeted.is_empty() {
+            return;
+        }
+
+        // (2) Build fresh candidate bases ONLY for entries whose interned index Arc
+        // no longer matches the project's current published index (ptr_eq). Compare
+        // and snapshot each `(project_id, candidate)` under one `projects.read()`,
+        // then drop it. The project_id is carried through because a `BaseKey` keys
+        // on `(canonical_root, commit)`, NOT the working-set project id.
+        let stale: Vec<(String, Arc<IndexBase>)> = {
+            let projects = self.projects.read();
+            targeted
+                .iter()
+                .filter_map(|(project_id, entry_index)| {
+                    let project = projects.get(project_id)?;
+                    // `read()` yields an arc_swap Guard derefing to the current
+                    // `Arc<LiveIndex>`; `&current` deref-coerces to the
+                    // `&Arc<LiveIndex>` ptr_eq wants (as `base()` does for clone).
+                    // Every publish stores a fresh Arc, so an equal pointer means
+                    // the published index has not advanced since intern.
+                    let current = project.index.read();
+                    if Arc::ptr_eq(&current, entry_index) {
+                        None // fresh — no re-intern
+                    } else {
+                        // candidate wrapping the current snapshot
+                        Some((project_id.clone(), project.base()))
+                    }
+                })
+                .collect()
+        }; // projects read guard dropped here, before bases.write() below
+        if stale.is_empty() {
+            return; // warm path: every targeted entry already fresh, zero writes
+        }
+
+        // (3) Force-replace each stale base in the intern table (bases.write each
+        // call, dropped before the next), keeping the project_id paired with the
+        // fresh shared Arc for the working-set swap.
+        let fresh: Vec<(String, Arc<IndexBase>)> = stale
+            .into_iter()
+            .map(|(project_id, candidate)| (project_id, self.intern_base_refresh(candidate)))
+            .collect();
+
+        // (4) Swap each refreshed base into the working set under its own write
+        // lock — NO daemon-map lock held here. `add` replaces the entry with a
+        // fresh empty overlay re-fenced to the new base (no StaleOverlay skip).
+        let mut ws = working_set.write();
+        for (project_id, base) in fresh {
+            // ponytail: ws.add attaches a fresh EMPTY overlay — correct ONLY while
+            // overlays are always empty (no production overlay writers). If cross-
+            // project overlay writes ever land, switch to
+            // Overlay::rebase(+uncommitted_paths) or this silently drops
+            // uncommitted deltas on every freshness refresh.
+            ws.add(project_id, base);
+        }
     }
 
     fn register_session_for_existing_project(
@@ -2427,11 +2562,24 @@ async fn call_tool_handler(
     // and new request acceptance.
     let tool_name_owned = tool_name.clone();
     let tool_name_for_panic = tool_name.clone();
+    let state_for_refresh = Arc::clone(&state);
     match state
         .governor
         .execute_non_abortable(&tool_name, async move {
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
+                // B2/D12: on the CROSS-PROJECT read path ONLY, lazily refresh each
+                // targeted working-set base if the project's published index has
+                // advanced since intern, BEFORE the search. The gate is shared with
+                // the read route (`resolve_cross_project_targets` returns `None` for
+                // the byte-identical single-active path), so single-project reads
+                // never compare/re-intern and stay frecency-neutral (SC-4). Errors
+                // and invalid targeting are surfaced by `execute_tool_call` itself.
+                if let Some(targets) =
+                    resolve_cross_project_targets(&tool_name_owned, &params, &runtime.project_id)
+                {
+                    state_for_refresh.refresh_working_set_bases(&runtime.working_set, &targets);
+                }
                 handle.block_on(execute_tool_call(runtime, &tool_name_owned, params))
             })
             .await
@@ -2761,6 +2909,74 @@ fn resolve_targets(
 /// NON-active project) is a cross-project read served from the working set.
 fn targets_is_single_active(targets: &Targets, active_project_id: &str) -> bool {
     matches!(targets, Targets::One(id) if id == active_project_id)
+}
+
+/// Whether `targets` selects `project_id` — membership mirroring
+/// `Targets::selects` (private to `view`) for the freshness refresh, which must
+/// iterate only the targeted working-set entries.
+fn targets_selects(targets: &Targets, project_id: &str) -> bool {
+    match targets {
+        Targets::One(id) => id == project_id,
+        Targets::Subset(ids) => ids.iter().any(|id| id == project_id),
+        Targets::All => true,
+    }
+}
+
+/// The three cross-project READ verbs. Edits, analyze_file_impact, orient, and
+/// meta verbs are NEVER cross-project (they stay single-project on the active
+/// project) — kept in one place so the read route (`execute_tool_call`) and the
+/// freshness-refresh gate (`call_tool_handler`) agree by construction.
+fn is_cross_project_read_verb(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "search_symbols" | "search_text" | "find_references"
+    )
+}
+
+/// Resolve whether a tool call is a genuine CROSS-PROJECT read, returning the
+/// targeted projects iff so (B2/D12). Returns `None` for every path that stays
+/// single-project — a non-read verb, an unparseable peek, a resolve error, or a
+/// `Targets` that is exactly the single active project — so callers leave the
+/// byte-identical single-project route untouched (SC-4).
+///
+/// This is the SINGLE gate shared by both the read route in `execute_tool_call`
+/// (which dispatches the cross-project search) and `call_tool_handler` (which
+/// lazily refreshes the targeted working-set bases just before that dispatch).
+/// Identical gating here guarantees the freshness refresh fires on exactly the
+/// reads that read the working set, and never on the single-active fast path.
+/// A genuine resolve error is surfaced by the read route's own `resolve_targets`
+/// call; this gate swallows it (returns `None`) so the refresh never errors.
+fn resolve_cross_project_targets(
+    tool_name: &str,
+    params: &serde_json::Value,
+    active_project_id: &str,
+) -> Option<Targets> {
+    if !is_cross_project_read_verb(tool_name) {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct CrossProjectPeek {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        projects: Option<Vec<String>>,
+    }
+    let peek: CrossProjectPeek =
+        serde_json::from_value(params.clone()).unwrap_or(CrossProjectPeek {
+            project: None,
+            projects: None,
+        });
+    let targets = resolve_targets(
+        peek.project.as_deref(),
+        peek.projects.as_deref(),
+        active_project_id,
+    )
+    .ok()?;
+    if targets_is_single_active(&targets, active_project_id) {
+        None
+    } else {
+        Some(targets)
+    }
 }
 
 /// Validate that every explicitly-named target is actually OPEN in the working
@@ -3211,10 +3427,7 @@ async fn execute_tool_call(
     // session's working set with attributed `── project: <id> ──` output. Edits,
     // analyze_file_impact, orient, and meta verbs are NEVER routed here — they
     // stay single-project on the active project (cross-project writes deferred).
-    if matches!(
-        tool_name,
-        "search_symbols" | "search_text" | "find_references"
-    ) {
+    if is_cross_project_read_verb(tool_name) {
         #[derive(serde::Deserialize)]
         struct CrossProjectPeek {
             #[serde(default)]
@@ -3223,7 +3436,10 @@ async fn execute_tool_call(
             projects: Option<Vec<String>>,
         }
         // A lenient peek: unrelated/invalid sibling fields must NOT make the real
-        // tool call fail here, so only the two targeting fields are extracted.
+        // tool call fail here, so only the two targeting fields are extracted. A
+        // genuine targeting CONTRACT violation (e.g. both params set) IS surfaced
+        // as an error here — the freshness gate (`resolve_cross_project_targets`)
+        // swallows that same error, so it never refreshes for an invalid call.
         let peek: CrossProjectPeek =
             serde_json::from_value(params.clone()).unwrap_or(CrossProjectPeek {
                 project: None,
@@ -5369,6 +5585,260 @@ mod tests {
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// B2/D12 regression: a cross-project read REFLECTS a project's watcher-
+    /// observed change (no git commit). Two projects in one session; mutate a
+    /// watched file in B (add a new symbol + delete an existing one); republish B
+    /// deterministically (`SharedIndexHandle::reload`, the same swap_and_publish
+    /// the watcher drives, with no debounce race); re-run the SAME cross-read.
+    ///
+    /// Asserts:
+    ///   SC-1 (add)    — the NEW symbol `xproj_marker_gamma` now appears under B.
+    ///   SC-2 (delete) — the deleted `xproj_marker_beta` is GONE (no stale ghost).
+    ///   control       — B's interned base_generation ADVANCED across the refresh
+    ///                   (proves the force-replace fired; the FROZEN base would
+    ///                   still have surfaced beta and not gamma).
+    ///   SC-002        — after the force-replace there is still exactly ONE
+    ///                   `Arc<IndexBase>` per BaseKey: the session entry's base
+    ///                   Arc IS the bases-table value for B's key (Arc::ptr_eq),
+    ///                   and the bases-table key count is unchanged.
+    #[tokio::test]
+    async fn test_cross_project_read_is_fresh_after_watcher_reindex() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        let project_a = project_dir("symforge-fresh-a");
+        let project_b = project_dir("symforge-fresh-b");
+        let b_source = project_b.path().join("src").join("b.rs");
+        std::fs::write(
+            project_a.path().join("src").join("a.rs"),
+            "pub fn xproj_marker_alpha() -> u32 { 1 }\n",
+        )
+        .expect("write source a");
+        std::fs::write(&b_source, "pub fn xproj_marker_beta() -> u32 { 2 }\n")
+            .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        // Open A, index A, additively open B.
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "fresh".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let session_id = opened.session_id.clone();
+        let canonical_b = canonical_project_root(project_b.path()).expect("canonical b");
+        let project_b_id = project_key(&canonical_b);
+
+        http.post(format!(
+            "{base_url}/v1/sessions/{session_id}/tools/index_folder"
+        ))
+        .json(&IndexFolderInput {
+            path: project_a.path().display().to_string(),
+            idempotency_key: None,
+            add: None,
+        })
+        .send()
+        .await
+        .expect("index A request")
+        .error_for_status()
+        .expect("index A status");
+
+        http.post(format!(
+            "{base_url}/v1/sessions/{session_id}/tools/index_folder"
+        ))
+        .json(&IndexFolderInput {
+            path: project_b.path().display().to_string(),
+            idempotency_key: None,
+            add: Some(true),
+        })
+        .send()
+        .await
+        .expect("index B request")
+        .error_for_status()
+        .expect("index B status");
+
+        // Baseline cross-read: B's ORIGINAL symbol present, the new one absent.
+        let baseline = http
+            .post(format!(
+                "{base_url}/v1/sessions/{session_id}/tools/search_symbols"
+            ))
+            .json(&serde_json::json!({ "query": "xproj_marker", "projects": ["*"] }))
+            .send()
+            .await
+            .expect("baseline request")
+            .error_for_status()
+            .expect("baseline status")
+            .text()
+            .await
+            .expect("baseline body");
+        assert!(
+            baseline.contains("xproj_marker_beta"),
+            "baseline cross-read must surface B's original symbol: {baseline}"
+        );
+        assert!(
+            !baseline.contains("xproj_marker_gamma"),
+            "baseline must NOT yet contain the not-written symbol: {baseline}"
+        );
+
+        // B's interned base_generation BEFORE the watcher change (control anchor).
+        let b_key = BaseKey::new(canonical_b.clone(), CommitId::Dirtyless);
+        let gen_before =
+            state_base_generation(&handle.state, &b_key).expect("B base interned at open");
+        let key_count_before = handle.state.bases.read().len();
+
+        // A's interned base_generation BEFORE B's refresh — A is the UNTOUCHED
+        // project; the mismatch-gate must NOT re-intern it. A is a non-git TempDir
+        // like B, so its key is (canonical_root, Dirtyless) — same shape as B's.
+        let canonical_a = canonical_project_root(project_a.path()).expect("canonical a");
+        let a_key = BaseKey::new(canonical_a, CommitId::Dirtyless);
+        let a_gen_before =
+            state_base_generation(&handle.state, &a_key).expect("A base interned at open");
+
+        // Mutate a WATCHED file in B: delete beta, add gamma. Then republish B
+        // DETERMINISTICALLY via the project's SharedIndex reload (same publish the
+        // watcher drives) so the test does not race the real watcher debounce.
+        std::fs::write(&b_source, "pub fn xproj_marker_gamma() -> u32 { 3 }\n")
+            .expect("rewrite source b");
+        {
+            let projects = handle.state.projects.read();
+            let project_b_inst = projects
+                .get(&project_b_id)
+                .expect("project B loaded in daemon");
+            project_b_inst
+                .index
+                .reload(&canonical_b)
+                .expect("deterministic B reload (watcher-equivalent publish)");
+        }
+
+        // The SAME cross-read now reflects B's current state.
+        let fresh = http
+            .post(format!(
+                "{base_url}/v1/sessions/{session_id}/tools/search_symbols"
+            ))
+            .json(&serde_json::json!({ "query": "xproj_marker", "projects": ["*"] }))
+            .send()
+            .await
+            .expect("fresh request")
+            .error_for_status()
+            .expect("fresh status")
+            .text()
+            .await
+            .expect("fresh body");
+        // SC-1 (add): the new symbol appears.
+        assert!(
+            fresh.contains("xproj_marker_gamma"),
+            "SC-1: cross-read after watcher reindex must surface B's NEW symbol: {fresh}"
+        );
+        // SC-2 (delete): the deleted symbol is gone (no stale ghost).
+        assert!(
+            !fresh.contains("xproj_marker_beta"),
+            "SC-2: cross-read must NOT surface B's DELETED symbol (stale ghost): {fresh}"
+        );
+        // A is untouched and still present (the refresh did not drop other projects).
+        assert!(
+            fresh.contains("xproj_marker_alpha"),
+            "A must remain present after B's refresh: {fresh}"
+        );
+
+        // Control: B's interned base_generation advanced (force-replace fired).
+        let gen_after = state_base_generation(&handle.state, &b_key)
+            .expect("B base still interned after refresh");
+        assert!(
+            gen_after > gen_before,
+            "control: force-replace must advance B's base_generation \
+             (before={gen_before}, after={gen_after}); a frozen base would not"
+        );
+
+        // Mismatch-gate control: A was UNTOUCHED, so its base must NOT have been
+        // re-interned by the refresh (no spurious force-replace of fresh entries).
+        let a_gen_after = state_base_generation(&handle.state, &a_key)
+            .expect("A base still interned after refresh");
+        assert_eq!(
+            a_gen_after, a_gen_before,
+            "mismatch-gate: untouched project A must NOT be re-interned \
+             (before={a_gen_before}, after={a_gen_after})"
+        );
+
+        // SC-002: exactly ONE Arc<IndexBase> per BaseKey after the force-replace —
+        // the session entry's base IS the bases-table value, and no key was added.
+        {
+            let bases = handle.state.bases.read();
+            let table_base = bases.get(&b_key).expect("B base in table after refresh");
+            let sessions = handle.state.sessions.read();
+            let session = sessions.get(&session_id).expect("session present");
+            let ws = session.working_set.read();
+            let entry = ws.get(&project_b_id).expect("B entry in working set");
+            assert!(
+                Arc::ptr_eq(table_base, &entry.base),
+                "SC-002: the working-set entry must share the SAME interned base Arc"
+            );
+            assert_eq!(
+                bases.len(),
+                key_count_before,
+                "SC-002: force-replace must REPLACE the value, not add a duplicate key"
+            );
+        }
+
+        // Lone NON-ACTIVE target (Targets::One(non_active)): the session is active
+        // on A, so targeting ONLY B exercises the single-non-active cross-project
+        // path the design promised to refresh (not just Targets::All). Mutate B
+        // again, republish deterministically, then read with projects:[B] only.
+        std::fs::write(&b_source, "pub fn xproj_marker_delta() -> u32 { 4 }\n")
+            .expect("rewrite source b (delta)");
+        {
+            let projects = handle.state.projects.read();
+            projects
+                .get(&project_b_id)
+                .expect("project B loaded in daemon")
+                .index
+                .reload(&canonical_b)
+                .expect("deterministic B reload (delta)");
+        }
+        let lone_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{session_id}/tools/search_symbols"
+            ))
+            .json(&serde_json::json!({ "query": "xproj_marker", "projects": [project_b_id] }))
+            .send()
+            .await
+            .expect("lone-B request")
+            .error_for_status()
+            .expect("lone-B status")
+            .text()
+            .await
+            .expect("lone-B body");
+        assert!(
+            lone_b.contains("xproj_marker_delta"),
+            "lone non-active target: refresh must fire for Targets::One(B) too: {lone_b}"
+        );
+        assert!(
+            !lone_b.contains("xproj_marker_gamma"),
+            "lone non-active target: B's superseded symbol must be gone: {lone_b}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Read the interned `base_generation` for `key`, if present. Test helper for
+    /// the B2/D12 freshness control assertion.
+    fn state_base_generation(state: &SharedDaemonState, key: &BaseKey) -> Option<u64> {
+        state.bases.read().get(key).map(|b| b.base_generation)
     }
 
     // ── Feature 012 hardening — cross-project output is BOUNDED ──────────────────
