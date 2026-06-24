@@ -133,10 +133,12 @@ impl<'a> StelStatusContext<'a> {
     /// events. Also re-renders the `tuning_note` from the new verdict so the
     /// section's two calibration lines stay consistent.
     ///
-    /// Honesty invariant (data-model): a `Disabled`/`Unavailable` durable store
-    /// pins the state at in-memory-only — callers pass `None` (keeping the
-    /// in-memory verdict, which is `Deferred`/`Accumulating`, never a false
-    /// `Tuned`). Only a `Durable` store with a real artifact yields `Tuned` here.
+    /// Honesty invariant (data-model): the durable verdict is fail-closed. `None`
+    /// is reserved for "no durable store wired" — the caller keeps the in-memory
+    /// verdict (`Deferred`/`Accumulating`, never a false `Tuned`). A wired-but-
+    /// broken store whose sample read fails passes `Some(Deferred)` so status
+    /// never keeps an in-memory `Tuned` without a readable durable artifact. Only
+    /// a readable `Durable` store with a real artifact yields `Tuned` here.
     pub fn with_calibration_verdict(
         mut self,
         verdict: crate::stel::calibration::CalibrationVerdict,

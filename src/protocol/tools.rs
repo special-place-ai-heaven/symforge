@@ -9291,10 +9291,10 @@ impl SymForgeServer {
 
         // T033 / FR-009: override the in-memory verdict with the DURABLE one so
         // `status detail:full` reflects the persisted cross-session calibration
-        // state + active tuning. `None` (no/failed durable store) keeps the
-        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
-        // `Tuned`). After a reset above, the durable read sees zero samples ->
-        // `Deferred`.
+        // state + active tuning. `None` means no durable store is wired; a wired
+        // store whose sample read fails returns `Deferred` so status never keeps
+        // an in-memory `Tuned` verdict without a readable durable artifact. After
+        // a reset above, the durable read sees zero samples -> `Deferred`.
         if let Some(verdict) = self.durable_calibration_verdict() {
             ctx = ctx.with_calibration_verdict(verdict);
         }
@@ -9343,9 +9343,8 @@ impl SymForgeServer {
         )
         .with_durable_ledger(self.durable_ledger_summary_for_status());
         // Mirror `render_stel_status_body`: override the in-memory verdict with the
-        // DURABLE one (cross-session samples + active tuning). `None` keeps the
-        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
-        // `Tuned`).
+        // DURABLE one (cross-session samples + active tuning). A wired store whose
+        // sample read fails returns `Deferred`; only no store at all yields `None`.
         if let Some(verdict) = self.durable_calibration_verdict() {
             ctx = ctx.with_calibration_verdict(verdict);
         }
@@ -10200,6 +10199,68 @@ mod tests {
         assert!(
             body.contains(&expected),
             "full status must render the true full-corpus threshold {expected:?}:\n{body}"
+        );
+    }
+
+    #[test]
+    fn broken_durable_store_pins_status_calibration_to_deferred() {
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS};
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let repo = tempfile::tempdir().expect("temp repo");
+        let store = StelLedgerStore::open(repo.path(), "proxy-broken");
+        let db_path =
+            crate::paths::symforge_db_path(repo.path(), crate::paths::STEL_LEDGER_DB_NAME);
+        rusqlite::Connection::open(db_path)
+            .expect("open ledger db directly")
+            .execute_batch("DROP TABLE stel_ledger_events;")
+            .expect("break durable sample query");
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+        for i in 0..TUNING_MIN_CORPUS {
+            let mut event = sample_durable_event();
+            event.ts_ms += i as u64;
+            event.plan_id = format!("p-biased-{i}");
+            event.actual_response_tokens = event.predicted_response_tokens * 2;
+            proxy.stel_ledger().lock().push(event);
+        }
+
+        let session_events = proxy.stel_ledger().lock().events();
+        assert!(
+            matches!(
+                crate::stel::summarize_calibration(&session_events).verdict,
+                CalibrationVerdict::Tuned { .. }
+            ),
+            "fixture must prove the in-memory session alone would claim tuned"
+        );
+        assert_eq!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Deferred),
+            "a broken wired store cannot prove any tuning is in force"
+        );
+
+        let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
+        });
+        assert!(
+            body.contains("durable_ledger: disabled"),
+            "broken store must be surfaced as disabled:\n{body}"
+        );
+        assert!(
+            body.contains("calibration: deferred"),
+            "status must not keep the in-memory tuned verdict when durable reads fail:\n{body}"
+        );
+        assert!(
+            !body.contains("calibration: tuned"),
+            "status must never claim tuned without a readable durable artifact:\n{body}"
         );
     }
 
