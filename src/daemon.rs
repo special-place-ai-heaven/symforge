@@ -1210,7 +1210,17 @@ impl DaemonState {
 
         // Update the session's project association *after* the projects lock is
         // released to maintain lock order (projects before sessions everywhere).
-        if needs_reassign {
+        //
+        // A successful reload is an explicit "trust disk again" boundary. Refresh
+        // the active working-set entry even when the project id is unchanged so
+        // any D15 read-your-writes overlay from before the reload cannot shadow
+        // the freshly rebuilt index.
+        let refreshed_base = {
+            let projects = self.projects.read();
+            projects.get(&target_project_id).map(ProjectInstance::base)
+        }
+        .map(|candidate| self.intern_base_refresh(candidate));
+        if let Some(session) = self.sessions.write().get_mut(session_id) {
             // Feature 012 (Phase 2) — CLOSE THE RETARGET SEAM. Phase 0/1 updated
             // ONLY `active_project_id`, leaving the seeded `working_set` entry
             // pointing at the pre-retarget (now-evicted) project, so the working
@@ -1218,15 +1228,14 @@ impl DaemonState {
             // reads the working set, re-seed it: swap the OLD active entry for the
             // freshly retargeted project + its interned base + a fresh EMPTY
             // overlay. Additively-opened sibling projects (if any) are left
-            // intact — retarget only swaps the ACTIVE slot. The base is interned
-            // FIRST, holding no session lock (`intern_base_for_project` takes
-            // `projects` then `bases` with no overlap), then applied under
-            // `sessions.write()`. No overlay is written (invariant).
-            let new_base = self.intern_base_for_project(&target_project_id);
-            if let Some(session) = self.sessions.write().get_mut(session_id) {
+            // intact — retarget only swaps the ACTIVE slot. The base is refreshed
+            // FIRST, holding no session lock, then applied under `sessions.write()`.
+            // Re-attaching the entry creates a fresh empty overlay for the new
+            // source-of-truth base.
+            if needs_reassign {
                 let old_active =
                     std::mem::replace(&mut session.active_project_id, target_project_id.clone());
-                if let Some(base) = new_base {
+                if let Some(base) = refreshed_base {
                     let mut working_set = session.working_set.write();
                     // Drop the stale active entry (its project was evicted on the
                     // retarget) before adding the new active project. If `add`
@@ -1238,10 +1247,17 @@ impl DaemonState {
                     }
                     working_set.add(target_project_id.clone(), base);
                 }
+            } else if session.active_project_id == target_project_id
+                && let Some(base) = refreshed_base
+            {
                 session
-                    .last_seen_at
-                    .store(now_epoch_millis(), Ordering::Relaxed);
+                    .working_set
+                    .write()
+                    .add(target_project_id.clone(), base);
             }
+            session
+                .last_seen_at
+                .store(now_epoch_millis(), Ordering::Relaxed);
         }
 
         let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
@@ -4376,6 +4392,90 @@ mod tests {
         assert!(
             read_out.contains("999"),
             "get_symbol must return the EDITED body (read-your-writes), got: {read_out}"
+        );
+    }
+
+    /// Regression: a same-project `index_folder` reload is an explicit rebuild
+    /// from disk. Any pre-reload D15 overlay delta must be cleared, or single-mode
+    /// `get_symbol` will keep returning stale edited bytes over the fresh index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_d15_overlay_cleared_by_same_project_index_folder_reload() {
+        let project = project_dir("symforge-d15-reload-clears-overlay");
+        let rel = write_overlay_fixture(&project, "src/lib.rs", "pub fn target() -> u32 { 1 }\n");
+
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "claude".to_string(),
+                pid: Some(1),
+            })
+            .expect("open session");
+
+        let runtime_edit = state.session_runtime(&opened.session_id).expect("runtime");
+        execute_tool_call(
+            runtime_edit,
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "new_body": "pub fn target() -> u32 { 999 }",
+            }),
+        )
+        .await
+        .expect("edit dispatch");
+        assert!(
+            session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "edit must seed an overlay delta before the reload"
+        );
+
+        // Simulate an external recovery/rebuild source of truth: disk now differs
+        // from the pre-reload overlay, and index_folder must make disk win.
+        std::fs::write(
+            project.path().join(&rel),
+            "pub fn target() -> u32 { 222 }\n",
+        )
+        .expect("external disk rewrite");
+        let reload_out = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("same-project reload");
+        assert!(
+            reload_out.starts_with("Indexed "),
+            "reload must succeed, got: {reload_out}"
+        );
+        assert!(
+            !session_overlay_has_upsert(&state, &opened.session_id, &rel),
+            "same-project reload must clear stale overlay deltas"
+        );
+
+        let runtime_read = state
+            .session_runtime(&opened.session_id)
+            .expect("runtime after reload");
+        let read_out = execute_tool_call(
+            runtime_read,
+            "get_symbol",
+            serde_json::json!({
+                "path": rel,
+                "name": "target",
+                "force_refresh": true,
+            }),
+        )
+        .await
+        .expect("read after reload");
+        assert!(
+            read_out.contains("222"),
+            "get_symbol must return reloaded disk bytes, got: {read_out}"
+        );
+        assert!(
+            !read_out.contains("999"),
+            "stale overlay bytes must not shadow the reloaded index, got: {read_out}"
         );
     }
 
