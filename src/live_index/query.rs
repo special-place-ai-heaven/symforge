@@ -2406,8 +2406,26 @@ impl LiveIndex {
             // nothing here.
             // ponytail: O(all refs) scan, mirroring the qualified branch above; an
             // explicit head index would make it O(1) if find_references is ever hot.
+            //
+            // Dedup head-match pushes against refs already collected by the
+            // reverse-index/alias passes (keyed by file path + byte range). The
+            // `reference.name == name` skip below covers the common case, but a ref
+            // whose simple name equals a resolved alias AND whose qualified-name head
+            // equals `name` could otherwise be pushed twice.
+            let already: HashSet<(&str, (u32, u32))> =
+                results.iter().map(|(p, r)| (*p, r.byte_range)).collect();
             for (file_path, file) in &self.files {
                 for reference in &file.references {
+                    // Implements refs carry qualified_name = the bare implementor
+                    // type (`impl Trait for Foo` => name="Trait", qn="Foo") with a
+                    // byte_range pointing at the TRAIT token, not the type head. A
+                    // head-match on those would add a same-line entry pointing at the
+                    // wrong token. The implementor is already discoverable as its own
+                    // `type_identifier` TypeUsage ref, so skip Implements here; this
+                    // branch is for qualified CALLS only.
+                    if reference.kind == ReferenceKind::Implements {
+                        continue;
+                    }
                     let Some(qn) = reference.qualified_name.as_deref() else {
                         continue;
                     };
@@ -2423,6 +2441,9 @@ impl LiveIndex {
                         continue;
                     }
                     if !include_filtered && is_filtered_name(&reference.name, &file.language) {
+                        continue;
+                    }
+                    if already.contains(&(file_path.as_str(), reference.byte_range)) {
                         continue;
                     }
                     results.push((file_path.as_str(), reference));
@@ -5284,6 +5305,46 @@ impl Actor for MyActor {
         assert_eq!(
             results[0].1.qualified_name.as_deref(),
             Some("MinimalFilter::new")
+        );
+    }
+
+    /// Head-match must NOT pull in `Implements` refs. `impl Trait for MyStruct`
+    /// produces an Implements ref `name="Trait", qualified_name="MyStruct"` whose
+    /// byte_range points at the TRAIT token, not the implementor head. Matching it
+    /// for `find_references("MyStruct")` would add a same-line entry pointing at the
+    /// wrong token. The implementor is already discoverable as its own TypeUsage.
+    #[test]
+    fn test_d13_head_match_skips_implements() {
+        let refs = vec![
+            // The impl line's `MyStruct` token, captured as a TypeUsage under the head.
+            make_ref("MyStruct", None, ReferenceKind::TypeUsage, None, 0),
+            // The Implements ref: name=trait, qn=bare implementor, range at trait token.
+            make_ref(
+                "Trait",
+                Some("MyStruct"),
+                ReferenceKind::Implements,
+                None,
+                20,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MyStruct", None, false);
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.kind != ReferenceKind::Implements),
+            "head-match must not surface the Implements ref (wrong-token entry); got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| (&r.name, &r.qualified_name, r.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "only the TypeUsage occurrence of MyStruct should be returned"
         );
     }
 

@@ -234,8 +234,13 @@ const CPP_XREF_QUERY: &str = r#"
 ; Method calls: obj.method() or obj->method()
 (call_expression function: (field_expression field: (field_identifier) @ref.method_call))
 
-; Qualified calls: std::sort, Foo::bar
-(qualified_identifier name: (identifier) @ref.call)
+; Qualified calls: std::sort(), Foo::bar() — capture the qualified_identifier as
+; @ref.qualified_call so the type/namespace head (`Foo`) is recoverable for D13
+; head-match recall (find_references("Foo") must see `Foo::bar()`/`Foo::create()`
+; static-call & construction sites, which are keyed under the leaf `bar`).
+; Scoped to call position to mirror the Rust rule and avoid double-capturing the
+; leaf for non-call qualified identifiers.
+(call_expression function: (qualified_identifier name: (identifier) @ref.call) @ref.qualified_call)
 
 ; #include imports
 (preproc_include path: (string_literal) @ref.import)
@@ -2333,6 +2338,26 @@ export const Table = ({ rows }) => (\n\
                 .any(|r| r.kind == ReferenceKind::Call && r.name == "sort"),
             "should have qualified call ref for sort, refs: {:?}",
             refs
+        );
+    }
+
+    /// D13: a C++ qualified call `Foo::create()` must retain the head (`Foo`) in
+    /// `qualified_name` so the find_references head-match branch can recall it under
+    /// the type. Before the `@ref.qualified_call` envelope was added to the C++
+    /// query, this carried `qualified_name=None` and the static-call/construction
+    /// site was invisible to find_references("Foo").
+    #[test]
+    fn test_cpp_qualified_call_retains_head() {
+        let source = "void f() { Foo::create(); }";
+        let (refs, _) = parse_and_extract(source, LanguageId::Cpp);
+        let call = refs
+            .iter()
+            .find(|r| r.name == "create" && r.kind == ReferenceKind::Call)
+            .expect("Foo::create() should be captured as a Call, refs: {refs:?}");
+        assert_eq!(
+            call.qualified_name.as_deref(),
+            Some("Foo::create"),
+            "C++ qualified call must retain the type/namespace head in qualified_name"
         );
     }
 
