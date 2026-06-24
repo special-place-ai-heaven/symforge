@@ -3195,10 +3195,18 @@ fn format_cross_project_references(
     out
 }
 
+fn strip_cross_project_targeting(mut params: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut object) = params {
+        object.remove("project");
+        object.remove("projects");
+    }
+    params
+}
+
 async fn execute_tool_call(
     runtime: SessionRuntime,
     tool_name: &str,
-    params: serde_json::Value,
+    mut params: serde_json::Value,
 ) -> anyhow::Result<String> {
     runtime.token_stats.record_tool_call(tool_name);
 
@@ -3239,7 +3247,10 @@ async fn execute_tool_call(
             let working_set = runtime.working_set.read();
             return execute_cross_project_read(tool_name, params, targets, &working_set);
         }
-        // else: single active project -> fall through to the unchanged path.
+        // else: single active project -> fall through to the unchanged path. The
+        // worker is intentionally local-only and refuses any `project`/`projects`
+        // field, so erase the already-resolved targeting hint before dispatch.
+        params = strip_cross_project_targeting(params);
     }
 
     // Use the cached server from ProjectInstance (cloned cheaply via Arc internals)
@@ -5237,6 +5248,44 @@ mod tests {
         assert!(
             !active_only.contains("project: "),
             "single-active query must render flat (no project header): {active_only}"
+        );
+
+        // (4b) Explicitly targeting the active project is still the same
+        // single-project route. The daemon resolves the target before dispatch,
+        // then strips the hint so the local worker does not refuse it as a
+        // cross-project request without a daemon.
+        let explicit_active = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_symbols",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "xproj_marker",
+                "project": project_a_id
+            }))
+            .send()
+            .await
+            .expect("explicit active query request")
+            .error_for_status()
+            .expect("explicit active query status")
+            .text()
+            .await
+            .expect("explicit active query body");
+        assert!(
+            explicit_active.contains("xproj_marker_alpha"),
+            "explicit active project query must surface A's symbol: {explicit_active}"
+        );
+        assert!(
+            !explicit_active.contains("xproj_marker_beta"),
+            "explicit active project query must NOT surface B's symbol: {explicit_active}"
+        );
+        assert!(
+            !explicit_active.contains("Cross-project queries"),
+            "explicit active project must not hit the local cross-project refusal: {explicit_active}"
+        );
+        assert!(
+            !explicit_active.contains("project: "),
+            "explicit active project must render as the flat single-project route: {explicit_active}"
         );
 
         // (5) B1 — cross-project scoping is now HONORED over the wire, not
