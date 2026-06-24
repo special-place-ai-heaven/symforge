@@ -234,8 +234,13 @@ const CPP_XREF_QUERY: &str = r#"
 ; Method calls: obj.method() or obj->method()
 (call_expression function: (field_expression field: (field_identifier) @ref.method_call))
 
-; Qualified calls: std::sort, Foo::bar
-(qualified_identifier name: (identifier) @ref.call)
+; Qualified calls: std::sort(), Foo::bar() — capture the qualified_identifier as
+; @ref.qualified_call so the type/namespace head (`Foo`) is recoverable for D13
+; head-match recall (find_references("Foo") must see `Foo::bar()`/`Foo::create()`
+; static-call & construction sites, which are keyed under the leaf `bar`).
+; Scoped to call position to mirror the Rust rule and avoid double-capturing the
+; leaf for non-call qualified identifiers.
+(call_expression function: (qualified_identifier name: (identifier) @ref.call) @ref.qualified_call)
 
 ; #include imports
 (preproc_include path: (string_literal) @ref.import)
@@ -1656,6 +1661,52 @@ mod tests {
         );
     }
 
+    /// D13 recall: a qualified-call construction site `MinimalFilter::new()` is
+    /// keyed in `reverse_index` under the leaf `new`, but retains the full
+    /// `qualified_name` (`MinimalFilter::new`). This asserts the extraction shape
+    /// the `find_references` head-match branch relies on. The struct-literal
+    /// `MinimalFilter { .. }` is ALREADY captured here as a `TypeUsage` keyed
+    /// under the head via the unscoped `(type_identifier)` rule -- so NO extra
+    /// struct_expression capture is needed (it would only duplicate).
+    #[test]
+    fn test_rust_qualified_call_retains_head_and_struct_literal_keyed_under_head() {
+        let src = r#"
+struct MinimalFilter { a: u8 }
+fn use_it(p: MinimalFilter) {
+    let a: MinimalFilter = MinimalFilter::new();
+    let b = MinimalFilter { a: 1 };
+    let _ = (a, b, p);
+}
+"#;
+        let (refs, _) = parse_and_extract(src, LanguageId::Rust);
+
+        // The constructor call is keyed under the leaf, with the head retained.
+        let ctor = refs
+            .iter()
+            .find(|r| r.name == "new" && r.kind == ReferenceKind::Call)
+            .expect("MinimalFilter::new() should be captured as a Call");
+        assert_eq!(
+            ctor.qualified_name.as_deref(),
+            Some("MinimalFilter::new"),
+            "constructor call must retain the type head in qualified_name"
+        );
+
+        // The struct literal IS already a head-keyed TypeUsage (no extra capture).
+        let literal_count = refs
+            .iter()
+            .filter(|r| {
+                r.name == "MinimalFilter"
+                    && r.kind == ReferenceKind::TypeUsage
+                    && r.line_range.0 == 4
+            })
+            .count();
+        assert_eq!(
+            literal_count, 1,
+            "struct literal MinimalFilter {{..}} on line 4 must be captured exactly once under the head, got refs: {:?}",
+            refs
+        );
+    }
+
     #[test]
     fn test_rust_impl_trait_for_struct() {
         let source = r#"
@@ -2287,6 +2338,26 @@ export const Table = ({ rows }) => (\n\
                 .any(|r| r.kind == ReferenceKind::Call && r.name == "sort"),
             "should have qualified call ref for sort, refs: {:?}",
             refs
+        );
+    }
+
+    /// D13: a C++ qualified call `Foo::create()` must retain the head (`Foo`) in
+    /// `qualified_name` so the find_references head-match branch can recall it under
+    /// the type. Before the `@ref.qualified_call` envelope was added to the C++
+    /// query, this carried `qualified_name=None` and the static-call/construction
+    /// site was invisible to find_references("Foo").
+    #[test]
+    fn test_cpp_qualified_call_retains_head() {
+        let source = "void f() { Foo::create(); }";
+        let (refs, _) = parse_and_extract(source, LanguageId::Cpp);
+        let call = refs
+            .iter()
+            .find(|r| r.name == "create" && r.kind == ReferenceKind::Call)
+            .expect("Foo::create() should be captured as a Call, refs: {refs:?}");
+        assert_eq!(
+            call.qualified_name.as_deref(),
+            Some("Foo::create"),
+            "C++ qualified call must retain the type/namespace head in qualified_name"
         );
     }
 
