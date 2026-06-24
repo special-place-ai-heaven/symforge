@@ -3847,24 +3847,6 @@ fn test_resolve_read_max_tokens_defaults_to_window() {
 }
 
 #[test]
-fn test_content_anchored_symbol_window_finds_doc_comment_match() {
-    let content = br#"/// Example
-#[tokio::main]
-pub async fn hard_link() {}
-"#;
-    let (_key, file) = make_file("src/fs/hard_link.rs", content, vec![]);
-    let window = content_anchored_symbol_window(&file, "main", 5).expect("window");
-    assert!(
-        window.contains("hard_link"),
-        "window should include nearby source: {window}"
-    );
-    assert!(
-        window.contains("content-anchored"),
-        "should label fallback: {window}"
-    );
-}
-
-#[test]
 fn test_saved_tokens_vs_competent_manual_uses_window() {
     assert_eq!(saved_tokens_vs_competent_manual(200, 500_000), 950);
 }

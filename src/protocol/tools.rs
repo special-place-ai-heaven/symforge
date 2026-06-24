@@ -11260,6 +11260,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_symbol_missing_symbol_returns_loud_not_found() {
+        // D18: a symbol absent from the file must yield a LOUD not-found that
+        // names the symbol + path — NOT a silent content-anchored window.
+        //
+        // Non-vacuity: the source deliberately contains "TotallyFake" as a
+        // substring (in a comment). On the pre-fix code, content_anchored_symbol_window
+        // would find that substring and return a numbered source window tagged
+        // "content-anchored ...". This test asserts the window is gone, so it
+        // FAILS against the old behavior.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("// TotallyFake is only in a comment\nfn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/lib.rs", "TotallyFake")))
+            .await;
+
+        assert!(
+            result.contains("No symbol TotallyFake in src/lib.rs"),
+            "must name the missing symbol and path; got: {result}"
+        );
+        assert!(
+            !result.contains("content-anchored"),
+            "must NOT silently return a content-anchored window; got: {result}"
+        );
+        // Distinct from the file-not-found message: the file IS indexed.
+        assert!(
+            !result.starts_with("File not found"),
+            "indexed file with absent symbol must not read as file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_missing_file_returns_not_found_file() {
+        // D18 boundary: an unindexed/absent file must report file-not-found,
+        // distinct from the symbol-absent message above.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/nonexistent.rs", "foo")))
+            .await;
+
+        assert!(
+            result.starts_with("File not found"),
+            "absent file must report file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_valid_symbol_still_resolves() {
+        // D18 no-regression: a real symbol must still return its body, never a
+        // false not-found.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/lib.rs", "foo")))
+            .await;
+
+        assert!(
+            !result.contains("No symbol"),
+            "valid symbol must not read as not-found; got: {result}"
+        );
+        assert!(
+            result.contains("fn foo"),
+            "valid symbol must return its body; got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_repo_map_full_uses_project_name() {
         let (key, file) = make_file("src/main.rs", b"fn main() {}", vec![]);
         let server = make_server(make_live_index_ready(vec![(key, file)]));

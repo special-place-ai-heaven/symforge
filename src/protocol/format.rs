@@ -812,11 +812,11 @@ pub fn symbol_detail_from_indexed_file(
             )
         }
         SymbolSelectorMatch::NotFound => {
-            if let Some(window) =
-                content_anchored_symbol_window(file, name, COMPETENT_READ_WINDOW_LINES / 2)
-            {
-                return window;
-            }
+            // D18: loud not-found. Do NOT silently substitute a content-anchored
+            // window (a substring hit in comments/strings) for the symbol the
+            // caller asked for. render_not_found_symbol names the symbol + path,
+            // offers near-miss suggestions, and (via "No symbol ") auto-classifies
+            // as OutcomeClass::NotFound in the result envelope.
             render_not_found_symbol(&file.relative_path, &file.symbols, name)
         }
         SymbolSelectorMatch::Ambiguous(lines) => {
@@ -5000,35 +5000,6 @@ pub fn resolve_read_max_tokens(explicit: Option<u64>, raw_chars: usize) -> u64 {
             estimate_tokens_from_chars(baseline).max(64)
         }
     }
-}
-
-/// Grep-then-window fallback when the symbol name is missing from the index but
-/// appears in source (matches sf-bench manual T1: grep hit + ±25-line window).
-pub fn content_anchored_symbol_window(
-    file: &crate::live_index::store::IndexedFile,
-    needle: &str,
-    radius_lines: u32,
-) -> Option<String> {
-    if needle.trim().is_empty() {
-        return None;
-    }
-    let text = std::str::from_utf8(&file.content).ok()?;
-    let lines: Vec<&str> = text.split('\n').collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let needle_lower = needle.to_lowercase();
-    let hit_line = lines
-        .iter()
-        .position(|line| line.to_lowercase().contains(&needle_lower))
-        .map(|idx| (idx + 1) as u32)?;
-    let excerpt = render_numbered_around_line_excerpt(&lines, hit_line, radius_lines);
-    if excerpt.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{excerpt}\n[content-anchored window around '{needle}' at L{hit_line}; no indexed symbol with that name]"
-    ))
 }
 
 /// Estimated tokens from a character count (`~chars/4` approximation).
