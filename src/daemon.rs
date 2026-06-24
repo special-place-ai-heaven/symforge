@@ -796,6 +796,42 @@ impl DaemonState {
             // uncommitted deltas on every freshness refresh.
             ws.add(project_id, base);
         }
+        drop(ws); // release working_set before sweeping the bases table
+
+        // (5) GC orphaned bases. A genuine commit-advance changes BaseKey.commit,
+        // so step (3)/(4) interned the snapshot under a NEW key and replaced the
+        // working-set entry — the OLD key's value is now referenced only by the
+        // map (no session/working-set entry holds it). SC-002-safe eviction: under
+        // `bases.write()` (the sole mutator/cloner of the map), `entry.base` is a
+        // clone of the SAME map Arc, so the map value's `strong_count == 1` iff no
+        // live consumer references it. Retain everything still referenced; drop the
+        // orphans. No `Weak<IndexBase>` exists and no other Arc<IndexBase> holder
+        // exists, so the count is exact. This is the ONLY path that orphans a base
+        // (the no-commit watcher path force-replaces the SAME key — no orphan).
+        // ponytail: full-map retain is O(bases); fine — table is tiny per daemon.
+        // Add a threshold only if base count ever grows large.
+        self.gc_orphaned_bases();
+    }
+
+    /// Evict orphaned interned bases — values no live consumer references anymore
+    /// (the unbounded-growth defect on a long-lived multi-commit daemon).
+    ///
+    /// SC-002-safe eviction condition: under `bases.write()` (the SOLE mutator and
+    /// cloner of the map), every `WorkingSetEntry.base` is a clone of the SAME map
+    /// `Arc<IndexBase>`, so a map value's `Arc::strong_count == 1` means the map is
+    /// the only owner — no session/working-set holds it. We retain everything still
+    /// referenced and drop only `== 1`. No `Weak<IndexBase>` exists and no other
+    /// `Arc<IndexBase>` holder exists anywhere, so the count is exact and the sweep
+    /// can never evict a base a later `intern_base` would re-share (which would mint
+    /// a SECOND Arc per BaseKey — the SC-002 violation this guards against).
+    ///
+    /// LOCK ORDER: acquires ONLY `bases` (top of `bases -> projects -> sessions`).
+    /// Never call while holding `projects`/`sessions`, nor while holding a transient
+    /// clone of a map value in the same scope (that would self-inflate the count).
+    fn gc_orphaned_bases(&self) {
+        self.bases
+            .write()
+            .retain(|_key, base| Arc::strong_count(base) > 1);
     }
 
     fn register_session_for_existing_project(
@@ -4216,6 +4252,100 @@ mod tests {
             state.bases.read().len(),
             2,
             "two roots -> two interned bases"
+        );
+    }
+
+    // ── Feature 012f — bases-table orphan GC (SC-002-safe) ──────────────────────
+    //
+    // A genuine commit-advance interns the snapshot under a NEW BaseKey and swaps
+    // the working-set entry, leaving the OLD key referenced only by the map: an
+    // orphan that grows the table unbounded on a long-lived multi-commit daemon.
+    // The GC evicts orphans (strong_count == 1) and MUST NOT evict a base a live
+    // working set still holds (strong_count > 1) — evicting it would let a later
+    // intern mint a SECOND Arc per key (the SC-002 violation).
+    #[test]
+    fn test_gc_orphaned_bases_evicts_orphan_keeps_live() {
+        use crate::live_index::store::LiveIndex;
+        use crate::live_index::view::{CommitId, WorkingSet};
+
+        let state = DaemonState::new();
+        let root = "/synthetic/gc-root";
+
+        // OLD-commit base: interned, then no longer referenced by any working set
+        // (simulating the entry-swap a commit-advance performs). Map-only Arc.
+        let orphan_key = BaseKey::new(root, CommitId::Sha("old-commit".to_string()));
+        state.bases.write().insert(
+            orphan_key.clone(),
+            Arc::new(IndexBase::new(
+                orphan_key.clone(),
+                Arc::new(LiveIndex::empty_live_index()),
+                1,
+            )),
+        );
+
+        // NEW-commit base: interned AND held by a live working set (the post-advance
+        // state). The working-set entry stores a CLONE of the SAME map Arc, so the
+        // map value's strong_count is > 1 — the liveness signal the GC relies on.
+        let live_key = BaseKey::new(root, CommitId::Sha("new-commit".to_string()));
+        let live_base = Arc::new(IndexBase::new(
+            live_key.clone(),
+            Arc::new(LiveIndex::empty_live_index()),
+            2,
+        ));
+        state
+            .bases
+            .write()
+            .insert(live_key.clone(), Arc::clone(&live_base));
+        let working_set = Arc::new(RwLock::new(WorkingSet::new()));
+        working_set.write().add("proj", Arc::clone(&live_base));
+        // Drop our local strong ref so ONLY the map + the working-set entry hold the
+        // live base (strong_count == 2). Without this, our local clone would mask a
+        // buggy GC that relies on an accidental extra ref.
+        drop(live_base);
+
+        // Non-vacuity: BEFORE the sweep the orphan IS in the table (the leak the GC
+        // closes) and both keys are present.
+        {
+            let bases = state.bases.read();
+            assert!(
+                bases.contains_key(&orphan_key),
+                "precondition: orphan must be present before GC (proves the leak)"
+            );
+            assert_eq!(bases.len(), 2, "precondition: both bases interned");
+            assert_eq!(
+                Arc::strong_count(bases.get(&orphan_key).unwrap()),
+                1,
+                "orphan must be map-only (the eviction signal)"
+            );
+            assert_eq!(
+                Arc::strong_count(bases.get(&live_key).unwrap()),
+                2,
+                "live base is held by map + working-set entry"
+            );
+        }
+
+        state.gc_orphaned_bases();
+
+        let bases = state.bases.read();
+        // Orphan evicted.
+        assert!(
+            !bases.contains_key(&orphan_key),
+            "GC must evict the orphaned (map-only) base"
+        );
+        // SC-002 guard: the still-referenced base survives — evicting it would let a
+        // later intern mint a second Arc for this key.
+        assert!(
+            bases.contains_key(&live_key),
+            "GC must NOT evict a base a live working set still references"
+        );
+        assert_eq!(bases.len(), 1, "only the orphan is removed");
+        // The surviving map value is STILL the SAME Arc the working-set entry holds.
+        let table_live = bases.get(&live_key).unwrap();
+        let ws = working_set.read();
+        let entry = ws.get("proj").expect("live entry present");
+        assert!(
+            Arc::ptr_eq(table_live, &entry.base),
+            "SC-002: survivor is the same shared Arc the working set holds"
         );
     }
 
