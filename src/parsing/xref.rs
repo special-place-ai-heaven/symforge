@@ -1656,6 +1656,52 @@ mod tests {
         );
     }
 
+    /// D13 recall: a qualified-call construction site `MinimalFilter::new()` is
+    /// keyed in `reverse_index` under the leaf `new`, but retains the full
+    /// `qualified_name` (`MinimalFilter::new`). This asserts the extraction shape
+    /// the `find_references` head-match branch relies on. The struct-literal
+    /// `MinimalFilter { .. }` is ALREADY captured here as a `TypeUsage` keyed
+    /// under the head via the unscoped `(type_identifier)` rule -- so NO extra
+    /// struct_expression capture is needed (it would only duplicate).
+    #[test]
+    fn test_rust_qualified_call_retains_head_and_struct_literal_keyed_under_head() {
+        let src = r#"
+struct MinimalFilter { a: u8 }
+fn use_it(p: MinimalFilter) {
+    let a: MinimalFilter = MinimalFilter::new();
+    let b = MinimalFilter { a: 1 };
+    let _ = (a, b, p);
+}
+"#;
+        let (refs, _) = parse_and_extract(src, LanguageId::Rust);
+
+        // The constructor call is keyed under the leaf, with the head retained.
+        let ctor = refs
+            .iter()
+            .find(|r| r.name == "new" && r.kind == ReferenceKind::Call)
+            .expect("MinimalFilter::new() should be captured as a Call");
+        assert_eq!(
+            ctor.qualified_name.as_deref(),
+            Some("MinimalFilter::new"),
+            "constructor call must retain the type head in qualified_name"
+        );
+
+        // The struct literal IS already a head-keyed TypeUsage (no extra capture).
+        let literal_count = refs
+            .iter()
+            .filter(|r| {
+                r.name == "MinimalFilter"
+                    && r.kind == ReferenceKind::TypeUsage
+                    && r.line_range.0 == 4
+            })
+            .count();
+        assert_eq!(
+            literal_count, 1,
+            "struct literal MinimalFilter {{..}} on line 4 must be captured exactly once under the head, got refs: {:?}",
+            refs
+        );
+    }
+
     #[test]
     fn test_rust_impl_trait_for_struct() {
         let source = r#"

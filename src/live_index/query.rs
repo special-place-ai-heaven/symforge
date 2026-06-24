@@ -2394,6 +2394,40 @@ impl LiveIndex {
             for alias in &aliases {
                 self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut results);
             }
+
+            // D13 recall: qualified-call construction sites (`Foo::new()`,
+            // `Foo::default()`, C++ `Foo::method()`) are keyed in `reverse_index`
+            // under the leaf segment (`new`), not the type head (`Foo`). They DO
+            // retain the full `qualified_name` (`Foo::new`), so also match any ref
+            // whose qualified-name HEAD segment == `name`. This closes the
+            // constructor class for ALL types at once, for every grammar that
+            // emits a qualified_name. Struct/composite literals already land under
+            // the head via the unscoped `(type_identifier)` capture, so they need
+            // nothing here.
+            // ponytail: O(all refs) scan, mirroring the qualified branch above; an
+            // explicit head index would make it O(1) if find_references is ever hot.
+            for (file_path, file) in &self.files {
+                for reference in &file.references {
+                    let Some(qn) = reference.qualified_name.as_deref() else {
+                        continue;
+                    };
+                    let head = qn.split(['.', ':']).next().unwrap_or(qn).trim();
+                    if head != name || reference.name == name {
+                        // `reference.name == name` was already covered by the
+                        // reverse-index hit above; skip to avoid duplicates.
+                        continue;
+                    }
+                    if let Some(kf) = kind_filter
+                        && reference.kind != kf
+                    {
+                        continue;
+                    }
+                    if !include_filtered && is_filtered_name(&reference.name, &file.language) {
+                        continue;
+                    }
+                    results.push((file_path.as_str(), reference));
+                }
+            }
         }
 
         results
@@ -5159,6 +5193,98 @@ impl Actor for MyActor {
 
         let results = index.find_references_for_name("foo", None, false);
         assert_eq!(results.len(), 2, "both files should match");
+    }
+
+    /// D13 recall fixture (the decision doc's required runnable check).
+    ///
+    /// For a type `T`, lay down the five reference shapes that
+    /// `find_references("T")` must return, exactly as xref extraction keys them:
+    ///   1. definition          -> name "T"               (keyed under "T")
+    ///   2. `let a: T`           -> name "T" TypeUsage     (keyed under "T")
+    ///   3. `fn f(p: T)`         -> name "T" TypeUsage     (keyed under "T")
+    ///   4. `T { .. }` literal   -> name "T" TypeUsage     (keyed under "T")
+    ///   5. `T::new()` ctor      -> name "new", qn "T::new" (keyed under "new")
+    ///
+    /// Pre-fix, site 5 was INVISIBLE to a simple `find_references("T")` because it
+    /// is keyed under the leaf "new". The head-match branch closes it. Sites 1-4
+    /// already resolve via the unscoped `(type_identifier)` capture (verified in
+    /// xref.rs `test_rust_qualified_call_retains_head_and_struct_literal_keyed_under_head`),
+    /// so this fixture is non-vacuous: drop the head-match branch and it returns 4,
+    /// not 5.
+    #[test]
+    fn test_d13_find_references_recall_all_five_usage_sites() {
+        let refs = vec![
+            // 1. definition site (TypeUsage keyed under the head by extraction)
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 0),
+            // 2. `let a: MinimalFilter`
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 20),
+            // 3. `fn f(p: MinimalFilter)`
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 40),
+            // 4. `MinimalFilter { .. }` struct literal (already head-keyed)
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 60),
+            // 5. `MinimalFilter::new()` — keyed under the leaf "new", head in qn.
+            make_ref(
+                "new",
+                Some("MinimalFilter::new"),
+                ReferenceKind::Call,
+                None,
+                80,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MinimalFilter", None, false);
+        assert_eq!(
+            results.len(),
+            5,
+            "find_references(MinimalFilter) must return all 5 usage sites incl. the ::new() ctor; got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| (&r.name, &r.qualified_name))
+                .collect::<Vec<_>>()
+        );
+        // The constructor site (keyed under "new") must be among them.
+        assert!(
+            results
+                .iter()
+                .any(|(_, r)| r.qualified_name.as_deref() == Some("MinimalFilter::new")),
+            "the MinimalFilter::new() construction site must be recalled"
+        );
+    }
+
+    /// Head-match must NOT over-capture: searching for a module head like `mem`
+    /// (from `mem::swap()`) returns the qualified call, but searching for the
+    /// type `T` must not pull in an unrelated `Other::foo()`.
+    #[test]
+    fn test_d13_head_match_no_false_positive_across_types() {
+        let refs = vec![
+            make_ref("foo", Some("Other::foo"), ReferenceKind::Call, None, 0),
+            make_ref(
+                "new",
+                Some("MinimalFilter::new"),
+                ReferenceKind::Call,
+                None,
+                20,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MinimalFilter", None, false);
+        assert_eq!(
+            results.len(),
+            1,
+            "only MinimalFilter::new should match head, got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results[0].1.qualified_name.as_deref(),
+            Some("MinimalFilter::new")
+        );
     }
 
     #[test]
