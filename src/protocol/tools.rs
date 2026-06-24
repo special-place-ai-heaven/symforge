@@ -5427,6 +5427,12 @@ impl SymForgeServer {
                 .as_ref()
                 .and_then(|resolution| resolution.neighbors.as_ref());
             let coupling_context = params.0.anchor_path.as_deref().zip(coupling_neighbors);
+            // Optional path-prefix scoping, mirroring the `path_scope` axis of
+            // search_symbols/search_text: the scope is applied inside the capture
+            // (pre-count predicate), so total_matches/overflow_count/hits are all
+            // consistently scoped — including the overflow set, not just the
+            // visible hits.
+            let path_scope = normalize_path_prefix(params.0.path_prefix.as_deref());
             let view = guard.capture_search_files_view_with_noise(
                 &params.0.query,
                 params.0.limit.unwrap_or(20) as usize,
@@ -5434,13 +5440,19 @@ impl SymForgeServer {
                 coupling_context,
                 include_vendor,
                 include_personal_tooling,
+                &path_scope,
             );
             if !(include_vendor && include_personal_tooling) {
-                let unfiltered = guard.capture_search_files_view(
+                // Same path_scope so hidden_noise_count compares like-for-like
+                // (noise hidden WITHIN the requested prefix, not repo-wide).
+                let unfiltered = guard.capture_search_files_view_with_noise(
                     &params.0.query,
                     params.0.limit.unwrap_or(20) as usize,
                     params.0.current_file.as_deref(),
                     coupling_context,
+                    true,
+                    true,
+                    &path_scope,
                 );
                 hidden_noise_count = search_files_total_matches(&unfiltered)
                     .saturating_sub(search_files_total_matches(&view));
@@ -5485,27 +5497,6 @@ impl SymForgeServer {
             }
             view
         };
-        // Optional path-prefix scoping. Mirrors the `path_scope` axis used by
-        // `search_symbols`/`search_text`: drop hits whose path falls outside the
-        // requested prefix. Applied to the captured hits because `search_files`
-        // uses a dedicated capture API rather than the shared search options.
-        let path_scope = normalize_path_prefix(params.0.path_prefix.as_deref());
-        if !matches!(path_scope, search::PathScope::Any)
-            && let SearchFilesView::Found {
-                hits,
-                total_matches,
-                ..
-            } = &mut view
-        {
-            let before = hits.len();
-            hits.retain(|hit| path_scope.matches(&hit.path));
-            *total_matches = total_matches.saturating_sub(before - hits.len());
-            if hits.is_empty() {
-                view = SearchFilesView::NotFound {
-                    query: params.0.query.clone(),
-                };
-            }
-        }
         // Optional frecency-fusion rerank. Activated when the caller requests
         // `rank_by="frecency"`, independent of the old persistent-collection
         // feature flag. Discovery still never opens a writeable frecency store:
@@ -14933,6 +14924,55 @@ mod tests {
         assert!(
             !scoped.contains("src/sidecar/tools.rs"),
             "scoped must drop out-of-prefix path, got: {scoped}"
+        );
+    }
+
+    /// Regression for D20 review: scoping must hold UNDER overflow truncation.
+    /// The default limit is 20; seeding >20 in-prefix and >20 out-of-prefix
+    /// same-basename files forces the overflow path. If the prefix were applied
+    /// only to the visible (already-truncated) hits, out-of-prefix files in the
+    /// overflow set would escape scoping and the reported total/overflow counts
+    /// would be inflated. We assert: (a) no out-of-prefix path appears at all,
+    /// and (b) the header total equals only the in-prefix count (30), proving
+    /// total_matches is scoped pre-count, not just the rendered view.
+    #[tokio::test]
+    async fn test_search_files_path_prefix_scopes_under_overflow() {
+        let mut files = Vec::new();
+        for i in 0..30 {
+            files.push(make_file(
+                &format!("src/protocol/m{i:02}/tools.rs"),
+                b"fn a() {}",
+                vec![],
+            ));
+            files.push(make_file(
+                &format!("src/sidecar/m{i:02}/tools.rs"),
+                b"fn b() {}",
+                vec![],
+            ));
+        }
+        let server = make_server(make_live_index_ready(files));
+
+        let scoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: Some("src/protocol".to_string()),
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+
+        // No out-of-prefix path leaks, even from the overflow set.
+        assert!(
+            !scoped.contains("src/sidecar/"),
+            "no out-of-prefix path may appear under overflow, got: {scoped}"
+        );
+        // total_matches reflects ONLY the 30 in-prefix files, not all 60.
+        assert!(
+            scoped.contains("30 matching files"),
+            "scoped header must count only in-prefix matches, got: {scoped}"
+        );
+        // overflow_count is scoped too: 30 matches, limit 20 => "... and 10 more".
+        assert!(
+            scoped.contains("... and 10 more"),
+            "scoped overflow count must be 30-20=10, got: {scoped}"
         );
     }
 

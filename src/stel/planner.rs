@@ -126,9 +126,9 @@ pub fn classify_param_dispositions(
     } else {
         // `path` absent, or a route whose tool carries no path scope and no path
         // selector (so neither A1b's forwarding nor a target arg applies — e.g.
-        // `get_repo_map`, `context_inventory`, or `search_files`, which has no
-        // `path_prefix` field at all; tracked as D20): explicit NotApplicable,
-        // not a silent drop.
+        // `get_repo_map` or `context_inventory`): explicit NotApplicable, not a
+        // silent drop. (search_files now has a `path_prefix` field and is in
+        // PATH_PREFIX_FORWARD_TOOLS, so it routes via the branch above.)
         ParamDisposition::NotApplicable
     };
 
