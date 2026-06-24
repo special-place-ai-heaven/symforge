@@ -53,8 +53,8 @@ pub use super::search_tools::{
     FindReferencesInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
 };
 pub(crate) use super::search_tools::{
-    fix_common_double_escapes, parse_language_filter, search_symbols_options_from_input,
-    search_text_options_from_input,
+    fix_common_double_escapes, normalize_path_prefix, parse_language_filter,
+    search_symbols_options_from_input, search_text_options_from_input,
 };
 
 const INDEX_FOLDER_RESET_ENV: &str = "SYMFORGE_INDEX_FOLDER_RESET";
@@ -5485,6 +5485,27 @@ impl SymForgeServer {
             }
             view
         };
+        // Optional path-prefix scoping. Mirrors the `path_scope` axis used by
+        // `search_symbols`/`search_text`: drop hits whose path falls outside the
+        // requested prefix. Applied to the captured hits because `search_files`
+        // uses a dedicated capture API rather than the shared search options.
+        let path_scope = normalize_path_prefix(params.0.path_prefix.as_deref());
+        if !matches!(path_scope, search::PathScope::Any)
+            && let SearchFilesView::Found {
+                hits,
+                total_matches,
+                ..
+            } = &mut view
+        {
+            let before = hits.len();
+            hits.retain(|hit| path_scope.matches(&hit.path));
+            *total_matches = total_matches.saturating_sub(before - hits.len());
+            if hits.is_empty() {
+                view = SearchFilesView::NotFound {
+                    query: params.0.query.clone(),
+                };
+            }
+        }
         // Optional frecency-fusion rerank. Activated when the caller requests
         // `rank_by="frecency"`, independent of the old persistent-collection
         // feature flag. Discovery still never opens a writeable frecency store:
@@ -9573,6 +9594,7 @@ impl SymForgeServer {
                     anchor_path: None,
                     include_vendor: None,
                     include_personal_tooling: None,
+                    path_prefix: None,
                 };
                 self.search_files(Parameters(input)).await
             }
@@ -10956,6 +10978,7 @@ mod tests {
             anchor_path: None,
             include_vendor: None,
             include_personal_tooling: None,
+            path_prefix: None,
         }
     }
 
@@ -14851,6 +14874,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(result.contains("2 matching files"), "got: {result}");
@@ -14873,6 +14897,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_files_path_prefix_scopes_results() {
+        let server = make_server(make_live_index_ready(vec![
+            make_file("src/protocol/tools.rs", b"fn a() {}", vec![]),
+            make_file("src/sidecar/tools.rs", b"fn b() {}", vec![]),
+        ]));
+
+        // Without path_prefix: both same-basename files are returned.
+        let unscoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: None,
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+        assert!(
+            unscoped.contains("src/protocol/tools.rs"),
+            "unscoped should include protocol path, got: {unscoped}"
+        );
+        assert!(
+            unscoped.contains("src/sidecar/tools.rs"),
+            "unscoped should include sidecar path, got: {unscoped}"
+        );
+
+        // With path_prefix=src/protocol: only paths under that prefix survive.
+        let scoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: Some("src/protocol".to_string()),
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+        assert!(
+            scoped.contains("src/protocol/tools.rs"),
+            "scoped should include in-prefix path, got: {scoped}"
+        );
+        assert!(
+            !scoped.contains("src/sidecar/tools.rs"),
+            "scoped must drop out-of-prefix path, got: {scoped}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_files_not_found() {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
@@ -14889,6 +14953,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(
@@ -14934,6 +14999,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -14985,6 +15051,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15014,6 +15081,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         // Without git temporal data, should return informative message (not an error/panic)
@@ -15082,6 +15150,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15134,6 +15203,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15186,6 +15256,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15226,6 +15297,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15265,6 +15337,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15301,6 +15374,7 @@ mod tests {
                 anchor_path: Some("src/missing/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15337,6 +15411,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15376,6 +15451,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15410,6 +15486,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15427,6 +15504,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15466,6 +15544,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15483,6 +15562,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15519,6 +15599,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15557,6 +15638,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: Some(true),
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15587,6 +15669,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15625,6 +15708,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: Some(true),
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15659,6 +15743,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15694,6 +15779,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(
@@ -15727,6 +15813,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(

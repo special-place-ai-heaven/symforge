@@ -431,7 +431,8 @@ fn is_orient_query(lower: &str) -> bool {
 /// is a TARGET/selector (e.g. `get_file_content`, `find_references`) are
 /// intentionally excluded: there the target comes from the query, not a scope
 /// hint, so forwarding the caller's `path` would be wrong.
-const PATH_PREFIX_FORWARD_TOOLS: &[&str] = &["search_symbols", "search_text", "explore"];
+const PATH_PREFIX_FORWARD_TOOLS: &[&str] =
+    &["search_symbols", "search_text", "explore", "search_files"];
 
 /// A1b gated per-tool forwarding: thread the caller's `path` into each plan
 /// step's `path_prefix` arg where that tool accepts a path scope (and the caller
