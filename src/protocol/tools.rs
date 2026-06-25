@@ -2446,9 +2446,24 @@ fn find_references_scope_summary(input: &FindReferencesInput, mode: &str) -> Str
     parts.join("; ")
 }
 
+/// True when the `references`-mode `kind` filter sweeps in type/value usages,
+/// whose recall is genuinely best-effort: the xref extractor resolves them
+/// syntactically and misses dynamic dispatch, macro-generated, reflective, and
+/// cross-language usages. Direct `call`/`import`/`macro_use` references are
+/// extracted reliably, so they earn no caveat (and `implementations` mode never
+/// reaches this label — it has its own branch). `None`/`"all"` default includes
+/// type/value usages, so it is best-effort too.
+fn find_references_kind_is_best_effort(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        None | Some("all") | Some("type_usage") | Some("value_use")
+    )
+}
+
 fn find_references_completeness_label(
     view: &crate::live_index::FindReferencesView,
     limits: &format::OutputLimits,
+    kind: Option<&str>,
 ) -> String {
     let shown_files = view.files.len().min(limits.max_files);
     let mut shown_refs = 0usize;
@@ -2465,8 +2480,17 @@ fn find_references_completeness_label(
     }
     let omitted_refs = view.total_refs.saturating_sub(shown_refs);
     let omitted_files = view.total_files.saturating_sub(shown_files);
+    // Recall-confidence caveat, targeted (not blanket): only type/value-usage
+    // traces are best-effort, so only they carry it. Riding the existing
+    // completeness label keeps it one site, one envelope, no ResultStatus bump.
+    let recall_caveat = if find_references_kind_is_best_effort(kind) {
+        " — usage-trace recall is best-effort; dynamic dispatch, macro-generated, \
+         reflective, and cross-language usages may be missed"
+    } else {
+        ""
+    };
     if omitted_refs == 0 && omitted_files == 0 {
-        return "full for current scope".to_string();
+        return format!("full for current scope{recall_caveat}");
     }
     let mut parts = vec!["truncated by result cap".to_string()];
     if omitted_refs > 0 {
@@ -2475,7 +2499,7 @@ fn find_references_completeness_label(
     if omitted_files > 0 {
         parts.push(format!("{omitted_files} file(s) omitted"));
     }
-    parts.join("; ")
+    format!("{}{recall_caveat}", parts.join("; "))
 }
 
 fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> String {
@@ -7232,7 +7256,7 @@ impl SymForgeServer {
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
                         ),
-                        &find_references_completeness_label(&view, &limits),
+                        &find_references_completeness_label(&view, &limits, input.kind.as_deref()),
                         &find_references_scope_summary(input, mode),
                         &find_references_evidence(&view),
                     ))
@@ -21030,6 +21054,61 @@ mod tests {
         assert!(
             !result.contains("definitions named"),
             "single definition must not trigger the disclosure; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_usage_trace_carries_recall_caveat() {
+        // R3 honesty: type/value-usage traces have best-effort recall (dynamic
+        // dispatch, macros, reflection, cross-language are missed). The default
+        // kind sweeps in type/value usages, so the completeness envelope must
+        // carry the recall caveat. Without it, a caller cannot tell the trace
+        // may be partial — a silent degrade.
+        let def = make_symbol("Widget", SymbolKind::Struct, 1, 1);
+        let user = make_symbol("user", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/widget.rs",
+            b"struct Widget;\nfn user(w: Widget) {}\n",
+            vec![def, user],
+            vec![make_ref(
+                "Widget",
+                None,
+                ReferenceKind::TypeUsage,
+                2,
+                Some(2),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let result = server
+            .find_references(Parameters(find_references_input("Widget")))
+            .await;
+        assert!(
+            result.contains("usage-trace recall is best-effort")
+                && result.contains("dynamic dispatch"),
+            "type/value-usage trace must carry the recall-confidence caveat; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_call_trace_has_no_recall_caveat() {
+        // Targeted, not blanket: direct `call` references are extracted reliably,
+        // so they must NOT carry the best-effort recall caveat — otherwise it is
+        // boilerplate noise the model learns to ignore.
+        let def = make_symbol("do_work", SymbolKind::Function, 1, 1);
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/work.rs",
+            b"fn do_work() {}\nfn caller() { do_work(); }\n",
+            vec![def, caller],
+            vec![make_ref("do_work", None, ReferenceKind::Call, 2, Some(2))],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let mut input = find_references_input("do_work");
+        input.kind = Some("call".to_string());
+        let result = server.find_references(Parameters(input)).await;
+        assert!(
+            !result.contains("usage-trace recall is best-effort"),
+            "direct call trace must NOT carry the recall caveat (targeted, not blanket); got: {result}"
         );
     }
 
