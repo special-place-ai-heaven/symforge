@@ -2454,9 +2454,15 @@ fn find_references_scope_summary(input: &FindReferencesInput, mode: &str) -> Str
 /// reaches this label — it has its own branch). `None`/`"all"` default includes
 /// type/value usages, so it is best-effort too.
 fn find_references_kind_is_best_effort(kind: Option<&str>) -> bool {
+    // Mirror `find_references_kind_filter` rather than duplicating a string
+    // whitelist, so the caveat can never drift from the kinds actually returned.
+    // A filter result of `None` means "no kind filter" -> all kinds returned,
+    // INCLUDING best-effort type/value usages; that covers `all`/`None` AND any
+    // UNRECOGNIZED kind (the filter's `_ => None` arm), so a typo'd `kind` still
+    // gets the caveat instead of silently shipping a best-effort trace unmarked.
     matches!(
-        kind,
-        None | Some("all") | Some("type_usage") | Some("value_use")
+        find_references_kind_filter(kind),
+        None | Some(ReferenceKind::TypeUsage) | Some(ReferenceKind::ValueUse)
     )
 }
 
@@ -21109,6 +21115,38 @@ mod tests {
         assert!(
             !result.contains("usage-trace recall is best-effort"),
             "direct call trace must NOT carry the recall caveat (targeted, not blanket); got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_unrecognized_kind_carries_recall_caveat() {
+        // Drift guard: an unrecognized `kind` maps to `None` in
+        // find_references_kind_filter -> NO filter -> ALL kinds returned,
+        // including best-effort type/value usages. The caveat must therefore
+        // still fire (it mirrors the filter), or a typo'd kind silently ships an
+        // unmarked best-effort trace — the exact silent-degrade R3 prevents.
+        let def = make_symbol("Widget", SymbolKind::Struct, 1, 1);
+        let user = make_symbol("user", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/widget.rs",
+            b"struct Widget;\nfn user(w: Widget) {}\n",
+            vec![def, user],
+            vec![make_ref(
+                "Widget",
+                None,
+                ReferenceKind::TypeUsage,
+                2,
+                Some(2),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let mut input = find_references_input("Widget");
+        input.kind = Some("totally-bogus-kind".to_string());
+        let result = server.find_references(Parameters(input)).await;
+        assert!(
+            result.contains("usage-trace recall is best-effort"),
+            "unrecognized kind returns all (best-effort) refs, so the caveat must \
+             still fire (filter-mirrored, no drift); got: {result}"
         );
     }
 
