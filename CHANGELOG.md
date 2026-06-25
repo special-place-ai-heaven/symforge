@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.4...v8.9.5) (2026-06-25)
+
+
+### Bug Fixes
+
+* **012f:** GC last-holder orphans on session close ([b140405](https://github.com/special-place-ai-heaven/symforge/commit/b1404057b6cfb962d47ff735d72b904140db3b5a))
+* **012f:** orphan GC for the bases intern table (SC-002-safe) ([3816fe3](https://github.com/special-place-ai-heaven/symforge/commit/3816fe3270b2ce42c4102172a94e4bd09d3c42b4))
+
 ## [8.9.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.3...v8.9.4) (2026-06-24)
 
 
