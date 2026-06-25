@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.5...v8.9.6) (2026-06-25)
+
+
+### Bug Fixes
+
+* **012f/r3:** mirror kind filter so unrecognized kind still caveats ([b9658bb](https://github.com/special-place-ai-heaven/symforge/commit/b9658bb43ee9d02541eb753850db0c370b456ce4))
+* **012f/r3:** recall-confidence caveat on find_references usage traces ([dae2add](https://github.com/special-place-ai-heaven/symforge/commit/dae2addcc0ae40d03ce654aa2c5ee3d4504705ad))
+
 ## [8.9.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.4...v8.9.5) (2026-06-25)
 
 
