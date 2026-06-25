@@ -12,11 +12,11 @@ Last updated: 2026-06-24.
 > empties the overlay, `daemon.rs:790-798`). Verified @086d6c4. The overlay is a
 > deliberate vision seam (012 US3/SC-003), NOT obsolete, but has NO production
 > consumer. Decision: `docs/reviews/overlay-redundancy-decision.md`. Honesty
-> caveat: low-recall type-usage traces ship no incompleteness signal — add a
-> recall-confidence caveat on partial type-usage traces (cheap honesty win;
-> still warranted after D13 — D13 closed qualified-call construction recall but
-> not every recall edge, so a partial-trace signal remains useful). Pairs with
-> D18/R3.
+> caveat: low-recall type-usage traces shipped no incompleteness signal —
+> **FIXED (012f, R3):** find_references type/value-usage traces now carry a
+> targeted recall-confidence caveat (best-effort modes ONLY, mirrors the kind
+> filter; names the dynamic/macro/reflective/cross-language gaps; no false
+> precision; not blanket noise).
 
 ## CULPRITS (root causes — these get attacked, not their symptoms)
 
@@ -63,7 +63,7 @@ Last updated: 2026-06-24.
 |----|----------------|--------------|--------|-------|
 | D16 | `/mcp` is a stateless single-`SymForgeServer`-over-one-index; remote multi-tenant/multi-project impossible. **C-stopgap (012d): the silent-wrong HALF is CONTAINED** — `/mcp` loudly refuses `project`/`projects` on the three cross-project tools via `local_cross_project_refusal` (no daemon behind the handler → `proxy_tool_call`=`None` because `/mcp`'s `SymForgeServer::new` leaves `daemon_client=None`). Already wired since Phase 3 (`278864c`); 012d adds the missing regression lock (`tests/serve_http_attach.rs`) + names the `/mcp` transport in the refusal. The ROOT (per-connection `/mcp` daemon session) stays OPEN/tracked-large. | **ROOT (Culprit C)** | OPEN (silent-half CONTAINED) | new |
 | D17 | open-vs-close TOCTOU race in the daemon (fail-loud, pre-existing on main). | ROOT (independent) | OPEN | new |
-| D18 | Reading a missing symbol silently returns the parent file outline instead of a not-found error (D18/R3). **#2 frontier** (silent-wrong family, same as the fixed R1/C4 wins): `get_symbol(TotallyFake, src/main.rs)` returns the full main.rs outline. Small isolated guard at the get_symbol read choke point; high impact, low effort. See `docs/reviews/overlay-redundancy-decision.md`. | SYMPTOM(A) | OPEN (#2) | new |
+| D18 | Reading a missing symbol silently returned a stand-in instead of a not-found (D18/R3). Note: the actual silent-wrong path was a `content_anchored_symbol_window` (a substring-matched source window — e.g. a comment mention), not the parent outline as first described. **FIXED (012f):** D18 — `get_symbol` on an absent symbol now returns a loud `No symbol <name> in <path>` that auto-classifies as `OutcomeClass::NotFound` (shared formatter → both single- and batch-mode; PR #379). R3 — find_references type/value-usage traces carry a targeted recall-confidence caveat (best-effort modes ONLY, mirrors the kind filter so a typo'd kind cannot silently ship an unmarked best-effort trace; not blanket noise, no false precision). | SYMPTOM(A) | FIXED (012f) | 012 |
 | D19 | No multi-step query decomposition (only the 3 hardcoded multi-hop strings). | SYMPTOM(A) | OPEN | new |
 
 ## FIXED this engagement (012 lane, verified green)
@@ -101,7 +101,7 @@ Sequence by (defects-killed ÷ effort), gated by file independence:
 5. **C-stopgap** — DONE (012d, behaviorally verified over the real `/mcp` HTTP transport). TRACE FINDING: the `/mcp` refusal was ALREADY wired since Phase 3 (`local_cross_project_refusal` fires because `/mcp`'s `SymForgeServer::new` has `daemon_client=None`); the real gaps were the missing regression lock (now `tests/serve_http_attach.rs`) + the message not naming the `/mcp` transport (now fixed). NO new refusal logic. D16's silent-wrong half is CONTAINED; the ROOT (per-connection `/mcp` session) stays tracked-large. Owner 012.
 6. **B2** — DONE (012e, merged PR #369): LAZY re-intern/force-replace of the stale cross-project base on the read path → **D12 FIXED**. Full CI green, unanimous adversarial review, real-watcher live daemon-HTTP SC-1/SC-2 proof. Owner 012.
 
-**NEXT frontier**: **D13 FIXED (012f)** — qualified-call construction recall closed via the `find_references` immediate-qualifier head-match (Rust + C++); struct/composite literals were already covered. **D18/R3** (loud not-found on missing symbol) is now the #1 OPEN frontier (small guard, high impact), paired with the recall-confidence caveat on partial type-usage traces. The overlay/IndexView track is PARKED: **D15** is a DORMANT SEAM (writer kept, redundant read removed), **D-B0** is MOOT until precondition #1 (a real overlay writer) lands — neither is built under the single shared live index. **D16-full** (`/mcp` per-connection daemon session) stays tracked-large. Owner 012. Decision: `docs/reviews/overlay-redundancy-decision.md`.
+**NEXT frontier**: the **012f actionable set is COMPLETE** — D13, D18, R3, D20, and bases-table orphan GC are all FIXED + merged (release-please v8.9.0–v8.9.4); D15 reframed as a DORMANT SEAM. The remaining Culprit-B/overlay work (D15 read-migration, **D-B0**, **D16-full**) is BLOCKED on **precondition #1**: a real overlay WRITER where edits land in the per-session overlay and are NOT written through to the shared base (commit-gated session isolation). Until that lands, the overlay is redundant in production and those items must not be built (building them is the no-op work this campaign exists to prevent). Owner 012. Decision + lesson invariant: `docs/reviews/overlay-redundancy-decision.md`; full campaign scorecard: `docs/reviews/012f-RESULTS.md`.
 
 A2 (`Figure` provenance enum) = DEMOTED to regression-guard (envelope already honest); low priority, owner 012.
 
