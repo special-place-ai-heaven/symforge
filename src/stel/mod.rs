@@ -88,11 +88,9 @@ pub use gates::{
     normalize_battery_results, phase2_minimum_gates_pass,
 };
 pub use golden_replay::{
-    DEFERRED_MULTI_HOP_ROW_IDS, GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification,
-    GoldenReplayCategory, MULTI_HOP_GOLDEN_ROW_IDS, MULTI_HOP_REPLAY_CORPUS_ROOT, ReplayValidation,
+    GOLDEN_ROUTES_FIXTURE, GoldenCorpusClassification, GoldenReplayCategory, ReplayValidation,
     S4_EXIT_ROW_IDS, S4_REPLAY_CORPUS, classify_golden_corpus, classify_golden_row,
-    corpus_for_row_id, corpus_marker_for_row_id, load_golden_rows,
-    multi_hop_replay_corpus_for_row_id, multi_hop_replay_corpus_marker, parse_golden_rows,
+    corpus_for_row_id, corpus_marker_for_row_id, load_golden_rows, parse_golden_rows,
     request_for_golden_row, s4_exit_rows, supported_pff_rows, supported_serve_rows,
     validate_pff_replay_output, validate_s4_replay_output, validate_serve_replay_output,
 };
@@ -111,8 +109,9 @@ pub use planner::{
 };
 pub use status::{
     DEFERRED_ITEMS, DurableLedgerState, DurableLedgerSummary, PHASE0_EVIDENCE_COMMIT,
-    PHASE0_GO_COMMIT, ProxyOwnedStatusLines, StelStatusContext, format_durable_ledger_line,
-    format_last_ledger_lines, format_stel_status, render_proxy_owned_lines,
+    PHASE0_GO_COMMIT, ProxyOwnedStatusLines, SUPERSEDED_ITEMS, StelStatusContext,
+    format_durable_ledger_line, format_last_ledger_lines, format_stel_status,
+    render_proxy_owned_lines,
 };
 pub use surface::{COMPACT_SURFACE_TOOL_COUNT, COMPACT_TOOL_NAMES, CompactSurfaceTool};
 pub use surface_list::{

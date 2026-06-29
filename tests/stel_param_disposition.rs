@@ -58,9 +58,6 @@ const ROUTE_PROBES: &[(&str, Option<IntentBucket>)] = &[
     ("map of workspace crates", Some(IntentBucket::Orient)),
     ("how does cfg_if work", Some(IntentBucket::Orient)),
     ("index health", Some(IntentBucket::Meta)),
-    // Multi-hop ordered plans.
-    ("search then fetch cfg_if body", None),
-    ("find test.js then read it", None),
     // Phrasing routes that consume path/symbol on specific tools.
     ("body of cfg_if in src/lib.rs", Some(IntentBucket::Read)),
     ("Database symbol in records.py", Some(IntentBucket::Read)),
