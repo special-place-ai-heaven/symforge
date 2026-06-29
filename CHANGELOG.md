@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.6...v8.9.7) (2026-06-29)
+
+
+### Bug Fixes
+
+* **stel:** remove the multi-hop fake; route honestly via single-step/find-fusion ([df33b58](https://github.com/special-place-ai-heaven/symforge/commit/df33b58344275fa1a2aa2e0a553915067f9d3a65))
+
 ## [8.9.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.5...v8.9.6) (2026-06-25)
 
 
