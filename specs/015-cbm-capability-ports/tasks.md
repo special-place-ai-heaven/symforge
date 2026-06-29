@@ -22,7 +22,7 @@
 - [x] P-PROG-004 Index symforge via MCP `status`; record baseline in sprint-0-spike-spec Baseline table + `code-evidence.md` dogfood log.
 - [x] P-PROG-005 Resolve PD-03 (BM25 defer) → decision-log D-015-011.
 - [x] P-PROG-006 Resolve PD-04 (detect_changes alias) → decision-log D-015-012.
-- [x] P-PROG-007 Create branch `015-cbm-capability-ports`; worktree `E:/project/symforge-015`; `.specify/feature.json` in worktree.
+- [x] P-PROG-007 Branch `015-cbm-capability-ports` in `E:/project/symforge`; `.specify/feature.json` → 015.
 - [x] P-PROG-008 [P] Review constitution.md Principles I–VIII; sign checklist in checklists/requirements.md.
 - [x] P-PROG-009 Bootstrap [planning/code-evidence.md](./planning/code-evidence.md): SymForge-verify S0–S1 touch points; grep CBM mcp.c anchors.
 

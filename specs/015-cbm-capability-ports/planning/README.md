@@ -28,7 +28,7 @@
 | Document | Purpose |
 |----------|---------|
 | **[benchmark-intake.md](./benchmark-intake.md)** | **Operator CBM vs SymForge runs** (parallel to Speckit) |
-| **[WORKTREE.md](./WORKTREE.md)** | **Isolated branch path `E:/project/symforge-015`** |
+| **[BRANCH.md](./BRANCH.md)** | **Work in `E:/project/symforge` on branch `015-cbm-capability-ports`** |
 | **[parallelism.md](./parallelism.md)** | **What can run ∥ vs must wait** (multi-agent dispatch) |
 | **[agent-workload.md](./agent-workload.md)** | Sprint balance + ≤6 [C] per agent wave |
 | **[code-evidence.md](./code-evidence.md)** | **SymForge-verified anchors** — every US/sprint claim links here |

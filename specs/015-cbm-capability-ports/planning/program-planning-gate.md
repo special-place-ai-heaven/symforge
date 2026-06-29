@@ -11,4 +11,5 @@ See [analyze.md](../analyze.md) for Speckit analyze (0 critical).
 **S1a Planning**: [sprint-1-quick-wins-spec.md](./sprint-1-quick-wins-spec.md) — wave 1 [P] done; gate pending  
 **Operator benchmarks**: [benchmark-intake.md](./benchmark-intake.md) — parallel track  
 **Next work (this agent)**: S1a [P] P-S1A-010..013 + contract freeze sign-off  
-**Operator before first PR**: push `015-cbm-capability-ports` from **`E:/project/symforge-015`** (see [WORKTREE.md](./WORKTREE.md)).
+**Work here**: `E:/project/symforge` · branch **`015-cbm-capability-ports`** ([BRANCH.md](./BRANCH.md))  
+**Operator before first PR**: `git push -u origin 015-cbm-capability-ports`
