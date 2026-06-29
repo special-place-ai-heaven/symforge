@@ -424,43 +424,6 @@ pub(crate) fn reindex_after_write(
     index.update_file(relative_path.to_string(), indexed);
 }
 
-/// D15 overlay-WRITER parse: re-read the just-written file from disk and parse it
-/// into an `Arc<IndexedFile>` for upsert into the session overlay. Mirrors
-/// [`reindex_after_write`]'s parse (`process_file` + `from_parse_result` +
-/// `with_mtime`) but returns the `Arc` instead of feeding the base index.
-///
-/// Separate from `reindex_after_write` because the base index owns its own `Arc`
-/// (`LiveIndex::update_file` re-wraps the value), so the overlay needs its own.
-/// PartialParse yields a valid `IndexedFile` with whatever symbols parsed — never
-/// an error — so the overlay upsert is never skipped for a partial file (AC6).
-/// Returns `None` only when the file cannot be re-read from disk (matching
-/// `reindex_after_write`'s warn-and-skip on a read failure).
-pub(crate) fn parse_indexed_for_overlay(
-    abs_path: &Path,
-    relative_path: &str,
-    language: LanguageId,
-) -> Option<std::sync::Arc<IndexedFile>> {
-    let on_disk = match std::fs::read(abs_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(
-                "parse_indexed_for_overlay: failed to re-read {}: {e}",
-                abs_path.display()
-            );
-            return None;
-        }
-    };
-    let mtime_secs = std::fs::metadata(abs_path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let result = crate::parsing::process_file(relative_path, &on_disk, language);
-    let indexed = IndexedFile::from_parse_result(result, on_disk).with_mtime(mtime_secs);
-    Some(std::sync::Arc::new(indexed))
-}
-
 // ---------------------------------------------------------------------------
 // Rerouted edit base (review finding 5, post-v7.19.0)
 // ---------------------------------------------------------------------------

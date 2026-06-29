@@ -794,35 +794,6 @@ impl SymForgeServer {
                 &new_content,
                 file.language.clone(),
             );
-            // DORMANT SEAM (012 US3/SC-003/FR-005). This populates the per-session
-            // overlay, but NO production read path consumes the delta today: the
-            // get_symbol overlay read was removed (redundant), and cross-project
-            // refresh_working_set_bases re-interns the base from the live index and
-            // attaches a fresh EMPTY overlay. The base is already updated by
-            // reindex_after_write above, so every read sees the edit via the base.
-            // The writer is kept as a deliberate seam for FUTURE commit-gated
-            // session-private edits (precondition #1 in
-            // docs/reviews/overlay-redundancy-decision.md): until edits stop writing
-            // through to the shared base, the overlay can only ever duplicate it.
-            // `None` on the shared instance and in local-stdio mode — byte-identical.
-            // The overlay lock is taken AFTER reindex_after_write returned (no
-            // index-lock nesting, I2) and while holding NO daemon-map lock (I1).
-            if let Some(ov) = &self.session_working_set
-                && let Some(parsed) = edit::parse_indexed_for_overlay(
-                    &resolved_path,
-                    &params.0.path,
-                    file.language.clone(),
-                )
-            {
-                let mut ws = ov.working_set.write();
-                if let Some(entry) = ws.get_mut(&ov.project_id) {
-                    entry.overlay.upsert(params.0.path.clone(), parsed);
-                }
-                // entry `None`: the active project was not seeded into this
-                // session's working set (a wiring bug — see spec stop_conditions).
-                // Best-effort: the base was already updated by reindex_after_write,
-                // so reads still see the edit via the base fall-through.
-            }
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
         let warnings = edit::detect_stale_references(
