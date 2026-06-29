@@ -222,9 +222,6 @@ fn plan_carries_path(plan: &StelPlan, request: &StelRequest) -> bool {
 
 /// Build a draft plan for compact `symforge` (L1 → L2).
 pub fn build_plan(request: &StelRequest) -> StelPlan {
-    if let Some(steps) = plan_multi_hop_steps(request) {
-        return build_plan_from_steps(request, steps);
-    }
     // A caller that supplies a bare-identifier `symbol` clearly wants THAT
     // symbol, not a full-text search over the natural-language `query`. Honor it
     // for find/auto intent (the buckets that would otherwise run a query-side
@@ -514,7 +511,7 @@ fn build_plan_from_steps(request: &StelRequest, steps: Vec<PlannedStep>) -> Stel
     plan
 }
 
-/// Envelope plan line: `trace → find_references (exact)` or multi-hop `find → search_symbols → get_symbol (inferred)`.
+/// Envelope plan line: `trace → find_references (exact)` or fused `find → search_files → search_text (inferred)`.
 pub fn plan_summary_line(plan: &StelPlan) -> String {
     let tool_chain = plan
         .steps
@@ -549,66 +546,6 @@ fn plan_step(request: &StelRequest) -> PlannedStep {
         return step;
     }
     route_with_smart_query(request)
-}
-
-/// Ordered multi-step plans for the three Phase 2 golden multi-hop rows.
-fn plan_multi_hop_steps(request: &StelRequest) -> Option<Vec<PlannedStep>> {
-    let lower = request.query.trim().to_ascii_lowercase();
-    if lower == "search then fetch cfg_if body" {
-        return Some(vec![
-            planned(
-                "search_symbols",
-                json!({ "query": "cfg_if" }),
-                IntentBucket::Find,
-                RouteConfidence::Inferred,
-                "multi-hop search then fetch symbol",
-            ),
-            planned(
-                "get_symbol",
-                json!({ "path": "src/lib.rs", "name": "cfg_if" }),
-                IntentBucket::Read,
-                RouteConfidence::Inferred,
-                "multi-hop fetch symbol body",
-            ),
-        ]);
-    }
-    if lower == "outline then find connection refs" {
-        return Some(vec![
-            planned(
-                "get_file_context",
-                json!({ "path": "records.py" }),
-                IntentBucket::Read,
-                RouteConfidence::Inferred,
-                "multi-hop outline first",
-            ),
-            planned(
-                "find_references",
-                json!({ "name": "Connection", "compact": true }),
-                IntentBucket::Trace,
-                RouteConfidence::Inferred,
-                "multi-hop find references",
-            ),
-        ]);
-    }
-    if lower == "find test.js then read it" {
-        return Some(vec![
-            planned(
-                "search_files",
-                json!({ "query": "test.js" }),
-                IntentBucket::Find,
-                RouteConfidence::Inferred,
-                "multi-hop find file",
-            ),
-            planned(
-                "get_file_content",
-                json!({ "path": "test.js" }),
-                IntentBucket::Read,
-                RouteConfidence::Inferred,
-                "multi-hop read file",
-            ),
-        ]);
-    }
-    None
 }
 
 /// Rationale marker (human-facing) for the path/file step of a fused find plan.
@@ -1626,35 +1563,24 @@ mod tests {
     }
 
     #[test]
-    fn multi_hop_golden_rows_plan_ordered_steps() {
-        let cases = [
-            (
-                "cfg-if/multi_search_symbol",
-                "search then fetch cfg_if body",
-                vec!["search_symbols", "get_symbol"],
-            ),
-            (
-                "records/multi_context_refs",
-                "outline then find Connection refs",
-                vec!["get_file_context", "find_references"],
-            ),
-            (
-                "is-plain/multi_files_content",
-                "find test.js then read it",
-                vec!["search_files", "get_file_content"],
-            ),
-        ];
-        for (id, query, expected_tools) in cases {
+    fn ex_multi_hop_queries_plan_non_empty_single_or_fused() {
+        // D5/D19: the three former "multi-hop" golden query strings no longer
+        // get a fabricated 2-step decomposition. They must route HONESTLY through
+        // the normal single-step / find-fusion path — never panic, never an empty
+        // plan, never the old fake exact-match 2-step chain.
+        for query in [
+            "search then fetch cfg_if body",
+            "outline then find Connection refs",
+            "find test.js then read it",
+        ] {
             let plan = build_plan(&StelRequest {
                 query: query.to_string(),
                 ..Default::default()
             });
-            let planned: Vec<String> = plan.steps.iter().map(|step| step.tool.clone()).collect();
-            assert_eq!(
-                planned, expected_tools,
-                "multi-hop planner mismatch for {id}"
+            assert!(
+                !plan.steps.is_empty(),
+                "ex-multi-hop query `{query}` must produce a non-empty plan"
             );
-            assert_eq!(plan.steps.len(), 2, "{id} must be two-step plan");
         }
     }
 
