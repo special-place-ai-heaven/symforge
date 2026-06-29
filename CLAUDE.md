@@ -57,5 +57,5 @@ When merging tools A into B:
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/012-harness-agnostic-mcp/plan.md
+at specs/015-cbm-capability-ports/plan.md
 <!-- SPECKIT END -->

@@ -1,0 +1,9 @@
+{
+  "scenario": "commit_2_changes_src_a_rs",
+  "changed_files": ["src/a.rs"],
+  "expected_blast": [
+    {"symbol": "core", "path": "src/lib.rs", "hop": 1, "risk": "high"},
+    {"symbol": "call_a", "path": "src/a.rs", "hop": 0, "risk": "changed"}
+  ],
+  "notes": "Populate after git bootstrap; hop/risk tiers per contracts/detect-impact.md"
+}
