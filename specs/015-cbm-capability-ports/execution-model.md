@@ -130,9 +130,9 @@ tasks.md             ← [P]/[C]/[V] ordered work
 
 | Prefix | Meaning | Example |
 |--------|---------|---------|
-| `P-Sn-###` | Planning for sprint n | `P-S1-003` |
-| `C-Sn-###` | Coding for sprint n | `C-S1-012` |
-| `V-Sn-###` | Validation for sprint n | `V-S1-004` |
+| `P-Sn-###` | Planning for sprint n | `P-S1A-003` |
+| `C-Sn-###` | Coding for sprint n | `C-S1A-003` |
+| `V-Sn-###` | Validation for sprint n | `V-S1A-001` |
 | `P-PROG-###` | Program-wide planning | `P-PROG-001` |
 
 Legacy `T###` IDs in older notes map to `[C]` tasks in tasks.md.

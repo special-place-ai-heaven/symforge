@@ -6,7 +6,7 @@
 
 **Code-backed rule**: Every `[P]` task ends with an `EV-*` row in [planning/code-evidence.md](./planning/code-evidence.md) citing SymForge MCP (symforge repo) or CBM clone line anchors. See [execution-model.md](./execution-model.md) § Code-backed planning.
 
-**Totals**: **159 tasks** — 91 `[P]` · 41 `[C]` · 27 `[V]` · **Waves**: [agent-workload.md](./planning/agent-workload.md) · **Parallel/seq**: [parallelism.md](./planning/parallelism.md)
+**Totals**: **159 tasks** — 91 `[P]` · 41 `[C]` · 27 `[V]` · **Waves**: [agent-workload.md](./planning/agent-workload.md) · **Parallel/seq**: [parallelism.md](./planning/parallelism.md) · **Live status board**: [planning/task-index.md](./planning/task-index.md)
 
 **Planning complete**: PROG + S0 `[P]` (2026-06-29). See [planning/program-planning-gate.md](./planning/program-planning-gate.md), [analyze.md](./analyze.md).
 
@@ -341,7 +341,7 @@ V-S1-001..005 → V-S1A-* + V-S1B-*
 ### [P]
 
 - [ ] P-POL-001 Final decision-log review; no open PD-*.
-- [ ] P-POL-002 Update Obsidian program report with actuals.
+- [x] P-POL-002 Update Obsidian program report with actuals.
 - [ ] P-POL-003 Minimal AGENTS.md MCP table delta draft (review only).
 
 ### [C]

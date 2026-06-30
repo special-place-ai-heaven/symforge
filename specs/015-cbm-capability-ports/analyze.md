@@ -5,6 +5,8 @@
 **Speckit**: `/speckit-analyze` (post-clarify)  
 **Constitution**: `.specify/memory/constitution.md` v1.0.0
 
+> **Patched 2026-06-30** (operator): task counts + S1a/S1b coverage IDs realigned to tasks.md (159 tasks; S1 split into S1a/S1b). The 2026-06-29 Findings table below is the historical record; a full `/speckit-analyze` re-run is still pending before the S1a Planning Gate (see Next Actions).
+
 ## Findings
 
 | ID | Category | Severity | Location(s) | Summary | Remediation |
@@ -27,11 +29,11 @@
 
 | Requirement | Has Task? | Task IDs (representative) |
 |-------------|-----------|---------------------------|
-| FR-001 detect_impact | Yes | C-S1-001..004 |
-| FR-002 zstd artifact | Yes | C-S1-005..006 |
-| FR-003 search rank | Yes | C-S1-007..008 |
-| FR-004 pagination | Yes | C-S1-009 |
-| FR-005 hook augment | Yes | C-S1-010 |
+| FR-001 detect_impact | Yes | C-S1A-001..003 |
+| FR-002 zstd artifact | Yes | C-S1A-005..006 |
+| FR-003 search rank | Yes | C-S1B-001..002 |
+| FR-004 pagination | Yes | C-S1B-003 |
+| FR-005 hook augment | Yes | C-S1B-004 |
 | FR-006 graph projection | Yes | C-S2-001..002 |
 | FR-007 trace_path | Yes | C-S2-003..004 |
 | FR-008 query_graph fail-closed | Yes | C-S2-005..006 |
@@ -57,7 +59,7 @@
 | II MCP-native | Pass | Tools + resources planned |
 | III Trust envelopes | Pass | detect_impact read-only; diagnostics no source |
 | IV Determinism/recovery | Pass | quarantine pattern reused |
-| V Frecency | Pass | V-S1-004, V-S4-001 explicit |
+| V Frecency | Pass | V-S1B-002 (frecency ext), V-S4-001 explicit |
 | VI Embed isolation | Pass | NFR-003 in spec |
 | VII Transport parity | Pass | NFR-004; CLI mirror S6 |
 | VIII Verification | Pass | quickstart + full gate per sprint |
@@ -66,7 +68,7 @@
 
 | Metric | Value |
 |--------|-------|
-| Total tasks | **151** ([P] 84 · [C] 41 · [V] 26) |
+| Total tasks | **159** ([P] 91 · [C] 41 · [V] 27) |
 | Requirement coverage | 100% |
 | Critical issues | 0 |
 

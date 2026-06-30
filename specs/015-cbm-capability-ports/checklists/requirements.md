@@ -24,7 +24,7 @@
 
 - [x] 15 user stories with independent tests
 - [x] Sprint map in sprints.md
-- [x] 151 tasks in tasks.md with file paths ([P] 84 / [C] 41 / [V] 26)
+- [x] 159 tasks in tasks.md with file paths ([P] 91 / [C] 41 / [V] 27)
 - [x] Contracts for all major surfaces
 - [x] quickstart.md runnable validation per sprint
 

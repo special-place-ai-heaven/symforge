@@ -56,7 +56,7 @@ SymForge MCP is bound to `project_root: E:/project/symforge`. For CBM code-backe
 - Call sites (SymForge trace 2026-06-29): `format.rs:5722` (edit_impact_summary), `tools.rs:7351` (find_dependents), `query.rs:2104` (capture_trace_symbol_view)
 - Test: `tests/impact_intent.rs:148` (impact envelope + co-change)
 
-### Git primitives already exist (reuse in C-S1-001)
+### Git primitives already exist (reuse in C-S1A-001)
 
 | API | Location | Notes |
 |-----|----------|-------|
@@ -102,7 +102,7 @@ SymForge MCP is bound to `project_root: E:/project/symforge`. For CBM code-backe
 | Text search engine | `src/live_index/search.rs` |
 | Trigram index | `src/live_index/trigram.rs` (via store) |
 | Symbol tiers | `SymbolMatchTier` in search.rs |
-| No structural rank by in-degree on text hits | **Gap** — implement C-S1-007 |
+| No structural rank by in-degree on text hits | **Gap** — implement C-S1B-001 |
 
 ---
 
@@ -114,7 +114,7 @@ SymForge MCP is bound to `project_root: E:/project/symforge`. For CBM code-backe
 | Grep workflow | `HookWorkflow::SourceSearch` @ `hook.rs:632` | CBM injects graph hits |
 | Fail-open | `fail_open_json` @ `hook.rs:805+` | — |
 | Sidecar HTTP | `endpoint_for` @ `hook.rs:738+` | Extend for symbol lookup |
-| Pagination on search | **Gap** — no `has_more` struct in format.rs | C-S1-009 |
+| Pagination on search | **Gap** — no `has_more` struct in format.rs | C-S1B-003 |
 
 ---
 

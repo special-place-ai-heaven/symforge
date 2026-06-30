@@ -21,3 +21,4 @@ Structured evidence lives in [code-evidence.md](./code-evidence.md).
 | 2026-06-29 | speckit | clarify: D-015-009/011/012; analyze.md 0 critical; PROG+S0 [P] gate |
 | 2026-06-29 | cbm-mcp | Enabled in Cursor (`E-project-symforge` indexed). SymForge = primary for this repo; CBM = graph/architecture/cross-repo reference when useful. |
 | 2026-06-29 | speckit | S1a [P] wave 1: contracts candidate-freeze, merge_git API, STEL before/after; benchmark-intake.md for operator terminal |
+| 2026-06-29 | obsidian | Refreshed `Projects/SymForge/015 CBM Capability Ports Program.md` (P-POL-002) |

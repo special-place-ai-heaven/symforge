@@ -54,9 +54,10 @@ main investment.
 
 ---
 
-## Sprint 1 — Quick wins (4 weeks) → 8.10.x — ARCHIVED
+## Sprint 1 — Quick wins → 8.10.0 + 8.10.1 — ARCHIVED (split)
 
-Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
+Split into **S1a** (8.10.0) + **S1b** (8.10.1) on the 2026-06-29 balance pass.
+Current scope lives in the S1a / S1b sections above.
 
 ---
 
@@ -71,7 +72,7 @@ Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
 | `query_graph` subset | `live_index/cypher/` (new) |
 | `symforge://repo/graph-schema` resource | `protocol/resources.rs` |
 
-**Release criteria**: S2 tasks T056–T095 green; dead-code query fixture passes.
+**Release criteria**: S2 `[C]`+`[V]` tasks green (see [tasks.md](./tasks.md) § Sprint 2); dead-code query fixture passes.
 
 ---
 
@@ -86,7 +87,7 @@ Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
 | Cross-file registry merge | `parsing/resolver/registry.rs` |
 | Pipeline integration | `parsing/mod.rs`, `live_index/store.rs` |
 
-**Release criteria**: S3 tasks T096–T135 green; resolver benchmarks in CI (ignored smoke).
+**Release criteria**: S3 `[C]`+`[V]` tasks green (see [tasks.md](./tasks.md) § Sprint 3); resolver benchmarks in CI (ignored smoke).
 
 ---
 
@@ -100,7 +101,7 @@ Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
 | STEL find keyword bridging | `stel/planner.rs`, `protocol/tools.rs` |
 | Deep index mode integration | `live_index/store.rs` |
 
-**Release criteria**: S4 tasks T136–T165 green; vocabulary fixture set passes.
+**Release criteria**: S4 `[C]`+`[V]` tasks green (see [tasks.md](./tasks.md) § Sprint 4); vocabulary fixture set passes.
 
 ---
 
@@ -114,7 +115,7 @@ Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
 | Architecture clusters | `live_index/cluster.rs`, `sidecar/handlers.rs` |
 | `get_architecture` or deep map mode | `protocol/tools.rs` |
 
-**Release criteria**: S5 tasks T166–T195 green; axum fixture + cluster smoke.
+**Release criteria**: S5 `[C]`+`[V]` tasks green (see [tasks.md](./tasks.md) § Sprint 5); axum fixture + cluster smoke.
 
 ---
 
@@ -129,7 +130,7 @@ Split into **S1a** + **S1b** (balance pass 2026-06-29). Original combined scope:
 | CLI mirror | `cli/mod.rs` (new subcommand tree) |
 | Trace ingest (minimal) | `live_index/traces.rs` |
 
-**Release criteria**: S6 tasks T196–T220 green; program quickstart full pass.
+**Release criteria**: S6 `[C]`+`[V]` tasks green (see [tasks.md](./tasks.md) § Sprint 6); program quickstart full pass.
 
 ---
 

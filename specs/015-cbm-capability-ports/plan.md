@@ -24,9 +24,9 @@ reimplements algorithms in Rust; no vendored C, no SQLite Soul Map.
 **Language/Version**: Rust 2024, single crate `symforge`.
 
 **Primary Dependencies**: Existing only — tree-sitter, `arc_swap`, `rmcp`, `postcard`,
-`rusqlite` (existing frecency/coupling/ledger stores only), `rayon`, optional `zstd`
-for artifacts (evaluate: may use `zstd` crate if not already present — check
-Cargo.toml before adding).
+`rusqlite` (existing frecency/coupling/ledger stores only), `rayon`, plus `zstd`
+for team artifacts (adopted per spec.md Clarifications / D-015-009; add the `zstd`
+crate to Cargo.toml at S1a).
 
 **Storage**:
 - **Authority**: in-process `LiveIndex` + `.symforge/index.bin` (unchanged).
@@ -69,20 +69,16 @@ No unjustified violations.
 specs/015-cbm-capability-ports/
 ├── spec.md
 ├── plan.md              # this file
+├── execution-model.md   # 60/30/10 gate model
 ├── sprints.md
 ├── research.md
 ├── data-model.md
 ├── quickstart.md
-├── tasks.md             # all sprints, all tasks
+├── tasks.md             # all sprints, all tasks (source of truth)
 ├── checklists/requirements.md
-└── contracts/
-    ├── graph-projection.md
-    ├── detect-impact.md
-    ├── team-artifact.md
-    ├── trace-path.md
-    ├── query-graph.md
-    ├── hybrid-resolver.md
-    └── semantic-edges.md
+├── contracts/           # 7 surface contracts: graph-projection, detect-impact,
+│                        #   team-artifact, trace-path, query-graph, hybrid-resolver, semantic-edges
+└── planning/            # sprint specs S0–S6, matrices, gates, logs (~30 files)
 ```
 
 ### Source (new + touch)
@@ -100,7 +96,7 @@ src/live_index/persist.rs        # zstd artifact export/import
 src/protocol/tools.rs            # detect_impact, trace_path, query_graph, manage_adr
 src/stel/planner.rs              # trace/impact/find semantic routing
 src/cli/hook.rs                  # Grep/Glob augment
-src/cli/mirror.rs                # CLI tool mirror (new)
+src/cli/mod.rs                   # CLI tool mirror subcommand tree (new) — matches sprints.md S6
 ```
 
 ## Implementation Sequencing
@@ -108,7 +104,7 @@ src/cli/mirror.rs                # CLI tool mirror (new)
 See [sprints.md](./sprints.md) and [tasks.md](./tasks.md).
 
 1. **S0**: Spikes falsify or confirm graph, artifact, resolver.
-2. **S1**: Agent-visible wins (impact, artifact, search rank, hooks).
+2. **S1a/S1b**: Agent-visible wins — S1a impact + team artifact (8.10.0), S1b search rank + hooks (8.10.1).
 3. **S2**: Graph + trace + Cypher — unlocks architecture and dead-code workflows.
 4. **S3**: Resolver depth — quality jump for trace/impact accuracy.
 5. **S4**: Semantic — vocabulary bridging without embeddings.

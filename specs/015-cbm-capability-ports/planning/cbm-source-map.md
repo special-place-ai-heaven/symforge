@@ -6,12 +6,12 @@
 
 | CBM path | Lines (approx) | Capability | SymForge target | Sprint | Read before |
 |----------|----------------|------------|-----------------|--------|-------------|
-| `src/mcp/mcp.c` | 311–496 | Tool schemas | `protocol/tools.rs`, `stel/surface_list.rs` | S1–S2 | P-S1-001, P-S2-001 |
-| `src/mcp/mcp.c` | 4415–4600 | detect_changes | `git.rs`, `live_index/graph.rs` | S1 | P-S1-010 |
-| `src/mcp/mcp.c` | 1685–1800 | search_graph BM25 | `live_index/search.rs` | S1 | P-S1-011 (defer BM25 per D-015-011) |
-| `src/cli/hook_augment.c` | all | Grep augment | `cli/hook.rs` | S1 | P-S1-012 |
-| `src/pipeline/artifact.c` | all | Team zstd artifact | `live_index/persist.rs` | S1 | P-S1-004 |
-| `src/pipeline/pipeline.c` | 1–120 | Index phases | `live_index/store.rs` modes | S1 | P-S1-013 |
+| `src/mcp/mcp.c` | 311–496 | Tool schemas | `protocol/tools.rs`, `stel/surface_list.rs` | S1–S2 | P-S1A-001, P-S2-001 |
+| `src/mcp/mcp.c` | 4415–4600 | detect_changes | `git.rs`, `live_index/graph.rs` | S1a | P-S1A-001 |
+| `src/mcp/mcp.c` | 1685–1800 | search_graph BM25 | `live_index/search.rs` | S1b | P-S1B-002 (defer BM25 per D-015-011) |
+| `src/cli/hook_augment.c` | all | Grep augment | `cli/hook.rs` | S1b | P-S1B-003 |
+| `src/pipeline/artifact.c` | all | Team zstd artifact | `live_index/persist.rs` | S1a | P-S1A-004 |
+| `src/pipeline/pipeline.c` | 1–120 | Index phases | `live_index/store.rs` modes | S4 | P-S4-007 (IndexMode, moved from S1) |
 | `src/store/store.c` | BFS fns | Graph traversal | `live_index/graph.rs` | S0,S2 | P-S0-002, P-S2-001 |
 | `src/store/store.c` | Leiden | Clusters | `live_index/cluster.rs` | S5 | P-S5-005 |
 | `src/cypher/cypher.c` | lexer/parser | query_graph | `live_index/cypher/` | S2 | P-S2-002 |
