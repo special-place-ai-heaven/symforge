@@ -190,7 +190,7 @@ fn statused_edit_tool_result(
     let mut meta = rmcp::model::JsonObject::new();
     meta.insert(RESULT_STATUS_META_KEY.to_string(), status_payload);
 
-    let content = vec![rmcp::model::Content::text(text)];
+    let content = vec![rmcp::model::ContentBlock::text(text)];
     let result = if status.outcome_class().is_error() {
         rmcp::model::CallToolResult::error(content)
     } else {

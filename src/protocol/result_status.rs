@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content, JsonObject, Meta};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Meta};
 use serde::{Deserialize, Serialize};
 
 pub const RESULT_STATUS_META_KEY: &str = "symforge/result_status";
@@ -62,7 +62,7 @@ impl ResultStatus {
             serde_json::to_value(self).expect("ResultStatus must serialize to JSON"),
         );
 
-        let content = vec![Content::text(human_text.into())];
+        let content = vec![ContentBlock::text(human_text.into())];
         let result = if self.outcome_class.is_error() {
             CallToolResult::error(content)
         } else {
