@@ -30,9 +30,8 @@ use rmcp::RoleServer;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
@@ -1001,6 +1000,14 @@ impl SymForgeServer {
     /// unreachable `roots/list`, or a forbidden root must never break the
     /// session — the server simply stays in its existing (empty) state, exactly
     /// as before this hook existed.
+    // ponytail: SEP-2577 deprecates the entire MCP Roots capability (Root,
+    // ListRootsResult, peer.list_roots()) with NO replacement in rmcp 2.0 — it is
+    // slated for removal from the spec, not renamed. `roots/list` is still the only
+    // way a client can declare its workspace, so we keep using it and scope the
+    // allow to this fn. Upgrade path: when the spec settles on a successor
+    // capability (or rmcp removes Roots), migrate this single function.
+    // https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577
+    #[allow(deprecated)]
     async fn bind_workspace_from_client_roots(&self, peer: &rmcp::Peer<RoleServer>) {
         // Precedence: `SYMFORGE_WORKSPACE_ROOT (env) > client roots > CWD walk`.
         //

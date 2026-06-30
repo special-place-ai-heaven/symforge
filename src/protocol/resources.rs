@@ -1,10 +1,7 @@
 use reqwest::Url;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    AnnotateAble, RawResource, RawResourceTemplate, ReadResourceResult, Resource, ResourceContents,
-    ResourceTemplate,
-};
+use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 
 use super::SymForgeServer;
 use crate::protocol::tools::{
@@ -374,11 +371,12 @@ fn render_glossary() -> String {
 }
 
 fn make_resource(uri: &str, name: &str, title: &str, description: &str) -> Resource {
-    RawResource::new(uri.to_string(), name.to_string())
+    // rmcp 2.0: `Resource` is a flat struct (no more `Annotated<RawResource>` /
+    // `AnnotateAble::no_annotation()`); build it directly.
+    Resource::new(uri.to_string(), name.to_string())
         .with_title(title.to_string())
         .with_description(description.to_string())
         .with_mime_type("text/markdown")
-        .no_annotation()
 }
 
 fn make_resource_template(
@@ -387,11 +385,11 @@ fn make_resource_template(
     title: &str,
     description: &str,
 ) -> ResourceTemplate {
-    RawResourceTemplate::new(uri_template.to_string(), name.to_string())
+    // rmcp 2.0: `ResourceTemplate` is a flat struct; build it directly.
+    ResourceTemplate::new(uri_template.to_string(), name.to_string())
         .with_title(title.to_string())
         .with_description(description.to_string())
         .with_mime_type("text/markdown")
-        .no_annotation()
 }
 
 fn build_uri(base: &str, params: &[(&str, Option<String>)]) -> String {
