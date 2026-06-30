@@ -1,6 +1,6 @@
 # Sprint 1a Planning Spec — Impact + artifact
 
-**Status**: draft (S1a scope; S1b split 2026-06-29)  
+**Status**: **planning gate signed** 2026-06-30 (coding gated on S0 GO)  
 **Release**: 8.10.0  
 **User stories**: US1–US2 only  
 **Depends on**: S0 GO ([research.md](../research.md) § Spike Results)
@@ -156,9 +156,9 @@ R-06 (git porcelain drift), R-14 (blast scope creep)
 
 - [x] P-S1A-001 CBM detect_changes read → EV-S1-CBM-001
 - [x] P-S1A-002 SymForge what_changed + git.rs → EV-S1-001..002
-- [ ] P-S1A-003 Freeze detect-impact contract
+- [x] P-S1A-003 Freeze detect-impact contract
 - [x] P-S1A-004 CBM artifact.c → persist touch points
-- [ ] P-S1A-005 Freeze team-artifact contract
+- [x] P-S1A-005 Freeze team-artifact contract
 - [x] P-S1A-006 D-015-009 zstd confirmed
 - [x] P-S1A-007 DetectImpactInput + output in contract
 - [x] P-S1A-008 merge_git_changed_paths designed
@@ -166,11 +166,14 @@ R-06 (git porcelain drift), R-14 (blast scope creep)
 - [x] P-S1A-010 Fixture tree + expected_impact.json
 - [x] P-S1A-011 STEL before/after (this spec)
 - [x] P-S1A-012 Test skeletons on disk
-- [ ] P-S1A-013 file-touch-matrix S1a + risks R-06, R-14
+- [x] P-S1A-013 file-touch-matrix S1a + risks R-06, R-14
 - [x] P-S1A-014 PD-04 alias → D-015-012
-- [ ] **S1a Planning Gate** sign-off
+- [x] **S1a Planning Gate** sign-off
 
-**Sign-off**: _________________ Date: _______
+**Sign-off**: Speckit agent (Claude) — all S1a `[P]` complete; detect-impact +
+team-artifact contracts frozen; risk review R-06/R-14 + S1a touch-set recorded;
+manual consistency pass clean (counts 159, coverage 100%). **S1a `[C]` coding
+remains gated on S0 GO** ([research.md](../research.md) § Spike Results). Date: 2026-06-30
 
 ## Rollback
 

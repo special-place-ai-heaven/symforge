@@ -89,7 +89,13 @@ Falsify or confirm three load-bearing assumptions **before** S1 coding spend:
 | SP-0B | hash match | Fix format before S1 |
 | SP-0C | ≥60% minimum | Reschedule S3; S1/S2 proceed |
 
-**Sign-off**: Speckit planning session 2026-06-29 (S0 `[P]` complete)
+**Sign-off**: Speckit planning session 2026-06-29 (S0 `[P]` complete).
+
+**S0 `[C]`/`[V]` GO — 2026-06-30** (adversarially verified by 3 independent agents):
+SP-0A p95 ≈ 46–48ms (GO, 4× margin); SP-0B 607/607 `content_hash` byte-exact, 3.61× (GO);
+SP-0C 73% strict ≥ 60% (GO — S0 feasibility only, S3 80% NOT demonstrated; keystone risk =
+bare-name resolution → false-positive edges). Full results + caveats + spike-code disposition:
+[research.md](../research.md) § Spike Results.
 
 ## Rollback
 

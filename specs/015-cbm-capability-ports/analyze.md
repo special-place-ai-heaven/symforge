@@ -5,7 +5,25 @@
 **Speckit**: `/speckit-analyze` (post-clarify)  
 **Constitution**: `.specify/memory/constitution.md` v1.0.0
 
-> **Patched 2026-06-30** (operator): task counts + S1a/S1b coverage IDs realigned to tasks.md (159 tasks; S1 split into S1a/S1b). The 2026-06-29 Findings table below is the historical record; a full `/speckit-analyze` re-run is still pending before the S1a Planning Gate (see Next Actions).
+> **Patched 2026-06-30** (operator): task counts + S1a/S1b coverage IDs realigned to tasks.md (159 tasks; S1 split into S1a/S1b). The 2026-06-29 Findings table below is the historical record.
+>
+> **Manual consistency pass 2026-06-30** (speckit agent): the `/speckit-analyze`
+> command is **not installed in this environment** (`.specify/` ships only the
+> agent-context extension + templates), so the automated re-run could not be
+> performed. A manual equivalent was done before the S1a Planning Gate and is
+> recorded below — no automated artifact was fabricated.
+>
+> **Manual pass result (clean):**
+> - **Counts** 159 (91 `[P]` · 41 `[C]` · 27 `[V]`) agree across tasks.md summary
+>   table + per-section line count, this file, checklists/requirements.md, and the
+>   task-index.md rollup.
+> - **Coverage** 17/17 FR + 5/5 NFR each map to ≥1 existing `[C]`/`[V]` task.
+> - **Operator residual fixed**: tasks.md:144 archived map `P-S1-013 → P-S4-008`
+>   corrected to **P-S4-007** (the real task carrying that legacy tag).
+> - **Contracts** detect-impact.md + team-artifact.md **frozen 2026-06-30**;
+>   `DetectImpactInput` consistent between contract and sprint-1a spec; team
+>   artifact now carries a code-backed R-14 security clause.
+> - **New findings**: 0 critical · 0 high.
 
 ## Findings
 
@@ -74,7 +92,8 @@
 
 ## Next Actions
 
-1. **S1a [P]** — P-S1A-010..013 + contract freeze (this agent / Speckit planning)
-2. **Operator** — log benchmarks in [planning/benchmark-intake.md](./planning/benchmark-intake.md)
-3. **S0 [C]** — after S0 GO in research.md or explicit go-ahead
-4. Re-analyze before S1a Planning Gate sign-off
+1. ~~**S1a [P]** — P-S1A-010..013 + contract freeze~~ **DONE 2026-06-30** (003/005 frozen, 013 risk+matrix).
+2. ~~**Operator** — log benchmarks in benchmark-intake.md~~ **DONE** (operator session 2026-06-30).
+3. **S0 [C]** — in progress (spike running); S1a `[C]` unblocks after S0 GO in research.md.
+4. ~~Re-analyze before S1a Planning Gate sign-off~~ **DONE** — manual pass above (`/speckit-analyze` not installed here).
+5. **S1a Planning Gate** — signed 2026-06-30 (planning complete; coding still gated on S0 GO).

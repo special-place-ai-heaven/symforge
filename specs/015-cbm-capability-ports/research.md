@@ -117,3 +117,88 @@ are single-project scoped with `project_root` in envelope.
 Rust safe) — one dependency justified by team artifact (CBM uses zstd 1.5.7).
 
 **Ponytail**: If dependency rejected, use gzip in v1 with documented ratio tradeoff.
+
+> **Correction (S0 spike, 2026-06-30)**: `zstd` 0.13 is **C-backed** (`zstd-sys`,
+> built with `cc`), not "pure Rust" as written above. This adds **no new** CI risk —
+> a C toolchain is already required (`libsqlite3-sys` bundled SQLite, `libgit2-sys`
+> vendored libgit2, tree-sitter C grammars). The genuine pure-Rust fallback is
+> `flate2` (miniz_oxide backend), not `zstd`. See § Spike Results SP-0B.
+
+---
+
+## Spike Results (S0 gate — 2026-06-30)
+
+**Decision: GO.** All three falsifiers cleared their S0 bars. A spike agent
+produced the code/numbers; **three independent adversarial agents then verified**
+(one re-ran the ignored tests and audited for measurement gaming; two skeptic
+reviewers pressure-tested the metrics and methodology). Reproduced numbers
+matched — **no gaming found**. The S0 bars prove *feasibility*, NOT the per-sprint
+production targets; caveats below are mandatory.
+
+**Method**: spike code behind `#[ignore]` tests over the symforge index
+(~600 files / 19,817 symbol nodes), **debug** build. Verification re-ran
+`cargo test --test cbm_spike_* -- --ignored --test-threads=1` (exit 0; full
+suite 103 test binaries green, 0 failed).
+
+| Spike | S0 bar | Result | Verdict |
+|-------|--------|--------|---------|
+| SP-0A graph BFS | p95 < 200ms depth-5 | p95 ≈ 46–48ms (4× margin) | **GO** |
+| SP-0B artifact | every `content_hash` byte-exact | 607/607, 3.61× ratio | **GO** |
+| SP-0C resolver | ≥ 60% | **73% strict** (11/15); clears every framing | **GO** (feasibility) |
+
+### SP-0A — graph BFS — GO at symforge scale
+p95 ≈ 46–48ms for inbound BFS depth-5 over 19,817 nodes / 127,540 name-based Call
+edges (debug; 1000 samples seeded from the highest in-degree symbols = worst-case).
+Verified: depth genuinely reaches 5; visited-set dedup bounds any query to O(V+E);
+no early-cap or short-circuit. Conservative on three axes — name-based edge
+over-approximation (real S2 resolver narrows), debug build, un-interned `String`
+node keys — all of which the real graph improves on.
+**Caveats**: (a) per-query cost is O(V+E), linear in graph size → the 4× margin is
+**not** established for repos materially larger than symforge; (b) module-level
+callers with no enclosing symbol are dropped → under-counts file-scope edges in
+Python/JS; (c) does not measure S2's confidence-weighted edge filtering or
+generation-fence overhead.
+
+### SP-0B — zstd artifact round-trip — GO
+607/607 per-file `content_hash` byte-exact through postcard→zstd→decompress→postcard
+(real `build_snapshot` path; `content_hash` is a genuine per-file SHA digest,
+`src/parsing/mod.rs:51`), ratio 3.61×. Corrupt/truncated frames return `Err` with
+no partial state (pure function — partial state is structurally impossible).
+**Caveats**: (a) verifies `content_hash` survival + full-snapshot decodability, not
+field-by-field fidelity of every snapshot field — C-S1A-005 should assert
+`postcard::to_stdvec(&after) == raw` (deterministic re-encode ⇒ whole-snapshot
+byte-exact); (b) `zstd` is C-backed (R11 correction above); (c) the gzip fallback is
+not wired.
+
+### SP-0C — Rust resolver — GO (S0 feasibility only; NOT the S3 target)
+Same-file + in-file `use` resolver on the 16-case `cbm_resolver_rust` fixture.
+**Publish the strict number: true-callee recall 11/15 = 73%**; precision over
+claimed resolutions 11/13 = 85%; absolute floor 11/16 = 69%. The "verdict accuracy"
+14/16 = 87.5% headline credits 3 "correct declines" (2 are out-of-scope calls with
+real-but-unreachable targets), and in-scope recall 11/11 = 100% is a curation
+artifact — **neither is a real-repo predictor**. The S0 ≥60% floor clears under
+every framing; the **S3 80% real-repo target is NOT demonstrated**.
+**Keystone risk**: bare method-call names resolve against all same-file definitions
+with no receiver type (`src/parsing/resolver/rust.rs:101-104`) → **false-positive
+call edges** (worse than missing edges for a graph). Both fixture misses are this
+one class (`Bag::len` over-resolving `HashSet::len` + slice `len`). The fixture
+under-samples it (one collision); real Rust is saturated with name collisions
+(`len`/`new`/`get`/`push`/…) and adds method chains, trait dispatch,
+generics/turbofish, glob imports, multi-impl scope — all absent.
+**S3 requirement**: add receiver-type gating before any bare-method resolution and
+re-benchmark on a real-repo sample.
+
+### Spike-code disposition (open — decide at S1a kickoff)
+Per spike-spec §Rollback, spike code should be `#[cfg(test)]`/ignored-test-only.
+Currently `graph.rs` / `parsing/resolver/` / `persist.rs` `spike_*` helpers are
+`pub` and exercised only by ignored tests (dormant), and `zstd` is a non-optional
+dependency. Options: **(1)** keep as the S1a/S2 foundation — C-S1A-002 wires
+`graph.rs`, C-S1A-005 replaces the artifact helpers — accepting ~1 sprint of
+transitional dormancy; **(2)** `#[cfg(test)]`-gate the helpers and move `zstd` to a
+dev-dependency until C-S1A-005 promotes it to a real runtime dep. Per the
+no-dormant-code policy, (2) is the conservative default unless S1a starts
+immediately. **Decision pending operator direction.**
+
+### Gate decision
+**GO to Sprint 1a `[C]`.** (S1a planning gate already signed 2026-06-30; coding was
+blocked only on this S0 GO.)

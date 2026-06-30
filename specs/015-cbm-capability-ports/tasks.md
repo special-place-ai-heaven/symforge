@@ -38,20 +38,20 @@
 
 #### [C] S0 (~20%)
 
-- [ ] C-S0-001 Scaffold `src/live_index/graph.rs` + `mod` in `live_index/mod.rs`. **S**
-- [ ] C-S0-002 Implement minimal BFS for SP-0A in `graph.rs`. **M**
-- [ ] C-S0-003 Implement artifact compress/decompress stub in `persist.rs`. **M**
+- [x] C-S0-001 Scaffold `src/live_index/graph.rs` + `mod` in `live_index/mod.rs`. **S**
+- [x] C-S0-002 Implement minimal BFS for SP-0A in `graph.rs`. **M**
+- [x] C-S0-003 Implement artifact compress/decompress stub in `persist.rs`. **M**
 
 **STOP** — run `cargo check` before next wave.
 
-- [ ] C-S0-004 Scaffold `src/parsing/resolver/{mod,rust}.rs` same-file only. **M**
-- [ ] C-S0-005 Create fixture dirs per P-S0-006. **S**
+- [x] C-S0-004 Scaffold `src/parsing/resolver/{mod,rust}.rs` same-file only. **M**
+- [x] C-S0-005 Create fixture dirs per P-S0-006. **S**
 
 #### [V] S0 (~10%)
 
-- [ ] V-S0-001 Run `tests/cbm_spike_graph_bfs.rs --ignored`; record p95 in sprint-0 spec.
-- [ ] V-S0-002 Run `tests/cbm_spike_artifact.rs --ignored`; record hash result.
-- [ ] V-S0-003 Run `tests/cbm_spike_rust_resolver.rs --ignored`; record %; write GO/NO-GO in research.md § Spike Results.
+- [x] V-S0-001 Run `tests/cbm_spike_graph_bfs.rs --ignored`; record p95 in sprint-0 spec. *(p95≈46–48ms GO)*
+- [x] V-S0-002 Run `tests/cbm_spike_artifact.rs --ignored`; record hash result. *(607/607 GO)*
+- [x] V-S0-003 Run `tests/cbm_spike_rust_resolver.rs --ignored`; record %; write GO/NO-GO in research.md § Spike Results. *(73% strict GO)*
 
 ---
 
@@ -63,9 +63,9 @@
 
 - [x] P-S1A-001 Read CBM `mcp.c` detect_changes (~4415–4600); dogfood-notes → **EV-S1-CBM-001**.
 - [x] P-S1A-002 SymForge MCP read `what_changed` + `git.rs` → **EV-S1-001..002**.
-- [ ] P-S1A-003 Freeze [contracts/detect-impact.md](./contracts/detect-impact.md). *(candidate freeze — gate sign-off)*
+- [x] P-S1A-003 Freeze [contracts/detect-impact.md](./contracts/detect-impact.md). *(frozen 2026-06-30)*
 - [x] P-S1A-004 Read CBM `artifact.c`; map persist.rs touch points.
-- [ ] P-S1A-005 Freeze [contracts/team-artifact.md](./contracts/team-artifact.md). *(candidate freeze — gate sign-off)*
+- [x] P-S1A-005 Freeze [contracts/team-artifact.md](./contracts/team-artifact.md). *(frozen 2026-06-30)*
 - [x] P-S1A-006 Confirm D-015-009 zstd in decision-log; Cargo.toml plan.
 - [x] P-S1A-007 Design `DetectImpactInput` + output JSON in contract.
 - [x] P-S1A-008 Design `merge_git_changed_paths` signature for `git.rs`.
@@ -78,9 +78,9 @@
 - [x] P-S1A-010 Fixture `tests/fixtures/cbm_impact/` + `expected_impact.json`.
 - [x] P-S1A-011 STEL impact routing doc (planner.rs before/after).
 - [x] P-S1A-012 Skeleton `tests/detect_impact.rs`, `tests/team_artifact.rs`.
-- [ ] P-S1A-013 Review risks R-06, R-14; file-touch-matrix S1a column.
+- [x] P-S1A-013 Review risks R-06, R-14; file-touch-matrix S1a column.
 - [x] P-S1A-014 Resolve PD-04 alias plan in daemon.rs (if not done).
-- [ ] P-S1A-015 **S1a Planning Gate** sign-off.
+- [x] P-S1A-015 **S1a Planning Gate** sign-off. *(signed 2026-06-30; coding gated on S0 GO)*
 
 ### Wave 3 — [C] US1 impact (max 4 [C]; 1× L)
 
@@ -141,7 +141,7 @@ Split into **S1a** + **S1b** (2026-06-29 balance pass). Legacy IDs map in [agent
 
 <!--
 ### [P] S1 Planning — archived IDs
-P-S1-001..020 → P-S1A-* + P-S1B-*; P-S1-013 IndexMode → P-S4-008
+P-S1-001..020 → P-S1A-* + P-S1B-*; P-S1-013 IndexMode → P-S4-007
 ### [C] S1 Coding
 C-S1-001..012 → C-S1A-* + C-S1B-*; C-S1-011 IndexMode → C-S4-004
 ### [V] S1 Validation

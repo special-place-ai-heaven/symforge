@@ -1,7 +1,7 @@
 # Contract: detect_impact
 
 **Feature**: 015 · **Sprint**: S1a · **US**: US1  
-**Status**: candidate freeze (S1a Planning Gate)  
+**Status**: **frozen** 2026-06-30 (S1a Planning Gate — P-S1A-003)  
 **Evidence**: EV-S1-001, EV-S1-002, EV-S1-CBM-001
 
 ## Tool surface
@@ -30,6 +30,8 @@ struct DetectImpactInput {
     include_untracked: bool,
 }
 ```
+
+**Defaults (serde)**: `depth` = 2 via a custom default fn — **not** `u8::default()` (0), since depth 0 yields an empty blast radius (a silent no-op impact). Clamp to max 5 with a warning. `scope` = `Symbols`; `include_untracked` = `true`. These mirror the Input table above.
 
 Git path union: `GitRepo::merge_git_changed_paths` (see sprint-1a spec P-S1A-008).
 

@@ -17,8 +17,8 @@
 | Phase | Done | Total | Sprint-[C] unblocked when… |
 |-------|-----:|------:|----------------------------|
 | PROG | 9 | 9 | — (done) |
-| S0 | 10 | 18 | S0 `[P]` done → **[C] runnable now** |
-| S1a | 11 | 25 | S0 **GO** (research.md) + `P-S1A-015` gate |
+| S0 | 18 | 18 | **GO 2026-06-30** (research.md § Spike Results) — done |
+| S1a | 15 | 25 | **[P]+gate ✓ 2026-06-30**; `[C]` needs S0 **GO** (research.md) |
 | S1b | 0 | 14 | S1a ship (8.10.0) + `P-S1B-007` gate |
 | S2 | 0 | 21 | S1a graph shipped + `P-S2-010` gate |
 | S3 | 0 | 21 | S2 graph stable + `P-S3-011` gate |
@@ -26,12 +26,14 @@
 | S5 | 0 | 14 | S2 + S3 rec + `P-S5-009` gate |
 | S6 | 0 | 16 | S1a tools registered + `P-S6-007a/b` gates |
 | POLISH | 1 | 8 | all sprints `[V]` |
-| **Total** | **31** | **159** | |
+| **Total** | **43** | **159** | |
 
 ## ▶ Executable now (the frontier)
 
-1. **S0 `[C]` spike** — `C-S0-001`, `C-S0-003`, `C-S0-004` can start in parallel (3 agents / different files). Chains: `C-S0-001→C-S0-002`, `C-S0-004→C-S0-005`. Then `V-S0-*`, then write **GO/NO-GO** (`V-S0-003`→research.md) — this gates everything S1a+.
-2. **Finish S1a `[P]`** — `P-S1A-003`, `P-S1A-005` (contract freezes) ∥ `P-S1A-013` (risk review); then `P-S1A-015` (S1a gate). Planning is read-only → safe alongside the S0 spike.
+1. ~~**S0 `[C]` spike**~~ — **GO 2026-06-30** (adversarially verified by 3 agents): SP-0A p95≈46–48ms, SP-0B 607/607, SP-0C 73% strict. research.md § Spike Results.
+2. ~~**Finish S1a `[P]`**~~ — **DONE 2026-06-30**: contracts frozen, risk review recorded, **S1a Planning Gate signed**.
+
+**▶ New frontier — S1a `[C]` is UNBLOCKED** (S0 GO ✓ + S1a gate ✓). Chain (parallelism.md): `C-S1A-001` git.rs merge → `C-S1A-002` graph.rs compute_impact → `C-S1A-003` detect_impact handler → `C-S1A-004` STEL; `C-S1A-005` persist.rs artifact runs ∥ as a 2nd agent → `C-S1A-006` → `C-S1A-007` register. **First** resolve the spike-code disposition (research.md § Spike-code disposition).
 
 > Discipline (parallelism.md "Never parallel"): no `[C]` before its sprint gate; don't start S2 `[C]` until S1a graph ships; one agent per `protocol/tools.rs` per wave.
 
@@ -42,28 +44,28 @@
 ### PROG — program planning ● complete (9/9)
 `P-PROG-001 … P-PROG-009` — all ●. No blockers; foundation for S0.
 
-### S0 — Spike (10/18)
+### S0 — Spike (18/18) ● GO 2026-06-30
 | Task | T | Status | After | ∥ |
 |------|---|--------|-------|---|
 | P-S0-001..010 | P | ● | PROG | (in sprint-0 spec) |
-| C-S0-001 | S | ○ | gate (S0 [P] ●) | start of Track A |
-| C-S0-002 | M | ○ | → C-S0-001 | |
-| C-S0-003 | M | ○ | gate | ∥ C-S0-001 (persist.rs) |
-| C-S0-004 | M | ○ | gate | ∥ Track A/B (resolver) |
-| C-S0-005 | S | ○ | → C-S0-004 | |
-| V-S0-001 | V | ○ | → all S0 [C] | |
-| V-S0-002 | V | ○ | → all S0 [C] | |
-| V-S0-003 | V | ○ | → all S0 [C] | **writes GO/NO-GO** |
+| C-S0-001 | S | ● | done | graph.rs scaffold |
+| C-S0-002 | M | ● | done | BFS p95≈46–48ms |
+| C-S0-003 | M | ● | done | persist.rs zstd round-trip |
+| C-S0-004 | M | ● | done | resolver same-file |
+| C-S0-005 | S | ● | done | cbm_resolver_rust fixture |
+| V-S0-001 | V | ● | done | SP-0A GO |
+| V-S0-002 | V | ● | done | SP-0B GO 607/607 |
+| V-S0-003 | V | ● | done | **GO/NO-GO written** (research.md) |
 
-### S1a — Impact + artifact → 8.10.0 (11/25)
+### S1a — Impact + artifact → 8.10.0 (15/25)
 | Task | T | Status | After | ∥ |
 |------|---|--------|-------|---|
 | P-S1A-001,002,004,006,007,008 | P | ● | PROG | done |
 | P-S1A-009,010,011,012,014 | P | ● | — | done |
-| P-S1A-003 | P | ○ | — | freeze detect-impact.md (∥ 005) |
-| P-S1A-005 | P | ○ | — | freeze team-artifact.md (∥ 003) |
-| P-S1A-013 | P | ○ | — | risk review (∥ 003/005) |
-| P-S1A-015 | P | ○ | → 003,005,013 | **S1a gate** |
+| P-S1A-003 | P | ● | — | frozen 2026-06-30 |
+| P-S1A-005 | P | ● | — | frozen 2026-06-30 |
+| P-S1A-013 | P | ● | — | risk review + S1a touch-set done |
+| P-S1A-015 | P | ● | → 003,005,013 | **S1a gate signed** 2026-06-30 |
 | C-S1A-001 | M | ○ | gate + **S0 GO** | start impact chain |
 | C-S1A-002 | L | ○ | → C-S1A-001 | |
 | C-S1A-003 | L | ○ | → C-S1A-002 | |
