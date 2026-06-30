@@ -3,6 +3,9 @@ pub mod coupling;
 mod disambiguation;
 pub mod frecency;
 pub mod git_temporal;
+// ponytail: Program 015 SP-0A spike module — name-based call graph + inbound BFS.
+#[cfg(feature = "cbm-spike")]
+pub mod graph;
 mod health_view;
 pub mod persist;
 pub(crate) mod qualified_usages;

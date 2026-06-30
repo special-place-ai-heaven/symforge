@@ -191,6 +191,86 @@ pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotReset
     Ok(SnapshotResetReport { removed, missing })
 }
 
+// ── SP-0B spike (Program 015 S0 falsifier) — zstd artifact round-trip ──────────
+//
+// ponytail: throwaway-grade. Proves the existing postcard snapshot round-trips
+// through zstd compress/decompress with byte-exact per-file `content_hash`
+// before S1 spend. The real two-tier `index.bin.zst` export/import lands at
+// C-S1A-005; these helpers will be folded into it then.
+
+/// Per-file `content_hash` verification report for one zstd round-trip.
+#[cfg(feature = "cbm-spike")]
+pub struct SpikeArtifactReport {
+    pub files: usize,
+    pub matched: usize,
+    /// `"<path>: <before> != <after>"` (or `"<path>: missing"`) per failure.
+    pub mismatches: Vec<String>,
+    pub raw_bytes: usize,
+    pub compressed_bytes: usize,
+}
+
+/// Build the snapshot, postcard-serialize, and zstd-compress it. Returns
+/// `(snapshot, raw_len, compressed_bytes)`.
+#[cfg(feature = "cbm-spike")]
+fn spike_build_compressed(
+    index: &LiveIndex,
+    project_root: &Path,
+) -> anyhow::Result<(IndexSnapshot, usize, Vec<u8>)> {
+    let snapshot = build_snapshot(capture_snapshot_build_input(index), project_root);
+    let raw = postcard::to_stdvec(&snapshot)?;
+    let compressed = zstd::encode_all(raw.as_slice(), 3)?;
+    Ok((snapshot, raw.len(), compressed))
+}
+
+/// Compress the current snapshot to in-memory `index.bin.zst` bytes.
+#[cfg(feature = "cbm-spike")]
+pub fn spike_compress_snapshot(index: &LiveIndex, project_root: &Path) -> anyhow::Result<Vec<u8>> {
+    Ok(spike_build_compressed(index, project_root)?.2)
+}
+
+/// Decompress + deserialize a compressed snapshot. Errors (with no partial
+/// state — nothing is returned) on corrupt zstd or postcard bytes.
+#[cfg(feature = "cbm-spike")]
+pub fn spike_import_compressed(compressed: &[u8]) -> anyhow::Result<IndexSnapshot> {
+    let raw =
+        zstd::decode_all(compressed).map_err(|e| anyhow::anyhow!("zstd decode failed: {e}"))?;
+    let snapshot: IndexSnapshot =
+        postcard::from_bytes(&raw).map_err(|e| anyhow::anyhow!("postcard decode failed: {e}"))?;
+    Ok(snapshot)
+}
+
+/// Full round-trip: serialize -> zstd -> decompress -> deserialize, then verify
+/// every per-file `content_hash` survived byte-exact.
+#[cfg(feature = "cbm-spike")]
+pub fn spike_zstd_round_trip(
+    index: &LiveIndex,
+    project_root: &Path,
+) -> anyhow::Result<SpikeArtifactReport> {
+    let (before, raw_bytes, compressed) = spike_build_compressed(index, project_root)?;
+    let after = spike_import_compressed(&compressed)?;
+
+    let mut matched = 0usize;
+    let mut mismatches = Vec::new();
+    for (path, bf) in &before.files {
+        match after.files.get(path) {
+            Some(af) if af.content_hash == bf.content_hash => matched += 1,
+            Some(af) => mismatches.push(format!(
+                "{path}: {} != {}",
+                bf.content_hash, af.content_hash
+            )),
+            None => mismatches.push(format!("{path}: missing after round-trip")),
+        }
+    }
+
+    Ok(SpikeArtifactReport {
+        files: before.files.len(),
+        matched,
+        mismatches,
+        raw_bytes,
+        compressed_bytes: compressed.len(),
+    })
+}
+
 fn write_snapshot(
     snapshot: IndexSnapshot,
     project_root: &Path,

@@ -39,6 +39,10 @@ server = [
 # daemon/sidecar/protocol-server/CLI surface, so server-side breakage (unsafe
 # syscalls, axum, rmcp, process signaling) structurally cannot reach an embedder.
 embed = []
+# Program 015 Sprint-0 falsifier spikes (graph BFS, zstd artifact round-trip,
+# Rust resolver). Off by default so no dormant spike code — or its zstd dep —
+# ships in a normal build. Run the spikes with `--features cbm-spike`.
+cbm-spike = ["dep:zstd"]
 
 [dependencies]
 aho-corasick = "1.1"
@@ -112,6 +116,10 @@ tempfile = "3"
 libc = "0.2.183"
 dunce = "1"
 socket2 = { version = "0.6", optional = true }
+# Program 015 SP-0B spike: zstd round-trip falsifier for the team artifact
+# (R4/R11/D-015-009). Becomes the real `index.bin.zst` export at C-S1A-005.
+# Optional, gated behind the `cbm-spike` feature so it stays out of the default build.
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
