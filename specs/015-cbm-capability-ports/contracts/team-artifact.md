@@ -52,3 +52,31 @@ files are never indexed, so they cannot enter `index.bin` or its `.zst` artifact
 
 - Add `zstd` crate to `Cargo.toml` (safe pure-Rust backend; level 3 / 9 per tier).
 - Reuse `write_snapshot` / quarantine patterns in `persist.rs` (EV-S1-003).
+
+## Git-trackability (dogfood finding, 2026-06-30)
+
+Whether the exported artifact is actually **shareable via git** depends
+entirely on the *consuming project's own* `.gitignore` — SymForge writes into
+`.symforge/` but deliberately does **not** auto-modify a project's `.gitignore`
+to un-ignore the artifact files, the same posture CBM's own README takes
+("Optional: never committed unless you want it. Add `.codebase-memory/` to
+`.gitignore` if you prefer everyone to reindex from scratch."). This is a
+team/project decision, not something the tool should force.
+
+**Tradeoff a team should weigh before opting in** (not resolved here, S6 docs
+territory): a committed `.zst` is a full new binary blob in git history on
+every commit that changes it — non-diffable, permanent, downloaded by every
+future clone forever. `.gitattributes: *.zst merge=ours` only prevents merge
+conflicts on that blob; it does nothing to bound history growth. Lower-bloat
+alternatives exist (a CI artifact cache/release asset instead of git; or
+committing only at deliberate checkpoints rather than continuously) and are
+worth documenting alongside the plain "commit it" path when S6 writes the
+onboarding docs.
+
+Confirmed live against this repo (dogfood, 2026-06-30): `export_artifact`
+correctly wrote `.symforge/index.bin.zst` (608 files, 14.85MB → 3.59MB, 4.14×)
++ `artifact.json`, and idempotently created a project-root `.gitattributes`
+with the `*.zst merge=ours` hint — exactly as specified. Whether *this*
+project (SymForge's own repo) should itself opt into git-tracking its
+artifact for contributor onboarding is a separate, low-urgency maintainer
+decision, independent of the feature's correctness.
