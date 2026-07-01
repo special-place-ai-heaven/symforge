@@ -1017,17 +1017,19 @@ fn route_trace(request: &StelRequest) -> PlannedStep {
     })
 }
 
-fn route_impact(request: &StelRequest) -> PlannedStep {
-    let path = request
-        .path
-        .clone()
-        .unwrap_or_else(|| request.query.trim().to_string());
+/// Impact intent with no bare `symbol` (path-only or free-text query): route
+/// to the git-aware `detect_impact` tool (scope=files) instead of the old
+/// `find_dependents` chain (Program 015 C-S1A-004,
+/// planning/sprint-1-quick-wins-spec.md § STEL impact routing). `detect_impact`
+/// has no `path` input — it derives its changed-file set from git — so
+/// `request.path`/`request.query` are not threaded into this route's args.
+fn route_impact(_request: &StelRequest) -> PlannedStep {
     planned(
-        "find_dependents",
-        json!({ "path": path }),
+        "detect_impact",
+        json!({ "scope": "files" }),
         IntentBucket::Impact,
         RouteConfidence::Inferred,
-        "impact intent dependents lookup",
+        "impact intent git-aware blast radius (scope=files)",
     )
 }
 

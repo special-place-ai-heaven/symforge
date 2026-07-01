@@ -24,6 +24,8 @@
 //!   - `trace_symbol` → `get_symbol_context` (sections=None translates to
 //!     `Some(vec![])`, which switches `get_symbol_context` into trace mode)
 //!     with an explicit deprecation warning.
+//!   - `detect_changes` → `detect_impact` (same input shape, D-015-012) with
+//!     an explicit deprecation warning.
 //!
 //! When a new alias is added or removed in `execute_tool_call`, update this
 //! file in the same commit. A new alias without a test here is a silent
@@ -207,6 +209,133 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
          destination bytes: {}",
         alias_payload.len(),
         destination_body.len(),
+    );
+
+    let _ = handle.shutdown_tx.send(());
+    wait_for_shutdown(handle.port).await;
+}
+
+/// Pin the `detect_changes` → `detect_impact` alias (D-015-012, CBM migrator
+/// ergonomics).
+///
+/// `execute_tool_call` routes the old CBM tool name `detect_changes` to the
+/// real `detect_impact` handler with the SAME input shape, prefixed with an
+/// explicit deprecation warning. If the alias branch is dropped, or its input
+/// decoding drifts from `detect_impact`'s, this test fails loudly. The fixture
+/// project has no `.git`, so both the alias and the destination hit the same
+/// "Git unavailable" error path — sufficient to pin routing without needing a
+/// bootstrapped git history here.
+#[allow(unsafe_code)] // test-only daemon home override is scoped to this async test.
+#[tokio::test]
+async fn detect_changes_alias_routes_to_detect_impact() {
+    let daemon_home = TempDir::new().expect("daemon home temp dir");
+    let auth_token = "daemon-aliases-detect-changes-test-token";
+    // SAFETY: single-threaded test binary; no concurrent env access.
+    unsafe {
+        std::env::set_var("SYMFORGE_HOME", daemon_home.path());
+        std::env::set_var("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
+    }
+
+    let project = TempDir::new().expect("project temp dir");
+    write_fixture(project.path());
+
+    let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+    let client = reqwest::Client::new();
+    let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+    let opened: OpenProjectResponse = client
+        .post(format!("{base_url}/v1/sessions/open"))
+        .bearer_auth(auth_token)
+        .json(&OpenProjectRequest {
+            project_root: project.path().display().to_string(),
+            client_name: "daemon-aliases-detect-changes-test".to_string(),
+            pid: Some(9102),
+        })
+        .send()
+        .await
+        .expect("open session request")
+        .error_for_status()
+        .expect("open session status")
+        .json()
+        .await
+        .expect("open session body");
+
+    // --- Call the OLD name: detect_changes ---------------------------------
+    let alias_resp = client
+        .post(format!(
+            "{base_url}/v1/sessions/{}/tools/detect_changes",
+            opened.session_id
+        ))
+        .bearer_auth(auth_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("detect_changes alias request");
+
+    assert!(
+        alias_resp.status().is_success(),
+        "detect_changes alias HTTP status must be 2xx, got {}",
+        alias_resp.status(),
+    );
+    let alias_body = alias_resp.text().await.expect("detect_changes alias body");
+    assert!(
+        !alias_body.contains("unknown tool"),
+        "detect_changes alias must not return 'unknown tool' while retained for \
+         compatibility. Got body: {alias_body}"
+    );
+    let deprecation_warning = concat!(
+        "Deprecation warning: `detect_changes` is a CBM-compatibility alias; ",
+        "use `detect_impact` instead. Compatibility policy: kept for CBM migrator ",
+        "ergonomics (decision-log D-015-012); no removal date set."
+    );
+    assert!(
+        alias_body.starts_with(deprecation_warning),
+        "detect_changes alias must emit an explicit deprecation warning. Got body: {alias_body}"
+    );
+
+    // --- Call the DESTINATION with the same input ---------------------------
+    let destination_resp = client
+        .post(format!(
+            "{base_url}/v1/sessions/{}/tools/detect_impact",
+            opened.session_id
+        ))
+        .bearer_auth(auth_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("detect_impact destination request");
+
+    assert!(
+        destination_resp.status().is_success(),
+        "detect_impact destination HTTP status must be 2xx, got {}",
+        destination_resp.status(),
+    );
+    let destination_body = destination_resp
+        .text()
+        .await
+        .expect("detect_impact destination body");
+
+    // --- Deprecated alias preserves destination payload after warning ------
+    let alias_payload = alias_body
+        .strip_prefix(deprecation_warning)
+        .and_then(|body| body.strip_prefix("\n\n"))
+        .expect("detect_changes alias should return warning plus destination payload");
+    assert_eq!(
+        alias_payload,
+        destination_body.as_str(),
+        "detect_changes alias payload must match detect_impact for the same input \
+         after removing the deprecation warning.\n\
+         Divergence here means the alias branch in \
+         src/daemon.rs::execute_tool_call has drifted from its destination handler.\n\
+         alias payload bytes: {}\n\
+         destination bytes: {}",
+        alias_payload.len(),
+        destination_body.len(),
+    );
+    assert!(
+        destination_body.contains("Git unavailable"),
+        "fixture project has no .git — both alias and destination should surface \
+         the git-unavailable error. Got: {destination_body}"
     );
 
     let _ = handle.shutdown_tx.send(());

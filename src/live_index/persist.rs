@@ -191,16 +191,49 @@ pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotReset
     Ok(SnapshotResetReport { removed, missing })
 }
 
-// ── SP-0B spike (Program 015 S0 falsifier) — zstd artifact round-trip ──────────
+// ── Team artifact (Program 015 S1a, C-S1A-005) — index.bin.zst export/import ──
 //
-// ponytail: throwaway-grade. Proves the existing postcard snapshot round-trips
-// through zstd compress/decompress with byte-exact per-file `content_hash`
-// before S1 spend. The real two-tier `index.bin.zst` export/import lands at
-// C-S1A-005; these helpers will be folded into it then.
+// contracts/team-artifact.md (frozen 2026-06-30). Promoted in place from the
+// SP-0B spike (former `spike_build_compressed` / `spike_compress_snapshot` /
+// `spike_import_compressed` / `SpikeArtifactReport`, previously gated behind
+// `cbm-spike` — see research.md § SP-0B): one implementation, no parallel
+// spike-only path.
+//
+// R-14 (no secret leak): every function below only (de)serializes the
+// snapshot already captured from `LiveIndex` — the same in-memory data
+// `serialize_index` writes to `index.bin`. Nothing here re-walks the
+// filesystem, so the artifact can never contain a path the discovery walk
+// (`src/discovery/mod.rs`, `.gitignore` + hidden-file aware) had excluded.
 
-/// Per-file `content_hash` verification report for one zstd round-trip.
-#[cfg(feature = "cbm-spike")]
-pub struct SpikeArtifactReport {
+/// Bare filename of the compressed team-artifact snapshot under `.symforge/`.
+pub const ARTIFACT_FILENAME: &str = "index.bin.zst";
+/// Bare filename of the artifact's sidecar metadata (content_hash etc.).
+pub const ARTIFACT_METADATA_FILENAME: &str = "artifact.json";
+const ARTIFACT_TMP_FILENAME: &str = "index.bin.zst.tmp";
+/// Compression level for `checkpoint_now(export_artifact=true)` — the only
+/// export path wired this sprint (contracts/team-artifact.md § Tiers, Best).
+/// The Fast tier (level 3, watcher/periodic checkpoint) is part of the frozen
+/// contract's tier vocabulary but has no caller yet — no sprint task wires a
+/// background artifact export, so adding it now would be untested, unreachable
+/// code. Add a `Fast` level constant + call site when that lands.
+const ARTIFACT_BEST_ZSTD_LEVEL: i32 = 9;
+
+/// Report of a completed team-artifact export ([`export_artifact`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactExportReport {
+    pub path: PathBuf,
+    pub metadata_path: PathBuf,
+    pub files: usize,
+    pub raw_bytes: usize,
+    pub compressed_bytes: usize,
+    pub content_hash: String,
+}
+
+/// Per-file `content_hash` verification report for one in-memory zstd
+/// export/import round trip (no disk I/O). Used by real-repo-scale regression
+/// coverage (`tests/team_artifact_calibration.rs`) that must not touch a live
+/// project's own `.symforge/` directory.
+pub struct ArtifactRoundTripReport {
     pub files: usize,
     pub matched: usize,
     /// `"<path>: <before> != <after>"` (or `"<path>: missing"`) per failure.
@@ -209,45 +242,44 @@ pub struct SpikeArtifactReport {
     pub compressed_bytes: usize,
 }
 
-/// Build the snapshot, postcard-serialize, and zstd-compress it. Returns
-/// `(snapshot, raw_len, compressed_bytes)`.
-#[cfg(feature = "cbm-spike")]
-fn spike_build_compressed(
+/// Build the snapshot, postcard-serialize, and zstd-compress it in memory.
+/// Returns `(snapshot, raw_bytes, compressed_bytes)`.
+fn build_compressed_snapshot(
     index: &LiveIndex,
     project_root: &Path,
-) -> anyhow::Result<(IndexSnapshot, usize, Vec<u8>)> {
+) -> anyhow::Result<(IndexSnapshot, Vec<u8>, Vec<u8>)> {
     let snapshot = build_snapshot(capture_snapshot_build_input(index), project_root);
     let raw = postcard::to_stdvec(&snapshot)?;
-    let compressed = zstd::encode_all(raw.as_slice(), 3)?;
-    Ok((snapshot, raw.len(), compressed))
+    let compressed = zstd::encode_all(raw.as_slice(), ARTIFACT_BEST_ZSTD_LEVEL)?;
+    Ok((snapshot, raw, compressed))
 }
 
-/// Compress the current snapshot to in-memory `index.bin.zst` bytes.
-#[cfg(feature = "cbm-spike")]
-pub fn spike_compress_snapshot(index: &LiveIndex, project_root: &Path) -> anyhow::Result<Vec<u8>> {
-    Ok(spike_build_compressed(index, project_root)?.2)
+/// Compress the current snapshot to in-memory `index.bin.zst` bytes (no disk
+/// I/O). Building block for [`export_artifact`] and round-trip regression
+/// coverage.
+pub fn compress_snapshot(index: &LiveIndex, project_root: &Path) -> anyhow::Result<Vec<u8>> {
+    Ok(build_compressed_snapshot(index, project_root)?.2)
 }
 
-/// Decompress + deserialize a compressed snapshot. Errors (with no partial
-/// state — nothing is returned) on corrupt zstd or postcard bytes.
-#[cfg(feature = "cbm-spike")]
-pub fn spike_import_compressed(compressed: &[u8]) -> anyhow::Result<IndexSnapshot> {
-    let raw =
-        zstd::decode_all(compressed).map_err(|e| anyhow::anyhow!("zstd decode failed: {e}"))?;
-    let snapshot: IndexSnapshot =
-        postcard::from_bytes(&raw).map_err(|e| anyhow::anyhow!("postcard decode failed: {e}"))?;
-    Ok(snapshot)
+/// Decompress zstd-compressed artifact bytes to raw postcard bytes (no
+/// postcard decode, no disk I/O). Kept separate from postcard decode because
+/// the Import flow (contracts/team-artifact.md) verifies `content_hash`
+/// against these raw bytes *before* deserializing.
+pub fn decompress_artifact_bytes(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
+    zstd::decode_all(compressed).map_err(|e| anyhow::anyhow!("zstd decode failed: {e}"))
 }
 
-/// Full round-trip: serialize -> zstd -> decompress -> deserialize, then verify
-/// every per-file `content_hash` survived byte-exact.
-#[cfg(feature = "cbm-spike")]
-pub fn spike_zstd_round_trip(
+/// Full in-memory round trip: build -> zstd compress -> decompress ->
+/// deserialize, then verify every per-file `content_hash` survived
+/// byte-exact. No disk I/O — safe to run against a live project's own index
+/// (see `tests/team_artifact_calibration.rs`).
+pub fn artifact_round_trip_report(
     index: &LiveIndex,
     project_root: &Path,
-) -> anyhow::Result<SpikeArtifactReport> {
-    let (before, raw_bytes, compressed) = spike_build_compressed(index, project_root)?;
-    let after = spike_import_compressed(&compressed)?;
+) -> anyhow::Result<ArtifactRoundTripReport> {
+    let (before, raw, compressed) = build_compressed_snapshot(index, project_root)?;
+    let decompressed = decompress_artifact_bytes(&compressed)?;
+    let after: IndexSnapshot = postcard::from_bytes(&decompressed)?;
 
     let mut matched = 0usize;
     let mut mismatches = Vec::new();
@@ -262,13 +294,316 @@ pub fn spike_zstd_round_trip(
         }
     }
 
-    Ok(SpikeArtifactReport {
+    Ok(ArtifactRoundTripReport {
         files: before.files.len(),
         matched,
         mismatches,
-        raw_bytes,
+        raw_bytes: raw.len(),
         compressed_bytes: compressed.len(),
     })
+}
+
+/// Export the current index as the Best-tier `.symforge/index.bin.zst` team
+/// artifact plus its `artifact.json` sidecar, and ensure the `.gitattributes`
+/// `*.zst merge=ours` hint (A-US2-04) exists at `project_root`. Atomic write
+/// (tmp -> rename), mirroring [`write_snapshot`].
+pub fn export_artifact(
+    index: &LiveIndex,
+    project_root: &Path,
+) -> anyhow::Result<ArtifactExportReport> {
+    let (snapshot, raw, compressed) = build_compressed_snapshot(index, project_root)?;
+    let file_count = snapshot.files.len();
+    let content_hash = crate::hash::digest_hex(&raw);
+
+    let dir = paths::ensure_symforge_dir(project_root)?;
+    let final_path = dir.join(ARTIFACT_FILENAME);
+    let tmp_path = dir.join(ARTIFACT_TMP_FILENAME);
+    std::fs::write(&tmp_path, &compressed).map_err(|e| {
+        anyhow::anyhow!("writing team artifact tmp at {}: {}", tmp_path.display(), e)
+    })?;
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        anyhow::anyhow!(
+            "renaming team artifact {} -> {}: {}",
+            tmp_path.display(),
+            final_path.display(),
+            e
+        )
+    })?;
+
+    let metadata_path = dir.join(ARTIFACT_METADATA_FILENAME);
+    let metadata = serde_json::json!({
+        "content_hash": content_hash,
+        "raw_bytes": raw.len(),
+        "compressed_bytes": compressed.len(),
+        "files": file_count,
+    });
+    std::fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?).map_err(|e| {
+        anyhow::anyhow!(
+            "writing team artifact metadata at {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })?;
+
+    ensure_gitattributes_merge_hint(project_root)?;
+
+    info!(
+        bytes = compressed.len(),
+        files = file_count,
+        path = %final_path.display(),
+        "team artifact exported"
+    );
+
+    Ok(ArtifactExportReport {
+        path: final_path,
+        metadata_path,
+        files: file_count,
+        raw_bytes: raw.len(),
+        compressed_bytes: compressed.len(),
+        content_hash,
+    })
+}
+
+/// Ensure `project_root/.gitattributes` carries the `*.zst merge=ours` hint
+/// (contracts/team-artifact.md § Paths) so merging the shared artifact always
+/// keeps the current branch's copy instead of a line-diff conflict on binary
+/// content. Idempotent: appends only if the line is not already present;
+/// preserves any existing file content byte-for-byte otherwise.
+fn ensure_gitattributes_merge_hint(project_root: &Path) -> anyhow::Result<()> {
+    const HINT_LINE: &str = "*.zst merge=ours";
+    let path = project_root.join(".gitattributes");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == HINT_LINE) {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(HINT_LINE);
+    updated.push('\n');
+    std::fs::write(&path, updated)
+        .map_err(|e| anyhow::anyhow!("writing .gitattributes at {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Read the `content_hash` field out of an `artifact.json` sidecar, if it
+/// parses. Returns `None` when the sidecar is missing, is invalid JSON, or
+/// lacks the field. Per contracts/team-artifact.md § Integrity failure, the
+/// caller ([`import_artifact`]) treats `None` as an integrity failure: the
+/// artifact's `content_hash` cannot be verified, so it is quarantined and the
+/// daemon falls back to a full index build rather than trusting an
+/// unverifiable payload.
+fn read_artifact_content_hash(metadata_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(metadata_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("content_hash")?.as_str().map(str::to_string)
+}
+
+/// Import the team artifact (`.symforge/index.bin.zst`) per
+/// contracts/team-artifact.md § Import flow: decompress, verify
+/// `content_hash` against the `artifact.json` sidecar, then deserialize. The
+/// returned snapshot rehydrates via the same `snapshot_to_live_index` +
+/// stat-check path an `index.bin` load already uses (see `load_snapshot`).
+///
+/// Any integrity failure (corrupt zstd frame, hash mismatch, corrupt
+/// postcard, version mismatch) quarantines the artifact under
+/// `.symforge/quarantine/artifacts/` and returns `None`, so the caller falls
+/// back to a full cold re-index (contract § Integrity failure).
+fn import_artifact(project_root: &Path) -> Option<IndexSnapshot> {
+    let dir = paths::resolve_symforge_dir(project_root);
+    let artifact_path = dir.join(ARTIFACT_FILENAME);
+    let metadata_path = dir.join(ARTIFACT_METADATA_FILENAME);
+
+    let compressed = std::fs::read(&artifact_path).ok()?;
+
+    let raw = match decompress_artifact_bytes(&compressed) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!("failed to decompress team artifact (corrupt zst?): {e}");
+            try_quarantine_bad_artifact(
+                project_root,
+                &artifact_path,
+                &metadata_path,
+                &compressed,
+                "zstd-decode-error",
+                e.to_string(),
+            );
+            return None;
+        }
+    };
+
+    // contracts/team-artifact.md § Import flow requires "verify content_hash"
+    // BEFORE loading. A missing/unparseable sidecar means the hash cannot be
+    // verified — reachable when a crash (or partial checkout) lands between
+    // `export_artifact`'s artifact rename and its separate, non-atomic sidecar
+    // write. Do NOT silently trust an unverifiable payload: treat it as an
+    // integrity failure (§ Integrity failure), quarantine, and fall back to a
+    // full index build.
+    let Some(expected_hash) = read_artifact_content_hash(&metadata_path) else {
+        warn!(
+            path = %artifact_path.display(),
+            metadata_path = %metadata_path.display(),
+            "team artifact sidecar missing or unparseable — content_hash unverifiable; quarantining and falling back to a full index build"
+        );
+        try_quarantine_bad_artifact(
+            project_root,
+            &artifact_path,
+            &metadata_path,
+            &compressed,
+            "missing-sidecar",
+            format!(
+                "artifact.json missing or unparseable at {}",
+                metadata_path.display()
+            ),
+        );
+        return None;
+    };
+
+    let actual_hash = crate::hash::digest_hex(&raw);
+    if actual_hash != expected_hash {
+        warn!(
+            "team artifact content_hash mismatch (expected {expected_hash}, got {actual_hash}) — quarantining"
+        );
+        try_quarantine_bad_artifact(
+            project_root,
+            &artifact_path,
+            &metadata_path,
+            &compressed,
+            "content-hash-mismatch",
+            format!("expected {expected_hash}, got {actual_hash}"),
+        );
+        return None;
+    }
+
+    match postcard::from_bytes::<IndexSnapshot>(&raw) {
+        Ok(snapshot) if snapshot.version == CURRENT_VERSION => Some(snapshot),
+        Ok(snapshot) => {
+            warn!(
+                "team artifact snapshot version mismatch: got {}, expected {} — will cold re-index",
+                snapshot.version, CURRENT_VERSION
+            );
+            try_quarantine_bad_artifact(
+                project_root,
+                &artifact_path,
+                &metadata_path,
+                &compressed,
+                "version-mismatch",
+                format!(
+                    "snapshot version {}, expected {}",
+                    snapshot.version, CURRENT_VERSION
+                ),
+            );
+            None
+        }
+        Err(e) => {
+            warn!("failed to deserialize team artifact (corrupt postcard?): {e}");
+            try_quarantine_bad_artifact(
+                project_root,
+                &artifact_path,
+                &metadata_path,
+                &compressed,
+                "postcard-decode-error",
+                e.to_string(),
+            );
+            None
+        }
+    }
+}
+
+fn quarantine_bad_artifact(
+    project_root: &Path,
+    artifact_path: &Path,
+    metadata_path: &Path,
+    compressed_bytes: &[u8],
+    reason: &str,
+    detail: String,
+) -> anyhow::Result<PathBuf> {
+    let dir = paths::ensure_artifact_quarantine_dir(project_root)?;
+    let hash = crate::hash::digest_hex(compressed_bytes);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let name = format!(
+        "{}-{:09}-{}-{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        &hash[..16],
+        reason
+    );
+    let quarantine_path = dir.join(format!("{name}.zst"));
+    let metadata_out_path = dir.join(format!("{name}.json"));
+
+    std::fs::write(&quarantine_path, compressed_bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "writing quarantined team artifact at {}: {}",
+            quarantine_path.display(),
+            e
+        )
+    })?;
+
+    let quarantine_metadata = serde_json::json!({
+        "source_path": artifact_path.to_string_lossy(),
+        "quarantine_path": quarantine_path.to_string_lossy(),
+        "reason": reason,
+        "detail": detail,
+        "sha256": hash,
+        "bytes": compressed_bytes.len(),
+        "quarantined_at_unix_seconds": now.as_secs(),
+        "quarantined_at_unix_nanos": now.subsec_nanos(),
+    });
+    let metadata_bytes = serde_json::to_vec_pretty(&quarantine_metadata)?;
+    std::fs::write(&metadata_out_path, metadata_bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "writing team artifact quarantine metadata at {}: {}",
+            metadata_out_path.display(),
+            e
+        )
+    })?;
+
+    // Remove the bad artifact (+ its sidecar) so a later cold start does not
+    // retry the same corrupt artifact forever.
+    match std::fs::remove_file(artifact_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %artifact_path.display(),
+            "failed to remove bad team artifact after quarantine: {error}"
+        ),
+    }
+    let _ = std::fs::remove_file(metadata_path);
+
+    Ok(quarantine_path)
+}
+
+fn try_quarantine_bad_artifact(
+    project_root: &Path,
+    artifact_path: &Path,
+    metadata_path: &Path,
+    compressed_bytes: &[u8],
+    reason: &str,
+    detail: String,
+) {
+    match quarantine_bad_artifact(
+        project_root,
+        artifact_path,
+        metadata_path,
+        compressed_bytes,
+        reason,
+        detail,
+    ) {
+        Ok(quarantine_path) => warn!(
+            path = %artifact_path.display(),
+            quarantine_path = %quarantine_path.display(),
+            reason = reason,
+            "bad team artifact quarantined"
+        ),
+        Err(error) => warn!(
+            path = %artifact_path.display(),
+            reason = reason,
+            "failed to quarantine bad team artifact: {error}"
+        ),
+    }
 }
 
 fn write_snapshot(
@@ -413,8 +748,16 @@ pub fn load_snapshot(project_root: &Path) -> Option<IndexSnapshot> {
 
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // contracts/team-artifact.md § Import flow: index.bin missing but a
+            // team-shared index.bin.zst artifact may be present — import it
+            // instead of dropping straight to a full cold re-index. Absent
+            // artifact too (the common first-run case) falls through to `None`.
+            return import_artifact(project_root);
+        }
         Err(_) => {
-            // File not found is the normal case on first run
+            // Any other read failure (permissions, etc.) is the pre-existing
+            // "give up, caller re-indexes" behavior.
             return None;
         }
     };
@@ -2309,5 +2652,191 @@ mod tests {
         assert!(tmp.path().join(".symforge").join("index.bin").exists());
         // No tmp file should remain
         assert!(!tmp.path().join(".symforge").join("index.bin.tmp").exists());
+    }
+
+    // ── Team artifact tests (Program 015 S1a, C-S1A-005) ──────────────────────
+
+    #[test]
+    fn test_export_artifact_writes_metadata_and_gitattributes_hint() {
+        let tmp = TempDir::new().unwrap();
+        let index =
+            make_live_index_with_files(vec![("a.rs", b"fn a() {}"), ("b.rs", b"fn b() {}")]);
+
+        let report = export_artifact(&index, tmp.path()).expect("export should succeed");
+        assert_eq!(report.files, 2);
+        assert!(report.path.exists(), "index.bin.zst should exist");
+        assert!(report.metadata_path.exists(), "artifact.json should exist");
+        assert_eq!(report.path.file_name().unwrap(), ARTIFACT_FILENAME);
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report.metadata_path).unwrap()).unwrap();
+        assert_eq!(metadata["content_hash"], report.content_hash);
+        assert_eq!(metadata["files"], 2);
+
+        // A-US2-04: .gitattributes carries the merge=ours hint.
+        let gitattributes = std::fs::read_to_string(tmp.path().join(".gitattributes")).unwrap();
+        assert!(
+            gitattributes
+                .lines()
+                .any(|line| line.trim() == "*.zst merge=ours"),
+            "expected *.zst merge=ours hint, got: {gitattributes:?}"
+        );
+
+        // Idempotent: exporting again must not duplicate the gitattributes hint.
+        export_artifact(&index, tmp.path()).expect("second export should succeed");
+        let gitattributes_again =
+            std::fs::read_to_string(tmp.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            gitattributes_again.matches("merge=ours").count(),
+            1,
+            "repeat export must not duplicate the gitattributes hint"
+        );
+    }
+
+    #[test]
+    fn test_artifact_round_trip_is_byte_exact_and_preserves_content_hash() {
+        let tmp = TempDir::new().unwrap();
+        let index = make_live_index_with_files(vec![
+            ("src/foo.rs", b"fn foo() { bar(); }"),
+            ("src/bar.py", b"def bar():\n    pass\n"),
+        ]);
+
+        let (before, raw, compressed) =
+            build_compressed_snapshot(&index, tmp.path()).expect("build compressed snapshot");
+        let decompressed = decompress_artifact_bytes(&compressed).expect("decompress");
+        let after: IndexSnapshot = postcard::from_bytes(&decompressed).expect("decode postcard");
+
+        // SP-0B caveat (a), adapted: `IndexSnapshot.files` is a `HashMap`, so
+        // re-serializing the *deserialized* snapshot is not guaranteed to
+        // reproduce the original bytes (HashMap iteration order is not part
+        // of its API contract, even for identical logical content). The
+        // property that IS deterministic — and is the real "whole-snapshot
+        // byte-exact" guarantee this artifact needs — is the zstd round trip
+        // itself: decompression must reproduce the exact pre-compression
+        // postcard bytes.
+        assert_eq!(
+            decompressed, raw,
+            "zstd decompress must reproduce the pre-compression postcard bytes exactly"
+        );
+
+        for (path, before_file) in &before.files {
+            let after_file = after
+                .files
+                .get(path)
+                .expect("file present after round trip");
+            assert_eq!(after_file.content_hash, before_file.content_hash);
+        }
+    }
+
+    #[test]
+    fn test_load_snapshot_imports_artifact_when_bin_missing() {
+        let tmp = TempDir::new().unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}")]);
+
+        export_artifact(&index, tmp.path()).expect("export should succeed");
+        assert!(
+            !tmp.path().join(".symforge").join("index.bin").exists(),
+            "only the .zst artifact should exist for this scenario"
+        );
+
+        let snapshot = load_snapshot(tmp.path()).expect("load_snapshot should import the artifact");
+        let file = snapshot
+            .files
+            .get("src/main.rs")
+            .expect("imported snapshot should contain the file");
+        assert_eq!(file.content_hash, crate::hash::digest_hex(b"fn main() {}"));
+    }
+
+    #[test]
+    fn test_load_snapshot_quarantines_corrupt_artifact_and_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}")]);
+        export_artifact(&index, tmp.path()).expect("export should succeed");
+
+        let artifact_path = tmp.path().join(".symforge").join(ARTIFACT_FILENAME);
+        let good = std::fs::read(&artifact_path).unwrap();
+        std::fs::write(&artifact_path, &good[..good.len() / 2]).unwrap();
+
+        let result = load_snapshot(tmp.path());
+        assert!(
+            result.is_none(),
+            "corrupt artifact must fall back to a full re-index, not partial-serve"
+        );
+        assert!(
+            !artifact_path.exists(),
+            "corrupt artifact should be removed from the active path after quarantine"
+        );
+
+        let quarantine_dir = paths::resolve_artifact_quarantine_dir(tmp.path());
+        let quarantined: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .expect("quarantine dir should exist")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("zst"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "corrupt artifact should be quarantined under .symforge/quarantine/artifacts/"
+        );
+    }
+
+    #[test]
+    fn test_load_snapshot_quarantines_artifact_with_missing_sidecar() {
+        // The artifact and its sidecar are written non-atomically
+        // (export_artifact: rename the .zst, then a separate std::fs::write of
+        // artifact.json). A crash between them — or a partial checkout that
+        // picked up the .zst but not the .json — leaves a VALID compressed
+        // artifact with NO sidecar. content_hash is then unverifiable, so the
+        // import path must quarantine and fall back, not silently trust it.
+        let tmp = TempDir::new().unwrap();
+        let index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}")]);
+        export_artifact(&index, tmp.path()).expect("export should succeed");
+
+        let artifact_path = tmp.path().join(".symforge").join(ARTIFACT_FILENAME);
+        let metadata_path = tmp
+            .path()
+            .join(".symforge")
+            .join(ARTIFACT_METADATA_FILENAME);
+        std::fs::remove_file(&metadata_path).expect("remove sidecar");
+        assert!(
+            artifact_path.exists(),
+            "artifact bytes remain valid — only the sidecar is gone"
+        );
+
+        let result = load_snapshot(tmp.path());
+        assert!(
+            result.is_none(),
+            "a valid artifact with a missing sidecar must NOT be silently trusted; \
+             content_hash is unverifiable, so import must quarantine and fall back"
+        );
+        assert!(
+            !artifact_path.exists(),
+            "unverifiable artifact should be removed from the active path after quarantine"
+        );
+
+        let quarantine_dir = paths::resolve_artifact_quarantine_dir(tmp.path());
+        let quarantined: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .expect("quarantine dir should exist")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("zst"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "missing-sidecar artifact should be quarantined under .symforge/quarantine/artifacts/"
+        );
+
+        let quarantine_json: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .expect("quarantine dir should exist")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        assert_eq!(quarantine_json.len(), 1);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(quarantine_json[0].path()).unwrap()).unwrap();
+        assert_eq!(
+            metadata["reason"], "missing-sidecar",
+            "quarantine metadata must record the missing-sidecar integrity failure"
+        );
     }
 }

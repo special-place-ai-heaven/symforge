@@ -2338,6 +2338,42 @@ pub fn what_changed_timestamp_view(view: &WhatChangedTimestampView, since_ts: i6
     }
 }
 
+/// Render `detect_impact`'s JSON payload wrapped in a short plain-text
+/// summary. MCP tool responses here are always text, never raw JSON (house
+/// convention — see `tools.rs` module doc); the exact contract shape
+/// (contracts/detect-impact.md § Output) is embedded verbatim after the
+/// `--- impact payload ---` marker so callers can parse it directly, the same
+/// pattern `format_session_cache_hit_body` uses for its cache payload.
+pub fn detect_impact_result(
+    payload: &serde_json::Value,
+    requested_depth: u8,
+    effective_depth: u8,
+) -> String {
+    let changed_files = payload["changed_files"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let changed_symbols = payload["changed_symbols"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let risk = &payload["risk_summary"];
+    let total_blast = payload["pagination"]["total"].as_u64().unwrap_or(0);
+    let summary = format!(
+        "Impact analysis: {changed_files} changed file(s), {changed_symbols} changed symbol(s), \
+         {total_blast} blast-radius node(s) ({} critical / {} high / {} medium / {} low)",
+        risk["critical"], risk["high"], risk["medium"], risk["low"],
+    );
+    let json = serde_json::to_string_pretty(payload).expect("detect_impact payload serializes");
+    let mut out = format!("{summary}\n\n--- impact payload ---\n{json}");
+    if requested_depth > effective_depth {
+        out.push_str(&format!(
+            "\n\nWarning: depth clamped to {effective_depth} (requested {requested_depth})."
+        ));
+    }
+    out
+}
+
 pub fn what_changed_paths_result(paths: &[String], empty_message: &str) -> String {
     let mut normalized_paths: Vec<String> =
         paths.iter().map(|path| path.replace('\\', "/")).collect();

@@ -95,6 +95,17 @@ impl GitRepo {
 3. Always merge `uncommitted_paths()` when `include_untracked` (already includes untracked per EV-S1-002).
 4. Dedupe, sort, reject paths outside repo root.
 
+> **`main` default (contract):** `merge_git_changed_paths` itself treats a
+> `None` `base_branch` + `None` `since` as uncommitted-only (its unit tests pin
+> this low-level shape). The `detect_impact` handler applies the frozen
+> contract default *before* calling the helper: when the caller supplied
+> neither `base_branch` nor `since`, it substitutes `base_branch = "main"`, so
+> the STEL-upgraded path (`route_impact`, which passes only `scope=files`)
+> diffs against `main` rather than returning an empty blast radius on a clean
+> tree with committed-but-unmerged work. A repo whose default branch is not
+> `main` surfaces the step-2 ref-resolution error (`Invalid git ref`), not a
+> silent empty result — pass an explicit `base_branch`/`since` there.
+
 ## STEL impact routing ([P] P-S1A-011)
 
 | | Before (8.9.x) | After (8.10.0) |

@@ -176,6 +176,55 @@ impl GitRepo {
         Ok(collect_diff_paths(&diff))
     }
 
+    /// Union of ref-range diff + working-tree changes; repo-relative POSIX
+    /// paths; deduped (Program 015 S1a, `detect_impact` — see
+    /// `specs/015-cbm-capability-ports/planning/sprint-1-quick-wins-spec.md`
+    /// § Git merge helper).
+    ///
+    /// Algorithm:
+    /// 1. `since` set -> [`Self::changed_paths_between_refs`]`(since, "HEAD")`,
+    ///    or the working-tree variant ([`Self::changed_paths_from_ref`]`("HEAD")`)
+    ///    when `since` is the literal sentinel `"WORKTREE"`.
+    /// 2. Else `base_branch` set -> three-dot diff vs `HEAD`.
+    /// 3. Always merge [`Self::uncommitted_paths`] when `include_untracked`
+    ///    (staged + unstaged + untracked).
+    /// 4. Dedupe, sort, reject any path escaping the repo root.
+    ///
+    /// No shell is invoked (this crate uses `git2`, never `Command::new("git")`
+    /// for production paths — see module docs), so shell-metacharacter
+    /// injection does not apply here; an invalid `since`/`base_branch` ref is
+    /// still rejected via `git2`'s own ref resolution error.
+    pub fn merge_git_changed_paths(
+        &self,
+        base_branch: Option<&str>,
+        since: Option<&str>,
+        include_untracked: bool,
+    ) -> Result<Vec<String>, String> {
+        let since = since.map(str::trim).filter(|s| !s.is_empty());
+        let base_branch = base_branch.map(str::trim).filter(|s| !s.is_empty());
+
+        let mut paths: Vec<String> = if let Some(since_ref) = since {
+            if since_ref == "WORKTREE" {
+                self.changed_paths_from_ref("HEAD")?
+            } else {
+                self.changed_paths_between_refs(since_ref, "HEAD")?
+            }
+        } else if let Some(base) = base_branch {
+            self.changed_paths_between_refs(base, "HEAD")?
+        } else {
+            Vec::new()
+        };
+
+        if include_untracked {
+            paths.extend(self.uncommitted_paths()?);
+        }
+
+        paths.retain(|p| is_repo_relative(p));
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     /// Read file content at a specific git ref. Returns None if the file doesn't exist at that ref.
     ///
     /// Replaces: `git show <ref>:<path>`
@@ -349,6 +398,24 @@ pub fn commit_distance(from: &str, to: &str, repo_root: &Path) -> Result<Option<
         .graph_ahead_behind(to_oid, from_oid)
         .map_err(|e| format!("graph_ahead_behind failed: {e}"))?;
     Ok(Some(ahead as u32))
+}
+
+/// True when `path` is a well-behaved repo-relative path: not absolute, and
+/// no `..` component. Defense in depth for [`GitRepo::merge_git_changed_paths`]
+/// — `git2` diffs are already tree-relative and cannot escape the repo root,
+/// but a malformed or crafted delta path must never leak outside the scope
+/// this tool operates on.
+fn is_repo_relative(path: &str) -> bool {
+    // `Path::is_absolute()` requires a drive letter on Windows, so a
+    // leading `/` (git's own path separator) would otherwise slip through.
+    if path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    let p = Path::new(path);
+    !p.is_absolute()
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 /// Collect changed file paths from a git2 diff.
@@ -706,6 +773,82 @@ mod tests {
         let (dir, _repo) = make_test_repo();
         let result = commit_distance("no_such_ref", "HEAD", dir.path());
         assert!(result.is_err(), "expected error for invalid ref");
+    }
+
+    #[test]
+    fn test_is_repo_relative() {
+        assert!(is_repo_relative("src/main.rs"));
+        assert!(is_repo_relative("a.rs"));
+        assert!(!is_repo_relative("../secret.txt"));
+        assert!(!is_repo_relative("src/../../escape.rs"));
+        assert!(!is_repo_relative("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_base_branch() {
+        let (_dir, repo) = make_test_repo();
+        // make_test_repo's second commit touches file2.rs + README.md.
+        let paths = repo
+            .merge_git_changed_paths(Some("HEAD~1"), None, false)
+            .unwrap();
+        assert_eq!(paths, vec!["README.md".to_string(), "file2.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_since_overrides_base_branch() {
+        let (_dir, repo) = make_test_repo();
+        // `since` wins even when a (bogus) base_branch is also supplied.
+        let paths = repo
+            .merge_git_changed_paths(Some("no_such_branch"), Some("HEAD~1"), false)
+            .unwrap();
+        assert_eq!(paths, vec!["README.md".to_string(), "file2.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_worktree_sentinel() {
+        let (dir, repo) = make_test_repo();
+        fs::write(dir.path().join("file1.rs"), "fn changed() {}").unwrap();
+        // WORKTREE diffs tracked changes (HEAD vs working tree) without pulling
+        // in untracked files, unlike `include_untracked`.
+        let paths = repo
+            .merge_git_changed_paths(None, Some("WORKTREE"), false)
+            .unwrap();
+        assert_eq!(paths, vec!["file1.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_include_untracked_merges() {
+        let (dir, repo) = make_test_repo();
+        fs::write(dir.path().join("new_file.rs"), "fn new() {}").unwrap();
+        let paths = repo.merge_git_changed_paths(None, None, true).unwrap();
+        assert_eq!(paths, vec!["new_file.rs".to_string()]);
+
+        let paths_excluded = repo.merge_git_changed_paths(None, None, false).unwrap();
+        assert!(
+            paths_excluded.is_empty(),
+            "include_untracked=false must not merge working-tree changes"
+        );
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_dedup_sorted() {
+        let (dir, repo) = make_test_repo();
+        // file2.rs is both part of the HEAD~1..HEAD diff and currently re-modified.
+        fs::write(dir.path().join("file2.rs"), "fn helper() { /* changed */ }").unwrap();
+        let paths = repo
+            .merge_git_changed_paths(Some("HEAD~1"), None, true)
+            .unwrap();
+        assert_eq!(paths, vec!["README.md".to_string(), "file2.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_git_changed_paths_invalid_ref_rejected() {
+        let (_dir, repo) = make_test_repo();
+        let result = repo.merge_git_changed_paths(Some("no_such_ref_at_all"), None, false);
+        assert!(
+            result.is_err(),
+            "an invalid base_branch ref must be rejected"
+        );
     }
 
     #[test]

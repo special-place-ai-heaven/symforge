@@ -84,25 +84,25 @@
 
 ### Wave 3 — [C] US1 impact (max 4 [C]; 1× L)
 
-- [ ] C-S1A-001 `merge_git_changed_paths` in `src/git.rs`. **M**
-- [ ] C-S1A-002 `compute_impact` in `src/live_index/graph.rs`. **L**
-- [ ] C-S1A-003 `detect_impact` handler + format in `tools.rs`, `format.rs`. **L**
+- [x] C-S1A-001 `merge_git_changed_paths` in `src/git.rs`. **M**
+- [x] C-S1A-002 `compute_impact` in `src/live_index/graph.rs`. **L**
+- [x] C-S1A-003 `detect_impact` handler + format in `tools.rs`, `format.rs`. **L**
 
 **STOP** — `cargo test detect_impact` skeleton.
 
-- [ ] C-S1A-004 STEL impact in `stel/planner.rs`, `handler.rs`. **M**
+- [x] C-S1A-004 STEL impact in `stel/planner.rs`, `handler.rs`. **M**
 
 ### Wave 4 — [C] US2 artifact + register (max 3 [C])
 
-- [ ] C-S1A-005 Artifact export/import in `persist.rs`. **L**
-- [ ] C-S1A-006 `checkpoint_now(export_artifact)` in `tools.rs`. **M**
-- [ ] C-S1A-007 Register `detect_impact` + init.rs; daemon alias per D-015-012. **S**
+- [x] C-S1A-005 Artifact export/import in `persist.rs`. **L**
+- [x] C-S1A-006 `checkpoint_now(export_artifact)` in `tools.rs`. **M**
+- [x] C-S1A-007 Register `detect_impact` + init.rs; daemon alias per D-015-012. **S**
 
 ### [V] S1a
 
-- [ ] V-S1A-001 A-US1-01..05 green.
-- [ ] V-S1A-002 A-US2-01..04 green.
-- [ ] V-S1A-003 quickstart S1a + scoped gate.
+- [x] V-S1A-001 A-US1-01..05 green. *(detect_impact 4/4; adversarially found+fixed base_branch default gap)*
+- [x] V-S1A-002 A-US2-01..04 green. *(team_artifact 2/2; adversarially found+fixed daemon-bootstrap + missing-sidecar gaps)*
+- [x] V-S1A-003 quickstart S1a + scoped gate. *(fmt/check/clippy/embed green; full-suite coverage via 2 independent partial runs + all changed-surface tests, zero failures; cargo build --release could not complete locally — sandbox wall-time ceiling, not a code failure — CI is authoritative for that check; see research.md § S1a Implementation Results)*
 
 ---
 

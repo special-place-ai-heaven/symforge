@@ -1,9 +1,11 @@
 {
   "scenario": "commit_2_changes_src_a_rs",
   "changed_files": ["src/a.rs"],
-  "expected_blast": [
-    {"symbol": "core", "path": "src/lib.rs", "hop": 1, "risk": "high"},
-    {"symbol": "call_a", "path": "src/a.rs", "hop": 0, "risk": "changed"}
+  "changed_symbols": [
+    {"name": "call_a", "path": "src/a.rs", "kind": "fn"}
   ],
-  "notes": "Populate after git bootstrap; hop/risk tiers per contracts/detect-impact.md"
+  "expected_blast": [
+    {"symbol": "main", "hop": 1, "risk": "critical"}
+  ],
+  "notes": "Populated by C-S1A-003 (tests/detect_impact.rs) against the real GraphProjection/compute_impact output over a bootstrapped 2-commit fixture repo. main() in src/main.rs is the sole caller of call_a (via the qualified a::call_a()) and is itself the fn-main entry point, so it lands at hop 1 with risk promoted to critical per contracts/detect-impact.md's entry_point rule. blast_radius entries carry only {symbol,hop,risk} (bare symbol name, no path) per the frozen contract's Output shape — this superseded an earlier draft of this file that used core/hop1/high, written before compute_impact existed; core has no callers of its own reachable from call_a's change, so it never enters the blast radius."
 }

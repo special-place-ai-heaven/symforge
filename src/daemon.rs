@@ -29,11 +29,11 @@ use crate::protocol::edit::{
 };
 use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::protocol::tools::{
-    AnalyzeFileImpactInput, CheckpointNowInput, DiffSymbolsInput, EditPlanInput, ExploreInput,
-    FindDependentsInput, FindReferencesInput, GetFileContentInput, GetFileContextInput,
-    GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, HealthInput, IndexFolderInput,
-    InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
-    SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
+    AnalyzeFileImpactInput, CheckpointNowInput, DetectImpactInput, DiffSymbolsInput, EditPlanInput,
+    ExploreInput, FindDependentsInput, FindReferencesInput, GetFileContentInput,
+    GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, HealthInput,
+    IndexFolderInput, InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput,
+    SearchTextInput, SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
 };
 use crate::sidecar::{SidecarState, SymbolSnapshot, TokenStats};
 use crate::watcher::{self, WatcherInfo};
@@ -87,6 +87,14 @@ const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
     "use `get_symbol_context` with `sections=[...]` or `find_references` instead. ",
     "Compatibility policy: keep daemon alias through v7.x; planned removal in v8.0."
+);
+/// D-015-012: CBM migrator ergonomics — route the CBM `detect_changes` tool
+/// name to the real `detect_impact` tool so a migrating client's existing
+/// tool-name references keep working.
+const DETECT_CHANGES_ALIAS_DEPRECATION: &str = concat!(
+    "Deprecation warning: `detect_changes` is a CBM-compatibility alias; ",
+    "use `detect_impact` instead. Compatibility policy: kept for CBM migrator ",
+    "ergonomics (decision-log D-015-012); no removal date set."
 );
 
 pub type SharedDaemonState = Arc<DaemonState>;
@@ -2009,12 +2017,7 @@ impl ProjectInstance {
             .unwrap_or("project")
             .to_string();
 
-        let index = live_index::LiveIndex::load(canonical_root).with_context(|| {
-            format!(
-                "failed to load project index for {}",
-                canonical_root.display()
-            )
-        })?;
+        let index = bootstrap_project_index(canonical_root)?;
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
 
@@ -2153,6 +2156,62 @@ impl ProjectInstance {
 
         Ok((file_count, symbol_count))
     }
+}
+
+/// Bootstrap a project's live index for a daemon open/switch.
+///
+/// Fast path (contracts/team-artifact.md § Import flow): consume the persisted
+/// `.symforge/index.bin`, or — when that is absent — the shared team artifact
+/// `index.bin.zst`, via [`live_index::persist::load_snapshot`] (which verifies
+/// integrity and quarantines a corrupt/stale/unverifiable artifact, returning
+/// `None`). This is the whole point of the exported artifact: a teammate who
+/// just `git clone`d gets a warm index instead of a cold full scan. A
+/// background stat-check reconciles on-disk drift, mirroring the stdio local
+/// path in `main.rs::run_local_mcp_server_async`.
+///
+/// Cold path: no snapshot/artifact present (or it was quarantined) — fall back
+/// to a full discovery+parse [`live_index::LiveIndex::load`].
+fn bootstrap_project_index(canonical_root: &Path) -> anyhow::Result<SharedIndex> {
+    if let Some(snapshot) = live_index::persist::load_snapshot(canonical_root) {
+        let file_count = snapshot.files.len();
+        let snapshot_mtimes: HashMap<String, u64> = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect();
+        let live = live_index::persist::snapshot_to_live_index(snapshot, canonical_root);
+        tracing::info!(
+            files = file_count,
+            load_source = ?live.load_source(),
+            root = %canonical_root.display(),
+            "daemon bootstrap restored index from .symforge snapshot/team artifact"
+        );
+        let shared: SharedIndex = live_index::SharedIndexHandle::shared(live);
+
+        // Reconcile the restored snapshot against current disk state (offline
+        // edits, or a teammate-cloned artifact vs their own working tree). Only
+        // when a tokio runtime is present — daemon opens run under
+        // `spawn_blocking`, so `Handle::current()` is available; a bare-sync
+        // caller (e.g. a unit test) simply skips reconciliation and relies on
+        // the watcher started in `activate()` for subsequent changes. Same
+        // guard style as `start_project_watcher`.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let bg_index = shared.clone();
+            let bg_root = canonical_root.to_path_buf();
+            handle.spawn(async move {
+                live_index::persist::background_verify(bg_index, bg_root, snapshot_mtimes).await;
+            });
+        }
+
+        return Ok(shared);
+    }
+
+    live_index::LiveIndex::load(canonical_root).with_context(|| {
+        format!(
+            "failed to load project index for {}",
+            canonical_root.display()
+        )
+    })
 }
 
 fn start_project_watcher(
@@ -3369,6 +3428,16 @@ async fn execute_tool_call(
         "checkpoint_now" => Ok(server
             .checkpoint_now(Parameters(decode_params::<CheckpointNowInput>(params)?))
             .await),
+        "detect_impact" => Ok(server
+            .detect_impact(Parameters(decode_params::<DetectImpactInput>(params)?))
+            .await),
+        // D-015-012 backward-compat alias: CBM's `detect_changes` -> `detect_impact`.
+        "detect_changes" => {
+            let output = server
+                .detect_impact(Parameters(decode_params::<DetectImpactInput>(params)?))
+                .await;
+            Ok(format!("{DETECT_CHANGES_ALIAS_DEPRECATION}\n\n{output}"))
+        }
         // TR-01 / FR-006: the front-end `status` tool proxies here so the readout
         // reflects the DAEMON's populated index (the one that actually serves
         // queries), not the empty front-end index. `status_for_daemon_session`
@@ -3594,6 +3663,48 @@ mod tests {
             .default_headers(headers)
             .build()
             .expect("build authed reqwest client")
+    }
+
+    #[test]
+    fn project_instance_load_consumes_exported_team_artifact() {
+        // A teammate who just `git clone`d has `.symforge/index.bin.zst` (the
+        // exported team artifact) but no local `index.bin`. The daemon's real
+        // per-project bootstrap (`ProjectInstance::load`) must consume that
+        // artifact — the whole point of exporting it — instead of a cold full
+        // discovery+parse scan.
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("main.rs"), b"fn main() { helper(); }\n").unwrap();
+        std::fs::write(tmp.path().join("helper.rs"), b"pub fn helper() {}\n").unwrap();
+
+        // Build a fresh index and export the Best-tier team artifact. No
+        // `index.bin` is written — only `index.bin.zst` + `artifact.json`.
+        let fresh = live_index::LiveIndex::load(tmp.path()).expect("cold load");
+        {
+            let guard = fresh.read();
+            live_index::persist::export_artifact(&guard, tmp.path()).expect("export artifact");
+        }
+        assert!(
+            !tmp.path().join(".symforge").join("index.bin").exists(),
+            "only the .zst team artifact should exist for the clone scenario"
+        );
+        assert!(
+            tmp.path().join(".symforge").join("index.bin.zst").exists(),
+            "the exported team artifact must be present"
+        );
+
+        // The real daemon bootstrap must restore FROM the artifact.
+        let project = ProjectInstance::load(tmp.path()).expect("project load");
+        let guard = project.index.read();
+        assert_eq!(
+            guard.load_source(),
+            crate::live_index::store::IndexLoadSource::SnapshotRestore,
+            "daemon bootstrap must consume the team artifact (SnapshotRestore), \
+             not fall back to a cold full scan (FreshLoad)"
+        );
+        assert!(
+            guard.get_file("main.rs").is_some(),
+            "the artifact-restored index must serve the indexed files"
+        );
     }
 
     #[test]

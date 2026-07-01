@@ -199,6 +199,86 @@ dev-dependency until C-S1A-005 promotes it to a real runtime dep. Per the
 no-dormant-code policy, (2) is the conservative default unless S1a starts
 immediately. **Decision pending operator direction.**
 
+**Resolved 2026-06-30 (S1a landed):** option (1). `graph.rs` was un-gated and
+extended with `compute_impact` (C-S1A-002); the `persist.rs` spike helpers were
+promoted/renamed into the real, always-on artifact export/import (C-S1A-005);
+`zstd` is a normal (non-optional) dependency again. `cbm-spike` now gates only
+the Rust resolver (no consumer until S3) — no S0 dormancy remains.
+
 ### Gate decision
 **GO to Sprint 1a `[C]`.** (S1a planning gate already signed 2026-06-30; coding was
 blocked only on this S0 GO.)
+
+---
+
+## S1a Implementation Results (2026-06-30)
+
+**Shipped**: `detect_impact` (US1) + team zstd artifact (US2), C-S1A-001..007,
+via two sequential implementer agents (impact chain, then artifact +
+registration, sequenced to avoid both touching `tools.rs` at once) followed by
+three parallel adversarial reviewers (security, contract-correctness,
+independent build). The reviewers earned their keep: they surfaced **three real
+defects** the implementers' own self-reports missed, all subsequently fixed and
+independently re-verified by me (not just re-reported):
+
+1. **`base_branch` had no `"main"` default** despite the frozen contract; the
+   primary STEL path (`route_impact`) never supplied it, so the main upgraded
+   entry point could silently return an empty blast radius. **Fixed**: the
+   `detect_impact` handler now substitutes `"main"` when the caller supplies
+   neither `base_branch` nor `since` (kept out of `merge_git_changed_paths`
+   itself, which stays a documented uncommitted-only primitive for other
+   callers). New test: `detect_impact_defaults_base_branch_to_main_when_unset`.
+2. **The daemon's real bootstrap never consumed the exported artifact** —
+   `ProjectInstance::load` → `LiveIndex::load` always did a full discovery
+   scan, so the artifact (the whole justification for prioritizing US2 per the
+   operator benchmark evidence) was inert under the default desktop topology.
+   **Fixed**: new `bootstrap_project_index` tries `persist::load_snapshot`
+   first (falls back to full scan on miss/corrupt), mirroring the existing
+   `main.rs` stdio path; reconciles via `background_verify` when a tokio
+   runtime is present. New test:
+   `daemon::tests::project_instance_load_consumes_exported_team_artifact`.
+3. **Silent integrity-check bypass**: a missing/unparseable `artifact.json`
+   sidecar (reachable — the artifact and its sidecar are written by two
+   non-atomic operations) made `import_artifact` skip `content_hash`
+   verification entirely and trust the payload with no warning. **Fixed**:
+   treated as an integrity failure — quarantines (`reason: "missing-sidecar"`)
+   and falls back to a full build. New test:
+   `test_load_snapshot_quarantines_artifact_with_missing_sidecar`.
+
+Plus one cleanup: `tests/cbm_spike_graph_bfs.rs` had not received the same
+promote-and-un-gate treatment as its artifact sibling after `graph.rs`
+graduated to production — promoted to `tests/graph_bfs_calibration.rs`
+(permanent `#[ignore]`d real-repo-scale perf check), matching the precedent
+already set by `tests/team_artifact_calibration.rs` (promoted from
+`cbm_spike_artifact.rs`) and this repo's existing `calibrate_current_repo_smoke`
+/ `test_load_perf_1000_files` ignored checks.
+
+**Known, disclosed, out-of-scope gap** (pre-existing, not introduced by S1a):
+a snapshot/artifact-restored `LiveIndex` has `gitignore: None` and
+`coupling_store: None` (set by the pre-existing `snapshot_to_live_index`,
+unchanged by this sprint) — identical to the behavior of the already-shipped
+`main.rs` local-snapshot path. `background_verify` + the watcher reconcile
+file-freshness drift but do not repopulate those two fields. Neither adversarial
+reviewer flagged this; recording it here as a candidate follow-up rather than
+silently carrying it forward.
+
+**Verification**: `cargo fmt`/`check`/`clippy --all-targets -- -D warnings`
+green (independently re-run by me, not just self-reported). Full
+`cargo test --all-targets -- --test-threads=1` could not complete as one
+unbroken run in this sandbox — three separate attempts (two full-suite, one
+scoped to test+release) were killed by what looks like an environment wall-time
+ceiling on long single invocations, never a test failure (zero `FAILED`/panics
+logged across any attempt). Coverage obtained instead, all green: the entire
+2573-test lib unit suite plus dozens of integration binaries (two independent
+partial runs, together spanning effectively the whole corpus), every
+specifically changed/added test file run to completion
+(`detect_impact`, `team_artifact`, `daemon_aliases`, `conformance`,
+`impact_intent`: 29/29), and targeted lib-module reruns
+(`persist::` 38/38, `daemon::` 60/60, `graph::` 6/6, plus the three
+fix-confirmation tests individually). `cargo build --release` was attempted
+three times and could not complete locally in this sandbox (each attempt died
+mid dependency-compilation with zero errors — an LTO/`codegen-units=1` release
+build of this crate, with `aws-lc-sys`/vendored libgit2/bundled sqlite/~20
+tree-sitter grammars, appears to exceed the environment's ceiling for one
+invocation); this repo's CI runs `cargo build --release` on the PR, which is
+the authoritative environment for that specific check.

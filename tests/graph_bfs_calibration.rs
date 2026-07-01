@@ -1,12 +1,19 @@
-#![cfg(feature = "cbm-spike")]
-//! SP-0A — Graph BFS latency falsifier (Program 015).
+//! Graph BFS real-repo-scale latency calibration (Program 015, C-S1A-002).
 //!
-//! Planning artifact only (`#[ignore]`). Run:
-//! `cargo test --test cbm_spike_graph_bfs -- --ignored --test-threads=1`
+//! Promoted from the SP-0A spike falsifier (`sprint-0-spike-spec.md`, GO:
+//! p95 inbound BFS depth-5 < 200ms on the symforge repo index) into a
+//! permanent ignored perf-regression check once `graph.rs` graduated to
+//! always-on production code backing `detect_impact` (see
+//! `src/live_index/mod.rs`). Mirrors the sibling
+//! `tests/team_artifact_calibration.rs` promotion and this repo's existing
+//! `calibrate_current_repo_smoke` / `test_load_perf_1000_files` ignored
+//! real-repo smoke coverage.
 //!
-//! GO: p95 inbound BFS depth-5 < 200ms on the symforge repo index
-//! (target < 50ms local). Empty index -> empty result, never panic.
-//! See `specs/015-cbm-capability-ports/planning/sprint-0-spike-spec.md`.
+//! It earns its keep beyond `tests/detect_impact.rs` (functional blast-radius
+//! correctness on a tiny synthetic fixture) and `graph.rs`'s own unit tests:
+//! only the real repo index provides the node/edge scale a p95 latency bound
+//! can regress against. `#[ignore]` — run in scheduled/manual CI perf smoke:
+//! `cargo test --test graph_bfs_calibration -- --ignored --test-threads=1`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,8 +23,8 @@ use symforge::live_index::LiveIndex;
 use symforge::live_index::graph::{GraphProjection, SymbolId};
 
 #[test]
-#[ignore = "015 S0 spike — planning falsifier, run with --ignored"]
-fn cbm_spike_graph_bfs_p95_under_threshold() {
+#[ignore = "real-repo-scale calibration — run with --ignored"]
+fn graph_bfs_real_repo_p95_calibration() {
     // Error catalog: empty index BFS must return empty, not panic.
     let empty = LiveIndex::empty();
     {
@@ -72,7 +79,7 @@ fn cbm_spike_graph_bfs_p95_under_threshold() {
     let max = *samples.last().expect("samples non-empty");
 
     eprintln!(
-        "SP-0A BFS depth5: nodes={} edges={} build={}ms roots={} samples={} p50={:?} p95={:?} max={:?}",
+        "graph BFS depth5 calibration: nodes={} edges={} build={}ms roots={} samples={} p50={:?} p95={:?} max={:?}",
         graph.node_count(),
         graph.edge_count(),
         build_ms,
@@ -85,6 +92,6 @@ fn cbm_spike_graph_bfs_p95_under_threshold() {
 
     assert!(
         p95 < Duration::from_millis(200),
-        "SP-0A NO-GO: p95={p95:?} exceeds 200ms GO bar"
+        "graph BFS perf regression: p95={p95:?} exceeds the 200ms bound"
     );
 }
