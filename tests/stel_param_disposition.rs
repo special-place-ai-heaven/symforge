@@ -58,9 +58,6 @@ const ROUTE_PROBES: &[(&str, Option<IntentBucket>)] = &[
     ("map of workspace crates", Some(IntentBucket::Orient)),
     ("how does cfg_if work", Some(IntentBucket::Orient)),
     ("index health", Some(IntentBucket::Meta)),
-    // Multi-hop ordered plans.
-    ("search then fetch cfg_if body", None),
-    ("find test.js then read it", None),
     // Phrasing routes that consume path/symbol on specific tools.
     ("body of cfg_if in src/lib.rs", Some(IntentBucket::Read)),
     ("Database symbol in records.py", Some(IntentBucket::Read)),
@@ -177,13 +174,15 @@ fn disposition_of(
         .unwrap_or_else(|| panic!("field `{field}` must be classified"))
 }
 
-/// Records the CURRENT disposition of each field, pinning today's behavior so a
-/// future increment that CHANGES routing (e.g. A1b forwarding `path` /
-/// `max_tokens` into plan args) updates this deliberately rather than drifting
-/// silently. Documents the A1a baseline; it is the behavior-change tripwire, not
-/// a behavioral claim about which tool a route picks.
+/// Records the CURRENT disposition of each field, pinning behavior so a future
+/// routing change updates this deliberately rather than drifting silently. Now
+/// reflects A1b: the caller's `path` is forwarded into scoped search routes'
+/// `path_prefix` (Routed). `max_tokens` stays handler-`Forwarded` (already
+/// honored; intentionally NOT pushed into plan-step args, which would violate the
+/// `Forwarded` contract). The behavior-change tripwire, not a claim about which
+/// tool a route picks.
 #[test]
-fn current_dispositions_pin_the_a1a_baseline() {
+fn current_dispositions_pin_the_post_a1b_baseline() {
     // Constant across routes: query/intent are always consumed; max_tokens /
     // preview are handler-forwarded (post-planner); project / projects are
     // loudly refused (D9).
@@ -226,11 +225,11 @@ fn current_dispositions_pin_the_a1a_baseline() {
         ParamDisposition::Routed
     );
 
-    // A1a BASELINE GAP (the A1b target): a multi-word fuzzy find with NO
-    // `symbol` routes through find-fusion, which does NOT thread `path` into its
-    // args today. `path` is therefore explicitly NotApplicable — the planner saw
-    // it and did not consume it on this route — NOT a silent drop. A1b will flip
-    // this to Routed/Forwarded and must re-baseline this exact assertion.
+    // A1b (the re-baselined assertion): a multi-word fuzzy find with NO `symbol`
+    // routes through find-fusion to a scoped search tool, and A1b now forwards
+    // the caller's `path` into that route's `path_prefix`. So `path` is Routed —
+    // this was `NotApplicable` at the A1a baseline and was the documented A1b
+    // re-baseline target.
     let no_symbol = StelRequest {
         query: "stel planner find helper".to_string(),
         intent: Some(IntentBucket::Find),
@@ -241,13 +240,41 @@ fn current_dispositions_pin_the_a1a_baseline() {
     let no_symbol_d = classify_param_dispositions(&no_symbol, &no_symbol_plan);
     assert_eq!(
         disposition_of(&no_symbol_d, "path"),
-        ParamDisposition::NotApplicable,
-        "A1a baseline: fuzzy-find route does not consume `path` yet (A1b target)"
+        ParamDisposition::Routed,
+        "A1b: fuzzy-find route now forwards `path` into `path_prefix` (Routed)"
     );
     // The unset `symbol` on this route is NotApplicable, never silent.
     assert_eq!(
         disposition_of(&no_symbol_d, "symbol"),
         ParamDisposition::NotApplicable
+    );
+}
+
+/// A1b behavioral proof: a search-intent request with `path` set yields a plan
+/// whose scoped-search step actually carries `path_prefix == path` (the
+/// forwarding lands in the args, not merely in the disposition record). Every
+/// route funnels through `build_plan_from_steps`, so this holds for single-step
+/// routes too.
+#[test]
+fn a1b_forwards_path_into_path_prefix_arg() {
+    let request = StelRequest {
+        query: "find Database class".to_string(),
+        intent: Some(IntentBucket::Find),
+        path: Some("src/db".to_string()),
+        ..Default::default()
+    };
+    let plan = build_plan(&request);
+    let forwarded = plan
+        .steps
+        .iter()
+        .any(|step| step.args.get("path_prefix").and_then(Value::as_str) == Some("src/db"));
+    assert!(
+        forwarded,
+        "A1b: a scoped search route must forward `path` into `path_prefix`; got {:?}",
+        plan.steps
+            .iter()
+            .map(|s| s.args.clone())
+            .collect::<Vec<_>>()
     );
 }
 

@@ -26,6 +26,118 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.9.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.6...v8.9.7) (2026-06-29)
+
+
+### Bug Fixes
+
+* **stel:** remove the multi-hop fake; route honestly via single-step/find-fusion ([df33b58](https://github.com/special-place-ai-heaven/symforge/commit/df33b58344275fa1a2aa2e0a553915067f9d3a65))
+
+## [8.9.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.5...v8.9.6) (2026-06-25)
+
+
+### Bug Fixes
+
+* **012f/r3:** mirror kind filter so unrecognized kind still caveats ([b9658bb](https://github.com/special-place-ai-heaven/symforge/commit/b9658bb43ee9d02541eb753850db0c370b456ce4))
+* **012f/r3:** recall-confidence caveat on find_references usage traces ([dae2add](https://github.com/special-place-ai-heaven/symforge/commit/dae2addcc0ae40d03ce654aa2c5ee3d4504705ad))
+
+## [8.9.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.4...v8.9.5) (2026-06-25)
+
+
+### Bug Fixes
+
+* **012f:** GC last-holder orphans on session close ([b140405](https://github.com/special-place-ai-heaven/symforge/commit/b1404057b6cfb962d47ff735d72b904140db3b5a))
+* **012f:** orphan GC for the bases intern table (SC-002-safe) ([3816fe3](https://github.com/special-place-ai-heaven/symforge/commit/3816fe3270b2ce42c4102172a94e4bd09d3c42b4))
+
+## [8.9.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.3...v8.9.4) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d20:** path_prefix scoping for search_files ([c2fd24e](https://github.com/special-place-ai-heaven/symforge/commit/c2fd24e2a4f9a5d440d1ee8bd350b91a5c0b0649))
+* **012f/d20:** thread search_files path_prefix into capture (pre-count scope) ([dc0e814](https://github.com/special-place-ai-heaven/symforge/commit/dc0e814b7bf1d4af827b5791683f0957ab79af18))
+
+## [8.9.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.2...v8.9.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d18:** loud not-found for missing symbols in get_symbol ([17b750d](https://github.com/special-place-ai-heaven/symforge/commit/17b750d7a37ac65991c0a0439e3ce72dd351bbd2))
+
+## [8.9.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.1...v8.9.2) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f/d13:** address review -- C++ qualified-call recall + Implements precision + dedup guard ([f32c9d9](https://github.com/special-place-ai-heaven/symforge/commit/f32c9d91e480e83f7cf7c5616a79a8feaeda5fcc))
+* **012f/d13:** head-match the immediate qualifier (path-qualified recall) ([984d452](https://github.com/special-place-ai-heaven/symforge/commit/984d452656468675b6223697919ac8ff68db18a9))
+* **012f/d13:** xref recall -- match qualified-call type heads in find_references ([b4f6239](https://github.com/special-place-ai-heaven/symforge/commit/b4f62395cbbb0be79c52ab1fa9be61403b35c009))
+
+## [8.9.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.0...v8.9.1) (2026-06-24)
+
+
+### Bug Fixes
+
+* **012f:** remove redundant D15 overlay read; mark writer as dormant seam ([5070f14](https://github.com/special-place-ai-heaven/symforge/commit/5070f14df182b810f4182f84975deb8586b44f42))
+
+## [8.9.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.4...v8.9.0) (2026-06-24)
+
+
+### Features
+
+* **012f/d15:** single-project overlay-WRITER (read-your-writes for get_symbol) ([22e66ca](https://github.com/special-place-ai-heaven/symforge/commit/22e66ca6ca0377b977f63a2e8b0ec3353879b862))
+
+## [8.8.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.3...v8.8.4) (2026-06-24)
+
+
+### Bug Fixes
+
+* **daemon:** cross-project reads stay fresh after watcher reindex (B2/D12) ([745313d](https://github.com/special-place-ai-heaven/symforge/commit/745313d2963cb3215633fec6daa2a572805cea9f))
+
+## [8.8.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.2...v8.8.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **stel:** fail closed on broken durable calibration status ([8dc5b9a](https://github.com/special-place-ai-heaven/symforge/commit/8dc5b9a2da94ee4c47f768c1de6387415e760eee))
+
+## [8.8.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.1...v8.8.2) (2026-06-23)
+
+
+### Bug Fixes
+
+* **stel:** name /mcp transport in cross-project refusal + lock it (C-stopgap, D16) ([0adcb85](https://github.com/special-place-ai-heaven/symforge/commit/0adcb85dc75c8156a3d7d80b1f9f096ba236911e))
+
+## [8.8.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.8.0...v8.8.1) (2026-06-23)
+
+
+### Bug Fixes
+
+* **stel:** report full calibration accumulation threshold ([fdeae50](https://github.com/special-place-ai-heaven/symforge/commit/fdeae508fda51dd4493d41dbfe405e9fd608d05f))
+
+## [8.8.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.7.0...v8.8.0) (2026-06-23)
+
+
+### Features
+
+* **stel:** forward caller `path` into scoped search routes (A1b) ([cb67abc](https://github.com/special-place-ai-heaven/symforge/commit/cb67abcd37de425aed62ddb1afaf8c862e5e739f))
+
+## [8.7.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.6.0...v8.7.0) (2026-06-23)
+
+
+### Features
+
+* **stel:** 013 predictor calibration (complete) — US2 auto-tune + systemic fixes ([e9e7760](https://github.com/special-place-ai-heaven/symforge/commit/e9e776000503c2f8e271209fbaa929843e349931))
+
+
+### Bug Fixes
+
+* **paths:** single symforge_db_path helper; fix live api-keys doubled path (D1-ROOT/D7) ([2cacda1](https://github.com/special-place-ai-heaven/symforge/commit/2cacda13a91dc79399d2e63454214beb6122edef))
+* route daemon-proxy symforge edit applies ([396c38a](https://github.com/special-place-ai-heaven/symforge/commit/396c38a3f7502686d4c0792ef3bdca2632173a62))
+* **stel:** calibrate predictor output vs real residual (D8-ROOT) + D9-D13 ([6eeaf96](https://github.com/special-place-ai-heaven/symforge/commit/6eeaf96946a11ff5a0c872df931694151409f4ba))
+* **stel:** overlay all proxy-owned status lines on daemon-backed stdio (D2-ROOT) ([def21a3](https://github.com/special-place-ai-heaven/symforge/commit/def21a30e65be1ffc9f8fc0075ac91cc399503de))
+* **stel:** record raw prediction so re-tunes stay consistent (D15) + D14 hardening ([8963193](https://github.com/special-place-ai-heaven/symforge/commit/89631934783381c68ddef44a795be41af5817ead))
+
 ## [8.6.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.5.0...v8.6.0) (2026-06-22)
 
 

@@ -16,16 +16,6 @@ pub const S4_EXIT_ROW_IDS: [&str; 5] = [
     "compression/t5_dependents",
 ];
 
-/// Multi-hop golden rows closed in Phase 2 (formerly deferred at Phase 1 exit).
-pub const MULTI_HOP_GOLDEN_ROW_IDS: [&str; 3] = [
-    "cfg-if/multi_search_symbol",
-    "records/multi_context_refs",
-    "is-plain/multi_files_content",
-];
-
-/// Back-compat alias — prefer [`MULTI_HOP_GOLDEN_ROW_IDS`].
-pub const DEFERRED_MULTI_HOP_ROW_IDS: [&str; 3] = MULTI_HOP_GOLDEN_ROW_IDS;
-
 /// Relative path to the canonical golden corpus from the repo root.
 pub const GOLDEN_ROUTES_FIXTURE: &str = "docs/fixtures/routes.golden.jsonl";
 
@@ -37,7 +27,6 @@ pub const S4_REPLAY_CORPUS: &str = "tests/fixtures/phase0-corpus/cfg-if-rust";
 pub enum GoldenReplayCategory {
     SupportedServe,
     SupportedPffBypass,
-    DeferredMultiHop,
     DeferredPlannerMismatch { expected: String, planned: String },
 }
 
@@ -46,7 +35,6 @@ pub enum GoldenReplayCategory {
 pub struct GoldenCorpusClassification {
     pub supported_serve: Vec<String>,
     pub supported_pff_bypass: Vec<String>,
-    pub deferred_multi_hop: Vec<String>,
     pub deferred_planner_mismatch: Vec<String>,
 }
 
@@ -54,13 +42,9 @@ impl GoldenCorpusClassification {
     pub fn row_count(&self) -> usize {
         self.supported_serve.len()
             + self.supported_pff_bypass.len()
-            + self.deferred_multi_hop.len()
             + self.deferred_planner_mismatch.len()
     }
 }
-
-/// Checked-in minimal corpora for CI-proof multi-hop golden replay (outside gitignored phase0 clones).
-pub const MULTI_HOP_REPLAY_CORPUS_ROOT: &str = "tests/fixtures/stel_multi_hop";
 
 /// Pinned corpus root for a golden row id.
 pub fn corpus_for_row_id(id: &str) -> &'static str {
@@ -74,26 +58,6 @@ pub fn corpus_for_row_id(id: &str) -> &'static str {
         "tests/fixtures/compression_ratio/rust"
     } else {
         panic!("golden row `{id}` has no pinned corpus mapping")
-    }
-}
-
-/// Deterministic checked-in corpus for Phase 2 multi-hop golden replay rows.
-pub fn multi_hop_replay_corpus_for_row_id(id: &str) -> &'static str {
-    match id {
-        "cfg-if/multi_search_symbol" => "tests/fixtures/stel_multi_hop/cfg-if-rust",
-        "records/multi_context_refs" => "tests/fixtures/stel_multi_hop/records-python",
-        "is-plain/multi_files_content" => "tests/fixtures/stel_multi_hop/is-plain-obj-ts",
-        _ => panic!("golden row `{id}` is not a multi-hop replay row"),
-    }
-}
-
-/// Marker file proving a multi-hop replay corpus is present on disk.
-pub fn multi_hop_replay_corpus_marker(id: &str) -> &'static str {
-    match id {
-        "cfg-if/multi_search_symbol" => "src/lib.rs",
-        "records/multi_context_refs" => "records.py",
-        "is-plain/multi_files_content" => "test.js",
-        _ => panic!("golden row `{id}` is not a multi-hop replay row"),
     }
 }
 
@@ -173,7 +137,6 @@ pub fn classify_golden_corpus(rows: &[GoldenRouteRow]) -> GoldenCorpusClassifica
             GoldenReplayCategory::SupportedPffBypass => {
                 out.supported_pff_bypass.push(row.id.clone())
             }
-            GoldenReplayCategory::DeferredMultiHop => out.deferred_multi_hop.push(row.id.clone()),
             GoldenReplayCategory::DeferredPlannerMismatch { .. } => {
                 out.deferred_planner_mismatch.push(row.id.clone())
             }
@@ -181,7 +144,6 @@ pub fn classify_golden_corpus(rows: &[GoldenRouteRow]) -> GoldenCorpusClassifica
     }
     out.supported_serve.sort();
     out.supported_pff_bypass.sort();
-    out.deferred_multi_hop.sort();
     out.deferred_planner_mismatch.sort();
     out
 }
@@ -396,9 +358,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_failed_step_body() {
+        // Generic two-step (find-fusion-shaped) row, NOT a golden-corpus id: the
+        // multi-step serve validator must keep rejecting a chain whose second step
+        // returns a non-success body. Find fusion is the live multi-step consumer,
+        // so this validator coverage stays load-bearing after the multi-hop
+        // decomposer removal.
         let row = GoldenRouteRow {
-            id: "cfg-if/multi_search_symbol".to_string(),
-            query: "search then fetch cfg_if body".to_string(),
+            id: "synthetic/two_step_failure".to_string(),
+            query: "generic two-step chain with a failing second step".to_string(),
             intent: None,
             must_call: vec!["search_symbols".to_string(), "get_symbol".to_string()],
             must_not_call: vec![],
@@ -443,23 +410,9 @@ mod tests {
     #[test]
     fn golden_corpus_partitions_all_rows() {
         let rows = fixture_rows();
-        assert_eq!(rows.len(), 36, "golden fixture must contain 36 rows");
+        assert_eq!(rows.len(), 33, "golden fixture must contain 33 rows");
         let classification = classify_golden_corpus(&rows);
-        assert_eq!(classification.row_count(), 36);
-        assert!(
-            classification.deferred_multi_hop.is_empty(),
-            "Phase 2 closes multi-hop deferrals: {:?}",
-            classification.deferred_multi_hop
-        );
-        for id in MULTI_HOP_GOLDEN_ROW_IDS {
-            assert!(
-                classification
-                    .supported_serve
-                    .iter()
-                    .any(|row_id| row_id == id),
-                "multi-hop row {id} must classify as supported serve"
-            );
-        }
+        assert_eq!(classification.row_count(), 33);
         for id in S4_EXIT_ROW_IDS {
             assert!(
                 classification
@@ -507,7 +460,6 @@ mod tests {
         let rows = fixture_rows();
         let classification = classify_golden_corpus(&rows);
         let expected = [
-            "cfg-if/multi_search_symbol",
             "cfg-if/t1_search",
             "cfg-if/t2_context",
             "cfg-if/t3_symbols",
@@ -521,7 +473,6 @@ mod tests {
             "compression/t3_symbol",
             "compression/t4_refs",
             "compression/t5_dependents",
-            "is-plain/multi_files_content",
             "is-plain/t1_search",
             "is-plain/t2_context",
             "is-plain/t3_content",
@@ -530,7 +481,6 @@ mod tests {
             "is-plain/t6_refs",
             "is-plain/t7_files",
             "is-plain/t8_health",
-            "records/multi_context_refs",
             "records/t1_search",
             "records/t2_context",
             "records/t3_files",

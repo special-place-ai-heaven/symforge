@@ -1,6 +1,6 @@
 [package]
 name = "symforge"
-version = "8.6.0"
+version = "8.9.7"
 edition = "2024"
 description = "SymForge — in-memory code intelligence MCP server for Claude Code, Codex, and Gemini CLI"
 license-file = "LICENSE"
@@ -60,7 +60,7 @@ schemars = "1"
 # resolves >=1.7 (the `allowed_hosts` DNS-rebinding behavior depends on >=1.7
 # APIs). Future fix: pin an exact/min version (or treat Cargo.lock as the source
 # of truth) and add a minimum-version / deny check so a downgrade can't slip in.
-rmcp = { version = "1.1.0", features = ["transport-io", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "2.0", features = ["transport-io", "transport-streamable-http-server"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Maintained libyaml-lineage YAML backend. The previous `serde_yml 0.0.13` fork
@@ -79,7 +79,7 @@ chrono = "0.4"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-tree-sitter = "=0.26.9"
+tree-sitter = "=0.26.10"
 streaming-iterator = "0.1"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-python = "0.25"

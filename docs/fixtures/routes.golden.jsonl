@@ -31,6 +31,3 @@
 {"id":"records/pff_whole_module","query":"audit full records.py line by line","must_call":[],"must_not_call":[],"expected_decision":"bypass","chain":"single","eligible_h6":false,"notes":"P-FF bypass row"}
 {"id":"is-plain/pff_whole_index","query":"read complete index.js for refactor","must_call":[],"must_not_call":[],"expected_decision":"bypass","chain":"single","eligible_h6":false,"notes":"P-FF bypass row"}
 {"id":"compression/pff_whole_service","query":"full file review service.rs","must_call":[],"must_not_call":[],"expected_decision":"bypass","chain":"single","eligible_h6":false,"notes":"P-FF bypass row; reviewed"}
-{"id":"cfg-if/multi_search_symbol","query":"search then fetch cfg_if body","must_call":["search_symbols","get_symbol"],"must_not_call":[],"expected_decision":"serve","chain":"multi","eligible_h6":true,"notes":"multi-hop golden; Phase 2 replay"}
-{"id":"records/multi_context_refs","query":"outline then find Connection refs","must_call":["get_file_context","find_references"],"must_not_call":[],"expected_decision":"serve","chain":"multi","eligible_h6":true,"notes":"multi-hop golden"}
-{"id":"is-plain/multi_files_content","query":"find test.js then read it","must_call":["search_files","get_file_content"],"must_not_call":[],"expected_decision":"serve","chain":"multi","eligible_h6":true,"notes":"multi-hop golden; reviewed"}

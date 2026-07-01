@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Seed docs/fixtures/routes.golden.jsonl — 36 Phase 0 golden route rows.
+ * Seed docs/fixtures/routes.golden.jsonl — 33 Phase 0 golden route rows.
  * Schema: preflight-evidence-contract.md Golden Route Row
  */
 const fs = require("fs");
@@ -96,33 +96,10 @@ const rows = [
     eligible_h6: false,
     notes: "P-FF bypass row; reviewed",
   }),
-
-  // Multi-chain (3) — H5 diversity
-  row({
-    id: "cfg-if/multi_search_symbol",
-    query: "search then fetch cfg_if body",
-    must_call: ["search_symbols", "get_symbol"],
-    chain: "multi",
-    notes: "multi-hop golden; Phase 2 replay",
-  }),
-  row({
-    id: "records/multi_context_refs",
-    query: "outline then find Connection refs",
-    must_call: ["get_file_context", "find_references"],
-    chain: "multi",
-    notes: "multi-hop golden",
-  }),
-  row({
-    id: "is-plain/multi_files_content",
-    query: "find test.js then read it",
-    must_call: ["search_files", "get_file_content"],
-    chain: "multi",
-    notes: "multi-hop golden; reviewed",
-  }),
 ];
 
-if (rows.length !== 36) {
-  console.error("Expected 36 rows, got", rows.length);
+if (rows.length !== 33) {
+  console.error("Expected 33 rows, got", rows.length);
   process.exit(1);
 }
 

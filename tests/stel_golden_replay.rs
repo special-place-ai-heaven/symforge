@@ -79,24 +79,10 @@ async fn replay_row(server: &SymForgeServer, row: &GoldenRouteRow) -> String {
 }
 
 #[test]
-fn golden_corpus_classification_has_zero_deferred_multi_hop() {
+fn golden_corpus_classification_accounts_for_all_rows() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("golden fixture");
     let classification = stel::classify_golden_corpus(&rows);
     assert_eq!(classification.row_count(), rows.len());
-    assert!(
-        classification.deferred_multi_hop.is_empty(),
-        "Phase 2 closes multi-hop deferrals: {:?}",
-        classification.deferred_multi_hop
-    );
-    for id in stel::MULTI_HOP_GOLDEN_ROW_IDS {
-        assert!(
-            classification
-                .supported_serve
-                .iter()
-                .any(|row_id| row_id == id),
-            "multi-hop row {id} must classify as supported serve"
-        );
-    }
     assert!(
         classification.deferred_planner_mismatch.is_empty(),
         "planner mismatches must be empty or listed explicitly in deferred_planner_mismatch_ids_are_stable"
@@ -155,73 +141,6 @@ async fn s4_minimum_subset_replays_on_compact_symforge() {
     let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
     let exit_rows = stel::s4_exit_rows(&rows);
     replay_serve_rows_grouped_by_corpus(&exit_rows).await;
-}
-
-#[tokio::test]
-async fn multi_hop_golden_rows_replay_on_compact_symforge() {
-    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
-    let _surface = stel_surface_env::set_symforge_surface("compact");
-    // Force the FULL trust envelope: the replay validators assert the full
-    // contract (`── stel ──`, `decision: serve|bypass`, `ledger:`), which the
-    // live serve path generates only in full mode.
-    let _full = stel_surface_env::force_full_stel_envelope();
-
-    let rows = stel::load_golden_rows(&golden_fixture_path()).expect("load golden fixture");
-    let mut missing = Vec::new();
-    let multi_hop: Vec<_> = stel::MULTI_HOP_GOLDEN_ROW_IDS
-        .iter()
-        .map(|id| {
-            rows.iter()
-                .find(|row| row.id == *id)
-                .unwrap_or_else(|| panic!("golden corpus missing multi-hop row `{id}`"))
-        })
-        .filter(|row| {
-            let corpus = stel::multi_hop_replay_corpus_for_row_id(&row.id);
-            let marker = stel::multi_hop_replay_corpus_marker(&row.id);
-            let path = corpus_path(corpus).join(marker);
-            if path.is_file() {
-                true
-            } else {
-                missing.push(format!("{} (expected {})", row.id, path.display()));
-                false
-            }
-        })
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "multi-hop replay requires checked-in fixtures under tests/fixtures/stel_multi_hop/: {}",
-        missing.join(", ")
-    );
-    assert_eq!(
-        multi_hop.len(),
-        stel::MULTI_HOP_GOLDEN_ROW_IDS.len(),
-        "all multi-hop golden rows must replay"
-    );
-
-    let mut failures = Vec::new();
-    for row in multi_hop {
-        let corpus = stel::multi_hop_replay_corpus_for_row_id(&row.id);
-        let project = Path::new(corpus)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("replay");
-        let server = server_for_corpus(corpus, project);
-        let output = replay_row(&server, row).await;
-        let validation = stel::validate_serve_replay_output(row, &output);
-        if !validation.passed {
-            failures.push(format!(
-                "{}: {}",
-                validation.row_id,
-                validation.errors.join("; ")
-            ));
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "multi-hop golden replay failures:\n{}",
-        failures.join("\n")
-    );
 }
 
 #[tokio::test]

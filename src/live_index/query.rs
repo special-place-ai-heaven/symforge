@@ -1270,6 +1270,7 @@ impl LiveIndex {
             coupling_context,
             true,
             true,
+            &PathScope::Any,
         )
     }
 
@@ -1279,6 +1280,10 @@ impl LiveIndex {
     /// for tests and internal callers. Public tool entry points should call this
     /// variant so advertised vendor/personal-tooling defaults apply before
     /// ranking and total-match counts are computed.
+    // ponytail: 8 positional args on one internal capture API; an options
+    // struct would be the upgrade if a 9th axis appears, but not worth the
+    // churn for one scope param.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture_search_files_view_with_noise(
         &self,
         query: &str,
@@ -1287,14 +1292,21 @@ impl LiveIndex {
         coupling_context: Option<(&str, &SearchFilesCouplingNeighbors)>,
         include_vendor: bool,
         include_personal_tooling: bool,
+        path_scope: &PathScope,
     ) -> SearchFilesView {
         let limit = limit.clamp(1, 50);
         let normalized_query = normalize_path_query(query);
         if normalized_query.is_empty() {
             return SearchFilesView::EmptyQuery;
         }
+        // `path_scope` mirrors the `path_scope` axis of `search_symbols`/`search_text`:
+        // it filters candidates BEFORE counting/limiting, so total_matches,
+        // overflow_count, and hits are all consistently scoped. Folding it into
+        // `path_allowed` reuses the one pre-count predicate every tier funnels
+        // through (strong/basename/prefix/loose/glob/metadata).
         let path_allowed = |path: &str| -> bool {
-            (include_vendor || !is_vendor_path(path))
+            path_scope.matches(path)
+                && (include_vendor || !is_vendor_path(path))
                 && (include_personal_tooling || !is_personal_tooling_path(path))
         };
 
@@ -2394,6 +2406,90 @@ impl LiveIndex {
             for alias in &aliases {
                 self.collect_refs_for_key(alias, kind_filter, include_filtered, &mut results);
             }
+
+            // D13 recall: qualified-call construction sites (`Foo::new()`,
+            // `Foo::default()`, C++ `Foo::method()`) are keyed in `reverse_index`
+            // under the leaf segment (`new`), not the qualifier (`Foo`). They DO
+            // retain the full `qualified_name` (`Foo::new`, `a::b::Foo::new`), so
+            // also match any ref whose IMMEDIATE QUALIFIER (the segment directly
+            // before the leaf) == `name`. So `find_references(X)` surfaces every
+            // qualified-call site where X is the immediate qualifier of the call,
+            // at any path depth: `X::method()`, `a::b::X::method()`,
+            // `Color::Red`. Struct/composite literals already land under the head
+            // via the unscoped `(type_identifier)` capture, so they need nothing
+            // here.
+            //
+            // Limitation: it matches the IMMEDIATE qualifier only. In
+            // `X::Inner::method()` the immediate qualifier is `Inner`, so the
+            // site is recalled by `find_references("Inner")`, NOT
+            // `find_references("X")` (X is an outer module/type, not the
+            // call's receiver). This is the correct receiver-of-the-call
+            // semantics, not a recall gap for the constructed type.
+            // ponytail: O(all refs) scan, mirroring the qualified branch above; an
+            // explicit head index would make it O(1) if find_references is ever hot.
+            //
+            // Dedup head-match pushes against refs already collected by the
+            // reverse-index/alias passes (keyed by file path + byte range). The
+            // `reference.name == name` skip below covers the common case, but a ref
+            // whose simple name equals a resolved alias AND whose qualified-name head
+            // equals `name` could otherwise be pushed twice.
+            let already: HashSet<(&str, (u32, u32))> =
+                results.iter().map(|(p, r)| (*p, r.byte_range)).collect();
+            for (file_path, file) in &self.files {
+                for reference in &file.references {
+                    // Skip Implements refs: `impl Trait for Foo` carries
+                    // name="Trait", qualified_name="Foo" with a byte_range at the
+                    // TRAIT token, so a head-match would add a same-line entry
+                    // pointing at the WRONG token (the implementor is already found
+                    // as its own `type_identifier` ref). Other multi-segment-qn
+                    // kinds DO flow through this branch, not calls only: imports
+                    // (`use a::b::C`) and type usages also head-match on their
+                    // immediate qualifier (e.g. `find_references("collections")`
+                    // surfaces `use std::collections::HashMap`). That is
+                    // count-neutral vs the prior first-segment match (one head
+                    // either way) and a defensible "who uses <segment>" result,
+                    // though its byte_range points at the leaf token. Tracked as a
+                    // minor head-match noise class in the defect ledger; tighten by
+                    // gating to call kinds if it ever matters.
+                    if reference.kind == ReferenceKind::Implements {
+                        continue;
+                    }
+                    let Some(qn) = reference.qualified_name.as_deref() else {
+                        continue;
+                    };
+                    // Immediate qualifier = the segment right before the leaf.
+                    // Split on `.`/`:`, drop empties (Rust/C++ `::` yields an
+                    // empty between the colons), and take the second-to-last
+                    // segment; single-segment names use themselves.
+                    let segs: Vec<&str> = qn
+                        .split(['.', ':'])
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let head = match segs.len() {
+                        0 => continue,
+                        1 => segs[0],
+                        n => segs[n - 2],
+                    };
+                    if head != name || reference.name == name {
+                        // `reference.name == name` was already covered by the
+                        // reverse-index hit above; skip to avoid duplicates.
+                        continue;
+                    }
+                    if let Some(kf) = kind_filter
+                        && reference.kind != kf
+                    {
+                        continue;
+                    }
+                    if !include_filtered && is_filtered_name(&reference.name, &file.language) {
+                        continue;
+                    }
+                    if already.contains(&(file_path.as_str(), reference.byte_range)) {
+                        continue;
+                    }
+                    results.push((file_path.as_str(), reference));
+                }
+            }
         }
 
         results
@@ -3443,16 +3539,30 @@ mod tests {
         );
 
         // Default (vendor hidden): the vendored lockfile must NOT surface.
-        let hidden =
-            index.capture_search_files_view_with_noise("package-lock", 20, None, None, false, true);
+        let hidden = index.capture_search_files_view_with_noise(
+            "package-lock",
+            20,
+            None,
+            None,
+            false,
+            true,
+            &super::PathScope::Any,
+        );
         assert!(
             matches!(hidden, SearchFilesView::NotFound { .. }),
             "vendored Tier-2 path must be suppressed by default: {hidden:?}"
         );
 
         // include_vendor=true: now it surfaces as metadata-only.
-        let shown =
-            index.capture_search_files_view_with_noise("package-lock", 20, None, None, true, true);
+        let shown = index.capture_search_files_view_with_noise(
+            "package-lock",
+            20,
+            None,
+            None,
+            true,
+            true,
+            &super::PathScope::Any,
+        );
         match shown {
             SearchFilesView::Found { hits, .. } => {
                 assert_eq!(hits.len(), 1);
@@ -3830,6 +3940,7 @@ mod tests {
             Some(("wiki/notes.md", &neighbors)),
             true,
             false,
+            &super::PathScope::Any,
         );
 
         assert_eq!(
@@ -5159,6 +5270,204 @@ impl Actor for MyActor {
 
         let results = index.find_references_for_name("foo", None, false);
         assert_eq!(results.len(), 2, "both files should match");
+    }
+
+    /// D13 recall fixture (the decision doc's required runnable check).
+    ///
+    /// For a type `T`, lay down the five reference shapes that
+    /// `find_references("T")` must return, exactly as xref extraction keys them:
+    ///   1. definition          -> name "T"               (keyed under "T")
+    ///   2. `let a: T`           -> name "T" TypeUsage     (keyed under "T")
+    ///   3. `fn f(p: T)`         -> name "T" TypeUsage     (keyed under "T")
+    ///   4. `T { .. }` literal   -> name "T" TypeUsage     (keyed under "T")
+    ///   5. `T::new()` ctor      -> name "new", qn "T::new" (keyed under "new")
+    ///
+    /// Pre-fix, site 5 was INVISIBLE to a simple `find_references("T")` because it
+    /// is keyed under the leaf "new". The head-match branch closes it. Sites 1-4
+    /// already resolve via the unscoped `(type_identifier)` capture (verified in
+    /// xref.rs `test_rust_qualified_call_retains_head_and_struct_literal_keyed_under_head`),
+    /// so this fixture is non-vacuous: drop the head-match branch and it returns 4,
+    /// not 5.
+    #[test]
+    fn test_d13_find_references_recall_all_five_usage_sites() {
+        let refs = vec![
+            // 1. definition site (TypeUsage keyed under the head by extraction)
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 0),
+            // 2. `let a: MinimalFilter`
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 20),
+            // 3. `fn f(p: MinimalFilter)`
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 40),
+            // 4. `MinimalFilter { .. }` struct literal (already head-keyed)
+            make_ref("MinimalFilter", None, ReferenceKind::TypeUsage, None, 60),
+            // 5. `MinimalFilter::new()` — keyed under the leaf "new", head in qn.
+            make_ref(
+                "new",
+                Some("MinimalFilter::new"),
+                ReferenceKind::Call,
+                None,
+                80,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MinimalFilter", None, false);
+        assert_eq!(
+            results.len(),
+            5,
+            "find_references(MinimalFilter) must return all 5 usage sites incl. the ::new() ctor; got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| (&r.name, &r.qualified_name))
+                .collect::<Vec<_>>()
+        );
+        // The constructor site (keyed under "new") must be among them.
+        assert!(
+            results
+                .iter()
+                .any(|(_, r)| r.qualified_name.as_deref() == Some("MinimalFilter::new")),
+            "the MinimalFilter::new() construction site must be recalled"
+        );
+    }
+
+    /// Head-match must NOT over-capture: searching for a module head like `mem`
+    /// (from `mem::swap()`) returns the qualified call, but searching for the
+    /// type `T` must not pull in an unrelated `Other::foo()`.
+    #[test]
+    fn test_d13_head_match_no_false_positive_across_types() {
+        let refs = vec![
+            make_ref("foo", Some("Other::foo"), ReferenceKind::Call, None, 0),
+            make_ref(
+                "new",
+                Some("MinimalFilter::new"),
+                ReferenceKind::Call,
+                None,
+                20,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MinimalFilter", None, false);
+        assert_eq!(
+            results.len(),
+            1,
+            "only MinimalFilter::new should match head, got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results[0].1.qualified_name.as_deref(),
+            Some("MinimalFilter::new")
+        );
+    }
+
+    /// Path-qualified construction recall: `a::b::Widget::new()` is keyed under
+    /// the leaf "new" with qn "a::b::Widget::new". The immediate qualifier is
+    /// "Widget", so `find_references("Widget")` must return it.
+    ///
+    /// Non-vacuity: the pre-fix first-segment head was "a" (qn.split.next),
+    /// which != "Widget", so this returned 0. The immediate-qualifier head is
+    /// the second-to-last non-empty segment ("Widget"), so it now returns 1.
+    #[test]
+    fn test_d13_path_qualified_construction_recall() {
+        let refs = vec![make_ref(
+            "new",
+            Some("a::b::Widget::new"),
+            ReferenceKind::Call,
+            None,
+            0,
+        )];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("Widget", None, false);
+        assert_eq!(
+            results.len(),
+            1,
+            "path-qualified a::b::Widget::new() must be recalled by find_references(Widget); got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results[0].1.qualified_name.as_deref(),
+            Some("a::b::Widget::new")
+        );
+    }
+
+    /// Precision lock: intermediate path segments ("a", "b") must NOT head-match
+    /// `a::b::Widget::new()`. Only the immediate qualifier "Widget" does. The
+    /// pre-fix first-segment head WOULD have matched "a" (a false positive that
+    /// labels a module path component as the call receiver).
+    #[test]
+    fn test_d13_path_qualified_no_false_positive_from_intermediate_segments() {
+        let refs = vec![make_ref(
+            "new",
+            Some("a::b::Widget::new"),
+            ReferenceKind::Call,
+            None,
+            0,
+        )];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        for seg in ["a", "b"] {
+            let results = index.find_references_for_name(seg, None, false);
+            assert!(
+                results
+                    .iter()
+                    .all(|(_, r)| r.qualified_name.as_deref() != Some("a::b::Widget::new")),
+                "intermediate segment {seg:?} must not head-match a::b::Widget::new(); got: {:?}",
+                results
+                    .iter()
+                    .map(|(_, r)| &r.qualified_name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Head-match must NOT pull in `Implements` refs. `impl Trait for MyStruct`
+    /// produces an Implements ref `name="Trait", qualified_name="MyStruct"` whose
+    /// byte_range points at the TRAIT token, not the implementor head. Matching it
+    /// for `find_references("MyStruct")` would add a same-line entry pointing at the
+    /// wrong token. The implementor is already discoverable as its own TypeUsage.
+    #[test]
+    fn test_d13_head_match_skips_implements() {
+        let refs = vec![
+            // The impl line's `MyStruct` token, captured as a TypeUsage under the head.
+            make_ref("MyStruct", None, ReferenceKind::TypeUsage, None, 0),
+            // The Implements ref: name=trait, qn=bare implementor, range at trait token.
+            make_ref(
+                "Trait",
+                Some("MyStruct"),
+                ReferenceKind::Implements,
+                None,
+                20,
+            ),
+        ];
+        let f = make_file_with_refs("a.rs", refs, HashMap::new());
+        let index = make_index(vec![("a.rs", f)], false);
+
+        let results = index.find_references_for_name("MyStruct", None, false);
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.kind != ReferenceKind::Implements),
+            "head-match must not surface the Implements ref (wrong-token entry); got: {:?}",
+            results
+                .iter()
+                .map(|(_, r)| (&r.name, &r.qualified_name, r.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "only the TypeUsage occurrence of MyStruct should be returned"
+        );
     }
 
     #[test]

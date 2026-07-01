@@ -295,9 +295,9 @@ pub fn format_gate_report_markdown(report: &Phase2GateReport) -> String {
          When no `*_small` task ids are present, all accepted serve rows in the golden corpus \
          are used (Phase 2 golden naming uses `tN` ids, not sf-bench `*_small` suffix).\n\n\
          ## H5 note\n\n\
-         Compact surface uses one external `symforge` MCP call per task. Multi-hop rows \
-         (`chain=multi`) may execute multiple legacy tools in-process but must still report \
-         `mcpCalls=1`.\n",
+         Compact surface uses one external `symforge` MCP call per task. A fused find plan \
+         may execute multiple tools in-process (e.g. search_files + search_text) but must still \
+         report `mcpCalls=1`.\n",
         report_id = report.report_id,
         surface = report.surface,
         baseline = report.baseline_commit,

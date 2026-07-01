@@ -153,7 +153,7 @@ H3 evaluates **accepted serve** rows only (bypass/degrade/cache_hit excluded). W
 
 ## H5 note
 
-Compact surface uses one external \`symforge\` MCP call per task. Multi-hop rows (\`chain=multi\`) execute legacy tools in-process but report \`mcpCalls=1\`.
+Compact surface uses one external \`symforge\` MCP call per task. A fused find plan executes multiple tools in-process (e.g. search_files + search_text) but reports \`mcpCalls=1\`.
 `;
 }
 

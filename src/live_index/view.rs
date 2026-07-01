@@ -31,9 +31,9 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    DEFAULT_MAX_PER_FILE, SymbolMatchTier, TextSearchError, TextSearchResult, compute_test_ranges,
-    current_code_search_keeps_file, search_symbols as base_search_symbols,
-    search_text as base_search_text, truncate_display_line,
+    DEFAULT_MAX_PER_FILE, SymbolMatchTier, SymbolSearchOptions, TextSearchError, TextSearchOptions,
+    TextSearchResult, compute_test_ranges, current_code_search_keeps_file,
+    search_symbols_with_options, search_text_with_options, truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
 use crate::live_index::query::is_filtered_name;
@@ -153,16 +153,6 @@ impl Overlay {
         }
     }
 
-    /// Record an upsert delta for `rel_path`.
-    pub fn upsert(&mut self, rel_path: impl Into<String>, file: Arc<IndexedFile>) {
-        self.deltas.insert(rel_path.into(), FileDelta::Upsert(file));
-    }
-
-    /// Record a tombstone (deletion) delta for `rel_path`.
-    pub fn tombstone(&mut self, rel_path: impl Into<String>) {
-        self.deltas.insert(rel_path.into(), FileDelta::Tombstone);
-    }
-
     /// Number of live deltas (the dirty-set size K).
     pub fn delta_count(&self) -> usize {
         self.deltas.len()
@@ -172,32 +162,6 @@ impl Overlay {
     /// generation both match the base it is read against.
     pub fn is_valid_against(&self, base: &IndexBase) -> bool {
         self.base_key == base.key && self.base_generation == base.base_generation
-    }
-
-    /// Rebase this overlay onto a NEW base after a commit advance (D2 trigger
-    /// (a) / data-model state transition `dirty --base commit advances-->`).
-    ///
-    /// `still_dirty` is the recomputed dirty set from `uncommitted_paths()`
-    /// (`git.rs:68`) — the set of paths that remain uncommitted against the new
-    /// base. Deltas whose path is no longer in `still_dirty` were absorbed by
-    /// the new base (committed) and are dropped; the rest are kept and re-fenced
-    /// to the new base.
-    ///
-    /// COST: O(K) where K = `self.deltas.len()`. It iterates only the overlay's
-    /// own deltas and probes the (typically small) `still_dirty` set. It does
-    /// NOT scan the base's N-file map. This is the spike's load-bearing claim
-    /// (the named CoW perf cliff falsifier).
-    pub fn rebase(
-        &mut self,
-        new_base: &IndexBase,
-        still_dirty: &std::collections::HashSet<String>,
-    ) {
-        // Drop deltas absorbed by the new base (no longer uncommitted). Retain
-        // touches each delta exactly once -> O(K), independent of base size N.
-        self.deltas.retain(|path, _| still_dirty.contains(path));
-        // Re-fence to the new base.
-        self.base_key = new_base.key.clone();
-        self.base_generation = new_base.base_generation;
     }
 }
 
@@ -281,10 +245,9 @@ impl<'a> IndexView<'a> {
     /// Iterate all resolved `(path, file)` pairs: base files not shadowed by an
     /// overlay delta, plus overlay upserts; tombstoned base files are excluded.
     ///
-    /// Allocates a result `Vec` because resolution merges two maps; the spike's
-    /// hot-path claim is about [`Overlay::rebase`], not this convenience
-    /// iterator. The single-consumer path (`overlay: None`) returns base files
-    /// directly with no overlay work.
+    /// Allocates a result `Vec` because resolution merges two maps; this is a
+    /// convenience iterator, not a hot path. The single-consumer path
+    /// (`overlay: None`) returns base files directly with no overlay work.
     pub fn all_files(&self) -> Vec<(String, &IndexedFile)> {
         match self.overlay {
             None => self.base.all_files().map(|(p, f)| (p.clone(), f)).collect(),
@@ -318,28 +281,40 @@ impl<'a> IndexView<'a> {
     /// Symbol-name search resolved THROUGH the overlay (research D1: symbol-name
     /// search resolves through the overlay, not via the base's derived indices).
     ///
-    /// For a base-only view this delegates straight to the engine's
-    /// [`base_search_symbols`] over the base index (byte-for-byte today's
-    /// behavior). When an overlay is present we cannot call the base function
-    /// (it would scan the stale base file map), so we scan the OVERLAY-RESOLVED
-    /// file set ([`all_files`]) directly with the same name-match + tiering rules
-    /// the engine search uses, then sort and bound identically. Correctness over
-    /// speed: this is a linear scan of the resolved file set.
+    /// For a view with NO live deltas (base-only, OR an empty overlay — the US1
+    /// cross-project case, since overlays are never written there) this delegates
+    /// straight to the engine's option-honoring [`search_symbols_with_options`]
+    /// over the base, so the caller's `options` (path scope, language filter,
+    /// noise policy, and the `result_limit` ranking) ARE honored on the
+    /// cross-project read path (D11 scoping + D14 ranking). When live overlay
+    /// deltas ARE present we cannot call the base function (it would scan the
+    /// stale base file map), so we scan the OVERLAY-RESOLVED file set
+    /// ([`all_files`]) directly with the name-match + tiering rules the engine
+    /// uses. Correctness over speed: this is a linear scan of the resolved set.
     ///
-    /// `// DEFERRED (012 full tier):` the engine's richer
-    /// `search_symbols_with_options` (noise policy, test-module suppression,
-    /// path scope, language filter) is intentionally NOT reproduced here — the
-    /// overlay path applies only the name/kind tiering needed for cross-project
-    /// attribution. Wiring the full option surface through the overlay is the
-    /// deferred derived-index work; until then the overlay symbol search is a
-    /// minimal, correct superset (it may include hits the option-filtered base
-    /// path would suppress).
+    /// `// DEFERRED (D-B0):` the overlay-present scan applies only the name/kind
+    /// tiering needed for cross-project attribution; honoring the full option
+    /// surface (path scope, language, noise) over the dirty set is the deferred
+    /// per-overlay derived-index work. That branch is unreached on the US1
+    /// cross-project path (overlays are empty there); until then the overlay
+    /// symbol search is a minimal, correct superset.
     ///
     /// [`all_files`]: IndexView::all_files
-    pub fn search_symbols(&self, query: &str, kind_filter: Option<&str>) -> Vec<ViewSymbolHit> {
-        // Fast path: no overlay -> reuse the engine search verbatim over the base.
-        if self.overlay.is_none() {
-            let result = base_search_symbols(self.base, query, kind_filter, usize::MAX);
+    pub fn search_symbols(
+        &self,
+        query: &str,
+        kind_filter: Option<&str>,
+        options: &SymbolSearchOptions,
+    ) -> Vec<ViewSymbolHit> {
+        // No live deltas (absent OR empty overlay) -> reuse the engine's
+        // option-honoring search verbatim over the base. This IS the US1
+        // cross-project path; caller scoping + result_limit ranking are honored.
+        let no_deltas = match self.overlay_deltas() {
+            None => true,
+            Some(deltas) => deltas.is_empty(),
+        };
+        if no_deltas {
+            let result = search_symbols_with_options(self.base, query, kind_filter, options);
             return result
                 .hits
                 .into_iter()
@@ -403,7 +378,9 @@ impl<'a> IndexView<'a> {
     /// `search_text` depends on the base's repo-wide `trigram_index`, which the
     /// overlay does NOT re-derive (that is the DEFERRED per-consumer derived
     /// index). So we:
-    /// 1. run the engine [`base_search_text`] against the immutable base index;
+    /// 1. run the engine [`search_text_with_options`] against the immutable base
+    ///    index (honoring the caller's `options` — path scope, language, noise,
+    ///    limits — so cross-project text scoping is honored, D11);
     /// 2. DROP every base file-result whose path is a live overlay delta — its
     ///    base content is stale (the consumer edited or deleted that file);
     /// 3. directly SCAN each overlay `Upsert`'s current content for the same
@@ -440,8 +417,9 @@ impl<'a> IndexView<'a> {
         query: Option<&str>,
         terms: Option<&[String]>,
         regex: bool,
+        options: &TextSearchOptions,
     ) -> Result<TextSearchResult, TextSearchError> {
-        let mut result = base_search_text(self.base, query, terms, regex)?;
+        let mut result = search_text_with_options(self.base, query, terms, regex, options)?;
 
         let Some(deltas) = self.overlay_deltas() else {
             return Ok(result);
@@ -958,6 +936,7 @@ impl WorkingSet {
         targets: &Targets,
         query: &str,
         kind_filter: Option<&str>,
+        options: &SymbolSearchOptions,
     ) -> Vec<ProjectHit<ViewSymbolHit>> {
         let mut out = Vec::new();
         for entry in self
@@ -968,7 +947,7 @@ impl WorkingSet {
             let Ok(view) = Self::view_for(entry) else {
                 continue;
             };
-            for hit in view.search_symbols(query, kind_filter) {
+            for hit in view.search_symbols(query, kind_filter, options) {
                 out.push(ProjectHit {
                     project_id: entry.project_id.clone(),
                     hit,
@@ -988,6 +967,7 @@ impl WorkingSet {
         query: Option<&str>,
         terms: Option<&[String]>,
         regex: bool,
+        options: &TextSearchOptions,
     ) -> Result<Vec<ProjectHit<TextSearchResult>>, TextSearchError> {
         let mut out = Vec::new();
         for entry in self
@@ -998,7 +978,7 @@ impl WorkingSet {
             let Ok(view) = Self::view_for(entry) else {
                 continue;
             };
-            let result = view.search_text(query, terms, regex)?;
+            let result = view.search_text(query, terms, regex, options)?;
             out.push(ProjectHit {
                 project_id: entry.project_id.clone(),
                 hit: result,
@@ -1042,7 +1022,6 @@ mod tests {
     use super::*;
     use crate::domain::{FileClassification, LanguageId};
     use crate::live_index::store::{IndexedFile, LiveIndex, ParseStatus};
-    use std::collections::HashSet;
     use std::time::Instant;
 
     /// Build a minimal synthetic `IndexedFile` for spike tests. All fields are
@@ -1083,38 +1062,6 @@ mod tests {
 
     fn base_key(commit: &str) -> BaseKey {
         BaseKey::new("/repo/root", CommitId::Sha(commit.to_string()))
-    }
-
-    // ── Proof 2 — SC-003 isolation ──────────────────────────────────────────
-    #[test]
-    fn proof2_overlay_isolation() {
-        let live = synthetic_index(3); // f0.rs, f1.rs, f2.rs
-        let base = Arc::new(IndexBase::new(base_key("c0"), Arc::new(live), 1));
-
-        // Consumer A upserts "foo" (an edited f0.rs) and tombstones f1.rs.
-        let mut overlay_a = Overlay::fresh(&base);
-        overlay_a.upsert("f0.rs", Arc::new(make_file("f0.rs", "A_EDITED")));
-        overlay_a.tombstone("f1.rs");
-
-        // Consumer B has a fresh (empty) overlay over the SAME base.
-        let overlay_b = Overlay::fresh(&base);
-
-        let view_a = IndexView::new(&base, Some(&overlay_a)).expect("A view");
-        let view_b = IndexView::new(&base, Some(&overlay_b)).expect("B view");
-
-        // A sees its own overlay content.
-        assert_eq!(view_a.get_file("f0.rs").unwrap().content, b"A_EDITED");
-        // A's tombstone hides f1.rs from A.
-        assert!(view_a.get_file("f1.rs").is_none(), "tombstone hides for A");
-
-        // B sees base content for f0.rs (A's upsert is INVISIBLE to B).
-        assert_eq!(view_b.get_file("f0.rs").unwrap().content, b"fn f0() {}");
-        // B still sees f1.rs (A's tombstone is INVISIBLE to B).
-        assert!(
-            view_b.get_file("f1.rs").is_some(),
-            "A's tombstone must not affect B"
-        );
-        assert_eq!(view_b.get_file("f1.rs").unwrap().content, b"fn f1() {}");
     }
 
     // ── Proof 1 — SC-002 shared base, no second files-map clone ──────────────
@@ -1220,213 +1167,11 @@ mod tests {
         assert!(!overlay.is_valid_against(&base_v2));
     }
 
-    // ── Proof 5 — THE FALSIFIER: rebase is O(K), independent of N ─────────────
-    //
-    // Build a base of N files, hold an overlay of K dirty files, advance the
-    // base (new generation), time the rebase. PASS iff rebase time tracks K and
-    // is independent of N. We assert it directly: the rebase touches only the K
-    // deltas (and the still_dirty probe set), never the N base files.
-    //
-    // METHODOLOGY: All base/index construction (the only N-sized allocation in
-    // the system) happens OUTSIDE the timed region. The timer wraps a tight loop
-    // of `ITERS` rebases over pre-built, reused inputs and divides by `ITERS`,
-    // so we measure steady-state `Overlay::rebase` cost free of adjacent
-    // large-allocation cache/allocator noise (the artifact that contaminated a
-    // naive build-then-time-once loop). The base is held by `Arc` and merely
-    // borrowed by `rebase` — it is never cloned or scanned.
-    #[test]
-    fn proof5_falsifier_rebase_is_ok_not_on() {
-        let ns = [1_000usize, 10_000usize];
-        let ks = [1usize, 8usize, 64usize];
-
-        let mut table: Vec<(usize, usize, f64)> = Vec::new();
-        for &n in &ns {
-            for &k in &ks {
-                let per_rebase_ns = bench_rebase_steady_state(n, k);
-                table.push((n, k, per_rebase_ns));
-            }
-        }
-
-        println!("\n=== Proof 5 falsifier: steady-state overlay rebase cost ===");
-        println!("{:>8} {:>6} {:>16}", "N", "K", "rebase (ns/op)");
-        for &(n, k, t) in &table {
-            println!("{n:>8} {k:>6} {t:>16.1}");
-        }
-
-        // ASSERTION 1 — N-INDEPENDENCE: for a fixed K, rebase time must NOT scale
-        // with N. An O(N) whole-repo rescan from N=1k to N=10k (10x) would blow
-        // up ~10x. We require t(10k)/t(1k) < 2.5 (generous slack for sub-us timer
-        // noise on a warm steady-state measurement). O(N) fails this hard (~10x).
-        for &k in &ks {
-            let t_1k = lookup(&table, 1_000, k).max(0.1);
-            let t_10k = lookup(&table, 10_000, k);
-            let ratio = t_10k / t_1k;
-            println!("K={k}: t(10k)/t(1k) = {ratio:.2} (PASS if < 2.5 -> independent of N)");
-            assert!(
-                ratio < 2.5,
-                "FALSIFIER TRIPPED: rebase scaled with N for K={k} \
-                 (t_1k={t_1k:.1}ns, t_10k={t_10k:.1}ns, ratio={ratio:.2}); \
-                 rebase is NOT O(K) -> revisit the primitive design"
-            );
-        }
-
-        // ASSERTION 2 — O(K) SHAPE: for a fixed N, rebase cost grows with K (it is
-        // work proportional to the dirty set). Going K=1 -> K=64 (64x) must
-        // increase cost, but stay near-linear in K, not super-linear. We assert
-        // t(K=64) > t(K=1) (real per-delta work) and t(K=64)/t(K=1) < 200
-        // (linear-ish; an O(K*N) or worse would explode). This confirms the cost
-        // IS in K, which is the whole point.
-        for &n in &ns {
-            let t_k1 = lookup(&table, n, 1).max(0.1);
-            let t_k64 = lookup(&table, n, 64);
-            let ratio = t_k64 / t_k1;
-            println!("N={n}: t(K=64)/t(K=1) = {ratio:.2} (cost lives in K, linear-ish)");
-            assert!(
-                t_k64 > t_k1,
-                "rebase cost should grow with the dirty set K (N={n}): \
-                 t(K=1)={t_k1:.1}ns, t(K=64)={t_k64:.1}ns"
-            );
-            assert!(
-                ratio < 200.0,
-                "rebase cost should be near-linear in K, not super-linear (N={n}): \
-                 t(K=1)={t_k1:.1}ns, t(K=64)={t_k64:.1}ns, ratio={ratio:.2}"
-            );
-        }
-
-        // Correctness of the rebase semantics (drop absorbed, keep dirty, re-fence).
-        assert_rebase_semantics();
-    }
-
-    fn lookup(table: &[(usize, usize, f64)], n: usize, k: usize) -> f64 {
-        table
-            .iter()
-            .find(|&&(nn, kk, _)| nn == n && kk == k)
-            .map(|&(_, _, t)| t)
-            .expect("table cell")
-    }
-
-    /// Measure steady-state per-rebase cost for a base of N files with a K-dirty
-    /// overlay. Construction is OUTSIDE the timer; the timed region is a tight
-    /// loop of pure `rebase` calls over reused, pre-built inputs.
-    fn bench_rebase_steady_state(n: usize, k: usize) -> f64 {
-        use std::time::Instant as TInstant;
-
-        // ── build inputs ONCE, outside any timing ──
-        let base_v1 = IndexBase::new(base_key("c0"), Arc::new(synthetic_index(n)), 1);
-        let base_v2 = IndexBase::new(base_key("c1"), Arc::new(synthetic_index(n)), 2);
-
-        // A pristine overlay with K dirty upserts; cloned per iteration so each
-        // rebase starts from the same K-sized state (clone of a K-entry map is
-        // itself O(K), but is done OUTSIDE the timed region per iteration).
-        let mut pristine = Overlay::fresh(&base_v1);
-        for i in 0..k {
-            pristine.upsert(
-                format!("f{i}.rs"),
-                Arc::new(make_file(&format!("f{i}.rs"), "DIRTY")),
-            );
-        }
-        // still_dirty keeps the even-indexed half (absorbed: odd indices).
-        let still_dirty: HashSet<String> = (0..k)
-            .filter(|i| i % 2 == 0)
-            .map(|i| format!("f{i}.rs"))
-            .collect();
-
-        const ITERS: usize = 2_000;
-
-        // Warm-up (touch the code path, prime caches) — untimed.
-        {
-            let mut o = pristine.clone();
-            o.rebase(&base_v2, &still_dirty);
-            std::hint::black_box(&o);
-        }
-
-        // Pre-build the per-iteration overlays OUTSIDE the timer so the timed
-        // region contains ONLY rebase work (no clone, no allocation of N).
-        let mut overlays: Vec<Overlay> = (0..ITERS).map(|_| pristine.clone()).collect();
-
-        let start = TInstant::now();
-        for o in overlays.iter_mut() {
-            o.rebase(&base_v2, &still_dirty);
-            std::hint::black_box(&*o);
-        }
-        let total = start.elapsed().as_nanos() as f64;
-        std::hint::black_box(&overlays);
-
-        // Sanity on the last one.
-        debug_assert!(overlays[ITERS - 1].is_valid_against(&base_v2));
-        debug_assert_eq!(overlays[ITERS - 1].delta_count(), still_dirty.len());
-
-        total / ITERS as f64
-    }
-
-    /// Verify rebase drops absorbed deltas, keeps still-dirty, and re-fences.
-    fn assert_rebase_semantics() {
-        let live = synthetic_index(10);
-        let base_v1 = IndexBase::new(base_key("c0"), Arc::new(live), 1);
-        let mut overlay = Overlay::fresh(&base_v1);
-        overlay.upsert("f0.rs", Arc::new(make_file("f0.rs", "DIRTY0")));
-        overlay.upsert("f1.rs", Arc::new(make_file("f1.rs", "DIRTY1")));
-        overlay.tombstone("f2.rs");
-        assert_eq!(overlay.delta_count(), 3);
-
-        let live_v2 = synthetic_index(10);
-        let base_v2 = IndexBase::new(base_key("c1"), Arc::new(live_v2), 2);
-        // f1.rs got committed (absorbed); f0.rs and f2.rs remain dirty.
-        let still_dirty: HashSet<String> = ["f0.rs".to_string(), "f2.rs".to_string()]
-            .into_iter()
-            .collect();
-        overlay.rebase(&base_v2, &still_dirty);
-
-        assert_eq!(
-            overlay.delta_count(),
-            2,
-            "absorbed delta f1.rs must be dropped"
-        );
-        assert!(overlay.deltas.contains_key("f0.rs"));
-        assert!(overlay.deltas.contains_key("f2.rs"));
-        assert!(!overlay.deltas.contains_key("f1.rs"));
-        assert!(overlay.is_valid_against(&base_v2), "re-fenced to new base");
-
-        // The rebased overlay reads correctly through a view.
-        let view = IndexView::new(&base_v2, Some(&overlay)).expect("view");
-        assert_eq!(view.get_file("f0.rs").unwrap().content, b"DIRTY0");
-        assert!(
-            view.get_file("f2.rs").is_none(),
-            "tombstone survives rebase"
-        );
-        // f1.rs now reads the base (committed content), overlay no longer shadows.
-        assert_eq!(view.get_file("f1.rs").unwrap().content, b"fn f1() {}");
-    }
-
-    // ── all_files resolution sanity (overlay merge) ──────────────────────────
-    #[test]
-    fn all_files_merges_overlay() {
-        let live = synthetic_index(3); // f0,f1,f2
-        let base = IndexBase::new(base_key("c0"), Arc::new(live), 1);
-        let mut overlay = Overlay::fresh(&base);
-        overlay.upsert("f0.rs", Arc::new(make_file("f0.rs", "EDIT")));
-        overlay.tombstone("f1.rs");
-        overlay.upsert("new.rs", Arc::new(make_file("new.rs", "NEW")));
-
-        let view = IndexView::new(&base, Some(&overlay)).expect("view");
-        let mut paths: Vec<String> = view.all_files().into_iter().map(|(p, _)| p).collect();
-        paths.sort();
-        // f1.rs tombstoned out; new.rs added; f0.rs/f2.rs present.
-        assert_eq!(paths, vec!["f0.rs", "f2.rs", "new.rs"]);
-
-        // base_only view == today's behavior.
-        let base_view = IndexView::base_only(base.index.as_ref());
-        let mut base_paths: Vec<String> =
-            base_view.all_files().into_iter().map(|(p, _)| p).collect();
-        base_paths.sort();
-        assert_eq!(base_paths, vec!["f0.rs", "f1.rs", "f2.rs"]);
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
     // WorkingSet + cross-project query (Phase 2)
     // ─────────────────────────────────────────────────────────────────────────
 
-    use crate::domain::{ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
+    use crate::domain::{SymbolKind, SymbolRecord};
 
     /// Build a synthetic indexed file carrying ONE symbol named `symbol_name`
     /// (so symbol search has something to match) and the given content.
@@ -1500,28 +1245,6 @@ mod tests {
         assert_eq!(ids, vec!["B"]);
     }
 
-    #[test]
-    fn working_set_add_replaces_existing_id() {
-        let mut ws = WorkingSet::new();
-        let base_v1 = base_with_symbol("/a", "c0", "old_fn", "fn old_fn() {}");
-        ws.add("A", base_v1);
-        // Record an overlay delta, then re-add the same id -> fresh overlay.
-        ws.get_mut("A")
-            .unwrap()
-            .overlay
-            .upsert("dirty.rs", Arc::new(make_file("dirty.rs", "X")));
-        assert_eq!(ws.get("A").unwrap().overlay.delta_count(), 1);
-
-        let base_v2 = base_with_symbol("/a", "c1", "new_fn", "fn new_fn() {}");
-        ws.add("A", base_v2);
-        assert_eq!(ws.len(), 1, "re-add same id must replace, not duplicate");
-        assert_eq!(
-            ws.get("A").unwrap().overlay.delta_count(),
-            0,
-            "re-add resets the overlay"
-        );
-    }
-
     // ── SC-001: cross-project search returns source-attributed hits ───────────
     #[test]
     fn cross_project_search_is_source_attributed() {
@@ -1540,7 +1263,12 @@ mod tests {
             base_with_symbol("/c", "c0", "shared_c", "fn shared_c() {}"),
         );
 
-        let hits = ws.search_symbols(&Targets::All, "shared", None);
+        let hits = ws.search_symbols(
+            &Targets::All,
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert_eq!(hits.len(), 3, "one hit per project");
 
         // Every hit is attributed to its source project, and the project's own
@@ -1572,7 +1300,12 @@ mod tests {
         );
 
         // Single.
-        let one = ws.search_symbols(&Targets::One("B".to_string()), "shared", None);
+        let one = ws.search_symbols(
+            &Targets::One("B".to_string()),
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].project_id, "B");
         assert_eq!(one[0].hit.name, "shared_b");
@@ -1582,6 +1315,7 @@ mod tests {
             &Targets::Subset(vec!["A".to_string(), "C".to_string()]),
             "shared",
             None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
         );
         let projects: std::collections::BTreeSet<&str> =
             subset.iter().map(|h| h.project_id.as_str()).collect();
@@ -1595,7 +1329,12 @@ mod tests {
         // A target naming a project not in the set yields no hits (the caller
         // layer turns "project not open" into an explicit error; the primitive
         // simply does not match it).
-        let none = ws.search_symbols(&Targets::One("Z".to_string()), "shared", None);
+        let none = ws.search_symbols(
+            &Targets::One("Z".to_string()),
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert!(none.is_empty());
     }
 
@@ -1624,349 +1363,6 @@ mod tests {
         assert!(!ws.shares_base_with("view1", "other"));
     }
 
-    // ── overlay post-filter: search_text reflects overlay deltas ──────────────
-    #[test]
-    fn view_search_text_reflects_overlay_deltas() {
-        // Base file f.rs contains the token NEEDLE.
-        let base = base_with_symbol("/a", "c0", "f", "let NEEDLE = 1;");
-        let mut overlay = Overlay::fresh(&base);
-
-        // Sanity: base-only view finds the base hit.
-        let base_view = IndexView::new(&base, None).unwrap();
-        let base_hits = base_view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("base text search");
-        assert_eq!(base_hits.total_matches, 1);
-        assert_eq!(base_hits.files.len(), 1);
-        assert_eq!(base_hits.files[0].path, "f.rs");
-
-        // Consumer edits f.rs so the NEEDLE is GONE, and adds new.rs WITH NEEDLE.
-        overlay.upsert("f.rs", Arc::new(make_file("f.rs", "let other = 2;")));
-        overlay.upsert("new.rs", Arc::new(make_file("new.rs", "let NEEDLE = 3;")));
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("overlay text search");
-
-        let paths: std::collections::BTreeSet<&str> =
-            result.files.iter().map(|f| f.path.as_str()).collect();
-        // The stale base hit for the now-edited f.rs is DROPPED (post-filter (2)).
-        assert!(
-            !paths.contains("f.rs"),
-            "dirty edit's stale base hit must not be returned"
-        );
-        // The upserted new.rs hit IS returned (post-filter (3)).
-        assert!(
-            paths.contains("new.rs"),
-            "an upserted file's fresh hit must be returned"
-        );
-        assert_eq!(result.total_matches, 1, "only the live overlay hit remains");
-    }
-
-    // ── overlay post-filter: tombstone removes a base text hit ────────────────
-    #[test]
-    fn view_search_text_tombstone_drops_base_hit() {
-        let base = base_with_symbol("/a", "c0", "f", "let NEEDLE = 1;");
-        let mut overlay = Overlay::fresh(&base);
-        overlay.tombstone("f.rs");
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("text search");
-        assert_eq!(
-            result.total_matches, 0,
-            "a tombstoned file contributes no text hits"
-        );
-        assert!(result.files.is_empty());
-    }
-
-    // ── overlay post-filter: find_references reflects overlay deltas ──────────
-    #[test]
-    fn view_find_references_reflects_overlay_deltas() {
-        // Build a base where caller.rs references `target_fn` once.
-        let mut idx = LiveIndex::empty_live_index();
-        idx.is_empty = false;
-        idx.loaded_at = Instant::now();
-        let mut caller = make_file("caller.rs", "fn use_it() { target_fn(); }");
-        caller.references = vec![ReferenceRecord {
-            name: "target_fn".to_string(),
-            qualified_name: None,
-            kind: ReferenceKind::Call,
-            byte_range: (14, 23),
-            line_range: (0, 0),
-            enclosing_symbol_index: None,
-        }];
-        let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::new();
-        files.insert("caller.rs".to_string(), Arc::new(caller));
-        idx.files = files;
-        idx.rebuild_reverse_index();
-        let base = Arc::new(IndexBase::new(
-            BaseKey::new("/a", CommitId::Sha("c0".to_string())),
-            Arc::new(idx),
-            1,
-        ));
-
-        // Base-only: one reference to target_fn in caller.rs.
-        let base_view = IndexView::new(&base, None).unwrap();
-        let base_refs = base_view.find_references("target_fn", None, true);
-        assert_eq!(base_refs.len(), 1);
-        assert_eq!(base_refs[0].0, "caller.rs");
-
-        // Consumer edits caller.rs to remove the call (its base ref is now stale),
-        // and adds new_caller.rs that DOES call target_fn.
-        let mut overlay = Overlay::fresh(&base);
-        overlay.upsert(
-            "caller.rs",
-            Arc::new(make_file("caller.rs", "fn use_it() { /* removed */ }")),
-        );
-        let mut new_caller = make_file("new_caller.rs", "fn n() { target_fn(); }");
-        new_caller.references = vec![ReferenceRecord {
-            name: "target_fn".to_string(),
-            qualified_name: None,
-            kind: ReferenceKind::Call,
-            byte_range: (9, 18),
-            line_range: (0, 0),
-            enclosing_symbol_index: None,
-        }];
-        overlay.upsert("new_caller.rs", Arc::new(new_caller));
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let refs = view.find_references("target_fn", None, true);
-        let paths: std::collections::BTreeSet<&str> =
-            refs.iter().map(|(p, _)| p.as_str()).collect();
-        // The stale base reference in the edited caller.rs is dropped.
-        assert!(
-            !paths.contains("caller.rs"),
-            "dirty edit's stale base reference must not be returned"
-        );
-        // The upserted new_caller.rs reference is returned.
-        assert!(
-            paths.contains("new_caller.rs"),
-            "an upserted file's reference must be returned"
-        );
-        assert_eq!(refs.len(), 1);
-    }
-
-    // ── overlay text scan: per-file cap + line truncation match the base ──────
-    #[test]
-    fn view_search_text_overlay_caps_and_truncates() {
-        // Base has no NEEDLE; the upserted file carries 10 matching lines plus
-        // one absurdly long matching line (to prove truncation).
-        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
-        let mut overlay = Overlay::fresh(&base);
-
-        let mut body = String::new();
-        for i in 0..10 {
-            body.push_str(&format!("let NEEDLE_{i} = {i};\n"));
-        }
-        // A single match line longer than MAX_DISPLAY_LINE_CHARS (2000).
-        body.push_str(&format!("let NEEDLE_long = \"{}\";\n", "x".repeat(5000)));
-        overlay.upsert("added.rs", Arc::new(make_file("added.rs", &body)));
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("overlay text search");
-
-        let added = result
-            .files
-            .iter()
-            .find(|f| f.path == "added.rs")
-            .expect("added.rs present");
-        // 11 visible matches collapse to at most DEFAULT_MAX_PER_FILE (5).
-        assert_eq!(
-            added.matches.len(),
-            5,
-            "overlay scan must cap retained matches at DEFAULT_MAX_PER_FILE like the base"
-        );
-        // No retained line exceeds the display cap; if a long line survived the
-        // cap it must carry the honest truncation marker.
-        for m in &added.matches {
-            assert!(
-                m.line.chars().count() <= super::super::search::MAX_DISPLAY_LINE_CHARS + 64,
-                "retained overlay line must be truncated, not raw: len={}",
-                m.line.chars().count()
-            );
-        }
-        // total_matches is coherent with the displayed (capped) match lines.
-        assert_eq!(result.total_matches, added.matches.len());
-        // Coherent meta after the post-filter (not stale base numbers).
-        assert_eq!(result.overflow_count, 0);
-        assert_eq!(result.suppressed_by_noise, 0);
-    }
-
-    // ── overlay text scan: an upserted TEST-classified file is suppressed ──────
-    #[test]
-    fn view_search_text_overlay_suppresses_test_classified_file() {
-        // Base file (code) carries NEEDLE; an upserted file under tests/ also
-        // carries NEEDLE but must be suppressed by the file-level noise gate, the
-        // same way the base hides test files under for_current_code_search().
-        let base = base_with_symbol("/a", "c0", "f", "let NEEDLE = 1;");
-        let mut overlay = Overlay::fresh(&base);
-        // for_code_path("tests/foo.rs") => is_test = true.
-        overlay.upsert(
-            "tests/foo.rs",
-            Arc::new(make_file("tests/foo.rs", "let NEEDLE = 99;")),
-        );
-        // A normal code file IS kept.
-        overlay.upsert(
-            "src/added.rs",
-            Arc::new(make_file("src/added.rs", "let NEEDLE = 2;")),
-        );
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("overlay text search");
-        let paths: std::collections::BTreeSet<&str> =
-            result.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(
-            !paths.contains("tests/foo.rs"),
-            "an upserted test-classified file must not leak hits the base would suppress"
-        );
-        assert!(
-            paths.contains("src/added.rs"),
-            "an upserted code file's hit is returned"
-        );
-    }
-
-    // ── overlay text scan: #[cfg(test)] block suppression + count ──────────────
-    #[test]
-    fn view_search_text_overlay_suppresses_cfg_test_block() {
-        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
-        let mut overlay = Overlay::fresh(&base);
-
-        // A Rust file with a `tests` module (lines 2..=3) carrying NEEDLE; the
-        // match on line 0 is visible, the in-module matches are suppressed.
-        let content = "let NEEDLE = 0;\nmod tests {\nlet NEEDLE = 1;\nlet NEEDLE = 2;\n}\n";
-        let mut file = make_file("src/code.rs", content);
-        file.symbols = vec![SymbolRecord {
-            name: "tests".to_string(),
-            kind: SymbolKind::Module,
-            depth: 0,
-            sort_order: 0,
-            byte_range: (0, content.len() as u32),
-            // line_range is 0-based inclusive: the `mod tests` block spans lines 1..=4.
-            line_range: (1, 4),
-            doc_byte_range: None,
-            item_byte_range: None,
-        }];
-        overlay.upsert("src/code.rs", Arc::new(file));
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("overlay text search");
-        let code = result
-            .files
-            .iter()
-            .find(|f| f.path == "src/code.rs")
-            .expect("src/code.rs present");
-        assert_eq!(
-            code.matches.len(),
-            1,
-            "only the non-test-module NEEDLE match should be visible"
-        );
-        assert_eq!(code.matches[0].line_number, 1);
-        assert_eq!(
-            result.suppressed_by_noise, 2,
-            "the two #[cfg(test)]-module matches are counted as suppressed"
-        );
-    }
-
-    // ── overlay find_references: include_filtered asymmetry ────────────────────
-    #[test]
-    fn view_find_references_overlay_honors_include_filtered() {
-        // Base is empty of refs; the overlay adds a file referencing `T`, a
-        // single-letter generic that `is_filtered_name` filters by default.
-        let mut idx = LiveIndex::empty_live_index();
-        idx.is_empty = false;
-        idx.loaded_at = Instant::now();
-        idx.rebuild_reverse_index();
-        let base = Arc::new(IndexBase::new(
-            BaseKey::new("/a", CommitId::Sha("c0".to_string())),
-            Arc::new(idx),
-            1,
-        ));
-
-        let mut overlay = Overlay::fresh(&base);
-        let mut added = make_file("src/added.rs", "fn n<T>() -> T { todo!() }");
-        added.references = vec![ReferenceRecord {
-            name: "T".to_string(),
-            qualified_name: None,
-            kind: ReferenceKind::TypeUsage,
-            byte_range: (0, 1),
-            line_range: (0, 0),
-            enclosing_symbol_index: None,
-        }];
-        overlay.upsert("src/added.rs", Arc::new(added));
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        // include_filtered = false -> single-letter generic T is hidden.
-        let hidden = view.find_references("T", None, false);
-        assert!(
-            hidden.is_empty(),
-            "with include_filtered=false an overlay single-letter generic ref must be filtered"
-        );
-        // include_filtered = true -> the same ref is returned.
-        let shown = view.find_references("T", None, true);
-        assert_eq!(
-            shown.len(),
-            1,
-            "with include_filtered=true the overlay ref is returned"
-        );
-        assert_eq!(shown[0].0, "src/added.rs");
-    }
-
-    // ── overlay scans: appended files are deterministically ordered ────────────
-    #[test]
-    fn view_overlay_appended_files_are_path_sorted() {
-        // Many upserted code files all carrying NEEDLE; the appended order must be
-        // path-sorted regardless of HashMap iteration order.
-        let base = base_with_symbol("/a", "c0", "f", "fn f() {}");
-        let mut overlay = Overlay::fresh(&base);
-        let names = ["src/zeta.rs", "src/alpha.rs", "src/mike.rs", "src/bravo.rs"];
-        for n in names {
-            overlay.upsert(n, Arc::new(make_file(n, "let NEEDLE = 1;")));
-        }
-
-        let view = IndexView::new(&base, Some(&overlay)).unwrap();
-        let result = view
-            .search_text(Some("NEEDLE"), None, false)
-            .expect("overlay text search");
-        let ordered: Vec<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
-        let mut expected = names.to_vec();
-        expected.sort();
-        assert_eq!(
-            ordered, expected,
-            "appended overlay text files must be path-sorted (deterministic, Principle V)"
-        );
-
-        // Same determinism for find_references.
-        let mut ref_overlay = Overlay::fresh(&base);
-        for n in names {
-            let mut f = make_file(n, "fn u() { target(); }");
-            f.references = vec![ReferenceRecord {
-                name: "target".to_string(),
-                qualified_name: None,
-                kind: ReferenceKind::Call,
-                byte_range: (0, 6),
-                line_range: (0, 0),
-                enclosing_symbol_index: None,
-            }];
-            ref_overlay.upsert(n, Arc::new(f));
-        }
-        let ref_view = IndexView::new(&base, Some(&ref_overlay)).unwrap();
-        let refs = ref_view.find_references("target", None, true);
-        let ref_order: Vec<&str> = refs.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(
-            ref_order, expected,
-            "appended overlay reference files must be path-sorted (deterministic, Principle V)"
-        );
-    }
-
     // ── cross-project text query is source-attributed ────────────────────────
     #[test]
     fn cross_project_text_search_attribution() {
@@ -1976,7 +1372,13 @@ mod tests {
         ws.add("C", base_with_symbol("/c", "c0", "h", "let NEEDLE = 3;"));
 
         let results = ws
-            .search_text(&Targets::All, Some("NEEDLE"), None, false)
+            .search_text(
+                &Targets::All,
+                Some("NEEDLE"),
+                None,
+                false,
+                &TextSearchOptions::for_current_code_search(),
+            )
             .expect("cross-project text search");
         // Only projects whose content has NEEDLE produce non-empty results, but
         // every targeted project yields a (possibly empty) attributed result.
@@ -2000,10 +1402,108 @@ mod tests {
         // rebase). The query must SKIP it (never serve stale) rather than panic.
         ws.get_mut("A").unwrap().overlay.base_generation = 999;
 
-        let hits = ws.search_symbols(&Targets::All, "shared", None);
+        let hits = ws.search_symbols(
+            &Targets::All,
+            "shared",
+            None,
+            &SymbolSearchOptions::for_current_code_search(usize::MAX),
+        );
         assert!(
             hits.is_empty(),
             "a stale-overlay entry must be skipped, not served"
+        );
+    }
+
+    /// Build a base from explicit (path, language, symbol_name) tuples, each file
+    /// defining one function named `symbol_name`. Used to prove the cross-project
+    /// search HONORS caller options (path scope, language, result_limit) on the
+    /// empty-overlay path (B1 / D11 + D14).
+    fn base_with_files(
+        root: &str,
+        commit: &str,
+        files: &[(&str, LanguageId, &str)],
+    ) -> Arc<IndexBase> {
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+        for (path, lang, sym) in files {
+            let mut file = make_file_with_symbol(path, sym, &format!("fn {sym}() {{}}"));
+            file.language = lang.clone();
+            map.insert((*path).to_string(), Arc::new(file));
+        }
+        idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);
+        idx.files = map;
+        idx.rebuild_reverse_index();
+        Arc::new(IndexBase::new(
+            BaseKey::new(root, CommitId::Sha(commit.to_string())),
+            Arc::new(idx),
+            1,
+        ))
+    }
+
+    // ── B1: cross-project search HONORS caller scoping + limit (D11 + D14) ─────
+    // These options were previously LOUDLY REFUSED at the daemon guard; now they
+    // are threaded through the engine's option-honoring search.
+    #[test]
+    fn cross_project_search_honors_scoping_options() {
+        use crate::live_index::search::PathScope;
+
+        let mut ws = WorkingSet::new();
+        // One project; three files all defining `widget`: two Rust (src/, other/)
+        // and one Python under src/.
+        ws.add(
+            "A",
+            base_with_files(
+                "/a",
+                "c0",
+                &[
+                    ("src/keep.rs", LanguageId::Rust, "widget"),
+                    ("other/skip.rs", LanguageId::Rust, "widget"),
+                    ("src/also.py", LanguageId::Python, "widget"),
+                ],
+            ),
+        );
+
+        // path_scope = src/ -> the other/ file is EXCLUDED (D11 path scoping).
+        let mut scoped = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        scoped.path_scope = PathScope::prefix("src");
+        let hits = ws.search_symbols(&Targets::All, "widget", None, &scoped);
+        let paths: std::collections::BTreeSet<&str> =
+            hits.iter().map(|h| h.hit.path.as_str()).collect();
+        assert!(
+            paths.contains("src/keep.rs") && paths.contains("src/also.py"),
+            "src/-scoped search must include the src/ hits: {paths:?}"
+        );
+        assert!(
+            !paths.contains("other/skip.rs"),
+            "src/-scoped search must EXCLUDE other/ hits (path scoping honored): {paths:?}"
+        );
+
+        // language = Rust -> the Python file is EXCLUDED (D11 language scoping).
+        let mut rust_only = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        rust_only.language_filter = Some(LanguageId::Rust);
+        let rust_hits = ws.search_symbols(&Targets::All, "widget", None, &rust_only);
+        let rust_paths: std::collections::BTreeSet<&str> =
+            rust_hits.iter().map(|h| h.hit.path.as_str()).collect();
+        assert!(
+            rust_paths.contains("src/keep.rs") && rust_paths.contains("other/skip.rs"),
+            "Rust-filtered search keeps the Rust files: {rust_paths:?}"
+        );
+        assert!(
+            !rust_paths.contains("src/also.py"),
+            "Rust-filtered search must EXCLUDE the Python file (language scoping honored): {rust_paths:?}"
+        );
+
+        // result_limit = 1 -> the per-project hits are bounded + tier-ranked, not
+        // an unbounded usize::MAX dump (D14).
+        let bounded = SymbolSearchOptions::for_current_code_search(1);
+        let bounded_hits = ws.search_symbols(&Targets::All, "widget", None, &bounded);
+        assert_eq!(
+            bounded_hits.len(),
+            1,
+            "result_limit=1 bounds the per-project hits (D14): got {}",
+            bounded_hits.len()
         );
     }
 }

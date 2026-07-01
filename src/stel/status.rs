@@ -18,9 +18,24 @@ pub const PHASE0_EVIDENCE_COMMIT: &str = "08f7d14";
 /// `calibration_auto_tune` was removed (013 US2, T038): the auto-tune now
 /// DERIVES, held-out-VALIDATES, and APPLIES corrected token-estimate constants
 /// (the `tuned` state is reachable with a before/after error artifact), so
-/// listing it as deferred would be false. The remaining items are genuinely
-/// not-yet-implemented seams.
-pub const DEFERRED_ITEMS: &str = "b_results,multi_step_planner";
+/// listing it as deferred would be false.
+/// `multi_step_planner` was MOVED to [`SUPERSEDED_ITEMS`] (D5/D19): the
+/// fabricated 3-string "multi-hop" decomposer was DELETED and no server-side
+/// decomposer will be built, so calling it `deferred:` falsely implied
+/// in-progress server work. The remaining item is a genuinely
+/// not-yet-implemented seam.
+pub const DEFERRED_ITEMS: &str = "b_results";
+
+/// Stable comma-separated superseded-capability list (D5/D19).
+///
+/// A PLANNED capability now served by a different, already-shipped mechanism —
+/// distinct from `deferred:` (genuinely-unbuilt seams that still carry future
+/// intent) and never a silent drop. `multi_step_planner`: server-side dependent-
+/// query decomposition is superseded by the client agentic loop (the model reads
+/// each result and issues the next call) plus find-fusion (multi-surface fan-out
+/// the executor runs as one merged plan). The dishonest 3-string decomposer was
+/// removed; no replacement decomposer will be built server-side.
+pub const SUPERSEDED_ITEMS: &str = "multi_step_planner";
 
 /// Restart-survival view of the durable STEL ledger store (US3/T029).
 ///
@@ -133,10 +148,12 @@ impl<'a> StelStatusContext<'a> {
     /// events. Also re-renders the `tuning_note` from the new verdict so the
     /// section's two calibration lines stay consistent.
     ///
-    /// Honesty invariant (data-model): a `Disabled`/`Unavailable` durable store
-    /// pins the state at in-memory-only — callers pass `None` (keeping the
-    /// in-memory verdict, which is `Deferred`/`Accumulating`, never a false
-    /// `Tuned`). Only a `Durable` store with a real artifact yields `Tuned` here.
+    /// Honesty invariant (data-model): the durable verdict is fail-closed. `None`
+    /// is reserved for "no durable store wired" — the caller keeps the in-memory
+    /// verdict (`Deferred`/`Accumulating`, never a false `Tuned`). A wired-but-
+    /// broken store whose sample read fails passes `Some(Deferred)` so status
+    /// never keeps an in-memory `Tuned` without a readable durable artifact. Only
+    /// a readable `Durable` store with a real artifact yields `Tuned` here.
     pub fn with_calibration_verdict(
         mut self,
         verdict: crate::stel::calibration::CalibrationVerdict,
@@ -290,6 +307,9 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         format!("index_ready: {}", ctx.index_ready),
         format!("index_files: {}", ctx.index_files),
         format!("deferred: {DEFERRED_ITEMS}"),
+        // D5/D19: planned-but-superseded capability, surfaced honestly so it is
+        // not silently dropped and never reads as in-progress server work.
+        format!("superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
         "──".to_string(),
     ];
     lines.join("\n")
@@ -362,7 +382,9 @@ mod tests {
             "project_root: E:/project/symforge-test",
             "index_ready: true",
             "index_files: 12",
-            "deferred: b_results,multi_step_planner",
+            "deferred: b_results",
+            // D5/D19: multi_step_planner is honestly SUPERSEDED, not deferred.
+            "superseded: multi_step_planner (client agentic loop + find-fusion)",
             "──",
         ] {
             assert!(body.contains(needle), "missing `{needle}` in:\n{body}");

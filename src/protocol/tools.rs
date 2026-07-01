@@ -53,8 +53,8 @@ pub use super::search_tools::{
     FindReferencesInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
 };
 pub(crate) use super::search_tools::{
-    fix_common_double_escapes, parse_language_filter, search_symbols_options_from_input,
-    search_text_options_from_input,
+    fix_common_double_escapes, normalize_path_prefix, parse_language_filter,
+    search_symbols_options_from_input, search_text_options_from_input,
 };
 
 const INDEX_FOLDER_RESET_ENV: &str = "SYMFORGE_INDEX_FOLDER_RESET";
@@ -2512,9 +2512,30 @@ fn find_references_scope_summary(input: &FindReferencesInput, mode: &str) -> Str
     parts.join("; ")
 }
 
+/// True when the `references`-mode `kind` filter sweeps in type/value usages,
+/// whose recall is genuinely best-effort: the xref extractor resolves them
+/// syntactically and misses dynamic dispatch, macro-generated, reflective, and
+/// cross-language usages. Direct `call`/`import`/`macro_use` references are
+/// extracted reliably, so they earn no caveat (and `implementations` mode never
+/// reaches this label — it has its own branch). `None`/`"all"` default includes
+/// type/value usages, so it is best-effort too.
+fn find_references_kind_is_best_effort(kind: Option<&str>) -> bool {
+    // Mirror `find_references_kind_filter` rather than duplicating a string
+    // whitelist, so the caveat can never drift from the kinds actually returned.
+    // A filter result of `None` means "no kind filter" -> all kinds returned,
+    // INCLUDING best-effort type/value usages; that covers `all`/`None` AND any
+    // UNRECOGNIZED kind (the filter's `_ => None` arm), so a typo'd `kind` still
+    // gets the caveat instead of silently shipping a best-effort trace unmarked.
+    matches!(
+        find_references_kind_filter(kind),
+        None | Some(ReferenceKind::TypeUsage) | Some(ReferenceKind::ValueUse)
+    )
+}
+
 fn find_references_completeness_label(
     view: &crate::live_index::FindReferencesView,
     limits: &format::OutputLimits,
+    kind: Option<&str>,
 ) -> String {
     let shown_files = view.files.len().min(limits.max_files);
     let mut shown_refs = 0usize;
@@ -2531,8 +2552,17 @@ fn find_references_completeness_label(
     }
     let omitted_refs = view.total_refs.saturating_sub(shown_refs);
     let omitted_files = view.total_files.saturating_sub(shown_files);
+    // Recall-confidence caveat, targeted (not blanket): only type/value-usage
+    // traces are best-effort, so only they carry it. Riding the existing
+    // completeness label keeps it one site, one envelope, no ResultStatus bump.
+    let recall_caveat = if find_references_kind_is_best_effort(kind) {
+        " — usage-trace recall is best-effort; dynamic dispatch, macro-generated, \
+         reflective, and cross-language usages may be missed"
+    } else {
+        ""
+    };
     if omitted_refs == 0 && omitted_files == 0 {
-        return "full for current scope".to_string();
+        return format!("full for current scope{recall_caveat}");
     }
     let mut parts = vec!["truncated by result cap".to_string()];
     if omitted_refs > 0 {
@@ -2541,7 +2571,7 @@ fn find_references_completeness_label(
     if omitted_files > 0 {
         parts.push(format!("{omitted_files} file(s) omitted"));
     }
-    parts.join("; ")
+    format!("{}{recall_caveat}", parts.join("; "))
 }
 
 fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> String {
@@ -2566,11 +2596,17 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
 }
 
 /// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
-/// the daemon-owned working set, which does not exist on the local (stdio/embed
-/// or daemon-degraded) execution path. When a `project`/`projects` param is
-/// present and we are about to run LOCALLY, return an honest refusal instead of
-/// silently ignoring the target and serving the active project only. Returns the
-/// refusal message when the request is cross-project, else `None`.
+/// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
+/// stdio/embed, or daemon-degraded) execution path. When a `project`/`projects`
+/// param is present and we are about to run LOCALLY, return an honest refusal
+/// instead of silently ignoring the target and serving the active project only.
+/// Returns the refusal message when the request is cross-project, else `None`.
+///
+/// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
+/// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
+/// is `None`), so this is the guard that contains D16's silent-wrong half —
+/// `/mcp` loudly refuses cross-project targeting rather than silently serving the
+/// single bound index. `tests/serve_http_attach.rs` locks it end-to-end.
 fn local_cross_project_refusal(
     project: Option<&str>,
     projects: Option<&[String]>,
@@ -2581,8 +2617,8 @@ fn local_cross_project_refusal(
         Some(
             "Cross-project queries (project/projects) require the daemon: the \
              working set of open projects lives on the daemon transport, not on \
-             stdio/embed or while the daemon is unreachable. Start the daemon to \
-             query across projects."
+             the /mcp HTTP transport, stdio/embed, or while the daemon is \
+             unreachable. Start the daemon to query across projects."
                 .to_string(),
         )
     } else {
@@ -3627,6 +3663,12 @@ impl SymForgeServer {
         }
 
         let file = {
+            // The single-project overlay READ was REMOVED: it was redundant (the
+            // shared live index already holds the edit via reindex_after_write) and
+            // carried a narrow staleness shadow risk (overlay-first with no freshness
+            // gate could shadow a base advanced by a watcher event). The base read is
+            // always at-least-as-fresh. See
+            // docs/reviews/overlay-redundancy-decision.md.
             let guard = self.index.read();
             loading_guard!(guard);
             guard.capture_shared_file(&params.0.path)
@@ -5481,6 +5523,12 @@ impl SymForgeServer {
                 .as_ref()
                 .and_then(|resolution| resolution.neighbors.as_ref());
             let coupling_context = params.0.anchor_path.as_deref().zip(coupling_neighbors);
+            // Optional path-prefix scoping, mirroring the `path_scope` axis of
+            // search_symbols/search_text: the scope is applied inside the capture
+            // (pre-count predicate), so total_matches/overflow_count/hits are all
+            // consistently scoped — including the overflow set, not just the
+            // visible hits.
+            let path_scope = normalize_path_prefix(params.0.path_prefix.as_deref());
             let view = guard.capture_search_files_view_with_noise(
                 &params.0.query,
                 params.0.limit.unwrap_or(20) as usize,
@@ -5488,13 +5536,19 @@ impl SymForgeServer {
                 coupling_context,
                 include_vendor,
                 include_personal_tooling,
+                &path_scope,
             );
             if !(include_vendor && include_personal_tooling) {
-                let unfiltered = guard.capture_search_files_view(
+                // Same path_scope so hidden_noise_count compares like-for-like
+                // (noise hidden WITHIN the requested prefix, not repo-wide).
+                let unfiltered = guard.capture_search_files_view_with_noise(
                     &params.0.query,
                     params.0.limit.unwrap_or(20) as usize,
                     params.0.current_file.as_deref(),
                     coupling_context,
+                    true,
+                    true,
+                    &path_scope,
                 );
                 hidden_noise_count = search_files_total_matches(&unfiltered)
                     .saturating_sub(search_files_total_matches(&view));
@@ -7450,7 +7504,7 @@ impl SymForgeServer {
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
                         ),
-                        &find_references_completeness_label(&view, &limits),
+                        &find_references_completeness_label(&view, &limits, input.kind.as_deref()),
                         &find_references_scope_summary(input, mode),
                         &find_references_evidence(&view),
                     ))
@@ -9527,10 +9581,10 @@ impl SymForgeServer {
 
         // T033 / FR-009: override the in-memory verdict with the DURABLE one so
         // `status detail:full` reflects the persisted cross-session calibration
-        // state + active tuning. `None` (no/failed durable store) keeps the
-        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
-        // `Tuned`). After a reset above, the durable read sees zero samples ->
-        // `Deferred`.
+        // state + active tuning. `None` means no durable store is wired; a wired
+        // store whose sample read fails returns `Deferred` so status never keeps
+        // an in-memory `Tuned` verdict without a readable durable artifact. After
+        // a reset above, the durable read sees zero samples -> `Deferred`.
         if let Some(verdict) = self.durable_calibration_verdict() {
             ctx = ctx.with_calibration_verdict(verdict);
         }
@@ -9579,9 +9633,8 @@ impl SymForgeServer {
         )
         .with_durable_ledger(self.durable_ledger_summary_for_status());
         // Mirror `render_stel_status_body`: override the in-memory verdict with the
-        // DURABLE one (cross-session samples + active tuning). `None` keeps the
-        // honest in-memory verdict (`Deferred`/`Accumulating`, never a false
-        // `Tuned`).
+        // DURABLE one (cross-session samples + active tuning). A wired store whose
+        // sample read fails returns `Deferred`; only no store at all yields `None`.
         if let Some(verdict) = self.durable_calibration_verdict() {
             ctx = ctx.with_calibration_verdict(verdict);
         }
@@ -9804,6 +9857,7 @@ impl SymForgeServer {
                     anchor_path: None,
                     include_vendor: None,
                     include_personal_tooling: None,
+                    path_prefix: None,
                 };
                 self.search_files(Parameters(input)).await
             }
@@ -10390,6 +10444,114 @@ mod tests {
         assert!(
             bare_overlaid.contains("durable_ledger: unavailable"),
             "a no-store proxy stays unavailable after overlay:\n{bare_overlaid}"
+        );
+    }
+
+    #[test]
+    fn durable_calibration_status_accumulates_against_full_corpus_threshold() {
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS, TUNING_MIN_SAMPLES};
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let store =
+            StelLedgerStore::open_in_memory("proxy-accumulating").expect("in-memory durable store");
+        for _ in 0..(TUNING_MIN_SAMPLES + 1) {
+            store.record(&sample_durable_event());
+        }
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+        match proxy.durable_calibration_verdict() {
+            Some(CalibrationVerdict::Accumulating { n, min }) => {
+                assert_eq!(n, TUNING_MIN_SAMPLES + 1);
+                assert_eq!(min, TUNING_MIN_CORPUS);
+                assert!(
+                    n <= min,
+                    "status must never render accumulating ({n}/{min})"
+                );
+            }
+            other => panic!("expected durable accumulating verdict, got {other:?}"),
+        }
+
+        let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
+        });
+        let expected = format!(
+            "calibration: accumulating ({}/{})",
+            TUNING_MIN_SAMPLES + 1,
+            TUNING_MIN_CORPUS
+        );
+        assert!(
+            body.contains(&expected),
+            "full status must render the true full-corpus threshold {expected:?}:\n{body}"
+        );
+    }
+
+    #[test]
+    fn broken_durable_store_pins_status_calibration_to_deferred() {
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS};
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let repo = tempfile::tempdir().expect("temp repo");
+        let store = StelLedgerStore::open(repo.path(), "proxy-broken");
+        let db_path =
+            crate::paths::symforge_db_path(repo.path(), crate::paths::STEL_LEDGER_DB_NAME);
+        rusqlite::Connection::open(db_path)
+            .expect("open ledger db directly")
+            .execute_batch("DROP TABLE stel_ledger_events;")
+            .expect("break durable sample query");
+
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+        for i in 0..TUNING_MIN_CORPUS {
+            let mut event = sample_durable_event();
+            event.ts_ms += i as u64;
+            event.plan_id = format!("p-biased-{i}");
+            event.actual_response_tokens = event.predicted_response_tokens * 2;
+            proxy.stel_ledger().lock().push(event);
+        }
+
+        let session_events = proxy.stel_ledger().lock().events();
+        assert!(
+            matches!(
+                crate::stel::summarize_calibration(&session_events).verdict,
+                CalibrationVerdict::Tuned { .. }
+            ),
+            "fixture must prove the in-memory session alone would claim tuned"
+        );
+        assert_eq!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Deferred),
+            "a broken wired store cannot prove any tuning is in force"
+        );
+
+        let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
+        });
+        assert!(
+            body.contains("durable_ledger: disabled"),
+            "broken store must be surfaced as disabled:\n{body}"
+        );
+        assert!(
+            body.contains("calibration: deferred"),
+            "status must not keep the in-memory tuned verdict when durable reads fail:\n{body}"
+        );
+        assert!(
+            !body.contains("calibration: tuned"),
+            "status must never claim tuned without a readable durable artifact:\n{body}"
         );
     }
 
@@ -11079,6 +11241,7 @@ mod tests {
             anchor_path: None,
             include_vendor: None,
             include_personal_tooling: None,
+            path_prefix: None,
         }
     }
 
@@ -11379,6 +11542,82 @@ mod tests {
         assert!(
             result.contains("Tip:"),
             "should include next-step hint: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_missing_symbol_returns_loud_not_found() {
+        // D18: a symbol absent from the file must yield a LOUD not-found that
+        // names the symbol + path — NOT a silent content-anchored window.
+        //
+        // Non-vacuity: the source deliberately contains "TotallyFake" as a
+        // substring (in a comment). On the pre-fix code, content_anchored_symbol_window
+        // would find that substring and return a numbered source window tagged
+        // "content-anchored ...". This test asserts the window is gone, so it
+        // FAILS against the old behavior.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("// TotallyFake is only in a comment\nfn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/lib.rs", "TotallyFake")))
+            .await;
+
+        assert!(
+            result.contains("No symbol TotallyFake in src/lib.rs"),
+            "must name the missing symbol and path; got: {result}"
+        );
+        assert!(
+            !result.contains("content-anchored"),
+            "must NOT silently return a content-anchored window; got: {result}"
+        );
+        // Distinct from the file-not-found message: the file IS indexed.
+        assert!(
+            !result.starts_with("File not found"),
+            "indexed file with absent symbol must not read as file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_missing_file_returns_not_found_file() {
+        // D18 boundary: an unindexed/absent file must report file-not-found,
+        // distinct from the symbol-absent message above.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/nonexistent.rs", "foo")))
+            .await;
+
+        assert!(
+            result.starts_with("File not found"),
+            "absent file must report file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_valid_symbol_still_resolves() {
+        // D18 no-regression: a real symbol must still return its body, never a
+        // false not-found.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("src/lib.rs", "foo")))
+            .await;
+
+        assert!(
+            !result.contains("No symbol"),
+            "valid symbol must not read as not-found; got: {result}"
+        );
+        assert!(
+            result.contains("fn foo"),
+            "valid symbol must return its body; got: {result}"
         );
     }
 
@@ -14899,6 +15138,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(result.contains("2 matching files"), "got: {result}");
@@ -14921,6 +15161,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_files_path_prefix_scopes_results() {
+        let server = make_server(make_live_index_ready(vec![
+            make_file("src/protocol/tools.rs", b"fn a() {}", vec![]),
+            make_file("src/sidecar/tools.rs", b"fn b() {}", vec![]),
+        ]));
+
+        // Without path_prefix: both same-basename files are returned.
+        let unscoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: None,
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+        assert!(
+            unscoped.contains("src/protocol/tools.rs"),
+            "unscoped should include protocol path, got: {unscoped}"
+        );
+        assert!(
+            unscoped.contains("src/sidecar/tools.rs"),
+            "unscoped should include sidecar path, got: {unscoped}"
+        );
+
+        // With path_prefix=src/protocol: only paths under that prefix survive.
+        let scoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: Some("src/protocol".to_string()),
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+        assert!(
+            scoped.contains("src/protocol/tools.rs"),
+            "scoped should include in-prefix path, got: {scoped}"
+        );
+        assert!(
+            !scoped.contains("src/sidecar/tools.rs"),
+            "scoped must drop out-of-prefix path, got: {scoped}"
+        );
+    }
+
+    /// Regression for D20 review: scoping must hold UNDER overflow truncation.
+    /// The default limit is 20; seeding >20 in-prefix and >20 out-of-prefix
+    /// same-basename files forces the overflow path. If the prefix were applied
+    /// only to the visible (already-truncated) hits, out-of-prefix files in the
+    /// overflow set would escape scoping and the reported total/overflow counts
+    /// would be inflated. We assert: (a) no out-of-prefix path appears at all,
+    /// and (b) the header total equals only the in-prefix count (30), proving
+    /// total_matches is scoped pre-count, not just the rendered view.
+    #[tokio::test]
+    async fn test_search_files_path_prefix_scopes_under_overflow() {
+        let mut files = Vec::new();
+        for i in 0..30 {
+            files.push(make_file(
+                &format!("src/protocol/m{i:02}/tools.rs"),
+                b"fn a() {}",
+                vec![],
+            ));
+            files.push(make_file(
+                &format!("src/sidecar/m{i:02}/tools.rs"),
+                b"fn b() {}",
+                vec![],
+            ));
+        }
+        let server = make_server(make_live_index_ready(files));
+
+        let scoped = server
+            .search_files(Parameters(super::SearchFilesInput {
+                path_prefix: Some("src/protocol".to_string()),
+                ..search_files_input("tools.rs")
+            }))
+            .await;
+
+        // No out-of-prefix path leaks, even from the overflow set.
+        assert!(
+            !scoped.contains("src/sidecar/"),
+            "no out-of-prefix path may appear under overflow, got: {scoped}"
+        );
+        // total_matches reflects ONLY the 30 in-prefix files, not all 60.
+        assert!(
+            scoped.contains("30 matching files"),
+            "scoped header must count only in-prefix matches, got: {scoped}"
+        );
+        // overflow_count is scoped too: 30 matches, limit 20 => "... and 10 more".
+        assert!(
+            scoped.contains("... and 10 more"),
+            "scoped overflow count must be 30-20=10, got: {scoped}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_files_not_found() {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
@@ -14937,6 +15266,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(
@@ -14982,6 +15312,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15033,6 +15364,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15062,6 +15394,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         // Without git temporal data, should return informative message (not an error/panic)
@@ -15130,6 +15463,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15182,6 +15516,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15234,6 +15569,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15274,6 +15610,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15313,6 +15650,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15349,6 +15687,7 @@ mod tests {
                 anchor_path: Some("src/missing/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15385,6 +15724,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15424,6 +15764,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15458,6 +15799,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15475,6 +15817,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15514,6 +15857,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15531,6 +15875,7 @@ mod tests {
                 anchor_path: Some("src/auth/routes.rs".to_string()),
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15567,6 +15912,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15605,6 +15951,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: Some(true),
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15635,6 +15982,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15673,6 +16021,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: Some(true),
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15707,6 +16056,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
 
@@ -15742,6 +16092,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(
@@ -15775,6 +16126,7 @@ mod tests {
                 anchor_path: None,
                 include_vendor: None,
                 include_personal_tooling: None,
+                path_prefix: None,
             }))
             .await;
         assert!(
@@ -20996,6 +21348,93 @@ mod tests {
         assert!(
             !result.contains("definitions named"),
             "single definition must not trigger the disclosure; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_usage_trace_carries_recall_caveat() {
+        // R3 honesty: type/value-usage traces have best-effort recall (dynamic
+        // dispatch, macros, reflection, cross-language are missed). The default
+        // kind sweeps in type/value usages, so the completeness envelope must
+        // carry the recall caveat. Without it, a caller cannot tell the trace
+        // may be partial — a silent degrade.
+        let def = make_symbol("Widget", SymbolKind::Struct, 1, 1);
+        let user = make_symbol("user", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/widget.rs",
+            b"struct Widget;\nfn user(w: Widget) {}\n",
+            vec![def, user],
+            vec![make_ref(
+                "Widget",
+                None,
+                ReferenceKind::TypeUsage,
+                2,
+                Some(2),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let result = server
+            .find_references(Parameters(find_references_input("Widget")))
+            .await;
+        assert!(
+            result.contains("usage-trace recall is best-effort")
+                && result.contains("dynamic dispatch"),
+            "type/value-usage trace must carry the recall-confidence caveat; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_call_trace_has_no_recall_caveat() {
+        // Targeted, not blanket: direct `call` references are extracted reliably,
+        // so they must NOT carry the best-effort recall caveat — otherwise it is
+        // boilerplate noise the model learns to ignore.
+        let def = make_symbol("do_work", SymbolKind::Function, 1, 1);
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/work.rs",
+            b"fn do_work() {}\nfn caller() { do_work(); }\n",
+            vec![def, caller],
+            vec![make_ref("do_work", None, ReferenceKind::Call, 2, Some(2))],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let mut input = find_references_input("do_work");
+        input.kind = Some("call".to_string());
+        let result = server.find_references(Parameters(input)).await;
+        assert!(
+            !result.contains("usage-trace recall is best-effort"),
+            "direct call trace must NOT carry the recall caveat (targeted, not blanket); got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_unrecognized_kind_carries_recall_caveat() {
+        // Drift guard: an unrecognized `kind` maps to `None` in
+        // find_references_kind_filter -> NO filter -> ALL kinds returned,
+        // including best-effort type/value usages. The caveat must therefore
+        // still fire (it mirrors the filter), or a typo'd kind silently ships an
+        // unmarked best-effort trace — the exact silent-degrade R3 prevents.
+        let def = make_symbol("Widget", SymbolKind::Struct, 1, 1);
+        let user = make_symbol("user", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/widget.rs",
+            b"struct Widget;\nfn user(w: Widget) {}\n",
+            vec![def, user],
+            vec![make_ref(
+                "Widget",
+                None,
+                ReferenceKind::TypeUsage,
+                2,
+                Some(2),
+            )],
+        );
+        let server = make_server(make_live_index_ready(vec![file]));
+        let mut input = find_references_input("Widget");
+        input.kind = Some("totally-bogus-kind".to_string());
+        let result = server.find_references(Parameters(input)).await;
+        assert!(
+            result.contains("usage-trace recall is best-effort"),
+            "unrecognized kind returns all (best-effort) refs, so the caveat must \
+             still fire (filter-mirrored, no drift); got: {result}"
         );
     }
 

@@ -30,9 +30,8 @@ use rmcp::RoleServer;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
@@ -491,23 +490,26 @@ impl SymForgeServer {
     /// reading the artifact straight off the persisted set so the surface never
     /// claims `tuned` without it. Otherwise the verdict reflects the durable
     /// sample count (`Deferred` / `Accumulating(n/min)`). When no durable store is
-    /// wired (or it is `Disabled`/errors), returns `None` so the caller keeps the
-    /// in-memory verdict (which pins `Deferred`/`Accumulating` — never a false
-    /// `Tuned`). Read-only; no frecency bump.
+    /// wired, returns `None` so the caller keeps the in-memory view. When a wired
+    /// store cannot answer the sample query, pins the verdict to `Deferred` so a
+    /// stale in-memory session cannot claim `Tuned` while no validated tuning is
+    /// readable. Read-only; no frecency bump.
     ///
     /// [`CalibrationVerdict`]: crate::stel::calibration::CalibrationVerdict
     #[cfg(feature = "server")]
     pub(crate) fn durable_calibration_verdict(
         &self,
     ) -> Option<crate::stel::calibration::CalibrationVerdict> {
-        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_SAMPLES};
+        use crate::stel::calibration::{CalibrationVerdict, TUNING_MIN_CORPUS};
         use crate::stel::ledger_store::{CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX};
 
         let store = self.stel_ledger_store.as_ref()?;
-        // A wired but failing store -> keep the in-memory verdict (None here).
-        let records = store
-            .samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX)
-            .ok()?;
+        // A wired but failing store cannot prove any tuning is in force.
+        let records =
+            match store.samples_for_estimator(CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX) {
+                Ok(records) => records,
+                Err(_) => return Some(CalibrationVerdict::Deferred),
+            };
         let n = records.len();
 
         // An active, in-force tuning with a real reduction artifact reads `Tuned`.
@@ -526,7 +528,7 @@ impl SymForgeServer {
         } else {
             Some(CalibrationVerdict::Accumulating {
                 n,
-                min: TUNING_MIN_SAMPLES,
+                min: TUNING_MIN_CORPUS,
             })
         }
     }
@@ -998,6 +1000,14 @@ impl SymForgeServer {
     /// unreachable `roots/list`, or a forbidden root must never break the
     /// session — the server simply stays in its existing (empty) state, exactly
     /// as before this hook existed.
+    // ponytail: SEP-2577 deprecates the entire MCP Roots capability (Root,
+    // ListRootsResult, peer.list_roots()) with NO replacement in rmcp 2.0 — it is
+    // slated for removal from the spec, not renamed. `roots/list` is still the only
+    // way a client can declare its workspace, so we keep using it and scope the
+    // allow to this fn. Upgrade path: when the spec settles on a successor
+    // capability (or rmcp removes Roots), migrate this single function.
+    // https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577
+    #[allow(deprecated)]
     async fn bind_workspace_from_client_roots(&self, peer: &rmcp::Peer<RoleServer>) {
         // Precedence: `SYMFORGE_WORKSPACE_ROOT (env) > client roots > CWD walk`.
         //

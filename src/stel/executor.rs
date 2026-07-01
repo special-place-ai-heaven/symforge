@@ -750,6 +750,66 @@ mod tests {
     }
 
     #[test]
+    fn partial_multi_step_body_renders_chain_failure_footer() {
+        // Ported from the deleted `tests/stel_multi_hop_chain.rs`: the partial-body
+        // render on a failed inner step (reject decision + executed-step bodies +
+        // the "Multi-hop chain failed:" footer) is the mechanic that file uniquely
+        // covered. Find fusion is now the live multi-step consumer, so the shape is
+        // a fused search_files → search_text plan whose second step fails.
+        use crate::stel::types::{IntentBucket, RouteConfidence, StelPlan, StelPlanStep};
+        let plan = StelPlan {
+            plan_id: "fusion".to_string(),
+            intent: IntentBucket::Find,
+            confidence: RouteConfidence::Inferred,
+            confidence_rationale: "fused".to_string(),
+            steps: vec![
+                StelPlanStep {
+                    order: 1,
+                    tool: "search_files".to_string(),
+                    args: serde_json::json!({ "query": "test", "rank_by": "path+cochange" }),
+                    est_response_tokens: 400,
+                    est_manual_tokens: 800,
+                    index_refs: vec![],
+                },
+                StelPlanStep {
+                    order: 2,
+                    tool: "search_text".to_string(),
+                    args: serde_json::json!({ "query": "test" }),
+                    est_response_tokens: 400,
+                    est_manual_tokens: 800,
+                    index_refs: vec![],
+                },
+            ],
+            suggested_followup: None,
+        };
+        let request = StelRequest::default();
+        let base = evaluate_plan(&request, &plan);
+        let failed = chain_failure_decision(&plan, &base, 1, "search_text", OutcomeClass::NotFound);
+        assert_eq!(failed.decision, AdmissionDecision::Reject);
+
+        let body = format_partial_multi_step_serve_body(
+            &plan,
+            &failed,
+            &[
+                ServedStepResult {
+                    tool: "search_files".to_string(),
+                    body: "path hits".to_string(),
+                },
+                ServedStepResult {
+                    tool: "search_text".to_string(),
+                    body: "No matches".to_string(),
+                },
+            ],
+            Some(failed.decision_reason.as_str()),
+        );
+        assert!(body.contains("Chosen tool: search_files"));
+        assert!(body.contains("Chosen tool: search_text"));
+        assert!(body.contains("path hits"));
+        assert!(body.contains("Multi-hop chain failed:"));
+        assert!(body.contains("search_text"));
+    }
+
+    #[test]
     fn extract_served_step_bodies_finds_per_step_output() {
         let output = "Step 1: Route confidence: inferred\nChosen tool: search_symbols\nInvocation: {}\nRationale: x\nEconomics: serve (ok)\n\nresults\n\nStep 2: Route confidence: inferred\nChosen tool: get_symbol\nInvocation: {}\nRationale: y\nEconomics: serve (ok)\n\nbody";
         let steps = extract_served_step_bodies(output);

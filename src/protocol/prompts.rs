@@ -1,5 +1,5 @@
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{GetPromptResult, PromptMessage, PromptMessageRole};
+use rmcp::model::{GetPromptResult, PromptMessage, Role};
 use rmcp::{prompt, prompt_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -64,16 +64,16 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_code_review_instructions(&self.project_name, &params.0),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
         ];
 
         if let Some(path) = params.0.path.as_deref() {
             messages.push(PromptMessage::new_resource_link(
-                PromptMessageRole::User,
+                Role::User,
                 file_context_resource(path, Some(200)),
             ));
         }
@@ -92,17 +92,17 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_architecture_map_instructions(&self.project_name, params.0.area.as_deref()),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_outline_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_outline_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
         ];
 
         if let Some(area) = params.0.area.as_deref() {
             messages.push(PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!("Prioritize the area or subsystem named '{area}' if it exists."),
             ));
         }
@@ -122,17 +122,17 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_failure_triage_instructions(&self.project_name, &params.0),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_changes_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_changes_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
         ];
 
         if let Some(path) = params.0.path.as_deref() {
             messages.push(PromptMessage::new_resource_link(
-                PromptMessageRole::User,
+                Role::User,
                 file_context_resource(path, Some(200)),
             ));
         }
@@ -152,18 +152,18 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_onboard_instructions(&self.project_name, params.0.area.as_deref()),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_outline_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, tools_catalog_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_outline_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, tools_catalog_resource()),
         ];
 
         if let Some(area) = params.0.area.as_deref() {
             messages.push(PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!("Focus onboarding on the '{area}' area first."),
             ));
         }
@@ -182,16 +182,16 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_refactor_instructions(&self.project_name, &params.0),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_map_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
         ];
 
         if let Some(target) = params.0.target.as_deref() {
             messages.push(PromptMessage::new_resource_link(
-                PromptMessageRole::User,
+                Role::User,
                 file_context_resource(target, Some(200)),
             ));
         }
@@ -210,16 +210,16 @@ impl SymForgeServer {
     ) -> GetPromptResult {
         let mut messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 build_debug_instructions(&self.project_name, &params.0),
             ),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_health_resource()),
-            PromptMessage::new_resource_link(PromptMessageRole::User, repo_changes_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_changes_resource()),
         ];
 
         if let Some(path) = params.0.path.as_deref() {
             messages.push(PromptMessage::new_resource_link(
-                PromptMessageRole::User,
+                Role::User,
                 file_context_resource(path, Some(200)),
             ));
         }
@@ -255,7 +255,7 @@ impl SymForgeServer {
                 .unwrap_or(None);
 
         let body = build_admin_instructions(&self.project_name, dashboard_url.as_deref());
-        GetPromptResult::new(vec![PromptMessage::new_text(PromptMessageRole::User, body)])
+        GetPromptResult::new(vec![PromptMessage::new_text(Role::User, body)])
             .with_description(
                 "Open the SymForge operator dashboard (reuse the running server, or start it via `symforge admin`).",
             )
@@ -629,7 +629,7 @@ mod tests {
             .messages
             .iter()
             .find_map(|message| match &message.content {
-                rmcp::model::PromptMessageContent::Text { text } => Some(text.clone()),
+                rmcp::model::ContentBlock::Text(content) => Some(content.text.clone()),
                 _ => None,
             })
             .expect("admin prompt returns a text message");
@@ -674,7 +674,7 @@ mod tests {
         assert!(
             result.messages.iter().any(|message| matches!(
                 &message.content,
-                rmcp::model::PromptMessageContent::ResourceLink { link }
+                rmcp::model::ContentBlock::ResourceLink(link)
                     if link.uri == REPO_HEALTH_URI
             )),
             "symforge-review prompt should link repo health"
@@ -682,7 +682,7 @@ mod tests {
         assert!(
             result.messages.iter().any(|message| matches!(
                 &message.content,
-                rmcp::model::PromptMessageContent::ResourceLink { link }
+                rmcp::model::ContentBlock::ResourceLink(link)
                     if link.uri.contains("symforge://file/context")
             )),
             "symforge-review prompt should link file context"

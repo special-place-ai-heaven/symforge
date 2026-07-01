@@ -66,15 +66,6 @@ function baselineCommit() {
 }
 
 function corpusForRow(row) {
-  if (row.id === "cfg-if/multi_search_symbol") {
-    return path.join(REPO_ROOT, "tests/fixtures/stel_multi_hop/cfg-if-rust");
-  }
-  if (row.id === "records/multi_context_refs") {
-    return path.join(REPO_ROOT, "tests/fixtures/stel_multi_hop/records-python");
-  }
-  if (row.id === "is-plain/multi_files_content") {
-    return path.join(REPO_ROOT, "tests/fixtures/stel_multi_hop/is-plain-obj-ts");
-  }
   if (row.id.startsWith("cfg-if/")) {
     return path.join(REPO_ROOT, "tests/fixtures/phase0-corpus/cfg-if-rust");
   }
@@ -93,9 +84,7 @@ function corpusForRow(row) {
 function markerForRow(row) {
   if (row.id.startsWith("cfg-if/")) return "src/lib.rs";
   if (row.id.startsWith("records/")) return "records.py";
-  if (row.id.startsWith("is-plain/")) {
-    return row.id === "is-plain/multi_files_content" ? "test.js" : "index.js";
-  }
+  if (row.id.startsWith("is-plain/")) return "index.js";
   if (row.id.startsWith("compression/")) return "service.rs";
   return null;
 }
