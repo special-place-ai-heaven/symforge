@@ -3,6 +3,9 @@ pub mod config_extractors;
 #[cfg(test)]
 mod inline_tests;
 pub mod languages;
+// ponytail: Program 015 SP-0C spike module — same-file + use-import Rust resolver.
+#[cfg(feature = "cbm-spike")]
+pub mod resolver;
 pub mod xref;
 
 use std::collections::HashMap;

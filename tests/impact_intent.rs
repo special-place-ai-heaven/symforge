@@ -3,24 +3,29 @@
 // file keeps `--no-default-features --features embed --all-targets` compiling.
 #![cfg(feature = "server")]
 
-//! Acceptance coverage for the impact intent one-envelope behavior
-//! (feature 007, US5 / FR-012).
+//! Acceptance coverage for the impact intent's routing (feature 007, US5 /
+//! FR-012 — upgraded by Program 015 C-S1A-004).
 //!
-//! The `symforge` impact intent plans a single `find_dependents` step. This test
-//! pins that the response envelope chains BOTH the file dependents (from
-//! `find_dependents`) AND the git co-change partners (from the shared
-//! `git_temporal()` snapshot) into one body — reusing the existing
-//! `analyze_file_impact` co-change flow, not a second index or a forked
-//! formatter.
+//! The `symforge` impact intent with a path but no symbol used to plan a
+//! single `find_dependents` step, chaining git co-change partners into the
+//! same envelope via `analyze_file_impact`'s co-change flow. Per
+//! specs/015-cbm-capability-ports/planning/sprint-1-quick-wins-spec.md
+//! § STEL impact routing, this route now plans a single `detect_impact`
+//! (scope=files) step instead: git-aware blast radius, no co-change chaining
+//! (`detect_impact` has no `path` input to key the chain on).
 //!
-//! A fresh tempdir is not a git repo, so the temporal index is seeded directly
-//! onto the shared handle (mirroring `test_search_files_changed_with_surfaces_weak_candidates`).
+//! Unlike the old `find_dependents` route, `detect_impact` derives its
+//! changed-file set from git rather than from `request.path`, so these tests
+//! seed an actual uncommitted change rather than merely asking "what depends
+//! on this file".
 
 #[path = "support/stel_surface_env.rs"]
 mod stel_surface_env;
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -46,9 +51,28 @@ fn library_with_one_dependent() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Build a server over a tempdir fixture and seed a `Ready` git temporal index
-/// with a strong co-change partner for `widget.rs`.
-fn server_with_seeded_cochange() -> (TempDir, SymForgeServer) {
+fn git(args: &[&str], root: &Path) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Build a server over a real git repo, with `src/widget.rs` left as an
+/// uncommitted change so `detect_impact`'s default (no base_branch/since)
+/// working-tree scan picks it up. When `seed_cochange` is set, a `Ready` git
+/// temporal snapshot with a strong `widget.rs` co-change partner is seeded
+/// before the server is constructed (proving `detect_impact` never chains it
+/// in, unlike the old `find_dependents` route).
+fn server_over_repo_with_uncommitted_widget_change(
+    seed_cochange: bool,
+) -> (TempDir, SymForgeServer) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     for (rel, content) in library_with_one_dependent() {
@@ -58,38 +82,59 @@ fn server_with_seeded_cochange() -> (TempDir, SymForgeServer) {
         }
         fs::write(&path, content).expect("write fixture file");
     }
+    git(&["init"], &root);
+    git(&["config", "user.email", "test@test.com"], &root);
+    git(&["config", "user.name", "Test"], &root);
+    git(&["add", "."], &root);
+    git(&["commit", "-m", "initial"], &root);
+    // detect_impact's default base_branch is "main" (contracts/detect-impact.md
+    // § Input). Force the branch name so this test is deterministic regardless
+    // of the host's `init.defaultBranch` — HEAD == main means the three-dot diff
+    // is empty and the uncommitted edit below is what the blast radius reflects.
+    git(&["branch", "-M", "main"], &root);
+
+    // Uncommitted change: detect_impact's default (base_branch=main, HEAD on
+    // main) merges this via `uncommitted_paths()` — no explicit base/since.
+    fs::write(
+        root.join("src/widget.rs"),
+        "pub fn render() -> u32 {\n    2\n}\n",
+    )
+    .expect("modify widget.rs");
+
     let shared = LiveIndex::load(&root).expect("LiveIndex::load");
 
-    let history = GitFileHistory {
-        commit_count: 7,
-        churn_score: 0.9,
-        last_commit: CommitSummary {
-            hash: "abc1234".to_string(),
-            timestamp: "2026-06-01T12:00:00Z".to_string(),
-            author: "Tester".to_string(),
-            message_head: "touch widget".to_string(),
-            days_ago: 2.0,
-        },
-        contributors: vec![],
-        co_changes: vec![CoChangeEntry {
-            path: "src/consumer.rs".to_string(),
-            coupling_score: 0.71,
-            shared_commits: 5,
-        }],
-        weak_co_changes: vec![],
-    };
-    shared.update_git_temporal(GitTemporalIndex {
-        files: HashMap::from([("src/widget.rs".to_string(), history)]),
-        stats: GitTemporalStats {
-            total_commits_analyzed: 14,
-            analysis_window_days: 90,
-            hotspots: vec![],
-            most_coupled: vec![],
-            computed_at: SystemTime::now(),
-            compute_duration: Duration::ZERO,
-        },
-        state: GitTemporalState::Ready,
-    });
+    if seed_cochange {
+        let history = GitFileHistory {
+            commit_count: 7,
+            churn_score: 0.9,
+            last_commit: CommitSummary {
+                hash: "abc1234".to_string(),
+                timestamp: "2026-06-01T12:00:00Z".to_string(),
+                author: "Tester".to_string(),
+                message_head: "touch widget".to_string(),
+                days_ago: 2.0,
+            },
+            contributors: vec![],
+            co_changes: vec![CoChangeEntry {
+                path: "src/consumer.rs".to_string(),
+                coupling_score: 0.71,
+                shared_commits: 5,
+            }],
+            weak_co_changes: vec![],
+        };
+        shared.update_git_temporal(GitTemporalIndex {
+            files: HashMap::from([("src/widget.rs".to_string(), history)]),
+            stats: GitTemporalStats {
+                total_commits_analyzed: 14,
+                analysis_window_days: 90,
+                hotspots: vec![],
+                most_coupled: vec![],
+                computed_at: SystemTime::now(),
+                compute_duration: Duration::ZERO,
+            },
+            state: GitTemporalState::Ready,
+        });
+    }
 
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
     let server = SymForgeServer::new(
@@ -134,79 +179,57 @@ async fn run_impact_intent(server: &SymForgeServer, path: &str) -> String {
     tool_result_text(&serialized)
 }
 
+/// Program 015 C-S1A-004: the impact intent's path-only route now plans
+/// `detect_impact(scope=files)` instead of `find_dependents`. `detect_impact`
+/// ignores `request.path` (it has no such input — it derives its changed-file
+/// set from git), so the response reflects the repo's actual uncommitted
+/// change (`src/widget.rs`) and its blast radius, not a lookup of the
+/// queried path's importers.
 #[tokio::test]
-async fn impact_intent_returns_dependents_and_cochanges_in_one_envelope() {
+async fn impact_intent_routes_to_detect_impact_blast_radius() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
 
-    let (_dir, server) = server_with_seeded_cochange();
-
-    // Sanity: widget.rs has a real dependent under the parser.
-    let dependent_count = server
-        .index()
-        .read()
-        .capture_find_dependents_view("src/widget.rs")
-        .files
-        .len();
-    assert!(
-        dependent_count >= 1,
-        "fixture must yield at least one dependent of src/widget.rs (got {dependent_count})"
-    );
+    let (_dir, server) = server_over_repo_with_uncommitted_widget_change(false);
 
     let body = run_impact_intent(&server, "src/widget.rs").await;
 
-    // Dependents portion: the find_dependents step names the importing file.
     assert!(
-        body.contains("src/consumer.rs"),
-        "impact intent envelope must report the file dependent (src/consumer.rs):\n{body}"
-    );
-
-    // Co-change portion: chained into the SAME envelope from git_temporal.
-    assert!(
-        body.contains("Git temporal data for src/widget.rs"),
-        "impact intent envelope must chain the git co-change section:\n{body}"
+        body.contains("Chosen tool: detect_impact"),
+        "impact intent (path only) must route to detect_impact:\n{body}"
     );
     assert!(
-        body.contains("Co-changing files"),
-        "impact intent envelope must list co-changing files:\n{body}"
+        body.contains("\"src/widget.rs\""),
+        "detect_impact must report the actual uncommitted change:\n{body}"
+    );
+    // consumer.rs's `run()` calls `widget::render()`, so it's widget.rs's sole
+    // caller; scope=files aggregates the blast radius to file granularity.
+    assert!(
+        body.contains("\"symbol\": \"src/consumer.rs\""),
+        "blast radius must include widget.rs's caller file (src/consumer.rs):\n{body}"
     );
 }
 
-/// When temporal is not `Ready` (the default for a non-git tempdir), the impact
-/// intent still returns the dependents envelope plus a short, non-fatal note —
-/// it must not error or omit the dependents body.
+/// The old `find_dependents` + git co-change chain
+/// (`append_impact_intent_cochanges`) only fires when the executed step's
+/// args carry a `path` key — `detect_impact`'s args never do (scope=files
+/// only), so a `Ready` git-temporal snapshot must no longer leak co-change
+/// text into the impact intent's response.
 #[tokio::test]
-async fn impact_intent_dependents_only_when_temporal_not_ready() {
+async fn impact_intent_no_longer_chains_cochanges() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    for (rel, content) in library_with_one_dependent() {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("create parent dir");
-        }
-        fs::write(&path, content).expect("write fixture file");
-    }
-    let shared = LiveIndex::load(&root).expect("LiveIndex::load");
-    let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
-    let server = SymForgeServer::new(
-        shared,
-        "impact_intent_no_temporal".to_string(),
-        watcher_info,
-        Some(root),
-        None,
-    );
+    let (_dir, server) = server_over_repo_with_uncommitted_widget_change(true);
 
     let body = run_impact_intent(&server, "src/widget.rs").await;
 
     assert!(
-        body.contains("src/consumer.rs"),
-        "impact intent must still report dependents without git temporal data:\n{body}"
+        body.contains("Chosen tool: detect_impact"),
+        "impact intent (path only) must route to detect_impact:\n{body}"
     );
     assert!(
-        !body.contains("Co-changing files"),
-        "no co-changing files should be listed when temporal is not Ready:\n{body}"
+        !body.contains("Co-changing files") && !body.contains("Git temporal data for"),
+        "detect_impact does not chain co-change data, even when a Ready snapshot exists:\n{body}"
     );
 }

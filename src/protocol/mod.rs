@@ -1156,6 +1156,7 @@ impl SymForgeServer {
             "get_symbol_context" => call!(get_symbol_context, tools::GetSymbolContextInput),
             "find_references" => call!(find_references, tools::FindReferencesInput),
             "find_dependents" => call!(find_dependents, tools::FindDependentsInput),
+            "detect_impact" => call!(detect_impact, tools::DetectImpactInput),
             "explore" => call!(explore, tools::ExploreInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),
             "context_inventory" => self.context_inventory().await,

@@ -19,6 +19,8 @@ pub const SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH: &str = ".symforge/idempotency/r
 pub const SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH: &str = ".symforge/idempotency/quarantine";
 pub const SYMFORGE_INDEX_SNAPSHOT_QUARANTINE_DIR_PATH: &str =
     ".symforge/quarantine/index-snapshots";
+/// contracts/team-artifact.md § Integrity failure.
+pub const SYMFORGE_ARTIFACT_QUARANTINE_DIR_PATH: &str = ".symforge/quarantine/artifacts";
 
 /// OS isolation tag for per-process runtime files (sidecar/daemon port/pid/session).
 ///
@@ -131,6 +133,28 @@ pub fn ensure_index_snapshot_quarantine_dir(base: &Path) -> io::Result<PathBuf> 
             e.kind(),
             format!(
                 "ensuring index snapshot quarantine dir at {}: {}",
+                dir.display(),
+                e
+            ),
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Resolve the canonical team-artifact quarantine directory under `base`
+/// (contracts/team-artifact.md § Integrity failure).
+pub fn resolve_artifact_quarantine_dir(base: &Path) -> PathBuf {
+    base.join(SYMFORGE_ARTIFACT_QUARANTINE_DIR_PATH)
+}
+
+/// Ensure the canonical team-artifact quarantine directory exists under `base`.
+pub fn ensure_artifact_quarantine_dir(base: &Path) -> io::Result<PathBuf> {
+    let dir = resolve_artifact_quarantine_dir(base);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "ensuring team artifact quarantine dir at {}: {}",
                 dir.display(),
                 e
             ),
@@ -468,6 +492,21 @@ mod tests {
                 .join("quarantine")
                 .join("index-snapshots")
         );
+    }
+
+    #[test]
+    fn test_artifact_quarantine_path_stays_under_canonical_symforge_dir() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(
+            resolve_artifact_quarantine_dir(tmp.path()),
+            tmp.path()
+                .join(SYMFORGE_DIR_NAME)
+                .join("quarantine")
+                .join("artifacts")
+        );
+        let dir = ensure_artifact_quarantine_dir(tmp.path()).unwrap();
+        assert!(dir.is_dir(), "artifact quarantine dir should be created");
     }
 
     #[test]

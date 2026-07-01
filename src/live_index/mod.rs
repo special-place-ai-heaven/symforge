@@ -3,6 +3,9 @@ pub mod coupling;
 mod disambiguation;
 pub mod frecency;
 pub mod git_temporal;
+// Program 015 SP-0A spike -> C-S1A-002: name-based call graph + inbound BFS,
+// now a real `detect_impact` production dependency (no longer cbm-spike-gated).
+pub mod graph;
 mod health_view;
 pub mod persist;
 pub(crate) mod qualified_usages;

@@ -39,6 +39,12 @@ server = [
 # daemon/sidecar/protocol-server/CLI surface, so server-side breakage (unsafe
 # syscalls, axum, rmcp, process signaling) structurally cannot reach an embedder.
 embed = []
+# Program 015 Sprint-0 falsifier spike still pending promotion: the Rust
+# resolver only (`src/parsing/resolver/`, targeted at S3 — no consumer yet).
+# Graph BFS (C-S1A-002) and the zstd team-artifact round-trip (C-S1A-005) have
+# been promoted to real, always-on production code and no longer gate on this
+# feature. Run the resolver spike test with `--features cbm-spike`.
+cbm-spike = []
 
 [dependencies]
 aho-corasick = "1.1"
@@ -112,6 +118,9 @@ tempfile = "3"
 libc = "0.2.183"
 dunce = "1"
 socket2 = { version = "0.6", optional = true }
+# Team artifact compression (R-11/D-015-009): backs the always-on
+# `index.bin.zst` export/import (contracts/team-artifact.md, C-S1A-005).
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

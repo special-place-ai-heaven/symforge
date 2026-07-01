@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "file": "local_calls.rs",
+      "cases": [
+        { "name": "helper", "line": 6, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "helper" },
+        { "name": "triple", "line": 10, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "triple" },
+        { "name": "double", "line": 24, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "double" },
+        { "name": "new", "line": 29, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "Calc::new" },
+        { "name": "compute", "line": 30, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "compute" }
+      ]
+    },
+    {
+      "file": "imported_calls.rs",
+      "cases": [
+        { "name": "read_to_string", "line": 7, "category": "use_path", "expected_strategy": "import", "expected_callee": "std::fs::read_to_string" },
+        { "name": "unwrap", "line": 8, "category": "method", "expected_strategy": "unresolved", "expected_callee": null },
+        { "name": "new", "line": 12, "category": "use_path", "expected_strategy": "import", "expected_callee": "std::collections::HashMap::new" },
+        { "name": "new", "line": 16, "category": "use_path", "expected_strategy": "import", "expected_callee": "std::collections::BTreeMap::new" },
+        { "name": "max", "line": 20, "category": "use_path", "expected_strategy": "import", "expected_callee": "std::cmp::max" }
+      ]
+    },
+    {
+      "file": "mixed_calls.rs",
+      "cases": [
+        { "name": "new", "line": 10, "category": "use_path", "expected_strategy": "import", "expected_callee": "std::collections::HashSet::new" },
+        { "name": "len", "line": 15, "category": "method", "expected_strategy": "unresolved", "expected_callee": null },
+        { "name": "len", "line": 20, "category": "same_file", "expected_strategy": "same_file", "expected_callee": "len" },
+        { "name": "len", "line": 21, "category": "method", "expected_strategy": "unresolved", "expected_callee": null },
+        { "name": "sum", "line": 25, "category": "crate_path", "expected_strategy": "unresolved", "expected_callee": null },
+        { "name": "helper_total", "line": 26, "category": "negative", "expected_strategy": "unresolved", "expected_callee": null }
+      ]
+    }
+  ]
+}

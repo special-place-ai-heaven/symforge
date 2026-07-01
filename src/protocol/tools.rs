@@ -44,8 +44,8 @@ pub use super::read_tools::{
 };
 pub(crate) use super::read_tools::{
     ValidateFileSyntaxInput, encode_include_tests_marker, file_content_options_from_input,
-    include_tests_from_sections, lenient_bool, lenient_i64, lenient_u32, lenient_u64,
-    lenient_vec_required, normalize_file_content_aliases, visible_sections,
+    include_tests_from_sections, lenient_bool, lenient_bool_required, lenient_i64, lenient_u32,
+    lenient_u64, lenient_vec_required, normalize_file_content_aliases, visible_sections,
 };
 #[cfg(test)]
 pub(crate) use super::search_tools::normalize_search_text_glob;
@@ -411,6 +411,12 @@ pub struct CheckpointNowInput {
     /// When true, deserialize the snapshot after writing and fail the command if it cannot be read back.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub verify_after_write: Option<bool>,
+    /// When true, additionally export the Best-tier team artifact
+    /// (`.symforge/index.bin.zst` + `artifact.json`, plus a `.gitattributes`
+    /// `*.zst merge=ours` hint) alongside the plain snapshot. See
+    /// contracts/team-artifact.md § Tiers.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub export_artifact: Option<bool>,
 }
 
 /// Input for `health`.
@@ -473,6 +479,66 @@ pub struct WhatChangedInput {
     /// Optional maximum token budget for the response.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
+}
+
+/// Blast-radius granularity for `detect_impact`
+/// (contracts/detect-impact.md, frozen 2026-06-30).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImpactScope {
+    Files,
+    #[default]
+    Symbols,
+}
+
+/// `depth` defaults to 2 via this function — **not** `u8::default()` (0),
+/// since depth 0 yields an empty blast radius (a silent no-op impact query).
+/// contracts/detect-impact.md § Input.
+fn default_impact_depth() -> u8 {
+    2
+}
+
+fn default_include_untracked() -> bool {
+    true
+}
+
+/// Maximum depth accepted before `detect_impact` clamps + warns
+/// (contracts/detect-impact.md § Risk tiers / error catalog: "depth capped").
+const DETECT_IMPACT_MAX_DEPTH: u8 = 5;
+
+/// ponytail: fixed safety cap on `blast_radius` entries returned per call.
+/// The frozen contract's `pagination` envelope has no `offset`/`limit` input
+/// field to page past it — add one if a real need for deeper paging shows up.
+const DETECT_IMPACT_MAX_RETURNED: usize = 200;
+
+/// Input for `detect_impact` (contracts/detect-impact.md, frozen 2026-06-30).
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct DetectImpactInput {
+    /// Base branch/ref to diff against HEAD when `since` is not set. Defaults
+    /// to `main` when neither `base_branch` nor `since` is set
+    /// (contracts/detect-impact.md § Input); on a repo whose default branch is
+    /// not `main`, pass this (or `since`) explicitly — an absent `main` surfaces
+    /// an "Invalid git ref" error. Uncommitted working-tree changes are always
+    /// merged in per `include_untracked`.
+    pub base_branch: Option<String>,
+    /// Git ref to diff against HEAD; overrides `base_branch` when set. Pass
+    /// the literal value `WORKTREE` to diff tracked working-tree changes
+    /// (staged + unstaged) against HEAD instead of another ref.
+    pub since: Option<String>,
+    /// Blast-radius hop depth (default 2). Values above 5 are clamped to 5
+    /// with a warning footer.
+    #[serde(default = "default_impact_depth")]
+    pub depth: u8,
+    /// Blast-radius granularity: `files` or `symbols` (default `symbols`).
+    #[serde(default)]
+    pub scope: ImpactScope,
+    /// Merge uncommitted (staged + unstaged + untracked) changes into the
+    /// changed-file set (default true).
+    #[serde(
+        default = "default_include_untracked",
+        deserialize_with = "lenient_bool_required"
+    )]
+    pub include_untracked: bool,
 }
 
 /// Input for `analyze_file_impact`.
@@ -6238,7 +6304,7 @@ impl SymForgeServer {
     /// Serialize the current in-memory index to `.symforge/index.bin` immediately.
     #[tool(
         name = "checkpoint_now",
-        description = "Serialize the current in-memory index to `.symforge/index.bin` immediately. Uses the same atomic snapshot path as shutdown persistence and reports failures explicitly.",
+        description = "Serialize the current in-memory index to `.symforge/index.bin` immediately. Uses the same atomic snapshot path as shutdown persistence and reports failures explicitly. When export_artifact=true, additionally exports the Best-tier team artifact (`.symforge/index.bin.zst` + `artifact.json`, plus a `.gitattributes` merge=ours hint) for sharing a bootstrap cache across a team — see contracts/team-artifact.md.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -6264,6 +6330,7 @@ impl SymForgeServer {
         let index = Arc::clone(&self.index);
         let checkpoint_root = repo_root.clone();
         let verify_after_write = params.0.verify_after_write.unwrap_or(false);
+        let export_artifact = params.0.export_artifact.unwrap_or(false);
         match tokio::task::spawn_blocking(move || {
             let report =
                 crate::live_index::persist::checkpoint_shared_index(&index, &checkpoint_root)?;
@@ -6274,11 +6341,20 @@ impl SymForgeServer {
                     "checkpoint verification failed: snapshot did not deserialize after write"
                 );
             }
-            anyhow::Ok(report)
+            let artifact_report = if export_artifact {
+                let guard = index.read();
+                Some(crate::live_index::persist::export_artifact(
+                    &guard,
+                    &checkpoint_root,
+                )?)
+            } else {
+                None
+            };
+            anyhow::Ok((report, artifact_report))
         })
         .await
         {
-            Ok(Ok(report)) => {
+            Ok(Ok((report, artifact_report))) => {
                 let mut message = format!(
                     "Checkpoint complete: wrote {} bytes for {} file(s) to {}",
                     report.bytes,
@@ -6298,6 +6374,15 @@ impl SymForgeServer {
                          index, which may lag the daemon's live index. Re-run checkpoint_now once \
                          the daemon is reachable to persist its authoritative state.",
                     );
+                }
+                if let Some(artifact) = artifact_report {
+                    message.push_str(&format!(
+                        "\nArtifact exported: {} ({} bytes compressed from {} for {} file(s))",
+                        artifact.path.display(),
+                        artifact.compressed_bytes,
+                        artifact.raw_bytes,
+                        artifact.files
+                    ));
                 }
                 message
             }
@@ -6789,6 +6874,163 @@ impl SymForgeServer {
                 }
             }
         }
+    }
+
+    /// Git-aware change impact: merge `base_branch`/`since` ref diffs with
+    /// uncommitted working-tree changes into a changed-file set, then walk the
+    /// call graph up to `depth` hops to compute a blast radius with per-node
+    /// risk tiers. See contracts/detect-impact.md (frozen 2026-06-30).
+    #[tool(
+        description = "Git-aware change impact analysis. Merges base_branch/since ref diffs with uncommitted working-tree changes (include_untracked, default true) into a changed-file set, then walks the call graph up to depth hops (default 2, max 5 — clamped with a warning above) to compute a blast radius: symbols that transitively call what changed, tiered by hop distance (1=high, 2=medium, 3+=low; an entry point like fn main at hop 1 is critical). scope=symbols (default) returns per-symbol blast entries; scope=files aggregates to file granularity. Response embeds a JSON payload (changed_files, changed_symbols, blast_radius, risk_summary, pagination) after a `--- impact payload ---` marker. Requires a git repository. Does NOT re-index files or bump frecency (use analyze_file_impact for that).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn detect_impact(&self, params: Parameters<DetectImpactInput>) -> String {
+        if let Some(result) = self.proxy_tool_call("detect_impact", &params.0).await {
+            return result;
+        }
+
+        {
+            let guard = self.index.read();
+            loading_guard!(guard);
+        }
+
+        let Some(repo_root) = self.effective_repo_root_for_git_tools() else {
+            return "Error: Git unavailable: not inside a git repository. detect_impact requires \
+                    git for change detection; use find_dependents or what_changed(since=...) for \
+                    non-git impact/change queries."
+                .to_string();
+        };
+        let repo = match crate::git::GitRepo::open(&repo_root) {
+            Ok(r) => r,
+            Err(e) => return format!("Error: Git unavailable: {e}"),
+        };
+
+        let requested_depth = params.0.depth;
+        let effective_depth = requested_depth.min(DETECT_IMPACT_MAX_DEPTH);
+
+        // contracts/detect-impact.md § Input: `base_branch` defaults to `main`
+        // when the caller supplies neither `base_branch` nor `since`. Without
+        // this, the STEL-upgraded path (`route_impact` plans only
+        // `{"scope":"files"}`) would silently fall through to uncommitted-only
+        // and return an empty blast radius on a clean tree with committed-but-
+        // unmerged work — the silent no-op the depth-default already guards
+        // against. A repo with no `main` branch degrades to the "Invalid git
+        // ref" error below (git2 ref resolution fails), never a panic; pass an
+        // explicit `base_branch`/`since` for non-`main` default branches.
+        let base_branch: Option<&str> =
+            if params.0.base_branch.is_none() && params.0.since.is_none() {
+                Some("main")
+            } else {
+                params.0.base_branch.as_deref()
+            };
+
+        let changed_files = match repo.merge_git_changed_paths(
+            base_branch,
+            params.0.since.as_deref(),
+            params.0.include_untracked,
+        ) {
+            Ok(paths) => paths,
+            Err(e) => return format!("Error: Invalid git ref: {e}"),
+        };
+
+        let (changed_symbols, blast_radius) = {
+            let guard = self.index.read();
+            let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
+            for path in &changed_files {
+                if let Some(file) = guard.files.get(path) {
+                    for sym in &file.symbols {
+                        changed_symbols.push(crate::live_index::graph::SymbolId {
+                            path: path.clone(),
+                            name: sym.name.clone(),
+                            kind: sym.kind,
+                        });
+                    }
+                }
+            }
+            let graph = crate::live_index::graph::GraphProjection::from_index(&guard);
+            let blast_radius = crate::live_index::graph::compute_impact(
+                &graph,
+                &changed_symbols,
+                effective_depth as u32,
+            );
+            (changed_symbols, blast_radius)
+        };
+
+        // scope=files aggregates per-symbol blast nodes to file granularity
+        // (nearest hop / matching risk wins per file); scope=symbols (default)
+        // keeps one entry per symbol.
+        let mut blast_entries: Vec<(String, u32, crate::live_index::graph::RiskTier)> =
+            match params.0.scope {
+                ImpactScope::Symbols => blast_radius
+                    .iter()
+                    .map(|node| (node.symbol.name.clone(), node.hop, node.risk))
+                    .collect(),
+                ImpactScope::Files => {
+                    let mut by_file: HashMap<String, (u32, crate::live_index::graph::RiskTier)> =
+                        HashMap::new();
+                    for node in &blast_radius {
+                        by_file
+                            .entry(node.symbol.path.clone())
+                            .and_modify(|(hop, risk)| {
+                                if node.hop < *hop {
+                                    *hop = node.hop;
+                                    *risk = node.risk;
+                                }
+                            })
+                            .or_insert((node.hop, node.risk));
+                    }
+                    by_file
+                        .into_iter()
+                        .map(|(path, (hop, risk))| (path, hop, risk))
+                        .collect()
+                }
+            };
+        blast_entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let total = blast_entries.len();
+        let returned_entries = &blast_entries[..total.min(DETECT_IMPACT_MAX_RETURNED)];
+        let returned = returned_entries.len();
+
+        let mut risk_counts: HashMap<&'static str, u32> = HashMap::new();
+        for (_, _, risk) in &blast_entries {
+            *risk_counts.entry(risk.as_str()).or_insert(0) += 1;
+        }
+
+        let changed_symbols_json: Vec<serde_json::Value> = changed_symbols
+            .iter()
+            .map(
+                |s| serde_json::json!({"name": s.name, "path": s.path, "kind": s.kind.to_string()}),
+            )
+            .collect();
+        let blast_radius_json: Vec<serde_json::Value> = returned_entries
+            .iter()
+            .map(|(symbol, hop, risk)| serde_json::json!({"symbol": symbol, "hop": hop, "risk": risk.as_str()}))
+            .collect();
+
+        let payload = serde_json::json!({
+            "changed_files": changed_files,
+            "changed_symbols": changed_symbols_json,
+            "blast_radius": blast_radius_json,
+            "risk_summary": {
+                "critical": risk_counts.get("critical").copied().unwrap_or(0),
+                "high": risk_counts.get("high").copied().unwrap_or(0),
+                "medium": risk_counts.get("medium").copied().unwrap_or(0),
+                "low": risk_counts.get("low").copied().unwrap_or(0),
+            },
+            "pagination": {
+                "total": total,
+                "returned": returned,
+                "offset": 0,
+                "has_more": total > returned,
+            },
+        });
+
+        let result = format::detect_impact_result(&payload, requested_depth, effective_depth);
+        self.session_context.record_summary_output(
+            "detect_impact",
+            (result.len() / 4).min(u32::MAX as usize) as u32,
+        );
+        result
     }
 
     /// Read raw file content. Modes: full file, line range, around_line/around_match/around_symbol,
@@ -11497,6 +11739,7 @@ mod tests {
         let output = server
             .checkpoint_now(Parameters(super::CheckpointNowInput {
                 verify_after_write: Some(true),
+                export_artifact: None,
             }))
             .await;
 
@@ -16060,6 +16303,7 @@ mod tests {
         let result = server
             .checkpoint_now(Parameters(super::CheckpointNowInput {
                 verify_after_write: Some(true),
+                export_artifact: None,
             }))
             .await;
 
@@ -16080,6 +16324,50 @@ mod tests {
         assert!(
             crate::live_index::persist::load_snapshot(temp.path()).is_some(),
             "checkpoint_now should write a readable snapshot"
+        );
+    }
+
+    /// C-S1A-006: `export_artifact=true` additionally writes the Best-tier
+    /// team artifact (contracts/team-artifact.md § Tiers, A-US2-01/04).
+    #[tokio::test]
+    async fn test_checkpoint_now_export_artifact_writes_team_artifact() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        fs::create_dir_all(temp.path().join("src")).expect("create fixture source dir");
+        fs::write(temp.path().join("src/lib.rs"), b"fn foo() {}\n").expect("write fixture source");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+
+        let result = server
+            .checkpoint_now(Parameters(super::CheckpointNowInput {
+                verify_after_write: None,
+                export_artifact: Some(true),
+            }))
+            .await;
+
+        assert!(
+            result.contains("Checkpoint complete"),
+            "checkpoint should report success: {result}"
+        );
+        assert!(
+            result.contains("Artifact exported"),
+            "export_artifact=true should report the artifact export: {result}"
+        );
+        assert!(
+            temp.path()
+                .join(".symforge")
+                .join(crate::live_index::persist::ARTIFACT_FILENAME)
+                .exists(),
+            "checkpoint_now(export_artifact=true) should create .symforge/index.bin.zst"
+        );
+        assert!(
+            temp.path()
+                .join(".symforge")
+                .join(crate::live_index::persist::ARTIFACT_METADATA_FILENAME)
+                .exists(),
+            "checkpoint_now(export_artifact=true) should create .symforge/artifact.json"
         );
     }
 
