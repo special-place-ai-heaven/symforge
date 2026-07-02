@@ -18,8 +18,8 @@
 |-------|-----:|------:|----------------------------|
 | PROG | 9 | 9 | — (done) |
 | S0 | 18 | 18 | **GO 2026-06-30** (research.md § Spike Results) — done |
-| S1a | 25 | 25 | **● complete 2026-06-30** — detect_impact + team artifact coded, adversarially verified, gate-checked; awaiting 8.10.0 release |
-| S1b | 0 | 14 | S1a **ship** (8.10.0 released, not just coded) + `P-S1B-007` gate |
+| S1a | 25 | 25 | **● shipped 2026-07-01** — detect_impact + team artifact coded, adversarially verified, gate-checked, merged (PR #395), released as **v8.10.0** (tag + 4-platform binaries + npm + crates.io, all green) |
+| S1b | 0 | 14 | S1a **ship** — **satisfied 2026-07-01** (8.10.0 released) — `P-S1B-007` gate still required before `[C]` |
 | S2 | 0 | 21 | S1a graph shipped + `P-S2-010` gate |
 | S3 | 0 | 21 | S2 graph stable + `P-S3-011` gate |
 | S4 | 0 | 13 | S2 (+S3 rec) + `P-S4-008` gate |
@@ -34,9 +34,11 @@
 2. ~~**Finish S1a `[P]`**~~ — **DONE 2026-06-30**: contracts frozen, risk review recorded, **S1a Planning Gate signed**.
 3. ~~**S1a `[C]`+`[V]`**~~ — **DONE 2026-06-30**: detect_impact + team artifact implemented (2 sequential agents) + adversarially verified (3 parallel reviewers found and got 3 real defects fixed: base_branch default, daemon-bootstrap artifact consumption, missing-sidecar integrity bypass). Gate: fmt/check/clippy/embed green; extensive test coverage green (full lib suite + dozens of integration binaries + every changed test file, zero failures); `cargo build --release` could not complete in this sandbox (wall-time ceiling, not a code failure) — CI is authoritative. Full writeup: research.md § S1a Implementation Results.
 
-**▶ New frontier**: commit + PR → CI → merge → release-please cuts **8.10.0**. Only once that release actually ships does S1b unblock (`P-S1B-007` gate + `S1a ship`). Meanwhile S1b `[P]` (read-only planning) may start now in parallel — it does not need S1a shipped, only the [C] wave does.
+4. ~~**8.10.0 release**~~ — **SHIPPED 2026-07-01**: PR #395 merged (branch was 83 commits behind `main`, including the rmcp 1.7→2.0 migration — resolved via a real merge commit, one textual conflict, full rmcp-2.0 API-shape audit clean, full `--all-targets` suite green 3267/0/7-ign); release-please cut `v8.10.0`; all 4 platform binaries built, GitHub release published, npm + crates.io published. Verified live via `gh` (tag, release assets, job-by-job green), not just workflow "success".
 
-> Discipline (parallelism.md "Never parallel"): no `[C]` before its sprint gate; don't start S2 `[C]` until S1a graph ships; one agent per `protocol/tools.rs` per wave.
+**▶ New frontier**: S1a has shipped — **S1b `[C]` is unblocked**. Still need `P-S1B-007` (S1b Planning Gate sign-off) before starting `[C]`; S1b `[P]` tasks (P-S1B-001..006) can be completed now if not already done.
+
+> Discipline (parallelism.md "Never parallel"): no `[C]` before its sprint gate; don't start S2 `[C]` until S1a graph ships (now true — S2 gate `P-S2-010` is the remaining blocker for S2); one agent per `protocol/tools.rs` per wave.
 
 ---
 
