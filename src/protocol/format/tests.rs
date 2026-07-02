@@ -2125,6 +2125,30 @@ fn test_what_changed_paths_result_sorts_and_deduplicates() {
 }
 
 #[test]
+fn test_what_changed_paths_result_caps_large_listing() {
+    // Fix 3: a large changed-path listing (100 KB on a real repo) must be bounded
+    // with the house truncation marker + an omitted count, not dumped whole.
+    let paths: Vec<String> = (0..250).map(|i| format!("src/f{i:04}.rs")).collect();
+    let result = what_changed_paths_result(&paths, "No git changes detected.");
+
+    let lines: Vec<&str> = result.lines().collect();
+    // 200 path lines + 1 truncation notice line.
+    assert_eq!(
+        lines.len(),
+        201,
+        "must cap to 200 paths + one notice: {result}"
+    );
+    assert!(
+        lines.last().unwrap().contains("[truncated]"),
+        "must disclose truncation with the house marker: {result}"
+    );
+    assert!(
+        result.contains("200 of 250 paths shown; 50 more omitted"),
+        "must disclose the omitted count: {result}"
+    );
+}
+
+#[test]
 fn test_search_files_resolve_result_view_returns_exact_path() {
     let view = SearchFilesResolveView::Resolved {
         path: "src/protocol/tools.rs".to_string(),

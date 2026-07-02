@@ -142,9 +142,12 @@ async fn detect_impact_fixture_blast_matches_expected() {
     assert_eq!(payload["risk_summary"]["medium"], json!(0));
     assert_eq!(payload["risk_summary"]["low"], json!(0));
 
-    assert_eq!(payload["pagination"]["total"], json!(1));
-    assert_eq!(payload["pagination"]["returned"], json!(1));
-    assert_eq!(payload["pagination"]["has_more"], json!(false));
+    assert_eq!(payload["pagination"]["blast_radius"]["total"], json!(1));
+    assert_eq!(payload["pagination"]["blast_radius"]["returned"], json!(1));
+    assert_eq!(
+        payload["pagination"]["blast_radius"]["truncated"],
+        json!(false)
+    );
 }
 
 /// Contract default (contracts/detect-impact.md § Input): omitting both
@@ -200,6 +203,16 @@ async fn detect_impact_defaults_base_branch_to_main_when_unset() {
         "omitting base_branch/since must diff against the default `main` branch \
          (a real blast radius), not return an empty uncommitted-only result:\n{body}"
     );
+    // Fix 6: with only a local `main` (no origin/main), the default resolves to
+    // local `main` and discloses it; no staleness note is emitted.
+    assert!(
+        body.contains("base: main"),
+        "default resolution must disclose the resolved base ref:\n{body}"
+    );
+    assert!(
+        !body.contains("differs from origin/main"),
+        "no origin/main → no staleness note:\n{body}"
+    );
 }
 
 #[tokio::test]
@@ -215,6 +228,180 @@ async fn detect_impact_non_git_repo_clear_error() {
     assert!(
         body.contains("Git unavailable"),
         "expected a clear git-unavailable error, got:\n{body}"
+    );
+}
+
+/// Fix 6: when local `main` lags `origin/main`, the DEFAULT resolution (no
+/// base_branch/since) must diff against `origin/main` — the true delta — not the
+/// stale local ref, and disclose the resolved ref + staleness.
+#[tokio::test]
+async fn detect_impact_default_prefers_origin_main_over_stale_local() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let fixture_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cbm_impact");
+    for rel in FIXTURE_FILES {
+        let to = root.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir for {rel}: {e}"));
+        }
+        fs::copy(fixture_src.join(rel), &to).unwrap_or_else(|e| panic!("copy {rel}: {e}"));
+    }
+
+    git(&["init"], root);
+    git(&["config", "user.email", "test@test.com"], root);
+    git(&["config", "user.name", "Test"], root);
+    git(&["add", "."], root);
+    git(&["commit", "-m", "C0 initial"], root);
+    git(&["branch", "-M", "main"], root);
+
+    // C1 changes src/b.rs — this is the "origin/main" state.
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn call_b() -> u32 {\n    2\n}\n// C1: on origin/main only.\n",
+    )
+    .expect("rewrite src/b.rs");
+    git(&["commit", "-am", "C1 change b"], root);
+    // Record C1 as origin/main, THEN rewind local main to C0 (stale by 1 commit).
+    git(&["update-ref", "refs/remotes/origin/main", "main"], root);
+    git(&["checkout", "-b", "feature"], root);
+    git(&["branch", "-f", "main", "HEAD~1"], root);
+
+    // C2 changes src/a.rs on feature — the true delta vs origin/main (C1).
+    fs::write(
+        root.join("src/a.rs"),
+        "use cbm_impact_fixture::core;\n\n\
+         // C2: on feature only.\n\
+         pub fn call_a() -> u32 {\n    core()\n}\n",
+    )
+    .expect("rewrite src/a.rs");
+    git(&["commit", "-am", "C2 change a on feature"], root);
+
+    let server = server_over(root);
+    let body = server
+        .dispatch_tool_for_tests("detect_impact", json!({}))
+        .await;
+    let payload = impact_payload(&body);
+
+    // origin/main(C1)...HEAD(C2) = src/a.rs only. If it had used the stale local
+    // main(C0) the diff would also include src/b.rs (C1) — the confidently-wrong
+    // result this fix prevents.
+    assert_eq!(
+        payload["changed_files"],
+        json!(["src/a.rs"]),
+        "default must diff against origin/main (true delta), not stale local main:\n{body}"
+    );
+    assert!(
+        body.contains("base: origin/main"),
+        "must disclose the resolved base ref:\n{body}"
+    );
+    assert!(
+        body.contains("local main is behind origin/main"),
+        "must disclose direction-aware staleness (local behind) vs origin/main:\n{body}"
+    );
+}
+
+/// Fix 1: a changed-set exceeding the per-list caps must bound every list at 200,
+/// disclose the full totals + truncation in `pagination`, and keep `risk_summary`
+/// counting the FULL blast set (not the truncated 200).
+#[tokio::test]
+async fn detect_impact_caps_large_changed_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).expect("mkdir src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"caps_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+
+    // changed.rs: core() + 210 standalone pads => 211 changed symbols (> cap).
+    let mut changed = String::from("pub fn core() -> u32 {\n    0\n}\n");
+    for i in 0..210 {
+        changed.push_str(&format!("pub fn pad_{i}() -> u32 {{\n    {i}\n}}\n"));
+    }
+    fs::write(root.join("src/changed.rs"), &changed).expect("write changed.rs");
+
+    // callers.rs: 210 functions each calling core() => 210 blast nodes (> cap),
+    // all hop 1 / risk High. Lives in an UNCHANGED file so the callers are not
+    // themselves hop-0 changed symbols (which compute_impact excludes).
+    let mut callers = String::new();
+    for i in 0..210 {
+        callers.push_str(&format!("pub fn caller_{i}() -> u32 {{\n    core()\n}}\n"));
+    }
+    fs::write(root.join("src/callers.rs"), &callers).expect("write callers.rs");
+
+    git(&["init"], root);
+    git(&["config", "user.email", "test@test.com"], root);
+    git(&["config", "user.name", "Test"], root);
+    git(&["add", "."], root);
+    git(&["commit", "-m", "initial"], root);
+
+    // Second commit touches ONLY changed.rs, so the changed-file set is one file
+    // but its 211 symbols all enter changed_symbols.
+    changed.push_str("// widened comment, same symbols.\n");
+    fs::write(root.join("src/changed.rs"), &changed).expect("rewrite changed.rs");
+    git(&["commit", "-am", "touch changed"], root);
+
+    let server = server_over(root);
+    let body = server
+        .dispatch_tool_for_tests("detect_impact", json!({ "since": "HEAD~1" }))
+        .await;
+    let payload = impact_payload(&body);
+
+    // changed_files: exactly one, not truncated.
+    assert_eq!(payload["changed_files"], json!(["src/changed.rs"]));
+    assert_eq!(payload["pagination"]["changed_files"]["total"], json!(1));
+    assert_eq!(
+        payload["pagination"]["changed_files"]["truncated"],
+        json!(false)
+    );
+
+    // changed_symbols: capped at 200, full total disclosed.
+    assert_eq!(
+        payload["changed_symbols"].as_array().expect("array").len(),
+        200,
+        "changed_symbols array must be capped at 200:\n{body}"
+    );
+    assert_eq!(
+        payload["pagination"]["changed_symbols"]["total"],
+        json!(211)
+    );
+    assert_eq!(
+        payload["pagination"]["changed_symbols"]["returned"],
+        json!(200)
+    );
+    assert_eq!(
+        payload["pagination"]["changed_symbols"]["truncated"],
+        json!(true)
+    );
+
+    // blast_radius: capped at 200, full total disclosed.
+    assert_eq!(
+        payload["blast_radius"].as_array().expect("array").len(),
+        200,
+        "blast_radius array must be capped at 200:\n{body}"
+    );
+    assert_eq!(payload["pagination"]["blast_radius"]["total"], json!(210));
+    assert_eq!(
+        payload["pagination"]["blast_radius"]["returned"],
+        json!(200)
+    );
+    assert_eq!(
+        payload["pagination"]["blast_radius"]["truncated"],
+        json!(true)
+    );
+
+    // risk_summary counts the FULL blast set (210 high), NOT the truncated 200.
+    assert_eq!(
+        payload["risk_summary"]["high"],
+        json!(210),
+        "risk_summary must reflect the full blast set, not the capped list:\n{body}"
+    );
+
+    // Human summary discloses truncation with the house marker.
+    assert!(
+        body.contains("[truncated]"),
+        "summary must disclose truncation:\n{body}"
     );
 }
 

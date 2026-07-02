@@ -86,15 +86,33 @@ fn row_by_id<'a>(rows: &'a [GoldenRouteRow], id: &str) -> &'a GoldenRouteRow {
 }
 
 #[tokio::test]
-async fn status_rejects_non_compact_surface() {
+async fn status_runs_on_full_surface_and_reports_it() {
+    // Wave 1 Fix 4: `status` is a read-only health/trust readout the docs tell
+    // every client to call at session start, so it must NOT refuse on the full
+    // surface (the pre-fix behavior). It self-describes the ACTIVE surface
+    // instead of erroring or lying about being compact.
+    if !corpora_available() {
+        eprintln!("skip status_runs_on_full_surface_and_reports_it: missing corpora");
+        return;
+    }
+
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("full");
 
-    let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-non-compact");
+    let server = server_for_corpus(stel::S4_REPLAY_CORPUS, "status-full-surface");
     let output = dispatch_status(&server, None).await;
+
     assert!(
-        output.contains("requires SYMFORGE_SURFACE=compact"),
-        "unexpected status output:\n{output}"
+        !output.contains("requires SYMFORGE_SURFACE=compact"),
+        "status must not refuse on the full surface:\n{output}"
+    );
+    assert!(
+        output.contains("── stel status ──"),
+        "status must render its report on the full surface:\n{output}"
+    );
+    assert!(
+        output.contains("surface: full"),
+        "status must self-describe the active (full) surface:\n{output}"
     );
 }
 

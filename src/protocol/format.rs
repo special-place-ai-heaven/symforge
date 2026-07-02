@@ -2348,22 +2348,39 @@ pub fn detect_impact_result(
     payload: &serde_json::Value,
     requested_depth: u8,
     effective_depth: u8,
+    base_ref: Option<&str>,
+    staleness_note: Option<&str>,
 ) -> String {
-    let changed_files = payload["changed_files"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let changed_symbols = payload["changed_symbols"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+    // Counts come from the per-list `pagination` totals, NOT the (capped) arrays,
+    // so the summary reports the FULL change/blast size even when the lists are
+    // truncated (Wave 1 Fix 1).
+    let pagination = &payload["pagination"];
+    let changed_files = pagination["changed_files"]["total"].as_u64().unwrap_or(0);
+    let changed_symbols = pagination["changed_symbols"]["total"].as_u64().unwrap_or(0);
+    let total_blast = pagination["blast_radius"]["total"].as_u64().unwrap_or(0);
     let risk = &payload["risk_summary"];
-    let total_blast = payload["pagination"]["total"].as_u64().unwrap_or(0);
-    let summary = format!(
+    let mut summary = format!(
         "Impact analysis: {changed_files} changed file(s), {changed_symbols} changed symbol(s), \
          {total_blast} blast-radius node(s) ({} critical / {} high / {} medium / {} low)",
         risk["critical"], risk["high"], risk["medium"], risk["low"],
     );
+    // Self-describing base ref + staleness disclosure (Wave 1 Fix 6).
+    if let Some(base) = base_ref {
+        summary.push_str(&format!("\nbase: {base}"));
+    }
+    if let Some(note) = staleness_note {
+        summary.push_str(&format!("\nnote: {note}"));
+    }
+    // Truncation disclosure in the human summary (machine-readable totals live in
+    // `pagination`), using the house truncation marker (Wave 1 Fix 1).
+    let any_truncated = ["changed_files", "changed_symbols", "blast_radius"]
+        .iter()
+        .any(|list| pagination[*list]["truncated"].as_bool().unwrap_or(false));
+    if any_truncated {
+        summary.push_str(&format!(
+            "\n{CANONICAL_TRUNCATION_MARKER} one or more lists capped; see `pagination` for full totals and returned counts."
+        ));
+    }
     let json = serde_json::to_string_pretty(payload).expect("detect_impact payload serializes");
     let mut out = format!("{summary}\n\n--- impact payload ---\n{json}");
     if requested_depth > effective_depth {
@@ -2374,6 +2391,11 @@ pub fn detect_impact_result(
     out
 }
 
+/// Fix 3 (Wave 1): cap the changed/uncommitted-path listing. On a large repo the
+/// working-tree listing reached ~100 KB of raw paths; bound it and disclose the
+/// omitted count with the house truncation marker.
+const WHAT_CHANGED_MAX_PATHS: usize = 200;
+
 pub fn what_changed_paths_result(paths: &[String], empty_message: &str) -> String {
     let mut normalized_paths: Vec<String> =
         paths.iter().map(|path| path.replace('\\', "/")).collect();
@@ -2382,6 +2404,17 @@ pub fn what_changed_paths_result(paths: &[String], empty_message: &str) -> Strin
 
     if normalized_paths.is_empty() {
         return empty_message.to_string();
+    }
+
+    let total = normalized_paths.len();
+    if total > WHAT_CHANGED_MAX_PATHS {
+        let omitted = total - WHAT_CHANGED_MAX_PATHS;
+        normalized_paths.truncate(WHAT_CHANGED_MAX_PATHS);
+        let mut out = normalized_paths.join("\n");
+        out.push_str(&format!(
+            "\n{CANONICAL_TRUNCATION_MARKER} {WHAT_CHANGED_MAX_PATHS} of {total} paths shown; {omitted} more omitted."
+        ));
+        return out;
     }
 
     normalized_paths.join("\n")

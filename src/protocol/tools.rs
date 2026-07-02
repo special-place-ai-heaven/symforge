@@ -506,9 +506,11 @@ fn default_include_untracked() -> bool {
 /// (contracts/detect-impact.md § Risk tiers / error catalog: "depth capped").
 const DETECT_IMPACT_MAX_DEPTH: u8 = 5;
 
-/// ponytail: fixed safety cap on `blast_radius` entries returned per call.
-/// The frozen contract's `pagination` envelope has no `offset`/`limit` input
-/// field to page past it — add one if a real need for deeper paging shows up.
+/// ponytail: fixed safety cap on EACH list (`changed_files`, `changed_symbols`,
+/// `blast_radius`) returned per call — the bound that stops the 54 MB / 291K-symbol
+/// dump seen on a large repo. The frozen contract's `pagination` envelope has no
+/// `offset`/`limit` input field to page past it — add one if a real need for
+/// deeper paging shows up. `risk_summary` is always counted over the full set.
 const DETECT_IMPACT_MAX_RETURNED: usize = 200;
 
 /// Input for `detect_impact` (contracts/detect-impact.md, frozen 2026-06-30).
@@ -3506,8 +3508,139 @@ fn loading_guard_message_from_published(
     }
 }
 
+/// Outcome of a name-only `get_symbol` lookup (Wave 1 Fix 2).
+enum SymbolNameLookup {
+    /// Exactly one exact-name match — its path is used as if the caller passed it.
+    Unique { path: String },
+    /// More than one exact-name match — a ready-to-return disambiguation listing.
+    Ambiguous(String),
+    /// No exact-name match — a ready-to-return loud not-found (D18 style).
+    NotFound(String),
+}
+
+/// Render the disambiguation listing for a name-only `get_symbol` hit that
+/// matched multiple symbols. Shows path + start line + kind per candidate,
+/// capped at 20 with a count disclosure, and names how to disambiguate.
+fn render_symbol_name_ambiguity(
+    name: &str,
+    hits: &[crate::live_index::search::SymbolSearchHit],
+    overflowed: bool,
+) -> String {
+    const MAX_CANDIDATES: usize = 20;
+    // Under the 500-hit search cap the exact count can under-report; when the
+    // search overflowed, disclose the total as a lower bound (Wave 1 Fix 4).
+    let total = if overflowed {
+        format!("more than {}", hits.len())
+    } else {
+        hits.len().to_string()
+    };
+    let mut output = format!(
+        "Ambiguous symbol selector: {total} symbols named \"{name}\" found across the index.\n\
+         Pass `path` (and `symbol_line` if a file has several) to disambiguate.\n\
+         Candidates:",
+    );
+    for hit in hits.iter().take(MAX_CANDIDATES) {
+        output.push_str(&format!(
+            "\n- {} (line {}, {})",
+            hit.path, hit.line, hit.kind
+        ));
+    }
+    if hits.len() > MAX_CANDIDATES {
+        output.push_str(&format!(
+            "\n... and {} more (use search_symbols to list them all)",
+            hits.len() - MAX_CANDIDATES
+        ));
+    }
+    output
+}
+
 #[tool_router(router = core_tool_router, vis = "pub(crate)")]
 impl SymForgeServer {
+    /// Resolve a bare symbol `name` (no path) to a file path by an EXACT
+    /// name search across the index, honoring the `kind` filter and the
+    /// `symbol_line` disambiguator (Wave 1 Fix 2). Reuses the same search
+    /// machinery `search_symbols` uses so name resolution is consistent with it.
+    fn resolve_symbol_path_by_name(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        symbol_line: Option<u32>,
+    ) -> SymbolNameLookup {
+        use crate::live_index::search::{
+            ResultLimit, SymbolMatchTier, SymbolSearchOptions, search_symbols_with_options,
+        };
+        let guard = self.index.read();
+        // Permissive noise policy (the default) so a symbol defined only in a
+        // test/vendor/generated file is still resolvable by exact name — an
+        // explicit path already reaches those files. A generous limit keeps the
+        // ambiguity count honest without changing the O(symbols) scan cost.
+        let options = SymbolSearchOptions {
+            result_limit: ResultLimit::new(500),
+            ..Default::default()
+        };
+        let result = search_symbols_with_options(&guard, name, kind, &options);
+        // Under the 500-hit search cap, `overflow_count > 0` means more matches
+        // exist than were returned, so the ambiguity total must be a lower bound,
+        // never an exact under-report (Wave 1 Fix 4).
+        let overflowed = result.overflow_count > 0;
+        // Exact tier + exact (case-sensitive) name only — a name selector must
+        // not silently resolve to a prefix/substring neighbor.
+        let mut exact: Vec<crate::live_index::search::SymbolSearchHit> = result
+            .hits
+            .into_iter()
+            .filter(|hit| hit.tier == SymbolMatchTier::Exact && hit.name == name)
+            .collect();
+        // `symbol_line` narrows to matches at that 1-based start line when it
+        // resolves at least one candidate (e.g. two files, one line each).
+        if let Some(line) = symbol_line {
+            let narrowed: Vec<_> = exact
+                .iter()
+                .filter(|hit| hit.line == line)
+                .cloned()
+                .collect();
+            if !narrowed.is_empty() {
+                exact = narrowed;
+            }
+        }
+        match exact.len() {
+            0 => {
+                // Kind-mismatch guard (Wave 1 Fix 1): before claiming the name is
+                // absent, re-check WITHOUT the kind filter. If it exists under other
+                // kinds, "No symbol named X" is factually false — name the kinds it
+                // DOES have so the caller can drop or correct the filter.
+                if let Some(requested_kind) = kind {
+                    let unfiltered = search_symbols_with_options(&guard, name, None, &options);
+                    let mut kinds: Vec<String> = unfiltered
+                        .hits
+                        .into_iter()
+                        .filter(|hit| hit.tier == SymbolMatchTier::Exact && hit.name == name)
+                        .map(|hit| hit.kind)
+                        .collect();
+                    kinds.sort();
+                    kinds.dedup();
+                    if !kinds.is_empty() {
+                        return SymbolNameLookup::NotFound(format!(
+                            "`{name}` exists in the index, but not as kind={requested_kind} \
+                             (found: {}). Drop the kind filter or pass the correct kind.",
+                            kinds.join(", ")
+                        ));
+                    }
+                }
+                SymbolNameLookup::NotFound(format!(
+                    "No symbol named `{name}` in the index. \
+                     Use search_symbols(query=\"{name}\") for a fuzzy lookup, \
+                     or pass an explicit `path` if the file is not indexed."
+                ))
+            }
+            1 => SymbolNameLookup::Unique {
+                path: exact.remove(0).path,
+            },
+            _ => {
+                SymbolNameLookup::Ambiguous(render_symbol_name_ambiguity(name, &exact, overflowed))
+            }
+        }
+    }
+
     /// Look up symbol(s) by file path and name. Single mode: provide path + name for one symbol.
     /// Batch mode: provide targets[] array for multiple symbols or code slices in one call.
     /// When multiple symbols share the same name (e.g. `handle` in different impl blocks),
@@ -3647,6 +3780,34 @@ impl SymForgeServer {
         }
 
         // Single mode: path + name
+        let mut params = params;
+
+        // Name-only lookup (Wave 1 Fix 2): `path` is OPTIONAL. When the caller
+        // supplies a `name` but no `path`, resolve the path by an EXACT name
+        // search across the index (the same machinery `search_symbols` uses),
+        // honoring `kind` and the `symbol_line` disambiguator. This also powers
+        // the compact `read` intent, which routes here via the STEL planner —
+        // one fix, two surfaces. Both empty (and no `targets`) is a clean
+        // invalid-request, never `File not found: .`.
+        if params.0.path.trim().is_empty() {
+            if params.0.name.trim().is_empty() {
+                return "Invalid request: get_symbol needs a `name` (optionally with `path`), \
+                        or a `targets` array. Add `path`/`symbol_line` to disambiguate a common \
+                        name, or use search_symbols for a fuzzy lookup."
+                    .to_string();
+            }
+            match self.resolve_symbol_path_by_name(
+                params.0.name.trim(),
+                params.0.kind.as_deref(),
+                params.0.symbol_line,
+            ) {
+                SymbolNameLookup::Unique { path } => params.0.path = path,
+                SymbolNameLookup::Ambiguous(message) | SymbolNameLookup::NotFound(message) => {
+                    return message;
+                }
+            }
+        }
+
         let force_refresh = params.0.force_refresh == Some(true);
         let params_hash = crate::protocol::session::hash_symbol_params(
             params.0.kind.as_deref(),
@@ -6917,15 +7078,66 @@ impl SymForgeServer {
         // against. A repo with no `main` branch degrades to the "Invalid git
         // ref" error below (git2 ref resolution fails), never a panic; pass an
         // explicit `base_branch`/`since` for non-`main` default branches.
-        let base_branch: Option<&str> =
+        //
+        // Wave-1 defect fix (2026-07-02, contracts/detect-impact.md § 2026-07-02
+        // addendum): the DEFAULT substitution now prefers `origin/main` over
+        // local `main`. A local `main` that lags the remote (e.g. 83 commits
+        // behind) produces a confidently-wrong blast radius against a stale base;
+        // the shared remote ref is the intended comparison. An EXPLICIT
+        // caller-passed `base_branch:"main"` still means local `main` (unchanged).
+        // The resolved ref (and any staleness) is disclosed in the response
+        // header so the output is self-describing.
+        let mut staleness_note: Option<String> = None;
+        let base_branch: Option<String> =
             if params.0.base_branch.is_none() && params.0.since.is_none() {
-                Some("main")
+                let origin = repo.resolve_ref_commit("origin/main");
+                let local = repo.resolve_ref_commit("main");
+                let resolved = match (origin, local) {
+                    (Some(origin_oid), Some(local_oid)) => {
+                        if origin_oid != local_oid {
+                            // Direction-aware disclosure (Wave 1 Fix 3): behind is the
+                            // motivating stale-local case; ahead means unpushed local
+                            // work landed in the base; both means diverged. `ahead` =
+                            // commits in local not in origin; `behind` = the reverse.
+                            staleness_note = Some(match repo.ahead_behind(local_oid, origin_oid) {
+                                Some((ahead, behind)) if behind > 0 && ahead == 0 => {
+                                    "local main is behind origin/main; using origin/main"
+                                        .to_string()
+                                }
+                                Some((ahead, behind)) if ahead > 0 && behind == 0 => {
+                                    "local main is ahead of origin/main (unpushed commits); using \
+                                 origin/main — the blast radius includes your unpushed work \
+                                 relative to the shared base"
+                                        .to_string()
+                                }
+                                Some((ahead, behind)) if ahead > 0 && behind > 0 => {
+                                    "local main and origin/main have diverged; using origin/main"
+                                        .to_string()
+                                }
+                                // No common ancestor (or the unreachable both-zero given
+                                // origin != local): fall back to the direction-neutral note.
+                                _ => "local main differs from origin/main; using origin/main"
+                                    .to_string(),
+                            });
+                        }
+                        "origin/main"
+                    }
+                    (Some(_), None) => "origin/main",
+                    // No origin/main (or neither ref exists): fall back to local
+                    // `main`. When neither exists, merge_git_changed_paths surfaces
+                    // the existing "Invalid git ref" error below, unchanged.
+                    (None, _) => "main",
+                };
+                Some(resolved.to_string())
             } else {
-                params.0.base_branch.as_deref()
+                params.0.base_branch.clone()
             };
+        // The base ref disclosed in the response header: the resolved default or
+        // the explicit caller value; `None` when only `since` was supplied.
+        let base_disclosure: Option<String> = base_branch.clone();
 
         let changed_files = match repo.merge_git_changed_paths(
-            base_branch,
+            base_branch.as_deref(),
             params.0.since.as_deref(),
             params.0.include_untracked,
         ) {
@@ -6985,30 +7197,66 @@ impl SymForgeServer {
                         .collect()
                 }
             };
-        blast_entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        // Fix 1 (Wave 1, 2026-07-02): keep the most severe blast nodes when the
+        // list is capped — sort by risk severity desc, then hop asc, then name.
+        blast_entries.sort_by(|a, b| {
+            b.2.severity_rank()
+                .cmp(&a.2.severity_rank())
+                .then(a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
-        let total = blast_entries.len();
-        let returned_entries = &blast_entries[..total.min(DETECT_IMPACT_MAX_RETURNED)];
-        let returned = returned_entries.len();
-
+        // risk_summary counts the FULL blast set (it is counts, not entries), so
+        // it stays complete even though the returned entries are capped.
         let mut risk_counts: HashMap<&'static str, u32> = HashMap::new();
         for (_, _, risk) in &blast_entries {
             *risk_counts.entry(risk.as_str()).or_insert(0) += 1;
         }
 
+        // Fix 1: bound the JSON PAYLOAD — cap each list at DETECT_IMPACT_MAX_RETURNED
+        // and disclose the full totals + truncation in `pagination`. This bounds the
+        // serialized/emitted entries at 200/list; it does NOT make the tool
+        // sub-linear. The changed_symbols collection above, the BFS in
+        // compute_impact, the blast clone+sort, and the risk counting all remain
+        // O(full set) by necessity: risk_summary and the pagination totals must
+        // reflect the COMPLETE set, so everything is still counted. A large explicit
+        // diff still costs linear time; what the cap removes is the multi-MB payload
+        // (the 54 MB / 291K-entry dump).
+        let cap = DETECT_IMPACT_MAX_RETURNED;
+
+        let changed_files_total = changed_files.len();
+        let changed_files_json: Vec<&String> = changed_files.iter().take(cap).collect();
+
+        let changed_symbols_total = changed_symbols.len();
         let changed_symbols_json: Vec<serde_json::Value> = changed_symbols
             .iter()
+            .take(cap)
             .map(
                 |s| serde_json::json!({"name": s.name, "path": s.path, "kind": s.kind.to_string()}),
             )
             .collect();
-        let blast_radius_json: Vec<serde_json::Value> = returned_entries
+
+        let blast_total = blast_entries.len();
+        let blast_radius_json: Vec<serde_json::Value> = blast_entries
             .iter()
+            .take(cap)
             .map(|(symbol, hop, risk)| serde_json::json!({"symbol": symbol, "hop": hop, "risk": risk.as_str()}))
             .collect();
 
+        let changed_files_returned = changed_files_json.len();
+        let changed_symbols_returned = changed_symbols_json.len();
+        let blast_returned = blast_radius_json.len();
+
+        let list_page = |total: usize, returned: usize| {
+            serde_json::json!({
+                "total": total,
+                "returned": returned,
+                "truncated": total > returned,
+            })
+        };
+
         let payload = serde_json::json!({
-            "changed_files": changed_files,
+            "changed_files": changed_files_json,
             "changed_symbols": changed_symbols_json,
             "blast_radius": blast_radius_json,
             "risk_summary": {
@@ -7017,15 +7265,24 @@ impl SymForgeServer {
                 "medium": risk_counts.get("medium").copied().unwrap_or(0),
                 "low": risk_counts.get("low").copied().unwrap_or(0),
             },
+            // Per-list pagination (total / returned / truncated). The frozen
+            // contract's flat single-list `pagination` shape did not anticipate
+            // the changed_files/changed_symbols explosion; this per-list shape is
+            // the honest disclosure (contracts/detect-impact.md § 2026-07-02).
             "pagination": {
-                "total": total,
-                "returned": returned,
-                "offset": 0,
-                "has_more": total > returned,
+                "changed_files": list_page(changed_files_total, changed_files_returned),
+                "changed_symbols": list_page(changed_symbols_total, changed_symbols_returned),
+                "blast_radius": list_page(blast_total, blast_returned),
             },
         });
 
-        let result = format::detect_impact_result(&payload, requested_depth, effective_depth);
+        let result = format::detect_impact_result(
+            &payload,
+            requested_depth,
+            effective_depth,
+            base_disclosure.as_deref(),
+            staleness_note.as_deref(),
+        );
         self.session_context.record_summary_output(
             "detect_impact",
             (result.len() / 4).min(u32::MAX as usize) as u32,
@@ -8945,6 +9202,13 @@ impl SymForgeServer {
                 .into_call_tool_result("query is required: pass a natural-language phrase"));
         }
 
+        // Gate KEPT (unlike `status`, Wave 1 Fix 4): the `symforge` facade is a
+        // genuine compact-surface invariant, not a self-inflicted refusal. It is
+        // deliberately NOT advertised on the full surface (surface_probe.rs filters
+        // it out of `tools/list`), and the A-019 golden-replay harness special-
+        // cases THIS exact string as the "compact surface was not selected" signal
+        // (stel/golden_replay.rs). On full, the caller has the 32 legacy tools the
+        // facade fuses — the message names that path.
         if super::surface_probe::surface_profile_from_env()
             != super::surface_probe::SurfaceProfile::Compact
         {
@@ -9083,11 +9347,17 @@ impl SymForgeServer {
         }
 
         if should_skip_legacy_dispatch(&decision) {
-            let body = if decision.decision == crate::stel::AdmissionDecision::CacheHit {
+            let mut body = if decision.decision == crate::stel::AdmissionDecision::CacheHit {
                 format_cache_hit_body(&decision)
             } else {
                 format_bypass_body(&decision)
             };
+            // Wave 1 Fix 5: disclose unconsumed caller params on the bypass path
+            // too, so an economics-bypassed impact request is equally honest.
+            for note in crate::stel::planner::served_param_disclosures(request, &plan) {
+                body.push_str("\n\n");
+                body.push_str(&note);
+            }
             let output = self.finalize_symforge_with_ledger(
                 "symforge",
                 request,
@@ -9208,6 +9478,14 @@ impl SymForgeServer {
             self.append_impact_intent_cochanges(&mut body, &exec_plan.steps[0].args);
         }
 
+        // Wave 1 Fix 5: disclose any caller param the route did NOT consume
+        // (e.g. a `path` on the git-derived impact route) — lossless-or-loud,
+        // via the existing ParamDisposition accounting, never a silent drop.
+        for note in crate::stel::planner::served_param_disclosures(request, &plan) {
+            body.push_str("\n\n");
+            body.push_str(&note);
+        }
+
         let tools = tools_executed(&step_results);
         let route_label = route_tool_label(&tools);
         let tools_called = if tools.len() > 1 { Some(tools) } else { None };
@@ -9294,6 +9572,11 @@ impl SymForgeServer {
         &self,
         params: Parameters<crate::stel::StelEditRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Gate KEPT (unlike `status`, Wave 1 Fix 4): `symforge_edit` routes through
+        // the STEL economics/ledger apply path, the compact-surface invariant the
+        // A-019 golden replay pins. On full the caller has the legacy edit tools
+        // (replace_symbol_body / edit_within_symbol / …) this facade fuses — the
+        // message names that path. Pinned by tests/stel_symforge_edit.rs.
         if super::surface_probe::surface_profile_from_env()
             != super::surface_probe::SurfaceProfile::Compact
         {
@@ -9477,13 +9760,14 @@ impl SymForgeServer {
         &self,
         params: Parameters<crate::stel::StelStatusRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        if super::surface_probe::surface_profile_from_env()
-            != super::surface_probe::SurfaceProfile::Compact
-        {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
-                "status STEL handler requires SYMFORGE_SURFACE=compact; use health or health_compact on the full surface",
-            ));
-        }
+        // Wave-1 defect fix (2026-07-02): NO surface gate here. `status` is a
+        // read-only health/trust readout that the docs tell every client to call
+        // at session start, so refusing it on `SYMFORGE_SURFACE=full` was a
+        // self-inflicted failure with no invariant behind it (unlike `symforge`/
+        // `symforge_edit`, whose gates guard the STEL economics/golden-replay
+        // path — kept, see those handlers). The body self-describes the active
+        // surface via `render_stel_status_body`, so a full-surface `status` is
+        // honest about where it ran.
 
         // TR-01 (FR-006/007): in the default daemon-proxy topology this front-end
         // server's `self.index` is EMPTY — the populated index lives in the warm
@@ -9553,6 +9837,15 @@ impl SymForgeServer {
             None
         };
 
+        // Report the ACTIVE surface, not a hardcoded label (Wave 1 Fix 4): now
+        // that `status` runs on `SYMFORGE_SURFACE=full` too, claiming `compact`
+        // would be a lie. Reads the same env the dispatch gate reads.
+        let surface_label = match super::surface_probe::surface_profile_from_env() {
+            super::surface_probe::SurfaceProfile::Full => "full",
+            super::surface_probe::SurfaceProfile::Meta => "meta",
+            super::surface_probe::SurfaceProfile::Compact => "compact",
+        };
+
         let guard = self.index.read();
         let ledger = self.stel_ledger.lock();
         // 012 D6-a bound-root visibility: surface WHICH workspace answered. This
@@ -9565,7 +9858,7 @@ impl SymForgeServer {
         // 013: `mut` — line below reassigns `ctx` with the durable calibration
         // verdict override (T033/FR-009).
         let mut ctx = crate::stel::StelStatusContext::from_server(
-            "compact",
+            surface_label,
             &self.project_name,
             project_root,
             guard.is_ready(),
@@ -10778,6 +11071,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_serves_on_full_surface_without_corpus() {
+        // Wave 1 Fix 4 (corpus-free proof): with SYMFORGE_SURFACE=full active,
+        // `status` must NOT refuse (its old surface gate is gone) and must
+        // self-describe the active surface. Runs over a temp in-memory index —
+        // no phase0 corpus, so it executes in a fresh clone (unlike the
+        // corpus-gated tests/stel_status.rs coverage that skips when absent).
+        // The lib suite runs --test-threads=1; EnvVarGuard restores on drop.
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+
+        let (key, file) = make_file("src/lib.rs", b"fn core() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .status_stel_tool(Parameters(crate::stel::StelStatusRequest::default()))
+            .await
+            .expect("status dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let output = tool_result_text(&serialized);
+
+        assert!(
+            !output.contains("requires SYMFORGE_SURFACE=compact"),
+            "status must not refuse on the full surface:\n{output}"
+        );
+        assert!(
+            output.contains("surface: full"),
+            "status must self-describe the active (full) surface:\n{output}"
+        );
+    }
+
     fn make_symbol_with_bytes(
         name: &str,
         kind: SymbolKind,
@@ -11618,6 +11941,135 @@ mod tests {
         assert!(
             result.contains("fn foo"),
             "valid symbol must return its body; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_name_only_unique_resolves_path() {
+        // Fix 2: a `name` with no `path` resolves via an exact index search and
+        // returns the body — never `File not found: .`.
+        let sym = make_symbol("core", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn core() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("", "core")))
+            .await;
+
+        assert!(
+            result.contains("fn core"),
+            "name-only lookup must resolve and return the body; got: {result}"
+        );
+        assert!(
+            !result.contains("File not found"),
+            "name-only lookup must not report file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_name_only_ambiguous_lists_candidates() {
+        // Fix 2: a name matching symbols in multiple files returns a
+        // disambiguation listing naming path + line + kind, not one arbitrary hit.
+        let sym_a = make_symbol("handle", SymbolKind::Function, 1, 3);
+        let sym_b = make_symbol("handle", SymbolKind::Function, 5, 7);
+        let content = medium_test_source("fn handle() {}");
+        let (key_a, file_a) = make_file("src/a.rs", &content, vec![sym_a]);
+        let (key_b, file_b) = make_file("src/b.rs", &content, vec![sym_b]);
+        let server = make_server(make_live_index_ready(vec![
+            (key_a, file_a),
+            (key_b, file_b),
+        ]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("", "handle")))
+            .await;
+
+        assert!(
+            result.contains("Ambiguous symbol selector"),
+            "multiple matches must return a disambiguation listing; got: {result}"
+        );
+        assert!(
+            result.contains("src/a.rs") && result.contains("src/b.rs"),
+            "disambiguation must list every candidate path; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_name_only_missing_is_loud_not_found() {
+        // Fix 2: a name absent from the index yields a loud not-found that names
+        // the symbol and points at search_symbols — not `File not found: .`.
+        let sym = make_symbol("core", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn core() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("", "Nonexistent")))
+            .await;
+
+        assert!(
+            result.contains("No symbol named `Nonexistent`"),
+            "missing name must be a loud not-found; got: {result}"
+        );
+        assert!(
+            result.contains("search_symbols"),
+            "missing name must suggest search_symbols for fuzzy lookup; got: {result}"
+        );
+        assert!(
+            !result.contains("File not found"),
+            "missing name must not read as file-not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_name_only_kind_mismatch_names_actual_kinds() {
+        // Fix 1: a `name` that exists only under OTHER kinds must not read as a
+        // hard "No symbol named X" (factually false); it must name the kinds the
+        // symbol DOES have so the caller can drop or correct the `kind` filter.
+        let sym = make_symbol("core", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn core() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let mut input = get_symbol_input("", "core");
+        input.kind = Some("struct".to_string());
+        let result = server.get_symbol(Parameters(input)).await;
+
+        assert!(
+            result.contains("`core` exists in the index, but not as kind=struct"),
+            "kind mismatch must not claim the name is absent; got: {result}"
+        );
+        assert!(
+            result.contains("found: fn"),
+            "kind mismatch must name the kinds the symbol does have; got: {result}"
+        );
+        assert!(
+            !result.contains("No symbol named"),
+            "kind mismatch must not degrade to a hard not-found; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_all_empty_is_clean_invalid_request() {
+        // Fix 2: neither path nor name (nor targets) must yield a clean
+        // invalid-request naming what is required — never `File not found: .`.
+        let sym = make_symbol("core", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn core() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let result = server
+            .get_symbol(Parameters(get_symbol_input("", "")))
+            .await;
+
+        assert!(
+            result.contains("Invalid request") && result.contains("name"),
+            "all-empty input must name what is required; got: {result}"
+        );
+        assert!(
+            !result.contains("File not found"),
+            "all-empty input must not degrade to `File not found: .`; got: {result}"
         );
     }
 

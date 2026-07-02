@@ -41,8 +41,11 @@ pub enum ParamDisposition {
     /// The field is consumed downstream of the planner (the handler layer),
     /// not by the plan steps — named by where it lands today.
     Forwarded { into_arg: String },
-    /// The field is loudly refused (the facade returns an error rather than a
-    /// silently-partial answer) — named by why.
+    /// The field is loudly refused — named by why. Surfaced one of two ways:
+    /// as a hard error INSTEAD of a silently-partial answer (project/projects,
+    /// D9), or DISCLOSED alongside a still-served result when the answer is
+    /// useful without the field (impact-route `path`, Wave 1 Fix 5 — see
+    /// `served_param_disclosures`). Either way the drop is loud, never silent.
     Refused { reason: String },
     /// The field carries no actionable caller value on this route today
     /// (absent/blank, or a route the planner does not consume it on yet). An
@@ -123,6 +126,15 @@ pub fn classify_param_dispositions(
 
     let path = if path_set && plan_carries_path(plan, request) {
         ParamDisposition::Routed
+    } else if path_set && plan_targets_git_impact(plan) {
+        // Impact route (`detect_impact`) derives its changed-file set from git and
+        // has no `path` input, so a caller-supplied path IS meaningfully dropped.
+        // Record it as a loud Refusal (disclosed alongside the served impact
+        // result by `served_param_disclosures`, not a hard abort) rather than a
+        // silent NotApplicable — root D-A0 lossless-or-loud. Wave 1 Fix 5.
+        ParamDisposition::Refused {
+            reason: "detect_impact derives its changed-file set from git; the `path` filter is not applied".to_string(),
+        }
     } else {
         // `path` absent, or a route whose tool carries no path scope and no path
         // selector (so neither A1b's forwarding nor a target arg applies — e.g.
@@ -184,6 +196,44 @@ pub fn classify_param_dispositions(
         ("project", project),
         ("projects", projects),
     ]
+}
+
+/// True when the finalized `plan`'s primary step is the git-aware `detect_impact`
+/// tool, which derives its changed-file set from git and consumes no `path`
+/// (Wave 1 Fix 5).
+fn plan_targets_git_impact(plan: &StelPlan) -> bool {
+    plan.steps
+        .first()
+        .is_some_and(|step| step.tool == "detect_impact")
+}
+
+/// Caller-facing disclosure lines for any `Refused` param that is surfaced
+/// ALONGSIDE a served result (not a hard abort). Today this is only the
+/// impact-route `path` drop: `detect_impact` ignores `path`, so a caller-supplied
+/// path is refused-with-reason and DISCLOSED rather than silently dropped (Wave 1
+/// Fix 5). project/projects Refusals never reach here — the handler aborts on them
+/// before the plan is built (D9), so at serve time they are blank/NotApplicable.
+/// Routes through the existing `classify_param_dispositions` accounting; it does
+/// not invent a parallel mechanism.
+pub fn served_param_disclosures(request: &StelRequest, plan: &StelPlan) -> Vec<String> {
+    classify_param_dispositions(request, plan)
+        .into_iter()
+        .filter_map(|(field, disposition)| match disposition {
+            ParamDisposition::Refused { reason } => {
+                let value = match field {
+                    "path" => request.path.as_deref(),
+                    _ => None,
+                }
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+                Some(match value {
+                    Some(value) => format!("note: `{field}` \"{value}\" not consumed — {reason}"),
+                    None => format!("note: `{field}` not consumed — {reason}"),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// True when the finalized `plan` carries the caller's `symbol` value in any

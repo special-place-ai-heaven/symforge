@@ -258,7 +258,10 @@ where
 /// Input for `get_symbol`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct GetSymbolInput {
-    /// Relative path to the file (required for single lookup; ignored when `targets` is provided).
+    /// Relative path to the file. OPTIONAL: when omitted, the symbol is resolved
+    /// by an exact `name` search across the index (pass `symbol_line`/`kind` to
+    /// disambiguate a common name). Provide `path` to skip the search and go
+    /// straight to that file. Ignored when `targets` is provided.
     #[serde(default)]
     pub path: String,
     /// Symbol name to look up (required for single lookup; ignored when `targets` is provided).
