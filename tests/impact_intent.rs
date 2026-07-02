@@ -210,6 +210,33 @@ async fn impact_intent_routes_to_detect_impact_blast_radius() {
     );
 }
 
+/// Fix 5 (Wave 1): the impact route drops the caller's `path` (detect_impact
+/// derives its changed-file set from git), but the drop must be LOUD — disclosed
+/// in the response envelope via the ParamDisposition accounting, not silently
+/// discarded as it was before.
+#[tokio::test]
+async fn impact_intent_discloses_unconsumed_path() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let (_dir, server) = server_over_repo_with_uncommitted_widget_change(false);
+
+    let body = run_impact_intent(&server, "src/widget.rs").await;
+
+    assert!(
+        body.contains("Chosen tool: detect_impact"),
+        "impact intent (path only) must route to detect_impact:\n{body}"
+    );
+    assert!(
+        body.contains("`path` \"src/widget.rs\" not consumed"),
+        "impact intent must disclose the caller's path was not consumed:\n{body}"
+    );
+    assert!(
+        body.contains("derives its changed-file set from git"),
+        "disclosure must name WHY the path was dropped:\n{body}"
+    );
+}
+
 /// The old `find_dependents` + git co-change chain
 /// (`append_impact_intent_cochanges`) only fires when the executed step's
 /// args carry a `path` key — `detect_impact`'s args never do (scope=files

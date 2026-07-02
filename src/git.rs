@@ -225,6 +225,24 @@ impl GitRepo {
         Ok(paths)
     }
 
+    /// Resolve a ref/revspec to its commit OID, or `None` when it does not
+    /// exist. Used by `detect_impact`'s default base resolution to prefer
+    /// `origin/main` over a possibly-stale local `main` (dogfood Wave 1 Fix 6).
+    pub fn resolve_ref_commit(&self, reference: &str) -> Option<git2::Oid> {
+        let obj = self.repo.revparse_single(reference).ok()?;
+        obj.peel_to_commit().ok().map(|commit| commit.id())
+    }
+
+    /// Ahead/behind commit counts of `local` relative to `upstream`, as
+    /// `(ahead, behind)`: `ahead` = commits reachable from `local` but not
+    /// `upstream` (unpushed work); `behind` = commits reachable from `upstream`
+    /// but not `local` (staleness). Returns `None` when the two share no common
+    /// ancestor, where the direction is not a meaningful scalar.
+    pub fn ahead_behind(&self, local: git2::Oid, upstream: git2::Oid) -> Option<(usize, usize)> {
+        self.repo.merge_base(local, upstream).ok()?;
+        self.repo.graph_ahead_behind(local, upstream).ok()
+    }
+
     /// Read file content at a specific git ref. Returns None if the file doesn't exist at that ref.
     ///
     /// Replaces: `git show <ref>:<path>`

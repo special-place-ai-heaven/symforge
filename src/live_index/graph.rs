@@ -225,6 +225,18 @@ impl RiskTier {
         }
     }
 
+    /// Severity ordering for ranking blast entries (higher = more severe):
+    /// Critical > High > Medium > Low. Used by `detect_impact` to keep the most
+    /// severe nodes when the returned list is capped.
+    pub fn severity_rank(self) -> u8 {
+        match self {
+            RiskTier::Critical => 3,
+            RiskTier::High => 2,
+            RiskTier::Medium => 1,
+            RiskTier::Low => 0,
+        }
+    }
+
     /// Tier for a blast node at `hop` hops from the nearest changed symbol,
     /// promoted to `Critical` when the node is an entry point at hop 1
     /// (contracts/detect-impact.md § Risk tiers: hop 1 = High, hop 2 = Medium,
