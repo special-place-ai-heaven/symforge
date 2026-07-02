@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.10.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.0...v8.10.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* detect_impact caps, get_symbol name lookup, status on full surface ([13a1c8c](https://github.com/special-place-ai-heaven/symforge/commit/13a1c8c45c86843b4b7de38ad9dabec49df2b43f))
+
 ## [8.10.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.9.7...v8.10.0) (2026-07-01)
 
 
