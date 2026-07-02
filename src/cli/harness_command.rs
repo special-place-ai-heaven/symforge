@@ -24,11 +24,11 @@ use crate::cli::harness_apply::{BackupRecord, write_backup};
 pub const CLAUDE_ADMIN_COMMAND_FILE: &str = "symforge-admin.md";
 
 /// Markdown body of the Claude Code `/symforge-admin` slash-command. Invoking it
-/// runs the `symforge admin` CLI verb, which reuses a running operator server or
-/// starts one and opens the dashboard (contracts/command-file.md).
+/// runs the `symforge admin` CLI verb, which returns a running dashboard's URL
+/// immediately or starts a new server in the foreground (contracts/command-file.md).
 const CLAUDE_ADMIN_COMMAND_BODY: &str = "\
 ---
-description: Open the SymForge operator dashboard (reuse a running server, or start one)
+description: Open the SymForge operator dashboard (reuse a running server, or start one in the background)
 ---
 
 Run the SymForge admin verb to open the operator dashboard.
@@ -39,10 +39,15 @@ Execute this command in the project root:
 symforge admin
 ```
 
-`symforge admin` reuses a server already running on the remembered port, or
-starts one on a verified-free port and opens the dashboard URL. If your
-environment cannot run shell commands, use the `symforge-admin` MCP prompt
-instead, which reports the running dashboard URL.
+If a dashboard is already running on the remembered port, `symforge admin` prints
+its URL and returns immediately. If none is running it STARTS a new server and
+serves it IN THE FOREGROUND until you stop it (Ctrl-C) — so if you are an agent
+running this in a shell tool, launch it as a background/detached process (e.g.
+append `&` or run it detached) and then read the printed dashboard URL, or the
+tool call blocks until it times out and kills the fresh server.
+
+If your environment cannot run shell commands, use the `symforge-admin` MCP
+prompt instead, which reports the running dashboard URL.
 ";
 
 /// Whether a harness got a command file installed, and where — or why it did not.

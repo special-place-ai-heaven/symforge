@@ -303,23 +303,39 @@ fn build_admin_instructions(project_name: &str, dashboard_url: Option<&str>) -> 
              \n\
              No operator dashboard is currently running for this project.\n\
              \n\
-             Start (or reattach to) it by running the CLI verb in a terminal at the \
-             project root:\n\
+             Start it by running the CLI verb in a terminal at the project root:\n\
              \n\
              ```\n\
              symforge admin\n\
              ```\n\
              \n\
-             `symforge admin` reuses a server already running on the remembered port, or \
-             starts one on a verified-free port and opens the dashboard. This prompt only \
-             reports a running dashboard — it does not start the server itself."
+             `symforge admin` prints the dashboard URL. If it STARTS a new server (nothing \
+             was running on the remembered port) it stays in the foreground and keeps serving \
+             until you stop it (Ctrl-C); if it REUSES a server already running, it returns \
+             immediately (the dashboard stays up because another process owns it). This prompt \
+             only reports an already-running dashboard — it does not start the server itself."
         ),
     }
 }
 
+/// Shared surface-mapping preamble for the six tool-driven prompt bodies. The
+/// step tool names below are full-surface spellings (`SYMFORGE_SURFACE=full`);
+/// on the default compact surface the agent has only
+/// `symforge`/`symforge_edit`/`status`, so the mapping is stated once here
+/// instead of dual-spelling every step. `build_admin_instructions` is excluded:
+/// it drives the `symforge admin` CLI verb, not the MCP tool surface.
+const SURFACE_NOTE: &str = "> Surface note: the tool names in these steps are full-surface \
+spellings (`SYMFORGE_SURFACE=full`). On the default compact surface you have three tools — \
+`symforge` (read/explore: pass a natural-language `query` such as \"find symbol X\", \
+\"who calls X\", or \"what changed\", optionally with an `intent` hint of \
+orient/find/read/trace/impact/meta/auto), `symforge_edit` (structural edits), and \
+`status` (which names your active surface). When on compact, route each step below through \
+`symforge`/`symforge_edit`.\n";
+
 fn build_code_review_instructions(project_name: &str, input: &CodeReviewPromptInput) -> String {
     let target = input.path.as_deref().map_or(
-        "Start from what_changed(uncommitted=true, code_only=true) to find all modified files."
+        "Start from `what_changed(uncommitted=true, code_only=true)` to find all modified files \
+         (the path list caps at 200 — narrow with `path_prefix` if it truncates)."
             .to_string(),
         |p| format!("Start with the target path '{p}'."),
     );
@@ -330,9 +346,12 @@ fn build_code_review_instructions(project_name: &str, input: &CodeReviewPromptIn
     format!(
         "## Code Review Workflow for '{project_name}'\n\
          \n\
+         {SURFACE_NOTE}\
+         \n\
          ### Step 1: Scope the Review\n\
          {target}\n\
          - Call `diff_symbols(code_only=true)` to see which symbols changed\n\
+         - Call `detect_impact(scope=\"symbols\")` for the change's blast radius vs the base branch (origin/main by default; each list caps at 200 with {{total,returned,truncated}} pagination). Surface caveat: through the compact `symforge` facade `intent=impact` yields the file-scoped impact only — `scope=\"symbols\"` needs the full surface\n\
          - If > 20 symbols changed, use `diff_symbols(compact=true)` first for overview\n\
          \n\
          ### Step 2: Prioritize by Risk\n\
@@ -363,6 +382,8 @@ fn build_architecture_map_instructions(project_name: &str, area: Option<&str>) -
 
     format!(
         "## Architecture Mapping Workflow for '{project_name}'\n\
+         \n\
+         {SURFACE_NOTE}\
          \n\
          ### Step 1: Get the Big Picture\n\
          - Read the repo map resource (attached) for directory structure and key types\n\
@@ -404,9 +425,12 @@ fn build_failure_triage_instructions(
         "## Failure Triage Workflow for '{project_name}'\n\
          Symptom: {symptom}\n\
          \n\
+         {SURFACE_NOTE}\
+         \n\
          ### Step 1: Check Recent Changes\n\
-         - Call `what_changed(uncommitted=true, code_only=true, include_symbol_diff=true)`\n\
+         - Call `what_changed(uncommitted=true, code_only=true, include_symbol_diff=true)` (path list caps at 200 — narrow with `path_prefix` if it truncates)\n\
          - If the symptom appeared recently, the bug is likely in uncommitted changes\n\
+         - For a suspected regression, `detect_impact` shows what changed vs the base branch (origin/main by default) and its blast radius\n\
          - Check `diff_symbols()` — which functions were modified?\n\
          \n\
          ### Step 2: Locate the Failure Point\n\
@@ -442,6 +466,8 @@ fn build_onboard_instructions(project_name: &str, area: Option<&str>) -> String 
 
     format!(
         "## Codebase Onboarding Workflow for '{project_name}'\n\
+         \n\
+         {SURFACE_NOTE}\
          \n\
          ### Step 1: Project Overview (2 minutes)\n\
          - Read the repo map resource (attached) for structure and languages\n\
@@ -485,6 +511,8 @@ fn build_refactor_instructions(project_name: &str, input: &RefactorPromptInput) 
         "## Refactoring Workflow for '{project_name}'\n\
          Goal: {goal}\n\
          \n\
+         {SURFACE_NOTE}\
+         \n\
          ### Step 1: Understand Current State\n\
          - Call `search_symbols(query=\"<target>\")` to find the symbol(s) involved\n\
          - Call `get_symbol_context(name=\"<sym>\", bundle=true)` to see the full definition + type deps\n\
@@ -509,6 +537,7 @@ fn build_refactor_instructions(project_name: &str, input: &RefactorPromptInput) 
          \n\
          ### Step 5: Verify\n\
          - Call `analyze_file_impact(path=\"<changed_file>\")` for each modified file\n\
+         - Call `detect_impact(scope=\"symbols\")` for the whole change's blast radius vs the base branch (origin/main by default; each list caps at 200 with {{total,returned,truncated}} pagination)\n\
          - Check for stale references in the impact report\n\
          - Search for any remaining old names: `search_text(query=\"<old_name>\")`{target_note}",
         goal = input.goal
@@ -525,6 +554,8 @@ fn build_debug_instructions(project_name: &str, input: &DebugPromptInput) -> Str
         "## Debugging Workflow for '{project_name}'\n\
          Error: {error}\n\
          \n\
+         {SURFACE_NOTE}\
+         \n\
          ### Step 1: Find the Error Origin\n\
          - Extract the key error text or pattern from the error message\n\
          - Call `search_text(query=\"<error_pattern>\")` to find where it's generated\n\
@@ -532,12 +563,13 @@ fn build_debug_instructions(project_name: &str, input: &DebugPromptInput) -> Str
          - Call `inspect_match(path=\"<file>\", line=<N>)` on the match for full context\n\
          \n\
          ### Step 2: Understand the Failing Function\n\
-         - Call `get_symbol(path=\"<file>\", name=\"<fn>\")` to read the full body\n\
+         - Call `get_symbol(name=\"<fn>\")` to read the full body (`path` is optional — name alone resolves; add `path`/`symbol_line` only to disambiguate a shared name)\n\
          - Call `get_symbol_context(name=\"<fn>\", sections=[])` for callers + callees + types\n\
          - Map the data flow: what goes in, what comes out, what can fail?\n\
          \n\
          ### Step 3: Check Recent Changes (is this a regression?)\n\
-         - Call `what_changed(uncommitted=true, include_symbol_diff=true)`\n\
+         - Call `what_changed(uncommitted=true, include_symbol_diff=true)` (path list caps at 200 — narrow with `path_prefix` if it truncates)\n\
+         - Call `detect_impact` to see what changed vs the base branch (origin/main by default) and whether the blast radius reaches the failing function\n\
          - Did the failing function change recently?\n\
          - Did any of its dependencies change? Check `diff_symbols()`\n\
          \n\
@@ -604,15 +636,104 @@ mod tests {
     fn test_prompt_router_lists_expected_prompts() {
         let server = make_server();
         let prompts = server.prompt_router.list_all();
-        let names: Vec<&str> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-        assert!(names.contains(&"symforge-review"));
-        assert!(names.contains(&"symforge-architecture"));
-        assert!(names.contains(&"symforge-triage"));
-        assert!(names.contains(&"symforge-onboard"));
-        assert!(names.contains(&"symforge-refactor"));
-        assert!(names.contains(&"symforge-debug"));
-        // 009 US3 (T024): the universal in-harness admin affordance.
-        assert!(names.contains(&"symforge-admin"));
+        let by_name: HashMap<&str, &rmcp::model::Prompt> =
+            prompts.iter().map(|p| (p.name.as_str(), p)).collect();
+
+        // All seven prompts are advertised. 009 US3 (T024): symforge-admin is the
+        // universal in-harness affordance.
+        for name in [
+            "symforge-review",
+            "symforge-architecture",
+            "symforge-triage",
+            "symforge-onboard",
+            "symforge-refactor",
+            "symforge-debug",
+            "symforge-admin",
+        ] {
+            assert!(by_name.contains_key(name), "missing prompt: {name}");
+        }
+
+        // Regression guard for the prompts/list `description` each client renders
+        // in its slash-command menu. A client once showed `symforge-architecture`
+        // mangled ("using Synts: area)"); the SOURCE string was intact, so the
+        // mangling was client-side truncation. This pins every source description
+        // exactly, so a genuine source-side corruption would fail here.
+        let expect_desc = |name: &str, desc: &str| {
+            assert_eq!(
+                by_name[name].description.as_deref(),
+                Some(desc),
+                "list description drift for {name}"
+            );
+        };
+        expect_desc(
+            "symforge-review",
+            "Generate a code review plan using SymForge context surfaces.",
+        );
+        expect_desc(
+            "symforge-architecture",
+            "Generate an architecture mapping plan using SymForge repo context.",
+        );
+        expect_desc(
+            "symforge-triage",
+            "Generate a debugging and failure-triage plan using SymForge state.",
+        );
+        expect_desc(
+            "symforge-onboard",
+            "Generate a codebase onboarding plan using SymForge for guided exploration.",
+        );
+        expect_desc(
+            "symforge-refactor",
+            "Generate a refactoring plan with impact analysis using SymForge.",
+        );
+        expect_desc(
+            "symforge-debug",
+            "Generate a detailed debugging plan using SymForge call tracing and change analysis.",
+        );
+        expect_desc(
+            "symforge-admin",
+            "Return the running SymForge operator dashboard URL, or guidance to start it.",
+        );
+
+        // Declared arguments (prompts/list) must match the input structs,
+        // including which are optional. rmcp derives `required` from the schema:
+        // `Option<_>` fields are not required.
+        let args = |name: &str| -> HashMap<String, bool> {
+            by_name[name]
+                .arguments
+                .as_ref()
+                .map(|list| {
+                    list.iter()
+                        .map(|a| (a.name.clone(), a.required.unwrap_or(false)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            args("symforge-review"),
+            HashMap::from([("path".into(), false), ("focus".into(), false)]),
+        );
+        assert_eq!(
+            args("symforge-architecture"),
+            HashMap::from([("area".into(), false)]),
+        );
+        assert_eq!(
+            args("symforge-triage"),
+            HashMap::from([("symptom".into(), true), ("path".into(), false)]),
+        );
+        assert_eq!(
+            args("symforge-onboard"),
+            HashMap::from([("area".into(), false)]),
+        );
+        assert_eq!(
+            args("symforge-refactor"),
+            HashMap::from([("goal".into(), true), ("target".into(), false)]),
+        );
+        assert_eq!(
+            args("symforge-debug"),
+            HashMap::from([("error".into(), true), ("path".into(), false)]),
+        );
+        // AdminPromptInput has no fields -> no declared arguments.
+        assert!(args("symforge-admin").is_empty());
     }
 
     #[tokio::test]
@@ -642,6 +763,17 @@ mod tests {
         assert!(
             text.contains("No operator dashboard is currently running"),
             "must honestly report nothing is running: {text}"
+        );
+        // D21: a fresh `symforge admin` stays in the foreground (does not fire-and-
+        // return); the guidance must describe the foreground-serving behavior, while
+        // the reuse path returns immediately.
+        assert!(
+            text.contains("stays in the foreground"),
+            "guidance must describe foreground serving on fresh start (D21): {text}"
+        );
+        assert!(
+            text.contains("returns immediately"),
+            "guidance must state the reuse path returns immediately: {text}"
         );
     }
 
@@ -724,6 +856,77 @@ mod tests {
         assert!(
             body.contains("search_symbols") && body.contains("search_text"),
             "architecture doctrine must point at search_symbols / search_text: {body}"
+        );
+    }
+
+    #[test]
+    fn test_tool_driven_instructions_are_surface_aware_and_current() {
+        let review = build_code_review_instructions(
+            "p",
+            &CodeReviewPromptInput {
+                path: None,
+                focus: None,
+            },
+        );
+        let architecture = build_architecture_map_instructions("p", None);
+        let triage = build_failure_triage_instructions(
+            "p",
+            &FailureTriagePromptInput {
+                symptom: "boom".to_string(),
+                path: None,
+            },
+        );
+        let onboard = build_onboard_instructions("p", None);
+        let refactor = build_refactor_instructions(
+            "p",
+            &RefactorPromptInput {
+                goal: "extract validation".to_string(),
+                target: None,
+            },
+        );
+        let debug = build_debug_instructions(
+            "p",
+            &DebugPromptInput {
+                error: "panic".to_string(),
+                path: None,
+            },
+        );
+
+        // Every tool-driven body carries the single upfront surface-mapping note so a
+        // compact-surface agent knows the step tool names are full-surface spellings
+        // and how to route them through `symforge`/`symforge_edit`.
+        for (label, body) in [
+            ("review", &review),
+            ("architecture", &architecture),
+            ("triage", &triage),
+            ("onboard", &onboard),
+            ("refactor", &refactor),
+            ("debug", &debug),
+        ] {
+            assert!(
+                body.contains("Surface note:") && body.contains("`symforge_edit`"),
+                "{label} body must embed the surface-mapping note: {body}"
+            );
+        }
+
+        // Current-reality capability claims land only where they help the plan.
+        assert!(
+            review.contains("detect_impact") && review.contains("caps at 200"),
+            "review must mention detect_impact + the what_changed 200 cap: {review}"
+        );
+        assert!(
+            triage.contains("detect_impact") && triage.contains("caps at 200"),
+            "triage must mention detect_impact + the what_changed 200 cap: {triage}"
+        );
+        assert!(
+            refactor.contains("detect_impact"),
+            "refactor verify step must mention detect_impact: {refactor}"
+        );
+        assert!(
+            debug.contains("get_symbol(name=")
+                && debug.contains("detect_impact")
+                && debug.contains("caps at 200"),
+            "debug must use name-only get_symbol + detect_impact + the 200 cap: {debug}"
         );
     }
 }
