@@ -47,8 +47,11 @@ impl ProjectConfigTrustMode {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
-    use super::{EditResultStatus, classify_edit_output};
+    use super::{EditResultStatus, classify_edit_output, session_stale_recovery};
+    use crate::protocol::surface_probe::{SurfaceProfile, with_connection_surface};
+    use std::ffi::OsString;
 
     #[test]
     fn daemon_wrapped_edit_errors_classify_as_invalid_request() {
@@ -58,6 +61,75 @@ mod tests {
                 false
             ),
             EditResultStatus::InvalidRequest
+        );
+    }
+
+    /// Test-only RAII guard serializing `SYMFORGE_SURFACE` mutation so the D23
+    /// stale-session regressions can prove the CONNECTION surface overrides the
+    /// daemon's own env. Single-threaded test context (`--test-threads=1`).
+    struct SurfaceEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    #[allow(unsafe_code)] // test-only env guard; no concurrent env readers under --test-threads=1.
+    impl SurfaceEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("SYMFORGE_SURFACE");
+            // SAFETY: single-threaded test context; no concurrent env readers.
+            unsafe { std::env::set_var("SYMFORGE_SURFACE", value) };
+            Self { previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // test-only env guard restores the serialized mutation.
+    impl Drop for SurfaceEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                // SAFETY: single-threaded test context; no concurrent env readers.
+                Some(previous) => unsafe { std::env::set_var("SYMFORGE_SURFACE", previous) },
+                // SAFETY: single-threaded test context; no concurrent env readers.
+                None => unsafe { std::env::remove_var("SYMFORGE_SURFACE") },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_session_recovery_names_compact_over_full_env() {
+        // D23 sibling on the EDIT path: the daemon env is `full`, but the proxied
+        // edit is served on a `compact` connection. The stale-session recovery
+        // clause the daemon renders and returns verbatim through the proxy MUST
+        // name only compact-callable recovery — NEVER `index_folder`, whose compact
+        // gate would then refuse the retry (the P0-1 loop this clause prevents).
+        // Drives the real `session_stale_recovery` under the same
+        // `with_connection_surface` binding the daemon dispatch composes.
+        let _surface = SurfaceEnvGuard::set("full");
+        let recovery = with_connection_surface(Some(SurfaceProfile::Compact), async {
+            session_stale_recovery()
+        })
+        .await;
+        assert!(
+            !recovery.contains("index_folder"),
+            "compact-connection stale recovery must never name the gated index_folder: {recovery}"
+        );
+        assert!(
+            recovery.contains("SYMFORGE_WORKSPACE_ROOT"),
+            "compact-connection stale recovery must name a compact-callable path: {recovery}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_recovery_names_index_folder_over_compact_env() {
+        // Inverse skew: daemon env `compact`, connection `full`. `index_folder` IS
+        // callable on the full connection, so the clause MAY (and does) name it —
+        // proving the recovery follows the CONNECTION surface, not the daemon env.
+        let _surface = SurfaceEnvGuard::set("compact");
+        let recovery = with_connection_surface(Some(SurfaceProfile::Full), async {
+            session_stale_recovery()
+        })
+        .await;
+        assert!(
+            recovery.contains("index_folder"),
+            "full-connection stale recovery must name index_folder (callable there): {recovery}"
         );
     }
 }
@@ -294,7 +366,7 @@ pub(crate) enum EditError {
 /// `index_folder` is not). Computed from the active surface so the message never
 /// names a forbidden capability.
 fn session_stale_recovery() -> String {
-    match crate::protocol::surface_probe::surface_profile_from_env() {
+    match crate::protocol::surface_probe::connection_surface_or_env() {
         crate::protocol::surface_probe::SurfaceProfile::Compact => {
             "set SYMFORGE_WORKSPACE_ROOT to the project path (or run `symforge init` for \
              this harness) and reconnect to refresh repo_root, or set SYMFORGE_SURFACE=full \

@@ -18,8 +18,8 @@ use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::admin::{
-    ADMIN_SERVE_START_DEADLINE, ServerSessionDescriptor, operator_server_reachable,
-    start_operator_server,
+    ADMIN_SERVE_START_DEADLINE, FOREGROUND_SERVE_NOTICE, ServerSessionDescriptor,
+    operator_server_reachable, start_operator_server,
 };
 use crate::cli::browser::{BrowserOpener, OsBrowserOpener};
 use crate::cli::harness::{AttachEntry, HarnessId, HarnessRegistry, HarnessState};
@@ -252,8 +252,63 @@ pub fn run(args: SetupCliArgs) -> anyhow::Result<()> {
     } else {
         let mut sink = StderrSetupSink;
         let browser = OsBrowserOpener;
-        run_wizard(args, &ctx, &mut sink, &browser)?;
+        let outcome = run_wizard(args, &ctx, &mut sink, &browser)?;
+        // D21 sibling: an interactive fresh-start server runs on a background
+        // thread that dies when this process exits — so the dashboard URL the
+        // wizard just printed would be dead the instant setup returns. Hold the
+        // foreground and keep serving until Ctrl-C; a reused server (owned by
+        // another process) returns immediately. The non-interactive branch above
+        // never blocks (scripting / CI must return).
+        // Manual-verification contract: the seam's reuse-vs-block behavior is unit-
+        // tested directly (setup_holds_foreground_*/setup_does_not_hold_*), but
+        // `run`'s own wiring — INTERACTIVE branch calls the seam, non-interactive
+        // branch never does — rides on `from_env` (un-seamed real home/cwd) and is
+        // pinned by an interactive TTY run, not an in-lib test.
+        serve_foreground_if_wizard_started(&outcome, block_until_ctrl_c)?;
     }
+    Ok(())
+}
+
+/// Keep an interactive `symforge setup` in the foreground when the wizard STARTED
+/// the operator server, so the "Dashboard: <url>" it just printed actually keeps
+/// serving (D21 sibling of the admin-verb fix). A reused server is owned by
+/// another process (return immediately); a run that started nothing (in-harness
+/// mode, or a declined plan) also returns. Only a server we started ourselves
+/// must be held alive here, blocking in `wait_for_shutdown` until the operator
+/// stops the process (Ctrl-C in production).
+///
+/// The non-interactive / scripted path (FR-014) never reaches this — [`run`]
+/// returns there so scripts and CI don't hang, and its `ScriptedSetupSink` prints
+/// nothing to a human, so a transient verify-server dying with the process makes
+/// no false promise. Split from [`run`] and generic over the waiter so the
+/// reuse-vs-block decision is unit-testable without an unstoppable Ctrl-C wait.
+/// Mirrors `admin::serve_foreground_if_started`.
+fn serve_foreground_if_wizard_started(
+    outcome: &WizardOutcome,
+    wait_for_shutdown: impl FnOnce(&ServerSessionDescriptor) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if outcome.reused_server {
+        return Ok(());
+    }
+    let Some(session) = outcome.session.as_ref() else {
+        return Ok(());
+    };
+    eprintln!("{FOREGROUND_SERVE_NOTICE}");
+    wait_for_shutdown(session)
+}
+
+/// Block until the operator asks the process to stop (Ctrl-C on all platforms) on
+/// a sibling current-thread runtime — [`run`] is synchronous and the operator
+/// server owns its own thread + runtime, so this is never a nested reactor.
+///
+/// ponytail: a 5-line twin of the private `admin::block_until_ctrl_c`; reusing it
+/// would mean widening that helper's visibility in admin.rs, out of scope for this
+/// fix. Collapse the two into one shared helper if a third caller ever appears.
+fn block_until_ctrl_c(_session: &ServerSessionDescriptor) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(tokio::signal::ctrl_c())?;
     Ok(())
 }
 
@@ -792,5 +847,139 @@ mod tests {
         assert!(OperatorSetupProfile::load(project.path()).is_none());
         // The restate was still presented before the decline (FR-008).
         assert_eq!(sink.confirmations.len(), 1);
+    }
+
+    #[test]
+    fn setup_holds_foreground_after_fresh_start_until_shutdown() {
+        // No server running -> the wizard's Server mode starts one on a background
+        // thread. serve_foreground_if_wizard_started must then KEEP setup in the
+        // foreground (invoke the waiter), and while "blocked" the freshly-started
+        // server must be reachable AND STAY reachable. D21 sibling: pre-fix
+        // `setup::run` returned immediately, so the serve thread died with the process
+        // and the "Dashboard: <url>" the interactive wizard printed was refused.
+        use crate::cli::admin::operator_server_reachable;
+        use crate::cli::browser::NoopBrowserOpener;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let project = tempfile::tempdir().expect("temp project");
+        let ctx = SetupContext {
+            home: home.path().to_path_buf(),
+            working_dir: project.path().to_path_buf(),
+        };
+        let mut sink = ScriptedSetupSink::new([], true);
+        let browser = NoopBrowserOpener::default();
+
+        let outcome = run_wizard(
+            SetupCliArgs {
+                non_interactive: true,
+                installation_type: Some(InstallationType::Server),
+                port: None,
+                harnesses: vec![],
+                yes: true,
+            },
+            &ctx,
+            &mut sink,
+            &browser,
+        )
+        .expect("server-mode setup should start a server when none runs");
+        assert!(
+            !outcome.reused_server,
+            "no server ran; the wizard must start one"
+        );
+        assert!(
+            outcome.session.is_some(),
+            "a fresh start yields a live session"
+        );
+
+        let waited = std::cell::Cell::new(false);
+        serve_foreground_if_wizard_started(&outcome, |session| {
+            waited.set(true);
+            // Probe twice with a gap: the started server must be serving now AND still
+            // serving a moment later — not fire-and-return (D21).
+            assert!(
+                operator_server_reachable(session.bound_addr, Duration::from_millis(500)),
+                "freshly-started server must be reachable while setup holds the foreground"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                operator_server_reachable(session.bound_addr, Duration::from_millis(500)),
+                "the started server must STAY reachable (D21: it must not die after start)"
+            );
+            Ok(())
+        })
+        .expect("foreground wait returns cleanly on shutdown");
+
+        assert!(
+            waited.get(),
+            "a freshly-started server must hold the foreground (D21 fix); pre-fix `run` returned immediately"
+        );
+        // The fresh branch prints FOREGROUND_SERVE_NOTICE right before the waiter, so
+        // an interactive fresh start is not a silent block; pin the wording (stderr
+        // capture is impractical in-lib, and `waited.get()` proves the branch ran).
+        assert!(
+            FOREGROUND_SERVE_NOTICE.contains("Ctrl-C"),
+            "the foreground notice must tell the operator how to stop it"
+        );
+    }
+
+    #[test]
+    fn setup_does_not_hold_foreground_when_reusing() {
+        // A server already runs and the profile points at it -> the wizard reuses it.
+        // serve_foreground_if_wizard_started must NOT block: another process owns the
+        // server, so setup returns without invoking the waiter (reuse path unchanged).
+        use crate::cli::browser::NoopBrowserOpener;
+
+        let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let running =
+            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
+                .expect("operator server should come up");
+
+        let home = tempfile::tempdir().expect("temp home");
+        let project = tempfile::tempdir().expect("temp project");
+        OperatorSetupProfile::new(
+            InstallationType::Server,
+            running.bound_addr.port(),
+            AuthPosture::LoopbackNoKey,
+            &[],
+            1,
+        )
+        .save(project.path())
+        .expect("persist profile");
+
+        let ctx = SetupContext {
+            home: home.path().to_path_buf(),
+            working_dir: project.path().to_path_buf(),
+        };
+        let mut sink = ScriptedSetupSink::new([], true);
+        let browser = NoopBrowserOpener::default();
+
+        let outcome = run_wizard(
+            SetupCliArgs {
+                non_interactive: true,
+                installation_type: Some(InstallationType::Server),
+                port: None,
+                harnesses: vec![],
+                yes: true,
+            },
+            &ctx,
+            &mut sink,
+            &browser,
+        )
+        .expect("server-mode setup should reuse the running server");
+        assert!(
+            outcome.reused_server,
+            "must reuse the already-running server"
+        );
+
+        let waited = std::cell::Cell::new(false);
+        serve_foreground_if_wizard_started(&outcome, |_| {
+            waited.set(true);
+            Ok(())
+        })
+        .expect("reuse path returns cleanly");
+        assert!(
+            !waited.get(),
+            "the reuse path must not hold the foreground (another process owns the server)"
+        );
     }
 }

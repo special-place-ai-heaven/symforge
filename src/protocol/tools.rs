@@ -6794,7 +6794,7 @@ impl SymForgeServer {
             // Surface-aware recovery (TR-02 / FR-012): `index_folder` is gated on
             // the compact surface, so name only callable recovery there. `since=`
             // is always valid and is offered on every surface.
-            let attach = match crate::protocol::surface_probe::surface_profile_from_env() {
+            let attach = match crate::protocol::surface_probe::connection_surface_or_env() {
                 crate::protocol::surface_probe::SurfaceProfile::Compact => {
                     "set SYMFORGE_WORKSPACE_ROOT (or run `symforge init`) and reconnect"
                 }
@@ -11896,6 +11896,115 @@ mod tests {
             compact_result,
             crate::protocol::format::empty_guard_message(),
             "empty index get_repo_map(compact) must return the guard message, got: {compact_result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_guard_names_compact_recovery_when_connection_is_compact_over_full_env() {
+        // D23: the DAEMON's env is `full` but the proxied call is served on a
+        // `compact` connection. The empty-index guard the daemon renders and
+        // returns verbatim through the proxy MUST name only compact-callable
+        // recovery — NEVER `index_folder`, which the compact adapter's own gate
+        // would then refuse (the P0-1 unrecoverable loop this hint exists to
+        // prevent). Drives the REAL handler through the same
+        // `with_connection_surface` wrapper the daemon dispatch composes around
+        // `execute_tool_call`.
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+        let server = make_server(make_live_index_empty());
+
+        let result = crate::protocol::surface_probe::with_connection_surface(
+            Some(crate::protocol::surface_probe::SurfaceProfile::Compact),
+            server.get_repo_map(Parameters(super::GetRepoMapInput {
+                detail: Some("full".to_string()),
+                path: None,
+                depth: None,
+                max_files: None,
+                estimate: None,
+                max_tokens: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            crate::protocol::format::empty_index_recovery_hint(
+                crate::protocol::surface_probe::SurfaceProfile::Compact
+            ),
+            "compact connection must get the compact recovery hint, not the daemon env's:\n{result}"
+        );
+        assert!(
+            !result.contains("index_folder"),
+            "compact-connection guard must never name the gated index_folder:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_guard_names_index_folder_when_connection_is_full_over_compact_env() {
+        // Inverse skew: DAEMON env `compact`, connection `full`. `index_folder`
+        // IS callable on the full connection, so the guard MAY (and does) name it
+        // — proving the hint follows the CONNECTION surface, not the daemon env.
+        // Uses a `loading_guard!`-macro carrier (`get_symbol`).
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+        let server = make_server(make_live_index_empty());
+
+        let result = crate::protocol::surface_probe::with_connection_surface(
+            Some(crate::protocol::surface_probe::SurfaceProfile::Full),
+            server.get_symbol(Parameters(super::GetSymbolInput {
+                path: "anything.rs".to_string(),
+                name: "anything".to_string(),
+                kind: None,
+                symbol_line: None,
+                targets: None,
+                estimate: None,
+                max_tokens: None,
+                force_refresh: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            crate::protocol::format::empty_index_recovery_hint(
+                crate::protocol::surface_probe::SurfaceProfile::Full
+            ),
+            "full connection must get the full recovery hint:\n{result}"
+        );
+        assert!(
+            result.contains("index_folder"),
+            "full-connection guard must name index_folder (callable there):\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_guard_absent_connection_surface_falls_back_to_daemon_env() {
+        // Backward compat (old adapter sends no header -> None): the daemon
+        // renders from its own env, byte-identical to pre-D23 behavior.
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+        let server = make_server(make_live_index_empty());
+
+        let result = crate::protocol::surface_probe::with_connection_surface(
+            None,
+            server.get_symbol(Parameters(super::GetSymbolInput {
+                path: "anything.rs".to_string(),
+                name: "anything".to_string(),
+                kind: None,
+                symbol_line: None,
+                targets: None,
+                estimate: None,
+                max_tokens: None,
+                force_refresh: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            crate::protocol::format::empty_guard_message(),
+            "absent connection surface must fall back to the env-based guard:\n{result}"
+        );
+        assert!(
+            result.contains("index_folder"),
+            "full daemon env with no connection override still names index_folder:\n{result}"
         );
     }
 

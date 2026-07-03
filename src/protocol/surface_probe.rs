@@ -6,6 +6,7 @@
 //! replay against pinned Phase 0 evidence.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::model::Tool;
@@ -53,12 +54,78 @@ pub fn surface_profile_label(profile: SurfaceProfile) -> &'static str {
 /// label. Returns `None` for anything the adapter would never send, so an
 /// unrecognized value falls back to the daemon's own env rather than echoing
 /// arbitrary text into the trust readout.
+///
+/// Delegates to [`surface_profile_from_label`] — the single canonical str→enum
+/// parser — so a new [`SurfaceProfile`] variant is added in exactly one place;
+/// this label round-trip inherits it instead of drifting behind a private table.
 pub fn surface_label_from_str(value: &str) -> Option<&'static str> {
+    surface_profile_from_label(value).map(surface_profile_label)
+}
+
+/// HTTP header the front-end adapter stamps on every proxied daemon tool call
+/// with the surface actually served on THIS connection (D23).
+///
+/// Out-of-band from the tool params JSON on purpose: the params carry each
+/// tool's own typed input, one of which (`get_file_content`) is
+/// `#[serde(deny_unknown_fields)]` — an injected params key would make an older
+/// daemon's decode reject the call. A header degrades cleanly in BOTH version-
+/// skew directions: an old daemon never reads it, a new daemon falls back to its
+/// own env when an old adapter never sends it.
+pub const CONNECTION_SURFACE_HEADER: &str = "x-symforge-connection-surface";
+
+/// Map a canonical connection-surface label back to a [`SurfaceProfile`].
+///
+/// Mirrors [`surface_label_from_str`] but yields the profile the guard renderer
+/// needs. Returns `None` for anything an adapter would never send, so an
+/// unrecognized header falls back to the daemon's own env rather than trusting
+/// arbitrary text.
+pub fn surface_profile_from_label(value: &str) -> Option<SurfaceProfile> {
     match value {
-        "full" => Some("full"),
-        "meta" => Some("meta"),
-        "compact" => Some("compact"),
+        "full" => Some(SurfaceProfile::Full),
+        "meta" => Some(SurfaceProfile::Meta),
+        "compact" => Some(SurfaceProfile::Compact),
         _ => None,
+    }
+}
+
+tokio::task_local! {
+    /// Surface served on the connection whose proxied tool call the daemon is
+    /// currently rendering (D23). Bound for the duration of ONE daemon-side tool
+    /// dispatch by [`with_connection_surface`] from the adapter-supplied
+    /// [`CONNECTION_SURFACE_HEADER`]; unset on direct/daemon-less serving, where
+    /// this process's env IS the connection surface.
+    static CONNECTION_SURFACE: SurfaceProfile;
+}
+
+/// Surface to render surface-aware empty-index guards against: the proxied
+/// connection surface when a daemon-side proxied call is in flight, else this
+/// process's own env (`SYMFORGE_SURFACE`).
+///
+/// This is the D23 fix point. The empty-index recovery hint must name only
+/// tools callable on the AGENT's surface; in the daemon-proxy topology that is
+/// the adapter's surface, not the daemon process's env (a compact adapter proxied
+/// through a full-env daemon must not be told to call the gated `index_folder`).
+pub fn connection_surface_or_env() -> SurfaceProfile {
+    CONNECTION_SURFACE
+        .try_with(|profile| *profile)
+        .unwrap_or_else(|_| surface_profile_from_env())
+}
+
+/// Run `future` with the connection surface bound for a daemon-side proxied tool
+/// call. `None` (an older adapter, or an unrecognized header) leaves it unbound
+/// so [`connection_surface_or_env`] falls back to env — the pre-D23 behavior.
+///
+/// ponytail: bound to the FUTURE, not the thread — correct across the `.await`s
+/// the handler makes on its own task. Guards render inline in each handler, never
+/// in a `tokio::spawn`ed sub-task (task-locals do not propagate into those); if a
+/// future guard site is ever spawned, thread the profile explicitly instead.
+pub async fn with_connection_surface<F, T>(profile: Option<SurfaceProfile>, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match profile {
+        Some(profile) => CONNECTION_SURFACE.scope(profile, future).await,
+        None => future.await,
     }
 }
 
@@ -299,5 +366,42 @@ mod tests {
             probe_legacy_args: None,
         };
         assert!(resolve_facade_probe(&input).is_err());
+    }
+
+    #[test]
+    fn surface_profile_from_label_roundtrips_canonical_and_rejects_junk() {
+        assert_eq!(
+            surface_profile_from_label("full"),
+            Some(SurfaceProfile::Full)
+        );
+        assert_eq!(
+            surface_profile_from_label("compact"),
+            Some(SurfaceProfile::Compact)
+        );
+        assert_eq!(
+            surface_profile_from_label("meta"),
+            Some(SurfaceProfile::Meta)
+        );
+        // Non-canonical input (wrong case, arbitrary text, empty) must NOT resolve —
+        // it falls back to the daemon's own env instead of trusting adapter garbage.
+        assert_eq!(surface_profile_from_label("FULL"), None);
+        assert_eq!(surface_profile_from_label("nonsense"), None);
+        assert_eq!(surface_profile_from_label(""), None);
+    }
+
+    #[tokio::test]
+    async fn connection_surface_scope_binds_then_unbinds() {
+        // Inside the scope, the bound connection profile is what the guard renderer
+        // reads — regardless of this process's env.
+        let bound = with_connection_surface(Some(SurfaceProfile::Compact), async {
+            connection_surface_or_env()
+        })
+        .await;
+        assert_eq!(bound, SurfaceProfile::Compact);
+
+        // `None` leaves it unbound: `connection_surface_or_env` reads env, and reading
+        // an unset task-local must not panic (uses `try_with`, not `with`).
+        let unbound = with_connection_surface(None, async { connection_surface_or_env() }).await;
+        assert_eq!(unbound, surface_profile_from_env());
     }
 }
