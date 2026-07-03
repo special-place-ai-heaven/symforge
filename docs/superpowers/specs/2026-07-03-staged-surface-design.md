@@ -116,6 +116,14 @@ Both reviews returned **SOUND_WITH_REVISIONS**. The architecture survives; the p
 2. **Spike gate (§9):** (a) full `tools/list` acceptance test at each real target harness; (b) tips-follow-rate mined from the waves-1–3 dogfood transcripts (evidences or kills B5); (c) misroute / turns-to-first-evidence, full vs compact, on the existing corpus.
 3. **Gate verdict:** if no harness rejects `full` and selection quality holds → **`full` becomes the default**, `compact` stays as the escape hatch, and §3 is SHELVED as design-on-file. Staged is built only if the spike finds a genuinely constrained consumer — and then with every §8a reconciliation applied.
 
+**Gate RUN 2026-07-03** (`docs/reviews/2026-07-03-surface-spike-gate.md`): no
+harness rejected the full 36-tool list (measured: Claude Code, Codex CLI,
+Gemini CLI, Kilo CLI; inferred: Kilo ext, Claude Desktop; unknown: Cursor);
+full payload measured at 71.4 KB / ~16.1k tokens (~119 tokens on deferred
+harnesses); B5 (tips steer discovery) KILLED by base-rate-controlled mining of
+4,154 real calls. **Verdict: `full` default, `compact` escape hatch, staged
+stays shelved.**
+
 ## 8. Open questions (to resolve in planning)
 
 1. Does Claude Code re-read `tools/list` promptly on `listChanged` in current builds? (Determines whether `staged` is also viable there, or `full` remains its init default. Verify empirically.)
