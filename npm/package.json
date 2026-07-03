@@ -1,6 +1,6 @@
 {
   "name": "symforge",
-  "version": "8.10.3",
+  "version": "8.10.4",
   "description": "SymForge — in-memory code intelligence for Claude Code, Codex, and Gemini CLI",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -14,10 +14,10 @@
     "test": "node --test tests/*.test.js"
   },
   "optionalDependencies": {
-    "symforge-linux-x64": "8.10.3",
-    "symforge-macos-arm64": "8.10.3",
-    "symforge-macos-x64": "8.10.3",
-    "symforge-windows-x64": "8.10.3"
+    "symforge-linux-x64": "8.10.4",
+    "symforge-macos-arm64": "8.10.4",
+    "symforge-macos-x64": "8.10.4",
+    "symforge-windows-x64": "8.10.4"
   },
   "files": [
     "bin/",

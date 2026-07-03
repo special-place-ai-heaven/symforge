@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.10.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.3...v8.10.4) (2026-07-03)
+
+
+### Bug Fixes
+
+* **init:** stop wiping user MCP config on re-registration, write explicit coherent surface (G-036) ([ae62ebc](https://github.com/special-place-ai-heaven/symforge/commit/ae62ebc6e2f2740e528fab102d6d3dfa074a6e87))
+
 ## [8.10.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.2...v8.10.3) (2026-07-03)
 
 
