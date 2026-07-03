@@ -9777,7 +9777,24 @@ impl SymForgeServer {
         // local `self.index` when there is no daemon (embed/local) or the daemon
         // is unreachable (degraded fallback, where `ensure_local_index` has
         // populated `self.index`).
-        if let Some(result) = self.proxy_tool_call("status", &params.0).await {
+        //
+        // Thread THIS adapter's served surface into the proxied request so the
+        // daemon reports the surface actually served on this connection — not the
+        // daemon process's own env, which may differ (dogfood defect: a full-env
+        // adapter proxied through a compact-env daemon rendered `surface:
+        // compact`). The adapter is the authority, so OVERWRITE any client value;
+        // the daemon prefers this field and falls back to its own env for older
+        // adapters (backward compat via `#[serde(default)]` on
+        // `connection_surface`). The same request drives the daemon-less fallback
+        // below, where env IS the connection surface, so output is unchanged.
+        let mut request = params.0.clone();
+        request.connection_surface = Some(
+            super::surface_probe::surface_profile_label(
+                super::surface_probe::surface_profile_from_env(),
+            )
+            .to_string(),
+        );
+        if let Some(result) = self.proxy_tool_call("status", &request).await {
             // D2-ROOT: the daemon worker owns the populated INDEX but has an EMPTY
             // session ledger + NO durable store, so its proxied body reads
             // `ledger_events: 0`, `last_ledger_*: none`, `durable_ledger:
@@ -9796,7 +9813,7 @@ impl SymForgeServer {
             return statused_tool_result(body, OutcomeClass::Found);
         }
 
-        let body = self.render_stel_status_body(&params.0);
+        let body = self.render_stel_status_body(&request);
         statused_tool_result(body, OutcomeClass::Found)
     }
 
@@ -9837,13 +9854,29 @@ impl SymForgeServer {
             None
         };
 
-        // Report the ACTIVE surface, not a hardcoded label (Wave 1 Fix 4): now
-        // that `status` runs on `SYMFORGE_SURFACE=full` too, claiming `compact`
-        // would be a lie. Reads the same env the dispatch gate reads.
-        let surface_label = match super::surface_probe::surface_profile_from_env() {
-            super::surface_probe::SurfaceProfile::Full => "full",
-            super::surface_probe::SurfaceProfile::Meta => "meta",
-            super::surface_probe::SurfaceProfile::Compact => "compact",
+        // Report the surface actually served on THIS connection. In the daemon-
+        // proxy topology that is the ADAPTER's profile, threaded in via
+        // `request.connection_surface`; this daemon process's own env may differ
+        // (a full-env adapter serves legacy tools through a compact-env daemon).
+        // Prefer the connection profile when present and recognized; fall back to
+        // this process's env for direct/daemon-less serving and for older
+        // adapters that predate the field (backward compat via `#[serde(default)]`).
+        let env_label = super::surface_probe::surface_profile_label(
+            super::surface_probe::surface_profile_from_env(),
+        );
+        let (surface_label, daemon_env_surface) = match request
+            .connection_surface
+            .as_deref()
+            .and_then(super::surface_probe::surface_label_from_str)
+        {
+            // Honest divergence disclosure: the connection serves `conn` while
+            // this daemon's env resolves `env_label`. Report the connection truth
+            // and name the daemon's own env on one line (see
+            // `format_compact_status`), so a cross-process mismatch is never a
+            // silent lie.
+            Some(conn) if conn != env_label => (conn, Some(env_label)),
+            Some(conn) => (conn, None),
+            None => (env_label, None),
         };
 
         let guard = self.index.read();
@@ -9881,6 +9914,11 @@ impl SymForgeServer {
         if let Some(verdict) = self.durable_calibration_verdict() {
             ctx = ctx.with_calibration_verdict(verdict);
         }
+
+        // Attach the daemon-env divergence (proxy topology only); `None` on
+        // same-env and direct serving so the disclosure line appears strictly on
+        // divergence.
+        ctx.daemon_env_surface = daemon_env_surface;
 
         let body = crate::stel::format_stel_status(request, &ctx);
         match reset_note {
@@ -10554,6 +10592,7 @@ mod tests {
         server.render_stel_status_body(&crate::stel::StelStatusRequest {
             detail: Some(crate::stel::StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         })
     }
 
@@ -10644,6 +10683,7 @@ mod tests {
             &crate::stel::StelStatusRequest {
                 detail: None,
                 reset_calibration: None,
+                connection_surface: None,
             },
         );
         assert!(
@@ -10731,6 +10771,7 @@ mod tests {
         let bare_body = bare.render_stel_status_body(&StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         });
         let bare_overlaid =
             super::overlay_proxy_status_lines(bare_body, &bare.proxy_owned_status_lines());
@@ -10774,6 +10815,7 @@ mod tests {
         let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
             detail: Some(crate::stel::StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         });
         let expected = format!(
             "calibration: accumulating ({}/{})",
@@ -10833,6 +10875,7 @@ mod tests {
         let body = proxy.render_stel_status_body(&crate::stel::StelStatusRequest {
             detail: Some(crate::stel::StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         });
         assert!(
             body.contains("durable_ledger: disabled"),
@@ -11098,6 +11141,83 @@ mod tests {
         assert!(
             output.contains("surface: full"),
             "status must self-describe the active (full) surface:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_connection_surface_and_discloses_daemon_env_divergence() {
+        // Dogfood defect (2026-07-02): a full-surface stdio ADAPTER proxies
+        // `status` to a compact-env DAEMON. The daemon must report the surface
+        // actually served on the connection (`full`, threaded in via
+        // `connection_surface`) — NOT its own env (`compact`) — and disclose the
+        // divergence on one line. Exercises the daemon-side handler directly;
+        // in-process the adapter and daemon share env, so divergence is only
+        // reachable by hand-threading the connection profile.
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let (key, file) = make_file("src/lib.rs", b"fn core() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let request = crate::stel::StelStatusRequest {
+            connection_surface: Some("full".to_string()),
+            ..Default::default()
+        };
+        let body = server.render_stel_status_body(&request);
+
+        assert!(
+            body.contains("surface: full"),
+            "status must report the surface served on the connection (full):\n{body}"
+        );
+        assert!(
+            body.contains("daemon_env_surface: compact (serving connection: full)"),
+            "status must disclose the daemon/connection surface divergence:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_without_connection_surface_falls_back_to_env() {
+        // Backward compat: an OLD adapter sends no `connection_surface`. The
+        // daemon falls back to its own env (`compact`) and adds NO divergence
+        // line — byte-identical to pre-fix behavior.
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let (key, file) = make_file("src/lib.rs", b"fn core() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let body = server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
+
+        assert!(
+            body.contains("surface: compact"),
+            "absent connection surface must fall back to env (compact):\n{body}"
+        );
+        assert!(
+            !body.contains("daemon_env_surface:"),
+            "no divergence line without a connection surface:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_same_env_and_connection_surface_has_no_divergence_line() {
+        // Same-env path: connection `full` + daemon env `full`. Report `full`
+        // with NO divergence line (divergence discloses strictly on mismatch).
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "full");
+
+        let (key, file) = make_file("src/lib.rs", b"fn core() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let request = crate::stel::StelStatusRequest {
+            connection_surface: Some("full".to_string()),
+            ..Default::default()
+        };
+        let body = server.render_stel_status_body(&request);
+
+        assert!(
+            body.contains("surface: full"),
+            "matching connection+env must report full:\n{body}"
+        );
+        assert!(
+            !body.contains("daemon_env_surface:"),
+            "no divergence line when connection matches env:\n{body}"
         );
     }
 

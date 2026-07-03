@@ -288,6 +288,57 @@ pub fn run(args: AdminCliArgs) -> anyhow::Result<()> {
         "Browser: {:?} — open {}",
         outcome.browser_outcome, outcome.session.dashboard_url
     );
+
+    // D21: a freshly-started operator server runs on a background thread that
+    // dies the moment this process exits — so `admin` must stay in the
+    // foreground and keep serving until the operator stops it, or the URL we
+    // just printed is dead the instant we return. A reused server is owned by
+    // another process, so that path returns immediately (exit 0).
+    serve_foreground_if_started(&outcome, block_until_ctrl_c)
+}
+
+/// Operator-facing notice printed on the fresh-start (non-reused) path right
+/// before `symforge admin` blocks in the foreground. Without it a fresh start
+/// reads as a frozen terminal (a dogfood defect). Never printed on the reuse
+/// path, which returns immediately.
+pub(crate) const FOREGROUND_SERVE_NOTICE: &str =
+    "Serving the operator dashboard in the foreground — press Ctrl-C to stop.";
+
+/// Keep `symforge admin` in the foreground when it STARTED the operator server,
+/// so the printed dashboard URL actually keeps serving (D21). A reused server is
+/// owned by another process, so this returns immediately (exit 0); only a server
+/// we started ourselves must be kept alive here, blocking in `wait_for_shutdown`
+/// until the operator terminates the process (Ctrl-C in production).
+///
+/// Split from [`run`] so the reuse-vs-block decision is unit-testable with an
+/// injected waiter (the real waiter blocks until Ctrl-C, which a test cannot).
+fn serve_foreground_if_started(
+    outcome: &AdminOutcome,
+    wait_for_shutdown: impl FnOnce(&ServerSessionDescriptor) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if outcome.reused_server {
+        return Ok(());
+    }
+    eprintln!("{FOREGROUND_SERVE_NOTICE}");
+    wait_for_shutdown(&outcome.session)
+}
+
+/// Block the calling thread until the operator asks the process to stop (Ctrl-C
+/// on all platforms). Mirrors [`operator_server_reachable`]'s private
+/// current-thread runtime so it is callable from the plain synchronous CLI
+/// context without an ambient reactor — the operator server runs on its own
+/// thread + runtime, so this is a sibling runtime, never a nested one.
+///
+/// ponytail: on Ctrl-C the process exits promptly and the background serve
+/// thread is torn down best-effort — the operator dashboard is read-only (no
+/// writes to drain), so an abrupt stop is safe. If graceful drain ever matters,
+/// thread the serve thread's `JoinHandle` out of `start_operator_server` and
+/// join it here instead.
+fn block_until_ctrl_c(_session: &ServerSessionDescriptor) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(tokio::signal::ctrl_c())?;
     Ok(())
 }
 
@@ -591,5 +642,98 @@ mod tests {
         );
         assert_eq!(outcome.browser_outcome, BrowserOpenOutcome::Skipped);
         assert!(outcome.session.dashboard_url.ends_with("/admin"));
+    }
+
+    // --- D21: `admin` must keep serving after a fresh start (foreground) --------
+
+    #[test]
+    fn admin_keeps_serving_after_fresh_start_until_shutdown() {
+        // No server running -> run_admin starts one on a background thread.
+        // serve_foreground_if_started must then KEEP admin in the foreground (invoke
+        // the waiter), and while "blocked" the freshly-started server must be
+        // reachable AND STAY reachable. D21: pre-fix `run` returned immediately, so
+        // the serve thread died with the process and the printed URL was refused.
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        let ctx = ctx_over(home.path(), project.path());
+        let browser = NoopBrowserOpener::default();
+
+        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
+            .expect("admin should start a server when none runs");
+        assert!(!outcome.reused_server, "no server ran; must start one");
+
+        let waited = std::cell::Cell::new(false);
+        serve_foreground_if_started(&outcome, |session| {
+            waited.set(true);
+            // Probe twice with a gap: the started server must be serving now AND
+            // still serving a moment later — not fire-and-return (D21).
+            assert!(
+                operator_server_reachable(session.bound_addr, Duration::from_millis(500)),
+                "freshly-started server must be reachable while admin holds the foreground"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                operator_server_reachable(session.bound_addr, Duration::from_millis(500)),
+                "the started server must STAY reachable (D21: it must not die after start)"
+            );
+            Ok(())
+        })
+        .expect("foreground wait returns cleanly on shutdown");
+
+        assert!(
+            waited.get(),
+            "a freshly-started server must hold the foreground (D21 fix); pre-fix `run` returned immediately"
+        );
+
+        // Fix 1: the fresh branch prints `FOREGROUND_SERVE_NOTICE` unconditionally
+        // right before the waiter runs, so a fresh start is not a silent block.
+        // stderr capture is impractical in-lib, so pin the notice wording here; the
+        // `waited.get()` assertion above proves the fresh branch (which emits it)
+        // executed, and `admin_does_not_hold_foreground_when_reusing` proves the
+        // reuse branch returns before reaching the notice.
+        assert!(
+            FOREGROUND_SERVE_NOTICE.contains("Ctrl-C"),
+            "the foreground notice must tell the operator how to stop it"
+        );
+    }
+
+    #[test]
+    fn admin_does_not_hold_foreground_when_reusing() {
+        // A server already runs and the profile points at it -> reuse. The reuse
+        // path must NOT block: another process owns the server, so admin exits 0
+        // after opening the dashboard (required behavior #1).
+        let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let running =
+            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
+                .expect("operator server should come up");
+
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        OperatorSetupProfile::new(
+            InstallationType::Server,
+            running.bound_addr.port(),
+            AuthPosture::LoopbackNoKey,
+            &[],
+            1,
+        )
+        .save(project.path())
+        .expect("persist profile");
+
+        let ctx = ctx_over(home.path(), project.path());
+        let browser = NoopBrowserOpener::default();
+        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
+            .expect("admin should reuse the running server");
+        assert!(outcome.reused_server, "must reuse the running server");
+
+        let waited = std::cell::Cell::new(false);
+        serve_foreground_if_started(&outcome, |_session| {
+            waited.set(true);
+            Ok(())
+        })
+        .expect("reuse path returns cleanly");
+        assert!(
+            !waited.get(),
+            "reuse path must NOT hold the foreground — another process owns the server"
+        );
     }
 }

@@ -93,6 +93,13 @@ pub struct StelStatusContext<'a> {
     /// `Unavailable` on stdio/embed (no store wired); `Disabled { reason }` when
     /// a wired store failed to open or its query failed; `Durable` otherwise.
     pub durable_ledger: DurableLedgerState,
+    /// The daemon process's OWN env surface, present ONLY when it diverges from
+    /// the connection surface reported in `surface`. Set in the daemon-proxy
+    /// topology where a full-env adapter serves through a compact-env daemon (or
+    /// vice-versa); drives the single `daemon_env_surface: … (serving
+    /// connection: …)` disclosure line so a cross-process surface mismatch is
+    /// never silent. `None` on same-env and direct serving.
+    pub daemon_env_surface: Option<&'static str>,
 }
 
 impl<'a> StelStatusContext<'a> {
@@ -128,6 +135,7 @@ impl<'a> StelStatusContext<'a> {
             last_ledger_route,
             calibration,
             durable_ledger: DurableLedgerState::Unavailable,
+            daemon_env_surface: None,
         }
     }
 
@@ -283,7 +291,7 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
     // is the always-on in-memory cache (durable restart-survival state is
     // reported separately under `detail: full`). The blanket `active` literal
     // implied more than the surface can prove without probing.
-    let lines = vec![
+    let mut lines = vec![
         "── stel status ──".to_string(),
         format!("surface: {}", ctx.surface),
         format!("symforge_version: {}", ctx.version),
@@ -312,6 +320,20 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
         format!("superseded: {SUPERSEDED_ITEMS} (client agentic loop + find-fusion)"),
         "──".to_string(),
     ];
+    // Honest cross-process disclosure: when the surface served on this
+    // connection (`ctx.surface`) differs from the daemon process's own env,
+    // name the daemon's env right under the served surface. Set only in the
+    // daemon-proxy topology (a full-env adapter serving through a compact-env
+    // daemon, or vice-versa); absent on same-env and direct serving.
+    if let Some(env_label) = ctx.daemon_env_surface {
+        lines.insert(
+            2,
+            format!(
+                "daemon_env_surface: {env_label} (serving connection: {})",
+                ctx.surface
+            ),
+        );
+    }
     lines.join("\n")
 }
 
@@ -358,6 +380,7 @@ mod tests {
             last_ledger_route: Some("search_text".to_string()),
             calibration: summarize_calibration(&[]),
             durable_ledger: DurableLedgerState::Unavailable,
+            daemon_env_surface: None,
         }
     }
 
@@ -416,6 +439,7 @@ mod tests {
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
                 reset_calibration: None,
+                connection_surface: None,
             },
             &sample_context(),
         );
@@ -447,6 +471,7 @@ mod tests {
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
                 reset_calibration: None,
+                connection_surface: None,
             },
             &ctx,
         );
@@ -463,6 +488,7 @@ mod tests {
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
                 reset_calibration: None,
+                connection_surface: None,
             },
             &sample_context(),
         );
@@ -483,6 +509,7 @@ mod tests {
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
                 reset_calibration: None,
+                connection_surface: None,
             },
             &ctx,
         );

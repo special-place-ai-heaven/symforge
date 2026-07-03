@@ -221,6 +221,32 @@ pub struct StelStatusRequest {
     /// cleared. No-op on a build/surface with no durable store wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_calibration: Option<bool>,
+    /// Surface actually served on the connection this request arrived on, as a
+    /// canonical label (`full`/`compact`/`meta`; see
+    /// [`crate::protocol::surface_probe::surface_profile_label`]). The stdio
+    /// ADAPTER sets this to its OWN `surface_profile_from_env()` before proxying
+    /// `status` to the warm daemon, so the daemon reports the surface truly
+    /// served here — not the daemon process's own env, which may differ (a
+    /// full-env adapter serves legacy tools through a compact-env daemon). Scope
+    /// of the anti-spoof guarantee: on the stdio-ADAPTER path the adapter
+    /// overwrites this unconditionally, so a client value never survives; on a
+    /// DIRECT daemon `/mcp` attach the daemon cannot distinguish proxy from
+    /// direct, so the value is client-supplied and only label-validated (see
+    /// [`crate::protocol::surface_probe::surface_label_from_str`]) —
+    /// cosmetic-only: it can skew this readout's surface LABEL but no gate reads
+    /// it. `None` = direct/
+    /// daemon-less serving OR an older adapter predating this field; either way
+    /// the daemon falls back to its own env (unchanged behavior). Internal proxy
+    /// field: hidden from the advertised tool schema (`#[schemars(skip)]`, so it
+    /// stays out of the compact H1 byte budget) and wired under
+    /// `_connection_surface`, mirroring the `_probe_*` fields above.
+    #[serde(
+        default,
+        rename = "_connection_surface",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(skip)]
+    pub connection_surface: Option<String>,
 }
 
 /// Index file reference driving manual-baseline estimation.

@@ -70,6 +70,7 @@ fn render_full_status() -> String {
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         },
         &ctx,
     )
@@ -96,6 +97,7 @@ fn render_full_status_with_durable(state: symforge::stel::DurableLedgerState) ->
         &StelStatusRequest {
             detail: Some(StelStatusDetail::Full),
             reset_calibration: None,
+            connection_surface: None,
         },
         &ctx,
     )
@@ -408,6 +410,7 @@ fn full_status_calibration_section_is_honest_for_each_verdict() {
             &StelStatusRequest {
                 detail: Some(StelStatusDetail::Full),
                 reset_calibration: None,
+                connection_surface: None,
             },
             &ctx,
         )

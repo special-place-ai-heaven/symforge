@@ -36,6 +36,32 @@ pub fn surface_profile_from_env() -> SurfaceProfile {
     }
 }
 
+/// Canonical lowercase label (`full`/`compact`/`meta`) for a surface profile.
+///
+/// Single source of the wording used by the `status` readout AND threaded across
+/// the adapter→daemon proxy boundary, so both processes agree on the exact
+/// string (see `StelStatusRequest::connection_surface`).
+pub fn surface_profile_label(profile: SurfaceProfile) -> &'static str {
+    match profile {
+        SurfaceProfile::Full => "full",
+        SurfaceProfile::Meta => "meta",
+        SurfaceProfile::Compact => "compact",
+    }
+}
+
+/// Map a proxy-threaded connection-surface string back to a canonical static
+/// label. Returns `None` for anything the adapter would never send, so an
+/// unrecognized value falls back to the daemon's own env rather than echoing
+/// arbitrary text into the trust readout.
+pub fn surface_label_from_str(value: &str) -> Option<&'static str> {
+    match value {
+        "full" => Some("full"),
+        "meta" => Some("meta"),
+        "compact" => Some("compact"),
+        _ => None,
+    }
+}
+
 /// Central compact-surface dispatch gate (P1-A / FR-008 enforcement).
 ///
 /// `tools/list` already hides legacy tools on the compact surface, but hiding is
