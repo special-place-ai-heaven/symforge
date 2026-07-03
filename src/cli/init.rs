@@ -476,46 +476,6 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__symforge_edit",
 ];
 
-const KILO_ALWAYS_ALLOW: &[&str] = &[
-    "health",
-    "health_compact",
-    "checkpoint_now",
-    "index_folder",
-    "validate_file_syntax",
-    "get_repo_map",
-    "get_file_content",
-    "search_symbols",
-    "search_text",
-    "search_files",
-    "get_file_context",
-    "get_symbol",
-    "get_symbol_context",
-    "find_references",
-    "find_dependents",
-    "inspect_match",
-    "what_changed",
-    "analyze_file_impact",
-    "diff_symbols",
-    "detect_impact",
-    "explore",
-    "replace_symbol_body",
-    "edit_within_symbol",
-    "insert_symbol",
-    "delete_symbol",
-    "batch_edit",
-    "batch_insert",
-    "batch_rename",
-    "ask",
-    "conventions",
-    "edit_plan",
-    "context_inventory",
-    "investigation_suggest",
-    "symforge_retrieve",
-    "status",
-    "symforge",
-    "symforge_edit",
-];
-
 const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "health",
     "health_compact",
@@ -682,6 +642,70 @@ fn merge_event_entries(
     hooks.insert(event_key.to_string(), Value::Array(retained));
 }
 
+// ---------------------------------------------------------------------------
+// Shared JSON MCP-entry merge helpers (G-036 init/update coherence)
+// ---------------------------------------------------------------------------
+//
+// Every JSON harness (Claude Code, Claude Desktop, Cursor, Gemini, Kilo) writes
+// its `mcpServers.symforge` entry through these. Invariant: re-registration
+// (e.g. `symforge update` -> `symforge init --client all`) REFRESHES the managed
+// launcher path but never clobbers a user-set env value, allowlist entry, or
+// unknown field. The 8.10.1 update wiped `SYMFORGE_SURFACE=full`; merging into
+// the existing object in place instead of replacing it kills that defect class.
+
+/// Get (or create) the `mcpServers.symforge` entry as a mutable object so
+/// callers merge INTO the existing entry rather than replacing it wholesale.
+fn symforge_json_entry_mut(config: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !config["mcpServers"].is_object() {
+        config["mcpServers"] = json!({});
+    }
+    let servers = config["mcpServers"]
+        .as_object_mut()
+        .expect("mcpServers is an object");
+    let slot = servers.entry("symforge").or_insert_with(|| json!({}));
+    if !slot.is_object() {
+        *slot = json!({});
+    }
+    slot.as_object_mut().expect("symforge entry is an object")
+}
+
+/// Insert each `(key, value)` env default into the entry's `env` object ONLY
+/// when the key is absent — a present env key's value is preserved verbatim.
+fn insert_env_defaults(entry: &mut serde_json::Map<String, Value>, defaults: &[(&str, &str)]) {
+    if defaults.is_empty() {
+        return;
+    }
+    if !entry.get("env").map(Value::is_object).unwrap_or(false) {
+        entry.insert("env".to_string(), json!({}));
+    }
+    let env = entry
+        .get_mut("env")
+        .and_then(Value::as_object_mut)
+        .expect("env is an object");
+    for (key, val) in defaults {
+        env.entry((*key).to_string())
+            .or_insert_with(|| Value::String((*val).to_string()));
+    }
+}
+
+/// Union `names` into the entry's `key` array (e.g. `alwaysAllow`), preserving
+/// order and every user-added entry — names already present are not duplicated.
+fn union_allow_names(entry: &mut serde_json::Map<String, Value>, key: &str, names: &[&str]) {
+    if !entry.get(key).map(Value::is_array).unwrap_or(false) {
+        entry.insert(key.to_string(), json!([]));
+    }
+    let arr = entry
+        .get_mut(key)
+        .and_then(Value::as_array_mut)
+        .expect("allow list is an array");
+    for name in names {
+        let val = Value::String((*name).to_string());
+        if !arr.contains(&val) {
+            arr.push(val);
+        }
+    }
+}
+
 /// Register symforge as an MCP server in `~/.claude.json` using the absolute binary path.
 ///
 /// This ensures Claude Code launches the native binary directly — no shell, no .cmd wrapper,
@@ -701,21 +725,18 @@ pub fn register_mcp_server(
     // Use backslashes on Windows for the command path (Claude Code spawns natively, not via shell).
     let command_path = native_command_path(binary_path);
 
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
-    }
-
-    let always_allow: Vec<Value> = CLAUDE_ALWAYS_ALLOW
-        .iter()
-        .map(|s| Value::String(s.to_string()))
-        .collect();
-
-    config["mcpServers"]["symforge"] = json!({
-        "command": command_path,
-        "args": [],
-        "disabled": false,
-        "alwaysAllow": always_allow
-    });
+    let entry = symforge_json_entry_mut(&mut config);
+    // Refresh the managed launcher path; preserve every other user-set field.
+    entry.insert("command".to_string(), Value::String(command_path));
+    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    entry
+        .entry("disabled".to_string())
+        .or_insert_with(|| Value::Bool(false));
+    // Claude Code has native deferred tool loading, so pin the full surface —
+    // this makes the 37-name allowlist coherent (spec §4). Never clobber a
+    // user-set value (the 8.10.1 SYMFORGE_SURFACE=full wipe).
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(claude_json_path, pretty)
@@ -758,10 +779,6 @@ fn register_claude_desktop_mcp_server_with_home(
         json!({})
     };
 
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
-    }
-
     let desktop_binary_path =
         desktop_binary_for_registration(std::path::Path::new(binary_path), home_dir)?;
     let desktop_binary_path_str = desktop_binary_path.display().to_string();
@@ -794,23 +811,17 @@ fn register_claude_desktop_mcp_server_with_home(
     //    populates the index even when the launcher CWD is unusable. Only set
     //    when a real root was discovered (the server validates it again at
     //    startup via the same trust-boundary guard).
-    let mut env = serde_json::Map::new();
-    env.insert(
-        "SYMFORGE_SURFACE".to_string(),
-        Value::String("compact".to_string()),
-    );
+    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "compact")];
     if let Some(root) = workspace_root_str.as_deref() {
-        env.insert(
-            crate::discovery::WORKSPACE_ROOT_ENV.to_string(),
-            Value::String(root.to_string()),
-        );
+        env_defaults.push((crate::discovery::WORKSPACE_ROOT_ENV, root));
     }
 
-    config["mcpServers"]["symforge"] = json!({
-        "command": command_path,
-        "args": [],
-        "env": Value::Object(env)
-    });
+    let entry = symforge_json_entry_mut(&mut config);
+    // Refresh the managed launcher path; preserve every other user-set field,
+    // including a user-set env value or an existing SYMFORGE_WORKSPACE_ROOT.
+    entry.insert("command".to_string(), Value::String(command_path));
+    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    insert_env_defaults(entry, &env_defaults);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(desktop_config_path, pretty)
@@ -981,29 +992,52 @@ fn merge_symforge_codex_server_for_target_os(
         .expect("symforge server entry must be a table");
 
     symforge["command"] = value(native_command_path(binary_path));
-    symforge["startup_timeout_sec"] = value(CODEX_STARTUP_TIMEOUT_SEC);
-    symforge["tool_timeout_sec"] = value(CODEX_TOOL_TIMEOUT_SEC);
+    // Preserve user-tuned timeouts on re-registration (same wipe class as the
+    // G-036 env wipe); only seed defaults when absent.
+    symforge
+        .entry("startup_timeout_sec")
+        .or_insert(value(CODEX_STARTUP_TIMEOUT_SEC));
+    symforge
+        .entry("tool_timeout_sec")
+        .or_insert(value(CODEX_TOOL_TIMEOUT_SEC));
     merge_codex_mcp_env_overrides(symforge, target_os);
 
-    let mut allow_array = Array::new();
-    for tool_name in SYMFORGE_TOOL_NAMES {
-        // Codex uses plain tool names without mcp__ prefix
-        let short_name = tool_name
-            .strip_prefix("mcp__symforge__")
-            .unwrap_or(tool_name);
-        allow_array.push(short_name);
-    }
-    symforge["allowed_tools"] = value(allow_array);
+    merge_codex_allowed_tools(symforge);
 
     merge_codex_project_doc_fallbacks(config);
 }
 
-fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
-    let overrides = codex_mcp_env_overrides_for_target_os(target_os);
-    if overrides.is_empty() {
-        return;
+/// Union the compact-surface tool names into Codex's `allowed_tools`,
+/// preserving any user-added entries. Codex strips the `mcp__symforge__` prefix,
+/// so the compact short names (`symforge`, `symforge_edit`, `status`) are what
+/// the served surface actually exposes — the allowlist matches the surface.
+fn merge_codex_allowed_tools(symforge: &mut Table) {
+    let mut names: Vec<String> = symforge
+        .get("allowed_tools")
+        .and_then(|item| item.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for name in crate::stel::COMPACT_TOOL_NAMES {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
     }
 
+    let mut allow_array = Array::new();
+    for name in &names {
+        allow_array.push(name.as_str());
+    }
+    symforge["allowed_tools"] = value(allow_array);
+}
+
+fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
+    // Ensure an env table exists — SYMFORGE_SURFACE is written on every OS, not
+    // only where an OS override applies.
     if !symforge.contains_key("env") || !symforge["env"].is_table_like() {
         symforge["env"] = Item::Table(Table::new());
     }
@@ -1012,7 +1046,13 @@ fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
         .as_table_like_mut()
         .expect("symforge env must be a table or inline table");
 
-    for (name, env_value) in overrides {
+    // Make the served compact surface explicit, but never clobber a user-set
+    // value (G-036: the 8.10.1 update wiped SYMFORGE_SURFACE=full).
+    if env.get("SYMFORGE_SURFACE").is_none() {
+        env.insert("SYMFORGE_SURFACE", value("compact"));
+    }
+
+    for (name, env_value) in codex_mcp_env_overrides_for_target_os(target_os) {
         env.insert(name, value(*env_value));
     }
 }
@@ -1072,15 +1112,18 @@ pub fn register_gemini_mcp_server(
 
     let command_path = native_command_path(binary_path);
 
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
-    }
-    config["mcpServers"]["symforge"] = json!({
-        "command": command_path,
-        "args": [],
-        "timeout": 120000,
-        "trust": true
-    });
+    let entry = symforge_json_entry_mut(&mut config);
+    // Refresh the managed launcher path; preserve every other user-set field.
+    entry.insert("command".to_string(), Value::String(command_path));
+    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    entry
+        .entry("timeout".to_string())
+        .or_insert_with(|| json!(120000));
+    entry
+        .entry("trust".to_string())
+        .or_insert_with(|| Value::Bool(true));
+    // Gemini CLI has no deferred loading — make the compact surface explicit.
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "compact")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(gemini_settings_path, pretty)
@@ -1112,21 +1155,17 @@ pub fn register_kilo_mcp_server(
 
     let command_path = native_command_path(binary_path);
 
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
-    }
-
-    let always_allow: Vec<Value> = KILO_ALWAYS_ALLOW
-        .iter()
-        .map(|s| Value::String(s.to_string()))
-        .collect();
-
-    config["mcpServers"]["symforge"] = json!({
-        "command": command_path,
-        "args": [],
-        "disabled": false,
-        "alwaysAllow": always_allow
-    });
+    let entry = symforge_json_entry_mut(&mut config);
+    // Refresh the managed launcher path; preserve every other user-set field.
+    entry.insert("command".to_string(), Value::String(command_path));
+    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    entry
+        .entry("disabled".to_string())
+        .or_insert_with(|| Value::Bool(false));
+    // Kilo has no deferred loading — serve the compact 3-tool facade and grant
+    // exactly those names so the allowlist matches the served surface (spec §4).
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "compact")]);
+    union_allow_names(entry, "alwaysAllow", &crate::stel::COMPACT_TOOL_NAMES);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(kilo_config_path, pretty)
@@ -1161,10 +1200,6 @@ pub fn register_cursor_mcp_server(
         json!({})
     };
 
-    if !config["mcpServers"].is_object() {
-        config["mcpServers"] = json!({});
-    }
-
     let command_path = native_command_path(binary_path);
 
     // Discover the operator's workspace at install time (same rationale as
@@ -1172,29 +1207,25 @@ pub fn register_cursor_mcp_server(
     let workspace_root = crate::discovery::find_project_root();
     let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
 
-    let mut env = serde_json::Map::new();
-    env.insert(
-        "SYMFORGE_SURFACE".to_string(),
-        Value::String("compact".to_string()),
-    );
+    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "compact")];
     if let Some(root) = workspace_root_str.as_deref() {
-        env.insert(
-            crate::discovery::WORKSPACE_ROOT_ENV.to_string(),
-            Value::String(root.to_string()),
-        );
+        env_defaults.push((crate::discovery::WORKSPACE_ROOT_ENV, root));
     }
 
-    let mut server = json!({
-        "command": command_path,
-        "args": [],
-        "env": Value::Object(env),
-    });
+    let entry = symforge_json_entry_mut(&mut config);
+    // Refresh the managed launcher path; preserve every other user-set field,
+    // including a user-set env value, workspace root, or `cwd`.
+    entry.insert("command".to_string(), Value::String(command_path));
+    entry.entry("args".to_string()).or_insert_with(|| json!([]));
+    insert_env_defaults(entry, &env_defaults);
     // Cursor honors a per-server `cwd`; point it at the discovered workspace so
-    // the launch CWD is the project, not the home directory.
+    // the launch CWD is the project, not the home directory. Preserve an
+    // existing user-set `cwd`.
     if let Some(root) = workspace_root_str.as_deref() {
-        server["cwd"] = Value::String(root.to_string());
+        entry
+            .entry("cwd".to_string())
+            .or_insert_with(|| Value::String(root.to_string()));
     }
-    config["mcpServers"]["symforge"] = server;
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(cursor_config_path, pretty)
@@ -1975,10 +2006,6 @@ mod tests {
             "Codex/client allow list should not grant retired trace_symbol alias"
         );
         assert!(
-            !KILO_ALWAYS_ALLOW.contains(&"trace_symbol"),
-            "Kilo allow list should not grant retired trace_symbol alias"
-        );
-        assert!(
             !CLAUDE_ALWAYS_ALLOW.contains(&"trace_symbol"),
             "Claude allow list should not grant retired trace_symbol alias"
         );
@@ -1989,10 +2016,6 @@ mod tests {
         assert!(
             SYMFORGE_TOOL_NAMES.contains(&"mcp__symforge__health_compact"),
             "Codex/client allow list should grant health_compact when conformance exposes it"
-        );
-        assert!(
-            KILO_ALWAYS_ALLOW.contains(&"health_compact"),
-            "Kilo allow list should grant health_compact when conformance exposes it"
         );
         assert!(
             CLAUDE_ALWAYS_ALLOW.contains(&"health_compact"),
@@ -2011,22 +2034,20 @@ mod tests {
             .collect();
 
         // SYMFORGE_TOOL_NAMES carries the `mcp__symforge__` prefix; strip it to compare.
-        let codex: BTreeSet<String> = SYMFORGE_TOOL_NAMES
+        // It backs the Claude Code settings.json `allowedTools` union (the full
+        // surface). Kilo/Codex intentionally grant only the compact names now
+        // (see the coherence tests), so they are not compared against the full
+        // surface here.
+        let full: BTreeSet<String> = SYMFORGE_TOOL_NAMES
             .iter()
             .map(|n| n.trim_start_matches("mcp__symforge__").to_string())
             .collect();
         assert_eq!(
-            codex, registered,
-            "SYMFORGE_TOOL_NAMES (Codex/Claude client allow list) must match the registered MCP tool \
-             surface exactly — a registered tool missing here means clients prompt for permission on \
-             every call; a stale entry grants a retired tool. Update the allow list when the tool \
-             surface changes."
-        );
-
-        let kilo: BTreeSet<String> = KILO_ALWAYS_ALLOW.iter().map(|n| n.to_string()).collect();
-        assert_eq!(
-            kilo, registered,
-            "KILO_ALWAYS_ALLOW must match the registered MCP tool surface exactly"
+            full, registered,
+            "SYMFORGE_TOOL_NAMES (Claude settings.json allowedTools union) must match the registered \
+             MCP tool surface exactly — a registered tool missing here means clients prompt for \
+             permission on every call; a stale entry grants a retired tool. Update the allow list \
+             when the tool surface changes."
         );
 
         let claude: BTreeSet<String> = CLAUDE_ALWAYS_ALLOW.iter().map(|n| n.to_string()).collect();
@@ -2068,25 +2089,312 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         register_codex_mcp_server(&config_path, "/usr/bin/symforge").unwrap();
         let content = std::fs::read_to_string(&config_path).unwrap();
+        // G-036 coherence: Codex serves the compact surface, so its allowlist
+        // grants exactly the compact facade names — nothing more.
         assert!(
-            content.contains("search_symbols"),
-            "should contain tool names: {content}"
+            content.contains("allowed_tools = [\"symforge\", \"symforge_edit\", \"status\"]"),
+            "Codex allow list must be exactly the compact facade names: {content}"
         );
         assert!(
-            content.contains("get_file_content"),
-            "should contain canonical raw-read tool: {content}"
-        );
-        assert!(
-            content.contains("get_file_context"),
-            "should contain canonical context tool: {content}"
+            !content.contains("\"search_symbols\""),
+            "Codex allow list must not grant full-surface tools when serving compact: {content}"
         );
         assert!(
             !content.contains("trace_symbol"),
             "Codex allow list must not include retired trace_symbol alias: {content}"
         );
         assert!(
+            content.contains("SYMFORGE_SURFACE = \"compact\""),
+            "Codex env must make the compact surface explicit: {content}"
+        );
+        assert!(
             content.contains("project_doc_fallback_filenames = [\"AGENTS.md\", \"CLAUDE.md\"]"),
             "should register both AGENTS.md and CLAUDE.md as project doc fallbacks: {content}"
+        );
+    }
+
+    // -- G-036 init/update coherence regression tests -----------------------
+
+    #[test]
+    fn test_claude_code_fresh_registration_is_coherent_full_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        register_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &config["mcpServers"]["symforge"];
+        assert_eq!(
+            entry["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("full"),
+            "fresh Claude Code registration must pin the full surface: {entry}"
+        );
+        let allow = entry["alwaysAllow"].as_array().unwrap();
+        assert_eq!(
+            allow.len(),
+            CLAUDE_ALWAYS_ALLOW.len(),
+            "the allowlist must match the full surface it serves: {entry}"
+        );
+    }
+
+    #[test]
+    fn test_reregistration_preserves_user_set_surface_both_directions() {
+        // Direction 1: user pinned compact on Claude Code (fresh default full).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/old/symforge",
+                        "env": {"SYMFORGE_SURFACE": "compact"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_mcp_server(&path, "/new/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("compact"),
+            "re-registration must NOT downgrade a user-set surface (the 8.10.1 wipe)"
+        );
+
+        // Direction 2: user pinned full on a compact-default harness (Kilo).
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("mcp.json");
+        std::fs::write(
+            &path2,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/old/symforge",
+                        "env": {"SYMFORGE_SURFACE": "full"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_kilo_mcp_server(&path2, "/new/symforge").unwrap();
+        let config2: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
+        assert_eq!(
+            config2["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("full"),
+            "re-registration must preserve a user-set full surface on a compact harness"
+        );
+    }
+
+    #[test]
+    fn test_reregistration_preserves_unknown_fields_and_updates_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/old/symforge",
+                        "userField": "keep-me",
+                        "env": {"MY_CUSTOM_ENV": "keep-me-too"},
+                        "alwaysAllow": ["my_custom_tool"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_mcp_server(&path, "/new/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &config["mcpServers"]["symforge"];
+        assert_eq!(
+            entry["userField"].as_str(),
+            Some("keep-me"),
+            "unknown user field must survive re-registration: {entry}"
+        );
+        assert_eq!(
+            entry["env"]["MY_CUSTOM_ENV"].as_str(),
+            Some("keep-me-too"),
+            "unknown user env key must survive re-registration: {entry}"
+        );
+        let allow: Vec<&str> = entry["alwaysAllow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            allow.contains(&"my_custom_tool"),
+            "user-added allowlist entries must never be dropped (union): {entry}"
+        );
+        let expected_command = if cfg!(windows) {
+            "\\new\\symforge"
+        } else {
+            "/new/symforge"
+        };
+        assert_eq!(
+            entry["command"].as_str(),
+            Some(expected_command),
+            "re-registration must refresh the launcher command path: {entry}"
+        );
+    }
+
+    #[test]
+    fn test_cursor_reregistration_preserves_existing_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/old/symforge",
+                        "env": {
+                            "SYMFORGE_SURFACE": "compact",
+                            "SYMFORGE_WORKSPACE_ROOT": "/user/pinned/workspace"
+                        },
+                        "cwd": "/user/pinned/workspace"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_cursor_mcp_server(&path, "/new/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &config["mcpServers"]["symforge"];
+        assert_eq!(
+            entry["env"][crate::discovery::WORKSPACE_ROOT_ENV].as_str(),
+            Some("/user/pinned/workspace"),
+            "existing workspace root must NOT be overwritten by rediscovery: {entry}"
+        );
+        assert_eq!(
+            entry["cwd"].as_str(),
+            Some("/user/pinned/workspace"),
+            "existing cwd must be preserved: {entry}"
+        );
+    }
+
+    #[test]
+    fn test_gemini_fresh_registration_pins_compact_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        register_gemini_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("compact"),
+            "fresh Gemini registration must make the compact surface explicit"
+        );
+    }
+
+    #[test]
+    fn test_kilo_fresh_registration_allowlist_is_exactly_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        register_kilo_mcp_server(&path, "/usr/bin/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let allow: Vec<&str> = config["mcpServers"]["symforge"]["alwaysAllow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(allow, vec!["symforge", "symforge_edit", "status"]);
+    }
+
+    #[test]
+    fn test_kilo_reregistration_unions_existing_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "symforge": {
+                        "command": "/old/symforge",
+                        "alwaysAllow": ["my_custom_tool"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        register_kilo_mcp_server(&path, "/new/symforge").unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let allow: Vec<&str> = config["mcpServers"]["symforge"]["alwaysAllow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            allow.contains(&"my_custom_tool"),
+            "user entry dropped: {allow:?}"
+        );
+        for name in ["symforge", "symforge_edit", "status"] {
+            assert!(
+                allow.contains(&name),
+                "missing compact name {name}: {allow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codex_fresh_registration_allowlist_is_exactly_compact() {
+        let mut config = DocumentMut::new();
+        merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "macos");
+        let content = config.to_string();
+        assert!(
+            content.contains("allowed_tools = [\"symforge\", \"symforge_edit\", \"status\"]"),
+            "fresh Codex allowlist must be exactly the compact names: {content}"
+        );
+        assert!(
+            content.contains("SYMFORGE_SURFACE = \"compact\""),
+            "fresh Codex env must pin the compact surface on every OS: {content}"
+        );
+    }
+
+    #[test]
+    fn test_codex_reregistration_unions_allowlist_and_preserves_surface() {
+        let mut config = r#"
+    [mcp_servers.symforge]
+    command = "/old/symforge"
+    startup_timeout_sec = 90
+    tool_timeout_sec = 900
+    allowed_tools = ["my_custom_tool"]
+
+    [mcp_servers.symforge.env]
+    SYMFORGE_SURFACE = "full"
+    "#
+        .parse::<DocumentMut>()
+        .unwrap();
+        merge_symforge_codex_server_for_target_os(&mut config, "/new/symforge", "macos");
+        let content = config.to_string();
+        assert!(
+            content.contains("my_custom_tool"),
+            "user-added Codex allow entry must never be dropped: {content}"
+        );
+        for name in ["\"symforge\"", "\"symforge_edit\"", "\"status\""] {
+            assert!(
+                content.contains(name),
+                "compact name {name} must be unioned in: {content}"
+            );
+        }
+        assert!(
+            content.contains("SYMFORGE_SURFACE = \"full\""),
+            "re-registration must preserve a user-set Codex surface: {content}"
+        );
+        assert!(
+            content.contains("startup_timeout_sec = 90")
+                && content.contains("tool_timeout_sec = 900"),
+            "re-registration must preserve user-tuned Codex timeouts: {content}"
+        );
+        assert!(
+            !content.contains("/old/symforge") && content.contains("symforge"),
+            "re-registration must still refresh the binary path: {content}"
         );
     }
 
