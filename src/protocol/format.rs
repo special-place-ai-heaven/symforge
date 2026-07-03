@@ -47,7 +47,7 @@ use crate::live_index::{
     SearchFilesResolveView, SearchFilesTier, SearchFilesView, SnapshotVerifyState,
     SymbolDetailView, TypeDependencyView, WhatChangedTimestampView, search,
 };
-use crate::protocol::surface_probe::{SurfaceProfile, surface_profile_from_env};
+use crate::protocol::surface_probe::{SurfaceProfile, connection_surface_or_env};
 use crate::{cli::hook::HookAdoptionSnapshot, sidecar::StatsSnapshot};
 
 const PARSE_QUARANTINE_ENTRY_LIMIT: usize = 10;
@@ -4871,15 +4871,22 @@ pub fn empty_index_recovery_hint(profile: SurfaceProfile) -> String {
     }
 }
 
-/// Empty-index guard message computed from the live `SYMFORGE_SURFACE` profile.
+/// Empty-index guard message computed from the surface served on THIS
+/// connection.
 ///
 /// Thin wrapper over [`empty_index_recovery_hint`] that resolves the active
-/// surface via [`surface_profile_from_env`]. Existing guard sites and the
+/// surface via [`connection_surface_or_env`]. Existing guard sites and the
 /// `loading_guard!` macro call this so the emitted message is always surface-
 /// aware without each site having to thread the profile by hand (N-5: one
 /// function, no residual hardcoded "Call index_folder" on a compact path).
+///
+/// D23: `connection_surface_or_env` reads the proxied connection surface when a
+/// daemon-side proxied tool call is in flight (bound from the adapter's
+/// `CONNECTION_SURFACE_HEADER`), else this process's env. This closes the
+/// adapter/daemon env-skew hole where a compact adapter proxied through a full-
+/// env daemon was handed a hint naming the gated `index_folder`.
 pub fn empty_guard_message() -> String {
-    empty_index_recovery_hint(surface_profile_from_env())
+    empty_index_recovery_hint(connection_surface_or_env())
 }
 
 /// Format a "Token Savings (this session)" section from a `StatsSnapshot`.

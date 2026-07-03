@@ -1646,7 +1646,20 @@ impl DaemonSessionClient {
                 self.base_url, self.session_id, tool_name
             ))
             .json(&params);
-        let response = apply_daemon_auth_header(request, self.auth_token.as_deref())
+        // D23: stamp the surface actually served on THIS adapter's connection so
+        // the daemon renders empty-index recovery hints for the AGENT's surface,
+        // not the daemon process's own env. This runs in the adapter process, so
+        // `surface_profile_from_env` here IS the connection surface. Set
+        // unconditionally at the proxy boundary — a stdio client cannot inject
+        // this header onto the adapter→daemon hop, so the adapter value is
+        // authoritative (D22 overwrite discipline; out-of-band header variant).
+        let request = apply_daemon_auth_header(request, self.auth_token.as_deref()).header(
+            crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER,
+            crate::protocol::surface_probe::surface_profile_label(
+                crate::protocol::surface_probe::surface_profile_from_env(),
+            ),
+        );
+        let response = request
             .send()
             .await
             .with_context(|| format!("calling daemon tool '{tool_name}'"))?
@@ -2631,6 +2644,20 @@ async fn open_project_session_handler(
     Ok(Json(response))
 }
 
+/// Resolve the [`crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER`] on a
+/// proxied daemon request to a surface profile (D23).
+///
+/// Absent or non-canonical -> `None`, so the empty-index guard renderer falls
+/// back to the daemon's own env. Backward compatible with adapters that predate
+/// the header and with direct clients that never send it — neither is an error.
+fn connection_surface_from_headers(
+    headers: &HeaderMap,
+) -> Option<crate::protocol::surface_probe::SurfaceProfile> {
+    headers
+        .get(crate::protocol::surface_probe::CONNECTION_SURFACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::protocol::surface_probe::surface_profile_from_label)
+}
 async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
@@ -2673,6 +2700,12 @@ async fn call_tool_handler(
     let tool_name_owned = tool_name.clone();
     let tool_name_for_panic = tool_name.clone();
     let state_for_refresh = Arc::clone(&state);
+    // D23: the surface served on the connection this proxied call arrived on,
+    // threaded out-of-band by the adapter. Bound around the dispatch below so any
+    // empty-index recovery hint names only tools callable on the AGENT's surface,
+    // not this daemon process's env. `None` (older adapter / direct attach) leaves
+    // it unbound -> env fallback (unchanged behavior).
+    let connection_surface = connection_surface_from_headers(&headers);
     match state
         .governor
         .execute_non_abortable(&tool_name, async move {
@@ -2690,7 +2723,10 @@ async fn call_tool_handler(
                 {
                     state_for_refresh.refresh_working_set_bases(&runtime.working_set, &targets);
                 }
-                handle.block_on(execute_tool_call(runtime, &tool_name_owned, params))
+                handle.block_on(crate::protocol::surface_probe::with_connection_surface(
+                    connection_surface,
+                    execute_tool_call(runtime, &tool_name_owned, params),
+                ))
             })
             .await
             .map_err(|join_err| anyhow::anyhow!("tool task panicked: {join_err}"))?
@@ -4020,6 +4056,31 @@ mod tests {
 
         // Fully equal long slice still accepts after folding all bytes.
         assert!(constant_time_eq(&base, &base.clone()));
+    }
+
+    #[test]
+    fn connection_surface_header_resolves_profile_and_ignores_junk() {
+        use crate::protocol::surface_probe::{CONNECTION_SURFACE_HEADER, SurfaceProfile};
+
+        // Absent header (older adapter / direct client) -> None -> env fallback.
+        let mut headers = HeaderMap::new();
+        assert_eq!(connection_surface_from_headers(&headers), None);
+
+        // Canonical labels resolve to their profile.
+        headers.insert(CONNECTION_SURFACE_HEADER, "compact".parse().unwrap());
+        assert_eq!(
+            connection_surface_from_headers(&headers),
+            Some(SurfaceProfile::Compact)
+        );
+        headers.insert(CONNECTION_SURFACE_HEADER, "full".parse().unwrap());
+        assert_eq!(
+            connection_surface_from_headers(&headers),
+            Some(SurfaceProfile::Full)
+        );
+
+        // Non-canonical value is ignored (falls back to env), never echoed.
+        headers.insert(CONNECTION_SURFACE_HEADER, "garbage".parse().unwrap());
+        assert_eq!(connection_surface_from_headers(&headers), None);
     }
 
     #[test]
