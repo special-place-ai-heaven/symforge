@@ -1,6 +1,6 @@
 # Staged Tool Surface — Design (8.11.0)
 
-**Status:** DRAFT for review · **Date:** 2026-07-03 · **Owner:** surface redesign (post-dogfood campaign)
+**Status:** REVIEWED — GATED (do not implement §3 before the §9 spike gate passes) · **Date:** 2026-07-03 · **Owner:** surface redesign (post-dogfood campaign)
 **Supersedes:** compact-3 as default (`SYMFORGE_SURFACE` default flips from `compact` to `staged`).
 **Evidence base:** waves 1–3 of the 2026-07 dogfood campaign (D21–D23, PR #397/#399/#401), A-017 (OPEN — compact-routing premise never validated), A-019 (VALIDATED only for a harness-relay byte-parity A/B, not discoverability), field failure of 8.10.0 compact-3 in production.
 
@@ -102,6 +102,19 @@ On reveal, the server:
 - Renaming/removing any of the 36 canonical tools.
 - The `standard` static 15-tool tier (obsoleted by staged; the groups ARE the tier, disclosed dynamically).
 - Server-side per-connection surface negotiation via `initialize` clientInfo sniffing (future option; init-time detection covers today's need).
+
+## 8a. Adversarial review outcome (2026-07-03, two independent reviewers)
+
+Both reviews returned **SOUND_WITH_REVISIONS**. The architecture survives; the plan as drafted does not. Binding conclusions:
+
+**Product review (blocker):** no evidence any target harness rejects the full ~62 KB / 36-schema `tools/list`; the 8.10.0 field failure was a REFUSAL failure, which argues for `full`, not for `staged`. Making an unmeasured surface the default repeats the A-017 mistake. Additional convictions by the design's own behavior model: generic verb names (`read`/`find`/`edit`) collide with the model's strongest priors (B2); advertising a verb AND its revealed synonyms is the B4 two-vocabularies trap; subagent fleets pay a reveal-reset drill-down tax per connection, making staged strictly worse for the primary (agent-army) use case; `symforge_retrieve` and `detect_impact` are in NO catalog group — on a strict staged client they would be unreachable, recreating the P0-1 class this design claims to kill.
+
+**Feasibility review:** buildable on rmcp 2.0 (`enable_tool_list_changed` + `notify_tool_list_changed`; reveal logic in the `call_tool` wrapper; per-connection state on the stdio adapter). But: `find`'s find-fusion is planner-internal (new code, not an existing tool); `project` no-arg listing is a new tool + daemon arm; `impact` no-arg errors on non-`main`-default repos (B3 violation); the client allowlist must be the SUPERSET (verbs ∪ all revealable tools) or reveals deadlock; flipping the server default under an EXISTING config hard-deadlocks strict clients (verbs unpermitted, primitives invisible) — staged can only ever be opt-in-by-reinit; `/mcp` (stateless singleton, D16) must forbid staged; `diagnose` must pin `status` (the D22-honest readout), not `health`. Cost: entry verbs L, reveal machinery M, init M, tests M/L.
+
+**Phased decision (supersedes §4's "new default" claim):**
+1. **Ship independently, first:** the G-036 init/update coherence + update-preservation fix (§4's bullet list) — evidenced production regression (8.10.1 env wipe), not hostage to any surface decision.
+2. **Spike gate (§9):** (a) full `tools/list` acceptance test at each real target harness; (b) tips-follow-rate mined from the waves-1–3 dogfood transcripts (evidences or kills B5); (c) misroute / turns-to-first-evidence, full vs compact, on the existing corpus.
+3. **Gate verdict:** if no harness rejects `full` and selection quality holds → **`full` becomes the default**, `compact` stays as the escape hatch, and §3 is SHELVED as design-on-file. Staged is built only if the spike finds a genuinely constrained consumer — and then with every §8a reconciliation applied.
 
 ## 8. Open questions (to resolve in planning)
 
