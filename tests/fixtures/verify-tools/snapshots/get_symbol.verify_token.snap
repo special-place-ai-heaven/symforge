@@ -1,0 +1,8 @@
+/// Verify a presented Bearer token: boot token first, then minted keys.
+    pub fn verify_token(&self, token: &str) -> bool {
+        if token == self.boot_token {
+            return true;
+        }
+        self.keys.iter().any(|k| k.verify(token))
+    }
+[fn, lines 26-31, 255 bytes]

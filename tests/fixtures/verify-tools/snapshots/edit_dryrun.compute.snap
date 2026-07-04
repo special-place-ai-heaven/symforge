@@ -1,0 +1,15 @@
+── stel · edit → replace_symbol_body (exact) · serve · ~168 tok served (est.) ──
+
+Mode: preview-only (dry_run); default when apply is omitted or false
+Route confidence: exact
+Chosen tool: replace_symbol_body
+Invocation: {"dry_run":true,"name":"compute","new_body":"pub fn compute(a: i64, b: i64) -> i64 {\n    a.saturating_add(b)\n}","path":"src/edit_target.rs"}
+Rationale: explicit path, symbol, and body
+Economics: serve (predicted_net=-185 (est.); structural edit always serves)
+
+Edit safety: structural-edit-safe
+Path authority: repository-bound
+Source authority: current index
+Write semantics: dry run (no writes)
+Evidence: symbol anchor `src/edit_target.rs:6`
+[DRY RUN] Would replace `compute` in src/edit_target.rs (old: 51 bytes -> new: 65 bytes)
