@@ -1131,9 +1131,8 @@ pub fn search_text_result_view(
                 "Error: structural pattern failed to parse.\n\
                  Pattern: {pattern}\n\
                  Parse error: {error}\n\
-                 Hint: ast-grep patterns use $VAR for single-node metavariables \
-                 and $$$ for multi-node wildcards (e.g., `fn $NAME($$$) {{ $$$ }}`). \
-                 Narrow `language` to target a specific grammar if needed."
+                 Hint: $VAR = single-node metavariable, $$$ = multi-node wildcard \
+                 (e.g. `fn $NAME($$$) {{ $$$ }}`). Narrow `language` if needed."
             );
         }
         Err(search::TextSearchError::UnsupportedStructuralLanguage {
@@ -1144,10 +1143,8 @@ pub fn search_text_result_view(
                 "Error: structural search has no supported grammar for any indexed file.\n\
                  Pattern: {pattern}\n\
                  Sample: {sample_error}\n\
-                 Hint: ast-grep only supports programming-language grammars. \
-                 Config languages (TOML, JSON, YAML) are never searchable with \
-                 `structural=true`. Widen `path_prefix` / `language` / `include_tests` \
-                 so at least one source-code candidate is in scope."
+                 Hint: ast-grep covers programming languages only, not TOML/JSON/YAML. \
+                 Widen `path_prefix` / `language` / `include_tests`."
             );
         }
     };
@@ -1302,11 +1299,14 @@ pub fn search_text_result_view(
                         lines.push(format!("  (top-level): {} {}", no_symbol_count, match_word));
                     }
                 }
-                Some("usage") | Some("purpose") => {
+                // "usage"/"purpose" filter noise lines and report how many were skipped;
+                // None/"file" (default) keep every line. Otherwise identical rendering.
+                mode => {
+                    let filter_noise = matches!(mode, Some("usage") | Some("purpose"));
                     let mut last_symbol: Option<String> = None;
                     let mut filtered_count = 0usize;
                     for line_match in &file.matches {
-                        if is_noise_line(&line_match.line) {
+                        if filter_noise && is_noise_line(&line_match.line) {
                             filtered_count += 1;
                             continue;
                         }
@@ -1341,38 +1341,6 @@ pub fn search_text_result_view(
                         lines.push(format!(
                             "  ({filtered_count} import/comment match(es) excluded by usage filter)"
                         ));
-                    }
-                }
-                // None or Some("file") — default behavior
-                _ => {
-                    let mut last_symbol: Option<String> = None;
-                    for line_match in &file.matches {
-                        if let Some(ref enc) = line_match.enclosing_symbol {
-                            if last_symbol.as_deref() != Some(enc.name.as_str()) {
-                                lines.push(format!(
-                                    "  in {} {} (lines {}-{}):",
-                                    enc.kind,
-                                    enc.name,
-                                    enc.line_range.0 + 1,
-                                    enc.line_range.1 + 1
-                                ));
-                                last_symbol = Some(enc.name.clone());
-                            }
-                            lines.push(format!(
-                                "    > {}: {}{}",
-                                line_match.line_number,
-                                line_match.line,
-                                annotate_term(&line_match.line)
-                            ));
-                        } else {
-                            last_symbol = None;
-                            lines.push(format!(
-                                "  {}: {}{}",
-                                line_match.line_number,
-                                line_match.line,
-                                annotate_term(&line_match.line)
-                            ));
-                        }
                     }
                 }
             }
