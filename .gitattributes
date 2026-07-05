@@ -1,0 +1,7 @@
+# Tool-correctness harness fixtures: byte-exact snapshots (get_symbol byte
+# counts, get_file_context token estimates) must be platform-stable. Without
+# this, core.autocrlf checks these out as CRLF on Windows and LF on Linux, so
+# the tool measures different byte lengths per OS and the snapshots FAIL on CI.
+# Pin LF so the bytes the tools count are identical across platforms.
+tests/fixtures/verify-tools/** text eol=lf
+tests/fixtures/verify-tools-real/** text eol=lf

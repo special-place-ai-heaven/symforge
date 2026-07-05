@@ -1,0 +1,14 @@
+pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Orient => "orient",
+            Self::Find => "find",
+            Self::Read => "read",
+            Self::Trace => "trace",
+            Self::Impact => "impact",
+            Self::Edit => "edit",
+            Self::Meta => "meta",
+            Self::Auto => "auto",
+        }
+    }
+[fn, lines 25-36, 362 bytes]
+Tip: get_symbol_context (callers/callees/types) | find_references (usages) | edit_within_symbol / replace_symbol_body (edits)

@@ -81,6 +81,23 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Set up Node for tool-correctness harness
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The harness grep oracle shells out to ripgrep as a completeness
+      # tripwire. ubuntu-latest doesn't ship rg, so without this the oracle
+      # silently degrades to REVIEW on every case — a disabled tripwire on a
+      # non-interactive runner is worthless. Install it so the oracle runs.
+      - name: Install ripgrep (harness grep oracle)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Verify tool correctness (both fixtures)
+        run: |
+          node scripts/verify-tools.cjs --bin target/release/symforge
+          node scripts/verify-tools.cjs --fixture verify-tools-real --bin target/release/symforge
+
   embed-build:
     needs: release-version
     runs-on: ubuntu-latest

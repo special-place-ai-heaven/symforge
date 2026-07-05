@@ -1,0 +1,18 @@
+pub fn tally(xs: &[i64]) -> i64 {
+    xs.iter().sum()
+}
+[fn, src/code_target.rs:6-8]
+
+Trust: constrained | current index | parsed | full
+Scope: path `src/code_target.rs`; symbol-scoped references
+Evidence: path-constrained symbol `tally` in `src/code_target.rs`
+
+── src/code_target.rs ──
+  line 10  in fn double_sum
+  line 10  in fn double_sum
+  line 14  in fn describe
+
+Callees (2):
+  iter                           src/code_target.rs:7  in fn tally
+  sum                            src/code_target.rs:7  in fn tally
+Tip: get_symbol_context (callers/callees/types) | find_references (usages) | edit_within_symbol / replace_symbol_body (edits)

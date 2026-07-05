@@ -1,0 +1,15 @@
+Trust: exact | current index | parsed | full
+Scope: path `src/auth.rs`; sections outline
+Evidence: file anchor `src/auth.rs`
+
+── src/auth.rs (8 symbols, Rust) ──
+  struct     ApiKey  L6-9
+  impl       ApiKey  L11-16
+    fn         verify  L13-15
+  struct     AuthState  L19-22
+  impl       AuthState  L24-40
+    fn         verify_token  L26-31
+    fn         require_bearer  L34-39
+  fn         hash_secret  L43-45
+
+~226 tokens vs whole-file read; ~226 tokens vs ~50-line windowed read (competent-manual baseline)

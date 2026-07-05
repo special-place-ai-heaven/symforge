@@ -1,0 +1,54 @@
+Trust: exact | current index | parsed | full
+Scope: path `src/types.rs`; all sections
+Evidence: file anchor `src/types.rs`
+
+── src/types.rs (39 symbols, Rust) ──
+  type       CoreToolName  L8-8
+  enum       IntentBucket  L13-22
+  impl       IntentBucket  L24-37
+    fn         as_str  L25-36
+  enum       RouteConfidence  L42-46
+  enum       AdmissionDecision  L51-57
+  impl       AdmissionDecision  L59-69
+    fn         as_str  L60-68
+  struct     StelRequest  L73-112
+  struct     SymforgeCallInput  L116-125
+  impl       SymforgeCallInput  L127-131
+    fn         is_probe_relay  L128-130
+  struct     StelEditRequest  L135-164
+  enum       StelEditIntent  L169-171
+  enum       StelEditOp  L184-190
+  impl       StelEditOp  L192-201
+    fn         legacy_tool  L194-200
+  enum       StelStatusDetail  L206-209
+  struct     StelStatusRequest  L213-250
+  struct     IndexRef  L254-257
+  struct     StelPlanStep  L261-269
+  struct     StelPlan  L273-281
+  struct     StelEstimate  L285-294
+  struct     StelBypassBody  L298-308
+  struct     StelCacheBody  L312-318
+  struct     StelDecision  L322-336
+  struct     StelStepExecution  L340-346
+  struct     StelExecutionTotals  L350-356
+  struct     StelExecution  L360-366
+  struct     StelLedgerEvent  L370-390
+  struct     CalibrationState  L404-410
+  struct     GoldenRouteRow  L414-436
+  impl       GoldenRouteRow  L438-446
+    fn         to_request  L439-445
+  mod        tests  L449-531
+    fn         symforge_call_input_detects_probe_relay  L454-474
+    fn         stel_request_roundtrip_matches_schema_shape  L477-495
+    fn         stel_plan_roundtrip_from_schema_example  L498-520
+    fn         golden_route_row_deserializes_fixture_shape  L523-530
+
+Imports from (5 sources):
+  schemars::JsonSchema (1 symbols)
+  serde::Deserialize (1 symbols)
+  serde::Serialize (1 symbols)
+  serde_json::Value (1 symbols)
+  serde_json::json (1 symbols)
+Tip: get_symbol (body) | find_references (callers/imports) | search_text (string/pattern usage) | get_file_content (exact raw text)
+
+~4747 tokens vs whole-file read; ~490 tokens vs ~50-line windowed read (competent-manual baseline)

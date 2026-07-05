@@ -1,0 +1,9 @@
+# Frozen fixture crate (real repo code) for scripts/verify-tools.cjs --fixture verify-tools-real.
+[package]
+name = "verify-tools-real-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

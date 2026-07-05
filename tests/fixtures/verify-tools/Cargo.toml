@@ -1,0 +1,9 @@
+# Frozen fixture crate for scripts/verify-tools.cjs. Not part of the workspace build.
+[package]
+name = "verify-tools-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
