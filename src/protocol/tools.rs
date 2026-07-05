@@ -3511,10 +3511,7 @@ fn loading_guard_message_from_published(
 /// Outcome of a name-only `get_symbol` lookup (Wave 1 Fix 2).
 enum SymbolNameLookup {
     /// Exactly one match — path and canonical indexed symbol name.
-    Unique {
-        path: String,
-        symbol_name: String,
-    },
+    Unique { path: String, symbol_name: String },
     /// More than one exact-name match — a ready-to-return disambiguation listing.
     Ambiguous(String),
     /// No exact-name match — a ready-to-return loud not-found (D18 style).
@@ -3825,10 +3822,7 @@ impl SymForgeServer {
                 params.0.kind.as_deref(),
                 params.0.symbol_line,
             ) {
-                SymbolNameLookup::Unique {
-                    path,
-                    symbol_name,
-                } => {
+                SymbolNameLookup::Unique { path, symbol_name } => {
                     params.0.path = path;
                     params.0.name = symbol_name;
                 }
@@ -9261,12 +9255,7 @@ impl SymForgeServer {
         let mut plan = build_plan(request);
         self.ground_plan_economics(&mut plan);
         let tuned = self.active_tuning_for_economics();
-        evaluate_plan_tuned(
-            request,
-            &plan,
-            Some(&self.session_context),
-            tuned.as_ref(),
-        )
+        evaluate_plan_tuned(request, &plan, Some(&self.session_context), tuned.as_ref())
     }
 
     /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.

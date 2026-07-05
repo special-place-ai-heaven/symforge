@@ -16,6 +16,13 @@ pub const S4_EXIT_ROW_IDS: [&str; 5] = [
     "compression/t5_dependents",
 ];
 
+/// Planner-aligned serve rows that economics-bypass when grounded on tiny corpora.
+pub const GROUNDED_ECONOMICS_BYPASS_ROW_IDS: [&str; 3] = [
+    "is-plain/t2_context",
+    "is-plain/t3_content",
+    "is-plain/t5_symbol",
+];
+
 /// Relative path to the canonical golden corpus from the repo root.
 pub const GOLDEN_ROUTES_FIXTURE: &str = "docs/fixtures/routes.golden.jsonl";
 
@@ -27,6 +34,7 @@ pub const S4_REPLAY_CORPUS: &str = "tests/fixtures/phase0-corpus/cfg-if-rust";
 pub enum GoldenReplayCategory {
     SupportedServe,
     SupportedPffBypass,
+    EconomicsBypassWhenGrounded,
     DeferredPlannerMismatch { expected: String, planned: String },
 }
 
@@ -35,6 +43,7 @@ pub enum GoldenReplayCategory {
 pub struct GoldenCorpusClassification {
     pub supported_serve: Vec<String>,
     pub supported_pff_bypass: Vec<String>,
+    pub economics_bypass_when_grounded: Vec<String>,
     pub deferred_planner_mismatch: Vec<String>,
 }
 
@@ -42,6 +51,7 @@ impl GoldenCorpusClassification {
     pub fn row_count(&self) -> usize {
         self.supported_serve.len()
             + self.supported_pff_bypass.len()
+            + self.economics_bypass_when_grounded.len()
             + self.deferred_planner_mismatch.len()
     }
 }
@@ -125,6 +135,10 @@ pub fn classify_golden_row(row: &GoldenRouteRow) -> GoldenReplayCategory {
         };
     }
 
+    if GROUNDED_ECONOMICS_BYPASS_ROW_IDS.contains(&row.id.as_str()) {
+        return GoldenReplayCategory::EconomicsBypassWhenGrounded;
+    }
+
     GoldenReplayCategory::SupportedServe
 }
 
@@ -137,6 +151,9 @@ pub fn classify_golden_corpus(rows: &[GoldenRouteRow]) -> GoldenCorpusClassifica
             GoldenReplayCategory::SupportedPffBypass => {
                 out.supported_pff_bypass.push(row.id.clone())
             }
+            GoldenReplayCategory::EconomicsBypassWhenGrounded => {
+                out.economics_bypass_when_grounded.push(row.id.clone())
+            }
             GoldenReplayCategory::DeferredPlannerMismatch { .. } => {
                 out.deferred_planner_mismatch.push(row.id.clone())
             }
@@ -144,6 +161,7 @@ pub fn classify_golden_corpus(rows: &[GoldenRouteRow]) -> GoldenCorpusClassifica
     }
     out.supported_serve.sort();
     out.supported_pff_bypass.sort();
+    out.economics_bypass_when_grounded.sort();
     out.deferred_planner_mismatch.sort();
     out
 }
@@ -445,6 +463,7 @@ mod tests {
             "need broader serve replay than S4 minimum subset"
         );
         assert_eq!(classification.supported_pff_bypass.len(), 4);
+        assert_eq!(classification.economics_bypass_when_grounded.len(), 3);
     }
 
     #[test]
@@ -474,10 +493,7 @@ mod tests {
             "compression/t4_refs",
             "compression/t5_dependents",
             "is-plain/t1_search",
-            "is-plain/t2_context",
-            "is-plain/t3_content",
             "is-plain/t4_symbols",
-            "is-plain/t5_symbol",
             "is-plain/t6_refs",
             "is-plain/t7_files",
             "is-plain/t8_health",
@@ -491,5 +507,17 @@ mod tests {
             "records/t8_explore",
         ];
         assert_eq!(classification.supported_serve, expected);
+    }
+
+    #[test]
+    fn economics_bypass_when_grounded_ids_are_stable() {
+        let rows = fixture_rows();
+        let classification = classify_golden_corpus(&rows);
+        let expected = [
+            "is-plain/t2_context",
+            "is-plain/t3_content",
+            "is-plain/t5_symbol",
+        ];
+        assert_eq!(classification.economics_bypass_when_grounded, expected);
     }
 }

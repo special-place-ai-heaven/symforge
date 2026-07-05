@@ -70,15 +70,9 @@ fn row_serves_after_grounding(server: &SymForgeServer, row: &GoldenRouteRow) -> 
 }
 
 fn filter_grounded_serve_rows(rows: Vec<&GoldenRouteRow>) -> Vec<&GoldenRouteRow> {
-    // Path-only `search_files` cannot match multi-word hints like "plain object"
-    // on the minimal is-plain-obj clone (no path contains those tokens).
-    const PINNED_CORPUS_EXECUTION_SKIPS: &[&str] = &["is-plain/t7_files"];
     let mut by_corpus: BTreeMap<&str, SymForgeServer> = BTreeMap::new();
     rows.into_iter()
         .filter(|row| {
-            if PINNED_CORPUS_EXECUTION_SKIPS.contains(&row.id.as_str()) {
-                return false;
-            }
             let corpus = stel::corpus_for_row_id(&row.id);
             let project = Path::new(corpus)
                 .file_name()

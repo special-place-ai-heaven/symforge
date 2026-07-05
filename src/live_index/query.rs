@@ -548,6 +548,84 @@ fn tokenize_path_query(normalized_query: &str) -> Vec<String> {
         .collect()
 }
 
+const SEARCH_FILES_MANIFEST_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "for", "in", "is", "named", "of", "or", "the", "to",
+];
+
+/// When path tokens miss (e.g. "test files for plain object"), match indexed
+/// package manifests and surface entry/test paths named in `package.json`.
+fn package_manifest_discoverable_paths<F>(
+    index: &LiveIndex,
+    tokens: &[String],
+    path_allowed: &F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    const PKG: &str = "package.json";
+    let Some(pkg) = index.get_file(PKG) else {
+        return Vec::new();
+    };
+    if !path_allowed(PKG) {
+        return Vec::new();
+    }
+    let manifest = String::from_utf8_lossy(&pkg.content).to_ascii_lowercase();
+    let match_tokens: Vec<&str> = tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|token| !SEARCH_FILES_MANIFEST_STOPWORDS.contains(token))
+        .collect();
+    if match_tokens.len() < 2 {
+        return Vec::new();
+    }
+    if !match_tokens.iter().all(|token| manifest.contains(token)) {
+        return Vec::new();
+    }
+
+    let mut hits: Vec<String> = index
+        .all_files()
+        .map(|(path, _)| path.as_str())
+        .filter(|path| *path != PKG)
+        .filter(|path| path_allowed(path))
+        .filter(|path| {
+            let path_lower = path.to_ascii_lowercase();
+            manifest.contains(&path_lower)
+                || manifest.contains(&format!("\"./{path_lower}\""))
+                || manifest.contains(&format!("\"{path_lower}\""))
+        })
+        .map(|path| path.to_string())
+        .collect();
+
+    if tokens.iter().any(|t| t == "test" || t == "tests") {
+        for (path, _) in index.all_files() {
+            if !path_allowed(path) {
+                continue;
+            }
+            let Some(name) = std::path::Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+            else {
+                continue;
+            };
+            let name_lower = name.to_ascii_lowercase();
+            if (name_lower.starts_with("test") || name_lower.contains(".test."))
+                && (name_lower.ends_with(".js")
+                    || name_lower.ends_with(".ts")
+                    || name_lower.ends_with(".tsx"))
+            {
+                let owned = path.clone();
+                if !hits.contains(&owned) {
+                    hits.push(owned);
+                }
+            }
+        }
+    }
+
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
 /// Compute the [`PathMatchSignal`] tier score the given anchor path earns for
 /// `query`, using the same normalization and tokenization `search_files` uses
 /// for candidate classification. The co-change anchor-confidence gate compares
@@ -1479,7 +1557,7 @@ impl LiveIndex {
             .chain(prefix_hits.iter())
             .map(String::as_str)
             .collect();
-        let loose_hits: Vec<String> = self
+        let mut loose_hits: Vec<String> = self
             .all_files()
             .map(|(path, _)| path.as_str())
             .filter(|path| path_allowed(path))
@@ -1490,6 +1568,16 @@ impl LiveIndex {
             })
             .map(|path| path.to_string())
             .collect();
+
+        if loose_hits.is_empty()
+            && !has_path_context
+            && tokens.len() >= 2
+            && strong_hits.is_empty()
+            && basename_only_hits.is_empty()
+            && prefix_hits.is_empty()
+        {
+            loose_hits = package_manifest_discoverable_paths(self, &tokens, &path_allowed);
+        }
 
         let tier1_total =
             strong_hits.len() + basename_only_hits.len() + prefix_hits.len() + loose_hits.len();
@@ -3816,6 +3904,45 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn test_capture_search_files_view_matches_package_manifest_hints() {
+        let manifest = br#"{"name":"is-plain-obj","description":"Check if a value is a plain object","files":["index.js"],"exports":"./index.js","keywords":["object","test"]}"#;
+        let mut package = make_indexed_file("package.json", vec![], ParseStatus::Parsed);
+        package.content = manifest.to_vec();
+        package.byte_len = manifest.len() as u64;
+
+        let index = make_index(
+            vec![
+                ("package.json", package),
+                (
+                    "index.js",
+                    make_indexed_file("index.js", vec![], ParseStatus::Parsed),
+                ),
+                (
+                    "test.js",
+                    make_indexed_file("test.js", vec![], ParseStatus::Parsed),
+                ),
+            ],
+            false,
+        );
+
+        let view = index.capture_search_files_view("test files for plain object", 20, None, None);
+
+        if let SearchFilesView::Found { hits, .. } = view {
+            let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+            assert!(
+                paths.contains(&"index.js"),
+                "expected index.js from package manifest: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"test.js"),
+                "expected test.js when query mentions tests: {paths:?}"
+            );
+        } else {
+            panic!("expected Found view for package manifest hint, got {view:?}");
+        }
     }
 
     #[test]
