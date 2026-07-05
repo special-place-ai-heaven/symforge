@@ -6,9 +6,10 @@ Write semantics: dry run (no writes)
 Evidence: definition `src/code_target.rs` + project-wide constrained references
 Dry run: `tally` → `total_sum`
 
-── Confident matches (will be applied) — 3 site(s) across 1 file(s) ──
-  src/code_target.rs (3 site(s))
+── Confident matches (will be applied) — 4 site(s) across 1 file(s) ──
+  src/code_target.rs (4 site(s))
     L6: pub fn tally(xs: &[i64]) -> i64 {
     L11: tally(xs) + tally(xs)
     L11: tally(xs) + tally(xs)
+    L15: format!("total={}", tally(xs))
 [impact: 0 dependents]

@@ -997,6 +997,27 @@ fn extract_rust_value_refs(
 // Main extraction function
 // ---------------------------------------------------------------------------
 
+/// Collect the byte ranges of every `macro_invocation` node in a Rust tree.
+///
+/// tree-sitter parses macro arguments as an opaque `token_tree` (raw tokens),
+/// so call/type/import queries never fire inside a macro body. Callers use
+/// these ranges to scope a text-based recovery scan to macro interiors only,
+/// where whole-file scanning would otherwise be too imprecise.
+fn collect_rust_macro_ranges(root: &Node) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack: Vec<Node> = vec![*root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "macro_invocation" {
+            ranges.push((node.start_byte() as u32, node.end_byte() as u32));
+        }
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    ranges
+}
+
 /// Extract cross-references from a parsed tree-sitter tree.
 ///
 /// Returns `(Vec<ReferenceRecord>, HashMap<String, String>)` where the HashMap
@@ -1322,9 +1343,14 @@ pub fn extract_references(
     //
     // tree-sitter parses Rust macro bodies as `token_tree` (raw tokens), so
     // `call_expression` / `scoped_identifier` queries never fire inside macros
-    // like `format!(... crate::hash::digest_hex(...))`.  Fall back to a simple
-    // text scan for `qualified::path::name(` patterns whose byte positions are
-    // not already covered by a tree-sitter capture.
+    // like `format!(... crate::hash::digest_hex(...))`.  Fall back to a text
+    // scan that recovers two shapes whose byte positions are not already
+    // covered by a tree-sitter capture:
+    //   * qualified calls (`a::b::name(`) — recovered file-wide, since the `::`
+    //     prefix makes a false positive vanishingly unlikely; and
+    //   * plain calls (`name(`) — recovered ONLY inside a macro invocation's
+    //     token tree, where whole-file scanning would be too imprecise
+    //     (it would collide with definitions and ordinary already-captured calls).
     if *language == LanguageId::Rust {
         let captured_call_ranges: Vec<(u32, u32)> = references
             .iter()
@@ -1332,7 +1358,11 @@ pub fn extract_references(
             .map(|r| r.byte_range)
             .collect();
 
-        // Scan for `ident::ident(` patterns — at least two `::` segments.
+        // Byte ranges of macro invocations, used to scope plain-call recovery.
+        let macro_ranges = collect_rust_macro_ranges(root);
+
+        // Scan for `ident(` patterns; classify each as qualified (file-wide) or
+        // plain (macro-scoped) below.
         let bytes = source.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -1361,8 +1391,44 @@ pub fn extract_references(
                 continue;
             }
 
-            // Must be preceded by `::` to be a qualified call.
+            // Plain (unqualified) call: not preceded by `::`. Recover it ONLY
+            // when the call sits inside a macro token tree — elsewhere the main
+            // tree-sitter query already captured every real call, and a naked
+            // `ident(` file-wide would also match definitions (`fn name(`).
             if j < 2 || bytes[j - 1] != b':' || bytes[j - 2] != b':' {
+                let byte_start = name_start as u32;
+                let byte_end = name_end as u32;
+
+                // Only inside a macro invocation.
+                let in_macro = macro_ranges
+                    .iter()
+                    .any(|&(ms, me)| ms <= byte_start && byte_end <= me);
+                // Skip the macro name itself (`format` in `format!(`): the token
+                // immediately before is `!`, and it is already a MacroUse ref.
+                let is_macro_name = name_end < bytes.len() && bytes[name_end] == b'!';
+                // Skip if already captured by a tree-sitter query match.
+                let already = captured_call_ranges.iter().any(|&(cs, ce)| {
+                    (cs <= byte_start && byte_end <= ce) || (byte_start <= cs && cs < byte_end)
+                });
+                // Rough string-literal guard: even count of `"` before the name.
+                let outside_string = source[..name_start].matches('"').count().is_multiple_of(2);
+
+                if in_macro && !is_macro_name && !already && outside_string {
+                    let name_text = &source[name_start..name_end];
+                    if !name_text.is_empty() {
+                        let line =
+                            bytes[..name_start].iter().filter(|&&b| b == b'\n').count() as u32;
+                        references.push(ReferenceRecord {
+                            name: name_text.to_string(),
+                            qualified_name: None,
+                            kind: ReferenceKind::Call,
+                            byte_range: (byte_start, byte_end),
+                            line_range: (line, line),
+                            enclosing_symbol_index: None,
+                        });
+                    }
+                }
+
                 i += 1;
                 continue;
             }
@@ -1596,6 +1662,46 @@ mod tests {
         let calls: Vec<_> = refs
             .iter()
             .filter(|r| r.name == "digest_hex" && r.kind == ReferenceKind::Call)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "should have exactly one Call ref (no duplicates), got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_rust_plain_call_inside_macro_body() {
+        // tree-sitter parses macro bodies as token_tree (raw tokens), so a PLAIN
+        // (unqualified) call inside a macro like `format!("{}", tally(xs))` never
+        // fires the call_expression query.  The macro-body fallback must recover it
+        // even without a `::` qualifier, or renames leave dangling call sites.
+        let src = r#"fn describe(xs: &[i64]) -> String {
+        format!("total={}", tally(xs))
+    }"#;
+        let (refs, _) = parse_and_extract(src, LanguageId::Rust);
+        let call = refs
+            .iter()
+            .find(|r| r.name == "tally" && r.kind == ReferenceKind::Call);
+        assert!(
+            call.is_some(),
+            "should find plain `tally` call inside macro body, refs: {:?}",
+            refs
+        );
+        // A plain (unqualified) call carries no qualified name.
+        assert_eq!(call.unwrap().qualified_name, None);
+    }
+
+    #[test]
+    fn test_rust_plain_call_inside_macro_not_duplicated() {
+        // A normal call captured by tree-sitter must NOT be duplicated by the
+        // macro-body plain-call fallback.
+        let src = "fn main() { tally(); }";
+        let (refs, _) = parse_and_extract(src, LanguageId::Rust);
+        let calls: Vec<_> = refs
+            .iter()
+            .filter(|r| r.name == "tally" && r.kind == ReferenceKind::Call)
             .collect();
         assert_eq!(
             calls.len(),
