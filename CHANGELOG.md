@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.10.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.4...v8.10.5) (2026-07-05)
+
+
+### Bug Fixes
+
+* **xref:** recover plain call sites inside macro bodies (batch_rename dropped match) ([751b756](https://github.com/special-place-ai-heaven/symforge/commit/751b7568ccaafb4188b92071fa5c8a79963218ec))
+
 ## [8.10.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.3...v8.10.4) (2026-07-03)
 
 
