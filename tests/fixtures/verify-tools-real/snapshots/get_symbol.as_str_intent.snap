@@ -10,5 +10,5 @@ pub const fn as_str(self) -> &'static str {
             Self::Auto => "auto",
         }
     }
-[fn, lines 25-36, 373 bytes]
+[fn, lines 25-36, 362 bytes]
 Tip: get_symbol_context (callers/callees/types) | find_references (usages) | edit_within_symbol / replace_symbol_body (edits)

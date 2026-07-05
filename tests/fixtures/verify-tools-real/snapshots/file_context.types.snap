@@ -51,4 +51,4 @@ Imports from (5 sources):
   serde_json::json (1 symbols)
 Tip: get_symbol (body) | find_references (callers/imports) | search_text (string/pattern usage) | get_file_content (exact raw text)
 
-~4880 tokens vs whole-file read; ~490 tokens vs ~50-line windowed read (competent-manual baseline)
+~4747 tokens vs whole-file read; ~490 tokens vs ~50-line windowed read (competent-manual baseline)
