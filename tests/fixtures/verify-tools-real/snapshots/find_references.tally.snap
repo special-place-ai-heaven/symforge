@@ -1,0 +1,16 @@
+Trust: constrained (repo-wide name match) | current index | parsed | full for current scope — usage-trace recall is best-effort; dynamic dispatch, macro-generated, reflective, and cross-language usages may be missed
+Scope: repo-wide symbol token `tally`
+Evidence: reference anchors `src/code_target.rs:11`, `src/code_target.rs:11`, `src/code_target.rs:15`
+
+3 references in 1 files  [1.00]
+
+src/code_target.rs
+  10: pub fn double_sum(xs: &[i64]) -> i64 {
+  11:     tally(xs) + tally(xs)                 [in fn double_sum]
+  12: }
+  10: pub fn double_sum(xs: &[i64]) -> i64 {
+  11:     tally(xs) + tally(xs)                 [in fn double_sum]
+  12: }
+  14: pub fn describe(xs: &[i64]) -> String {
+  15:     format!("total={}", tally(xs))        [in fn describe]
+  16: }

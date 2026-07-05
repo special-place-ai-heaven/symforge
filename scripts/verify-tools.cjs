@@ -43,6 +43,7 @@ const READ_TOOLS = new Set([
   "find_references",
   "get_symbol",
   "get_file_context",
+  "get_symbol_context",
   "batch_rename",
 ]);
 
