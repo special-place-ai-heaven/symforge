@@ -29,6 +29,7 @@ fn walk_node(
         } else {
             SymbolKind::Function
         }),
+        "macro_definition" => Some(SymbolKind::Other),
         "struct_item" => Some(SymbolKind::Struct),
         "enum_item" => Some(SymbolKind::Enum),
         "trait_item" => Some(SymbolKind::Trait),
@@ -140,5 +141,14 @@ impl Greeter {
             (SymbolKind::Impl, "impl Greeter"),
             (SymbolKind::Method, "greet"),
         ]
+    );
+
+    inline_test!(
+        rust_inline_test_extracts_macro_rules,
+        LanguageId::Rust,
+        r#"macro_rules! cfg_if {
+    () => {};
+}"#,
+        [(SymbolKind::Other, "cfg_if")]
     );
 }

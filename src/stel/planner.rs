@@ -853,7 +853,9 @@ fn route_with_query_patterns(request: &StelRequest) -> Option<PlannedStep> {
     if let Some((path, max_lines)) = parse_bounded_content_read(query, &lower) {
         let mut args = json!({ "path": path });
         if let Some(max_lines) = max_lines {
-            args["max_lines"] = json!(max_lines);
+            // Line-range reads — not chunked paging (`chunk_index` + `max_lines`).
+            args["start_line"] = json!(1);
+            args["end_line"] = json!(max_lines);
         }
         return Some(planned(
             "get_file_content",
@@ -1476,7 +1478,8 @@ mod tests {
         let plan = build_plan(&req);
         assert_eq!(plan.steps[0].tool, "get_file_content");
         assert_eq!(plan.steps[0].args["path"], "src/lib.rs");
-        assert_eq!(plan.steps[0].args["max_lines"], 80);
+        assert_eq!(plan.steps[0].args["start_line"], 1);
+        assert_eq!(plan.steps[0].args["end_line"], 80);
 
         assert_eq!(
             plan_tool(StelRequest {

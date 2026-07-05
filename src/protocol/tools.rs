@@ -3510,8 +3510,11 @@ fn loading_guard_message_from_published(
 
 /// Outcome of a name-only `get_symbol` lookup (Wave 1 Fix 2).
 enum SymbolNameLookup {
-    /// Exactly one exact-name match — its path is used as if the caller passed it.
-    Unique { path: String },
+    /// Exactly one match — path and canonical indexed symbol name.
+    Unique {
+        path: String,
+        symbol_name: String,
+    },
     /// More than one exact-name match — a ready-to-return disambiguation listing.
     Ambiguous(String),
     /// No exact-name match — a ready-to-return loud not-found (D18 style).
@@ -3583,12 +3586,13 @@ impl SymForgeServer {
         // exist than were returned, so the ambiguity total must be a lower bound,
         // never an exact under-report (Wave 1 Fix 4).
         let overflowed = result.overflow_count > 0;
+        let hits = result.hits;
         // Exact tier + exact (case-sensitive) name only — a name selector must
         // not silently resolve to a prefix/substring neighbor.
-        let mut exact: Vec<crate::live_index::search::SymbolSearchHit> = result
-            .hits
-            .into_iter()
+        let mut exact: Vec<crate::live_index::search::SymbolSearchHit> = hits
+            .iter()
             .filter(|hit| hit.tier == SymbolMatchTier::Exact && hit.name == name)
+            .cloned()
             .collect();
         // `symbol_line` narrows to matches at that 1-based start line when it
         // resolves at least one candidate (e.g. two files, one line each).
@@ -3626,6 +3630,25 @@ impl SymForgeServer {
                         ));
                     }
                 }
+                // Unique snake_case prefix (`reconcile` → `reconcile_orders`) when the
+                // query names a single indexed symbol unambiguously.
+                if kind.is_none() {
+                    let prefix: Vec<_> = hits
+                        .iter()
+                        .filter(|hit| {
+                            hit.tier == SymbolMatchTier::Prefix
+                                && hit.name.starts_with(name)
+                                && hit.name.as_bytes().get(name.len()) == Some(&b'_')
+                        })
+                        .cloned()
+                        .collect();
+                    if prefix.len() == 1 {
+                        return SymbolNameLookup::Unique {
+                            path: prefix[0].path.clone(),
+                            symbol_name: prefix[0].name.clone(),
+                        };
+                    }
+                }
                 SymbolNameLookup::NotFound(format!(
                     "No symbol named `{name}` in the index. \
                      Use search_symbols(query=\"{name}\") for a fuzzy lookup, \
@@ -3633,7 +3656,8 @@ impl SymForgeServer {
                 ))
             }
             1 => SymbolNameLookup::Unique {
-                path: exact.remove(0).path,
+                path: exact[0].path.clone(),
+                symbol_name: exact[0].name.clone(),
             },
             _ => {
                 SymbolNameLookup::Ambiguous(render_symbol_name_ambiguity(name, &exact, overflowed))
@@ -3801,7 +3825,13 @@ impl SymForgeServer {
                 params.0.kind.as_deref(),
                 params.0.symbol_line,
             ) {
-                SymbolNameLookup::Unique { path } => params.0.path = path,
+                SymbolNameLookup::Unique {
+                    path,
+                    symbol_name,
+                } => {
+                    params.0.path = path;
+                    params.0.name = symbol_name;
+                }
                 SymbolNameLookup::Ambiguous(message) | SymbolNameLookup::NotFound(message) => {
                     return message;
                 }
@@ -9218,6 +9248,24 @@ impl SymForgeServer {
         }
 
         self.symforge_stel_handler(&params.0.request).await
+    }
+
+    /// Test/integration helper: L1 plan → index grounding → L2 decision.
+    pub fn stel_decision_for_request_for_tests(
+        &self,
+        request: &crate::stel::StelRequest,
+    ) -> crate::stel::StelDecision {
+        use crate::stel::controller::evaluate_plan_tuned;
+        use crate::stel::planner::build_plan;
+        let mut plan = build_plan(request);
+        self.ground_plan_economics(&mut plan);
+        let tuned = self.active_tuning_for_economics();
+        evaluate_plan_tuned(
+            request,
+            &plan,
+            Some(&self.session_context),
+            tuned.as_ref(),
+        )
     }
 
     /// Production compact-surface `symforge` path: L1 plan → L2 decision → L3 serve or P-FF bypass.

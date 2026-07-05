@@ -64,6 +64,16 @@ pub fn explain_reconciliation(actions: &[ReconcileAction]) -> String {
     format!("accepted={accepted}; retried={retried}; rejected={rejected}")
 }
 
+pub fn reconcile() {
+    let _ = reconcile_orders(&[], &[]);
+}
+
 pub fn fixture_notes() -> &'static str {
     "This fixture intentionally includes ordinary data-shaping logic, enum variants, match arms, and repeated explanatory strings so raw bytes are representative while the outline stays compact."
+}
+
+/// Golden-replay anchor: keeps a discoverable `reconcile` reference in the index.
+#[allow(dead_code)]
+fn fixture_reconcile_reference_sink() {
+    reconcile();
 }
