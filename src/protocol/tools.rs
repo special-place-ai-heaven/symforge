@@ -9251,6 +9251,7 @@ impl SymForgeServer {
     }
 
     /// Test/integration helper: L1 plan → index grounding → L2 decision.
+    #[doc(hidden)]
     pub fn stel_decision_for_request_for_tests(
         &self,
         request: &crate::stel::StelRequest,

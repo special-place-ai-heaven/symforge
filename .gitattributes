@@ -5,3 +5,4 @@
 # Pin LF so the bytes the tools count are identical across platforms.
 tests/fixtures/verify-tools/** text eol=lf
 tests/fixtures/verify-tools-real/** text eol=lf
+execution/*.sh text eol=lf

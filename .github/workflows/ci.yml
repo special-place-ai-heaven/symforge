@@ -75,6 +75,12 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # stel_golden_replay needs gitignored phase0 corpora; without this step the
+      # integration tests skip vacuously and CI misses regressions operators see
+      # after cloning per tests/fixtures/phase0-corpus/README.md.
+      - name: Clone phase0 golden-replay corpora
+        run: bash execution/clone_phase0_corpora.sh
+
       - name: Run Rust tests
         run: cargo test --all-targets -- --test-threads=1
 
