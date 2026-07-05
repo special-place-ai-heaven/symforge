@@ -14,6 +14,14 @@
  *
  * Council guardrail (Hotz): this stays ONE script + data (cases.jsonl + *.snap).
  * No config system, no plugin seam. If it grows one, it has become the bug.
+ *
+ * KNOWN LIMITATIONS (honest, so a future session does not rediscover them):
+ *  - The macro-body plain-call recovery in src/parsing/xref.rs uses a quote-parity
+ *    string-literal guard, not a real lexer (precision-favoring). A call name after
+ *    an odd number of earlier `"` chars in the file could be skipped. Bounded; see
+ *    the `ponytail:` comment at that guard.
+ *  - grep is a completeness TRIPWIRE, not a judge: it over-matches strings/comments
+ *    vs symbol-aware tools, so an oracle diff is REVIEW (human looks), never FAIL.
  */
 const { spawnSync, spawn } = require("child_process");
 const readline = require("readline");
@@ -30,9 +38,15 @@ const FIXTURE_NAME =
 const FIXTURE = path.join(REPO_ROOT, "tests/fixtures", FIXTURE_NAME);
 const SNAP_DIR = path.join(FIXTURE, "snapshots");
 const CASES = path.join(FIXTURE, "cases.jsonl");
-const BIN =
+// Binary: `--bin <path>` (CI/Linux, where it's target/release/symforge with no
+// extension), else a bare *.exe arg (Windows convenience), else the local debug
+// build. Resolved to ABSOLUTE — spawn runs with cwd=FIXTURE, so a relative --bin
+// would resolve against the wrong dir. Cross-platform for ubuntu CI.
+const BIN_ARG =
+  (ARGV.includes("--bin") && ARGV[ARGV.indexOf("--bin") + 1]) ||
   ARGV.find((a) => a.endsWith(".exe")) ||
-  path.join(REPO_ROOT, "target/debug/symforge.exe");
+  path.join(REPO_ROOT, process.platform === "win32" ? "target/debug/symforge.exe" : "target/debug/symforge");
+const BIN = path.resolve(REPO_ROOT, BIN_ARG);
 
 // Legacy tools reached via the compact `symforge` facade's deterministic probe
 // relay (_probe_legacy_tool/_probe_legacy_args) so we test the TOOL, not the NL
@@ -78,7 +92,7 @@ function writeSnapshot(name, text) {
   fs.writeFileSync(path.join(SNAP_DIR, name), text);
 }
 
-async function startSession() {
+async function startSession(READINESS_PROBE) {
   const proc = spawn(BIN, [], {
     cwd: FIXTURE,
     stdio: ["pipe", "pipe", "ignore"],
@@ -146,13 +160,27 @@ async function startSession() {
   proc.stdin.write(
     JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n"
   );
-  // Compact auto-indexes SYMFORGE_WORKSPACE_ROOT on startup (async). Poll `status`
-  // until the index reports ready before replaying cases.
-  for (let i = 0; i < 40; i++) {
-    const { text } = await callTool("status", {});
-    if (/index_ready:\s*true|"index_ready":\s*true|index_files/.test(text)) break;
-    await new Promise((r) => setTimeout(r, 250));
+  // Compact auto-indexes SYMFORGE_WORKSPACE_ROOT on startup (async). Poll until the
+  // index reports a NON-ZERO file count AND a known symbol is actually queryable —
+  // `index_files: 0` matches the loose old check but the fixture isn't searchable yet,
+  // which is the cold-start flake. Requiring a real hit makes readiness deterministic.
+  // ponytail: fixed 30-poll x 250ms ceiling (~7.5s); raise if a bigger fixture needs it.
+  let ready = false;
+  for (let i = 0; i < 30 && !ready; i++) {
+    const status = (await callTool("status", {})).text;
+    const files = (status.match(/index_files"?\s*:?\s*(\d+)/) || [])[1];
+    if (files && Number(files) > 0) {
+      if (!READINESS_PROBE) {
+        ready = true; // no known symbol to probe; non-zero count is the best signal
+      } else {
+        // Confirm the index actually answers before we trust it. Empty/error → wait.
+        const probe = await callTool("search_symbols", { query: READINESS_PROBE });
+        if (!probe.isError && probe.text.includes(READINESS_PROBE)) ready = true;
+      }
+    }
+    if (!ready) await new Promise((r) => setTimeout(r, 250));
   }
+  if (!ready) throw new Error("index never became queryable (cold-start timeout)");
   return { callTool, close: () => proc.kill() };
 }
 
@@ -226,7 +254,10 @@ function firstDiff(a, b) {
     process.exit(2);
   }
   const cases = loadCases();
-  const session = await startSession();
+  // Readiness probe: reuse the first search_symbols case's query — a symbol we know
+  // exists in this fixture — so the poll confirms the index actually answers.
+  const probe = (cases.find((c) => c.tool === "search_symbols") || {}).args?.query || "";
+  const session = await startSession(probe);
   const results = [];
   for (const c of cases) {
     try {

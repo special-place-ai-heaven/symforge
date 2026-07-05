@@ -1411,6 +1411,11 @@ pub fn extract_references(
                     (cs <= byte_start && byte_end <= ce) || (byte_start <= cs && cs < byte_end)
                 });
                 // Rough string-literal guard: even count of `"` before the name.
+                // ponytail: quote-parity heuristic, not a lexer — precision-favoring
+                // (matches the qualified-call fallback above; a name after an odd
+                // number of earlier quotes is skipped rather than risk a phantom
+                // ref). Upgrade to a real tokenizer only if a macro-heavy fixture
+                // shows a real miss. Known limitation logged in the verify-tools harness.
                 let outside_string = source[..name_start].matches('"').count().is_multiple_of(2);
 
                 if in_macro && !is_macro_name && !already && outside_string {
