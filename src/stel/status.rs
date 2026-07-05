@@ -146,7 +146,12 @@ impl<'a> StelStatusContext<'a> {
     /// for stdio/embed callers (which default to `Unavailable`); the server-only
     /// `status` read calls this with the opened store's `subsystem_state()`.
     pub fn with_durable_ledger(mut self, state: DurableLedgerState) -> Self {
+        let readable = matches!(state, DurableLedgerState::Durable(_));
         self.durable_ledger = state;
+        if !readable {
+            self = self
+                .with_calibration_verdict(crate::stel::calibration::CalibrationVerdict::Deferred);
+        }
         self
     }
 
@@ -156,12 +161,10 @@ impl<'a> StelStatusContext<'a> {
     /// events. Also re-renders the `tuning_note` from the new verdict so the
     /// section's two calibration lines stay consistent.
     ///
-    /// Honesty invariant (data-model): the durable verdict is fail-closed. `None`
-    /// is reserved for "no durable store wired" — the caller keeps the in-memory
-    /// verdict (`Deferred`/`Accumulating`, never a false `Tuned`). A wired-but-
-    /// broken store whose sample read fails passes `Some(Deferred)` so status
-    /// never keeps an in-memory `Tuned` without a readable durable artifact. Only
-    /// a readable `Durable` store with a real artifact yields `Tuned` here.
+    /// Honesty invariant (data-model): the durable verdict is fail-closed. No
+    /// readable durable store (`Unavailable`/`Disabled`) pins calibration to
+    /// `Deferred`; only a readable `Durable` store with a real artifact yields
+    /// `Tuned` here.
     pub fn with_calibration_verdict(
         mut self,
         verdict: crate::stel::calibration::CalibrationVerdict,
