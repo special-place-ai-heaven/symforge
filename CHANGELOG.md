@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.10.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.5...v8.10.6) (2026-07-05)
+
+
+### Bug Fixes
+
+* **daemon,status:** stop false cross-project refusal and false 'tuned' calibration ([971bbf7](https://github.com/special-place-ai-heaven/symforge/commit/971bbf79bfd1f1f1ba0891d8afb0fbb8119162f3))
+* **update:** revalidate holder path before force-killing during self-update ([5fc966f](https://github.com/special-place-ai-heaven/symforge/commit/5fc966fdbcb9a5666843b8f83d65cd7271bc5880))
+
 ## [8.10.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.4...v8.10.5) (2026-07-05)
 
 
