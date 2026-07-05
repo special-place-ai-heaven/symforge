@@ -577,6 +577,14 @@ fn select_inscope_holder_pids(
         .collect()
 }
 
+#[cfg(any(windows, test))]
+fn process_path_matches(processes: &[(u32, String)], pid: u32, expected_exe: &str) -> bool {
+    let expected = normalize_exe_path(expected_exe);
+    processes
+        .iter()
+        .any(|(candidate_pid, path)| *candidate_pid == pid && normalize_exe_path(path) == expected)
+}
+
 /// Parse the `"<pid>|<executable_path>"` lines emitted by the CIM process query
 /// into `(pid, path)` pairs. Malformed lines and rows with an empty path (access
 /// denied / system rows) are skipped. Pure, so parsing is unit-tested without
@@ -615,7 +623,7 @@ fn stop_other_inscope_holders() -> Vec<String> {
         return Vec::new();
     }
     for pid in &pids {
-        graceful_then_forced_stop(*pid);
+        graceful_then_forced_stop(*pid, &self_exe);
     }
     vec![format!(
         "{} other in-scope symforge holder(s) (pid {})",
@@ -666,15 +674,12 @@ fn enumerate_symforge_processes() -> Vec<(u32, String)> {
 /// checkpoint), a short grace window, then a forced stop (`/F`) only if the
 /// process ignored the graceful close (Invariant 2: graceful before forced).
 #[cfg(windows)]
-fn graceful_then_forced_stop(pid: u32) {
+fn graceful_then_forced_stop(pid: u32, expected_exe: &str) {
     use std::time::{Duration, Instant};
 
-    let _ = crate::process_util::hidden_command("taskkill")
-        .args(["/PID", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if !taskkill_if_process_matches_path(pid, expected_exe, false) {
+        return;
+    }
 
     // 5s grace window (matches SELF_UPDATE_PROCEDURE.md Step 3) so a daemon can
     // flush its index checkpoint before a forced kill.
@@ -683,24 +688,66 @@ fn graceful_then_forced_stop(pid: u32) {
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    // Forced only if it ignored the graceful close. `process_is_alive` re-confirms
-    // the pid is STILL a live symforge.exe, so a recycled pid (now owned by an
-    // unrelated process) is never force-killed.
+    // Forced only if it ignored the graceful close, and only after re-checking
+    // that the PID still belongs to this install path. A stale snapshot must not
+    // let us kill an unrelated same-named install.
     if process_is_alive(pid) {
-        let _ = crate::process_util::hidden_command("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
+        let _ = taskkill_if_process_matches_path(pid, expected_exe, true);
+    }
+}
+
+#[cfg(windows)]
+fn taskkill_if_process_matches_path(pid: u32, expected_exe: &str, force: bool) -> bool {
+    if !process_matches_exe_path(pid, expected_exe) {
+        return false;
+    }
+    let pid_arg = pid.to_string();
+    let mut args = Vec::with_capacity(3);
+    if force {
+        args.push("/F");
+    }
+    args.extend(["/PID", pid_arg.as_str()]);
+    matches!(
+        crate::process_util::hidden_command("taskkill")
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status(),
+        Ok(status) if status.success()
+    )
+}
+
+#[cfg(windows)]
+fn process_matches_exe_path(pid: u32, expected_exe: &str) -> bool {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"ProcessId={pid} AND name='symforge.exe'\" | \
+         ForEach-Object {{ \"$($_.ProcessId)|$($_.ExecutablePath)\" }}"
+    );
+    for shell in ["powershell", "pwsh"] {
+        match crate::process_util::hidden_command(shell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) => {
+                return process_path_matches(
+                    &parse_symforge_process_lines(&String::from_utf8_lossy(&out.stdout)),
+                    pid,
+                    expected_exe,
+                );
+            }
+            Err(_) => continue,
+        }
     }
+    false
 }
 
 /// Whether `pid` is still running AND still a `symforge.exe`. The `tasklist`
 /// query filters server-side to that exact pid + image name and emits one CSV row
 /// (which echoes the pid as a quoted token) when alive, or "No tasks" otherwise.
-/// Constraining to `symforge.exe` means a recycled pid now owned by an unrelated
-/// process reads as NOT alive, so the forced-kill path never targets it.
+/// Path safety is enforced separately immediately before each `taskkill`.
 #[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
     let needle = pid.to_string();
@@ -1071,6 +1118,32 @@ mod tests {
             pids,
             vec![100, 200, 300],
             "path-form variants of the same binary are all in scope (M1)"
+        );
+    }
+
+    #[test]
+    fn process_path_matches_requires_same_pid_and_same_executable_path() {
+        let procs = vec![
+            (100u32, r"C:\npm\symforge.exe".to_string()),
+            (200u32, r"D:\other\symforge.exe".to_string()),
+            (300u32, r"\\?\C:\NPM\symforge.exe".to_string()),
+        ];
+
+        assert!(
+            process_path_matches(&procs, 100, r"C:\NPM\symforge.exe"),
+            "same PID and path identity should match"
+        );
+        assert!(
+            process_path_matches(&procs, 300, r"C:\npm\symforge.exe"),
+            "path form normalization should match the same executable"
+        );
+        assert!(
+            !process_path_matches(&procs, 200, r"C:\npm\symforge.exe"),
+            "a recycled PID at a different install path must not be killable"
+        );
+        assert!(
+            !process_path_matches(&procs, 999, r"C:\npm\symforge.exe"),
+            "a missing PID must not match"
         );
     }
 
