@@ -1,6 +1,6 @@
 {
   "name": "symforge-linux-x64",
-  "version": "8.10.5",
+  "version": "8.10.6",
   "description": "Linux x64 native binary for SymForge",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
