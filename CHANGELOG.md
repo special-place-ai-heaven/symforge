@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.10.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.6...v8.10.7) (2026-07-05)
+
+
+### Bug Fixes
+
+* **search_files,golden-replay:** manifest hints and grounded economics class ([bf054ae](https://github.com/special-place-ai-heaven/symforge/commit/bf054ae9f47d728ec1f8369719304b58dd4ed9a0))
+* **stel,golden-replay:** pass replay with cloned phase0 corpora ([e450717](https://github.com/special-place-ai-heaven/symforge/commit/e450717eaa553c6cd8106d4f4f853f027eb66efe))
+
 ## [8.10.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.5...v8.10.6) (2026-07-05)
 
 
