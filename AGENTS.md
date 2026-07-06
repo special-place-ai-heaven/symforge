@@ -122,9 +122,10 @@ Current v7.13.x recovery contract:
 The shipped v7.13.x MCP surface includes tools, resources, and prompts. Do not
 design for tools only.
 
-The **default** `tools/list` surface is compact-3: `symforge`, `symforge_edit`,
-`status`. The full **35-tool** surface below (including `health_compact`) is a
-documented opt-out via `SYMFORGE_SURFACE=full`:
+The **default** `tools/list` surface is the full **36-tool** surface below
+(including `health_compact`). The compact-3 surface — `symforge`,
+`symforge_edit`, `status` — is a documented opt-in escape hatch via
+`SYMFORGE_SURFACE=compact`:
 
 - Runtime and index: `health`, `health_compact`, `index_folder`,
   `checkpoint_now`, `analyze_file_impact`, `what_changed`, `diff_symbols`,

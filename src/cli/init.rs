@@ -805,8 +805,9 @@ fn register_claude_desktop_mcp_server_with_home(
     };
 
     // Write a proven env instead of `{}` (TR-03 / FR-013):
-    //  - SYMFORGE_SURFACE=compact makes the default surface explicit in the
-    //    registered config and surfaces the documented opt-out to operators.
+    //  - SYMFORGE_SURFACE=compact pins the compact surface explicitly in the
+    //    registered config (the token-sensitive escape hatch; the server default
+    //    is now full), keeping the opt-in visible to operators.
     //  - SYMFORGE_WORKSPACE_ROOT carries the discovered workspace so cold start
     //    populates the index even when the launcher CWD is unusable. Only set
     //    when a real root was discovered (the server validates it again at
@@ -2743,7 +2744,7 @@ env = { EXISTING_FLAG = "keep" }
         assert_eq!(
             env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
             Some("compact"),
-            "registered env must make the default compact surface explicit: {env:?}"
+            "registered env must pin the compact surface explicitly: {env:?}"
         );
 
         // The test binary runs from the symforge repo (a git repo), so init

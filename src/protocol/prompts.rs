@@ -319,13 +319,15 @@ fn build_admin_instructions(project_name: &str, dashboard_url: Option<&str>) -> 
 }
 
 /// Shared surface-mapping preamble for the six tool-driven prompt bodies. The
-/// step tool names below are full-surface spellings (`SYMFORGE_SURFACE=full`);
-/// on the default compact surface the agent has only
+/// step tool names below are the full-surface spellings, directly callable on
+/// the default full surface. On the opt-in compact surface
+/// (`SYMFORGE_SURFACE=compact`) the agent has only
 /// `symforge`/`symforge_edit`/`status`, so the mapping is stated once here
 /// instead of dual-spelling every step. `build_admin_instructions` is excluded:
 /// it drives the `symforge admin` CLI verb, not the MCP tool surface.
-const SURFACE_NOTE: &str = "> Surface note: the tool names in these steps are full-surface \
-spellings (`SYMFORGE_SURFACE=full`). On the default compact surface you have three tools — \
+const SURFACE_NOTE: &str = "> Surface note: the tool names in these steps are the full-surface \
+spellings, directly callable on the default surface. If you have opted into the compact surface \
+(`SYMFORGE_SURFACE=compact`) you have only three tools — \
 `symforge` (read/explore: pass a natural-language `query` such as \"find symbol X\", \
 \"who calls X\", or \"what changed\", optionally with an `intent` hint of \
 orient/find/read/trace/impact/meta/auto), `symforge_edit` (structural edits), and \

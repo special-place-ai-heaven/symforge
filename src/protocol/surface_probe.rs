@@ -24,16 +24,19 @@ pub enum SurfaceProfile {
 }
 
 pub fn surface_profile_from_env() -> SurfaceProfile {
-    // Default surface is compact-3 (v8 cutover, US2/FR-008). `SYMFORGE_SURFACE=full`
-    // is the documented backward-compatible opt-out that restores the legacy
-    // 32-tool surface; `meta` and `compact` keep their explicit meanings.
+    // Default surface is FULL (spike-gate verdict 2026-07-03: no target harness
+    // rejects the full 36-tool `tools/list`; see docs/reviews). `SYMFORGE_SURFACE=compact`
+    // is the documented opt-in escape hatch (the compact-3 facade) for token-
+    // sensitive setups; `meta` keeps its explicit measurement meaning. Only this
+    // fallback arm changed — explicit `full`/`meta`/`compact` values are unchanged,
+    // and the D23 connection-surface task-local still takes precedence over env.
     match std::env::var("SYMFORGE_SURFACE")
         .ok()
         .map(|v| v.to_ascii_lowercase())
     {
-        Some(ref s) if s == "full" => SurfaceProfile::Full,
+        Some(ref s) if s == "compact" => SurfaceProfile::Compact,
         Some(ref s) if s == "meta" => SurfaceProfile::Meta,
-        _ => SurfaceProfile::Compact,
+        _ => SurfaceProfile::Full,
     }
 }
 
@@ -136,8 +139,9 @@ where
 /// is the pure decision used by the production `ServerHandler::call_tool` (shared
 /// by stdio and the HTTP `/mcp` path): on [`SurfaceProfile::Compact`], any tool
 /// name NOT in the advertised compact-3 set ([`crate::stel::surface::COMPACT_TOOL_NAMES`])
-/// is rejected. `Full` and `Meta` are never gated here, so the documented
-/// `SYMFORGE_SURFACE=full` opt-out still reaches every legacy tool.
+/// is rejected. `Full` and `Meta` are never gated here — the server default is
+/// full, and `SYMFORGE_SURFACE=full` remains an explicit alias for the same
+/// profile.
 pub fn compact_surface_blocks(profile: SurfaceProfile, tool_name: &str) -> bool {
     profile == SurfaceProfile::Compact
         && !crate::stel::surface::COMPACT_TOOL_NAMES.contains(&tool_name)
@@ -152,7 +156,7 @@ pub fn enforce_compact_surface(tool_name: &str) -> Result<(), rmcp::ErrorData> {
     if compact_surface_blocks(surface_profile_from_env(), tool_name) {
         return Err(rmcp::ErrorData::invalid_request(
             format!(
-                "tool '{tool_name}' not available on compact surface; set SYMFORGE_SURFACE=full"
+                "tool '{tool_name}' not available on compact surface; unset SYMFORGE_SURFACE or set SYMFORGE_SURFACE=full for the full tool surface"
             ),
             None,
         ));

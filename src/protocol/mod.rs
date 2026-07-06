@@ -1313,8 +1313,9 @@ impl ServerHandler for SymForgeServer {
     /// name NOT in the advertised compact-3 set
     /// ([`crate::stel::surface::COMPACT_TOOL_NAMES`]) is rejected with an MCP
     /// `InvalidRequest` error. Full and Meta surfaces are unaffected, so the
-    /// documented `SYMFORGE_SURFACE=full` opt-out still reaches every legacy
-    /// tool. This is shared by both transports because stdio and the HTTP `/mcp`
+    /// default full surface (and any explicit `SYMFORGE_SURFACE=full`) reaches
+    /// every legacy tool; `SYMFORGE_SURFACE=compact` is the opt-in escape hatch
+    /// that gates them. This is shared by both transports because stdio and the HTTP `/mcp`
     /// serve path dispatch through the same `ServerHandler::call_tool`.
     async fn call_tool(
         &self,
