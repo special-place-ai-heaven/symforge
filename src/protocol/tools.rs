@@ -2576,6 +2576,93 @@ fn find_references_completeness_label(
     format!("{}{recall_caveat}", parts.join("; "))
 }
 
+/// Tier-2 honesty sweep (dogfood finding #1, 2026-07-06): the reference scan
+/// covers Tier-1 files only, but first-party source demoted to Tier-2 for size
+/// (>1MB, `SkipReason::SizeThreshold`) can still contain the queried name —
+/// the field failure was a compile-breaking construction site inside a 1.2 MB
+/// file while the envelope claimed "full for current scope". Sweep those files
+/// textually (bounded) and return a disclosure so the envelope never claims a
+/// completeness it does not have. Returns `None` when there is nothing to
+/// disclose (no size-demoted files, or none contain the name).
+fn tier2_reference_disclosure(
+    skipped: &[crate::domain::index::SkippedFile],
+    repo_root: Option<&std::path::Path>,
+    name: &str,
+) -> Option<String> {
+    use crate::domain::index::SkipReason;
+    // Only size-demoted files are reference-relevant: binary, lockfile, and
+    // artifact demotions cannot hold code references to the queried symbol.
+    let candidates: Vec<&crate::domain::index::SkippedFile> = skipped
+        .iter()
+        .filter(|f| f.reason() == Some(SkipReason::SizeThreshold))
+        .collect();
+    if candidates.is_empty() || name.trim().is_empty() {
+        return None;
+    }
+    // ponytail: bounded whole-file reads + str::contains; the OS page cache
+    // makes repeated sweeps cheap. Budgets keep the pathological repo honest
+    // (reported as unswept) instead of slow.
+    const MAX_SWEEP_FILES: usize = 8;
+    const MAX_SWEEP_BYTES: u64 = 32 * 1024 * 1024;
+    let preview = |paths: &[&str]| -> String {
+        let shown: Vec<&str> = paths.iter().take(3).copied().collect();
+        let suffix = if paths.len() > shown.len() {
+            format!(", … (+{} more)", paths.len() - shown.len())
+        } else {
+            String::new()
+        };
+        format!("{}{}", shown.join(", "), suffix)
+    };
+    let Some(root) = repo_root else {
+        // No resolvable root: cannot sweep, but silence would be the lie.
+        let paths: Vec<&str> = candidates.iter().map(|f| f.path.as_str()).collect();
+        return Some(format!(
+            "Tier-2 exclusion: {} first-party file(s) >1MB were NOT reference-scanned \
+             (metadata-only) and could not be swept for \"{name}\" (no repo root): {}",
+            candidates.len(),
+            preview(&paths),
+        ));
+    };
+    let mut matched: Vec<&str> = Vec::new();
+    let mut unswept: Vec<&str> = Vec::new();
+    let mut bytes_budget = MAX_SWEEP_BYTES;
+    for (i, file) in candidates.iter().enumerate() {
+        if i >= MAX_SWEEP_FILES || bytes_budget < file.size {
+            unswept.push(file.path.as_str());
+            continue;
+        }
+        match std::fs::read(root.join(&file.path)) {
+            Ok(bytes) => {
+                bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
+                if String::from_utf8_lossy(&bytes).contains(name) {
+                    matched.push(file.path.as_str());
+                }
+            }
+            Err(_) => unswept.push(file.path.as_str()),
+        }
+    }
+    if matched.is_empty() && unswept.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !matched.is_empty() {
+        parts.push(format!(
+            "\"{name}\" appears textually in {} file(s) >1MB that were NOT \
+             reference-scanned (metadata-only): {} — grep or get_file_content to inspect",
+            matched.len(),
+            preview(&matched),
+        ));
+    }
+    if !unswept.is_empty() {
+        parts.push(format!(
+            "{} file(s) >1MB not reference-scanned and not swept (budget): {}",
+            unswept.len(),
+            preview(&unswept),
+        ));
+    }
+    Some(format!("Tier-2 exclusion: {}", parts.join("; ")))
+}
+
 fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> String {
     let anchors = view
         .files
@@ -3120,6 +3207,8 @@ fn render_search_text_output(
         format::SearchSuggestionContext {
             regex: is_regex,
             include_tests: options.noise_policy.include_tests,
+            multi_word_literal: !is_regex
+                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
         },
     );
     let mut rendered = match envelope {
@@ -3745,9 +3834,6 @@ impl SymForgeServer {
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
-            let has_symbol_lookup = captured
-                .iter()
-                .any(|entry| matches!(entry, CapturedGetSymbolsEntry::SymbolLookup { .. }));
             let batch_baseline_chars: usize = captured
                 .iter()
                 .filter_map(|entry| match entry {
@@ -3758,7 +3844,7 @@ impl SymForgeServer {
                     CapturedGetSymbolsEntry::FileNotFound { .. } => None,
                 })
                 .sum();
-            let mut output = captured
+            let output = captured
                 .into_iter()
                 .map(|entry| match entry {
                     CapturedGetSymbolsEntry::SymbolLookup {
@@ -3781,16 +3867,8 @@ impl SymForgeServer {
                 })
                 .collect::<Vec<_>>()
                 .join("\n---\n");
-            // Append the next-step hint ONCE for the whole batch — an agent
-            // learns it after the first occurrence, so repeating it per entry is
-            // pure token overhead.
-            if has_symbol_lookup {
-                output.push_str(&format::compact_next_step_hint(&[
-                    "get_symbol_context (callers/callees/types)",
-                    "find_references (usages)",
-                    "edit_within_symbol / replace_symbol_body (edits)",
-                ]));
-            }
+            // No next-step tip: always-on tips measured as saturation, not
+            // steering (2026-07-03 spike gate, B5) — tips stay rare + contextual.
             self.record_tool_savings_named(
                 "get_symbol",
                 format::estimate_tokens_from_chars(batch_baseline_chars),
@@ -3810,6 +3888,7 @@ impl SymForgeServer {
         // the compact `read` intent, which routes here via the STEL planner —
         // one fix, two surfaces. Both empty (and no `targets`) is a clean
         // invalid-request, never `File not found: .`.
+        let mut resolved_from_bare_name: Option<String> = None;
         if params.0.path.trim().is_empty() {
             if params.0.name.trim().is_empty() {
                 return "Invalid request: get_symbol needs a `name` (optionally with `path`), \
@@ -3823,6 +3902,10 @@ impl SymForgeServer {
                 params.0.symbol_line,
             ) {
                 SymbolNameLookup::Unique { path, symbol_name } => {
+                    // Dogfood #2 (2026-07-06): a bare-name pick must SAY which
+                    // file it resolved to — the caller cannot tell a TypeScript
+                    // alias from a Rust struct by the body alone.
+                    resolved_from_bare_name = Some(path.clone());
                     params.0.path = path;
                     params.0.name = symbol_name;
                 }
@@ -3902,25 +3985,19 @@ impl SymForgeServer {
         match file {
             Some(file) => {
                 let raw_chars = file.content.len();
-                let line_count = format::indexed_file_line_count(&file.content);
-                let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
                 let body = format::symbol_detail_from_indexed_file(
                     file.as_ref(),
                     &params.0.name,
                     params.0.kind.as_deref(),
                     params.0.symbol_line,
                 );
-                let hint = if is_small_file {
-                    String::new()
-                } else {
-                    format::compact_next_step_hint(&[
-                        "get_symbol_context (callers/callees/types)",
-                        "find_references (usages)",
-                        "edit_within_symbol / replace_symbol_body (edits)",
-                    ])
-                    .to_string()
+                let output = match &resolved_from_bare_name {
+                    Some(path) => format!(
+                        "Resolved bare name to {path} — pass `path` (and `symbol_line`) \
+                         to pin a different same-named symbol.\n{body}"
+                    ),
+                    None => body,
                 };
-                let output = format!("{body}{hint}");
                 let max_tokens = format::resolve_read_max_tokens(params.0.max_tokens, raw_chars);
                 self.record_tool_savings_named(
                     "get_symbol",
@@ -4121,17 +4198,11 @@ impl SymForgeServer {
                 let state = sidecar_state_for_server(self);
                 match repo_map_text(&state) {
                     Ok(result) => {
-                        let hint = format::compact_next_step_hint(&[
-                            "get_file_context (open one file)",
-                            "search_symbols (find by name)",
-                            "search_text (find text/patterns)",
-                            "diff_symbols (review changes)",
-                        ]);
                         let doctrine = "\nDoctrine: the map orients; the tools prove. \
                              Completeness: ranked and truncated by result cap - absence \
                              from the map is not absence from the repo; confirm with \
                              search_symbols / search_text before concluding something is missing.";
-                        format!("{result}{hint}{doctrine}")
+                        format!("{result}{doctrine}")
                     }
                     Err(StatusCode::NOT_FOUND) => "Repository map unavailable.".to_string(),
                     Err(StatusCode::INTERNAL_SERVER_ERROR) => {
@@ -4277,17 +4348,7 @@ impl SymForgeServer {
                         format!("{note}\n\n{result}")
                     };
                 }
-                let hint = if is_small_file {
-                    String::new()
-                } else {
-                    format::compact_next_step_hint(&[
-                        "get_symbol (body)",
-                        "find_references (callers/imports)",
-                        "search_text (string/pattern usage)",
-                        "get_file_content (exact raw text)",
-                    ])
-                };
-                let body = format!("{result}{hint}");
+                let body = result;
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
                 let mut output =
                     format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
@@ -4604,11 +4665,6 @@ impl SymForgeServer {
                 if !impl_block_tip.is_empty() {
                     output.push_str(impl_block_tip.trim_start_matches('\n'));
                 }
-                output.push_str(&format::compact_next_step_hint(&[
-                    "get_symbol_context (callers/callees/types)",
-                    "find_references (usages)",
-                    "edit_within_symbol / replace_symbol_body (edits)",
-                ]));
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
                 // Frecency bump — commitment tool, default-mode happy path.
                 // Resolve the bump path the same way the output did:
@@ -4637,10 +4693,6 @@ impl SymForgeServer {
                         body.push('\n');
                         body.push_str(impl_block_tip.trim_start_matches('\n'));
                     }
-                    body.push_str(&format::compact_next_step_hint(&[
-                        "get_symbol_context (callers/callees/types)",
-                        "find_references (usages)",
-                    ]));
                     let footer = format::compact_savings_footer(body.len(), raw_chars);
                     self.record_read_savings(format::saved_tokens_vs_competent_manual(
                         body.len(),
@@ -4892,14 +4944,9 @@ impl SymForgeServer {
             ))
         };
         let output = format::search_symbols_result_view(&result, query_str);
-        let hint = format::compact_next_step_hint(&[
-            "get_symbol (body)",
-            "get_symbol_context (callers/callees)",
-            "get_file_context (file overview)",
-        ]);
         let output = match envelope {
-            Some(envelope) => format!("{envelope}\n\n{output}{hint}"),
-            None => format!("{output}{hint}"),
+            Some(envelope) => format!("{envelope}\n\n{output}"),
+            None => output,
         };
         let output = if !is_browse
             && query_str.len() >= 2
@@ -5051,17 +5098,11 @@ impl SymForgeServer {
                 false,
                 false,
             );
-            let hint = format::compact_next_step_hint(&[
-                "inspect_match (deep-dive one hit)",
-                "get_file_context (file overview)",
-                "search_symbols (name-based lookup)",
-            ]);
-            let result = format!("{output}{hint}");
             self.session_context.record_summary_output(
                 "search_text",
-                (result.len() / 4).min(u32::MAX as usize) as u32,
+                (output.len() / 4).min(u32::MAX as usize) as u32,
             );
-            return self.apply_ccr_budget("search_text", result, params.0.max_tokens);
+            return self.apply_ccr_budget("search_text", output, params.0.max_tokens);
         }
 
         let mut options = match search_text_options_from_input(&params.0) {
@@ -5198,11 +5239,6 @@ impl SymForgeServer {
                         "\n(auto-corrected double-escaped regex: `{}` → `{}`)",
                         query, fixed
                     ));
-                    output.push_str(&format::compact_next_step_hint(&[
-                        "inspect_match (deep-dive one hit)",
-                        "get_file_context (file overview)",
-                        "search_symbols (name-based lookup)",
-                    ]));
                     self.session_context.record_summary_output(
                         "search_text",
                         (output.len() / 4).min(u32::MAX as usize) as u32,
@@ -5227,12 +5263,7 @@ impl SymForgeServer {
             auto_detected_regex,
             false,
         );
-        let hint = format::compact_next_step_hint(&[
-            "inspect_match (deep-dive one hit)",
-            "get_file_context (file overview)",
-            "search_symbols (name-based lookup)",
-        ]);
-        let result = format!("{output}{hint}");
+        let result = output;
         self.session_context.record_summary_output(
             "search_text",
             (result.len() / 4).min(u32::MAX as usize) as u32,
@@ -7776,8 +7807,25 @@ impl SymForgeServer {
                 if collect_qualified_usages {
                     merge_qualified_usages_into_view(&mut view, qualified_usages, indexed_ranges);
                 }
+                // Tier-2 honesty sweep (dogfood #1): compute BEFORE the envelope
+                // so the completeness label can confess the exclusion instead of
+                // claiming "full for current scope" over an unscanned file.
+                let tier2_disclosure = {
+                    let repo_root = self.capture_repo_root();
+                    let guard = self.index.read();
+                    tier2_reference_disclosure(
+                        guard.skipped_files(),
+                        repo_root.as_deref(),
+                        &input.name,
+                    )
+                };
                 let envelope = if !view.files.is_empty() {
                     let guard = self.index.read();
+                    let mut completeness =
+                        find_references_completeness_label(&view, &limits, input.kind.as_deref());
+                    if tier2_disclosure.is_some() {
+                        completeness.push_str("; Tier-2 exclusions apply (see below)");
+                    }
                     Some(search_format::format_search_envelope(
                         find_references_match_type_label(input, mode),
                         "current index",
@@ -7785,7 +7833,7 @@ impl SymForgeServer {
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
                         ),
-                        &find_references_completeness_label(&view, &limits, input.kind.as_deref()),
+                        &completeness,
                         &find_references_scope_summary(input, mode),
                         &find_references_evidence(&view),
                     ))
@@ -7862,6 +7910,14 @@ impl SymForgeServer {
                             tr.files.len(), input.name, input.name, input.name
                         ));
                     }
+                }
+
+                // Tier-2 honesty sweep (dogfood #1): the disclosure rides the
+                // OUTPUT (both the hits and zero-hits paths), not only the
+                // envelope, so a truncated or compact read still sees it.
+                if let Some(disclosure) = &tier2_disclosure {
+                    output.push_str("\n\n");
+                    output.push_str(disclosure);
                 }
 
                 self.record_tool_savings_named(
@@ -12155,7 +12211,11 @@ mod tests {
             .await;
         assert!(result.contains("src/main.rs"), "should contain path");
         assert!(result.contains("main"), "should contain symbol name");
-        assert!(result.contains("Tip:"), "should include next-step hint");
+        // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
+        assert!(
+            !result.contains("Tip:"),
+            "success path must not carry a tip"
+        );
     }
 
     #[tokio::test]
@@ -12181,9 +12241,37 @@ mod tests {
             !result.starts_with("Index"),
             "should not return guard message, got: {result}"
         );
+        // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
         assert!(
-            result.contains("Tip:"),
-            "should include next-step hint: {result}"
+            !result.contains("Tip:"),
+            "success path must not carry a tip: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_symbol_bare_name_echoes_resolved_path() {
+        // Dogfood #2 (2026-07-06): a bare-name lookup must SAY which file it
+        // resolved to — the caller cannot tell a same-named TypeScript alias from
+        // a Rust struct by the body alone.
+        let sym = make_symbol("foo", SymbolKind::Function, 1, 3);
+        let content = medium_test_source("fn foo() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let result = server
+            .get_symbol(Parameters(super::GetSymbolInput {
+                path: String::new(),
+                name: "foo".to_string(),
+                kind: None,
+                symbol_line: None,
+                targets: None,
+                estimate: None,
+                max_tokens: None,
+                force_refresh: None,
+            }))
+            .await;
+        assert!(
+            result.contains("Resolved bare name to src/lib.rs"),
+            "bare-name resolution must echo the picked path; got: {result}"
         );
     }
 
@@ -12553,9 +12641,10 @@ mod tests {
             result.contains("src"),
             "repo map should include directory breakdown; got: {result}"
         );
+        // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
         assert!(
-            result.contains("Tip:"),
-            "repo map should include next-step hint"
+            !result.contains("Tip:"),
+            "repo map success path must not carry a tip"
         );
     }
 
@@ -14490,9 +14579,10 @@ mod tests {
             result.contains("Trust: constrained (prefix tier) | current index | parsed"),
             "search_symbols should expose the compact trust line, got: {result}"
         );
+        // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
         assert!(
-            result.contains("Tip:"),
-            "search_symbols should include next-step hint"
+            !result.contains("Tip:"),
+            "search_symbols success path must not carry a tip"
         );
     }
 
@@ -15142,9 +15232,10 @@ mod tests {
             ),
             "search_text should expose applied scope, got: {result}"
         );
+        // B5 (2026-07-03 spike gate): success paths carry no always-on tip.
         assert!(
-            result.contains("Tip:"),
-            "search_text should include next-step hint"
+            !result.contains("Tip:"),
+            "search_text success path must not carry a tip"
         );
     }
 
@@ -22119,6 +22210,91 @@ mod tests {
         assert!(
             !result.contains("definitions named"),
             "single definition must not trigger the disclosure; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_discloses_tier2_textual_match() {
+        // Dogfood #1 (2026-07-06): a first-party file demoted to Tier-2 for size
+        // held the only construction site while the envelope claimed
+        // "full for current scope". The sweep must confess the textual match on
+        // BOTH the zero-hits path and the envelope.
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = "x".repeat(1_100_000);
+        big.push_str("\nlet r = PortRegistry::new();\n");
+        std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+
+        // Index knows the definition but has ZERO references to it (the only
+        // reference lives in the Tier-2 file) — the exact field failure shape.
+        let def = make_symbol("PortRegistry", SymbolKind::Struct, 1, 1);
+        let (key, file) = make_file("src/lib.rs", b"struct PortRegistry;\n", vec![def]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.skipped_files = vec![crate::domain::index::SkippedFile {
+            path: "big.rs".to_string(),
+            size: big.len() as u64,
+            extension: Some("rs".to_string()),
+            decision: crate::domain::index::AdmissionDecision::skip(
+                crate::domain::index::AdmissionTier::MetadataOnly,
+                crate::domain::index::SkipReason::SizeThreshold,
+            ),
+        }];
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+        let result = server
+            .find_references(Parameters(find_references_input("PortRegistry")))
+            .await;
+        assert!(
+            result.contains("Tier-2 exclusion"),
+            "envelope must confess the unscanned Tier-2 textual match; got: {result}"
+        );
+        assert!(
+            result.contains("big.rs"),
+            "the unscanned file must be named; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_references_tier2_sweep_stays_silent_without_match() {
+        // No lie to confess: the Tier-2 file does not contain the queried name,
+        // so the disclosure must not fire (noise is its own honesty failure).
+        let dir = tempfile::tempdir().unwrap();
+        let big = "y".repeat(1_100_000);
+        std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+
+        let def = make_symbol("solitary_fn", SymbolKind::Function, 1, 1);
+        let caller = make_symbol("caller", SymbolKind::Function, 2, 2);
+        let file = make_file_with_refs(
+            "src/only.rs",
+            b"fn solitary_fn() {}\nfn caller() { solitary_fn(); }\n",
+            vec![def, caller],
+            vec![make_ref(
+                "solitary_fn",
+                None,
+                ReferenceKind::Call,
+                1,
+                Some(1),
+            )],
+        );
+        let mut index = make_live_index_ready(vec![file]);
+        index.skipped_files = vec![crate::domain::index::SkippedFile {
+            path: "big.rs".to_string(),
+            size: big.len() as u64,
+            extension: Some("rs".to_string()),
+            decision: crate::domain::index::AdmissionDecision::skip(
+                crate::domain::index::AdmissionTier::MetadataOnly,
+                crate::domain::index::SkipReason::SizeThreshold,
+            ),
+        }];
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+        let result = server
+            .find_references(Parameters(find_references_input("solitary_fn")))
+            .await;
+        assert!(
+            !result.contains("Tier-2 exclusion"),
+            "no textual match means no disclosure; got: {result}"
+        );
+        assert!(
+            result.contains("full for current scope"),
+            "completeness stays unqualified when nothing was excluded; got: {result}"
         );
     }
 

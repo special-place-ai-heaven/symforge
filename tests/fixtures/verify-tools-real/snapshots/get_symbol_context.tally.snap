@@ -15,4 +15,3 @@ Evidence: path-constrained symbol `tally` in `src/code_target.rs`
 Callees (2):
   iter                           src/code_target.rs:7  in fn tally
   sum                            src/code_target.rs:7  in fn tally
-Tip: get_symbol_context (callers/callees/types) | find_references (usages) | edit_within_symbol / replace_symbol_body (edits)

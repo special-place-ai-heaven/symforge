@@ -606,6 +606,7 @@ fn test_search_text_zero_hit_drops_regex_suggestion_when_regex_already_set() {
         SearchSuggestionContext {
             regex: true,
             include_tests: false,
+            multi_word_literal: false,
         },
     );
     assert!(
@@ -633,11 +634,34 @@ fn test_search_text_zero_hit_keeps_regex_suggestion_when_not_regex() {
         SearchSuggestionContext {
             regex: false,
             include_tests: false,
+            multi_word_literal: false,
         },
     );
     assert!(
         rendered.contains("use regex=true"),
         "should suggest regex=true for a literal search; got: {rendered}"
+    );
+}
+
+#[test]
+fn test_search_text_zero_hit_multi_word_literal_suggests_bare_identifier() {
+    // Dogfood #5a (2026-07-06): `pub type ProjectId` finds nothing when the
+    // declaration is macro-generated; the zero-hit suggestions must steer
+    // toward the bare identifier instead of dead-ending.
+    let rendered = search_text_result_view(
+        empty_text_search_result("'pub type ProjectId'"),
+        None,
+        None,
+        None,
+        SearchSuggestionContext {
+            regex: false,
+            include_tests: false,
+            multi_word_literal: true,
+        },
+    );
+    assert!(
+        rendered.contains("bare identifier"),
+        "multi-word zero-hit must suggest the bare identifier; got: {rendered}"
     );
 }
 
@@ -651,6 +675,7 @@ fn test_search_text_zero_hit_drops_include_tests_when_already_included() {
         SearchSuggestionContext {
             regex: false,
             include_tests: true,
+            multi_word_literal: false,
         },
     );
     assert!(
@@ -3895,18 +3920,6 @@ fn test_compact_savings_footer_empty_when_no_savings() {
 fn test_compact_savings_footer_empty_for_small_files() {
     let footer = compact_savings_footer(50, 100);
     assert!(footer.is_empty());
-}
-
-#[test]
-fn test_compact_next_step_hint_formats_joined_items() {
-    let hint = compact_next_step_hint(&["get_symbol (body)", "find_references (usages)"]);
-    assert_eq!(hint, "\nTip: get_symbol (body) | find_references (usages)");
-}
-
-#[test]
-fn test_compact_next_step_hint_ignores_empty_items() {
-    let hint = compact_next_step_hint(&["", "search_text"]);
-    assert_eq!(hint, "\nTip: search_text");
 }
 
 // ── search_symbols tier ordering tests ───────────────────────────────────

@@ -49,6 +49,5 @@ Imports from (5 sources):
   serde::Serialize (1 symbols)
   serde_json::Value (1 symbols)
   serde_json::json (1 symbols)
-Tip: get_symbol (body) | find_references (callers/imports) | search_text (string/pattern usage) | get_file_content (exact raw text)
 
-~4747 tokens vs whole-file read; ~490 tokens vs ~50-line windowed read (competent-manual baseline)
+~4780 tokens vs whole-file read; ~523 tokens vs ~50-line windowed read (competent-manual baseline)
