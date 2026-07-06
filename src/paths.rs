@@ -57,6 +57,97 @@ pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
     base.join(SYMFORGE_DIR_NAME)
 }
 
+/// User-level SymForge home for runtime files when no safe project root exists.
+///
+/// Honors `SYMFORGE_HOME` when set (the directory itself, no extra nesting).
+/// Otherwise uses `~/.symforge`, matching the daemon's global state layout.
+pub fn global_symforge_home() -> io::Result<PathBuf> {
+    if let Some(explicit_home) = std::env::var_os("SYMFORGE_HOME") {
+        let dir = PathBuf::from(explicit_home);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("ensuring symforge global home at {}: {}", dir.display(), e),
+            )
+        })?;
+        return Ok(dir);
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "home directory not found")
+    })?;
+    ensure_symforge_dir(&home)
+}
+
+/// True when `path` must not host a project-local `.symforge` (sensitive /
+/// credential-bearing / too-broad roots). Mirrors the launcher's
+/// `discovery::find_project_root` refusal without importing discovery.
+fn is_unsafe_data_dir_base(path: &Path) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    is_sensitive_path(&canonical)
+}
+
+/// Choose the base directory for runtime `.symforge` state (sidecar port/pid
+/// files, init bootstrap, etc.) without creating it.
+///
+/// Preference order:
+/// 1. `project_root` when supplied and safe
+/// 2. Launch cwd when safe (not a sensitive/forbidden root)
+/// 3. [`global_symforge_home`]
+pub fn select_runtime_data_base(
+    project_root: Option<&Path>,
+    cwd: Option<&Path>,
+) -> PathBuf {
+    if let Some(root) = project_root.filter(|p| !is_unsafe_data_dir_base(p)) {
+        return resolve_symforge_dir(root);
+    }
+    if let Some(cwd) = cwd.filter(|p| !is_unsafe_data_dir_base(p)) {
+        return resolve_symforge_dir(cwd);
+    }
+    global_symforge_home().unwrap_or_else(|error| {
+        tracing::warn!(
+            "falling back to cwd-relative .symforge after global home resolution failed: {error}"
+        );
+        cwd.as_ref()
+            .map(|path| resolve_symforge_dir(path))
+            .unwrap_or_else(|| PathBuf::from(SYMFORGE_DIR_NAME))
+    })
+}
+
+/// Ensure runtime `.symforge` state exists, falling back to [`global_symforge_home`]
+/// when the preferred project/cwd base is unsafe or not writable.
+pub fn ensure_runtime_symforge_dir(project_root: Option<&Path>) -> io::Result<PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    let preferred_base = project_root
+        .filter(|p| !is_unsafe_data_dir_base(p))
+        .map(|p| p.to_path_buf())
+        .or_else(|| {
+            cwd.as_ref()
+                .filter(|p| !is_unsafe_data_dir_base(p))
+                .cloned()
+        });
+
+    if let Some(base) = preferred_base {
+        match ensure_symforge_dir(&base) {
+            Ok(dir) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                tracing::warn!(
+                    path = %base.display(),
+                    "cannot create project-local .symforge (permission denied); using global SymForge home"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    } else if let Some(ref launch_cwd) = cwd {
+        tracing::info!(
+            path = %launch_cwd.display(),
+            "launch cwd is not a safe project root for .symforge; using global SymForge home"
+        );
+    }
+
+    global_symforge_home()
+}
+
 /// Ensure the canonical symforge data directory exists under `base`.
 pub fn ensure_symforge_dir(base: &Path) -> io::Result<PathBuf> {
     let dir = resolve_symforge_dir(base);
@@ -392,6 +483,29 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn select_runtime_data_base_prefers_project_root_over_launch_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let chosen = select_runtime_data_base(Some(&project), Some(Path::new("/tmp")));
+        assert_eq!(chosen, resolve_symforge_dir(&project));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_runtime_data_base_skips_system32_launch_cwd() {
+        let chosen = select_runtime_data_base(None, Some(Path::new(r"C:\Windows\System32")));
+        assert!(
+            !chosen
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("system32"),
+            "System32 launch cwd must not host .symforge; got {}",
+            chosen.display()
+        );
+    }
 
     #[test]
     fn test_resolve_symforge_dir_prefers_existing_canonical_dir() {

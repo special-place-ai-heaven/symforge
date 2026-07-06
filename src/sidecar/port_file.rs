@@ -1,6 +1,8 @@
 //! Port and PID file management for the HTTP sidecar.
 //!
-//! All files live under `.symforge/` in the current working directory.
+//! All files live under `.symforge/` beside the project when one is known, or
+//! under the user-level SymForge home when the launch cwd is unsafe/unwritable
+//! (see [`crate::paths::ensure_runtime_symforge_dir`]).
 //! The hook binary reads the sidecar port file to locate the running sidecar.
 //!
 //! Runtime filenames are OS-tagged (`sidecar.<os>.port`, see
@@ -46,18 +48,23 @@ fn read_runtime_file(dir: &Path, tagged: &str, legacy: &str) -> io::Result<Strin
     }
 }
 
-/// Ensure the current working directory has a usable `.symforge/` runtime directory.
-pub fn ensure_symforge_dir() -> io::Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    crate::paths::ensure_symforge_dir(&cwd)
+/// Ensure a usable `.symforge/` runtime directory for sidecar port/pid files.
+pub fn ensure_symforge_dir(project_root: Option<&Path>) -> io::Result<PathBuf> {
+    crate::paths::ensure_runtime_symforge_dir(project_root)
+}
+
+/// Resolve the runtime `.symforge/` directory without creating it.
+fn resolve_symforge_dir(project_root: Option<&Path>) -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    crate::paths::select_runtime_data_base(project_root, cwd.as_deref())
 }
 
 /// Write the sidecar port to `.symforge/sidecar.port`.
 ///
 /// The file contains ONLY the port number as ASCII digits, no trailing newline.
 /// This is the convention the hook binary relies on.
-pub fn write_port_file(port: u16) -> io::Result<()> {
-    let dir = ensure_symforge_dir()?;
+pub fn write_port_file(port: u16, project_root: Option<&Path>) -> io::Result<()> {
+    let dir = ensure_symforge_dir(project_root)?;
     let path = dir.join(port_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{port}")?;
@@ -67,8 +74,8 @@ pub fn write_port_file(port: u16) -> io::Result<()> {
 /// Write the sidecar PID to `.symforge/sidecar.<os>.pid`.
 ///
 /// The file contains ONLY the PID as ASCII digits, no trailing newline.
-pub fn write_pid_file(pid: u32) -> io::Result<()> {
-    let dir = ensure_symforge_dir()?;
+pub fn write_pid_file(pid: u32, project_root: Option<&Path>) -> io::Result<()> {
+    let dir = ensure_symforge_dir(project_root)?;
     let path = dir.join(pid_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{pid}")?;
@@ -76,8 +83,8 @@ pub fn write_pid_file(pid: u32) -> io::Result<()> {
 }
 
 /// Write the daemon/session proxy identifier to `.symforge/sidecar.<os>.session`.
-pub fn write_session_file(session_id: &str) -> io::Result<()> {
-    let dir = ensure_symforge_dir()?;
+pub fn write_session_file(session_id: &str, project_root: Option<&Path>) -> io::Result<()> {
+    let dir = ensure_symforge_dir(project_root)?;
     let path = dir.join(session_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{session_id}")?;
@@ -95,7 +102,7 @@ pub fn cleanup_session_file() {
 ///
 /// Returns an error if the file doesn't exist or contains invalid data.
 pub fn read_port() -> io::Result<u16> {
-    read_port_at(&PathBuf::from(DIR_NAME))
+    read_port_at(&resolve_symforge_dir(None))
 }
 
 fn read_port_at(dir: &Path) -> io::Result<u16> {
@@ -226,14 +233,14 @@ pub fn read_sidecar_status_at(symforge_dir: &Path, bind_host: &str) -> SidecarSt
 }
 
 pub fn read_sidecar_status(bind_host: &str) -> SidecarStatus {
-    read_sidecar_status_at(&PathBuf::from(DIR_NAME), bind_host)
+    read_sidecar_status_at(&resolve_symforge_dir(None), bind_host)
 }
 
 /// Remove both port and PID files. Ignores all errors.
 ///
 /// Called during sidecar shutdown — it is safe to call even if files don't exist.
 pub fn cleanup_files() {
-    cleanup_files_at(&PathBuf::from(DIR_NAME));
+    cleanup_files_at(&resolve_symforge_dir(None));
 }
 
 /// Remove port/PID/session files from a specific directory (both the OS-tagged names
@@ -317,7 +324,7 @@ mod tests {
     #[test]
     fn test_write_read_port_roundtrip() {
         with_temp_dir(|| {
-            write_port_file(12345).expect("write_port_file should succeed");
+            write_port_file(12345, None).expect("write_port_file should succeed");
             let port = read_port().expect("read_port should succeed after write");
             assert_eq!(port, 12345, "port roundtrip must preserve value");
         });
@@ -326,7 +333,7 @@ mod tests {
     #[test]
     fn test_write_port_file_no_trailing_newline() {
         with_temp_dir(|| {
-            write_port_file(8080).expect("write_port_file should succeed");
+            write_port_file(8080, None).expect("write_port_file should succeed");
             // Read while still inside the temp cwd so the relative path resolves correctly.
             let port_path = PathBuf::from(DIR_NAME).join(port_file_name());
             let bytes = std::fs::read(&port_path).unwrap();
@@ -340,7 +347,7 @@ mod tests {
     #[test]
     fn test_write_is_os_tagged_only() {
         with_temp_dir(|| {
-            write_port_file(8080).expect("write_port_file should succeed");
+            write_port_file(8080, None).expect("write_port_file should succeed");
             let dir = PathBuf::from(DIR_NAME);
             // Writer is tag-pure: the OS-tagged file exists, the legacy name does NOT.
             assert!(
@@ -362,7 +369,7 @@ mod tests {
     fn test_read_falls_back_to_legacy_untagged() {
         with_temp_dir(|| {
             // Simulate a sidecar started by an OLD (pre-tag) binary.
-            let dir = ensure_symforge_dir().expect("dir");
+            let dir = ensure_symforge_dir(None).expect("dir");
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"7777").unwrap();
             let port = read_port().expect("read_port must fall back to legacy file");
             assert_eq!(port, 7777, "legacy fallback must read the un-tagged port");
@@ -372,7 +379,7 @@ mod tests {
     #[test]
     fn test_tagged_wins_over_legacy() {
         with_temp_dir(|| {
-            let dir = ensure_symforge_dir().expect("dir");
+            let dir = ensure_symforge_dir(None).expect("dir");
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"1111").unwrap();
             std::fs::write(dir.join(port_file_name()), b"2222").unwrap();
             let port = read_port().expect("read_port should succeed");
@@ -386,8 +393,8 @@ mod tests {
     #[test]
     fn test_cleanup_removes_files() {
         with_temp_dir(|| {
-            write_port_file(9000).expect("write should succeed");
-            write_pid_file(12345).expect("write should succeed");
+            write_port_file(9000, None).expect("write should succeed");
+            write_pid_file(12345, None).expect("write should succeed");
             // Also drop legacy files to prove cleanup removes BOTH.
             let dir = PathBuf::from(DIR_NAME);
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"9000").unwrap();
@@ -440,7 +447,7 @@ mod tests {
     #[test]
     fn test_ensure_symforge_dir_creates_directory() {
         with_temp_dir(|| {
-            let dir = ensure_symforge_dir().expect("ensure_symforge_dir should succeed");
+            let dir = ensure_symforge_dir(None).expect("ensure_symforge_dir should succeed");
             assert!(
                 dir.exists(),
                 ".symforge directory should exist after ensure_symforge_dir"
@@ -452,8 +459,8 @@ mod tests {
     #[test]
     fn test_ensure_symforge_dir_idempotent() {
         with_temp_dir(|| {
-            ensure_symforge_dir().expect("first call should succeed");
-            ensure_symforge_dir().expect("second call should also succeed (idempotent)");
+            ensure_symforge_dir(None).expect("first call should succeed");
+            ensure_symforge_dir(None).expect("second call should also succeed (idempotent)");
         });
     }
     #[test]
@@ -468,8 +475,8 @@ mod tests {
     fn test_check_stale_cleans_up_when_port_is_closed() {
         with_temp_dir(|| {
             // Write a port that is very unlikely to have anything listening.
-            write_port_file(19999).expect("write should succeed");
-            write_pid_file(99999).expect("write should succeed");
+            write_port_file(19999, None).expect("write should succeed");
+            write_pid_file(99999, None).expect("write should succeed");
 
             let is_stale = check_stale("127.0.0.1");
             assert!(

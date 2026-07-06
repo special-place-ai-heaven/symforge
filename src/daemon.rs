@@ -3822,15 +3822,7 @@ fn normalized_path_string(path: &Path) -> String {
 }
 
 pub(crate) fn daemon_dir() -> io::Result<PathBuf> {
-    if let Some(explicit_home) = std::env::var_os("SYMFORGE_HOME") {
-        let dir = PathBuf::from(explicit_home);
-        std::fs::create_dir_all(&dir)?;
-        return Ok(dir);
-    }
-
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    paths::ensure_symforge_dir(&home)
+    paths::global_symforge_home()
 }
 
 fn write_daemon_port_file(port: u16) -> io::Result<()> {

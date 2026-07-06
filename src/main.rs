@@ -254,9 +254,10 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
 
 async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> anyhow::Result<()> {
     if let Some(port) = session.port() {
-        sidecar::port_file::write_port_file(port)?;
-        sidecar::port_file::write_pid_file(std::process::id())?;
-        sidecar::port_file::write_session_file(session.session_id())?;
+        let project_root = session.project_root();
+        sidecar::port_file::write_port_file(port, project_root)?;
+        sidecar::port_file::write_pid_file(std::process::id(), project_root)?;
+        sidecar::port_file::write_session_file(session.session_id(), project_root)?;
     }
 
     let heartbeat_client = session.clone();
