@@ -457,6 +457,11 @@ pub enum SymbolKind {
     Other,
     Key,
     Section,
+    /// A name declared by a module-level macro invocation (e.g.
+    /// `define_id_type!(ProjectId)`). The definition is synthesized at compile
+    /// time, so the index has the NAME but not the generated body — dogfood
+    /// finding #3 (2026-07-06): these were invisible to search_symbols.
+    MacroGenerated,
 }
 
 impl fmt::Display for SymbolKind {
@@ -477,6 +482,7 @@ impl fmt::Display for SymbolKind {
             Self::Other => "other",
             Self::Key => "key",
             Self::Section => "section",
+            Self::MacroGenerated => "macro-generated",
         };
         write!(f, "{prefix}")
     }
