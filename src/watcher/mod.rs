@@ -1757,10 +1757,11 @@ mod tests {
             assert_eq!(idx.tier_counts(), (1, 0, 0));
         }
 
-        // Grow the file past the 1MB metadata-only threshold (still valid Rust),
+        // Grow the file past the 4MB CODE metadata-only threshold (still valid
+        // Rust; code languages get METADATA_ONLY_CODE_BYTES, dogfood #1/#7),
         // then bump mtime so the freshen path detects staleness.
         let mut grown = b"fn big() {}\n".to_vec();
-        grown.resize(1_200_000, b' ');
+        grown.resize(4_400_000, b' ');
         std::fs::write(&abs, &grown).unwrap();
         // Ensure the on-disk mtime differs from the indexed one so the freshen
         // mtime comparison fires (writes within the same second can otherwise
@@ -1805,9 +1806,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let rel = "shrink.rs";
         let abs = tmp.path().join(rel);
-        // Start oversized -> Tier 2 (SizeThreshold).
+        // Start oversized -> Tier 2 (SizeThreshold). Code files demote above
+        // METADATA_ONLY_CODE_BYTES (4MB), not the 1MB data threshold.
         let mut big = b"fn shrink() {}\n".to_vec();
-        big.resize(1_200_000, b' ');
+        big.resize(4_400_000, b' ');
         std::fs::write(&abs, &big).unwrap();
 
         let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();

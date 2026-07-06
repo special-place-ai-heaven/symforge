@@ -14098,8 +14098,9 @@ mod tests {
             .await;
 
         assert!(
-            result.contains("not found on disk"),
-            "deleted file should report 'not found on disk'; got: {result}"
+            result.contains("not found under"),
+            "deleted file should report 'not found under <root>' (dogfood #6: \
+             the lookup root is always named); got: {result}"
         );
     }
 
