@@ -131,3 +131,36 @@ Wave 1 (trust honesty, branch `fix/trust-envelope-tier2`, 2026-07-06):
   crossed 1MB and was repeatedly demoted to Tier-2 mid-session (#1's cutoff
   hitting the repo's own load-bearing file), and every external (non-symforge)
   edit to it triggered the #7 eviction until `analyze_file_impact`.
+
+Wave 2 (daemon correctness, PR #418, merged 2026-07-06):
+
+- **#7 FIXED (root-caused)** — not a UNC path bug: the impact path
+  (`analyze_file_impact` → `process_file` + `update_file`) force-admitted any
+  file, bypassing the admission gate the bulk walk and watcher both apply, so
+  files flapped admit/demote until evicted. `impact_admission_refusal`
+  (sidecar/handlers.rs) now runs `classify_admission` before impact and
+  records demotions in the skip registry. Companion fix: code languages get a
+  4MB `METADATA_ONLY_CODE_BYTES` threshold (data formats keep 1MB), so
+  first-party code just over 1MB — the AAP field failure and symforge's own
+  tools.rs — stays Tier-1. Tests: `tests/impact_admission.rs`.
+- **#6 MITIGATED (cheap half)** — edit-impact NotFound messages now name the
+  daemon root ("not found under <root> — … this daemon is rooted at a
+  different project than your session"), so a hijacked daemon is diagnosable.
+  The full fix (per-session active project) needs a written spec first —
+  wave 4.
+
+Wave 3 (ergonomics/noise, branch `fix/hook-noise-edit-disambiguators`,
+2026-07-06):
+
+- **#8 FIXED** (and #5b) — three noise sources cut: (1) the Grep PostToolUse
+  hook only forwards bare-identifier patterns to `/symbol-context`; regexes
+  and multi-token phrases (`Tip:`, `compact|SYMFORGE_SURFACE`) fail open
+  instead of buying a guaranteed zero-hit report; (2) the bare-token heuristic
+  prompt hint is now a one-line pointer (was a full ~1000-token symbol
+  context); (3) the no-evidence prompt report and the sidecar zero-reference
+  report are each one line.
+- **#4 FIXED** — `edit_within_symbol` gains `occurrence: N` (1-based) and
+  `near_line: L` disambiguators for old_text that appears several times
+  within one symbol (the match-arm case); targeting modes are mutually
+  exclusive; an untargeted multi-match edit now discloses "occurred N times;
+  edited the FIRST" instead of silently rewriting the first match.

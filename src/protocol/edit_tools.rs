@@ -1414,12 +1414,25 @@ impl SymForgeServer {
             edit::normalize_line_endings(params.0.new_text.as_bytes(), line_ending);
         let normalized_new_str =
             String::from_utf8(normalized_new).unwrap_or_else(|_| params.0.new_text.clone());
-        let (new_body, count) = if params.0.replace_all {
+        // Dogfood #4 (2026-07-06): `occurrence`/`near_line` target one exact
+        // match when `old_text` appears several times within the symbol
+        // (e.g. identical lines across match arms of a long fn).
+        let targeting_modes = usize::from(params.0.replace_all)
+            + usize::from(params.0.occurrence.is_some())
+            + usize::from(params.0.near_line.is_some());
+        if targeting_modes > 1 {
+            return fail_and_return_mutation_replay(
+                &idempotency,
+                "Error: `replace_all`, `occurrence`, and `near_line` are mutually exclusive — pass at most one targeting mode.".to_string(),
+            );
+        }
+        let (new_body, count, untargeted_extra) = if params.0.replace_all {
             let count = body_str.matches(&normalized_old_str).count();
             if count > 0 {
                 (
                     body_str.replace(&normalized_old_str, &normalized_new_str),
                     count,
+                    0,
                 )
             } else {
                 // Fallback: try whitespace-flexible matching.
@@ -1429,15 +1442,62 @@ impl SymForgeServer {
                     &normalized_new_str,
                     true,
                 ) {
-                    Some(result) => result,
-                    None => (body_str.to_string(), 0), // hits count==0 error below
+                    Some((body, count)) => (body, count, 0),
+                    None => (body_str.to_string(), 0, 0), // hits count==0 error below
                 }
+            }
+        } else if params.0.occurrence.is_some() || params.0.near_line.is_some() {
+            // Targeted single replacement: exact matches only (a targeted edit
+            // must never silently rebind to a whitespace-flexible guess).
+            let positions: Vec<usize> = body_str
+                .match_indices(normalized_old_str.as_str())
+                .map(|(pos, _)| pos)
+                .collect();
+            if positions.is_empty() {
+                (body_str.to_string(), 0, 0) // hits count==0 error below
+            } else {
+                let index = if let Some(n) = params.0.occurrence {
+                    let n = n as usize;
+                    if n == 0 || n > positions.len() {
+                        return fail_and_return_mutation_replay(
+                            &idempotency,
+                            format!(
+                                "Error: occurrence {n} is out of range — `old_text` has {} exact occurrence(s) within `{}`.",
+                                positions.len(),
+                                params.0.name
+                            ),
+                        );
+                    }
+                    n - 1
+                } else {
+                    // near_line: pick the match whose file line is closest.
+                    let target = i64::from(params.0.near_line.unwrap_or(1));
+                    let line_of = |pos: usize| {
+                        1 + file.content[..sym_start + pos]
+                            .iter()
+                            .filter(|&&byte| byte == b'\n')
+                            .count() as i64
+                    };
+                    (0..positions.len())
+                        .min_by_key(|&i| (line_of(positions[i]) - target).abs())
+                        .unwrap_or(0)
+                };
+                let pos = positions[index];
+                let mut body = String::with_capacity(body_str.len() + normalized_new_str.len());
+                body.push_str(&body_str[..pos]);
+                body.push_str(&normalized_new_str);
+                body.push_str(&body_str[pos + normalized_old_str.len()..]);
+                (body, 1, 0)
             }
         } else {
             match body_str.find(&normalized_old_str) {
                 Some(_) => (
                     body_str.replacen(&normalized_old_str, &normalized_new_str, 1),
                     1,
+                    body_str
+                        .matches(&normalized_old_str)
+                        .count()
+                        .saturating_sub(1),
                 ),
                 None => {
                     // Fallback: try whitespace-flexible matching.
@@ -1447,7 +1507,7 @@ impl SymForgeServer {
                         &normalized_new_str,
                         false,
                     ) {
-                        Some(result) => result,
+                        Some((body, count)) => (body, count, 0),
                         None => {
                             // Show a preview of the symbol body so the LLM can see what's actually there
                             let preview_len = 800.min(body_str.len());
@@ -1504,6 +1564,13 @@ impl SymForgeServer {
                 params.0.path,
                 count
             );
+            if untargeted_extra > 0 {
+                result.push_str(&format!(
+                    "\nNote: `old_text` occurs {} times within `{}`; this targets the FIRST. Pass `occurrence: N` or `near_line: L` to pick another.",
+                    untargeted_extra + 1,
+                    params.0.name
+                ));
+            }
             append_project_config_trust_suffix(&mut result, project_config_trust_suffix.as_deref());
             return result;
         }
@@ -1569,6 +1636,15 @@ impl SymForgeServer {
                 new_body.len(),
             )
         );
+        if untargeted_extra > 0 {
+            // Dogfood #4: replacing the first of several matches silently is a
+            // mini trust lie — disclose the ambiguity and the targeting knobs.
+            out.push_str(&format!(
+                "\nNote: `old_text` occurred {} times within `{}`; edited the FIRST. Pass `occurrence: N` or `near_line: L` to target another.",
+                untargeted_extra + 1,
+                params.0.name
+            ));
+        }
         out.push_str(&edit_format::format_reroute_suffix(
             working_directory,
             &resolved_target,
