@@ -1008,10 +1008,11 @@ fn merge_symforge_codex_server_for_target_os(
     merge_codex_project_doc_fallbacks(config);
 }
 
-/// Union the compact-surface tool names into Codex's `allowed_tools`,
+/// Union the full-surface tool names into Codex's `allowed_tools`,
 /// preserving any user-added entries. Codex strips the `mcp__symforge__` prefix,
-/// so the compact short names (`symforge`, `symforge_edit`, `status`) are what
-/// the served surface actually exposes — the allowlist matches the surface.
+/// so the unprefixed short names are what the served surface actually exposes —
+/// the allowlist matches the surface (spec §4; full-by-init per the 2026-07-03
+/// spike gate + 2026-07-06 operator flip).
 fn merge_codex_allowed_tools(symforge: &mut Table) {
     let mut names: Vec<String> = symforge
         .get("allowed_tools")
@@ -1023,7 +1024,7 @@ fn merge_codex_allowed_tools(symforge: &mut Table) {
         })
         .unwrap_or_default();
 
-    for name in crate::stel::COMPACT_TOOL_NAMES {
+    for name in CLAUDE_ALWAYS_ALLOW {
         if !names.iter().any(|existing| existing == name) {
             names.push(name.to_string());
         }
@@ -1047,10 +1048,11 @@ fn merge_codex_mcp_env_overrides(symforge: &mut Table, target_os: &str) {
         .as_table_like_mut()
         .expect("symforge env must be a table or inline table");
 
-    // Make the served compact surface explicit, but never clobber a user-set
-    // value (G-036: the 8.10.1 update wiped SYMFORGE_SURFACE=full).
+    // Codex defers schema loading (undocumented `tool_search` layer, measured
+    // 2026-07-03), so serve the full surface. Never clobber a user-set value
+    // (G-036: the 8.10.1 update wiped SYMFORGE_SURFACE=full).
     if env.get("SYMFORGE_SURFACE").is_none() {
-        env.insert("SYMFORGE_SURFACE", value("compact"));
+        env.insert("SYMFORGE_SURFACE", value("full"));
     }
 
     for (name, env_value) in codex_mcp_env_overrides_for_target_os(target_os) {
@@ -1123,8 +1125,10 @@ pub fn register_gemini_mcp_server(
     entry
         .entry("trust".to_string())
         .or_insert_with(|| Value::Bool(true));
-    // Gemini CLI has no deferred loading — make the compact surface explicit.
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "compact")]);
+    // Gemini CLI full-injects (~16k tokens/turn) but accepts all 36 tools
+    // (measured 2026-07-03); operator flipped init to full 2026-07-06.
+    // `SYMFORGE_SURFACE=compact` stays the documented escape hatch.
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(gemini_settings_path, pretty)
@@ -1163,10 +1167,12 @@ pub fn register_kilo_mcp_server(
     entry
         .entry("disabled".to_string())
         .or_insert_with(|| Value::Bool(false));
-    // Kilo has no deferred loading — serve the compact 3-tool facade and grant
-    // exactly those names so the allowlist matches the served surface (spec §4).
-    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "compact")]);
-    union_allow_names(entry, "alwaysAllow", &crate::stel::COMPACT_TOOL_NAMES);
+    // Kilo full-injects (~16k tokens/turn) but accepts all 36 tools (measured
+    // 2026-07-03); operator flipped init to full 2026-07-06. Grant the full
+    // names so the allowlist matches the served surface (spec §4);
+    // `SYMFORGE_SURFACE=compact` stays the documented escape hatch.
+    insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
+    union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
 
     let pretty = serde_json::to_string_pretty(&config)?;
     std::fs::write(kilo_config_path, pretty)
@@ -2036,9 +2042,8 @@ mod tests {
 
         // SYMFORGE_TOOL_NAMES carries the `mcp__symforge__` prefix; strip it to compare.
         // It backs the Claude Code settings.json `allowedTools` union (the full
-        // surface). Kilo/Codex intentionally grant only the compact names now
-        // (see the coherence tests), so they are not compared against the full
-        // surface here.
+        // surface). Kilo/Codex allowlists union CLAUDE_ALWAYS_ALLOW (pinned to
+        // the registered surface below), so they are covered transitively.
         let full: BTreeSet<String> = SYMFORGE_TOOL_NAMES
             .iter()
             .map(|n| n.trim_start_matches("mcp__symforge__").to_string())
@@ -2090,23 +2095,26 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         register_codex_mcp_server(&config_path, "/usr/bin/symforge").unwrap();
         let content = std::fs::read_to_string(&config_path).unwrap();
-        // G-036 coherence: Codex serves the compact surface, so its allowlist
-        // grants exactly the compact facade names — nothing more.
-        assert!(
-            content.contains("allowed_tools = [\"symforge\", \"symforge_edit\", \"status\"]"),
-            "Codex allow list must be exactly the compact facade names: {content}"
-        );
-        assert!(
-            !content.contains("\"search_symbols\""),
-            "Codex allow list must not grant full-surface tools when serving compact: {content}"
-        );
+        // G-036 coherence: Codex serves the full surface, so its allowlist
+        // grants every full-surface short name.
+        for name in [
+            "\"symforge\"",
+            "\"symforge_edit\"",
+            "\"status\"",
+            "\"search_symbols\"",
+        ] {
+            assert!(
+                content.contains(name),
+                "Codex allow list must grant full-surface name {name}: {content}"
+            );
+        }
         assert!(
             !content.contains("trace_symbol"),
             "Codex allow list must not include retired trace_symbol alias: {content}"
         );
         assert!(
-            content.contains("SYMFORGE_SURFACE = \"compact\""),
-            "Codex env must make the compact surface explicit: {content}"
+            content.contains("SYMFORGE_SURFACE = \"full\""),
+            "Codex env must make the full surface explicit: {content}"
         );
         assert!(
             content.contains("project_doc_fallback_filenames = [\"AGENTS.md\", \"CLAUDE.md\"]"),
@@ -2162,7 +2170,7 @@ mod tests {
             "re-registration must NOT downgrade a user-set surface (the 8.10.1 wipe)"
         );
 
-        // Direction 2: user pinned full on a compact-default harness (Kilo).
+        // Direction 2: user pinned compact (escape hatch) on Kilo (fresh default full).
         let dir2 = tempfile::tempdir().unwrap();
         let path2 = dir2.path().join("mcp.json");
         std::fs::write(
@@ -2171,7 +2179,7 @@ mod tests {
                 "mcpServers": {
                     "symforge": {
                         "command": "/old/symforge",
-                        "env": {"SYMFORGE_SURFACE": "full"}
+                        "env": {"SYMFORGE_SURFACE": "compact"}
                     }
                 }
             }))
@@ -2183,8 +2191,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
         assert_eq!(
             config2["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
-            Some("full"),
-            "re-registration must preserve a user-set full surface on a compact harness"
+            Some("compact"),
+            "re-registration must preserve a user-set compact escape hatch on Kilo"
         );
     }
 
@@ -2279,20 +2287,20 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_fresh_registration_pins_compact_surface() {
+    fn test_gemini_fresh_registration_pins_full_surface() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         register_gemini_mcp_server(&path, "/usr/bin/symforge").unwrap();
         let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
-            Some("compact"),
-            "fresh Gemini registration must make the compact surface explicit"
+            Some("full"),
+            "fresh Gemini registration must make the full surface explicit"
         );
     }
 
     #[test]
-    fn test_kilo_fresh_registration_allowlist_is_exactly_compact() {
+    fn test_kilo_fresh_registration_allowlist_is_exactly_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp.json");
         register_kilo_mcp_server(&path, "/usr/bin/symforge").unwrap();
@@ -2303,7 +2311,12 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(allow, vec!["symforge", "symforge_edit", "status"]);
+        assert_eq!(allow, CLAUDE_ALWAYS_ALLOW.to_vec());
+        assert_eq!(
+            config["mcpServers"]["symforge"]["env"]["SYMFORGE_SURFACE"].as_str(),
+            Some("full"),
+            "fresh Kilo registration must make the full surface explicit"
+        );
     }
 
     #[test]
@@ -2344,17 +2357,19 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_fresh_registration_allowlist_is_exactly_compact() {
+    fn test_codex_fresh_registration_allowlist_is_exactly_full() {
         let mut config = DocumentMut::new();
         merge_symforge_codex_server_for_target_os(&mut config, "/usr/bin/symforge", "macos");
         let content = config.to_string();
+        for name in CLAUDE_ALWAYS_ALLOW {
+            assert!(
+                content.contains(&format!("\"{name}\"")),
+                "fresh Codex allowlist must grant full-surface name {name}: {content}"
+            );
+        }
         assert!(
-            content.contains("allowed_tools = [\"symforge\", \"symforge_edit\", \"status\"]"),
-            "fresh Codex allowlist must be exactly the compact names: {content}"
-        );
-        assert!(
-            content.contains("SYMFORGE_SURFACE = \"compact\""),
-            "fresh Codex env must pin the compact surface on every OS: {content}"
+            content.contains("SYMFORGE_SURFACE = \"full\""),
+            "fresh Codex env must pin the full surface on every OS: {content}"
         );
     }
 
@@ -2368,7 +2383,7 @@ mod tests {
     allowed_tools = ["my_custom_tool"]
 
     [mcp_servers.symforge.env]
-    SYMFORGE_SURFACE = "full"
+    SYMFORGE_SURFACE = "compact"
     "#
         .parse::<DocumentMut>()
         .unwrap();
@@ -2381,12 +2396,12 @@ mod tests {
         for name in ["\"symforge\"", "\"symforge_edit\"", "\"status\""] {
             assert!(
                 content.contains(name),
-                "compact name {name} must be unioned in: {content}"
+                "surface name {name} must be unioned in: {content}"
             );
         }
         assert!(
-            content.contains("SYMFORGE_SURFACE = \"full\""),
-            "re-registration must preserve a user-set Codex surface: {content}"
+            content.contains("SYMFORGE_SURFACE = \"compact\""),
+            "re-registration must preserve a user-set Codex compact escape hatch: {content}"
         );
         assert!(
             content.contains("startup_timeout_sec = 90")
