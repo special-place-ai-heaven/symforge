@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.12.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.12.1...v8.12.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* **sidecar,daemon:** caller-root guard for hooks, raw-input system-path refusal ([66946d1](https://github.com/special-place-ai-heaven/symforge/commit/66946d10aae7e5a5c160faa1532cee57f095a9a2))
+
 ## [8.12.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.12.0...v8.12.1) (2026-07-06)
 
 
