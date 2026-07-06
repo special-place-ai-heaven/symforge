@@ -13262,6 +13262,8 @@ mod tests {
                 old_text: "let x = 1;".to_string(),
                 new_text: "let x = 7;".to_string(),
                 replace_all: false,
+                occurrence: None,
+                near_line: None,
                 dry_run: None,
                 idempotency_key: None,
                 working_directory: None,
@@ -24241,6 +24243,8 @@ mod tests {
             old_text: "\"hello\"".to_string(),
             new_text: "\"HELLO\"".to_string(),
             replace_all: false,
+            occurrence: None,
+            near_line: None,
             dry_run: None,
             idempotency_key: None,
             working_directory: None,
@@ -24255,6 +24259,106 @@ mod tests {
         let on_disk = std::fs::read_to_string(&file_path).unwrap();
         assert!(on_disk.contains("HELLO"), "edited: {on_disk}");
         assert!(!on_disk.contains("\"hello\""), "old text gone: {on_disk}");
+    }
+
+    fn multi_match_edit_input(
+        old_text: &str,
+        new_text: &str,
+    ) -> crate::protocol::edit::EditWithinSymbolInput {
+        crate::protocol::edit::EditWithinSymbolInput {
+            path: "src/lib.rs".to_string(),
+            name: "hello".to_string(),
+            kind: None,
+            symbol_line: None,
+            old_text: old_text.to_string(),
+            new_text: new_text.to_string(),
+            replace_all: false,
+            occurrence: None,
+            near_line: None,
+            dry_run: None,
+            idempotency_key: None,
+            working_directory: None,
+        }
+    }
+
+    // Dogfood #4 (2026-07-06): identical lines across arms of one fn were
+    // unaddressable — edit_within_symbol silently rewrote the first match.
+    const MULTI_MATCH_BODY: &[u8] =
+        b"fn hello() {\n    let a = 1;\n    let a = 1;\n    let a = 1;\n}\n";
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_occurrence_targets_nth_match() {
+        let (_dir, server, file_path) = setup_edit_test(MULTI_MATCH_BODY);
+        let mut input = multi_match_edit_input("let a = 1;", "let a = 2;");
+        input.occurrence = Some(2);
+        let result = server.edit_within_symbol(Parameters(input)).await;
+        assert!(result.contains("edited within"), "result: {result}");
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            on_disk.contains("let a = 1;\n    let a = 2;\n    let a = 1;"),
+            "only the second occurrence changes: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_near_line_picks_closest_match() {
+        let (_dir, server, file_path) = setup_edit_test(MULTI_MATCH_BODY);
+        let mut input = multi_match_edit_input("let a = 1;", "let a = 2;");
+        // Occurrences sit on file lines 2, 3, 4 — line 4 selects the third.
+        input.near_line = Some(4);
+        let result = server.edit_within_symbol(Parameters(input)).await;
+        assert!(result.contains("edited within"), "result: {result}");
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            on_disk.contains("let a = 1;\n    let a = 1;\n    let a = 2;"),
+            "only the occurrence nearest line 4 changes: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_occurrence_out_of_range_errors() {
+        let (_dir, server, file_path) = setup_edit_test(MULTI_MATCH_BODY);
+        let mut input = multi_match_edit_input("let a = 1;", "let a = 2;");
+        input.occurrence = Some(5);
+        let result = server.edit_within_symbol(Parameters(input)).await;
+        assert!(
+            result.contains("out of range") && result.contains("3 exact occurrence(s)"),
+            "out-of-range occurrence must error with the real count: {result}"
+        );
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            !on_disk.contains("let a = 2;"),
+            "no write on error: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_untargeted_multi_match_discloses() {
+        let (_dir, server, file_path) = setup_edit_test(MULTI_MATCH_BODY);
+        let input = multi_match_edit_input("let a = 1;", "let a = 2;");
+        let result = server.edit_within_symbol(Parameters(input)).await;
+        assert!(
+            result.contains("occurred 3 times") && result.contains("edited the FIRST"),
+            "an untargeted multi-match edit must disclose the ambiguity: {result}"
+        );
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            on_disk.contains("let a = 2;\n    let a = 1;\n    let a = 1;"),
+            "untargeted edit still rewrites the first occurrence: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_within_symbol_targeting_modes_are_mutually_exclusive() {
+        let (_dir, server, _file_path) = setup_edit_test(MULTI_MATCH_BODY);
+        let mut input = multi_match_edit_input("let a = 1;", "let a = 2;");
+        input.replace_all = true;
+        input.occurrence = Some(1);
+        let result = server.edit_within_symbol(Parameters(input)).await;
+        assert!(
+            result.contains("mutually exclusive"),
+            "conflicting targeting modes must error: {result}"
+        );
     }
 
     #[tokio::test]
@@ -24310,6 +24414,8 @@ mod tests {
             old_text: "nonexistent".to_string(),
             new_text: "replacement".to_string(),
             replace_all: false,
+            occurrence: None,
+            near_line: None,
             dry_run: None,
             idempotency_key: None,
             working_directory: None,
@@ -24426,6 +24532,8 @@ mod tests {
                 old_text: "old_text".to_string(),
                 new_text: "new_text".to_string(),
                 replace_all: false,
+                occurrence: None,
+                near_line: None,
                 dry_run: Some(true),
                 idempotency_key: None,
                 working_directory: None,

@@ -128,10 +128,9 @@ fn format_prompt_context_signal(level: &str, evidence: impl Into<String>, body: 
 }
 
 fn no_high_confidence_prompt_context_message() -> String {
-    "Prompt-context signal: no high-confidence hint\n\
-Evidence: no exact file, symbol, or repo-map cue matched the prompt\n\n\
-Suggested next step: use `search_symbols(...)` for likely names or `search_text(...)` for code/content search."
-        .to_string()
+    // Dogfood #8 (2026-07-06): a no-evidence report must cost one line, not a
+    // multi-line report — this lands in the agent's prompt on EVERY submit.
+    "Prompt-context signal: none (no file/symbol/repo-map cue in prompt)".to_string()
 }
 
 fn context_source_authority_label(authority: ContextSourceAuthority) -> &'static str {
@@ -1450,9 +1449,11 @@ fn symbol_context_text(
     }
 
     if body_lines.is_empty() {
-        body_lines.push("No references found in the index.".to_string());
+        // Dogfood #8 (2026-07-06): hooks feed this into prompt context on
+        // every Grep, so a zero-hit report must cost one line.
         body_lines.push(
-            "Tip: this symbol may only be used via dynamic dispatch, reflection, or external entry points.".to_string(),
+            "No references found in the index (not a symbol, or only dynamic/external usage)."
+                .to_string(),
         );
     }
 
@@ -1866,21 +1867,12 @@ async fn prompt_context_text(
             return Ok(format_prompt_context_signal(level, evidence, body));
         }
         (None, Some(name)) => {
-            let body = symbol_context_text(
-                state,
-                &SymbolContextParams {
-                    name: name.clone(),
-                    file: None,
-                    path: None,
-                    symbol_kind: None,
-                    symbol_line: None,
-                },
-                options,
-            )?;
-            return Ok(format_prompt_context_signal(
-                "heuristic",
-                format!("symbol token `{name}` matched somewhere in the index"),
-                body,
+            // Dogfood #8 (2026-07-06): a bare prompt token matching a symbol
+            // name is the weakest evidence tier — a conversational word can
+            // collide with an indexed symbol. Emit a one-line pointer, never
+            // a full symbol context (~1000 tokens on every prompt submit).
+            return Ok(format!(
+                "Prompt-context signal: heuristic\nEvidence: symbol token `{name}` matched somewhere in the index — get_symbol_context(name=\"{name}\") if intended"
             ));
         }
         (None, None) => {}
@@ -3512,14 +3504,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            result.contains("src/service.rs"),
-            "symbol-only prompt should use symbol context: {result}"
-        );
-        assert!(
-            result.contains("src/other.rs"),
-            "name-only symbol context should keep global same-name hits: {result}"
-        );
+        // Dogfood #8: a bare-token match is the weakest evidence tier — it
+        // must cost a one-line pointer, never a full symbol context.
         assert!(
             result.contains("Prompt-context signal: heuristic"),
             "symbol-only hints should be labeled heuristic: {result}"
@@ -3527,6 +3513,14 @@ mod tests {
         assert!(
             result.contains("symbol token `connect` matched somewhere in the index"),
             "symbol-only hints should expose their evidence source: {result}"
+        );
+        assert!(
+            result.contains("get_symbol_context(name=\"connect\")"),
+            "the pointer should name the follow-up tool call: {result}"
+        );
+        assert!(
+            !result.contains("src/service.rs"),
+            "heuristic hints must not inline reference bodies: {result}"
         );
     }
 
@@ -3550,12 +3544,13 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("Prompt-context signal: no high-confidence hint"),
-            "unmatched prompts should explicitly report low confidence: {result}"
+            result.contains("Prompt-context signal: none"),
+            "unmatched prompts should explicitly report no signal: {result}"
         );
+        // Dogfood #8: a no-evidence report costs one line on every prompt submit.
         assert!(
-            result.contains("search_symbols(...)"),
-            "unmatched prompts should suggest the next narrowing step: {result}"
+            !result.trim().contains('\n'),
+            "the no-signal report must be a single line: {result}"
         );
     }
 
@@ -3601,7 +3596,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("Prompt-context signal: no high-confidence hint"),
+            result.contains("Prompt-context signal: none"),
             "common-word collisions must not fire a heuristic symbol signal: {result}"
         );
         assert!(
@@ -4552,11 +4547,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            partial.contains("src/app.ts"),
+            partial.contains("symbol token `connect`"),
             "partial slash module aliases should stay on the fallback path: {partial}"
         );
         assert!(
-            partial.contains("src/other.ts"),
+            partial.contains("Prompt-context signal: heuristic"),
             "partial slash module aliases should not collapse to one exact file: {partial}"
         );
 
@@ -4570,11 +4565,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            continued.contains("src/app.ts"),
+            continued.contains("symbol token `connect`"),
             "continued slash module aliases should stay on the fallback path: {continued}"
         );
         assert!(
-            continued.contains("src/other.ts"),
+            continued.contains("Prompt-context signal: heuristic"),
             "continued slash module aliases should not collapse to one exact file: {continued}"
         );
     }
@@ -4832,11 +4827,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "partial module aliases should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("src/other.rs"),
+            result.contains("Prompt-context signal: heuristic"),
             "partial module aliases should not collapse to one exact file: {result}"
         );
     }
@@ -4877,11 +4872,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "continued qualified symbol aliases should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("src/other.rs"),
+            result.contains("Prompt-context signal: heuristic"),
             "continued qualified symbol aliases should not collapse to one exact file: {result}"
         );
     }
@@ -5230,11 +5225,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("pkg/service.py"),
+            result.contains("symbol token `connect`"),
             "continued dotted aliases should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("pkg/other.py"),
+            result.contains("Prompt-context signal: heuristic"),
             "continued dotted aliases should not collapse to one exact file: {result}"
         );
     }
@@ -5317,11 +5312,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/app.ts"),
+            result.contains("symbol token `connect`"),
             "continued slash aliases should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("src/other.ts"),
+            result.contains("Prompt-context signal: heuristic"),
             "continued slash aliases should not collapse to one exact file: {result}"
         );
     }
@@ -5602,11 +5597,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "partial module aliases should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("src/other.rs"),
+            result.contains("Prompt-context signal: heuristic"),
             "partial module aliases should not collapse to one exact file: {result}"
         );
     }
@@ -5654,11 +5649,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "partial extensionless paths should stay on the fallback path: {result}"
         );
         assert!(
-            result.contains("src/other.rs"),
+            result.contains("Prompt-context signal: heuristic"),
             "partial extensionless paths should not collapse to one exact file: {result}"
         );
     }
@@ -5784,11 +5779,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "ambiguous basename should fall back to name-only symbol context: {result}"
         );
         assert!(
-            result.contains("tests/helper.rs"),
+            result.contains("Prompt-context signal: heuristic"),
             "ambiguous basename should not collapse to one file hint: {result}"
         );
     }
@@ -5886,11 +5881,11 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.contains("src/service.rs"),
+            result.contains("symbol token `connect`"),
             "ambiguous extensionless alias should fall back to name-only symbol context: {result}"
         );
         assert!(
-            result.contains("tests/helper.py"),
+            result.contains("Prompt-context signal: heuristic"),
             "ambiguous extensionless alias should not collapse to one file hint: {result}"
         );
     }

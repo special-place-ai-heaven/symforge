@@ -1495,6 +1495,16 @@ pub struct EditWithinSymbolInput {
     /// If true, replace all occurrences within the symbol. Default: false (first match only).
     #[serde(default)]
     pub replace_all: bool,
+    /// Target the Nth exact occurrence of `old_text` within the symbol (1-based).
+    /// Use when `old_text` appears more than once (e.g. identical lines in
+    /// several match arms). Mutually exclusive with `replace_all` and `near_line`.
+    #[serde(default, deserialize_with = "super::tools::lenient_u32")]
+    pub occurrence: Option<u32>,
+    /// Target the exact occurrence of `old_text` closest to this 1-based FILE
+    /// line. Alternative to `occurrence` when you know where the target is but
+    /// not its rank. Mutually exclusive with `replace_all` and `occurrence`.
+    #[serde(default, deserialize_with = "super::tools::lenient_u32")]
+    pub near_line: Option<u32>,
     /// When true, validate and preview but skip the actual write.
     #[serde(default, deserialize_with = "super::tools::lenient_bool")]
     pub dry_run: Option<bool>,

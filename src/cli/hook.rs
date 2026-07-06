@@ -730,6 +730,16 @@ fn is_non_source_path(path: &str) -> bool {
     false
 }
 
+/// True when a Grep pattern is a bare code identifier worth a symbol lookup.
+/// Regexes, globs, and multi-token phrases can never match a symbol name, so
+/// forwarding them only produces zero-hit noise in prompt context (dogfood #8).
+fn is_plausible_symbol_name(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 /// Maps a resolved subcommand + stdin input to `(path, query_string)`.
 ///
 /// The `input` carries the file path and search pattern extracted from the
@@ -776,12 +786,14 @@ pub(crate) fn endpoint_for(
                 .as_ref()
                 .and_then(|ti| ti.pattern.as_deref().or(ti.path.as_deref()))
                 .unwrap_or("");
-            let query = if q.is_empty() {
-                String::new()
-            } else {
-                format!("name={}", url_encode(q))
-            };
-            ("/symbol-context", query)
+            // Dogfood #8 (2026-07-06): grep patterns are often regexes or
+            // multi-token phrases (`Tip:`, `compact|SYMFORGE_SURFACE`) — not
+            // symbol names. Forwarding them buys a guaranteed zero-hit report
+            // in prompt context. Only a bare identifier is worth the lookup.
+            if q.is_empty() || !is_plausible_symbol_name(q) {
+                return ("/health", String::new());
+            }
+            ("/symbol-context", format!("name={}", url_encode(q)))
         }
         Some(HookSubcommand::SessionStart) => ("/repo-map", String::new()),
         Some(HookSubcommand::PromptSubmit) => {
@@ -1567,6 +1579,43 @@ mod tests {
     }
 
     #[test]
+    fn test_endpoint_for_grep_regex_pattern_fails_open() {
+        // Dogfood #8: regex / multi-token grep patterns are not symbol names —
+        // forwarding them guarantees a zero-hit report in prompt context.
+        for pattern in [
+            "compact|SYMFORGE_SURFACE",
+            "Tip:",
+            "fn .*_handler",
+            "two words",
+            "foo.bar",
+            "^anchor",
+        ] {
+            let json = format!(
+                r#"{{"tool_name":"Grep","tool_input":{{"pattern":"{pattern}"}},"cwd":"/abs"}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap_or_default();
+            let (path, query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
+            assert_eq!(path, "/health", "pattern {pattern:?} must fail open");
+            assert!(
+                query.is_empty(),
+                "pattern {pattern:?} must not forward a query"
+            );
+        }
+        // Bare identifiers still get the lookup.
+        for pattern in ["classify_admission", "TODO", "_private", "Vec2d"] {
+            let json = format!(
+                r#"{{"tool_name":"Grep","tool_input":{{"pattern":"{pattern}"}},"cwd":"/abs"}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap_or_default();
+            let (path, _) = endpoint_for(Some(&HookSubcommand::Grep), &input);
+            assert_eq!(
+                path, "/symbol-context",
+                "pattern {pattern:?} is a plausible symbol"
+            );
+        }
+    }
+
+    #[test]
     fn test_endpoint_for_session_start_routes_to_repo_map() {
         let input = HookInput::default();
         let (path, query) = endpoint_for(Some(&HookSubcommand::SessionStart), &input);
@@ -1664,9 +1713,12 @@ mod tests {
 
     #[test]
     fn test_hook_subcommand_to_endpoint_grep_backward_compat() {
+        // Empty pattern fail-opens to /health (dogfood #8): with nothing to
+        // look up, /symbol-context could only produce a zero-hit report.
         let input = HookInput::default();
-        let (path, _query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
-        assert_eq!(path, "/symbol-context");
+        let (path, query) = endpoint_for(Some(&HookSubcommand::Grep), &input);
+        assert_eq!(path, "/health");
+        assert!(query.is_empty());
     }
 
     #[test]
