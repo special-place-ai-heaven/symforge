@@ -187,3 +187,25 @@ Wave 4 (recall + shared-state routing, branch
   repro as field evidence. The council's objection stands recorded: the
   Wave 2 root-naming warning is a bandage, not the fix; the ticket closes
   only when FR-006b ships.
+
+Wave 5 (session-root guard + system-path hardening, branch
+`fix/session-root-guard-and-system-dirs`, 2026-07-06):
+
+- **#6 HOOK HALF FIXED (FR-006b partial)** — hooks now pin every sidecar
+  request with `caller_root` (their canonicalized cwd); a sidecar middleware
+  compares it against the CURRENT index's `indexed_root` and answers 409 on
+  mismatch. The hook's existing error path then falls back to the daemon,
+  which resolves the project BY ROOT (`try_daemon_fallback`) — so a session
+  retargeted by another agent's `index_folder` produces correct answers or an
+  honest fail-open, never false "not found" alarms. `/health` and `/stats`
+  stay root-agnostic. Tests: `tests/hook_root_guard.rs` (409 on mismatch,
+  pass on match, back-compat without the param, health exemption). The full
+  per-session binding (spec 012 FR-006b proper) remains open.
+- **NEW: system-path guard ordering** (field report, same day) — `index_folder`
+  and `open_project_session` ran `exists()`/`canonicalize()` BEFORE the
+  sensitive-path guard, so a protected tree (`C:\Windows\System32\...`) could
+  surface a raw OS access error instead of the refusal. All three entry points
+  (local tool, daemon session index, daemon session open) now refuse on the
+  RAW input first, keeping the post-canonicalize check as the symlink belt.
+  Tests: `tests/system_path_refusal.rs` (System32/Windows/Program Files/
+  ProgramData/drive root, unresolvable system subpaths, forward-slash forms).

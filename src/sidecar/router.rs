@@ -48,5 +48,12 @@ pub fn build_router(state: SidecarState) -> Router {
             get(handlers::workflow_prompt_narrowing_handler),
         )
         .route("/stats", get(handlers::stats_handler))
+        // Dogfood #6 / spec 012 FR-006b (hook half): 409 when a request's
+        // `caller_root` does not match the current index root, so hooks fall
+        // back to the daemon instead of getting wrong-project answers.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handlers::caller_root_guard,
+        ))
         .with_state(state)
 }
