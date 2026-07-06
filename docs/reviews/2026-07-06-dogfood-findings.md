@@ -164,3 +164,26 @@ Wave 3 (ergonomics/noise, branch `fix/hook-noise-edit-disambiguators`,
   within one symbol (the match-arm case); targeting modes are mutually
   exclusive; an untargeted multi-match edit now discloses "occurred N times;
   edited the FIRST" instead of silently rewriting the first match.
+
+Wave 4 (recall + shared-state routing, branch
+`feat/macro-generated-symbols`, 2026-07-06):
+
+- **#3 FIXED** — module-level Rust `macro_invocation` identifier arguments are
+  indexed as symbols with the new trust-flagged kind `macro-generated`
+  (`define_id_type!(ProjectId)` → symbol `ProjectId`, kind label
+  `macro-generated`, anchored to the declaring invocation so `get_symbol`
+  returns the real line). Function-body macro calls never produce symbols;
+  names are deduplicated and capped at 8 per invocation to bound block-macro
+  pollution. The kind label IS the trust flag: the index has the declared
+  NAME, not the compile-time-synthesized body.
+- **#2 CLOSED (via #3)** — with the Rust candidate now indexed, bare-name
+  lookups that previously resolved "Unique" to the wrong language now see
+  both candidates and return the ambiguity list (plus Wave 1's resolved-path
+  echo).
+- **#6 full fix ROUTED TO SPEC 012** — the per-session active project is
+  FR-006/-007/-008 of `specs/012-harness-agnostic-mcp/spec.md`; added
+  **FR-006b** (retarget MUST be connection-scoped; one session's
+  `index_folder` must never swap another session's binding) with the dogfood
+  repro as field evidence. The council's objection stands recorded: the
+  Wave 2 root-naming warning is a bandage, not the fix; the ticket closes
+  only when FR-006b ships.

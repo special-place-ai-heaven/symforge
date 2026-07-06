@@ -553,6 +553,7 @@ fn symbol_kind_str(kind: &crate::domain::SymbolKind) -> &'static str {
         Other => "other",
         Key => "key",
         Section => "section",
+        MacroGenerated => "macro-generated",
     }
 }
 
