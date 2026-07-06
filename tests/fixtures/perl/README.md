@@ -12,7 +12,8 @@ Synthetic snippets for parse-quality and recall measurement. Each file is tagged
 ## Construct classes
 
 `sub`, `package`, `class`, `method`, `method_call`, `plain_call`, `ambiguous_call`,
-`use_import`, `require_import`, `qualified_call`
+`use_import`, `require_import`, `qualified_call`, `super_call`, `coderef_call`,
+`parent_import`
 
 ## Running
 

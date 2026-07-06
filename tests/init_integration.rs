@@ -402,22 +402,29 @@ fn test_init_registers_kilo_mcp_server() {
         "args must be empty"
     );
 
-    // G-036 coherence: Kilo serves the compact surface, so its allowlist grants
-    // exactly the compact facade names and the env pins that surface.
+    // G-036 coherence: Kilo serves the full surface (2026-07-06 operator flip),
+    // so its allowlist grants the full-surface names and the env pins full.
     assert_eq!(
         symforge["env"]["SYMFORGE_SURFACE"].as_str(),
-        Some("compact"),
-        "Kilo env must make the compact surface explicit"
+        Some("full"),
+        "Kilo env must make the full surface explicit"
     );
     let always_allow = symforge["alwaysAllow"]
         .as_array()
         .expect("alwaysAllow must be an array");
     let names: Vec<&str> = always_allow.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["symforge", "symforge_edit", "status"],
-        "alwaysAllow must be exactly the compact facade names"
-    );
+    for name in [
+        "symforge",
+        "symforge_edit",
+        "status",
+        "search_symbols",
+        "replace_symbol_body",
+    ] {
+        assert!(
+            names.contains(&name),
+            "alwaysAllow must grant full-surface name {name}: {names:?}"
+        );
+    }
 }
 
 #[test]

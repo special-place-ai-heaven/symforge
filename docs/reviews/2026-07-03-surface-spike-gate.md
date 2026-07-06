@@ -126,6 +126,11 @@ Post-merge checks on `main` after init fix + 8.11.0:
 | Claude Code init | `SYMFORGE_SURFACE=full` + full allowlist | `tests/init_integration.rs` |
 | Cursor init | `SYMFORGE_SURFACE=full` (operator flip per item 2) | `src/cli/init.rs` unit test |
 | Codex / Gemini / Kilo init | `SYMFORGE_SURFACE=compact` (16k/turn harnesses) | init unit tests |
+
+Update 2026-07-06 (post-8.11.1): operator exercised item 2 — Codex/Gemini/Kilo
+init flipped to `full` (Codex was measured deferred anyway; Gemini/Kilo accept
+full at ~16k/turn). `SYMFORGE_SURFACE=compact` remains the documented escape
+hatch and is preserved on re-init. Claude Desktop stays compact-by-init.
 | CI Release gate | green on Linux | GitHub Actions |
 
 Re-run init locally after upgrade: `symforge init --client cursor` (or `all`) to refresh
