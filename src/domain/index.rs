@@ -62,6 +62,24 @@ impl LanguageId {
         }
     }
 
+    /// True for programming languages (symbol-bearing code) as opposed to
+    /// data/markup formats. Drives the higher metadata-only size threshold
+    /// ([`METADATA_ONLY_CODE_BYTES`]): oversized machine-generated data files
+    /// must stay Tier-2, but oversized first-party code is load-bearing.
+    pub fn is_code_language(&self) -> bool {
+        !matches!(
+            self,
+            Self::Json
+                | Self::Toml
+                | Self::Yaml
+                | Self::Markdown
+                | Self::Env
+                | Self::Html
+                | Self::Css
+                | Self::Scss
+        )
+    }
+
     /// Returns `true` when `relative_path` is a TSX source file (`.tsx`).
     ///
     /// `.tsx` and `.ts` both map to [`LanguageId::TypeScript`], but they require
@@ -635,6 +653,13 @@ impl SkippedFile {
 
 pub const HARD_SKIP_BYTES: u64 = 100 * 1024 * 1024;
 pub const METADATA_ONLY_BYTES: u64 = 1024 * 1024;
+/// Higher metadata-only threshold for CODE languages (dogfood #1/#7,
+/// 2026-07-06): >1MB machine-generated JSON/YAML must stay Tier-2 (symbol
+/// pollution), but >1MB first-party code is load-bearing in real repos — a
+/// 1.2MB Rust module held the only construction site of a queried type, and
+/// symforge's own `src/protocol/tools.rs` crossed 1MB. Tree-sitter parses
+/// multi-MB source in milliseconds, so code gets 4MB before demotion.
+pub const METADATA_ONLY_CODE_BYTES: u64 = 4 * 1024 * 1024;
 pub const BINARY_SNIFF_BYTES: usize = 8192;
 
 const DENYLISTED_EXTENSIONS: &[&str] = &[

@@ -761,6 +761,17 @@ async fn impact_text(
     params: &ImpactParams,
     options: RenderOptions,
 ) -> Result<String, StatusCode> {
+    // Admission coherence (dogfood #7, 2026-07-06): this path used to
+    // force-index ANY file via process_file + update_file, bypassing the
+    // admission gate that the bulk walk and the watcher both apply. The result
+    // was flapping: analyze_file_impact admitted an oversized file, the next
+    // watcher event demoted it again. Apply the SAME gate here — a Tier-2/3
+    // file gets an honest refusal plus a skip-registry update, never a silent
+    // admit that the watcher will undo.
+    if let Some(refusal) = impact_admission_refusal(&state, &params.path) {
+        return Ok(refusal);
+    }
+
     let is_new_file = params.new_file.unwrap_or(false);
 
     if is_new_file {
@@ -791,6 +802,65 @@ async fn impact_text(
 
     // HOOK-05: Re-index existing file and compute symbol diff.
     handle_edit_impact(state, &params.path, options).await
+}
+
+/// Run the admission gate for the impact path. Returns `Some(refusal_text)`
+/// when the on-disk file classifies Tier-2/3 — the caller must not parse or
+/// insert it. Also records the demotion in the skip registry so `health` and
+/// the watcher agree with what this refusal says. Returns `None` for Tier-1
+/// files, unreadable paths (downstream NOT_FOUND handling owns those), and
+/// files outside a resolvable repo root.
+fn impact_admission_refusal(state: &SidecarState, path: &str) -> Option<String> {
+    use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkippedFile};
+
+    let root = resolve_repo_root(state).ok()?;
+    let abs_path = root.join(path);
+    let metadata = std::fs::metadata(&abs_path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let file_size = metadata.len();
+    // Content sample for the binary sniff — bounded read, never the whole file.
+    let sample = std::fs::File::open(&abs_path).ok().and_then(|mut f| {
+        use std::io::Read;
+        let mut buf = vec![0u8; BINARY_SNIFF_BYTES];
+        let n = f.read(&mut buf).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    });
+    let decision = crate::discovery::classify_admission(&abs_path, file_size, sample.as_deref());
+    if decision.tier == AdmissionTier::Normal {
+        return None;
+    }
+    let tier_label = match decision.tier {
+        AdmissionTier::MetadataOnly => "Tier 2 (metadata only)",
+        AdmissionTier::HardSkip => "Tier 3 (hard skip)",
+        AdmissionTier::Normal => unreachable!("Normal returned above"),
+    };
+    let reason = decision
+        .reason
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "policy".to_string());
+    let extension = abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
+    let sf = SkippedFile {
+        path: path.to_string(),
+        size: file_size,
+        extension,
+        decision,
+    };
+    let expected_gen = state.index.current_project_generation();
+    state
+        .index
+        .demote_to_skipped_at_generation(path, sf, expected_gen);
+    Some(format!(
+        "Not indexed: {path} is {tier_label} — reason: {reason}, size {:.1} MB. \
+         The admission gate applies to analyze_file_impact the same as bulk load \
+         and the watcher (no force-admit). Use get_file_content for raw reads.",
+        file_size as f64 / (1024.0 * 1024.0)
+    ))
 }
 
 async fn handle_new_file_impact(
@@ -1003,10 +1073,19 @@ async fn handle_edit_impact(
                 let mut cache = state.symbol_cache.write();
                 cache.remove(path);
             }
+            // Dogfood #6 (2026-07-06): ALWAYS name the root the lookup ran
+            // against. When another session retargets the shared daemon
+            // (index_folder on a different project), every path from THIS
+            // session resolves against the wrong root and this branch fires
+            // for files that exist — a bare "not found" reads as a false
+            // alarm; naming the root exposes the mismatch immediately.
+            let root_display = resolve_repo_root(&state)
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|_| "<unresolved root>".to_string());
             let text = if prev_symbol_count > 0 {
                 format!(
-                    "── Impact: {} ──\nStatus: not found on disk — removed from index\nPreviously had {} symbols.",
-                    path, prev_symbol_count
+                    "── Impact: {} ──\nStatus: not found under {} — removed from index\nPreviously had {} symbols.",
+                    path, root_display, prev_symbol_count
                 )
             } else {
                 // The file-watcher may have already purged the index entry
@@ -1014,8 +1093,10 @@ async fn handle_edit_impact(
                 // have no pre-count to report, so say so plainly instead of
                 // printing a misleading `Previously had 0 symbols.`.
                 format!(
-                    "── Impact: {} ──\nStatus: not found on disk — no index record remains (may have been removed by watcher).",
-                    path
+                    "── Impact: {} ──\nStatus: not found under {} — no index record remains (removed by watcher, \
+                     or this daemon is rooted at a different project than your session; \
+                     re-run index_folder on your repo if the root looks wrong).",
+                    path, root_display
                 )
             };
             return Ok(text);

@@ -1036,7 +1036,19 @@ pub fn classify_admission(
             SkipReason::DenylistedExtension,
         );
     }
-    if file_size > METADATA_ONLY_BYTES {
+    // Language-aware threshold (dogfood #1/#7, 2026-07-06): code languages get
+    // METADATA_ONLY_CODE_BYTES (4MB) before demotion — >1MB first-party source
+    // is load-bearing in real repos and tree-sitter parses it in milliseconds.
+    // Data/markup formats keep the 1MB threshold (symbol-pollution guard).
+    let size_threshold = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::domain::LanguageId::from_extension)
+        .filter(crate::domain::LanguageId::is_code_language)
+        .map_or(METADATA_ONLY_BYTES, |_| {
+            crate::domain::index::METADATA_ONLY_CODE_BYTES
+        });
+    if file_size > size_threshold {
         return AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::SizeThreshold);
     }
     if let Some(content) = content_sample
@@ -1741,6 +1753,45 @@ mod tests {
     fn test_medium_rust_source_is_normal() {
         let decision = classify_admission(std::path::Path::new("big_module.rs"), 500 * 1024, None);
         assert_eq!(decision, AdmissionDecision::normal());
+    }
+
+    #[test]
+    fn test_oversized_code_file_under_4mb_is_normal() {
+        // Dogfood #1/#7 (2026-07-06): >1MB first-party code is load-bearing
+        // (a 1.2MB Rust module held the only construction site of a queried
+        // type; symforge's own tools.rs crossed 1MB). Code languages get the
+        // 4MB METADATA_ONLY_CODE_BYTES threshold.
+        for name in ["orchestrator.rs", "big.py", "huge.ts", "large.pm"] {
+            let decision = classify_admission(std::path::Path::new(name), 1_200_000, None);
+            assert_eq!(
+                decision,
+                AdmissionDecision::normal(),
+                "1.2MB code file {name} must stay Tier-1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_file_above_4mb_is_metadata_only() {
+        let decision =
+            classify_admission(std::path::Path::new("generated.rs"), 5 * 1024 * 1024, None);
+        assert_eq!(decision.tier, AdmissionTier::MetadataOnly);
+        assert_eq!(decision.reason, Some(SkipReason::SizeThreshold));
+    }
+
+    #[test]
+    fn test_data_formats_keep_1mb_threshold() {
+        // The symbol-pollution guard: machine-generated data files demote at
+        // 1MB even though their language is "supported".
+        for name in ["big.yaml", "big.toml", "big.md", "big.html"] {
+            let decision = classify_admission(std::path::Path::new(name), 1_200_000, None);
+            assert_eq!(
+                decision.tier,
+                AdmissionTier::MetadataOnly,
+                "1.2MB data file {name} must stay Tier-2"
+            );
+            assert_eq!(decision.reason, Some(SkipReason::SizeThreshold));
+        }
     }
 
     #[test]
