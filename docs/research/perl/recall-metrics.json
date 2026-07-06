@@ -1,0 +1,9 @@
+{
+  "construct_class": "qualified_call",
+  "symbol_recall_pct": null,
+  "xref_recall_pct": 100.0,
+  "fixture_count": 1,
+  "accepted_loss": false,
+  "measured_at": "2026-07-06T10:40:00Z",
+  "note": "P1 S2 complete; SUPER/CORE deferred accepted-loss"
+}

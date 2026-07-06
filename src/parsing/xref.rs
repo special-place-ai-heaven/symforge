@@ -426,6 +426,9 @@ const PERL_XREF_QUERY: &str = r#"
 
 ; require Baz::Qux;
 (require_expression (bareword) @ref.import)
+
+; Qualified static calls: Foo::bar() — leaf split in extract_references for Perl
+; (function) node text is the full :: path; same capture as plain calls.
 "#;
 
 // ---------------------------------------------------------------------------
@@ -1274,8 +1277,8 @@ pub fn extract_references(
         if let Some(call_node) = ref_call
             && let Ok(name_text) = call_node.utf8_text(source_bytes)
         {
-            let name = name_text.trim().to_string();
-            let qualified_name = if let Some(qual_node) = ref_qualified_call {
+            let mut name = name_text.trim().to_string();
+            let mut qualified_name = if let Some(qual_node) = ref_qualified_call {
                 qual_node
                     .utf8_text(source_bytes)
                     .ok()
@@ -1283,6 +1286,14 @@ pub fn extract_references(
             } else {
                 None
             };
+
+            // ts-parser-perl: `Foo::bar()` captures the whole path on the `(function)`
+            // node — split to leaf + qualified_name like import refs for recall.
+            if *language == LanguageId::Perl && qualified_name.is_none() && name.contains("::") {
+                let full = name.clone();
+                name = full.rsplit("::").next().unwrap_or(&full).to_string();
+                qualified_name = Some(full);
+            }
 
             let start = call_node.start_position();
             let end = call_node.end_position();
@@ -2971,6 +2982,27 @@ public class PacketsController
         );
     }
 
+    /// Qualified static call `Foo::bar()` — function node wraps package + bareword.
+    #[test]
+    fn test_perl_qualified_function_call() {
+        let source = "Foo::bar(1, 2);";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        assert!(
+            has_ref(&refs, "bar", ReferenceKind::Call),
+            "should capture Foo::bar() call leaf, refs: {:?}",
+            refs
+        );
+        let call = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Call && r.name == "bar")
+            .expect("bar call ref");
+        assert_eq!(
+            call.qualified_name.as_deref(),
+            Some("Foo::bar"),
+            "qualified static call should retain full path"
+        );
+    }
+
     /// A deliberately-malformed query must degrade to `None` (logged + cached),
     /// never panic. This is the panic-hardening contract of `compile_xref_query`.
     #[test]
@@ -3006,6 +3038,7 @@ public class PacketsController
             "print foo;",
             "use Foo::Bar;",
             "require Baz::Qux;",
+            "Foo::bar(1, 2);",
         ];
         let mut parser = Parser::new();
         let lang: Language = tree_sitter_perl::LANGUAGE.into();

@@ -1,0 +1,10 @@
+{
+  "clean_parse_count": 22,
+  "clean_parse_pct": 100.0,
+  "error_count": 0,
+  "fixture_count": 22,
+  "grammar_version": "ts-parser-perl 1.1.3",
+  "measured_at": "2026-07-06T10:35:45.531602400+00:00",
+  "partial_parse_count": 0,
+  "symforge_version": "8.10.7"
+}

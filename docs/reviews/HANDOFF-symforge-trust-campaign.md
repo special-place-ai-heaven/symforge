@@ -43,7 +43,7 @@ Then: **A1b** — DONE (PR #358) · **C-stopgap** — DONE (012d — the `/mcp` 
 ## Working environment + gotchas
 - **`E:\project\symforge-012`** worktree is now on **`main`** (clean). Branch the next attack from here. (`feat/012` was merged + deleted.)
 - **`E:\project\symforge`** = the **013 predictor-calibration lane's** worktree (branch `013-stel-predictor-calibration-spec`) — has **unpushed commits**; DO NOT disturb. Its remote branch isn't pruned for that reason.
-- **`E:\project\symforge-perl`** = perl-grammar lane.
+- **`E:\project\symforge`** = primary worktree; Perl hardening program **016** on branch `016-perl-parser-hardening` (see `specs/016-perl-parser-hardening/`).
 - AAP repo: `E:\project\Agent_Army_Professionals` (consumes symforge via `embed`, git dep on main; diagrams in `docs/`).
 - Symforge MCP/daemon can disconnect/flake mid-session; cross-project is **daemon-only**; verify behaviorally via a built binary, not just unit tests.
 - Subagent rate limit historically resets ~2pm Europe/Ljubljana.

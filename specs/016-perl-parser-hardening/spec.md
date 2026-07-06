@@ -4,7 +4,7 @@
 
 **Created**: 2026-07-06
 
-**Status**: Planning complete — implementation blocked until PROG + S0 Planning Gate
+**Status**: S0–S2 complete on branch — S3 ops/doc polish remaining
 
 **Baseline**: `main` @ **`9572b31`** — grammar swap merged (#341 closed); this program completes evidence, corpus, recall targets, and bump protocol.
 

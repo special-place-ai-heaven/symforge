@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "grammar": "ts-parser-perl 1.1.3",
+  "fixtures": [
+    {
+      "file": "sub_greet.pl",
+      "construct_classes": ["sub"],
+      "parse_expect": "clean",
+      "symbols": [{ "kind": "Function", "name": "greet" }]
+    },
+    {
+      "file": "package_module.pl",
+      "construct_classes": ["package"],
+      "parse_expect": "clean",
+      "symbols": [{ "kind": "Module", "name": "MyApp::Module" }]
+    },
+    {
+      "file": "class_point_method.pl",
+      "construct_classes": ["class", "method"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Point" },
+        { "kind": "Function", "name": "render" }
+      ]
+    },
+    {
+      "file": "method_call.pl",
+      "construct_classes": ["method_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "method" }]
+    },
+    {
+      "file": "plain_call.pl",
+      "construct_classes": ["plain_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "helper" }]
+    },
+    {
+      "file": "ambiguous_print.pl",
+      "construct_classes": ["ambiguous_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "print" }]
+    },
+    {
+      "file": "use_import.pl",
+      "construct_classes": ["use_import"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Import", "name": "Bar", "qualified_name": "Foo::Bar" }]
+    },
+    {
+      "file": "require_import.pl",
+      "construct_classes": ["require_import"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Import", "name": "Qux", "qualified_name": "Baz::Qux" }]
+    },
+    {
+      "file": "class_self_draw.pl",
+      "construct_classes": ["class", "method", "method_call"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Point" },
+        { "kind": "Function", "name": "render" }
+      ],
+      "refs": [{ "kind": "Call", "name": "draw" }]
+    },
+    {
+      "file": "qualified_call.pl",
+      "construct_classes": ["qualified_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "bar", "qualified_name": "Foo::bar" }]
+    },
+    {
+      "file": "package_with_sub.pl",
+      "construct_classes": ["package", "sub"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "MyApp::Widget" },
+        { "kind": "Function", "name": "new" }
+      ]
+    },
+    {
+      "file": "multiple_subs.pl",
+      "construct_classes": ["sub"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Function", "name": "alpha" },
+        { "kind": "Function", "name": "beta" }
+      ]
+    },
+    {
+      "file": "use_strict_warnings.pl",
+      "construct_classes": ["use_import"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Import", "name": "strict" }]
+    },
+    {
+      "file": "require_in_expr.pl",
+      "construct_classes": ["require_import"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Import", "name": "Config" }]
+    },
+    {
+      "file": "class_two_methods.pl",
+      "construct_classes": ["class", "method"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Counter" },
+        { "kind": "Function", "name": "inc" },
+        { "kind": "Function", "name": "reset" }
+      ]
+    },
+    {
+      "file": "helper_caller.pl",
+      "construct_classes": ["sub", "plain_call"],
+      "parse_expect": "clean",
+      "symbols": [{ "kind": "Function", "name": "run" }],
+      "refs": [{ "kind": "Call", "name": "helper" }]
+    },
+    {
+      "file": "sub_with_params.pl",
+      "construct_classes": ["sub"],
+      "parse_expect": "clean",
+      "symbols": [{ "kind": "Function", "name": "add" }]
+    },
+    {
+      "file": "method_on_invocant.pl",
+      "construct_classes": ["method_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "save" }]
+    },
+    {
+      "file": "use_and_call.pl",
+      "construct_classes": ["use_import", "plain_call"],
+      "parse_expect": "clean",
+      "refs": [
+        { "kind": "Import", "name": "Dumper", "qualified_name": "Data::Dumper" },
+        { "kind": "Call", "name": "Dumper" }
+      ]
+    },
+    {
+      "file": "nested_package_sub.pl",
+      "construct_classes": ["package", "sub"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Outer::Inner" },
+        { "kind": "Function", "name": "init" }
+      ]
+    },
+    {
+      "file": "list_op_print.pl",
+      "construct_classes": ["ambiguous_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "say" }]
+    },
+    {
+      "file": "combined_xref_sample.pl",
+      "construct_classes": ["method_call", "plain_call", "use_import", "require_import"],
+      "parse_expect": "clean",
+      "refs": [
+        { "kind": "Call", "name": "greet" },
+        { "kind": "Call", "name": "helper" },
+        { "kind": "Import", "name": "Bar", "qualified_name": "Foo::Bar" },
+        { "kind": "Import", "name": "Qux", "qualified_name": "Baz::Qux" }
+      ]
+    }
+  ]
+}

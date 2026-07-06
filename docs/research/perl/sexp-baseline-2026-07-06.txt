@@ -1,0 +1,31 @@
+# Perl sexp baseline — ts-parser-perl 1.1.3
+# Captured: 2026-07-06 via probe_perl_grammar_sexp (--ignored)
+# SymForge program: 016-perl-parser-hardening / S0 V-S0-002
+# Contract: specs/016-perl-parser-hardening/contracts/perl-node-shapes.md
+
+--- sub greet { 1 }
+(source_file (subroutine_declaration_statement name: (bareword) body: (block (expression_statement (number)))))
+
+--- package MyApp::Module;
+(source_file (package_statement name: (package)))
+
+--- class Bar { method m { 1 } }
+(source_file (class_statement name: (package) (block (method_declaration_statement name: (bareword) body: (block (expression_statement (number)))))))
+
+--- $obj->method(1, 2);
+(source_file (expression_statement (method_call_expression invocant: (scalar (varname)) method: (method) arguments: (list_expression (number) (number)))))
+
+--- foo(1, 2);
+(source_file (expression_statement (function_call_expression function: (function) arguments: (list_expression (number) (number)))))
+
+--- print foo;
+(source_file (expression_statement (ambiguous_function_call_expression function: (function) arguments: (bareword))))
+
+--- use Foo::Bar;
+(source_file (use_statement module: (package)))
+
+--- require Baz::Qux;
+(source_file (expression_statement (require_expression (bareword))))
+
+--- Foo::bar(1, 2);
+(source_file (expression_statement (function_call_expression function: (function) arguments: (list_expression (number) (number)))))
