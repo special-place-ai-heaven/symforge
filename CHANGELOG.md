@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.11.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.7...v8.11.0) (2026-07-06)
+
+
+### Features
+
+* **parsing:** swap Perl grammar to ts-parser-perl + harden xref query compilation ([#341](https://github.com/special-place-ai-heaven/symforge/issues/341)) ([9572b31](https://github.com/special-place-ai-heaven/symforge/commit/9572b3133ff22285851940adea109cb12842d324))
+* **perl:** probe-driven xref recall — SUPER, coderef, parent/base ([8590d08](https://github.com/special-place-ai-heaven/symforge/commit/8590d0858da6dd28ac29465e058738807ce71f52))
+* **perl:** S0-S2 corpus, qualified xref recall, investigation doc ([64a8afc](https://github.com/special-place-ai-heaven/symforge/commit/64a8afce3b76e3303b5f0ebd373d8fc0bab068e5))
+* **surface:** flip default tools/list to full per spike-gate verdict ([64bf457](https://github.com/special-place-ai-heaven/symforge/commit/64bf457aadf0550e2d817b45be91f07a85b24bc9))
+
+
+### Bug Fixes
+
+* **startup:** fall back to global home when launch cwd is unsafe ([e558956](https://github.com/special-place-ai-heaven/symforge/commit/e558956ec4897fa0a7aac9dcf009c23af255316e))
+
 ## [8.10.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.6...v8.10.7) (2026-07-05)
 
 
