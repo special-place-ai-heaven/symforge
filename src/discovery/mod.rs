@@ -1004,7 +1004,7 @@ use crate::domain::index::{
 /// 1. Hard-skip size ceiling (>100MB) → Tier 3
 /// 2. Dependency lockfile (exact basename) → Tier 2
 /// 3. Extension denylist → Tier 2
-/// 4. Metadata-only size threshold (>1MB) → Tier 2
+/// 4. Metadata-only size threshold (1MB data / 4MB code) → Tier 2
 /// 5. Binary sniff (null bytes in first 8KB) → Tier 2
 /// 6. All else → Tier 1
 pub fn classify_admission(

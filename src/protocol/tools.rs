@@ -2578,7 +2578,7 @@ fn find_references_completeness_label(
 
 /// Tier-2 honesty sweep (dogfood finding #1, 2026-07-06): the reference scan
 /// covers Tier-1 files only, but first-party source demoted to Tier-2 for size
-/// (>1MB, `SkipReason::SizeThreshold`) can still contain the queried name —
+/// (`SkipReason::SizeThreshold`: 1MB data / 4MB code) can still contain the queried name —
 /// the field failure was a compile-breaking construction site inside a 1.2 MB
 /// file while the envelope claimed "full for current scope". Sweep those files
 /// textually (bounded) and return a disclosure so the envelope never claims a
@@ -2617,7 +2617,7 @@ fn tier2_reference_disclosure(
         // No resolvable root: cannot sweep, but silence would be the lie.
         let paths: Vec<&str> = candidates.iter().map(|f| f.path.as_str()).collect();
         return Some(format!(
-            "Tier-2 exclusion: {} first-party file(s) >1MB were NOT reference-scanned \
+            "Tier-2 exclusion: {} first-party file(s) over the size threshold (1MB data / 4MB code) were NOT reference-scanned \
              (metadata-only) and could not be swept for \"{name}\" (no repo root): {}",
             candidates.len(),
             preview(&paths),
@@ -2647,7 +2647,7 @@ fn tier2_reference_disclosure(
     let mut parts: Vec<String> = Vec::new();
     if !matched.is_empty() {
         parts.push(format!(
-            "\"{name}\" appears textually in {} file(s) >1MB that were NOT \
+            "\"{name}\" appears textually in {} size-demoted Tier-2 file(s) that were NOT \
              reference-scanned (metadata-only): {} — grep or get_file_content to inspect",
             matched.len(),
             preview(&matched),
@@ -2655,7 +2655,7 @@ fn tier2_reference_disclosure(
     }
     if !unswept.is_empty() {
         parts.push(format!(
-            "{} file(s) >1MB not reference-scanned and not swept (budget): {}",
+            "{} size-demoted Tier-2 file(s) not reference-scanned and not swept (budget): {}",
             unswept.len(),
             preview(&unswept),
         ));

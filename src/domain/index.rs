@@ -607,7 +607,7 @@ impl std::fmt::Display for SkipReason {
         match self {
             SkipReason::SizeCeiling => write!(f, ">100MB"),
             SkipReason::DenylistedExtension => write!(f, "artifact"),
-            SkipReason::SizeThreshold => write!(f, ">1MB"),
+            SkipReason::SizeThreshold => write!(f, "over size threshold (1MB data / 4MB code)"),
             SkipReason::BinaryContent => write!(f, "binary"),
             SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),

@@ -867,7 +867,7 @@ pub struct SearchFilesHit {
     pub coupling_score: Option<f32>,
     pub shared_commits: Option<u32>,
     /// Short human-readable reason a Tier-2 metadata-only path was demoted
-    /// (e.g. "lockfile", "artifact", ">1MB"). `None` for every Tier-1 hit.
+    /// (e.g. "lockfile", "artifact", size threshold). `None` for every Tier-1 hit.
     /// Carried on the hit so the formatter can render
     /// `[metadata-only: <reason>]` without re-deriving from the index.
     pub metadata_reason: Option<String>,
@@ -1125,7 +1125,7 @@ impl LiveIndex {
     /// Tier-3 hard-skipped files (and any future tiers) are excluded — only
     /// metadata-only files are surfaced as findable `search_files` hits. The
     /// reason label is the `SkipReason` display string (e.g. "lockfile",
-    /// "artifact", ">1MB") used by the formatter's `[metadata-only: …]` suffix.
+    /// "artifact", size threshold) used by the formatter's `[metadata-only: …]` suffix.
     pub fn metadata_only_skipped_paths(&self) -> impl Iterator<Item = (&str, String)> {
         self.skipped_files().iter().filter_map(|sf| {
             if sf.tier() == crate::domain::index::AdmissionTier::MetadataOnly {
