@@ -380,6 +380,18 @@ pub fn run_hook_with_input(
     // re-issue the same enrichment request — `sync_http_get` consumes `query`.
     let fallback_query = query.clone();
 
+    // Dogfood #6 / spec 012 FR-006b (hook half): pin the sidecar request to
+    // the caller's repo root. A sidecar whose shared session was retargeted by
+    // another agent's `index_folder` answers 409, and the daemon fallback
+    // below re-resolves the caller's project BY ROOT — no false alarms. The
+    // daemon fallback request itself stays unpinned (it is already
+    // root-resolved by `try_daemon_fallback`).
+    let query = if used_daemon_fallback {
+        query
+    } else {
+        append_caller_root(query)
+    };
+
     // Step 3/4 — make sync HTTP GET with 50 ms timeout.
     let (body, outcome) = match sync_http_get(port, &request_path, query) {
         Ok(b) => {
@@ -810,6 +822,20 @@ pub(crate) fn endpoint_for(
         Some(HookSubcommand::PreTool) => ("/health", String::new()),
         // Unknown tool_name → fail-open: route to a no-op that returns empty.
         None => ("/health", String::new()),
+    }
+}
+
+/// Append the hook's repo root (its cwd, canonicalized) as `caller_root` so
+/// the sidecar's root guard can 409 a wrong-project answer (dogfood #6 /
+/// spec 012 FR-006b).
+fn append_caller_root(query: String) -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let encoded = url_encode(&root.to_string_lossy());
+    if query.is_empty() {
+        format!("caller_root={encoded}")
+    } else {
+        format!("{query}&caller_root={encoded}")
     }
 }
 

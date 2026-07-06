@@ -925,6 +925,15 @@ impl DaemonState {
         &self,
         request: OpenProjectRequest,
     ) -> anyhow::Result<OpenProjectResponse> {
+        // Trust boundary, raw-input first (field report 2026-07-06): refuse a
+        // sensitive system path BEFORE canonicalization, whose failure on a
+        // protected tree would mask the refusal behind a raw OS access error.
+        if crate::paths::is_sensitive_path(Path::new(&request.project_root)) {
+            anyhow::bail!(
+                "Refused to open session for sensitive system path: {}. Use a project directory instead.",
+                request.project_root
+            );
+        }
         let canonical_root = canonical_project_root(Path::new(&request.project_root))?;
         // Trust boundary: `open_project_session` performs a full `LiveIndex::load`
         // with no guard of its own, so a session-open on a sensitive system or
@@ -1145,6 +1154,16 @@ impl DaemonState {
         session_id: &str,
         input: IndexFolderInput,
     ) -> anyhow::Result<String> {
+        // Trust boundary, raw-input first (field report 2026-07-06): refuse a
+        // sensitive system path BEFORE canonicalization, whose failure on a
+        // protected tree ("failed to canonicalize project root ...: Access is
+        // denied") would otherwise mask the refusal behind a raw OS error.
+        if crate::paths::is_sensitive_path(Path::new(&input.path)) {
+            return Ok(format!(
+                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
+                input.path
+            ));
+        }
         let target_root = canonical_project_root(Path::new(&input.path))?;
         // Fail-closed daemon auth is now in force: the daemon ALWAYS establishes
         // a token at startup and `authorize_daemon_request` rejects any caller

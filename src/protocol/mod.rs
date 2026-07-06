@@ -1157,6 +1157,7 @@ impl SymForgeServer {
             "find_references" => call!(find_references, tools::FindReferencesInput),
             "find_dependents" => call!(find_dependents, tools::FindDependentsInput),
             "analyze_file_impact" => call!(analyze_file_impact, tools::AnalyzeFileImpactInput),
+            "index_folder" => call!(index_folder, tools::IndexFolderInput),
             "detect_impact" => call!(detect_impact, tools::DetectImpactInput),
             "explore" => call!(explore, tools::ExploreInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),

@@ -6669,6 +6669,17 @@ impl SymForgeServer {
                 .to_string();
         }
         let root = PathBuf::from(&input.path);
+        // Trust boundary, raw-input first (field report 2026-07-06): a
+        // sensitive system path must be refused BEFORE exists()/canonicalize(),
+        // whose failures on protected trees surface raw OS access errors
+        // instead of the refusal. The post-canonicalize check below stays as
+        // the symlink belt.
+        if crate::paths::is_sensitive_path(&root) {
+            return format!(
+                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
+                root.display()
+            );
+        }
         if !root.exists() {
             return format!("Path does not exist: {}", input.path);
         }

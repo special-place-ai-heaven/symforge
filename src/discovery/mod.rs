@@ -589,7 +589,7 @@ fn validate_workspace_candidate(candidate: &Path, source: &str) -> Option<PathBu
 /// malformed; un-escaped input passes through unchanged. Kept dependency-free
 /// so it compiles in the engine-only `embed` build (where `url`/`reqwest` are
 /// absent).
-fn percent_decode_path(s: &str) -> Option<String> {
+pub(crate) fn percent_decode_path(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;

@@ -326,6 +326,68 @@ fn resolve_repo_root(state: &SidecarState) -> Result<std::path::PathBuf, StatusC
     }
 }
 
+/// Middleware (dogfood #6 / spec 012 FR-006b, hook half): when a request
+/// carries `caller_root`, refuse with 409 if it does not match the root the
+/// CURRENT index was built from. A daemon session retargeted by another
+/// agent's `index_folder` leaves this sidecar answering from a different
+/// project than the caller's repo; the 409 makes the hook fall back to the
+/// daemon, which resolves the project BY ROOT, instead of emitting false
+/// "not found" alarms into prompt context.
+pub async fn caller_root_guard(
+    State(state): State<SidecarState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // /health and /stats stay root-agnostic: liveness probes and the hook's
+    // fail-open target must never 409.
+    let path = request.uri().path();
+    if path != "/health"
+        && path != "/stats"
+        && let Some(caller_root) = query_param(request.uri().query(), "caller_root")
+        && let Some(indexed_root) = state.index.read().indexed_root.clone()
+        && !roots_match(std::path::Path::new(&caller_root), &indexed_root)
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "Sidecar index is rooted at {} but the caller is in {} — the shared session was likely retargeted by another agent's index_folder. Fall back to the daemon to resolve the caller's project by root.",
+                indexed_root.display(),
+                caller_root
+            ),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+    for pair in query?.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return crate::discovery::percent_decode_path(v).filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
+fn roots_match(caller: &std::path::Path, indexed: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        let canon = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = canon.to_string_lossy().replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        // Windows paths are case-insensitive; Unix roots differing only by
+        // case are distinct directories and must not be conflated.
+        if cfg!(windows) {
+            s.to_ascii_lowercase()
+        } else {
+            s
+        }
+    }
+    norm(caller) == norm(indexed)
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
