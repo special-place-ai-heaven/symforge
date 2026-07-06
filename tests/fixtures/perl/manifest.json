@@ -162,6 +162,38 @@
         { "kind": "Import", "name": "Bar", "qualified_name": "Foo::Bar" },
         { "kind": "Import", "name": "Qux", "qualified_name": "Baz::Qux" }
       ]
+    },
+    {
+      "file": "super_method_call.pl",
+      "construct_classes": ["super_call", "method_call"],
+      "parse_expect": "clean",
+      "refs": [
+        { "kind": "Call", "name": "method", "qualified_name": "SUPER::method" }
+      ]
+    },
+    {
+      "file": "coderef_call.pl",
+      "construct_classes": ["coderef_call"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Call", "name": "coderef" }]
+    },
+    {
+      "file": "use_parent.pl",
+      "construct_classes": ["parent_import"],
+      "parse_expect": "clean",
+      "refs": [{ "kind": "Import", "name": "Foo" }]
+    },
+    {
+      "file": "super_shift_chain.pl",
+      "construct_classes": ["package", "sub", "super_call"],
+      "parse_expect": "clean",
+      "symbols": [
+        { "kind": "Module", "name": "Shape::Circle" },
+        { "kind": "Function", "name": "area" }
+      ],
+      "refs": [
+        { "kind": "Call", "name": "compute", "qualified_name": "SUPER::compute" }
+      ]
     }
   ]
 }

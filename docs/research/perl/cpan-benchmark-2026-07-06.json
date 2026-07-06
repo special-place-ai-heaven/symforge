@@ -1,0 +1,149 @@
+{
+  "measured_at": "2026-07-06T16:54:58Z",
+  "symforge_version": "8.11.1",
+  "grammar_version": "ts-parser-perl 1.1.3",
+  "method": {
+    "tool": "shipped symforge.exe (npm symforge-windows-x64) via MCP index_folder + health",
+    "parse_outcome_proxy": "health quarantine registry: clean = Perl Tier-1 indexed - partial - failed; partials/failures enumerated per-file with tree-sitter diagnostic",
+    "denominator": "Tier-1 Perl files reported by get_repo_map (SymForge holds .t test files at Tier-2 metadata-only, so they are NOT symbol-parsed and are excluded)",
+    "notes": [
+      "The shipped CLI has no standalone scan/index command; indexing is driven through the MCP index_folder tool, and per-file parse outcomes come from the health quarantine registry.",
+      "health reports index-wide symbol counts but NO aggregate reference/xref count. Per-file 'Used by N refs' exists via get_file_context but there is no total-refs command; total references were therefore NOT measured.",
+      "Wall-clock is the daemon's own 'Loaded in' figure from health (parse+index of Tier-1 files), not end-to-end clone/IO."
+    ]
+  },
+  "repos": [
+    {
+      "name": "Mojolicious",
+      "url": "https://github.com/mojolicious/mojo",
+      "commit": "6007271e9152aa0998129991030c3ed16eb407d0",
+      "perl_files_on_disk": {
+        "total": 274,
+        "pm": 151,
+        "pl": 13,
+        "t": 110
+      },
+      "tier1_indexed_total": 198,
+      "tier1_language_breakdown": {
+        "Perl": 164,
+        "JavaScript": 9,
+        "Yaml": 9,
+        "Json": 6,
+        "Css": 5,
+        "Markdown": 4,
+        "Html": 1
+      },
+      "tier2_metadata_only": 205,
+      "symbols_extracted": 6650,
+      "references_extracted": null,
+      "load_ms": 78,
+      "perl_parse_outcomes": {
+        "perl_files_indexed": 164,
+        "clean": 158,
+        "partial": 6,
+        "failed": 0,
+        "clean_pct_raw": 96.34,
+        "clean_pct_excluding_intentional_fixtures": 98.17,
+        "partials_intentionally_malformed_fixtures": 3,
+        "partials_genuine_grammar_gap": 3
+      },
+      "non_perl_quarantine": {
+        "failed": [
+          "t/mojolicious/json_config_lite_app.json (serde_json data file, not Perl)",
+          "t/mojolicious/yaml_config_lite_app.yml (serde_yml data file, not Perl)"
+        ],
+        "partial": [
+          "lib/Mojolicious/resources/public/mojo/bootstrap/bootstrap.css (CSS, not Perl)",
+          "lib/Mojolicious/resources/public/mojo/mojo.css (CSS, not Perl)"
+        ]
+      },
+      "perl_partials": [
+        {
+          "file": "lib/Mojo/JSON.pm",
+          "symbols_recovered": 18,
+          "diagnostic": "tree-sitter: syntax error near `true` (line 224, column 10)",
+          "construct": "user-defined bareword sub call `true()` in `return true() if /\\Gtrue/gc;` (bareword call as statement-modifier expression)",
+          "intentional": false
+        },
+        {
+          "file": "lib/Mojo/Path.pm",
+          "symbols_recovered": 15,
+          "diagnostic": "tree-sitter: syntax missing ; near `$i, 2 }` (line 16, column 102)",
+          "construct": "chained if/elsif/else with block-form `{ ... }` statement bodies lacking trailing semicolons (grammar expects `;`)",
+          "intentional": false
+        },
+        {
+          "file": "lib/Mojo/Exception.pm",
+          "symbols_recovered": 10,
+          "diagnostic": "tree-sitter: syntax error near `CHECK:` (line 25, column 1)",
+          "construct": "statement label on a C-style for loop: `CHECK: for (my $i = 0; ...)`",
+          "intentional": false
+        },
+        {
+          "file": "t/mojolicious/lib/MojoliciousTest/SyntaxError.pm",
+          "diagnostic": "unexpected_partial",
+          "construct": "intentionally malformed test fixture (unclosed `sub foo {`)",
+          "intentional": true
+        },
+        {
+          "file": "t/mojo/lib/Mojo/LoaderException.pm",
+          "diagnostic": "unexpected_partial",
+          "construct": "intentionally malformed test fixture (bare unclosed `foo {` block)",
+          "intentional": true
+        },
+        {
+          "file": "t/mojo/lib/Mojo/LoaderTestException/A.pm",
+          "diagnostic": "unexpected_partial",
+          "construct": "intentionally malformed test fixture (bare unclosed `foo {` block)",
+          "intentional": true
+        }
+      ]
+    },
+    {
+      "name": "Perl-Critic",
+      "url": "https://github.com/Perl-Critic/Perl-Critic",
+      "commit": "c437d557ec903c99c5114bac738a484dfedb1f9f",
+      "perl_files_on_disk": {
+        "total": 255,
+        "pm": 205,
+        "pl": 0,
+        "t": 50
+      },
+      "tier1_indexed_total": 209,
+      "tier1_language_breakdown": {
+        "Perl": 205,
+        "Markdown": 3,
+        "Html": 1
+      },
+      "tier2_metadata_only": 228,
+      "symbols_extracted": 1761,
+      "references_extracted": null,
+      "load_ms": 45,
+      "perl_parse_outcomes": {
+        "perl_files_indexed": 205,
+        "clean": 205,
+        "partial": 0,
+        "failed": 0,
+        "clean_pct_raw": 100.0,
+        "clean_pct_excluding_intentional_fixtures": 100.0,
+        "partials_intentionally_malformed_fixtures": 0,
+        "partials_genuine_grammar_gap": 0
+      },
+      "non_perl_quarantine": {
+        "failed": [],
+        "partial": []
+      },
+      "perl_partials": []
+    }
+  ],
+  "totals": {
+    "perl_files_indexed": 369,
+    "clean": 363,
+    "partial": 6,
+    "failed": 0,
+    "clean_pct_raw": 98.37,
+    "clean_pct_excluding_intentional_fixtures": 99.19,
+    "genuine_grammar_gap_files": 3,
+    "symbols_extracted": 8411
+  }
+}
