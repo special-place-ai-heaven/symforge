@@ -64,18 +64,17 @@ pub async fn spawn_sidecar(
     let port = listener.local_addr()?.port();
 
     // Write port and PID files so hook scripts can locate the sidecar.
-    port_file::write_port_file(port)?;
-    port_file::write_pid_file(std::process::id())?;
+    port_file::write_port_file(port, repo_root.as_deref())?;
+    port_file::write_pid_file(std::process::id(), repo_root.as_deref())?;
 
     // Install panic hook to clean up port files if the process panics.
-    let symforge_dir = std::env::current_dir()
-        .map(|d| d.join(port_file::DIR_NAME))
-        .ok();
+    let symforge_dir = crate::paths::select_runtime_data_base(
+        repo_root.as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    );
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(ref dir) = symforge_dir {
-            port_file::cleanup_files_at(dir);
-        }
+        port_file::cleanup_files_at(&symforge_dir);
         previous_hook(info);
     }));
 

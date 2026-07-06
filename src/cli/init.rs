@@ -9,7 +9,7 @@
 //!    On Windows, a `.cmd` wrapper is generated to fix the System32 CWD issue.
 //! 5. For Codex, register the MCP server in `~/.codex/config.toml`.
 //! 6. For Kilo Code, register the MCP server in `.kilocode/mcp.json` (workspace-local).
-//! 7. Create `.symforge/` in the current working directory (runtime needs it).
+//! 7. Ensure runtime `.symforge/` state exists (global home when cwd is unsafe).
 //!
 //! Identification: any hook entry whose `hooks[].command` contains the substring
 //! `"symforge hook"` is considered a symforge-owned entry and will be replaced.
@@ -360,8 +360,8 @@ fn run_init_with_paths(
         );
     }
 
-    paths::ensure_symforge_dir(working_dir)
-        .with_context(|| format!("ensuring {}", working_dir.join(".symforge").display()))?;
+    paths::ensure_runtime_symforge_dir(None)
+        .context("ensuring symforge runtime data directory")?;
 
     // Registration writes ABSOLUTE binary paths, so the MCP clients we just wired
     // always launch this exact binary. But the user's own bare `symforge` CLI
