@@ -73,9 +73,8 @@ pub fn global_symforge_home() -> io::Result<PathBuf> {
         return Ok(dir);
     }
 
-    let home = dirs::home_dir().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "home directory not found")
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     ensure_symforge_dir(&home)
 }
 
@@ -94,10 +93,7 @@ fn is_unsafe_data_dir_base(path: &Path) -> bool {
 /// 1. `project_root` when supplied and safe
 /// 2. Launch cwd when safe (not a sensitive/forbidden root)
 /// 3. [`global_symforge_home`]
-pub fn select_runtime_data_base(
-    project_root: Option<&Path>,
-    cwd: Option<&Path>,
-) -> PathBuf {
+pub fn select_runtime_data_base(project_root: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
     if let Some(root) = project_root.filter(|p| !is_unsafe_data_dir_base(p)) {
         return resolve_symforge_dir(root);
     }

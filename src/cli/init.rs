@@ -360,8 +360,7 @@ fn run_init_with_paths(
         );
     }
 
-    paths::ensure_runtime_symforge_dir(None)
-        .context("ensuring symforge runtime data directory")?;
+    paths::ensure_runtime_symforge_dir(None).context("ensuring symforge runtime data directory")?;
 
     // Registration writes ABSOLUTE binary paths, so the MCP clients we just wired
     // always launch this exact binary. But the user's own bare `symforge` CLI
