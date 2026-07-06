@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.11.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.11.0...v8.11.1) (2026-07-06)
+
+
+### Bug Fixes
+
+* **init:** pin Cursor MCP to full surface (spike-gate B) ([20a8bd6](https://github.com/special-place-ai-heaven/symforge/commit/20a8bd666c05db78582d896eda6e79a7021e7c0f))
+
 ## [8.11.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.10.7...v8.11.0) (2026-07-06)
 
 
