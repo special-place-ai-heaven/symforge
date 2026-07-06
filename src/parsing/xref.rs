@@ -421,6 +421,9 @@ const PERL_XREF_QUERY: &str = r#"
 ; Ambiguous list-op calls: print foo
 (ambiguous_function_call_expression function: (function) @ref.call)
 
+; Coderef invocation: $coderef->()
+(coderef_call_expression (scalar (varname) @ref.call))
+
 ; use Foo::Bar;
 (use_statement module: (package) @ref.import)
 
@@ -703,6 +706,44 @@ fn expand_rust_import_paths(input: &str) -> Vec<String> {
     }
 
     vec![alias_free.to_string()]
+}
+
+/// `use parent qw(Foo)` / `use base qw(Bar)` — pragma name is on `(package)` but the
+/// inherited module lives in `(quoted_word_list content: (string_content))`.
+fn perl_use_import_paths(import_node: Node, name_text: &str, source_bytes: &[u8]) -> Vec<String> {
+    let pragma = name_text.trim();
+    if pragma != "parent" && pragma != "base" {
+        return vec![pragma.to_string()];
+    }
+
+    let Some(use_stmt) = import_node.parent().filter(|n| n.kind() == "use_statement") else {
+        return vec![pragma.to_string()];
+    };
+
+    let mut modules = Vec::new();
+    let mut cursor = use_stmt.walk();
+    for child in use_stmt.children(&mut cursor) {
+        if child.kind() != "quoted_word_list" {
+            continue;
+        }
+        let mut list_cursor = child.walk();
+        for list_child in child.children(&mut list_cursor) {
+            if list_child.kind() == "string_content"
+                && let Ok(text) = list_child.utf8_text(source_bytes)
+            {
+                let module = text.trim();
+                if !module.is_empty() {
+                    modules.push(module.to_string());
+                }
+            }
+        }
+    }
+
+    if modules.is_empty() {
+        vec![pragma.to_string()]
+    } else {
+        modules
+    }
 }
 
 fn push_import_reference(
@@ -1311,12 +1352,21 @@ pub fn extract_references(
         if let Some(method_node) = ref_method_call
             && let Ok(name_text) = method_node.utf8_text(source_bytes)
         {
-            let name = name_text.trim().to_string();
+            let mut name = name_text.trim().to_string();
+            let mut qualified_name = None;
+
+            // ts-parser-perl: `$self->SUPER::method()` puts the full path on `(method)`.
+            if *language == LanguageId::Perl && name.contains("::") {
+                let full = name.clone();
+                name = full.rsplit("::").next().unwrap_or(&full).to_string();
+                qualified_name = Some(full);
+            }
+
             let start = method_node.start_position();
             let end = method_node.end_position();
             references.push(ReferenceRecord {
                 name,
-                qualified_name: None,
+                qualified_name,
                 kind: ReferenceKind::Call,
                 byte_range: (
                     method_node.start_byte() as u32,
@@ -1342,6 +1392,7 @@ pub fn extract_references(
         {
             let import_texts = match language {
                 LanguageId::Rust => expand_rust_import_paths(name_text),
+                LanguageId::Perl => perl_use_import_paths(import_node, name_text, source_bytes),
                 _ => vec![name_text.trim().to_string()],
             };
 
@@ -3003,6 +3054,56 @@ public class PacketsController
         );
     }
 
+    /// `$self->SUPER::method()` — method node carries the full :: path.
+    #[test]
+    fn test_perl_super_method_call() {
+        let source = "$self->SUPER::method();";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        let call = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Call && r.name == "method")
+            .unwrap_or_else(|| panic!("should capture SUPER::method leaf, refs: {refs:?}"));
+        assert_eq!(call.qualified_name.as_deref(), Some("SUPER::method"));
+    }
+
+    /// `CORE::push()` — same leaf split as qualified static calls.
+    #[test]
+    fn test_perl_core_function_call() {
+        let source = "CORE::push(@a, 1);";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        let call = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Call && r.name == "push")
+            .unwrap_or_else(|| panic!("should capture CORE::push leaf, refs: {refs:?}"));
+        assert_eq!(call.qualified_name.as_deref(), Some("CORE::push"));
+    }
+
+    /// `use parent qw(Foo)` — pragma is not the inherited module.
+    #[test]
+    fn test_perl_use_parent_import() {
+        let source = "use parent qw(Foo);";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        assert!(
+            has_ref(&refs, "Foo", ReferenceKind::Import),
+            "should import parent module from qw list, refs: {refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, "parent", ReferenceKind::Import),
+            "pragma name should not be the import ref, refs: {refs:?}"
+        );
+    }
+
+    /// `$coderef->()` — coderef_call_expression invocant.
+    #[test]
+    fn test_perl_coderef_call() {
+        let source = "$coderef->();";
+        let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+        assert!(
+            has_ref(&refs, "coderef", ReferenceKind::Call),
+            "should capture coderef invocant as call, refs: {refs:?}"
+        );
+    }
+
     /// A deliberately-malformed query must degrade to `None` (logged + cached),
     /// never panic. This is the panic-hardening contract of `compile_xref_query`.
     #[test]
@@ -3023,6 +3124,22 @@ public class PacketsController
         );
     }
 
+    /// Quick ref probe for constructs beyond the 22-fixture corpus.
+    #[test]
+    #[ignore]
+    fn probe_deferred_perl_refs() {
+        let cases = [
+            ("super", "$self->SUPER::method();"),
+            ("core", "CORE::push(@a, 1);"),
+            ("parent", "use parent qw(Foo);"),
+            ("coderef", "$c->();"),
+        ];
+        for (label, source) in cases {
+            let (refs, _) = parse_and_extract(source, LanguageId::Perl);
+            println!("{label}: {refs:?}");
+        }
+    }
+
     /// Empirical anchor (kept `#[ignore]`): prints the s-expr for the verified
     /// ts-parser-perl node shapes. Run with `--ignored` to re-confirm the node
     /// names this implementation depends on after a grammar bump.
@@ -3039,6 +3156,12 @@ public class PacketsController
             "use Foo::Bar;",
             "require Baz::Qux;",
             "Foo::bar(1, 2);",
+            "$self->SUPER::method();",
+            "CORE::push(@arr, 1);",
+            "use parent qw(Foo);",
+            "use base qw(Bar);",
+            "$coderef->();",
+            "sub foo { shift->SUPER::bar(@_); }",
         ];
         let mut parser = Parser::new();
         let lang: Language = tree_sitter_perl::LANGUAGE.into();

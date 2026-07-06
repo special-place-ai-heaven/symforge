@@ -78,11 +78,7 @@ fn parse_ref_kind(s: &str) -> ReferenceKind {
 }
 
 fn process_fixture(path: &Path, bytes: &[u8]) -> symforge::domain::FileProcessingResult {
-    process_file(
-        path.to_string_lossy().as_ref(),
-        bytes,
-        LanguageId::Perl,
-    )
+    process_file(path.to_string_lossy().as_ref(), bytes, LanguageId::Perl)
 }
 
 fn tree_has_error(bytes: &[u8]) -> bool {
@@ -141,7 +137,10 @@ fn test_corpus_symbols_and_refs() {
         for sym in &fx.symbols {
             let kind = parse_symbol_kind(&sym.kind);
             assert!(
-                result.symbols.iter().any(|s| s.kind == kind && s.name == sym.name),
+                result
+                    .symbols
+                    .iter()
+                    .any(|s| s.kind == kind && s.name == sym.name),
                 "{}: missing symbol {} {:?}, got {:?}",
                 fx.file,
                 sym.name,
@@ -156,7 +155,10 @@ fn test_corpus_symbols_and_refs() {
 
         for expect in &fx.refs {
             let kind = parse_ref_kind(&expect.kind);
-            let found = result.references.iter().find(|r| r.kind == kind && r.name == expect.name);
+            let found = result
+                .references
+                .iter()
+                .find(|r| r.kind == kind && r.name == expect.name);
             if found.is_none() {
                 if expect.optional {
                     continue;
@@ -210,7 +212,9 @@ fn bench_corpus_parse_metrics() {
 
     let total = manifest.fixtures.len();
     let clean_pct = (clean as f64 / total as f64) * 100.0;
-    println!("perl corpus: total={total} clean={clean} partial={partial} error={error} clean_pct={clean_pct:.1}%");
+    println!(
+        "perl corpus: total={total} clean={clean} partial={partial} error={error} clean_pct={clean_pct:.1}%"
+    );
 
     if std::env::var("PERL_CORPUS_WRITE_METRICS").as_deref() == Ok("1") {
         let metrics = serde_json::json!({
@@ -223,7 +227,8 @@ fn bench_corpus_parse_metrics() {
             "symforge_version": env!("CARGO_PKG_VERSION"),
             "grammar_version": "ts-parser-perl 1.1.3"
         });
-        let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/research/perl/corpus-metrics.json");
+        let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/research/perl/corpus-metrics.json");
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).expect("mkdir docs/research/perl");
         }

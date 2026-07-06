@@ -11,8 +11,8 @@ and hardened xref compilation via `compile_xref_query` (no panic on query/gramma
 This document records **in-repo evidence** on a 22-fixture synthetic corpus. External #341
 benchmark claims (~95% vs ~40% on 8k files) are cited for context but **not** reproduced in CI.
 
-**Fixture corpus result**: **100% clean parse** (22/22), symbols and xref expectations met
-except `qualified_call` xref (optional — S2 target).
+**Fixture corpus result**: **100% clean parse** (22/22), symbols and xref expectations met.
+Post-S2 probe added SUPER/CORE method-call split, coderef calls, and `use parent`/`use base` qw imports.
 
 ## Empirical evidence
 
@@ -60,16 +60,23 @@ Sexp archive: [docs/research/perl/sexp-baseline-2026-07-06.txt](./research/perl/
 | sub / package / class / method | Green | — |
 | method / plain / ambiguous calls | Green | — |
 | use / require imports | Green | — |
-| qualified `Foo::bar()` | **Green** (leaf `bar` + qualified_name `Foo::bar`) | Done S2 |
-| SUPER / CORE | Not in corpus | P2 if sexp proves nodes |
-| dynamic calls | — | Accepted loss |
+| qualified `Foo::bar()` | **Green** (leaf + qualified_name) | Done S2 |
+| `$self->SUPER::method()` | **Green** (method :: split) | Done S2+ |
+| `CORE::push()` | **Green** (function :: split) | Done S2 |
+| `$coderef->()` | **Green** (coderef_call_expression) | Done S2+ |
+| `use parent qw(Foo)` | **Green** (qw list module) | Done S2+ |
+| fully dynamic `${...}()` | — | Accepted loss (after probe) |
 
 ## Final answers
 
 1. **Is ts-parser-perl the right grammar?** Yes for Tier-0; fixture corpus parses cleanly.
-2. **Is xref complete?** No — qualified calls need S2 work.
+2. **Is xref complete?** Tier-0 constructs covered; only truly dynamic invocation remains documented loss.
 3. **What happens on grammar bump?** Follow [quickstart § Grammar bump](../specs/016-perl-parser-hardening/quickstart.md).
 4. **What if query breaks?** `compile_xref_query` returns None; symbols may still index; warn once.
+
+## Limits (accepted loss)
+
+- **Dynamic invocation** — `${$coderef}()`, indirect calls through computed names: grammar may parse but xref cannot attach a stable callee. Not indexed; not silent.
 
 ## References
 

@@ -6,10 +6,12 @@
 |----|--------|----------------|----------|-------------------|------|
 | EV-PROG-001 | PROG | Perl parsing cluster | `src/parsing/xref.rs`, `perl.rs` | `explore` Perl ts-parser-perl xref | 2026-07-06 |
 | EV-PROG-002 | PROG | Merge retrofit diff | `src/parsing/` | `diff_symbols` 30dd4c3→9572b31 | 2026-07-06 |
-| EV-S0-001 | S0 | LanguageId::Perl dispatch | 6 files — see tasks P-S0-001 | `search_text` LanguageId::Perl | pending |
-| EV-S0-002 | S0 | Merge symbol delta | perl.rs + xref.rs | `diff_symbols` | pending |
-| EV-S0-003 | S0 | C++ qualified_call neighbor | `xref.rs` CPP_XREF_QUERY | `get_symbol` + test lock | pending |
-| EV-S1-001 | S1 | process_file harness | `src/parsing/mod.rs` | `get_symbol_context` | pending |
+| EV-S0-001 | S0 | LanguageId::Perl dispatch | 8 files — see investigation doc | `search_text` LanguageId::Perl | 2026-07-06 |
+| EV-S0-002 | S0 | Merge symbol delta | perl.rs + xref.rs | `diff_symbols` | 2026-07-06 |
+| EV-S0-003 | S0 | C++ qualified_call neighbor | `xref.rs` CPP_XREF_QUERY | `test_cpp_qualified_call_retains_head` | 2026-07-06 |
+| EV-S1-001 | S1 | process_file harness | `tests/perl_corpus.rs` | corpus integration test | 2026-07-06 |
+| EV-S2-001 | S2 | qualified_call :: split | `xref.rs` extract_references | `test_perl_qualified_function_call` | 2026-07-06 |
+| EV-S2-002 | S2 | SUPER/coderef/parent probe | `xref.rs` PERL_XREF_QUERY | probe + unit tests | 2026-07-06 |
 
 ## Sexp baseline
 

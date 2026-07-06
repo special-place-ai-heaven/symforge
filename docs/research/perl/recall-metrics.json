@@ -1,9 +1,82 @@
 {
-  "construct_class": "qualified_call",
-  "symbol_recall_pct": null,
-  "xref_recall_pct": 100.0,
-  "fixture_count": 1,
-  "accepted_loss": false,
-  "measured_at": "2026-07-06T10:40:00Z",
-  "note": "P1 S2 complete; SUPER/CORE deferred accepted-loss"
+  "measured_at": "2026-07-06T11:00:00Z",
+  "symforge_version": "8.10.7",
+  "grammar_version": "ts-parser-perl 1.1.3",
+  "fixture_corpus": {
+    "total": 22,
+    "clean_parse_pct": 100.0
+  },
+  "constructs": [
+    {
+      "construct_class": "method_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 3,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "plain_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 4,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "ambiguous_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 2,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "use_import",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 4,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "require_import",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 3,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "qualified_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 1,
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "super_method_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 0,
+      "unit_test": "test_perl_super_method_call",
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "core_function_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 0,
+      "unit_test": "test_perl_core_function_call",
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "coderef_call",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 0,
+      "unit_test": "test_perl_coderef_call",
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "use_parent_base",
+      "xref_recall_pct": 100.0,
+      "fixture_count": 0,
+      "unit_test": "test_perl_use_parent_import",
+      "accepted_loss": false
+    },
+    {
+      "construct_class": "dynamic_invocation",
+      "xref_recall_pct": null,
+      "fixture_count": 0,
+      "accepted_loss": true,
+      "note": "Fully dynamic ${...}() — no stable AST name; documented loss after sexp probe"
+    }
+  ]
 }
