@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - Rust toolchain matching `rust-toolchain.toml`
-- `CARGO_TARGET_DIR=C:/symforge-target` (Windows) or default target
+- Repo `.cargo/config.toml` sets `target/` on **E:** — do not override with `CARGO_TARGET_DIR=C:/symforge-target` on the command line
 - CBM reference clone optional: `E:/project/codebase-memory-mcp`
 - SymForge repo indexed at `E:/project/symforge`
 

@@ -23,7 +23,7 @@ git commit --no-edit                                     # completes the merge c
 ```
 Then push + open a NEW PR (see "Release plan" below). **Do NOT merge to main without the user's explicit "go".**
 
-Windows cargo 1.96.0; `CARGO_TARGET_DIR=C:/symforge-target` (keep warm, never `cargo clean` mid-work). If a stale `.cargo-lock` deadlocks, `pkill -f "cargo|rustc"` then retry. Never run two cargo builds on the same target at once (deadlocks the lock).
+Windows cargo 1.96.0; build cache per repo `.cargo/config.toml` (`target/` on E:). Run `cargo clean` after heavy local gates. If a stale `.cargo-lock` deadlocks, `pkill -f "cargo|rustc"` then retry. Never run two cargo builds on the same target at once (deadlocks the lock).
 
 ---
 

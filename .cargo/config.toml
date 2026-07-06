@@ -1,4 +1,3 @@
-# Build artifacts live on E: with the repo — not C:/symforge-target (fills the system drive).
-# If CARGO_TARGET_DIR is set in your shell/profile, unset it or this is ignored.
+# Build artifacts stay with the repo on E: (see CLAUDE.md § Windows build cache).
 [build]
 target-dir = "target"
