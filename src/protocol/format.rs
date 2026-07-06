@@ -1036,6 +1036,8 @@ pub fn search_text_result_with_options(
         SearchSuggestionContext {
             regex,
             include_tests: false,
+            multi_word_literal: !regex
+                && query.is_some_and(|q| q.trim().contains(char::is_whitespace)),
         },
     )
 }
@@ -1078,6 +1080,11 @@ pub fn is_noise_line(line: &str) -> bool {
 pub struct SearchSuggestionContext {
     pub regex: bool,
     pub include_tests: bool,
+    /// True when the zero-hit query was a multi-word literal. Declarations are
+    /// often macro-generated or wrapped/formatted differently than the query
+    /// (dogfood #5a: `pub type ProjectId` finds nothing when the type is minted
+    /// by a macro), so the suggestions steer toward the bare identifier.
+    pub multi_word_literal: bool,
 }
 
 /// Build the suggestion list for a zero-hit (non-structural) literal/regex
@@ -1094,6 +1101,12 @@ fn no_match_suggestions(ctx: SearchSuggestionContext) -> String {
         suggestions.push("broaden with include_tests=true / include_generated=true");
     } else {
         suggestions.push("broaden with include_generated=true or a wider path_prefix");
+    }
+    if ctx.multi_word_literal {
+        suggestions.push(
+            "a multi-word literal misses declarations that are macro-generated or \
+             formatted differently — retry with the bare identifier alone",
+        );
     }
     suggestions.join(", ")
 }
@@ -5248,19 +5261,6 @@ pub(crate) fn format_hook_adoption(snap: &HookAdoptionSnapshot) -> String {
     }
 
     lines.join("\n")
-}
-
-/// Format a compact "what next" hint line for tool outputs.
-pub fn compact_next_step_hint(items: &[&str]) -> String {
-    let items: Vec<&str> = items
-        .iter()
-        .copied()
-        .filter(|item| !item.trim().is_empty())
-        .collect();
-    if items.is_empty() {
-        return String::new();
-    }
-    format!("\nTip: {}", items.join(" | "))
 }
 
 /// Format a one-line git temporal summary for the health report.
