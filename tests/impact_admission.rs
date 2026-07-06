@@ -61,7 +61,7 @@ async fn impact_refuses_oversized_code_file() {
         "oversized code file must get an honest Tier-2 refusal; got: {result}"
     );
     assert!(
-        result.contains(">1MB"),
+        result.contains("over size threshold"),
         "the refusal must name the size reason; got: {result}"
     );
     // No silent admit: the file must NOT be in the Tier-1 index afterwards.
