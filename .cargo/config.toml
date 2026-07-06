@@ -1,0 +1,4 @@
+# Build artifacts live on E: with the repo — not C:/symforge-target (fills the system drive).
+# If CARGO_TARGET_DIR is set in your shell/profile, unset it or this is ignored.
+[build]
+target-dir = "target"

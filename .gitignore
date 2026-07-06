@@ -4,6 +4,9 @@
 
 # Root-level tool and harness state directories.
 /.*/
+!/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 !/.github/
 
 # Nested SymForge local cache (e.g. npm/.symforge/) — local state, never tracked.

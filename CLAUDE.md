@@ -5,6 +5,11 @@
 - `npm/` only: `cd npm && npm test`
 - Mixed: run both before reporting success
 
+### Windows build cache (disk)
+
+- Artifacts: `.cargo/config.toml` → `target/` on **E:** (gitignored). Unset shell `CARGO_TARGET_DIR=C:/symforge-target` if present — it overrides config and fills **C:**.
+- **Agent discipline**: OK to run full `cargo` gates locally; **clean up after yourself** — when you finish a heavy local session (`test --all-targets`, `build --release`), run `cargo clean` before ending so debug artifacts do not accumulate. If `target/debug` is already large before your gate, `cargo clean` first.
+
 ## CI Gates
 
 - PR and push CI run version sync, `cargo fmt --check`, `cargo check`,
