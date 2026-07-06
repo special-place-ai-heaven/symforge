@@ -26,6 +26,19 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.12.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.11.1...v8.12.0) (2026-07-06)
+
+
+### Features
+
+* **init:** flip Codex/Gemini/Kilo registration to the full surface ([3e3450d](https://github.com/special-place-ai-heaven/symforge/commit/3e3450d7f4690d2ae6b3d9c969fa617775a625c5))
+
+
+### Bug Fixes
+
+* **admission:** impact-path admission coherence and 4MB code-language threshold ([774f736](https://github.com/special-place-ai-heaven/symforge/commit/774f73600933ccbbf29cf71c137c2cd0f6866360))
+* **trust:** Tier-2 exclusion disclosure, bare-name path echo, zero-hit hint; tips overhaul ([d612a93](https://github.com/special-place-ai-heaven/symforge/commit/d612a9301f0399d1a67142d1aa989ea5499737b9))
+
 ## [8.11.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.11.0...v8.11.1) (2026-07-06)
 
 
