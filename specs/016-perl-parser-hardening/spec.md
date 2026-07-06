@@ -4,7 +4,7 @@
 
 **Created**: 2026-07-06
 
-**Status**: S0–S2 complete on branch — S3 ops/doc polish remaining
+**Status**: Complete (2026-07-06) — merged to main @ `8590d08`+; S3 ops closed
 
 **Baseline**: `main` @ **`9572b31`** — grammar swap merged (#341 closed); this program completes evidence, corpus, recall targets, and bump protocol.
 

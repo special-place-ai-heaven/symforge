@@ -30,10 +30,10 @@ Mirror `docs/dart-parser-investigation.md`:
 
 ## Release Gate checklist
 
-- [ ] Full Release Gate green
-- [ ] SC-005 bump checklist validated
-- [ ] SC-006 converge zero tasks
-- [ ] PR ready for main
+- [x] Full Release Gate green (CI on main)
+- [x] SC-005 bump checklist validated (quickstart § Grammar bump)
+- [x] SC-006 converge zero tasks (no new scope)
+- [x] Merged to main
 
 ## Program closure
 
