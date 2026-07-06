@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.12.2...v8.13.0) (2026-07-06)
+
+
+### Features
+
+* **parsing:** macro-generated symbol indexing (changelog reconciliation) ([04e6441](https://github.com/special-place-ai-heaven/symforge/commit/04e644104c5e8a37a9d9d19644bf146f07820ad7))
+
 ## [8.12.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.12.1...v8.12.2) (2026-07-06)
 
 
