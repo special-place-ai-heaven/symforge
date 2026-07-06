@@ -1208,7 +1208,7 @@ pub fn register_cursor_mcp_server(
     let workspace_root = crate::discovery::find_project_root();
     let workspace_root_str = workspace_root.as_ref().map(|r| r.display().to_string());
 
-    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "compact")];
+    let mut env_defaults: Vec<(&str, &str)> = vec![("SYMFORGE_SURFACE", "full")];
     if let Some(root) = workspace_root_str.as_deref() {
         env_defaults.push((crate::discovery::WORKSPACE_ROOT_ENV, root));
     }
@@ -2611,8 +2611,8 @@ env = { EXISTING_FLAG = "keep" }
     }
 
     // Plan 001 (home-cwd disease): `symforge init --client cursor` registers
-    // symforge in Cursor's global mcp.json with a proven env pinning the compact
-    // surface; and when a workspace is discoverable it threads both
+    // symforge in Cursor's global mcp.json with a proven env pinning the full
+    // surface (spike-gate default); and when a workspace is discoverable it threads both
     // SYMFORGE_WORKSPACE_ROOT and a per-server `cwd`, so Cursor never launches
     // into the empty-index home-cwd trap. Only the `symforge` server is touched.
     #[test]
@@ -2639,8 +2639,8 @@ env = { EXISTING_FLAG = "keep" }
             .expect("cursor env must be a proven object, not absent");
         assert_eq!(
             env.get("SYMFORGE_SURFACE").and_then(Value::as_str),
-            Some("compact"),
-            "cursor env must pin the compact surface: {server}"
+            Some("full"),
+            "cursor env must pin the full surface: {server}"
         );
         // The init test process runs inside the symforge git repo, so
         // find_project_root resolves a workspace; when it does, the per-server

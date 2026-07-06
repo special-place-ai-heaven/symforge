@@ -204,6 +204,11 @@ fn test_init_registers_mcp_server() {
     };
     assert_eq!(tok["command"], expected_command);
     assert_eq!(tok["disabled"], false, "disabled must be false");
+    assert_eq!(
+        tok["env"]["SYMFORGE_SURFACE"].as_str(),
+        Some("full"),
+        "Claude init must pin the full surface"
+    );
     assert!(
         tok["alwaysAllow"].is_array(),
         "alwaysAllow must be an array"

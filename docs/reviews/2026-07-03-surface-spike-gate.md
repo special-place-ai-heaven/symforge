@@ -115,7 +115,22 @@ Implementation consequences (follow-up wave, separate from the G-036 fix):
   (`── stel status ──`) — visible verbatim in third-party harnesses; consider
   a product-name banner.
 
-## Raw artifacts
+## Validation (2026-07-06)
+
+Post-merge checks on `main` after init fix + 8.11.0:
+
+| Layer | Expected | Verified |
+|---|---|---|
+| Server default (`SYMFORGE_SURFACE` unset) | `Full`, ≥30 tools in `tools/list` | `tests/surface_default.rs` |
+| Compact opt-in | 3 tools; legacy `tools/call` rejected | `tests/surface_default.rs` |
+| Claude Code init | `SYMFORGE_SURFACE=full` + full allowlist | `tests/init_integration.rs` |
+| Cursor init | `SYMFORGE_SURFACE=full` (operator flip per item 2) | `src/cli/init.rs` unit test |
+| Codex / Gemini / Kilo init | `SYMFORGE_SURFACE=compact` (16k/turn harnesses) | init unit tests |
+| CI Release gate | green on Linux | GitHub Actions |
+
+Re-run init locally after upgrade: `symforge init --client cursor` (or `all`) to refresh
+`~/.cursor/mcp.json`; existing `compact` pins are preserved until re-init.
+
 
 Session scratchpad (`C:\Users\rakovnik\AppData\Local\Temp\claude\E--project-symforge\6a067a28-d117-45c5-a205-9bf6ac08eb7d\scratchpad\`):
 `tools_list_full.json`, `tools_list_compact.json`, `measure_tools_list.py`
