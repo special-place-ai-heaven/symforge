@@ -208,3 +208,36 @@ fn edit_plan_emits_co_change_line_when_temporal_ready() {
         "the plan_edit co-change line must be terse (no coupling scores):\n{plan}"
     );
 }
+
+#[test]
+fn edit_plan_resolves_qualified_impl_method_selector() {
+    let source = "\
+struct PolicyEngine;
+
+impl PolicyEngine {
+    pub fn new() -> Self {
+        PolicyEngine
+    }
+}
+";
+    let dir = TempDir::new().expect("tempdir");
+    write_file(dir.path(), "crates/daemon/src/policy.rs", source);
+    let shared = LiveIndex::load(dir.path()).expect("load index");
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let plan = plan_edit(
+        &index,
+        &temporal,
+        "crates/daemon/src/policy.rs::PolicyEngine::new",
+    );
+
+    assert!(
+        !plan.contains("not found"),
+        "qualified impl method selector should resolve\n{plan}"
+    );
+    assert!(
+        plan.contains("new in crates/daemon/src/policy.rs"),
+        "plan should name the resolved bare method\n{plan}"
+    );
+}

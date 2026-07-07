@@ -1,7 +1,9 @@
 //! Edit planning: analyzes a target symbol/file and suggests the right
 //! sequence of SymForge edit tools to accomplish a change.
 
-use crate::live_index::store::LiveIndex;
+use crate::domain::SymbolRecord;
+use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+use crate::live_index::store::{IndexedFile, LiveIndex};
 
 fn split_path_qualified_target(target: &str) -> Option<(&str, &str)> {
     if let Some((path, name)) = target.split_once("::") {
@@ -32,27 +34,34 @@ pub fn plan_edit(
 ) -> String {
     let target = target.trim();
     let qualified_target = split_path_qualified_target(target);
-    let symbol_target_name = qualified_target.map(|(_, name)| name).unwrap_or(target);
 
     // Try to find the target as a symbol first
     let mut symbol_hits = Vec::new();
     let mut file_hit = None;
 
-    for (path, file) in index.all_files() {
-        for sym in &file.symbols {
-            let symbol_match = if let Some((target_path, target_name)) = qualified_target {
-                sym.name == target_name && (path == target_path || path.ends_with(target_path))
-            } else {
-                sym.name == target
-            };
-            if symbol_match {
-                symbol_hits.push((path.clone(), sym.name.clone(), sym.kind, sym.line_range));
+    if let Some((target_path, target_name)) = qualified_target {
+        for (path, file) in index.all_files() {
+            if path == target_path || path.ends_with(target_path) {
+                collect_selector_hits(&mut symbol_hits, path, file, target_name);
+            }
+            if path.ends_with(target) || path == target {
+                file_hit = Some(path.clone());
             }
         }
-        if path.ends_with(target) || path == target {
-            file_hit = Some(path.clone());
+    } else {
+        for (path, file) in index.all_files() {
+            collect_selector_hits(&mut symbol_hits, path, file, target);
+            if path.ends_with(target) || path == target {
+                file_hit = Some(path.clone());
+            }
         }
     }
+
+    let symbol_target_name = symbol_hits
+        .first()
+        .map(|(_, name, _, _)| name.as_str())
+        .or_else(|| qualified_target.map(|(_, name)| name))
+        .unwrap_or(target);
 
     let mut lines = vec!["── Edit Plan ──".to_string()];
 
@@ -146,4 +155,36 @@ pub fn plan_edit(
     }
 
     lines.join("\n")
+}
+
+fn collect_selector_hits(
+    symbol_hits: &mut Vec<(String, String, crate::domain::SymbolKind, (u32, u32))>,
+    path: &str,
+    file: &IndexedFile,
+    selector: &str,
+) {
+    match resolve_symbol_selector(file, selector, None, None) {
+        SymbolSelectorMatch::Selected(_, sym) => {
+            push_symbol_hit(symbol_hits, path, sym);
+        }
+        SymbolSelectorMatch::Ambiguous(lines) => {
+            for line in lines {
+                let symbol_line = line + 1;
+                if let SymbolSelectorMatch::Selected(_, sym) =
+                    resolve_symbol_selector(file, selector, None, Some(symbol_line))
+                {
+                    push_symbol_hit(symbol_hits, path, sym);
+                }
+            }
+        }
+        SymbolSelectorMatch::NotFound => {}
+    }
+}
+
+fn push_symbol_hit(
+    symbol_hits: &mut Vec<(String, String, crate::domain::SymbolKind, (u32, u32))>,
+    path: &str,
+    sym: &SymbolRecord,
+) {
+    symbol_hits.push((path.to_string(), sym.name.clone(), sym.kind, sym.line_range));
 }

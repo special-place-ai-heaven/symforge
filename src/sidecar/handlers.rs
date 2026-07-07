@@ -1019,6 +1019,29 @@ fn find_record_matching_snapshot<'a>(
         s.name == sym.name && s.kind.to_string() == sym.kind && s.byte_range == sym.byte_range
     })
 }
+
+fn slice_byte_range(bytes: &[u8], range: (u32, u32)) -> Option<&[u8]> {
+    let start = range.0 as usize;
+    let end = range.1 as usize;
+    (start < end && end <= bytes.len()).then(|| &bytes[start..end])
+}
+
+/// True when the matched symbol's core body text changed, not merely shifted byte
+/// offsets after a prefix insertion (e.g. top-of-file comment edits).
+fn symbol_body_bytes_changed(
+    pre_bytes: &[u8],
+    post_bytes: &[u8],
+    pre: &SymbolSnapshot,
+    post: &SymbolSnapshot,
+) -> bool {
+    match (
+        slice_byte_range(pre_bytes, pre.byte_range),
+        slice_byte_range(post_bytes, post.byte_range),
+    ) {
+        (Some(pre_slice), Some(post_slice)) => pre_slice != post_slice,
+        _ => pre.line_range != post.line_range || pre.byte_range != post.byte_range,
+    }
+}
 async fn handle_edit_impact(
     state: SidecarState,
     path: &str,
@@ -1069,9 +1092,12 @@ async fn handle_edit_impact(
     };
 
     // Get file byte_len from index before re-indexing.
-    let file_bytes_pre: u64 = {
+    let (file_bytes_pre, pre_content): (u64, Option<Vec<u8>>) = {
         let guard = state.index.read();
-        guard.get_file(path).map(|f| f.byte_len).unwrap_or(0)
+        guard
+            .get_file(path)
+            .map(|f| (f.byte_len, Some(f.content.clone())))
+            .unwrap_or((0, None))
     };
 
     // Determine language.
@@ -1182,6 +1208,7 @@ async fn handle_edit_impact(
         })
         .collect();
 
+    let post_content = bytes.clone();
     let indexed = crate::live_index::store::IndexedFile::from_parse_result(*result, bytes)
         .with_mtime(mtime_secs);
     state.index.update_file(path.to_string(), indexed);
@@ -1201,7 +1228,11 @@ async fn handle_edit_impact(
         if let Some((pri, pr)) = best {
             matched_pre[pri] = true;
             matched_post[pi] = true;
-            if pr.line_range != ps.line_range || pr.byte_range != ps.byte_range {
+            let body_changed = match pre_content.as_deref() {
+                Some(pre_bytes) => symbol_body_bytes_changed(pre_bytes, &post_content, pr, ps),
+                None => true,
+            };
+            if body_changed {
                 changed_post.push(pi);
             }
         }
@@ -2591,6 +2622,50 @@ mod tests {
             alias_map: HashMap::new(),
             mtime_secs: 0,
         }
+    }
+
+    #[test]
+    fn test_symbol_body_bytes_changed_ignores_prefix_insertion_drift() {
+        let pre = b"fn alpha() {}\nfn beta() {}";
+        let post = b"// header\nfn alpha() {}\nfn beta() {}";
+        let pre_alpha = SymbolSnapshot {
+            name: "alpha".to_string(),
+            kind: "fn".to_string(),
+            line_range: (0, 0),
+            byte_range: (0, 13),
+        };
+        let post_alpha = SymbolSnapshot {
+            name: "alpha".to_string(),
+            kind: "fn".to_string(),
+            line_range: (1, 1),
+            byte_range: (10, 23),
+        };
+        assert!(
+            !symbol_body_bytes_changed(pre, post, &pre_alpha, &post_alpha),
+            "unchanged symbol bodies after a prefix comment must not count as changed"
+        );
+    }
+
+    #[test]
+    fn test_symbol_body_bytes_changed_detects_real_body_edit() {
+        let pre = b"fn alpha() {}";
+        let post = b"fn alpha() { println!(\"x\"); }";
+        let pre_alpha = SymbolSnapshot {
+            name: "alpha".to_string(),
+            kind: "fn".to_string(),
+            line_range: (0, 0),
+            byte_range: (0, 13),
+        };
+        let post_alpha = SymbolSnapshot {
+            name: "alpha".to_string(),
+            kind: "fn".to_string(),
+            line_range: (0, 0),
+            byte_range: (0, 30),
+        };
+        assert!(
+            symbol_body_bytes_changed(pre, post, &pre_alpha, &post_alpha),
+            "edited symbol body must count as changed"
+        );
     }
 
     #[test]
