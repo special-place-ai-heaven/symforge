@@ -7540,6 +7540,334 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
+    /// F6 regression: a `symforge_edit` apply carrying `working_directory`
+    /// must route the write into the sibling git worktree through the DAEMON
+    /// dispatch path (front-end proxy → daemon `execute_tool_call` →
+    /// `edit_within_symbol`), NOT into the daemon's indexed root; and a
+    /// `working_directory` that is not a recognized worktree must error loudly
+    /// instead of silently writing to the indexed root.
+    ///
+    /// This is the path the field bug lived on: the in-process direct-dispatch
+    /// tests (`tests/worktree_awareness.rs`) never exercised the daemon's own
+    /// `execute_tool_call` server, so a daemon that resolved edits through the
+    /// no-op `DefaultEditHook` (worktree routing not effective) passed every
+    /// existing test while writing to the wrong tree in production.
+    #[tokio::test]
+    async fn test_symforge_edit_apply_routes_into_worktree_through_daemon_proxy() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        // A real git repo (main checkout) with one committed symbol.
+        let project = project_dir("symforge-wt-route-main");
+        let main_root = project.path().to_path_buf();
+        let main_file = main_root.join("src").join("lib.rs");
+        std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&main_root)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t.test"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // A sibling worktree (outside the main checkout) on a new branch.
+        let wt_parent = TempDir::new().expect("worktree parent");
+        let worktree_root = wt_parent.path().join("wt_one");
+        git(&[
+            "worktree",
+            "add",
+            worktree_root.to_str().expect("utf-8 worktree path"),
+            "-b",
+            "feature",
+        ]);
+        let worktree_file = worktree_root.join("src").join("lib.rs");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: main_root.display().to_string(),
+                client_name: "wt-route".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(main_root.clone());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        let indexed = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: main_root.display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon proxy index_folder must succeed, got: {indexed}"
+        );
+        // Prove the DAEMON holds the index and the edit below runs on the daemon
+        // dispatch path, not a front-end local fallback (which would also route
+        // because THIS process registered the hook via `new_daemon_proxy`). An
+        // empty front-end index means the daemon executed the edit.
+        assert_eq!(
+            server.index().published_state().file_count,
+            0,
+            "front-end proxy index must be empty — the daemon must serve the edit"
+        );
+
+        // (1) Routed apply: working_directory = the real worktree. The write
+        // must land in the WORKTREE copy and leave the indexed root untouched.
+        let routed = server
+            .symforge_edit_facade_tool(Parameters(crate::stel::StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("wt_edit".to_string()),
+                body: Some("pub fn wt_edit() -> u32 { 2 }".to_string()),
+                apply: Some(true),
+                working_directory: Some(worktree_root.display().to_string()),
+                ..Default::default()
+            }))
+            .await
+            .expect("symforge_edit dispatch");
+        let routed_body =
+            serde_json::to_value(&routed).expect("serialize routed result")["content"][0]["text"]
+                .as_str()
+                .expect("routed result text")
+                .to_string();
+
+        assert!(
+            routed_body.contains("rerouted: true"),
+            "worktree apply must report rerouted: true through the daemon path, got:\n{routed_body}"
+        );
+        let worktree_after = std::fs::read_to_string(&worktree_file).expect("read worktree file");
+        assert!(
+            worktree_after.contains("{ 2 }"),
+            "worktree copy must receive the routed edit, got:\n{worktree_after}\n\nbody:\n{routed_body}"
+        );
+        let main_after = std::fs::read_to_string(&main_file).expect("read main file");
+        assert!(
+            main_after.contains("{ 1 }") && !main_after.contains("{ 2 }"),
+            "indexed root must NOT be contaminated by a routed worktree edit, got:\n{main_after}\n\nbody:\n{routed_body}"
+        );
+
+        // (2) A working_directory that is not a recognized worktree must error
+        // loudly (not silently write to the indexed root).
+        let stray = TempDir::new().expect("stray dir");
+        let stray_result = server
+            .symforge_edit_facade_tool(Parameters(crate::stel::StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("wt_edit".to_string()),
+                body: Some("pub fn wt_edit() -> u32 { 9 }".to_string()),
+                apply: Some(true),
+                working_directory: Some(stray.path().display().to_string()),
+                ..Default::default()
+            }))
+            .await
+            .expect("symforge_edit dispatch");
+        let stray_body = serde_json::to_value(&stray_result).expect("serialize stray result")
+            ["content"][0]["text"]
+            .as_str()
+            .expect("stray result text")
+            .to_string();
+        assert!(
+            stray_body.contains("WorkingDirectoryNotARecognizedWorktree"),
+            "a non-worktree working_directory must error loudly, got:\n{stray_body}"
+        );
+        let main_after_stray = std::fs::read_to_string(&main_file).expect("read main after stray");
+        assert!(
+            main_after_stray.contains("{ 1 }") && !main_after_stray.contains("{ 9 }"),
+            "a rejected non-worktree edit must not write to the indexed root, got:\n{main_after_stray}\n\nbody:\n{stray_body}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// F6 root-cause guard: drive `edit_within_symbol` DIRECTLY against the
+    /// daemon's HTTP tool endpoint (the exact route the front-end proxy POSTs
+    /// to) with NO front-end `SymForgeServer` constructed in this test. That
+    /// isolation matters because the edit-hook registry is PROCESS-GLOBAL and
+    /// order-sensitive: the daemon registers BOTH `WorktreeAwareEditHook`
+    /// (via `SymForgeServer::new`) and the observer-only `FrecencyBumpHook`
+    /// (via `LiveIndex::load`), and the field bug was `edit_hooks::resolve`
+    /// picking only the LAST-registered hook — so when frecency registered
+    /// after the worktree hook, its default (no-op) `resolve_target_path`
+    /// shadowed worktree routing and every `working_directory` edit
+    /// contaminated the indexed root. This test indexes through the daemon
+    /// (registering frecency) so the resolve order matches production, then
+    /// asserts routing still holds.
+    #[tokio::test]
+    async fn test_daemon_http_edit_within_routes_into_worktree_without_frontend_server() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        let project = project_dir("symforge-wt-http-main");
+        let main_root = project.path().to_path_buf();
+        let main_file = main_root.join("src").join("lib.rs");
+        std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&main_root)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} spawn: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t.test"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let wt_parent = TempDir::new().expect("worktree parent");
+        let worktree_root = wt_parent.path().join("wt_one");
+        git(&[
+            "worktree",
+            "add",
+            worktree_root.to_str().expect("utf-8 worktree path"),
+            "-b",
+            "feature",
+        ]);
+        let worktree_file = worktree_root.join("src").join("lib.rs");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: main_root.display().to_string(),
+                client_name: "wt-http".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let session_id = opened.session_id;
+
+        // Raw HTTP tool call to the daemon — the same route `call_tool_value`
+        // uses. No `SymForgeServer` exists in this test process.
+        let call_tool = |tool: &str, params: serde_json::Value| {
+            let url = format!("{base_url}/v1/sessions/{session_id}/tools/{tool}");
+            let http = http.clone();
+            async move {
+                http.post(url)
+                    .json(&params)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status")
+                    .text()
+                    .await
+                    .expect("tool body")
+            }
+        };
+
+        let indexed = call_tool(
+            "index_folder",
+            serde_json::json!({ "path": main_root.display().to_string() }),
+        )
+        .await;
+        assert!(
+            indexed.starts_with("Indexed "),
+            "daemon index_folder must succeed, got: {indexed}"
+        );
+
+        // (1) Routed edit through the daemon HTTP endpoint.
+        let routed = call_tool(
+            "edit_within_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "name": "wt_edit",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "working_directory": worktree_root.display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            routed.contains("rerouted: true"),
+            "daemon must route the worktree edit (rerouted: true), got:\n{routed}"
+        );
+        let worktree_after = std::fs::read_to_string(&worktree_file).expect("read worktree file");
+        assert!(
+            worktree_after.contains("{ 2 }"),
+            "worktree copy must receive the routed edit, got:\n{worktree_after}\n\nresp:\n{routed}"
+        );
+        let main_after = std::fs::read_to_string(&main_file).expect("read main file");
+        assert!(
+            main_after.contains("{ 1 }") && !main_after.contains("{ 2 }"),
+            "indexed root must NOT be contaminated by a routed worktree edit, got:\n{main_after}\n\nresp:\n{routed}"
+        );
+
+        // (2) Non-worktree working_directory must error loudly, not write to root.
+        let stray = TempDir::new().expect("stray dir");
+        let stray_resp = call_tool(
+            "edit_within_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "name": "wt_edit",
+                "old_text": "{ 1 }",
+                "new_text": "{ 9 }",
+                "working_directory": stray.path().display().to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            stray_resp.contains("WorkingDirectoryNotARecognizedWorktree"),
+            "a non-worktree working_directory must error loudly, got:\n{stray_resp}"
+        );
+        let main_after_stray = std::fs::read_to_string(&main_file).expect("read main after stray");
+        assert!(
+            main_after_stray.contains("{ 1 }") && !main_after_stray.contains("{ 9 }"),
+            "a rejected non-worktree edit must not write to the indexed root, got:\n{main_after_stray}\n\nresp:\n{stray_resp}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
     /// Regression: a daemon-proxy `index_folder` switch must invalidate any
     /// stale in-process index that a prior local fallback populated for the OLD
     /// project. Without the fix, the server keeps serving the old project from
