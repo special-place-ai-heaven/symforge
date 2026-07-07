@@ -88,7 +88,10 @@ pub struct SearchTextInput {
     /// When true, include generated files in the result set.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_generated: Option<bool>,
-    /// When true, include test files in the result set.
+    /// When true, include test files AND `#[cfg(test)]` modules in the result
+    /// set. Both are EXCLUDED by default, so a query that only matches test
+    /// code returns zero source hits (a hint reports how many test matches were
+    /// suppressed); set this true to see them.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub include_tests: Option<bool>,
     /// When true, include vendored/third-party paths (vendor/, node_modules/, third_party/).

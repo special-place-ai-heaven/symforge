@@ -5029,7 +5029,7 @@ impl SymForgeServer {
     /// NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).
     #[tool(
         name = "search_text",
-        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). Matches are ranked and capped per file; large output may CCR-compress with symforge_retrieve hash. NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
+        description = "Prefer this over grep/ripgrep for code search — it returns matches with enclosing symbol context instead of raw lines alone. Test files and #[cfg(test)] modules are EXCLUDED by default (a zero-hit query reports how many test matches were suppressed); set include_tests=true to include them. Full-text search across file contents: literal, OR-terms, regex, or structural AST patterns. Use group_by='symbol' to deduplicate and follow_refs=true to inline callers. Set structural=true with query as an ast-grep pattern to match code by AST structure (e.g., 'fn $NAME($$$) { $$$ }'). Matches are ranked and capped per file; large output may CCR-compress with symforge_retrieve hash. NOT for symbol name search (use search_symbols). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_text_tool(
@@ -6259,6 +6259,17 @@ impl SymForgeServer {
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status(&sidecar_status));
+        if mode == format::RuntimeMode::LocalProcess
+            && matches!(
+                sidecar_status.liveness,
+                crate::sidecar::port_file::SidecarLiveness::Dead
+                    | crate::sidecar::port_file::SidecarLiveness::NoSidecar
+            )
+        {
+            result.push_str(
+                " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
+            );
+        }
 
         // Append token savings section if the sidecar's TokenStats are available.
         if let Some(ref stats) = self.token_stats {
@@ -6384,6 +6395,17 @@ impl SymForgeServer {
         let sidecar_status = sidecar_status_for_server(self);
         result.push('\n');
         result.push_str(&format::format_sidecar_status_compact(&sidecar_status));
+        if mode == format::RuntimeMode::LocalProcess
+            && matches!(
+                sidecar_status.liveness,
+                crate::sidecar::port_file::SidecarLiveness::Dead
+                    | crate::sidecar::port_file::SidecarLiveness::NoSidecar
+            )
+        {
+            result.push_str(
+                " (informational: local-process mode keeps no sidecar; hooks fail open by design)",
+            );
+        }
 
         if let Some(ref stats) = self.token_stats {
             let snap = stats.summary();
@@ -6640,6 +6662,20 @@ impl SymForgeServer {
             // if the daemon connection degrades later.
             if result.starts_with("Indexed ") {
                 let new_root = PathBuf::from(&params.0.path);
+                // Root actually changed → session accounting recorded under the
+                // previous root (context_inventory) would double-count; start
+                // fresh. A same-root retarget keeps accounting intact. Compare
+                // canonicalized forms so a raw vs canonical path spelling of the
+                // same directory does not spuriously wipe the session.
+                let previous_root = self.capture_repo_root();
+                let root_changed = new_root
+                    .canonicalize()
+                    .ok()
+                    .map(|canonical| previous_root.as_deref() != Some(canonical.as_path()))
+                    .unwrap_or(true);
+                if root_changed {
+                    self.session_context.reset();
+                }
                 self.set_repo_root(Some(new_root));
                 // Trust-critical: invalidate any stale in-process index left
                 // over from a previous local-fallback load. Without this, a
@@ -6760,6 +6796,12 @@ impl SymForgeServer {
                 let file_count = published.file_count;
                 let symbol_count = published.symbol_count;
 
+                // Root actually changed → session accounting recorded under the
+                // previous root (context_inventory) would double-count; start
+                // fresh. A same-root reindex keeps accounting intact.
+                if current_root.as_deref() != Some(root.as_path()) {
+                    self.session_context.reset();
+                }
                 self.set_repo_root(Some(root.clone()));
 
                 // Restart the file watcher at the new root so freshness continues.
@@ -6781,6 +6823,20 @@ impl SymForgeServer {
                 );
 
                 let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
+                // Warn-only: indexing a subfolder of a git repo binds paths to
+                // that subfolder, not the repo root. Narrow-scope indexing is
+                // supported, so we do NOT auto-retarget — just surface the
+                // namespace shift so repo-root-relative path expectations are
+                // not silently violated.
+                if let Some(git_root) = crate::discovery::git_root_above(&root)
+                    && git_root != root
+                {
+                    output.push_str(&format!(
+                        "\nNote: indexed a subfolder of a git repo — paths will be relative to {}, not the git root {}. Index the git root for repo-root-relative paths.",
+                        root.display(),
+                        git_root.display()
+                    ));
+                }
                 if let Some(reset_report) = reset_report {
                     output.push_str(&format!(
                         "\nReset: scope={} | removed={} | missing={}",
@@ -8339,6 +8395,13 @@ impl SymForgeServer {
             // the highest score for a given name — exactly the entry we want to keep.
             later.0.eq_ignore_ascii_case(&first.0)
         });
+
+        // Two or more DISTINCT symbols resolved (e.g. "how does X interact with Y").
+        // The question is about a relationship, not a single definition — fall through
+        // to Understand → explore rather than picking the highest-scoring subject.
+        if candidates.len() >= 2 {
+            return None;
+        }
 
         // Pick the single candidate with the highest prominence score.
         candidates
@@ -14340,6 +14403,32 @@ mod tests {
         assert!(
             result.contains("src/lib.rs"),
             "what_changed should keep using the indexed repo root after index_folder, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_folder_warns_when_indexing_subfolder_of_git_repo() {
+        let repo = init_git_repo();
+        let sub = repo.path().join("subproject");
+        fs::create_dir_all(&sub).expect("create subfolder");
+        fs::write(sub.join("lib.rs"), "fn foo() {}\n").expect("write source in subfolder");
+
+        let server = make_server(make_live_index_empty());
+        let result = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: sub.display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+
+        assert!(
+            result.contains("Indexed"),
+            "subfolder index should still succeed (warn-only, no retarget), got: {result}"
+        );
+        assert!(
+            result.contains("subfolder of a git repo") && result.contains("not the git root"),
+            "indexing a subfolder of a git repo should warn about the path namespace shift, got: {result}"
         );
     }
 
@@ -25662,6 +25751,39 @@ mod tests {
         assert!(
             result.contains("Invocation: get_symbol_context(name=\"MyHandler\")"),
             "result: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_routes_two_distinct_symbols_to_explore() {
+        // "how does X interact with Y" names two DISTINCT indexed symbols; the
+        // relationship question must fall through to explore, not get hijacked
+        // into get_symbol_context on whichever symbol scores highest.
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let content = b"struct BusActor;\nimpl BusActor { fn handle(&self) {} }\nstruct WorkerActor;\nimpl WorkerActor { fn run(&self) {} }\n";
+        std::fs::write(src_dir.join("actors.rs"), content).unwrap();
+
+        let result = crate::parsing::process_file("src/actors.rs", content, LanguageId::Rust);
+        let indexed =
+            crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+        let server = make_server_with_root(
+            make_live_index_ready(vec![("src/actors.rs".to_string(), indexed)]),
+            Some(dir.path().to_path_buf()),
+        );
+
+        let input = super::SmartQueryInput {
+            query: "how does BusActor interact with WorkerActor?".to_string(),
+            max_tokens: None,
+        };
+        let result = server.ask(Parameters(input)).await;
+
+        assert!(result.contains("Chosen tool: explore"), "result: {result}");
+        assert!(
+            !result.contains("Chosen tool: get_symbol_context"),
+            "a two-symbol relationship query must not upgrade to get_symbol_context: {result}"
         );
     }
 

@@ -101,6 +101,24 @@ impl SessionContext {
         }
     }
 
+    /// Reset all session accounting to a fresh state. Called when the index is
+    /// retargeted to a new repo root: paths recorded under the old root no longer
+    /// belong to this session and would otherwise double-count in context_inventory.
+    pub fn reset(&self) {
+        let mut inner = self.inner.lock();
+        *inner = SessionInner {
+            fetched_symbols: HashMap::new(),
+            listed_symbols: HashMap::new(),
+            fetched_files: HashMap::new(),
+            listed_files: HashMap::new(),
+            summary_outputs: HashMap::new(),
+            detailed_fetches: HashMap::new(),
+            cache_hit_count: 0,
+            total_tokens: 0,
+            started_at: Instant::now(),
+        };
+    }
+
     /// Record that a symbol body/detail was served to the LLM.
     pub fn record_symbol(&self, path: &str, name: &str, tokens: u32) {
         let mut inner = self.inner.lock();
@@ -596,6 +614,24 @@ mod tests {
         assert_eq!(snap.listed_files.len(), 1);
         assert_eq!(snap.summary_outputs.len(), 1);
         assert_eq!(snap.total_tokens, 700);
+    }
+
+    #[test]
+    fn test_reset_clears_accounting() {
+        let ctx = SessionContext::new();
+        ctx.record_symbol("old_root/a.rs", "foo", 100);
+        ctx.record_file("old_root/b.rs", 200);
+        assert!(ctx.has_symbol("old_root/a.rs", "foo"));
+        ctx.reset();
+        assert!(
+            !ctx.has_symbol("old_root/a.rs", "foo"),
+            "reset must drop symbols recorded under the previous root"
+        );
+        assert!(!ctx.has_file("old_root/b.rs"));
+        let snap = ctx.snapshot();
+        assert_eq!(snap.fetched_symbols.len(), 0);
+        assert_eq!(snap.fetched_files.len(), 0);
+        assert_eq!(snap.total_tokens, 0);
     }
 
     #[test]

@@ -98,8 +98,15 @@ fn is_module_level(node: &Node) -> bool {
 /// Index identifier argument tokens of a module-level macro invocation as
 /// `macro-generated` symbols (dogfood #3). Cheap heuristic by design: the
 /// kind label is the trust flag — the index has the declared NAME, not the
-/// synthesized body. Capped and deduplicated to bound pollution from
-/// block-style macros (`lazy_static!`, `cfg_if!`).
+/// synthesized body. A token_tree is a FLAT token list, so a path argument
+/// like `std::cell::Cell` would otherwise yield `std`, `cell`, `Cell` as
+/// separate "symbols". Precision filter: accept an identifier only when its
+/// immediate preceding token starts the tree or a top-level arg
+/// (`(` `[` `{` `,`) AND its immediate following token ends the arg
+/// (`,` `)` `]` `}`). This keeps `ProjectId` in `define_id_type!(ProjectId)`
+/// and `Alpha`/`Beta` in `declare_pair!(Alpha, Beta, ...)` while rejecting
+/// `::`-adjacent path segments and identifiers nested in larger expressions.
+/// Under-capture is the safe direction. Capped and deduplicated.
 fn push_macro_generated_names(node: &Node, source: &str, depth: u32, sink: &mut SymbolSink<'_, '_>) {
     const MAX_NAMES_PER_INVOCATION: usize = 8;
     let mut cursor = node.walk();
@@ -109,13 +116,22 @@ fn push_macro_generated_names(node: &Node, source: &str, depth: u32, sink: &mut 
     else {
         return;
     };
-    let mut seen: Vec<String> = Vec::new();
+    // Flat token list — index neighbors directly to check arg boundaries.
     let mut tree_cursor = token_tree.walk();
-    for token in token_tree.children(&mut tree_cursor) {
+    let tokens: Vec<Node> = token_tree.children(&mut tree_cursor).collect();
+    let mut seen: Vec<String> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
         if seen.len() >= MAX_NAMES_PER_INVOCATION {
             break;
         }
         if !matches!(token.kind(), "identifier" | "type_identifier") {
+            continue;
+        }
+        // Preceding token must start the tree or a top-level arg.
+        let prev_ok = i == 0 || tokens.get(i - 1).is_some_and(|prev| matches!(prev.kind(), "(" | "[" | "{" | ","));
+        // Following token must end the arg (or terminate the tree).
+        let next_ok = tokens.get(i + 1).is_none_or(|next| matches!(next.kind(), "," | ")" | "]" | "}"));
+        if !prev_ok || !next_ok {
             continue;
         }
         let Ok(name) = token.utf8_text(source.as_bytes()) else {
@@ -248,6 +264,32 @@ fn caller() {
 }
 "#,
         [(SymbolKind::Function, "caller")]
+    );
+
+    // Qualified path argument: a flat token_tree splits `std::cell::Cell`
+    // into sibling tokens `std`, `::`, `cell`, `::`, `Cell`. The precision
+    // filter rejects every `::`-adjacent segment — no debris captured.
+    inline_test!(
+        rust_inline_test_macro_generated_rejects_qualified_path,
+        LanguageId::Rust,
+        r#"
+foo!(std::cell::Cell);
+"#,
+        []
+    );
+
+    // Multi-arg invocation: each top-level identifier is bounded by
+    // `(`/`,` before and `,`/`)` after, so both are captured.
+    inline_test!(
+        rust_inline_test_macro_generated_multi_arg,
+        LanguageId::Rust,
+        r#"
+m!(Alpha, Beta);
+"#,
+        [
+            (SymbolKind::MacroGenerated, "Alpha"),
+            (SymbolKind::MacroGenerated, "Beta"),
+        ]
     );
 
     // Module-level invocations inside a `mod` body still declare.
