@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.2...v8.13.3) (2026-07-07)
+
+
+### Bug Fixes
+
+* **update:** kill every same-path holder natively before the npm swap ([978818d](https://github.com/special-place-ai-heaven/symforge/commit/978818d958ce40e6c1f27da11189841e40f6905e))
+
 ## [8.13.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.1...v8.13.2) (2026-07-07)
 
 
