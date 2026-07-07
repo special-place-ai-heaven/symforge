@@ -161,6 +161,14 @@ pub struct StelEditRequest {
     /// Replay guard for committed apply (forwarded to legacy `replace_symbol_body`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    // Caller's working directory (absolute): routes the write into the matching
+    // git worktree instead of the indexed root. Hidden from the compact
+    // symforge_edit schema (A-025 byte budget) but still deserialized — the
+    // worktree-awareness hook injects it at call time, so routing works without
+    // advertising an advanced field on the token-sensitive compact surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub working_directory: Option<String>,
 }
 
 /// Edit intent for `symforge_edit` (L0 routes structural mutations here).

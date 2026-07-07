@@ -600,6 +600,14 @@ pub enum SkipReason {
     /// accounting and minted a false "File not found"). The path stays searchable
     /// as metadata; only symbol extraction is skipped.
     UnsupportedLanguage,
+    /// F5: file demoted to Tier-2 because it lives under an untracked
+    /// generated-output directory (`dist`, `build`, `out`, `cache`, `*-out`, …)
+    /// with no git-tracked file anywhere beneath it. Such dirs are
+    /// machine-generated corpora (JSON cache dumps, build artifacts) that can
+    /// dominate the symbol index. Tracked files are never demoted by this
+    /// policy, and `SYMFORGE_INDEX_GENERATED_OUTPUT=1` opts back into full
+    /// indexing. Non-git trees are unaffected (fail open: admit).
+    GeneratedOutput,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -612,6 +620,10 @@ impl std::fmt::Display for SkipReason {
             SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),
             SkipReason::UnsupportedLanguage => write!(f, "unsupported language"),
+            SkipReason::GeneratedOutput => write!(
+                f,
+                "untracked generated output (SYMFORGE_INDEX_GENERATED_OUTPUT=1 to index)"
+            ),
         }
     }
 }

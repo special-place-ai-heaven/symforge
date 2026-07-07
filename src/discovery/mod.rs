@@ -1167,6 +1167,117 @@ fn tracked_path_set_for_build_dir_rescue(root: &Path) -> Option<std::collections
     Some(tracked.into_iter().collect())
 }
 
+/// Env var opting back INTO full indexing of untracked generated-output
+/// directories (F5). Default OFF — when unset, files under an untracked
+/// directory matching [`is_generated_output_dir_name`] are demoted to Tier-2
+/// metadata-only. Set to a truthy value (`1`, `true`, `yes`, `on`) to restore
+/// the previous behavior (full Tier-1 admission).
+pub const INDEX_GENERATED_OUTPUT_ENV: &str = "SYMFORGE_INDEX_GENERATED_OUTPUT";
+
+/// Returns `true` when the operator opted back into indexing untracked
+/// generated-output dirs. Same truthy spellings as [`exclude_untracked_enabled`].
+fn index_generated_output_enabled() -> bool {
+    std::env::var(INDEX_GENERATED_OUTPUT_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Conservative name heuristic for machine-generated output directories.
+///
+/// Deliberately small: only names that are overwhelmingly build/cache output in
+/// practice (`dist`, `build`, `out`, `output`, `cache`, `.cache`, `generated`,
+/// `*-out`, `*-output`). False positives are bounded by the tracked-file guard
+/// in [`untracked_generated_output_demotions`]: a dir with ANY tracked file
+/// beneath it is never demoted.
+pub fn is_generated_output_dir_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "dist" | "build" | "out" | "output" | "cache" | ".cache" | "generated"
+    ) || n.ends_with("-out")
+        || n.ends_with("-output")
+}
+
+/// F5: compute the set of discovered file paths to demote to Tier-2 because
+/// they live under an UNTRACKED generated-output directory.
+///
+/// Field-report motivation: a single untracked (not gitignored) JSON cache dump
+/// (`graphify-out/cache`, 963 files) contributed 86% of a 327k-symbol index.
+/// Untracked dirs whose name matches [`is_generated_output_dir_name`] are
+/// machine output the operator never chose to version; demote their files to
+/// Tier-2 metadata-only (path stays searchable, no symbol extraction).
+///
+/// Conservative guarantees:
+/// - A directory with ANY git-tracked file beneath it is NEVER demoted
+///   (tracked = the operator chose to version it; this also preserves the
+///   SF-012(B) tracked-rescue contract, e.g. a committed `frontend/dist`).
+/// - Non-git trees / unreadable git index → empty set (fail open: admit,
+///   exactly the current behavior).
+/// - `SYMFORGE_INDEX_GENERATED_OUTPUT=1` → empty set (explicit opt-in).
+pub fn untracked_generated_output_demotions(
+    root: &Path,
+    entries: &[DiscoveredEntry],
+) -> std::collections::HashSet<String> {
+    if index_generated_output_enabled() {
+        return std::collections::HashSet::new();
+    }
+    let Some(tracked) = tracked_path_set_for_build_dir_rescue(root) else {
+        return std::collections::HashSet::new();
+    };
+    untracked_generated_output_demotions_inner(entries, &tracked)
+}
+
+/// Env-free core of [`untracked_generated_output_demotions`], unit-testable
+/// without process-global state.
+fn untracked_generated_output_demotions_inner(
+    entries: &[DiscoveredEntry],
+    tracked: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Candidate-dir decision cache: prefix -> has any tracked file beneath it.
+    // ponytail: O(candidates * tracked) linear scans; prefix trie if this shows
+    // up in load profiles.
+    let mut dir_has_tracked: HashMap<String, bool> = HashMap::new();
+    let mut demoted: HashSet<String> = HashSet::new();
+
+    for entry in entries {
+        let rel = entry.relative_path.as_str();
+        if tracked.contains(rel) {
+            continue; // tracked file: never demoted by this policy
+        }
+        // Shallowest DIRECTORY component (never the file name) matching the
+        // generated-output heuristic defines the candidate directory prefix.
+        let Some((dirs, _file)) = rel.rsplit_once('/') else {
+            continue; // root-level file, no directory to classify
+        };
+        let mut candidate: Option<&str> = None;
+        let mut end = 0usize;
+        for comp in dirs.split('/') {
+            end += comp.len();
+            if is_generated_output_dir_name(comp) {
+                candidate = Some(&rel[..end]);
+                break;
+            }
+            end += 1; // the '/' separator
+        }
+        let Some(candidate) = candidate else { continue };
+        let has_tracked = *dir_has_tracked
+            .entry(candidate.to_string())
+            .or_insert_with(|| {
+                let prefix = format!("{candidate}/");
+                tracked.iter().any(|t| t.starts_with(&prefix))
+            });
+        if !has_tracked {
+            demoted.insert(entry.relative_path.clone());
+        }
+    }
+    demoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,6 +1709,177 @@ mod tests {
             assert!(
                 paths.contains(&"src/main.rs"),
                 "normal source must be discovered: {paths:?}"
+            );
+        }
+    }
+
+    mod generated_output_demotion {
+        use super::*;
+        use std::process::Command;
+
+        // Serializes the opt-in test (which mutates the process-global
+        // SYMFORGE_INDEX_GENERATED_OUTPUT) against the sibling tests that read it via
+        // `untracked_generated_output_demotions`. Without this, parallel cargo test
+        // runs let the opt-in window leak into a reader and flip its expected tier.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn init_git(root: &Path) -> impl Fn(&[&str]) + '_ {
+            let run = move |args: &[&str]| {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .output()
+                    .expect("git command");
+            };
+            run(&["init"]);
+            run(&["config", "user.email", "test@test.com"]);
+            run(&["config", "user.name", "Test"]);
+            run
+        }
+
+        #[test]
+        fn generated_output_dir_name_matcher_is_conservative() {
+            for name in [
+                "dist",
+                "build",
+                "out",
+                "output",
+                "cache",
+                ".cache",
+                "generated",
+                "graphify-out",
+                "codegen-output",
+                "Dist",
+            ] {
+                assert!(is_generated_output_dir_name(name), "{name} should match");
+            }
+            for name in ["src", "docs", "outline", "scout", "distros", "builder"] {
+                assert!(!is_generated_output_dir_name(name), "{name} must NOT match");
+            }
+        }
+
+        #[test]
+        fn untracked_cache_dir_is_demoted_tracked_dist_is_not() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let run = init_git(root);
+
+            // Tracked source + a TRACKED build-output dir (operator chose to
+            // version it — SF-012(B) contract: never demote tracked files).
+            create_file(root, "src/main.rs", "fn main() {}");
+            create_file(root, "frontend/dist/bundle.js", "var x = 1;");
+            run(&["add", "src", "frontend"]);
+            run(&["commit", "-m", "initial"]);
+
+            // The field-report shape: an UNTRACKED, non-gitignored JSON cache dump.
+            create_file(root, "graphify-out/cache/a.json", "{\"k\": 1}");
+            create_file(root, "graphify-out/cache/b.json", "{\"k\": 2}");
+            // Untracked file in a NORMAL dir: not demoted by this policy.
+            create_file(root, "src/new_module.rs", "fn newer() {}");
+
+            let entries = discover_all_files(root).unwrap();
+            let demoted = untracked_generated_output_demotions(root, &entries);
+
+            assert!(
+                demoted.contains("graphify-out/cache/a.json")
+                    && demoted.contains("graphify-out/cache/b.json"),
+                "untracked generated-output files must be demoted: {demoted:?}"
+            );
+            assert!(
+                !demoted.contains("frontend/dist/bundle.js"),
+                "tracked build output must NOT be demoted: {demoted:?}"
+            );
+            assert!(
+                !demoted.contains("src/main.rs") && !demoted.contains("src/new_module.rs"),
+                "normal source (tracked or not) must NOT be demoted: {demoted:?}"
+            );
+        }
+
+        #[test]
+        fn generated_dir_with_any_tracked_file_is_fully_admitted() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let run = init_git(root);
+
+            // One tracked file inside `out/` protects the WHOLE dir, including
+            // untracked siblings — when uncertain, admit.
+            create_file(root, "out/kept.json", "{}");
+            run(&["add", "out"]);
+            run(&["commit", "-m", "initial"]);
+            create_file(root, "out/generated.json", "{\"g\": true}");
+
+            let entries = discover_all_files(root).unwrap();
+            let demoted = untracked_generated_output_demotions(root, &entries);
+            assert!(
+                demoted.is_empty(),
+                "a generated-output dir containing a tracked file must not be demoted: {demoted:?}"
+            );
+        }
+
+        #[test]
+        fn non_git_tree_demotes_nothing() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "dist/bundle.js", "var x = 1;");
+            create_file(tmp.path(), "src/main.rs", "fn main() {}");
+
+            let entries = discover_all_files(tmp.path()).unwrap();
+            let demoted = untracked_generated_output_demotions(tmp.path(), &entries);
+            assert!(
+                demoted.is_empty(),
+                "no git evidence → fail open, admit everything: {demoted:?}"
+            );
+        }
+
+        #[test]
+        fn opt_in_env_restores_full_indexing() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let run = init_git(root);
+            create_file(root, "src/main.rs", "fn main() {}");
+            run(&["add", "src"]);
+            run(&["commit", "-m", "initial"]);
+            create_file(root, "graphify-out/cache/a.json", "{}");
+
+            let entries = discover_all_files(root).unwrap();
+
+            // Env-free core demotes (proves the policy is live) …
+            let tracked: std::collections::HashSet<String> =
+                std::iter::once("src/main.rs".to_string()).collect();
+            let demoted = untracked_generated_output_demotions_inner(&entries, &tracked);
+            assert!(demoted.contains("graphify-out/cache/a.json"), "{demoted:?}");
+
+            // … and the opt-in env gate empties the set. The module `ENV_LOCK`
+            // (held above) serializes this writer against the sibling readers of
+            // SYMFORGE_INDEX_GENERATED_OUTPUT; this guard restores the prior
+            // value on drop, before the lock is released.
+            struct EnvGuard(Option<std::ffi::OsString>);
+            #[allow(unsafe_code)] // test-only env guard; sole writer of this var.
+            impl Drop for EnvGuard {
+                fn drop(&mut self) {
+                    // SAFETY: single test mutating this var; restored on drop.
+                    unsafe {
+                        match &self.0 {
+                            Some(v) => std::env::set_var(INDEX_GENERATED_OUTPUT_ENV, v),
+                            None => std::env::remove_var(INDEX_GENERATED_OUTPUT_ENV),
+                        }
+                    }
+                }
+            }
+            let _guard = EnvGuard(std::env::var_os(INDEX_GENERATED_OUTPUT_ENV));
+            #[allow(unsafe_code)]
+            // SAFETY: single test mutating this var; guard restores prior state.
+            unsafe {
+                std::env::set_var(INDEX_GENERATED_OUTPUT_ENV, "1")
+            };
+
+            let demoted = untracked_generated_output_demotions(root, &entries);
+            assert!(
+                demoted.is_empty(),
+                "opt-in must restore full indexing: {demoted:?}"
             );
         }
     }

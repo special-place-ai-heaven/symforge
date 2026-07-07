@@ -442,6 +442,51 @@ async fn ac3_working_directory_at_known_worktree_writes_to_worktree() {
     );
 }
 
+/// F6 (beta finding): the `symforge_edit` facade must forward
+/// `working_directory` into the internal edit tool so a facade apply issued
+/// from a git worktree lands in the worktree's copy — not the shared indexed
+/// root. Before the fix `StelEditRequest` had no `working_directory` field,
+/// so every facade edit silently contaminated the indexed checkout.
+#[tokio::test]
+async fn symforge_edit_facade_routes_apply_into_worktree() {
+    let _env = WorktreePolicyEnvGuard::remove();
+    let fx = WorktreeFixture::new(&[("src/lib.rs", HELLO_RS)]);
+    let wt_arg = fx.worktree_root.to_str().unwrap().to_string();
+
+    let result = fx
+        .server
+        .dispatch_tool_result_for_tests(
+            "symforge_edit",
+            json!({
+                "path": "src/lib.rs",
+                "symbol": "hello",
+                "body": "fn hello() {\n    println!(\"HELLO_FACADE\");\n}",
+                "apply": true,
+                "working_directory": wt_arg,
+            }),
+        )
+        .await
+        .expect("symforge_edit dispatch");
+    let result = serde_json::to_value(&result).expect("serialize CallToolResult");
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("symforge_edit result must contain text content");
+
+    // §2.3 response shape — the rerouted facade write must self-describe.
+    assert_contains(text, "rerouted: true");
+
+    let wt_after = fx.read_worktree("src/lib.rs");
+    assert!(
+        wt_after.contains("HELLO_FACADE"),
+        "worktree copy must receive the facade write: {wt_after}",
+    );
+    let indexed_after = fx.read_indexed("src/lib.rs");
+    assert!(
+        !indexed_after.contains("HELLO_FACADE"),
+        "indexed copy must NOT be touched by a rerouted facade apply: {indexed_after}",
+    );
+}
+
 /// AC4: `working_directory` at a path that is NOT a recognized worktree
 /// returns an error and writes zero bytes.
 #[tokio::test]
