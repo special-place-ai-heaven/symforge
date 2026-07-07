@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.6...v8.13.7) (2026-07-07)
+
+
+### Bug Fixes
+
+* **impact:** compare symbol body bytes and resolve qualified edit_plan selectors ([730a611](https://github.com/special-place-ai-heaven/symforge/commit/730a611915ea62de0537581ca57a15bf7bc8a2cb))
+
 ## [8.13.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.5...v8.13.6) (2026-07-07)
 
 
