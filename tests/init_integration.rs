@@ -666,20 +666,17 @@ fn test_run_init_codex_writes_symforge_agents_guidance() {
         "Codex AGENTS guidance must include config validation guidance: {raw}"
     );
     assert!(
-        raw.contains("Do not default to broad raw file reads"),
-        "Codex AGENTS guidance must encode the stronger source-inspection rule: {raw}"
+        raw.contains("| Task | Call |"),
+        "Codex AGENTS guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
-        raw.contains("## Agent Directives: Mechanical Overrides"),
-        "Codex AGENTS guidance must include the mechanical overrides block: {raw}"
+        !raw.contains("## Agent Directives: Mechanical Overrides")
+            && !raw.contains("## Tooling Preference"),
+        "removed guidance sections must not ship again: {raw}"
     );
     assert!(
-        raw.contains("THE \"STEP 0\" RULE"),
-        "Codex AGENTS guidance must include the structural cleanup directive: {raw}"
-    );
-    assert!(
-        raw.contains("FORCED VERIFICATION"),
-        "Codex AGENTS guidance must include the forced verification directive: {raw}"
+        raw.contains("\n<!-- SYMFORGE END -->"),
+        "end marker must sit alone on its own line, nothing fused before it: {raw}"
     );
 }
 
@@ -709,7 +706,7 @@ fn test_run_init_codex_preserves_existing_agents_content_and_is_idempotent() {
 }
 
 #[test]
-fn test_run_init_codex_skips_mechanical_overrides_when_already_present_externally() {
+fn test_run_init_codex_never_duplicates_external_overrides_heading() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let binary_path = std::path::PathBuf::from(FAKE_BINARY);
@@ -759,20 +756,17 @@ fn test_run_init_claude_writes_symforge_memory_guidance() {
         "Claude memory guidance must include tool guidance: {raw}"
     );
     assert!(
-        raw.contains("Tooling Preference"),
-        "Claude memory guidance must include the Tooling Preference section: {raw}"
+        raw.contains("| Task | Call |"),
+        "Claude memory guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
         raw.contains("validate_file_syntax"),
         "Claude memory guidance must include config validation guidance: {raw}"
     );
     assert!(
-        raw.contains("## Agent Directives: Mechanical Overrides"),
-        "Claude memory guidance must include the mechanical overrides block: {raw}"
-    );
-    assert!(
-        raw.contains("SUB-AGENT SWARMING"),
-        "Claude memory guidance must include the context management directives: {raw}"
+        !raw.contains("## Agent Directives: Mechanical Overrides")
+            && !raw.contains("## Tooling Preference"),
+        "removed guidance sections must not ship again: {raw}"
     );
 }
 
@@ -802,7 +796,7 @@ fn test_run_init_claude_preserves_existing_memory_content_and_is_idempotent() {
 }
 
 #[test]
-fn test_run_init_claude_skips_mechanical_overrides_when_already_present_externally() {
+fn test_run_init_claude_never_duplicates_external_overrides_heading() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let binary_path = std::path::PathBuf::from(FAKE_BINARY);
@@ -871,16 +865,16 @@ fn test_run_init_gemini_writes_full_symforge_guidance() {
     let raw = read_text(&guidance_path);
 
     assert!(
-        raw.contains("Tooling Preference"),
-        "Gemini guidance must include the full tooling preference section: {raw}"
+        raw.contains("| Task | Call |"),
+        "Gemini guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
         raw.contains("validate_file_syntax"),
         "Gemini guidance must include config validation guidance: {raw}"
     );
     assert!(
-        raw.contains("Do not default to broad raw file reads"),
-        "Gemini guidance must encode the stronger source-inspection rule: {raw}"
+        raw.contains("Raw reads (`get_file_content`/Read) remain correct"),
+        "Gemini guidance must keep the raw-read fallback rule: {raw}"
     );
     assert!(
         !raw.contains("## Agent Directives: Mechanical Overrides"),
@@ -940,8 +934,8 @@ fn test_run_init_kilo_writes_symforge_rules_guidance() {
         "Kilo rules guidance must mention SymForge MCP: {raw}"
     );
     assert!(
-        raw.contains("Tooling Preference"),
-        "Kilo rules guidance must include the tooling preference section: {raw}"
+        raw.contains("| Task | Call |"),
+        "Kilo rules guidance must carry the task-to-tool map: {raw}"
     );
     assert!(
         raw.contains("validate_file_syntax"),
