@@ -784,9 +784,17 @@ fn register_claude_desktop_mcp_server_with_home(
 
     let command_path = if cfg!(windows) {
         // Generate a wrapper script that sets CWD before launching symforge.
+        // It lives in the Claude Desktop config dir (%APPDATA%\Claude) — a
+        // stable, symforge-managed injection point — NEVER next to the npm
+        // platform binary: npm wipes that bin dir on every package swap,
+        // which deleted the wrapper and left Desktop pointing at nothing.
+        let wrapper_dir = desktop_config_path
+            .parent()
+            .context("cannot determine Claude Desktop config directory")?;
         let wrapper_path = create_desktop_wrapper_windows(
             &desktop_binary_path_str,
             workspace_root_str.as_deref(),
+            wrapper_dir,
         )?;
         native_command_path(&wrapper_path)
     } else {
@@ -868,7 +876,14 @@ fn comparable_path(path: &std::path::Path) -> String {
     }
 }
 
-/// Create a `.cmd` wrapper next to the symforge binary that sets CWD before launching it.
+/// Create a `.cmd` wrapper in `wrapper_dir` (the Claude Desktop config dir)
+/// that sets CWD before launching the symforge binary by ABSOLUTE path.
+///
+/// The wrapper must NOT live next to the npm platform binary: npm replaces
+/// that `bin/` directory wholesale on every package swap, deleting the
+/// generated wrapper and leaving the registered Desktop command pointing at
+/// a nonexistent file. The Desktop config dir survives updates and is the
+/// same place the registration itself is injected.
 ///
 /// Claude Desktop on Windows launches MCP servers with CWD = `C:\WINDOWS\System32`
 /// (a forbidden directory that crashes symforge with "Access is denied" on first
@@ -890,22 +905,19 @@ fn comparable_path(path: &std::path::Path) -> String {
 fn create_desktop_wrapper_windows(
     binary_path: &str,
     workspace_root: Option<&str>,
+    wrapper_dir: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let bin_path = std::path::Path::new(binary_path);
-    let wrapper_dir = bin_path
-        .parent()
-        .context("cannot determine parent directory of symforge binary")?;
+    std::fs::create_dir_all(wrapper_dir)
+        .with_context(|| format!("creating {}", wrapper_dir.display()))?;
     let wrapper_path = wrapper_dir.join("symforge-desktop.cmd");
-    let binary_name = bin_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("cannot determine symforge binary file name")?;
 
     // `cd /d` into the discovered workspace (writable + indexable) when known,
     // else fall back to the always-writable home dir to keep the System32-crash
     // fix. Both are double-quoted; `cd /d` accepts a literal path verbatim.
+    // The binary is invoked by ABSOLUTE path (not `%~dp0`): the wrapper no
+    // longer lives next to the binary.
     let cd_target = workspace_root.unwrap_or("%USERPROFILE%");
-    let script = format!("@echo off\r\ncd /d \"{cd_target}\"\r\n\"%~dp0{binary_name}\" %*\r\n");
+    let script = format!("@echo off\r\ncd /d \"{cd_target}\"\r\n\"{binary_path}\" %*\r\n");
 
     std::fs::write(&wrapper_path, script)
         .with_context(|| format!("writing {}", wrapper_path.display()))?;
@@ -917,6 +929,7 @@ fn create_desktop_wrapper_windows(
 fn create_desktop_wrapper_windows(
     _binary_path: &str,
     _workspace_root: Option<&str>,
+    _wrapper_dir: &std::path::Path,
 ) -> anyhow::Result<String> {
     unreachable!("desktop wrapper is only created on Windows")
 }
@@ -2410,7 +2423,7 @@ env = { EXISTING_FLAG = "keep" }
 
     #[cfg(windows)]
     #[test]
-    fn test_claude_desktop_registration_writes_durable_wrapper_for_global_binary() {
+    fn test_claude_desktop_registration_writes_wrapper_into_config_dir() {
         let home = tempfile::tempdir().unwrap();
         let stable_bin_dir = std::env::current_dir()
             .unwrap()
@@ -2436,19 +2449,30 @@ env = { EXISTING_FLAG = "keep" }
             .as_str()
             .unwrap();
 
-        assert!(
-            command.contains("symforge-init-test"),
-            "Claude Desktop command should use durable global wrapper: {command}"
+        // The wrapper lives in the DESKTOP CONFIG DIR (survives npm package
+        // swaps), never next to the npm binary (npm wipes that dir on every
+        // update, which orphaned the registered command).
+        let wrapper = config_dir.path().join("symforge-desktop.cmd");
+        assert_eq!(
+            normalize_exe_path_for_test(command),
+            normalize_exe_path_for_test(&wrapper.display().to_string()),
+            "Claude Desktop command must point at the wrapper in the config dir"
         );
         assert!(
-            !command.contains("Temp"),
-            "Claude Desktop command must not persist a temporary wrapper path: {command}"
+            !stable_bin_dir.join("symforge-desktop.cmd").exists(),
+            "no wrapper may be written next to the binary (npm wipes that dir)"
         );
+        let script = std::fs::read_to_string(&wrapper).unwrap();
         assert!(
-            stable_bin_dir.join("symforge-desktop.cmd").exists(),
-            "durable wrapper should be created next to the home binary"
+            script.contains(&home_binary.display().to_string()),
+            "wrapper must launch the binary by absolute path: {script}"
         );
         let _ = std::fs::remove_dir_all(&stable_bin_dir);
+    }
+
+    #[cfg(windows)]
+    fn normalize_exe_path_for_test(path: &str) -> String {
+        path.replace('/', "\\").to_ascii_lowercase()
     }
 
     // Plan 001 (home-cwd disease): `symforge init --client cursor` registers
@@ -2511,9 +2535,11 @@ env = { EXISTING_FLAG = "keep" }
         let workspace = tempfile::tempdir().unwrap();
         let workspace_str = workspace.path().display().to_string();
 
+        let config_dir = tempfile::tempdir().unwrap();
         let wrapper_path = create_desktop_wrapper_windows(
             &binary.display().to_string(),
             Some(workspace_str.as_str()),
+            config_dir.path(),
         )
         .unwrap();
         let script = std::fs::read_to_string(&wrapper_path).unwrap();
@@ -2539,8 +2565,10 @@ env = { EXISTING_FLAG = "keep" }
         let binary = bin_dir.path().join("symforge.exe");
         std::fs::write(&binary, "x").unwrap();
 
+        let config_dir = tempfile::tempdir().unwrap();
         let wrapper_path =
-            create_desktop_wrapper_windows(&binary.display().to_string(), None).unwrap();
+            create_desktop_wrapper_windows(&binary.display().to_string(), None, config_dir.path())
+                .unwrap();
         let script = std::fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
