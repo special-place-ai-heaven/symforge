@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.3...v8.13.4) (2026-07-07)
+
+
+### Bug Fixes
+
+* **init:** write the Claude Desktop wrapper into the config dir, not the npm bin dir ([446fce9](https://github.com/special-place-ai-heaven/symforge/commit/446fce91a73bbac19d83ff520bb3124fa39b131e))
+* **test:** make desktop-wrapper registration assertion platform-aware ([55bfce0](https://github.com/special-place-ai-heaven/symforge/commit/55bfce0e4f75d0c2892ea03371f19b9277dda67c))
+
 ## [8.13.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.2...v8.13.3) (2026-07-07)
 
 
