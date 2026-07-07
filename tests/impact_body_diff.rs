@@ -23,6 +23,8 @@ use std::time::Duration;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::json;
+use symforge::domain::LanguageId;
+use symforge::live_index::IndexedFile;
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::sidecar::spawn_sidecar;
@@ -141,6 +143,25 @@ fn shell_exec_denied_maps_to_policy_denied() {}
     fx.rewrite("crates/daemon/tests/ipc_command.rs", after);
 
     let result = fx.impact("crates/daemon/tests/ipc_command.rs").await;
+    assert_no_changed_symbols(&result);
+}
+
+#[tokio::test]
+async fn impact_prefix_comment_survives_watcher_pre_update_snapshot() {
+    let before = "fn alpha() {}\nfn beta() {}\n";
+    let after = "//! header only\nfn alpha() {}\nfn beta() {}\n";
+    let fx = Fixture::new(&[("src/watcher_race.rs", before)]);
+    fx.rewrite("src/watcher_race.rs", after);
+
+    // Simulate the watcher re-indexing before analyze_file_impact runs.
+    let bytes = fs::read(fx.root.join("src/watcher_race.rs")).expect("read after bytes");
+    let parsed = symforge::parsing::process_file("src/watcher_race.rs", &bytes, LanguageId::Rust);
+    let indexed = IndexedFile::from_parse_result(parsed, bytes);
+    fx.server
+        .index()
+        .update_file("src/watcher_race.rs".to_string(), indexed);
+
+    let result = fx.impact("src/watcher_race.rs").await;
     assert_no_changed_symbols(&result);
 }
 

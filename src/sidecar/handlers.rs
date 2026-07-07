@@ -1049,33 +1049,35 @@ async fn handle_edit_impact(
 ) -> Result<String, StatusCode> {
     use crate::domain::LanguageId;
 
-    // Get pre-edit symbols: sidecar cache → index pre-update snapshot → current index.
+    // Get pre-edit symbols and bytes: sidecar cache → index pre-update snapshot → current index.
     //
-    // The index pre-update snapshot (`take_pre_update_symbols`) fixes a race
+    // The index pre-update snapshot (`take_pre_update_snapshot`) fixes a race
     // where the watcher re-indexes the file before this hook fires, causing the
-    // current index to already contain post-edit symbols and yielding a false
-    // "no symbol changes detected" result.
-    let pre_symbols: Vec<SymbolSnapshot> = {
+    // current index to already contain post-edit symbols/content while the hook
+    // still needs the pre-edit baseline for an accurate diff.
+    let (pre_symbols, pre_content): (Vec<SymbolSnapshot>, Option<Vec<u8>>) = {
         let cache = state.symbol_cache.read();
         if let Some(cached) = cache.get(path) {
-            cached.clone()
+            (cached.clone(), None)
         } else {
             drop(cache);
-            // Try the index-level pre-update snapshot first (survives watcher race).
-            if let Some(pre) = state.index.take_pre_update_symbols(path) {
-                pre.into_iter()
+            if let Some(pre) = state.index.take_pre_update_snapshot(path) {
+                let symbols = pre
+                    .symbols
+                    .into_iter()
                     .map(|s| SymbolSnapshot {
                         name: s.name,
                         kind: s.kind,
                         line_range: s.line_range,
                         byte_range: s.byte_range,
                     })
-                    .collect()
+                    .collect();
+                (symbols, Some(pre.content))
             } else {
-                // No pre-update snapshot — populate from current index.
                 let guard = state.index.read();
                 if let Some(file) = guard.get_file(path) {
-                    file.symbols
+                    let symbols = file
+                        .symbols
                         .iter()
                         .map(|s| SymbolSnapshot {
                             name: s.name.clone(),
@@ -1083,22 +1085,17 @@ async fn handle_edit_impact(
                             line_range: s.line_range,
                             byte_range: s.byte_range,
                         })
-                        .collect()
+                        .collect();
+                    (symbols, Some(file.content.clone()))
                 } else {
-                    Vec::new()
+                    (Vec::new(), None)
                 }
             }
         }
     };
 
-    // Get file byte_len from index before re-indexing.
-    let (file_bytes_pre, pre_content): (u64, Option<Vec<u8>>) = {
-        let guard = state.index.read();
-        guard
-            .get_file(path)
-            .map(|f| (f.byte_len, Some(f.content.clone())))
-            .unwrap_or((0, None))
-    };
+    // File byte_len before re-indexing (content baseline comes from `pre_content` above).
+    let file_bytes_pre: u64 = pre_content.as_ref().map_or(0, |b| b.len() as u64);
 
     // Determine language.
     let extension = std::path::Path::new(path)

@@ -644,8 +644,14 @@ pub struct LiveIndex {
 
 /// Lightweight snapshot of a symbol for pre-update diffing in `analyze_file_impact`.
 ///
-/// Stored in [`SharedIndexHandle::pre_update_symbols`] so the impact tool can
+/// Stored in [`SharedIndexHandle::pre_update_snapshots`] so the impact tool can
 /// compare against the state *before* the watcher or edit tools re-indexed.
+#[derive(Clone, Debug)]
+pub struct PreUpdateSnapshot {
+    pub content: Vec<u8>,
+    pub symbols: Vec<PreUpdateSymbol>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreUpdateSymbol {
     pub name: String,
@@ -681,10 +687,10 @@ pub struct SharedIndexHandle {
     /// per-file churn, ownership, and co-change data. Populated asynchronously
     /// after index load/reload completes.
     git_temporal: ArcSwap<super::git_temporal::GitTemporalIndex>,
-    /// Pre-update symbol snapshots: saved automatically by `update_file` before
+    /// Pre-update file snapshots: saved automatically by `update_file` before
     /// the index entry is replaced. Consumed (take) by `analyze_file_impact` to
     /// compute accurate diffs even when the watcher re-indexes before the hook fires.
-    pre_update_symbols: Mutex<HashMap<String, Vec<PreUpdateSymbol>>>,
+    pre_update_snapshots: Mutex<HashMap<String, PreUpdateSnapshot>>,
 }
 
 /// Write guard that republishes lightweight handle state when mutated data is released.
@@ -713,7 +719,7 @@ impl SharedIndexHandle {
             last_reset_project_generation: AtomicU64::new(0),
             rejected_stale_mutations: AtomicU64::new(0),
             git_temporal: ArcSwap::new(Arc::new(super::git_temporal::GitTemporalIndex::pending())),
-            pre_update_symbols: Mutex::new(HashMap::new()),
+            pre_update_snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -815,7 +821,7 @@ impl SharedIndexHandle {
         self.project_generation.fetch_add(1, Ordering::AcqRel);
         self.last_reset_project_generation
             .store(0, Ordering::Release);
-        self.pre_update_symbols.lock().clear();
+        self.pre_update_snapshots.lock().clear();
     }
 
     pub fn update_file(&self, path: String, file: IndexedFile) {
@@ -824,19 +830,22 @@ impl SharedIndexHandle {
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
         if let Some(existing) = current.get_file(&path) {
-            let snapshot: Vec<PreUpdateSymbol> = existing
-                .symbols
-                .iter()
-                .map(|s| PreUpdateSymbol {
-                    name: s.name.clone(),
-                    kind: s.kind.to_string(),
-                    line_range: s.line_range,
-                    byte_range: s.byte_range,
-                })
-                .collect();
-            self.pre_update_symbols
-                .lock()
-                .insert(path.clone(), snapshot);
+            self.pre_update_snapshots.lock().insert(
+                path.clone(),
+                PreUpdateSnapshot {
+                    content: existing.content.clone(),
+                    symbols: existing
+                        .symbols
+                        .iter()
+                        .map(|s| PreUpdateSymbol {
+                            name: s.name.clone(),
+                            kind: s.kind.to_string(),
+                            line_range: s.line_range,
+                            byte_range: s.byte_range,
+                        })
+                        .collect(),
+                },
+            );
         }
         let mut live = (*current).clone();
         let path_clone = path.clone();
@@ -886,19 +895,22 @@ impl SharedIndexHandle {
         // Capture pre-update symbols so analyze_file_impact can diff correctly
         // even when the watcher re-indexes before the hook fires.
         if let Some(existing) = current.get_file(path) {
-            let snapshot: Vec<PreUpdateSymbol> = existing
-                .symbols
-                .iter()
-                .map(|s| PreUpdateSymbol {
-                    name: s.name.clone(),
-                    kind: s.kind.to_string(),
-                    line_range: s.line_range,
-                    byte_range: s.byte_range,
-                })
-                .collect();
-            self.pre_update_symbols
-                .lock()
-                .insert(path.to_string(), snapshot);
+            self.pre_update_snapshots.lock().insert(
+                path.to_string(),
+                PreUpdateSnapshot {
+                    content: existing.content.clone(),
+                    symbols: existing
+                        .symbols
+                        .iter()
+                        .map(|s| PreUpdateSymbol {
+                            name: s.name.clone(),
+                            kind: s.kind.to_string(),
+                            line_range: s.line_range,
+                            byte_range: s.byte_range,
+                        })
+                        .collect(),
+                },
+            );
         }
         let mut live = (*current).clone();
         let path_owned = path.to_string();
@@ -1182,13 +1194,19 @@ impl SharedIndexHandle {
         self.git_temporal.load_full()
     }
 
-    /// Take (consume) the pre-update symbol snapshot for a file, if any.
+    /// Take (consume) the pre-update snapshot for a file, if any.
     ///
-    /// Used by `analyze_file_impact` to get the symbols from *before* the last
-    /// `update_file` call — prevents the watcher race where the index is already
-    /// updated to the post-edit state before the hook fires.
+    /// Used by `analyze_file_impact` to get the file bytes and symbols from
+    /// *before* the last `update_file` call — prevents the watcher race where
+    /// the index is already updated to the post-edit state before the hook fires.
+    pub fn take_pre_update_snapshot(&self, path: &str) -> Option<PreUpdateSnapshot> {
+        self.pre_update_snapshots.lock().remove(path)
+    }
+
+    /// Backward-compatible accessor for callers that only need the symbol half.
     pub fn take_pre_update_symbols(&self, path: &str) -> Option<Vec<PreUpdateSymbol>> {
-        self.pre_update_symbols.lock().remove(path)
+        self.take_pre_update_snapshot(path)
+            .map(|snapshot| snapshot.symbols)
     }
 
     /// Atomically replace the git temporal index with a new version.
