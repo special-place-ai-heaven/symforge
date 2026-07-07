@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.1...v8.13.2) (2026-07-07)
+
+
+### Bug Fixes
+
+* **init:** replace CLAUDE.md guidance injection with compact task-to-tool map ([8700e99](https://github.com/special-place-ai-heaven/symforge/commit/8700e997a806eef492904a874d35a3cd586a50d0))
+
 ## [8.13.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.0...v8.13.1) (2026-07-07)
 
 
