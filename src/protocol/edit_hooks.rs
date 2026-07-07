@@ -94,20 +94,42 @@ pub fn register(hook: Box<dyn EditHook>) {
 }
 
 /// Resolve the target path by walking registered hooks in reverse-registration
-/// order and returning the first result.
+/// order and returning the first hook that makes an ACTIVE routing decision.
 ///
-/// Because [`DefaultEditHook`] is pre-registered and its default impl always
-/// returns `Ok`, this function only returns `Err` when a feature hook explicitly
-/// fails the resolution.
+/// A hook makes an active decision when it returns an error (reject the edit)
+/// or an actual reroute (`rerouted == true`). Observer-only hooks — e.g.
+/// [`crate::live_index::frecency::FrecencyBumpHook`], which overrides only
+/// `after_edit_committed` — inherit the DEFAULT [`EditHook::resolve_target_path`],
+/// which returns a passthrough (`rerouted == false`, target == indexed). Such a
+/// passthrough must NOT shadow an earlier hook's reroute/error: doing so made
+/// worktree routing silently depend on registration order (F6 — when the
+/// frecency hook registered after [`crate::worktree::WorktreeAwareEditHook`],
+/// `next_back()` picked the frecency passthrough and every `working_directory`
+/// edit contaminated the indexed root). So skip passthrough results and keep
+/// looking; only when no hook makes an active decision do we return a
+/// passthrough (byte-identical to pre-hook behavior — the most-recently-
+/// registered hook's passthrough, exactly what `next_back()` used to yield).
+///
+/// Because [`DefaultEditHook`] is pre-registered and always returns `Ok`, this
+/// function only returns `Err` when a feature hook explicitly fails resolution.
 pub fn resolve(ctx: &EditContext) -> Result<ResolvedTarget, String> {
     let reg = registry().read();
-    // Walk hooks most-recently-registered first so feature hooks win over the default.
-    if let Some(hook) = reg.iter().next_back() {
-        return hook.resolve_target_path(ctx);
+    let mut passthrough: Option<ResolvedTarget> = None;
+    for hook in reg.iter().rev() {
+        let resolved = hook.resolve_target_path(ctx)?;
+        if resolved.rerouted {
+            return Ok(resolved);
+        }
+        if passthrough.is_none() {
+            passthrough = Some(resolved);
+        }
     }
-    // Defensive — the registry is seeded with DefaultEditHook on first access, so this
-    // branch is unreachable in practice.
-    DefaultEditHook.resolve_target_path(ctx)
+    // The registry is seeded with DefaultEditHook, so a passthrough is always
+    // produced unless a hook errored above; the fallback is defensive.
+    match passthrough {
+        Some(resolved) => Ok(resolved),
+        None => DefaultEditHook.resolve_target_path(ctx),
+    }
 }
 
 /// Invoke [`EditHook::after_edit_committed`] on every registered hook.
@@ -190,5 +212,67 @@ mod tests {
         let resolved = DefaultEditHook.resolve_target_path(&ctx).expect("resolves");
         assert_eq!(resolved.target_path, abs);
         assert!(!resolved.rerouted);
+    }
+
+    #[test]
+    fn resolve_prefers_active_reroute_over_later_passthrough_hook() {
+        // Root-cause regression (F6): `resolve` must honor an ACTIVE reroute from an
+        // earlier-registered hook even when a LATER-registered observer-only hook
+        // (mirroring `FrecencyBumpHook`, which overrides only `after_edit_committed`)
+        // inherits the default passthrough. The old `next_back()` returned only the
+        // last hook, so a passthrough observer registered after the worktree hook
+        // silently killed routing and every `working_directory` edit hit the indexed
+        // root. Using a unique sentinel `relative_path` keeps these hooks inert for
+        // every other test that shares this process-global registry.
+        const SENTINEL: &str = "F6_SENTINEL_REROUTE";
+
+        struct ReroutingHook;
+        impl EditHook for ReroutingHook {
+            fn resolve_target_path(&self, ctx: &EditContext) -> Result<ResolvedTarget, String> {
+                if ctx.relative_path == SENTINEL {
+                    Ok(ResolvedTarget {
+                        target_path: PathBuf::from("/worktree").join(ctx.relative_path),
+                        indexed_path: ctx.indexed_absolute_path.to_path_buf(),
+                        rerouted: true,
+                    })
+                } else {
+                    let abs = ctx.indexed_absolute_path.to_path_buf();
+                    Ok(ResolvedTarget {
+                        target_path: abs.clone(),
+                        indexed_path: abs,
+                        rerouted: false,
+                    })
+                }
+            }
+        }
+
+        // Observer-only: overrides ONLY after_edit_committed, exactly like
+        // FrecencyBumpHook, so its resolve_target_path is the default passthrough.
+        struct ObserverOnlyHook;
+        impl EditHook for ObserverOnlyHook {
+            fn after_edit_committed(&self, _ctx: &EditContext, _p: &Path) {}
+        }
+
+        // Register the router FIRST, the observer LAST — the order that broke prod.
+        register(Box::new(ReroutingHook));
+        register(Box::new(ObserverOnlyHook));
+
+        let repo_root = PathBuf::from("/repo");
+        let abs = repo_root.join(SENTINEL);
+        let ctx = EditContext {
+            relative_path: SENTINEL,
+            indexed_absolute_path: &abs,
+            repo_root: &repo_root,
+            working_directory: Some(Path::new("/worktree")),
+        };
+        let resolved = resolve(&ctx).expect("resolves");
+        assert!(
+            resolved.rerouted,
+            "an active reroute must win over a later observer-only passthrough hook"
+        );
+        assert_eq!(
+            resolved.target_path,
+            PathBuf::from("/worktree").join(SENTINEL)
+        );
     }
 }
