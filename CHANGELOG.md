@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.0...v8.13.1) (2026-07-07)
+
+
+### Bug Fixes
+
+* **tools:** address 2026-07-07 tool-smoke and beta dogfood findings ([673af78](https://github.com/special-place-ai-heaven/symforge/commit/673af78c56558ee4971945553e45a51bee49ff43))
+
 ## [8.13.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.12.2...v8.13.0) (2026-07-06)
 
 
