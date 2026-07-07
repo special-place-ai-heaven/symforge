@@ -624,10 +624,20 @@ fn test_run_init_all_updates_both_clients() {
     let claude_desktop_command = claude_desktop_config_value["mcpServers"]["symforge"]["command"]
         .as_str()
         .unwrap();
-    let durable_bin_dir = stable_bin_dir.display().to_string();
+    // The registered command is the wrapper in the Desktop CONFIG dir (npm
+    // wipes the binary's bin dir on every swap); the wrapper itself launches
+    // the stable binary by absolute path.
+    let desktop_config_dir = claude_desktop_config
+        .parent()
+        .expect("desktop config has a parent dir");
     assert!(
-        claude_desktop_command.contains(&durable_bin_dir),
-        "Claude Desktop config must use the injected stable binary directory: {claude_desktop_command}"
+        claude_desktop_command.contains(&desktop_config_dir.display().to_string()),
+        "Claude Desktop command must point at the wrapper in the config dir: {claude_desktop_command}"
+    );
+    let wrapper_script = read_text(&desktop_config_dir.join("symforge-desktop.cmd"));
+    assert!(
+        wrapper_script.contains(&stable_bin_dir.display().to_string()),
+        "the wrapper must launch the stable binary by absolute path: {wrapper_script}"
     );
 
     let codex_config = read_text(&home.path().join(".codex").join("config.toml"));
