@@ -408,8 +408,10 @@ impl<'a> IndexView<'a> {
     /// from the base result, the base's `overflow_count` and
     /// `suppressed_by_noise` would be STALE; rather than carry misleading base
     /// numbers, the overlay branch sets `overflow_count = 0` (no precise
-    /// merged-overflow claim) and `suppressed_by_noise` to ONLY the overlay
-    /// `#[cfg(test)]` suppressions actually counted while scanning the dirty set.
+    /// merged-overflow claim) and `suppressed_by_noise` to the BASE suppression
+    /// total PLUS the overlay `#[cfg(test)]` suppressions counted while scanning
+    /// the dirty set (the base count still holds for the non-dropped files, so
+    /// the zero-hit test-match hint survives a dirty working tree).
     /// Per-consumer derived indices that would make these globally exact are the
     /// deferred work.
     pub fn search_text(
@@ -493,12 +495,19 @@ impl<'a> IndexView<'a> {
         // honest-but-coarse value instead of stale base numbers:
         //   * overflow_count -> 0 (we do not claim a precise hidden-overflow
         //     count across the merged set);
-        //   * suppressed_by_noise -> only the overlay `#[cfg(test)]` suppressions
-        //     we actually counted while scanning the dirty set (the base's own
-        //     suppression total is not re-derived across the post-filter).
+        //   * suppressed_by_noise -> the BASE suppression total (source-level
+        //     `#[cfg(test)]` ranges + whole test files the base counted) PLUS
+        //     the overlay `#[cfg(test)]` suppressions we counted while scanning
+        //     the dirty set. The base count still describes suppressions in the
+        //     files we did NOT drop above (drops are keyed on delta paths, the
+        //     only files re-scanned), so adding is coherent — and it keeps the
+        //     zero-hit "N match(es) found in test modules" hint from silently
+        //     vanishing whenever the working tree is dirty.
         // This keeps every reported field consistent with the result we return.
         result.overflow_count = 0;
-        result.suppressed_by_noise = overlay_suppressed;
+        result.suppressed_by_noise = result
+            .suppressed_by_noise
+            .saturating_add(overlay_suppressed);
 
         Ok(result)
     }
@@ -1504,6 +1513,75 @@ mod tests {
             1,
             "result_limit=1 bounds the per-project hits (D14): got {}",
             bounded_hits.len()
+        );
+    }
+
+    // ── Regression — dirty-tree overlay must PRESERVE the base's test-match
+    //    suppression count, else the zero-hit "N match(es) found in test modules"
+    //    hint silently vanishes whenever the working tree is dirty (finding #3).
+    #[test]
+    fn overlay_preserves_base_test_suppression_count() {
+        // Base: one Rust source file whose ONLY `needle` match lives inside a
+        // `#[cfg(test)] mod tests` block. The base scans it (file is not
+        // test-classified), suppresses the in-`cfg(test)` line, and reports
+        // suppressed_by_noise = 1 with zero visible source hits.
+        let content = "fn real() {}\n#[cfg(test)]\nmod tests {\n    let needle = 1;\n}\n";
+        let mut lib = make_file("src/lib.rs", content);
+        lib.symbols = vec![SymbolRecord {
+            name: "tests".to_string(),
+            kind: SymbolKind::Module,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, content.len() as u32),
+            line_range: (1, 4),
+            doc_byte_range: None,
+            item_byte_range: None,
+        }];
+        let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+        map.insert("src/lib.rs".to_string(), Arc::new(lib));
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);
+        idx.files = map;
+        let base = Arc::new(IndexBase::new(base_key("c0"), Arc::new(idx), 1));
+        let opts = TextSearchOptions::for_current_code_search();
+
+        // Sanity: the base-only path already records the suppression.
+        let base_view = IndexView::new(&base, None).expect("base view");
+        let base_result = base_view
+            .search_text(Some("needle"), None, false, &opts)
+            .expect("base search");
+        assert!(
+            base_result.files.is_empty(),
+            "no visible source hits in base"
+        );
+        assert_eq!(
+            base_result.suppressed_by_noise, 1,
+            "base must count the #[cfg(test)] match as suppressed"
+        );
+
+        // Overlay: an unrelated dirty upsert with NO `needle` makes `deltas`
+        // non-empty, forcing the overlay merge path — which previously OVERWROTE
+        // `suppressed_by_noise` with the (zero) overlay-only count.
+        let mut overlay = Overlay::fresh(&base);
+        overlay.deltas.insert(
+            "src/other.rs".to_string(),
+            FileDelta::Upsert(Arc::new(make_file("src/other.rs", "fn other() {}\n"))),
+        );
+        let view = IndexView::new(&base, Some(&overlay)).expect("overlay view");
+        let result = view
+            .search_text(Some("needle"), None, false, &opts)
+            .expect("overlay search");
+
+        assert!(
+            result.files.is_empty(),
+            "still no visible source hits after the overlay merge"
+        );
+        assert!(
+            result.suppressed_by_noise >= 1,
+            "dirty-tree overlay must preserve the base test-match suppression count, got {}",
+            result.suppressed_by_noise
         );
     }
 }

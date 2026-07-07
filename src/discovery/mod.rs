@@ -536,6 +536,25 @@ pub fn find_project_root() -> Option<PathBuf> {
     }
 }
 
+/// Walk up from `start` looking for a `.git`-bearing ancestor STRICTLY ABOVE
+/// `start` (the directory itself is not considered). Returns the first such
+/// non-forbidden ancestor, or `None` when there is no wider git root.
+///
+/// Used by `index_folder` to warn (without retargeting) when a caller indexes a
+/// subfolder of a git repo, which shifts the path namespace off the repo root.
+pub(crate) fn git_root_above(start: &Path) -> Option<PathBuf> {
+    let mut current = start.parent()?.to_path_buf();
+    loop {
+        if current.join(".git").exists() && !is_forbidden_root(&current) {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
 /// Resolve and validate the `SYMFORGE_WORKSPACE_ROOT` cold-start override.
 ///
 /// Returns `Some(root)` only when the env var is set to a non-empty path that

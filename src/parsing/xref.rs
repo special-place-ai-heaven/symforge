@@ -59,6 +59,16 @@ const RUST_VALUE_IDENT_QUERY: &str = r#"
 (identifier) @ref.value
 "#;
 
+// Captures every `scoped_identifier` (a `::`-qualified path).  On its own this
+// is very noisy (it matches call targets, path prefixes of longer paths, `use`
+// segments, and match-pattern paths), so `extract_rust_qualified_value_refs`
+// gates each hit by parent node kind: it keeps ONLY value-position paths whose
+// function was not already captured as a qualified call, are not the prefix of
+// a longer path, and are not inside a `use` declaration or a match pattern.
+const RUST_QUALIFIED_VALUE_QUERY: &str = r#"
+(scoped_identifier) @ref.qualified_value
+"#;
+
 const PYTHON_XREF_QUERY: &str = r#"
 ; Function calls: foo(x)
 (call function: (identifier) @ref.call)
@@ -445,6 +455,7 @@ const PERL_XREF_QUERY: &str = r#"
 static RUST_QUERY: OnceLock<Option<Query>> = OnceLock::new();
 static RUST_CONST_DEF_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
 static RUST_VALUE_IDENT_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
+static RUST_QUALIFIED_VALUE_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
 static PYTHON_QUERY: OnceLock<Option<Query>> = OnceLock::new();
 static PYTHON_VALUE_TYPE_IDENT_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
 static PYTHON_STRING_TYPE_QUERY_C: OnceLock<Option<Query>> = OnceLock::new();
@@ -532,6 +543,15 @@ fn rust_value_ident_query(lang: &Language) -> Option<&'static Query> {
         lang,
         RUST_VALUE_IDENT_QUERY,
         "rust value-ident",
+    )
+}
+
+fn rust_qualified_value_query(lang: &Language) -> Option<&'static Query> {
+    compile_xref_query(
+        &RUST_QUALIFIED_VALUE_QUERY_C,
+        lang,
+        RUST_QUALIFIED_VALUE_QUERY,
+        "rust qualified-value",
     )
 }
 
@@ -1099,6 +1119,130 @@ fn extract_rust_value_refs(
     out
 }
 
+/// Resolve path-qualified references used in *value* position, e.g. a function
+/// passed as an argument rather than called: `from_fn(handlers::caller_guard)`.
+///
+/// The main Rust query captures a `scoped_identifier` only when it is the
+/// function of a `call_expression` (`Vec::new()`), and the macro-body text
+/// fallback only recovers `a::b::name(` *call* shapes. A qualified path in a
+/// value position (argument, `let` binding, struct field init, `Self::CONST`,
+/// `Enum::Variant` as an expression) is therefore invisible to
+/// `find_references`. This pass closes that gap.
+///
+/// Precision — a bare `(scoped_identifier)` match is enormous, so each hit is
+/// gated by the parent node kind (cheaper and clearer than encoding these
+/// exclusions in the tree-sitter query):
+///  * parent `call_expression` / `generic_function` → the path IS the callee of
+///    a (possibly turbofish) qualified call, already captured as `Call`; skip.
+///  * parent `scoped_identifier` → this is the `path:` prefix of a longer path
+///    (`axum::middleware` inside `axum::middleware::from_fn`); only the
+///    outermost path is emitted, so skip the prefix.
+///  * any ancestor `use_declaration` → import segment, handled by import capture.
+///  * parent is a pattern node (`match_pattern`, `tuple_struct_pattern`,
+///    `struct_pattern`, `or_pattern`) → a match/`let` pattern, not a value use.
+///
+/// `Type::CONST` / `Enum::Variant` in genuine value position are kept — they
+/// are real value usages. `name` is the leaf identifier (for name-based
+/// `find_references`); `qualified_name` retains the full `::` path.
+fn extract_rust_qualified_value_refs(
+    root: &Node,
+    source: &str,
+    ts_language: &Language,
+    existing: &[ReferenceRecord],
+) -> Vec<ReferenceRecord> {
+    let source_bytes = source.as_bytes();
+    let Some(query) = rust_qualified_value_query(ts_language) else {
+        return Vec::new();
+    };
+    let capture_names = query.capture_names();
+    // Dedup against ranges already captured by the main query (belt-and-braces;
+    // the parent-kind gate below is the real call-site guard) and within pass.
+    let existing_ranges: HashSet<(u32, u32)> = existing.iter().map(|r| r.byte_range).collect();
+    let mut emitted_ranges: HashSet<(u32, u32)> = HashSet::new();
+    let mut out: Vec<ReferenceRecord> = Vec::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source_bytes);
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        for capture in m.captures {
+            if capture_names[capture.index as usize] != "ref.qualified_value" {
+                continue;
+            }
+            let node = capture.node;
+
+            // Parent-kind gate.
+            let parent_kind = node.parent().map(|p| p.kind());
+            // Callee of a qualified call (already a `Call` ref), the prefix
+            // of a longer path, or a pattern position — all excluded.
+            if let Some(
+                "call_expression"
+                | "generic_function"
+                | "scoped_identifier"
+                | "match_pattern"
+                | "tuple_struct_pattern"
+                | "struct_pattern"
+                | "or_pattern",
+            ) = parent_kind
+            {
+                continue;
+            }
+
+            // Skip anything inside a `use` declaration (imports are captured by
+            // the main query's import rules).
+            let mut ancestor = node.parent();
+            let mut in_use = false;
+            while let Some(a) = ancestor {
+                if a.kind() == "use_declaration" {
+                    in_use = true;
+                    break;
+                }
+                ancestor = a.parent();
+            }
+            if in_use {
+                continue;
+            }
+
+            let range = (node.start_byte() as u32, node.end_byte() as u32);
+            if existing_ranges.contains(&range) || emitted_ranges.contains(&range) {
+                continue;
+            }
+
+            // Leaf identifier for name-based lookup; full path for qualified_name.
+            let Some(leaf) = node.child_by_field_name("name") else {
+                continue;
+            };
+            let Ok(leaf_text) = leaf.utf8_text(source_bytes) else {
+                continue;
+            };
+            let name = leaf_text.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let qualified_name = node
+                .utf8_text(source_bytes)
+                .ok()
+                .map(|t| t.trim().to_string());
+
+            let start = node.start_position();
+            let end = node.end_position();
+            out.push(ReferenceRecord {
+                name: name.to_string(),
+                qualified_name,
+                kind: ReferenceKind::ValueUse,
+                byte_range: range,
+                line_range: (start.row as u32, end.row as u32),
+                enclosing_symbol_index: None,
+            });
+            emitted_ranges.insert(range);
+        }
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Main extraction function
 // ---------------------------------------------------------------------------
@@ -1639,6 +1783,12 @@ pub fn extract_references(
     if *language == LanguageId::Rust {
         let value_refs = extract_rust_value_refs(root, source, &ts_language, &references);
         references.extend(value_refs);
+        // Path-qualified value-position uses (`from_fn(handlers::foo)`), which
+        // the main query and macro fallback never see. Runs after the const
+        // pass so it dedups against every reference captured so far.
+        let qualified_value_refs =
+            extract_rust_qualified_value_refs(root, source, &ts_language, &references);
+        references.extend(qualified_value_refs);
     }
 
     if *language == LanguageId::Python {
@@ -2177,6 +2327,75 @@ fn helper(n: usize) {
             has_ref(&refs, "SIZE", ReferenceKind::ValueUse),
             "const SIZE used as a bare arg should surface as ValueUse, refs: {:?}",
             refs
+        );
+    }
+
+    #[test]
+    fn test_rust_qualified_value_arg_surfaces_as_value_use() {
+        // A path-qualified function passed as an argument (not called) must
+        // surface as a ValueUse named by its leaf, with the full path retained.
+        let source = r#"
+fn wire() {
+    let _ = from_fn(handlers::foo);
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        let value_ref = refs
+            .iter()
+            .find(|r| r.name == "foo" && r.kind == ReferenceKind::ValueUse)
+            .unwrap_or_else(|| panic!("expected ValueUse for `foo`, refs: {refs:?}"));
+        assert_eq!(
+            value_ref.qualified_name.as_deref(),
+            Some("handlers::foo"),
+            "qualified_name should retain the full path, refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_rust_qualified_call_not_duplicated_by_value_pass() {
+        // A qualified CALL must remain exactly one reference: the value pass
+        // must not add a second ValueUse for the same path.
+        let source = r#"
+fn run() {
+    handlers::foo();
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        let foo_refs: Vec<_> = refs.iter().filter(|r| r.name == "foo").collect();
+        assert_eq!(
+            foo_refs.len(),
+            1,
+            "qualified call `handlers::foo()` should yield exactly one ref, refs: {refs:?}"
+        );
+        assert_eq!(
+            foo_refs[0].kind,
+            ReferenceKind::Call,
+            "the single ref should be a Call, not a ValueUse, refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_rust_use_declaration_produces_no_qualified_value_use() {
+        // `use handlers::foo;` must not emit a ValueUse from the new rule;
+        // import handling is unchanged (it stays an Import ref).
+        let source = r#"
+use handlers::foo;
+
+fn run() {
+    let _ = foo;
+}
+"#;
+        let (refs, _) = parse_and_extract(source, LanguageId::Rust);
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.qualified_name.as_deref() == Some("handlers::foo")
+                    && r.kind == ReferenceKind::ValueUse),
+            "a `use` path must not surface as a qualified ValueUse, refs: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::Import),
+            "the use declaration should still produce an Import ref, refs: {refs:?}"
         );
     }
 

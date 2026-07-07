@@ -1947,6 +1947,12 @@ pub fn health_report_compact_from_published_state(
         output.push_str(&line);
     }
 
+    if published.file_count == 0 {
+        output.push_str(
+            "\n⚠ Empty index — run index_folder(path=\"<your-repo-root>\") to bind an index",
+        );
+    }
+
     output
 }
 

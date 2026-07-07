@@ -1381,6 +1381,11 @@ pub struct ReplaceSymbolBodyInput {
     /// Relative file path.
     pub path: String,
     /// Symbol name to replace.
+    // `symbol` is accepted as an alias on every symbol-addressed edit input:
+    // the `symforge_edit` facade and its docs use `symbol`, so models moving
+    // between the facade and the direct tools should not trip on the field
+    // name. Canonical field stays `name`; both keys at once is a hard error.
+    #[serde(alias = "symbol")]
     pub name: String,
     /// Optional kind filter (e.g., "fn", "struct", "impl").
     pub kind: Option<String>,
@@ -1429,6 +1434,7 @@ pub struct InsertSymbolInput {
     /// Relative file path.
     pub path: String,
     /// Name of the reference symbol to insert adjacent to.
+    #[serde(alias = "symbol")]
     pub name: String,
     /// Optional kind filter.
     pub kind: Option<String>,
@@ -1458,6 +1464,7 @@ pub struct DeleteSymbolInput {
     /// Relative file path.
     pub path: String,
     /// Symbol name to delete.
+    #[serde(alias = "symbol")]
     pub name: String,
     /// Optional kind filter.
     pub kind: Option<String>,
@@ -1482,6 +1489,7 @@ pub struct EditWithinSymbolInput {
     /// Relative file path.
     pub path: String,
     /// Symbol name that scopes the edit.
+    #[serde(alias = "symbol")]
     pub name: String,
     /// Optional kind filter.
     pub kind: Option<String>,
@@ -1643,6 +1651,7 @@ impl<'de> serde::Deserialize<'de> for SingleEdit {
         enum EditOrStr {
             Struct {
                 path: String,
+                #[serde(alias = "symbol")]
                 name: String,
                 #[serde(default)]
                 kind: Option<String>,
@@ -2136,6 +2145,7 @@ pub struct BatchRenameInput {
     /// Relative file path containing the symbol definition.
     pub path: String,
     /// Current symbol name.
+    #[serde(alias = "symbol")]
     pub name: String,
     /// Optional kind filter.
     pub kind: Option<String>,
@@ -2632,6 +2642,7 @@ impl<'de> serde::Deserialize<'de> for InsertTarget {
         enum TargetOrStr {
             Struct {
                 path: String,
+                #[serde(alias = "symbol")]
                 name: String,
                 kind: Option<String>,
                 #[serde(default, deserialize_with = "super::tools::lenient_u32")]
@@ -5806,6 +5817,24 @@ fn uses_it() { Widget::default(); }
             err.contains("duplicate field"),
             "expected duplicate-field error, got: {err}"
         );
+    }
+
+    // -- symbol-addressed inputs: name / symbol alias --
+
+    #[test]
+    fn test_edit_within_symbol_input_accepts_symbol_alias() {
+        let raw =
+            r#"{"path":"src/lib.rs","symbol":"foo","old_text":"a","new_text":"b","kind":null}"#;
+        let input: EditWithinSymbolInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(input.name, "foo");
+    }
+
+    #[test]
+    fn test_edit_within_symbol_input_rejects_both_name_and_symbol() {
+        let raw =
+            r#"{"path":"src/lib.rs","name":"foo","symbol":"bar","old_text":"a","new_text":"b"}"#;
+        let result: Result<EditWithinSymbolInput, _> = serde_json::from_str(raw);
+        assert!(result.is_err(), "expected duplicate-field error");
     }
 
     // ─── working_directory plumbing — round-trip tests ───────────────────
