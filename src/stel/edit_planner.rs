@@ -185,6 +185,14 @@ pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValida
         args["idempotency_key"] = serde_json::json!(key);
     }
 
+    // Worktree routing (beta finding F6): all three internal tools accept
+    // `working_directory` and run it through the worktree-awareness edit hook.
+    // Dropping it here was the contamination bug — a facade edit issued from a
+    // git worktree silently landed in the shared indexed root.
+    if let Some(cwd) = &request.working_directory {
+        args["working_directory"] = serde_json::json!(cwd);
+    }
+
     Ok(StelPlan {
         plan_id: edit_plan_id(request),
         intent: IntentBucket::Edit,
@@ -331,6 +339,47 @@ mod tests {
         assert_eq!(
             plan.steps[0].args["if_match"], "fn helper() { old }",
             "if_match must be forwarded into the replace_symbol_body plan args"
+        );
+    }
+
+    #[test]
+    fn build_edit_plan_forwards_working_directory() {
+        // F6: dropping `working_directory` at planning was the worktree
+        // contamination bug — a facade edit issued from a git worktree landed
+        // in the shared indexed root instead of the worktree copy.
+        for (op, key) in [
+            (None, "working_directory"),
+            (Some(StelEditOp::InsertAfter), "working_directory"),
+        ] {
+            let plan = build_edit_plan(&StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                symbol: Some("helper".to_string()),
+                body: Some("fn helper() {}".to_string()),
+                op,
+                working_directory: Some("/repos/wt_one".to_string()),
+                ..Default::default()
+            })
+            .expect("valid edit request");
+            assert_eq!(
+                plan.steps[0].args[key], "/repos/wt_one",
+                "working_directory must be forwarded into the {} plan args",
+                plan.steps[0].tool
+            );
+        }
+    }
+
+    #[test]
+    fn build_edit_plan_omits_working_directory_when_absent() {
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            ..Default::default()
+        })
+        .expect("valid edit request");
+        assert!(
+            plan.steps[0].args.get("working_directory").is_none(),
+            "absent working_directory must not appear in plan args"
         );
     }
 

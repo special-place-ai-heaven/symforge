@@ -598,6 +598,19 @@ pub fn event_name_for(subcommand: &HookSubcommand) -> &'static str {
 fn pre_tool_suggestion(input: &HookInput) -> String {
     let tool = input.tool_name.as_deref().unwrap_or("");
     let cwd = input.cwd.as_deref().unwrap_or("");
+
+    // Suppress hints for targets outside the workspace root: SymForge cannot
+    // serve paths outside the indexed repo (e.g. %TEMP% task outputs, other
+    // repos), so the hint would be pure noise. Fail-open silent.
+    let target = input
+        .tool_input
+        .as_ref()
+        .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
+        .unwrap_or("");
+    if is_outside_workspace(target, cwd) {
+        return String::new();
+    }
+
     let file = extract_file_path(input, cwd);
     let pattern = input
         .tool_input
@@ -665,6 +678,34 @@ fn workflow_for_subcommand(subcommand: Option<&HookSubcommand>, input: &HookInpu
         Some(HookSubcommand::PreTool) => pre_tool_workflow(input),
         None => HookWorkflow::PassThrough,
     }
+}
+
+/// True when `target` is an absolute path that does not live under the
+/// workspace root (`root`, falling back to the hook's current directory).
+///
+/// SymForge tools resolve paths relative to the indexed project root, so an
+/// absolute path outside it (temp dirs, other repos) can never be served and
+/// must not produce an efficiency hint. Relative and empty targets are always
+/// treated as in-workspace. Cheap by design: string prefix check after
+/// normalization, no filesystem access beyond an optional `current_dir`.
+fn is_outside_workspace(target: &str, root: &str) -> bool {
+    if target.is_empty() || !std::path::Path::new(target).is_absolute() {
+        return false;
+    }
+    let root_norm = if root.is_empty() {
+        match std::env::current_dir() {
+            Ok(d) => normalize_path_for_match(&d),
+            // Fail-open: cannot determine the root, keep existing behavior.
+            Err(_) => return false,
+        }
+    } else {
+        normalize_path_for_match(std::path::Path::new(root))
+    };
+    if root_norm.is_empty() {
+        return false;
+    }
+    let target_norm = normalize_path_for_match(std::path::Path::new(target));
+    target_norm != root_norm && !target_norm.starts_with(&format!("{root_norm}/"))
 }
 
 /// Returns true when a read should stay conservative and fail open instead of
@@ -1901,6 +1942,70 @@ mod tests {
         assert!(
             s.contains("replace_symbol_body"),
             "should suggest replace_symbol_body: {s}"
+        );
+    }
+
+    #[test]
+    fn test_pre_tool_suggestion_read_outside_workspace_is_empty() {
+        // B5: Read of a %TEMP%-style path outside the repo root must not hint —
+        // get_file_context cannot serve paths outside every indexed root.
+        let temp_target = std::env::temp_dir()
+            .join("claude")
+            .join("tasks")
+            .join("1.output");
+        let input = HookInput {
+            tool_name: Some("Read".to_string()),
+            tool_input: Some(HookToolInput {
+                file_path: Some(temp_target.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            cwd: Some("/repo".to_string()),
+            ..Default::default()
+        };
+        let s = pre_tool_suggestion(&input);
+        assert!(s.is_empty(), "should not hint outside the workspace: {s}");
+    }
+
+    #[test]
+    fn test_pre_tool_suggestion_read_in_repo_absolute_still_hints() {
+        // In-repo absolute path under cwd keeps the hint. Use a real absolute
+        // path so the check is exercised on every platform.
+        let cwd = std::env::current_dir().unwrap();
+        let target = cwd.join("src").join("main.rs");
+        let input = HookInput {
+            tool_name: Some("Read".to_string()),
+            tool_input: Some(HookToolInput {
+                file_path: Some(target.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let s = pre_tool_suggestion(&input);
+        assert!(
+            s.contains("get_file_context"),
+            "in-repo absolute read should still hint: {s}"
+        );
+    }
+
+    #[test]
+    fn test_pre_tool_suggestion_grep_outside_workspace_is_empty() {
+        // B5: Grep scoped to a directory outside the repo root must not hint.
+        let temp_dir = std::env::temp_dir().join("scratch");
+        let input = HookInput {
+            tool_name: Some("Grep".to_string()),
+            tool_input: Some(HookToolInput {
+                pattern: Some("helper".to_string()),
+                path: Some(temp_dir.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            cwd: Some("/repo".to_string()),
+            ..Default::default()
+        };
+        let s = pre_tool_suggestion(&input);
+        assert!(
+            s.is_empty(),
+            "should not hint for grep outside the workspace: {s}"
         );
     }
 

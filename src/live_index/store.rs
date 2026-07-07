@@ -1506,9 +1506,15 @@ pub(crate) struct AdmitParseResult {
 /// `exclude_untracked_set` carries the SF-009 opt-in semantics: `None` (the
 /// default and the fail-open result for non-git trees) demotes nothing; `Some`
 /// demotes recognized-extension files that are not git-tracked to Tier 2.
+///
+/// `generated_output_demotions` carries the F5 policy: discovered file paths
+/// under UNTRACKED generated-output dirs (see
+/// `discovery::untracked_generated_output_demotions`) are demoted to Tier 2
+/// without reading their content. An empty set demotes nothing.
 pub(crate) fn admit_and_parse_entries(
     entries: &[crate::discovery::DiscoveredEntry],
     exclude_untracked_set: &Option<std::collections::HashSet<String>>,
+    generated_output_demotions: &std::collections::HashSet<String>,
 ) -> AdmitParseResult {
     use crate::discovery::{classify_admission, unsupported_language_decision};
     // `AdmissionTier` and `SkippedFile` are already imported at module scope.
@@ -1566,6 +1572,28 @@ pub(crate) fn admit_and_parse_entries(
                         return Some(AdmissionOutcome::Skip(sf));
                     }
                     AdmissionTier::Normal => {}
+                }
+
+                // F5: untracked generated-output demotion. Decided at discovery
+                // time (dir-level git evidence); checked here BEFORE any file
+                // read so a 900-file JSON cache dump costs zero I/O. Empty set
+                // (the default for git-less trees and under the
+                // `SYMFORGE_INDEX_GENERATED_OUTPUT` opt-in) demotes nothing.
+                if generated_output_demotions.contains(&entry.relative_path) {
+                    let sf = SkippedFile {
+                        path: entry.relative_path.clone(),
+                        size: entry.file_size,
+                        extension: entry
+                            .absolute_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.to_string()),
+                        decision: crate::domain::index::AdmissionDecision::skip(
+                            AdmissionTier::MetadataOnly,
+                            crate::domain::index::SkipReason::GeneratedOutput,
+                        ),
+                    };
+                    return Some(AdmissionOutcome::Skip(sf));
                 }
 
                 // Phase 2: we tentatively have Tier-1. If the file has no recognized
@@ -1805,6 +1833,12 @@ impl LiveIndex {
         // alone is sufficient here.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
+        // F5: demote files under untracked generated-output dirs (dist/build/
+        // out/cache/*-out/… with no tracked file beneath) to Tier-2. Empty for
+        // non-git trees and under `SYMFORGE_INDEX_GENERATED_OUTPUT=1`.
+        let generated_output_demotions =
+            discovery::untracked_generated_output_demotions(root, &all_entries);
+
         // 2. Run the shared admission + parse pipeline. This classifies every
         //    discovered file into Tier 1/2/3, records Tier-2/3 files in
         //    `skipped_files`, reads admitted files under the in-flight byte
@@ -1815,7 +1849,11 @@ impl LiveIndex {
             files,
             skipped_files,
             cb_state,
-        } = admit_and_parse_entries(&all_entries, &exclude_untracked_set);
+        } = admit_and_parse_entries(
+            &all_entries,
+            &exclude_untracked_set,
+            &generated_output_demotions,
+        );
 
         let load_duration = start.elapsed();
         info!(
@@ -2043,6 +2081,11 @@ impl LiveIndex {
         // the `skipped_files` registry agree across both discovery paths.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
+        // F5: same untracked generated-output demotion as `load`, so initial
+        // load and reload report identical tiering.
+        let generated_output_demotions =
+            discovery::untracked_generated_output_demotions(root, &all_entries);
+
         // 2. Run the shared admission + parse pipeline (identical to the one
         //    `LiveIndex::load` uses). This reads admitted files under the
         //    in-flight byte governor, parses in parallel, applies the circuit
@@ -2051,7 +2094,11 @@ impl LiveIndex {
             files: new_files,
             skipped_files,
             cb_state: new_cb,
-        } = admit_and_parse_entries(&all_entries, &exclude_untracked_set);
+        } = admit_and_parse_entries(
+            &all_entries,
+            &exclude_untracked_set,
+            &generated_output_demotions,
+        );
 
         let load_duration = start.elapsed();
         info!(

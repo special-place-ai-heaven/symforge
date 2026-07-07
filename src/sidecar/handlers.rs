@@ -1477,16 +1477,24 @@ fn symbol_context_text(
     files.sort();
 
     let mut evidence_anchors: Vec<String> = Vec::new();
+    // Files that contributed at least one anchor. The 3-anchor cap can exhaust
+    // on the first file(s); the evidence line must then say how many reference
+    // files it left unnamed instead of silently undercounting usage sites.
+    let mut anchored_files = 0usize;
     for file in &files {
         // safe: `files` is built from `map.keys()` immediately above; lookup cannot miss.
         let refs = map.get(file).unwrap();
         let mut sorted_refs = refs.clone();
         sorted_refs.sort_by_key(|(line, _, _)| *line);
+        let before = evidence_anchors.len();
         for (line, _, _) in &sorted_refs {
             if evidence_anchors.len() >= 3 {
                 break;
             }
             evidence_anchors.push(format!("{file}:{line}"));
+        }
+        if evidence_anchors.len() > before {
+            anchored_files += 1;
         }
         if evidence_anchors.len() >= 3 {
             break;
@@ -1567,11 +1575,21 @@ fn symbol_context_text(
             params.name
         )
     } else {
-        format!(
-            "symbol token `{}` anchored at {}",
-            params.name,
-            evidence_anchors.join(", ")
-        )
+        let more_files = files.len().saturating_sub(anchored_files);
+        if more_files > 0 {
+            format!(
+                "symbol token `{}` anchored at {} (+{} more files)",
+                params.name,
+                evidence_anchors.join(", "),
+                more_files
+            )
+        } else {
+            format!(
+                "symbol token `{}` anchored at {}",
+                params.name,
+                evidence_anchors.join(", ")
+            )
+        }
     };
     let scope = if let Some(path) = params.path.as_deref() {
         match params.symbol_line {
@@ -3230,6 +3248,57 @@ mod tests {
             result.contains("Evidence: symbol token `process` anchored at src/main.rs:5"),
             "got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_symbol_context_evidence_marks_uncovered_caller_files() {
+        // Dogfood F8: the Evidence header caps at 3 anchors, which one file can
+        // exhaust. With callers in 4 files it must append `(+N more files)`
+        // instead of silently naming only the anchored file(s).
+        let a = make_indexed_file(
+            "src/a.rs",
+            vec![],
+            vec![
+                make_reference("target", ReferenceKind::Call, 1),
+                make_reference("target", ReferenceKind::Call, 2),
+                make_reference("target", ReferenceKind::Call, 3),
+            ],
+            ParseStatus::Parsed,
+        );
+        let one_ref = |line| vec![make_reference("target", ReferenceKind::Call, line)];
+        let b = make_indexed_file("src/b.rs", vec![], one_ref(5), ParseStatus::Parsed);
+        let c = make_indexed_file("src/c.rs", vec![], one_ref(6), ParseStatus::Parsed);
+        let d = make_indexed_file("src/d.rs", vec![], one_ref(7), ParseStatus::Parsed);
+        let state = make_state(vec![
+            ("src/a.rs", a),
+            ("src/b.rs", b),
+            ("src/c.rs", c),
+            ("src/d.rs", d),
+        ]);
+
+        let params = SymbolContextParams {
+            name: "target".to_string(),
+            file: None,
+            path: None,
+            symbol_kind: None,
+            symbol_line: None,
+        };
+        let result = symbol_context_handler(State(state), Query(params))
+            .await
+            .unwrap();
+        assert!(
+            result.contains(
+                "Evidence: symbol token `target` anchored at src/a.rs:1, src/a.rs:2, src/a.rs:3 (+3 more files)"
+            ),
+            "evidence must flag caller files the anchor cap left unnamed; got: {result}"
+        );
+        // The body still lists every caller file.
+        for file in ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"] {
+            assert!(
+                result.contains(file),
+                "body must list {file}; got: {result}"
+            );
+        }
     }
 
     #[tokio::test]

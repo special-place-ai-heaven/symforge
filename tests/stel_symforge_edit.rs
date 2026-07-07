@@ -84,26 +84,37 @@ fn ledger_meta_from_output(output: &str) -> symforge::stel::LedgerEnvelopeMeta {
 }
 
 #[tokio::test]
-async fn symforge_edit_rejects_non_compact_surface() {
+async fn symforge_edit_preview_succeeds_on_full_surface() {
+    // Beta finding B4: the full surface exposes `symforge_edit` as the
+    // preferred editing facade, so it must work there — it falls through to
+    // the same internal legacy tools instead of erroring.
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("full");
 
-    let (dir, _) = temp_rust_repo("fn foo() {}\n");
-    let server = server_for_repo(dir.path(), "edit-non-compact");
-    let output = dispatch_symforge_edit(
+    let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
+    let before = std::fs::read(&file_path).expect("read file before edit");
+    let server = server_for_repo(dir.path(), "edit-full-surface");
+    let result = dispatch_symforge_edit_result(
         &server,
         &StelEditRequest {
             path: "src/lib.rs".to_string(),
             symbol: Some("foo".to_string()),
-            body: Some("fn foo() { 1 }".to_string()),
+            body: Some("fn foo() { new }".to_string()),
             ..Default::default()
         },
     )
     .await;
+    let output = tool_result_text(&result);
     assert!(
-        output.contains("requires SYMFORGE_SURFACE=compact"),
-        "unexpected output:\n{output}"
+        !output.contains("requires SYMFORGE_SURFACE=compact"),
+        "full surface must not refuse symforge_edit:\n{output}"
     );
+    for needle in ["Chosen tool: replace_symbol_body", "[DRY RUN]"] {
+        assert!(output.contains(needle), "missing `{needle}` in:\n{output}");
+    }
+    assert_eq!(outcome_class(&result), "found", "output:\n{output}");
+    let after = std::fs::read(&file_path).expect("read file after edit");
+    assert_eq!(before, after, "preview must not mutate source bytes");
 }
 
 #[tokio::test]

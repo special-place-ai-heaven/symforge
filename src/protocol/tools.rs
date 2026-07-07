@@ -9740,19 +9740,14 @@ impl SymForgeServer {
         &self,
         params: Parameters<crate::stel::StelEditRequest>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        // Gate KEPT (unlike `status`, Wave 1 Fix 4): `symforge_edit` routes through
-        // the STEL economics/ledger apply path, the compact-surface invariant the
-        // A-019 golden replay pins. On full the caller has the legacy edit tools
-        // (replace_symbol_body / edit_within_symbol / …) this facade fuses — the
-        // message names that path. Pinned by tests/stel_symforge_edit.rs.
-        if super::surface_probe::surface_profile_from_env()
-            != super::surface_probe::SurfaceProfile::Compact
-        {
-            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
-                "symforge_edit STEL handler requires SYMFORGE_SURFACE=compact; use legacy edit tools on the full surface",
-            ));
-        }
-
+        // Gate REMOVED (beta finding B4, 2026-07-07): the full surface exposes
+        // and documents `symforge_edit` as the preferred editing facade, so
+        // hard-refusing it there was a self-inflicted failure. The handler below
+        // already translates every op to the same internal legacy tools
+        // (replace_symbol_body / insert_symbol / edit_within_symbol) on both
+        // surfaces — no compact-only invariant lives in this dispatch. The
+        // `symforge` READ facade keeps its gate: its economics/golden-replay
+        // path (A-019) is compact-specific.
         self.symforge_edit_stel_handler(&params.0).await
     }
 
@@ -9792,6 +9787,17 @@ impl SymForgeServer {
                 };
             match run_pre_apply_gates(&self.index, request, &abs_path) {
                 Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
+                // F6: the already-applied check compares against the INDEXED
+                // copy, but a `working_directory` apply targets a worktree whose
+                // copy may still lack the change — short-circuiting would skip
+                // the routed write. Proceed to dispatch; the legacy tool rebases
+                // onto the worktree target and a truly-identical splice is a
+                // harmless idempotent rewrite.
+                Ok(PreApplyOutcome::AlreadyApplied(symbol))
+                    if request.working_directory.is_some() =>
+                {
+                    resolved_symbol = Some(symbol);
+                }
                 Ok(PreApplyOutcome::AlreadyApplied(symbol)) => {
                     let plan = build_edit_plan(request).expect("validated edit request");
                     let decision = evaluate_edit_plan(&plan);
@@ -9931,9 +9937,9 @@ impl SymForgeServer {
         // Wave-1 defect fix (2026-07-02): NO surface gate here. `status` is a
         // read-only health/trust readout that the docs tell every client to call
         // at session start, so refusing it on `SYMFORGE_SURFACE=full` was a
-        // self-inflicted failure with no invariant behind it (unlike `symforge`/
-        // `symforge_edit`, whose gates guard the STEL economics/golden-replay
-        // path — kept, see those handlers). The body self-describes the active
+        // self-inflicted failure with no invariant behind it (unlike `symforge`,
+        // whose gate guards the STEL economics/golden-replay path — kept there;
+        // `symforge_edit` lost its gate too, beta B4). The body self-describes the active
         // surface via `render_stel_status_body`, so a full-surface `status` is
         // honest about where it ran.
 

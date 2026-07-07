@@ -813,15 +813,12 @@ impl SymForgeServer {
         // (`run_pre_apply_gates`) still fails fast; THIS is the actual guarantee
         // at the write.
         //
-        // EXACT-BYTE comparison (`base == disk`) is correct here ONLY because
-        // the compact `if_match` path never reroutes: `StelEditRequest` carries
-        // no `working_directory`, so `resolved_path` is always the indexed file
-        // and `file.content` is its exact (line-ending-preserving) bytes. If
-        // `if_match` is ever plumbed through a worktree reroute, the base would
-        // be a rebased target whose line endings may differ, and this guard MUST
-        // then reconcile with `edit::line_ending_insensitive_eq` like
-        // `guard_batch_reroute_divergence` does — an exact-byte compare would
-        // spuriously reject on a pure CRLF/LF difference.
+        // EXACT-BYTE comparison (`base == disk`) stays correct under a worktree
+        // reroute (F6: `StelEditRequest.working_directory` now reaches here):
+        // `rebase_edit_base_for_reroute` guarantees `file.content` is either
+        // byte-identical to the target or freshly re-read FROM the target, so
+        // base and disk are the same file's bytes — line-ending differences
+        // between worktree and index never enter this compare.
         let write_report = match edit::guarded_atomic_write_file(
             &resolved_path,
             &file.content,

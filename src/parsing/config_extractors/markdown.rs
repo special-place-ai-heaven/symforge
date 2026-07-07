@@ -1,6 +1,4 @@
-use super::{
-    ConfigExtractor, EditCapability, ExtractionOutcome, ExtractionResult, escape_key_segment,
-};
+use super::{ConfigExtractor, EditCapability, ExtractionOutcome, ExtractionResult};
 use crate::domain::{SymbolKind, SymbolRecord};
 use std::collections::HashMap;
 
@@ -172,7 +170,7 @@ impl ConfigExtractor for MarkdownExtractor {
 
         let total_bytes = content.len() as u32;
 
-        // Build symbols. Stack holds (level, escaped_segment) for path building.
+        // Build symbols. Stack holds (level, segment) for path building.
         let mut stack: Vec<(u32, String)> = Vec::new();
         // Duplicate counter keyed by base path (before disambiguation suffix).
         let mut seen_paths: HashMap<String, u32> = HashMap::new();
@@ -186,17 +184,22 @@ impl ConfigExtractor for MarkdownExtractor {
                 stack.pop();
             }
 
-            // Build dot-joined path.
-            let escaped = escape_key_segment(&header.text);
+            // Build dot-joined path from the raw heading text. Section names
+            // are display-facing and looked up by exact full-name match only —
+            // nothing splits them back into segments (unlike TOML key paths),
+            // so `.`/`[`/`]` in a heading stay human-readable instead of being
+            // escaped to `~1`/`~2`/`~3`. A heading like "A.B" colliding with a
+            // nested A > B path falls into the existing #N duplicate handling.
+            let segment = header.text.clone();
             let base_path = if stack.is_empty() {
-                escaped.clone()
+                segment.clone()
             } else {
                 let parent: String = stack
                     .iter()
                     .map(|(_, n)| n.as_str())
                     .collect::<Vec<_>>()
                     .join(".");
-                format!("{}.{}", parent, escaped)
+                format!("{}.{}", parent, segment)
             };
 
             // Disambiguate duplicates.
@@ -208,7 +211,7 @@ impl ConfigExtractor for MarkdownExtractor {
                 format!("{}#{}", base_path, count)
             };
 
-            stack.push((level, escaped));
+            stack.push((level, segment));
 
             // Byte range: this header's start -> byte before next header at same or higher level (or EOF).
             let byte_end: u32 = headers[hi + 1..]
@@ -291,6 +294,25 @@ mod tests {
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0].name, "Install");
         assert_eq!(syms[1].name, "Install#2");
+    }
+
+    // Dogfood B2: heading punctuation must stay human-readable — no `~1`/`~2`/`~3`
+    // key-escaping leaking into display names.
+    #[test]
+    fn test_heading_with_dots_and_brackets_stays_readable() {
+        let syms = extract(b"# SymForge 8.13.0 beta issues\n## [FIXED upstream] note\n");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "SymForge 8.13.0 beta issues");
+        assert_eq!(
+            syms[1].name,
+            "SymForge 8.13.0 beta issues.[FIXED upstream] note"
+        );
+        assert!(
+            !syms.iter().any(|s| s.name.contains("~1")
+                || s.name.contains("~2")
+                || s.name.contains("~3")),
+            "escape encoding must not leak into section names"
+        );
     }
 
     #[test]
