@@ -624,20 +624,29 @@ fn test_run_init_all_updates_both_clients() {
     let claude_desktop_command = claude_desktop_config_value["mcpServers"]["symforge"]["command"]
         .as_str()
         .unwrap();
-    // The registered command is the wrapper in the Desktop CONFIG dir (npm
-    // wipes the binary's bin dir on every swap); the wrapper itself launches
-    // the stable binary by absolute path.
-    let desktop_config_dir = claude_desktop_config
-        .parent()
-        .expect("desktop config has a parent dir");
+    // Windows: the registered command is the wrapper in the Desktop CONFIG dir
+    // (npm wipes the binary's bin dir on every swap); the wrapper launches the
+    // stable binary by absolute path. Non-Windows: no wrapper is generated —
+    // the command is the stable binary itself.
+    #[cfg(windows)]
+    {
+        let desktop_config_dir = claude_desktop_config
+            .parent()
+            .expect("desktop config has a parent dir");
+        assert!(
+            claude_desktop_command.contains(&desktop_config_dir.display().to_string()),
+            "Claude Desktop command must point at the wrapper in the config dir: {claude_desktop_command}"
+        );
+        let wrapper_script = read_text(&desktop_config_dir.join("symforge-desktop.cmd"));
+        assert!(
+            wrapper_script.contains(&stable_bin_dir.display().to_string()),
+            "the wrapper must launch the stable binary by absolute path: {wrapper_script}"
+        );
+    }
+    #[cfg(not(windows))]
     assert!(
-        claude_desktop_command.contains(&desktop_config_dir.display().to_string()),
-        "Claude Desktop command must point at the wrapper in the config dir: {claude_desktop_command}"
-    );
-    let wrapper_script = read_text(&desktop_config_dir.join("symforge-desktop.cmd"));
-    assert!(
-        wrapper_script.contains(&stable_bin_dir.display().to_string()),
-        "the wrapper must launch the stable binary by absolute path: {wrapper_script}"
+        claude_desktop_command.contains(&stable_bin_dir.display().to_string()),
+        "Claude Desktop command must be the stable binary path on non-Windows: {claude_desktop_command}"
     );
 
     let codex_config = read_text(&home.path().join(".codex").join("config.toml"));
