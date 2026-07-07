@@ -85,6 +85,11 @@ If SymForge exposes a clean-shutdown verb (e.g. a `symforge shutdown` /
 checkpoint command, or an IPC `shutdown`), call THAT first instead of `taskkill`
 so the index is flushed deterministically; fall back to the kill ladder above.
 
+Note: `symforge update` automates this whole step natively (IPC daemon stop,
+then an identity-gated `TerminateProcess` of every remaining same-path holder —
+no taskkill; a bare `taskkill /PID` is refused by console processes anyway).
+The manual ladder above remains the fallback when the updater itself is broken.
+
 Easiest of all (what happened here): **disconnect the MCP client first** (its
 `/mcp` teardown stops the daemon it spawned). With no holder left, the file is
 unlocked with zero force-kills — the cleanest path when the client is yours.

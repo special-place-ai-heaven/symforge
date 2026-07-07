@@ -577,38 +577,10 @@ fn select_inscope_holder_pids(
         .collect()
 }
 
-#[cfg(any(windows, test))]
-fn process_path_matches(processes: &[(u32, String)], pid: u32, expected_exe: &str) -> bool {
-    let expected = normalize_exe_path(expected_exe);
-    processes
-        .iter()
-        .any(|(candidate_pid, path)| *candidate_pid == pid && normalize_exe_path(path) == expected)
-}
-
-/// Parse the `"<pid>|<executable_path>"` lines emitted by the CIM process query
-/// into `(pid, path)` pairs. Malformed lines and rows with an empty path (access
-/// denied / system rows) are skipped. Pure, so parsing is unit-tested without
-/// spawning PowerShell.
-#[cfg(any(windows, test))]
-fn parse_symforge_process_lines(text: &str) -> Vec<(u32, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let (pid, path) = line.trim().split_once('|')?;
-            let pid: u32 = pid.trim().parse().ok()?;
-            let path = path.trim();
-            if path.is_empty() {
-                None
-            } else {
-                Some((pid, path.to_string()))
-            }
-        })
-        .collect()
-}
-
 /// Stop every OTHER symforge process running from this process's own executable
-/// path (the binary npm will overwrite), graceful-then-forced, so the Windows
-/// image lock is released before the npm swap. Excludes this process. Returns a
-/// summary line when any holder was stopped.
+/// path (the binary npm will overwrite), identity-gated native terminate, so
+/// the Windows image lock is released before the npm swap. Excludes this
+/// process. Returns a summary line when any holder was stopped.
 #[cfg(windows)]
 fn stop_other_inscope_holders() -> Vec<String> {
     let Ok(self_exe) = std::env::current_exe() else {
@@ -623,7 +595,7 @@ fn stop_other_inscope_holders() -> Vec<String> {
         return Vec::new();
     }
     for pid in &pids {
-        graceful_then_forced_stop(*pid, &self_exe);
+        terminate_inscope_holder(*pid, &self_exe);
     }
     vec![format!(
         "{} other in-scope symforge holder(s) (pid {})",
@@ -643,130 +615,182 @@ fn stop_other_inscope_holders() -> Vec<String> {
     Vec::new()
 }
 
-/// Enumerate every running `symforge.exe` as `(pid, executable_path)` via CIM
-/// (`ExecutablePath` is required to scope by path per Invariant 1; `tasklist`
-/// does not expose it). Tries Windows PowerShell (`powershell`, the 5.1 default)
-/// and falls back to PowerShell 7 (`pwsh`) when the former is not installed.
-/// Returns an empty list when neither shell can be spawned — a safe no-op that
-/// degrades to the staged-guidance bail rather than killing nothing silently.
+/// Enumerate every running `symforge.exe` as `(pid, full_image_path)` natively
+/// via a ToolHelp snapshot + `QueryFullProcessImageNameW` — spawning NO external
+/// process (pattern ported from Terminal Commander's supervisor). The full image
+/// path is required to scope by install path per Invariant 1. Returns an empty
+/// list when the snapshot cannot be taken — a safe no-op that degrades to the
+/// staged-guidance bail rather than killing anything on uncertainty.
 #[cfg(windows)]
 fn enumerate_symforge_processes() -> Vec<(u32, String)> {
-    let script = "Get-CimInstance Win32_Process -Filter \"name='symforge.exe'\" | \
-                  ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }";
-    for shell in ["powershell", "pwsh"] {
-        match crate::process_util::hidden_command(shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
-            // The shell ran: trust its output (an empty list is a valid answer —
-            // genuinely no other holders — so do NOT retry the next shell).
-            Ok(out) => return parse_symforge_process_lines(&String::from_utf8_lossy(&out.stdout)),
-            // This shell is not installed: try the next one.
-            Err(_) => continue,
-        }
-    }
-    Vec::new()
+    windows_native::enumerate_by_image_name("symforge.exe")
 }
 
-/// Graceful stop (`taskkill /PID`, a WM_CLOSE that lets a daemon flush its index
-/// checkpoint), a short grace window, then a forced stop (`/F`) only if the
-/// process ignored the graceful close (Invariant 2: graceful before forced).
+/// Identity-gated forced terminate of one in-scope holder. Re-verifies via the
+/// OS — immediately before the kill — that `pid`'s image path is THIS install's
+/// binary, then terminates natively.
+///
+/// There is deliberately NO graceful leg on Windows: `taskkill` without `/F`
+/// is REFUSED by console processes ("can only be terminated forcefully"),
+/// which is what the daemon/sidecar/MCP server are — the old graceful-then-
+/// forced dance either mistook that refusal for "nothing to stop" (leaving
+/// holders alive and the npm swap blocked) or added a wait that protected
+/// nothing. The graceful path is the IPC daemon stop in `stop_processes`;
+/// whatever still holds the binary after it is terminated here.
+///
+/// A pid that cannot be queried or whose image path no longer matches is left
+/// alone (recycled-pid defense: never kill on uncertainty).
 #[cfg(windows)]
-fn graceful_then_forced_stop(pid: u32, expected_exe: &str) {
-    use std::time::{Duration, Instant};
-
-    if !taskkill_if_process_matches_path(pid, expected_exe, false) {
-        return;
-    }
-
-    // 5s grace window (matches SELF_UPDATE_PROCEDURE.md Step 3) so a daemon can
-    // flush its index checkpoint before a forced kill.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && process_is_alive(pid) {
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    // Forced only if it ignored the graceful close, and only after re-checking
-    // that the PID still belongs to this install path. A stale snapshot must not
-    // let us kill an unrelated same-named install.
-    if process_is_alive(pid) {
-        let _ = taskkill_if_process_matches_path(pid, expected_exe, true);
+fn terminate_inscope_holder(pid: u32, expected_exe: &str) {
+    let expected = normalize_exe_path(expected_exe);
+    let still_ours = windows_native::pid_image_full_path(pid)
+        .is_some_and(|path| normalize_exe_path(&path) == expected);
+    if still_ours {
+        let _ = windows_native::terminate_process(pid);
     }
 }
 
+/// Native Win32 process control for the update swap, ported from Terminal
+/// Commander's supervisor: ToolHelp enumeration, image-path identity, and
+/// `TerminateProcess`. Spawns NO external process — no powershell/CIM, no
+/// taskkill, no tasklist (corporate EDR flags spawned kill tools, and the
+/// tools themselves were the source of the refused-graceful bug).
+///
+/// `unsafe` here is FFI-only, each call justified by a SAFETY comment; the
+/// crate-level `unsafe_code = "deny"` is opted out per-item, matching the
+/// repo's test-env precedent.
 #[cfg(windows)]
-fn taskkill_if_process_matches_path(pid: u32, expected_exe: &str, force: bool) -> bool {
-    if !process_matches_exe_path(pid, expected_exe) {
-        return false;
-    }
-    let pid_arg = pid.to_string();
-    let mut args = Vec::with_capacity(3);
-    if force {
-        args.push("/F");
-    }
-    args.extend(["/PID", pid_arg.as_str()]);
-    matches!(
-        crate::process_util::hidden_command("taskkill")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-        Ok(status) if status.success()
-    )
-}
+mod windows_native {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess,
+    };
 
-#[cfg(windows)]
-fn process_matches_exe_path(pid: u32, expected_exe: &str) -> bool {
-    let script = format!(
-        "Get-CimInstance Win32_Process -Filter \"ProcessId={pid} AND name='symforge.exe'\" | \
-         ForEach-Object {{ \"$($_.ProcessId)|$($_.ExecutablePath)\" }}"
-    );
-    for shell in ["powershell", "pwsh"] {
-        match crate::process_util::hidden_command(shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(out) => {
-                return process_path_matches(
-                    &parse_symforge_process_lines(&String::from_utf8_lossy(&out.stdout)),
-                    pid,
-                    expected_exe,
-                );
+    /// RAII guard so a process/snapshot handle is closed on every return path.
+    /// `CloseHandle` failure on drop is ignored: the handle is being discarded
+    /// regardless.
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a handle we opened (OpenProcess /
+            // CreateToolhelp32Snapshot) and have not closed yet. Closing it
+            // exactly once here is the paired release for that open.
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = CloseHandle(self.0);
             }
-            Err(_) => continue,
         }
     }
-    false
-}
 
-/// Whether `pid` is still running AND still a `symforge.exe`. The `tasklist`
-/// query filters server-side to that exact pid + image name and emits one CSV row
-/// (which echoes the pid as a quoted token) when alive, or "No tasks" otherwise.
-/// Path safety is enforced separately immediately before each `taskkill`.
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    let needle = pid.to_string();
-    let output = crate::process_util::hidden_command("tasklist")
-        .args([
-            "/FI",
-            &format!("PID eq {pid}"),
-            "/FI",
-            "IMAGENAME eq symforge.exe",
-            "/NH",
-            "/FO",
-            "CSV",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(needle.as_str()),
-        Err(_) => false,
+    /// Read `pid`'s FULL image path via the OS, or `None` if the process
+    /// cannot be opened/queried (it exited, the pid is invalid, or access was
+    /// denied). Callers treat `None` as "not ours" — never kill on uncertainty.
+    #[allow(unsafe_code)]
+    pub(super) fn pid_image_full_path(pid: u32) -> Option<String> {
+        // SAFETY: OpenProcess takes a desired-access mask, an inherit BOOL,
+        // and a pid; it returns a valid handle on success or an Err we map to
+        // None. PROCESS_QUERY_LIMITED_INFORMATION is the least privilege that
+        // permits QueryFullProcessImageNameW.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+        let proc = OwnedHandle(handle);
+
+        let mut buf = [0u16; 1024];
+        let mut len = u32::try_from(buf.len()).expect("image-path buffer length fits in u32");
+        // SAFETY: `proc.0` is a live handle (just opened) valid for this call.
+        // PROCESS_NAME_FORMAT(0) requests the win32 path form. `buf`/`len`
+        // describe a properly sized, owned u16 buffer; the call writes at most
+        // `len` code units and updates `len` to the count written. We check
+        // the BOOL result and a non-zero length before reading the buffer.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(
+                proc.0,
+                PROCESS_NAME_FORMAT(0),
+                windows::core::PWSTR(buf.as_mut_ptr()),
+                &raw mut len,
+            )
+            .is_ok()
+        };
+        if !ok || len == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+
+    /// Force-terminate `pid` natively. Caller has already identity-gated the
+    /// pid. Returns an IO error if the process cannot be opened for
+    /// termination or the terminate call fails.
+    #[allow(unsafe_code)]
+    pub(super) fn terminate_process(pid: u32) -> std::io::Result<()> {
+        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        // SAFETY: OpenProcess as above; PROCESS_TERMINATE is the access right
+        // TerminateProcess requires. The Err arm maps the Win32 error into an
+        // io::Error without dereferencing anything.
+        let handle = unsafe { OpenProcess(access, false, pid) }
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let proc = OwnedHandle(handle);
+        // SAFETY: `proc.0` is a live handle opened with PROCESS_TERMINATE.
+        // TerminateProcess posts the exit and returns a BOOL we propagate as
+        // an io::Error on failure. Exit code 1 mirrors the prior `taskkill /F`.
+        unsafe { TerminateProcess(proc.0, 1) }.map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Enumerate all processes whose image FILE NAME matches `image_name`
+    /// (case-insensitive) as `(pid, full_image_path)`. The full path comes
+    /// from the authoritative per-pid query, not the snapshot's base name, so
+    /// callers can scope by install path. Self-exclusion is the caller's job
+    /// (`select_inscope_holder_pids` excludes `self_pid`).
+    #[allow(unsafe_code)]
+    pub(super) fn enumerate_by_image_name(image_name: &str) -> Vec<(u32, String)> {
+        // SAFETY: CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) returns a
+        // valid snapshot handle or an Err we map to an empty list. The handle
+        // is owned by `OwnedHandle` and released on every return path.
+        let Ok(snapshot_handle) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+        else {
+            return Vec::new();
+        };
+        let snapshot = OwnedHandle(snapshot_handle);
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+                .expect("PROCESSENTRY32W size fits in u32"),
+            ..Default::default()
+        };
+
+        let mut found = Vec::new();
+        // SAFETY: `snapshot.0` is a valid snapshot handle and `entry` is a
+        // properly initialized PROCESSENTRY32W with `dwSize` set, as the API
+        // requires. Process32FirstW fills `entry` and returns Ok/Err.
+        let mut has_entry = unsafe { Process32FirstW(snapshot.0, &raw mut entry).is_ok() };
+        while has_entry {
+            let pid = entry.th32ProcessID;
+            if exe_name_from_entry(&entry).eq_ignore_ascii_case(image_name)
+                && let Some(path) = pid_image_full_path(pid)
+            {
+                found.push((pid, path));
+            }
+            // SAFETY: same invariants as Process32FirstW; advances `entry` to
+            // the next process or returns Err at the end of the snapshot.
+            has_entry = unsafe { Process32NextW(snapshot.0, &raw mut entry).is_ok() };
+        }
+        found
+    }
+
+    /// Decode the NUL-terminated UTF-16 `szExeFile` base name from a snapshot
+    /// entry into a Rust string.
+    fn exe_name_from_entry(entry: &PROCESSENTRY32W) -> String {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        String::from_utf16_lossy(&entry.szExeFile[..end])
     }
 }
 
@@ -1121,49 +1145,101 @@ mod tests {
         );
     }
 
+    /// Copy a benign long-lived system exe to `<tmp>/symforge.exe` and spawn
+    /// it so the process's image FILE NAME is the symforge binary name (the
+    /// pattern Terminal Commander's supervisor tests use). The returned
+    /// `TempDir` keeps the copied exe alive for the test's duration.
+    #[cfg(windows)]
+    fn spawn_fake_symforge() -> (tempfile::TempDir, std::process::Child) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("symforge.exe");
+        let ping = std::path::Path::new(r"C:\Windows\System32\PING.EXE");
+        std::fs::copy(ping, &fake).expect("copy ping.exe to symforge.exe");
+        // `ping -n 30 127.0.0.1` stays alive ~30s; far longer than the test.
+        let child = std::process::Command::new(&fake)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fake symforge");
+        (dir, child)
+    }
+
     #[test]
-    fn process_path_matches_requires_same_pid_and_same_executable_path() {
+    #[cfg(windows)]
+    fn enumerate_symforge_processes_finds_spawned_symforge_image_with_full_path() {
+        let (dir, mut child) = spawn_fake_symforge();
+        let pid = child.id();
+        let procs = enumerate_symforge_processes();
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = procs.iter().find(|(p, _)| *p == pid);
+        let (_, path) = found.expect("native enumeration must list the spawned symforge.exe");
+        assert_eq!(
+            normalize_exe_path(path),
+            normalize_exe_path(&dir.path().join("symforge.exe").to_string_lossy()),
+            "the enumerated entry must carry the FULL image path for install scoping"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn terminate_inscope_holder_kills_matching_path_and_spares_mismatch() {
+        // Mismatched expected path -> the holder must be left alive
+        // (Invariant 1: never touch another install; recycled-pid defense).
+        let (dir, mut child) = spawn_fake_symforge();
+        let pid = child.id();
+        terminate_inscope_holder(pid, r"C:\some\other\install\symforge.exe");
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "a path-mismatched pid must NOT be terminated"
+        );
+
+        // Matching expected path -> terminated (this is the bug the taskkill
+        // graceful leg used to mask: console processes refused the graceful
+        // close and never reached the forced kill).
+        let expected = dir
+            .path()
+            .join("symforge.exe")
+            .to_string_lossy()
+            .to_string();
+        terminate_inscope_holder(pid, &expected);
+        let status = child.wait().expect("wait on terminated child");
+        assert!(
+            !status.success(),
+            "TerminateProcess(exit=1) must make the holder exit non-zero"
+        );
+
+        // A second terminate of the now-dead pid must be a no-op (identity
+        // gate: the pid no longer resolves to this image path).
+        terminate_inscope_holder(pid, &expected);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn terminate_inscope_holder_never_kills_the_test_runner() {
+        // The test runner is alive but its image is the test binary, not the
+        // expected symforge path -> must be refused (this failing would kill
+        // the test host, exactly TC's guard).
+        terminate_inscope_holder(std::process::id(), r"C:\npm\symforge.exe");
+    }
+
+    #[test]
+    fn select_inscope_rejects_other_install_and_absent_rows() {
         let procs = vec![
             (100u32, r"C:\npm\symforge.exe".to_string()),
             (200u32, r"D:\other\symforge.exe".to_string()),
             (300u32, r"\\?\C:\NPM\symforge.exe".to_string()),
         ];
-
-        assert!(
-            process_path_matches(&procs, 100, r"C:\NPM\symforge.exe"),
-            "same PID and path identity should match"
-        );
-        assert!(
-            process_path_matches(&procs, 300, r"C:\npm\symforge.exe"),
-            "path form normalization should match the same executable"
-        );
-        assert!(
-            !process_path_matches(&procs, 200, r"C:\npm\symforge.exe"),
-            "a recycled PID at a different install path must not be killable"
-        );
-        assert!(
-            !process_path_matches(&procs, 999, r"C:\npm\symforge.exe"),
-            "a missing PID must not match"
-        );
-    }
-
-    #[test]
-    fn parse_symforge_process_lines_parses_pid_path_and_skips_malformed() {
-        let text = "100|C:\\npm\\symforge.exe\r\n\
-                    200|C:\\other\\symforge.exe\n\
-                    notapid|C:\\x\\symforge.exe\n\
-                    300|\n\
-                    \n\
-                    400|C:\\a b\\symforge.exe";
-        let parsed = parse_symforge_process_lines(text);
         assert_eq!(
-            parsed,
-            vec![
-                (100, "C:\\npm\\symforge.exe".to_string()),
-                (200, "C:\\other\\symforge.exe".to_string()),
-                (400, "C:\\a b\\symforge.exe".to_string()),
-            ],
-            "malformed pid, empty path, and blank lines are skipped"
+            select_inscope_holder_pids(&procs, r"C:\NPM\symforge.exe", 999),
+            vec![100, 300],
+            "same-path rows (any form) are in scope; the other install is not"
+        );
+        assert_eq!(
+            select_inscope_holder_pids(&procs, r"C:\npm\symforge.exe", 100),
+            vec![300],
+            "the self pid must never be selected, even at the same path"
         );
     }
 
