@@ -541,6 +541,12 @@ pub struct DetectImpactInput {
         deserialize_with = "lenient_bool_required"
     )]
     pub include_untracked: bool,
+    /// Include non-source data files (e.g. JSON/YAML/TOML) in the changed-set
+    /// that seeds the blast radius. Default false (018 US1 / FR-001): the
+    /// impact walk is source-focused so untracked data files and their
+    /// key-symbols don't dominate. Set true to restore full inclusion.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub include_data: Option<bool>,
 }
 
 /// Input for `analyze_file_impact`.
@@ -3031,7 +3037,11 @@ fn what_changed_scope_summary(input: &WhatChangedInput, mode: &WhatChangedMode) 
     if let Some(language) = input.language.as_deref() {
         parts.push(format!("language `{language}`"));
     }
-    if input.code_only.unwrap_or(false) {
+    // US1 (018) III trust: disclose the code-only filter whenever it is
+    // actually applied. Uncommitted mode now defaults it on (FR-001), so the
+    // effective default is mode-scoped and must match the handler's sites.
+    let code_only_default = matches!(mode, WhatChangedMode::Uncommitted);
+    if input.code_only.unwrap_or(code_only_default) {
         parts.push("code-only filter".to_string());
     }
     if input.include_symbol_diff.unwrap_or(false) {
@@ -7032,7 +7042,11 @@ impl SymForgeServer {
                             paths,
                             params.0.path_prefix.as_deref(),
                             params.0.language.as_deref(),
-                            params.0.code_only.unwrap_or(false),
+                            // US1 (018) FR-001/SC-001: uncommitted mode defaults
+                            // to source-focused so untracked data files (e.g.
+                            // *.json) don't dominate. Timestamp/git_ref sites
+                            // keep `false`. Explicit `code_only` still honored.
+                            params.0.code_only.unwrap_or(true),
                         ) {
                             Ok(filtered) => {
                                 if filtered.is_empty() {
@@ -7276,6 +7290,18 @@ impl SymForgeServer {
         ) {
             Ok(paths) => paths,
             Err(e) => return format!("Error: Invalid git ref: {e}"),
+        };
+
+        // US1 (018) FR-001/FR-002: source-focus the impact seed by default so
+        // non-source data files (e.g. untracked JSON) and their key-symbols
+        // don't drive the blast radius. `include_data=true` restores the prior
+        // inclusive changed-set. language=None never errors, so keep the seed
+        // on the impossible Err rather than silently emptying the blast radius.
+        let changed_files = if params.0.include_data.unwrap_or(false) {
+            changed_files
+        } else {
+            filter_paths_by_prefix_and_language(changed_files.clone(), None, None, true)
+                .unwrap_or(changed_files)
         };
 
         let (changed_symbols, blast_radius) = {
@@ -17984,6 +18010,217 @@ mod tests {
         assert!(
             result.contains("Source authority: git ref diff"),
             "git_ref mode should expose git diff authority: {result}"
+        );
+    }
+
+    // ── US1 (018): source-focused change/impact defaults ──────────────────────
+
+    /// FR-001 / SC-001: with only a dirty non-source data file uncommitted, the
+    /// DEFAULT `what_changed` (uncommitted mode, `code_only` unset) is now
+    /// source-focused and reports zero code changes. Fails on pre-fix code (which
+    /// listed the data path).
+    #[tokio::test]
+    async fn test_what_changed_uncommitted_default_excludes_data_files() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn foo() {}\n").expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        // The only uncommitted change is an untracked non-source data file — the
+        // reported noise source (untracked *.json).
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\n  \"key\": 1\n}\n")
+            .expect("write data file");
+
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: None,
+                git_ref: None,
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            !result.contains("data/config.json"),
+            "default uncommitted mode must be source-focused and exclude data files: {result}"
+        );
+        assert!(
+            result.contains("No uncommitted changes matched the requested filters."),
+            "with only a data file dirty, default uncommitted mode reports no code changes: {result}"
+        );
+    }
+
+    /// FR-003 (opt-in preserved): the SAME uncommitted call with explicit
+    /// `code_only=false` still surfaces the data file — the fix moves the default,
+    /// it does not remove the inclusive path. Green before and after the fix.
+    #[tokio::test]
+    async fn test_what_changed_uncommitted_explicit_code_only_false_includes_data() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn foo() {}\n").expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\n  \"key\": 1\n}\n")
+            .expect("write data file");
+
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: None,
+                git_ref: None,
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: Some(false),
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("data/config.json"),
+            "explicit code_only=false must restore full inclusion (opt-in preserved): {result}"
+        );
+    }
+
+    /// FR-001 edge case: the default flip targets ONLY uncommitted mode.
+    /// Timestamp mode keeps `code_only` defaulting to false, so a data path still
+    /// appears by default. Guard test — must stay green after the flip.
+    #[tokio::test]
+    async fn test_what_changed_timestamp_default_keeps_data_files() {
+        let (rust_key, rust_file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let (json_key, json_file) = make_file("data/config.json", b"{\"k\":1}", vec![]);
+        let server = make_server(make_live_index_ready(vec![
+            (rust_key, rust_file),
+            (json_key, json_file),
+        ]));
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: Some(0),
+                git_ref: None,
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("data/config.json"),
+            "timestamp mode default must be UNCHANGED by the uncommitted flip (data still listed): {result}"
+        );
+        assert!(
+            result.contains("src/lib.rs"),
+            "timestamp mode default still lists source: {result}"
+        );
+    }
+
+    /// FR-001 edge case (committed diff): git_ref mode keeps `code_only`
+    /// defaulting to false, so a changed data path still appears by default. Guard
+    /// test — must stay green after the flip.
+    #[tokio::test]
+    async fn test_what_changed_git_ref_default_keeps_data_files() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\"k\":1}\n").expect("write initial data");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(repo.path().join("data/config.json"), "{\"k\":2}\n").expect("modify data file");
+
+        let (key, file) = make_file("data/config.json", b"{\"k\":2}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: None,
+                git_ref: Some("HEAD".to_string()),
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("data/config.json"),
+            "git_ref mode default must be UNCHANGED by the uncommitted flip (data still listed): {result}"
+        );
+    }
+
+    /// FR-001 + Constitution III: a default uncommitted call with a real source
+    /// change AND a dirty data file shows the source change, excludes the data
+    /// file, and HONESTLY discloses the applied code-only filter in the envelope.
+    #[tokio::test]
+    async fn test_what_changed_uncommitted_default_discloses_code_only_filter() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn foo() {}\n").expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        // A genuine source edit plus a dirty untracked data file.
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "fn foo() { println!(\"changed\"); }\n",
+        )
+        .expect("modify source file");
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\n  \"key\": 1\n}\n")
+            .expect("write data file");
+
+        let (key, file) = make_file(
+            "src/lib.rs",
+            b"fn foo() { println!(\"changed\"); }\n",
+            vec![],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: None,
+                git_ref: None,
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("src/lib.rs"),
+            "default uncommitted mode still surfaces the source change: {result}"
+        );
+        assert!(
+            !result.contains("data/config.json"),
+            "default uncommitted mode excludes the data file: {result}"
+        );
+        assert!(
+            result.contains("code-only filter"),
+            "the applied source-focus filter must be disclosed in the envelope (III trust): {result}"
         );
     }
 

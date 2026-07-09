@@ -12,7 +12,7 @@ field is removed. New defaults and one new internal helper only.
 - Disclosure (III): the envelope continues to state mode and that a filter was applied.
 
 **`detect_impact`**
-- Input: unchanged (`include_untracked` default stays `true`).
+- Input: adds one backward-compatible optional field `include_data: Option<bool>` (serde-default; default = source-focused). `include_untracked` default stays `true`. Old callers are unaffected (serde ignores the absent field). *(This is the one deviation from the initial "input unchanged" assumption: `detect_impact` had no existing opt-in lever like `what_changed`'s `code_only`, and FR-001/FR-003 require an explicit data-inclusion opt-in — so the field was added rather than dropping the opt-in.)*
 - Delta: the changed-set feeding the impact walk is source-focused by default; data-file-derived symbols no longer dominate the blast radius. Explicit data-inclusion opt-in restores prior behavior.
 - Invariant: graph structure and depth semantics unchanged; only the seed set is filtered.
 

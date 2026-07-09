@@ -423,3 +423,71 @@ async fn detect_impact_depth_cap_at_five() {
     // the clamp is exercised via the warning text above, not the payload shape.
     assert_eq!(payload["changed_files"], json!(["src/a.rs"]));
 }
+
+/// US1 (018) FR-001/FR-002 · SC-002: a real committed source edit plus a dirty
+/// (untracked) non-source data file. Default `detect_impact` must source-focus
+/// the changed-set — the data file and its JSON-key symbols must not seed the
+/// impact walk — while `include_data=true` restores the prior inclusive result.
+///
+/// Fails on pre-fix code: the untracked `data/config.json` (merged via
+/// `include_untracked=true`) lands in `changed_files` and its keys become
+/// changed_symbols.
+#[tokio::test]
+async fn detect_impact_default_source_focuses_changed_set() {
+    // bootstrap_fixture commits the Rust fixture, then edits src/a.rs in a
+    // second commit (the HEAD~1..HEAD delta).
+    let dir = bootstrap_fixture();
+    let root = dir.path();
+    // Dirty, untracked data file whose JSON keys the config extractor turns
+    // into first-class symbols — the reported noise source.
+    fs::create_dir_all(root.join("data")).expect("mkdir data");
+    fs::write(
+        root.join("data/config.json"),
+        "{\n  \"alpha_key\": 1,\n  \"beta_key\": 2\n}\n",
+    )
+    .expect("write data file");
+
+    let server = server_over(root);
+
+    // Default: source-focused seed → data file excluded.
+    let body = server
+        .dispatch_tool_for_tests("detect_impact", json!({ "since": "HEAD~1" }))
+        .await;
+    let payload = impact_payload(&body);
+    assert_eq!(
+        payload["changed_files"],
+        json!(["src/a.rs"]),
+        "default detect_impact must source-focus the seed and drop untracked data files:\n{body}"
+    );
+    let changed_names: Vec<&str> = payload["changed_symbols"]
+        .as_array()
+        .expect("changed_symbols array")
+        .iter()
+        .map(|s| s["name"].as_str().expect("symbol name"))
+        .collect();
+    assert!(
+        !changed_names
+            .iter()
+            .any(|n| n.contains("alpha_key") || n.contains("beta_key")),
+        "no data-file-derived (JSON key) symbols may seed the impact walk: {changed_names:?}\n{body}"
+    );
+
+    // Opt-in: include_data=true restores full inclusion (FR-003).
+    let body_incl = server
+        .dispatch_tool_for_tests(
+            "detect_impact",
+            json!({ "since": "HEAD~1", "include_data": true }),
+        )
+        .await;
+    let payload_incl = impact_payload(&body_incl);
+    let incl_files: Vec<&str> = payload_incl["changed_files"]
+        .as_array()
+        .expect("changed_files array")
+        .iter()
+        .map(|f| f.as_str().expect("file path"))
+        .collect();
+    assert!(
+        incl_files.contains(&"data/config.json"),
+        "include_data=true must restore the untracked data file in the changed-set: {incl_files:?}\n{body_incl}"
+    );
+}
