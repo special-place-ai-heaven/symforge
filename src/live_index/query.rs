@@ -3440,8 +3440,11 @@ mod tests {
         let outside = std::env::temp_dir().join("sf_us3_outside").join("leak.rs");
         let abs_key = outside.to_string_lossy().into_owned();
 
-        let in_root =
-            make_indexed_file("src/main.rs", vec![make_symbol("main")], ParseStatus::Parsed);
+        let in_root = make_indexed_file(
+            "src/main.rs",
+            vec![make_symbol("main")],
+            ParseStatus::Parsed,
+        );
         let dotdot =
             make_indexed_file("../evil.rs", vec![make_symbol("evil")], ParseStatus::Parsed);
         let abs = make_indexed_file(&abs_key, vec![make_symbol("leak")], ParseStatus::Parsed);
@@ -3483,13 +3486,20 @@ mod tests {
         // US3 guard (must stay green): a clean in-root repo's full outline
         // file count is unchanged by the containment guard.
         let root = std::env::temp_dir().join("sf_us3_clean_root");
-        let f1 = make_indexed_file("src/alpha.rs", vec![make_symbol("alpha")], ParseStatus::Parsed);
+        let f1 = make_indexed_file(
+            "src/alpha.rs",
+            vec![make_symbol("alpha")],
+            ParseStatus::Parsed,
+        );
         let f2 = make_indexed_file(
             "src/nested/beta.rs",
             vec![make_symbol("beta")],
             ParseStatus::Parsed,
         );
-        let mut index = make_index(vec![("src/alpha.rs", f1), ("src/nested/beta.rs", f2)], false);
+        let mut index = make_index(
+            vec![("src/alpha.rs", f1), ("src/nested/beta.rs", f2)],
+            false,
+        );
         index.indexed_root = Some(root);
 
         let view = index.capture_repo_outline_view();
