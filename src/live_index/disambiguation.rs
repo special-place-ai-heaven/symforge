@@ -203,6 +203,63 @@ pub(crate) fn resolve_symbol_selector<'a>(
     }
 }
 
+/// True when `candidate` (a method/function) is defined inside a container in
+/// the SAME file whose target type resolves to `type_name`, decided by
+/// line-range containment.
+///
+/// The index stores methods hierarchically under their `impl`/type block, so a
+/// candidate `Y` belongs to type `X` when some `impl X` /
+/// `struct|enum|trait|class|interface X` symbol's `line_range` encloses the
+/// candidate's. This is the deterministic "method Y belongs to type X" signal
+/// used by `plan_edit`'s `Type::method` fallback. It reuses existing
+/// `SymbolRecord` ranges only (no new index data) and matches the impl's
+/// target-type TOKEN (`impl X` and `impl Trait for X` both resolve to `X`),
+/// never the raw display string.
+pub(crate) fn symbol_belongs_to_type(
+    file: &IndexedFile,
+    candidate: &SymbolRecord,
+    type_name: &str,
+) -> bool {
+    let (cand_start, cand_end) = candidate.line_range;
+    file.symbols.iter().any(|container| {
+        let (start, end) = container.line_range;
+        start <= cand_start
+            && cand_end <= end
+            && container_target_type(container).is_some_and(|ty| ty == type_name)
+    })
+}
+
+/// The type token a container symbol defines methods for: the target type of an
+/// `impl` block (`impl X` / `impl Trait for X` → `X`), or the name of a type
+/// definition (`struct`/`enum`/`trait`/`class`/`interface`). Returns `None` for
+/// any other kind. Generic parameters and path qualifiers are stripped so
+/// `impl Cache<K, V>` and `crate::foo::Cache` both resolve to `Cache`.
+fn container_target_type(symbol: &SymbolRecord) -> Option<&str> {
+    let raw = match symbol.kind {
+        SymbolKind::Impl => {
+            let name = symbol.name.as_str();
+            match name.rsplit_once(" for ") {
+                Some((_, ty)) => ty,
+                None => name.strip_prefix("impl ").unwrap_or(name),
+            }
+        }
+        SymbolKind::Struct
+        | SymbolKind::Enum
+        | SymbolKind::Trait
+        | SymbolKind::Class
+        | SymbolKind::Interface => symbol.name.as_str(),
+        _ => return None,
+    };
+    Some(base_type_token(raw.trim()))
+}
+
+/// Strip generic parameters and path qualifiers from a type token:
+/// `Cache<K, V>` → `Cache`, `crate::foo::Repo` → `Repo`, `Repo` → `Repo`.
+fn base_type_token(ty: &str) -> &str {
+    let ty = ty.split('<').next().unwrap_or(ty).trim();
+    ty.rsplit("::").next().unwrap_or(ty).trim()
+}
+
 // ---------------------------------------------------------------------------
 // Cascading name resolution
 // ---------------------------------------------------------------------------

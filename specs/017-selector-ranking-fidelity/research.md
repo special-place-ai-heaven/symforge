@@ -69,13 +69,44 @@ signals in the scorer rather than letting name-token overlap dominate.
   `src/protocol/format.rs::explore_symbol_reason` (`format.rs:5455`), with view-filter tests
   `explore_result_view_filters_weak_trivial_symbols_and_doc_only_patterns` and
   `explore_result_view_keeps_trivial_symbol_when_strongly_contextualized` (`format.rs:6147`, `:6214`).
-- The **numeric score** is produced upstream in the live-index explore query (the explore capture view
-  in `src/live_index/query.rs` / `src/live_index/search.rs`). **Open item (resolve at implementation):**
-  pin the exact scoring function via `find_references(explore_symbol_reason)` and the explore capture
-  view, then locate where the 1.00/name-token weight is assigned.
+- The **numeric score** is produced in `src/protocol/tools.rs::explore` — the scored closure at
+  **tools.rs:8920–8969** (the multiply at 8962–8966), display max-normalization at **9011–9021**, name-only
+  tie-break at **8994**. (Pinned by the T009 tech-researcher pass; my earlier guess of `query.rs` was wrong.)
+- **Two-part root cause (proven by arithmetic that reproduces the live 0.06–0.14 ratios):**
+  1. The raw score is a **pure product** of five factors, three of which — `raw_count`,
+     `coverage_bonus = effective_terms²`, `alignment_multiplier` — are all correlated with name-token
+     overlap. Multiplying three correlated signals scales the query-dependent part like `k · k² · f(k)`,
+     giving ≈ **1 : 32 : 216** for 1/2/3 literal token matches. Max-normalization then pins the top to
+     `1.00` and renders everyone else on that steep curve as a cliff → "lone 1.00, then crater."
+  2. A per-file concept-proximity signal, **`file_signals` (tools.rs:668–672), is computed but NEVER read
+     by the scorer** (grep-proven: recorded at 8660/8724/8817, consumed only by the fallback-only
+     `derive_explore_cluster`; zero reads inside the scored closure). The signal that would surface
+     concept-central symbols exists but carries no weight into the final score.
+- Doc/code correction: `ConceptPattern` (explore.rs:4–9) has **no seed-files field** — only term queries.
+  The per-file concept signal is `file_signals`, not a concept-map output.
 - Live evidence: "worktree routing hook registration in the daemon" scored `worktree_routing_health_status`
-  1.00 and dropped `register_if_feature_enabled` / `WorktreeAwareEditHook` / `edit_hooks::register`
-  entirely; "watcher interact with analyze_file_impact" put an unrelated `run(SetupCliArgs)` at 1.00.
+  1.00 (2/5 exact-segment token hits) and dropped `register_if_feature_enabled` (segment `register` ≠
+  token `registration` under exact-segment matching); "watcher interact with analyze_file_impact" credited
+  the file literally containing `analyze_file_impact` (→ `run(SetupCliArgs)`) while `handle_edit_impact`
+  shares no literal token.
+
+### Recommended fix (tech-researcher verdict: STAY AND FIX, no redesign)
+Two additive changes inside the scored closure (tools.rs:8920–8969), plus a tie-break line — no new index,
+no backend, frecency read-only (V), deterministic (IV):
+1. **Consume `file_signals`**: give each symbol an additive proximity bonus from its own file's signal
+   (gate on `matched_terms ≥ 2`, reusing the existing threshold), so a symbol whose *name* shares no query
+   tokens but *lives in* a concept-central file lifts into top-N (FR-005).
+2. **Kill the multiplicative blow-up**: replace `coverage_bonus = n²` with a saturating term (BM25-style,
+   e.g. `1 + ln(1+n)` / linear), fold `raw_count` + coverage into ONE saturating name signal, and blend
+   **additively** with proximity: `score = kind_weight · path_penalty · (W_NAME · name_signal + W_PROX · prox)`
+   with **`W_NAME ≥ W_PROX`** so an exact-name query still ranks its target top (FR-006, no over-correction).
+3. **Determinism**: extend the tie-break at 8994 from name-only to `.then(path).then(line)`.
+Optional (only if the lone 1.00 must literally disappear): swap display normalization to an absolute
+saturating map `s/(s+K)` — but that forces recalibrating the 0.80/0.45 reason thresholds in
+`format.rs:5457–5459`; flattening the curve is usually enough, so treat as out-of-scope unless needed.
+Confidence: HIGH on diagnosis, MEDIUM that a small reweight lands both anchors first try → write the two
+anchor top-N tests FIRST and tune `W_NAME`/`W_PROX` + the saturation curve until both pass without
+regressing the `explore_result_view_*` tests (format.rs:6147/6214) or an exact-name anchor.
 
 ### Constraints the rebalance MUST honor
 - **V Frecency Invariant**: explore is a discovery tool; the scorer MUST NOT read-then-write frecency.

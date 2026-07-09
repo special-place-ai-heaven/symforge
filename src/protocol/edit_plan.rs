@@ -1,8 +1,10 @@
 //! Edit planning: analyzes a target symbol/file and suggests the right
 //! sequence of SymForge edit tools to accomplish a change.
 
-use crate::domain::SymbolRecord;
-use crate::live_index::query::{SymbolSelectorMatch, resolve_symbol_selector};
+use crate::domain::{SymbolKind, SymbolRecord};
+use crate::live_index::query::{
+    SymbolSelectorMatch, resolve_symbol_selector, symbol_belongs_to_type,
+};
 use crate::live_index::store::{IndexedFile, LiveIndex};
 
 fn split_path_qualified_target(target: &str) -> Option<(&str, &str)> {
@@ -40,13 +42,24 @@ pub fn plan_edit(
     let mut file_hit = None;
 
     if let Some((target_path, target_name)) = qualified_target {
+        let mut path_matched = false;
         for (path, file) in index.all_files() {
             if path == target_path || path.ends_with(target_path) {
+                path_matched = true;
                 collect_selector_hits(&mut symbol_hits, path, file, target_name);
             }
             if path.ends_with(target) || path == target {
                 file_hit = Some(path.clone());
             }
+        }
+        // Type-name fallback: the left segment matched no indexed file path, so
+        // interpret it as a TYPE name `X` and resolve `Y` as a method whose
+        // enclosing impl/type in the same file is `X` (FR-001/FR-002). Every
+        // other selector form (file-path::symbol, bare name, plain file path)
+        // is byte-identical because it either matched a path here or takes the
+        // `else` branch below.
+        if !path_matched {
+            collect_type_scoped_hits(&mut symbol_hits, index, target_path, target_name);
         }
     } else {
         for (path, file) in index.all_files() {
@@ -178,6 +191,34 @@ fn collect_selector_hits(
             }
         }
         SymbolSelectorMatch::NotFound => {}
+    }
+}
+
+/// Type-name fallback for a `Type::method` selector whose left segment matched
+/// no indexed file path. Collects every method/function named `method_name`
+/// whose enclosing `impl`/type in the same file resolves to `type_name`
+/// (range-containment via `symbol_belongs_to_type`). Deterministic: candidates
+/// are ordered by `(path, line)` so multiple matches render in a stable order.
+fn collect_type_scoped_hits(
+    symbol_hits: &mut Vec<(String, String, SymbolKind, (u32, u32))>,
+    index: &LiveIndex,
+    type_name: &str,
+    method_name: &str,
+) {
+    let mut hits: Vec<(&String, &SymbolRecord)> = Vec::new();
+    for (path, file) in index.all_files() {
+        for sym in &file.symbols {
+            if sym.name == method_name
+                && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+                && symbol_belongs_to_type(file, sym, type_name)
+            {
+                hits.push((path, sym));
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.0.cmp(b.0).then(a.1.line_range.0.cmp(&b.1.line_range.0)));
+    for (path, sym) in hits {
+        push_symbol_hit(symbol_hits, path, sym);
     }
 }
 

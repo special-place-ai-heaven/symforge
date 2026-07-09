@@ -241,3 +241,201 @@ impl PolicyEngine {
         "plan should name the resolved bare method\n{plan}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1 (US1): `Type::method` selector resolution.
+//
+// `edit_plan("GitRepo::tracked_paths")` must resolve to the method defined on
+// that type — the SAME symbol the bare name and `file::symbol` forms resolve
+// to — without a file-path prefix. These tests fail on the pre-fix code (a
+// bare type name matches no indexed file path, so the method is never
+// searched and the tool answers "not found").
+// ---------------------------------------------------------------------------
+
+/// T002: a `Type::method` selector with a unique method resolves to the same
+/// symbol as the bare-name selector.
+#[test]
+fn edit_plan_resolves_bare_type_method_selector() {
+    let source = "\
+struct GitRepo;
+
+impl GitRepo {
+    fn tracked_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let type_plan = plan_edit(&index, &temporal, "GitRepo::tracked_paths");
+    let bare_plan = plan_edit(&index, &temporal, "tracked_paths");
+
+    let line = canonical_symbol_line(&index, "src/lib.rs", "tracked_paths");
+    let expected = format!("tracked_paths in src/lib.rs (lines {line}-");
+
+    assert!(
+        type_plan.contains(&expected),
+        "Type::method must resolve to the same symbol as the bare name\n\
+         expected fragment: {expected:?}\nplan:\n{type_plan}"
+    );
+    assert!(
+        bare_plan.contains(&expected),
+        "bare-name selector must resolve to the same symbol\n\
+         expected fragment: {expected:?}\nplan:\n{bare_plan}"
+    );
+}
+
+/// T003: when a method name is shared across types, `Type::method` resolves to
+/// the method on the NAMED type only (disambiguation), never another type's.
+#[test]
+fn edit_plan_disambiguates_shared_method_name_by_type() {
+    let source = "\
+struct Alpha;
+
+impl Alpha {
+    fn new() -> Self {
+        Alpha
+    }
+}
+
+struct Beta;
+
+impl Beta {
+    fn new() -> Self {
+        Beta
+    }
+}
+";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    // Alpha::new is at source line 4, Beta::new at source line 12.
+    let alpha_plan = plan_edit(&index, &temporal, "Alpha::new");
+    let beta_plan = plan_edit(&index, &temporal, "Beta::new");
+
+    assert!(
+        alpha_plan.contains("Found 1 symbol(s)")
+            && alpha_plan.contains("new in src/lib.rs (lines 4-"),
+        "Alpha::new must resolve to Alpha's `new` (line 4) only\n{alpha_plan}"
+    );
+    assert!(
+        !alpha_plan.contains("(lines 12-"),
+        "Alpha::new must NOT resolve to Beta's `new` (line 12)\n{alpha_plan}"
+    );
+    assert!(
+        beta_plan.contains("Found 1 symbol(s)")
+            && beta_plan.contains("new in src/lib.rs (lines 12-"),
+        "Beta::new must resolve to Beta's `new` (line 12) only\n{beta_plan}"
+    );
+    assert!(
+        !beta_plan.contains("(lines 4-"),
+        "Beta::new must NOT resolve to Alpha's `new` (line 4)\n{beta_plan}"
+    );
+}
+
+/// T004: pre-existing selector forms (bare name, `file::symbol`, plain file
+/// path) resolve exactly as before — regression guard, passes now and after.
+#[test]
+fn edit_plan_preserves_existing_selector_forms() {
+    let source = "\
+struct Repo;
+
+impl Repo {
+    fn scan(&self) {}
+}
+";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let line = canonical_symbol_line(&index, "src/lib.rs", "scan");
+    let expected = format!("scan in src/lib.rs (lines {line}-");
+
+    let bare = plan_edit(&index, &temporal, "scan");
+    assert!(
+        bare.contains(&expected),
+        "bare-name selector regressed:\n{bare}"
+    );
+
+    let file_sym = plan_edit(&index, &temporal, "src/lib.rs::scan");
+    assert!(
+        file_sym.contains(&expected),
+        "file::symbol selector regressed:\n{file_sym}"
+    );
+
+    let file_only = plan_edit(&index, &temporal, "src/lib.rs");
+    assert!(
+        file_only.contains("Found file: src/lib.rs"),
+        "plain file-path selector regressed:\n{file_only}"
+    );
+}
+
+/// T005: a `Type::method` whose method does not exist on that type returns a
+/// truthful not-found that names what was searched — never a wrong hit.
+#[test]
+fn edit_plan_type_method_nonexistent_is_truthful_not_found() {
+    let source = "\
+struct GitRepo;
+
+impl GitRepo {
+    fn tracked_paths(&self) {}
+}
+";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let plan = plan_edit(&index, &temporal, "GitRepo::does_not_exist");
+
+    assert!(
+        plan.contains("not found"),
+        "a nonexistent Type::method must report not-found:\n{plan}"
+    );
+    assert!(
+        plan.contains("GitRepo::does_not_exist"),
+        "the not-found result must name what was searched:\n{plan}"
+    );
+    assert!(
+        !plan.contains("tracked_paths in src/lib.rs"),
+        "must not resolve to an unrelated method on the same type:\n{plan}"
+    );
+}
+
+/// FR-004 guard: a free function that merely shares a file with `impl X` is NOT
+/// a method of `X`. `GitRepo::head_sha` (head_sha is a free fn) must be a
+/// truthful not-found, while the bare `head_sha` selector still resolves. This
+/// documents why SC-001's `GitRepo::head_sha` correctly stays not-found:
+/// forcing it would be a wrong hit. Passes now and after the fix.
+#[test]
+fn edit_plan_type_method_does_not_match_free_function() {
+    let source = "\
+struct GitRepo;
+
+impl GitRepo {
+    fn tracked_paths(&self) {}
+}
+
+fn head_sha() -> String {
+    String::new()
+}
+";
+    let (_dir, shared) = build_index(source);
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let qualified = plan_edit(&index, &temporal, "GitRepo::head_sha");
+    assert!(
+        qualified.contains("not found"),
+        "a free function is not a Type method; GitRepo::head_sha must be not-found:\n{qualified}"
+    );
+
+    let bare = plan_edit(&index, &temporal, "head_sha");
+    let line = canonical_symbol_line(&index, "src/lib.rs", "head_sha");
+    assert!(
+        bare.contains(&format!("head_sha in src/lib.rs (lines {line}-")),
+        "the bare free-function selector must still resolve:\n{bare}"
+    );
+}
