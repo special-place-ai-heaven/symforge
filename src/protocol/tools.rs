@@ -4882,7 +4882,7 @@ impl SymForgeServer {
             Ok(options) => options,
             Err(message) => return message,
         };
-        let mut result = {
+        let result = {
             let guard = self.index.read();
             loading_guard!(guard);
             search::search_symbols_with_options(
@@ -4902,44 +4902,10 @@ impl SymForgeServer {
                 &result,
             )
         };
-        // In browse mode, sort by relevance: public symbols first, then kind priority,
-        // then penalize very short/common names, then alphabetical tiebreaker.
-        if is_browse {
-            let scores: Vec<(bool, f32, bool)> = {
-                let guard = self.index.read();
-                result
-                    .hits
-                    .iter()
-                    .map(|hit| {
-                        let is_pub = guard
-                            .get_file(&hit.path)
-                            .map(|f| LiveIndex::has_pub_symbol(f, &hit.name))
-                            .unwrap_or(false);
-                        let kind_score = search::symbol_kind_priority(&hit.kind);
-                        let is_short_common = hit.name.len() <= 3;
-                        (is_pub, kind_score, is_short_common)
-                    })
-                    .collect()
-            };
-            let mut indices: Vec<usize> = (0..result.hits.len()).collect();
-            indices.sort_by(|&i, &j| {
-                scores[j]
-                    .0
-                    .cmp(&scores[i].0) // public first
-                    .then(
-                        scores[j]
-                            .1
-                            .partial_cmp(&scores[i].1) // higher kind priority first
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                    .then(scores[i].2.cmp(&scores[j].2)) // non-short names first
-                    .then(result.hits[i].name.cmp(&result.hits[j].name)) // alphabetical
-            });
-            result.hits = indices
-                .into_iter()
-                .map(|i| result.hits[i].clone())
-                .collect();
-        }
+        // Browse ordering is owned by the engine (search::search_symbols_with_options),
+        // which ranks browse results by importance (reference count -> kind -> path ->
+        // line). Do NOT re-sort here: a tool-level re-sort would override that order and
+        // reintroduce the symbol_kind_priority display-kind mismatch ("fn" -> 0.1). (018 US2)
         let envelope = if result.hits.is_empty() {
             None
         } else {

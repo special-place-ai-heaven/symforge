@@ -31,9 +31,10 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    DEFAULT_MAX_PER_FILE, SymbolMatchTier, SymbolSearchOptions, TextSearchError, TextSearchOptions,
-    TextSearchResult, compute_test_ranges, current_code_search_keeps_file,
-    search_symbols_with_options, search_text_with_options, truncate_display_line,
+    DEFAULT_MAX_PER_FILE, PathScope, SymbolMatchTier, SymbolSearchOptions, TextSearchError,
+    TextSearchOptions, TextSearchResult, browse_kind_rank, compute_test_ranges,
+    current_code_search_keeps_file, search_symbols_with_options, search_text_with_options,
+    truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
 use crate::live_index::query::is_filtered_name;
@@ -329,7 +330,16 @@ impl<'a> IndexView<'a> {
         }
 
         let query_lower = query.to_lowercase();
-        let mut hits: Vec<ViewSymbolHit> = Vec::new();
+        // Same browse intent as the base engine (search.rs): an empty/whitespace
+        // query WITH a scope filter ranks by importance, not name-match tiers.
+        // Keeps the browse-vs-name-match distinction consistent across both
+        // `search_symbols` call sites (018 US2).
+        let browse = query.trim().is_empty()
+            && (kind_filter.is_some() || !matches!(options.path_scope, PathScope::Any));
+        // Carry the reverse-reference count alongside each hit for browse ranking
+        // (0 on the keyword path). Reference counts come from the base's
+        // `reverse_index` — the same source the engine uses.
+        let mut hits: Vec<(ViewSymbolHit, usize)> = Vec::new();
         let mut resolved = self.all_files();
         // Stable ordering before tiering so equal-tier ties are deterministic.
         resolved.sort_by(|a, b| a.0.cmp(&b.0));
@@ -343,7 +353,7 @@ impl<'a> IndexView<'a> {
                     continue;
                 }
                 let name_lower = sym.name.to_lowercase();
-                if !name_lower.contains(&query_lower) {
+                if !browse && !name_lower.contains(&query_lower) {
                     continue;
                 }
                 let tier = if name_lower == query_lower {
@@ -353,23 +363,46 @@ impl<'a> IndexView<'a> {
                 } else {
                     SymbolMatchTier::Substring
                 };
-                hits.push(ViewSymbolHit {
-                    name: sym.name.clone(),
-                    path: path.clone(),
-                    kind: sym.kind.to_string(),
-                    line: sym.line_range.0 + 1,
-                    tier,
-                });
+                let ref_count = if browse {
+                    self.base
+                        .reverse_index
+                        .get(&sym.name)
+                        .map(|refs| refs.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                hits.push((
+                    ViewSymbolHit {
+                        name: sym.name.clone(),
+                        path: path.clone(),
+                        kind: sym.kind.to_string(),
+                        line: sym.line_range.0 + 1,
+                        tier,
+                    },
+                    ref_count,
+                ));
             }
         }
 
-        hits.sort_by(|a, b| {
-            a.tier
-                .cmp(&b.tier)
-                .then(a.name.cmp(&b.name))
-                .then(a.path.cmp(&b.path))
-        });
-        hits
+        if browse {
+            // Importance order: reference count desc, then a total kind → path →
+            // line tie-break (Constitution IV).
+            hits.sort_by(|(a, ca), (b, cb)| {
+                cb.cmp(ca)
+                    .then_with(|| browse_kind_rank(&a.kind).cmp(&browse_kind_rank(&b.kind)))
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+        } else {
+            hits.sort_by(|(a, _), (b, _)| {
+                a.tier
+                    .cmp(&b.tier)
+                    .then(a.name.cmp(&b.name))
+                    .then(a.path.cmp(&b.path))
+            });
+        }
+        hits.into_iter().map(|(hit, _)| hit).collect()
     }
 
     /// Text search served BASE-ONLY + an overlay POST-FILTER over the dirty set
@@ -1582,6 +1615,62 @@ mod tests {
             result.suppressed_by_noise >= 1,
             "dirty-tree overlay must preserve the base test-match suppression count, got {}",
             result.suppressed_by_noise
+        );
+    }
+
+    // ── US2 (018): overlay-path browse ranks by importance too (T014) ─────────
+    #[test]
+    fn overlay_browse_ranks_referenced_symbol_first() {
+        // Base file defines a heavily-referenced function plus generic short
+        // names; the base reverse_index gives the referenced symbol its weight.
+        let content = "fn important_handler() {}\nfn add() {}\nfn get() {}\n";
+        let mut lib = make_file("src/lib.rs", content);
+        let mk = |name: &str, line: u32| SymbolRecord {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, 0),
+            line_range: (line, line),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        lib.symbols = vec![mk("important_handler", 0), mk("add", 1), mk("get", 2)];
+        let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+        map.insert("src/lib.rs".to_string(), Arc::new(lib));
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);
+        idx.files = map;
+        idx.reverse_index.insert(
+            "important_handler".to_string(),
+            (0..9u32)
+                .map(|i| crate::live_index::store::ReferenceLocation {
+                    file_path: "src/lib.rs".to_string(),
+                    reference_idx: i,
+                })
+                .collect(),
+        );
+        let base = Arc::new(IndexBase::new(base_key("c0"), Arc::new(idx), 1));
+
+        // A dirty delta forces the overlay (with-deltas) branch, not the
+        // engine-delegating no-delta path.
+        let mut overlay = Overlay::fresh(&base);
+        overlay.deltas.insert(
+            "src/other.rs".to_string(),
+            FileDelta::Upsert(Arc::new(make_file("src/other.rs", "fn other() {}\n"))),
+        );
+        let view = IndexView::new(&base, Some(&overlay)).expect("overlay view");
+
+        // Browse: empty query + kind scope.
+        let opts = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        let hits = view.search_symbols("", Some("fn"), &opts);
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("important_handler"),
+            "overlay browse must lead with the referenced symbol, got {names:?}"
         );
     }
 }

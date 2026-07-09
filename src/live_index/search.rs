@@ -774,6 +774,26 @@ struct ScoredSymbolMatch {
     path: String,
     kind: String,
     line: u32,
+    /// Reverse-reference count, populated only in browse mode (0 otherwise).
+    ref_count: usize,
+}
+
+/// Total-order kind priority for browse ranking, keyed on the DISPLAY strings
+/// `SymbolKind` emits (`"fn"`, `"struct"`, ...). Lower rank sorts first (more
+/// notable). Distinct from [`symbol_kind_priority`], whose f32 vocabulary is the
+/// semantic names (`"function"`/`"module"`) the text-search enclosing-symbol
+/// path uses — those miss `"fn"`/`"mod"`/`"let"` here.
+pub(crate) fn browse_kind_rank(kind: &str) -> u8 {
+    match kind {
+        "fn" => 0,
+        "class" | "struct" | "enum" | "interface" | "trait" | "union" => 1,
+        "impl" => 2,
+        "mod" => 3,
+        "const" => 4,
+        "type" | "let" => 5,
+        "key" | "section" => 6,
+        _ => 7,
+    }
 }
 
 /// Returns true when `filter` matches the given `kind`, accepting both the
@@ -812,6 +832,12 @@ pub fn search_symbols_with_options(
     options: &SymbolSearchOptions,
 ) -> SymbolSearchResult {
     let query_lower = query.to_lowercase();
+    // Browse intent: an empty/whitespace query WITH a scope filter (kind and/or
+    // path_prefix) means "show me what's notable here" — rank by importance
+    // (reference count → kind → path → line) instead of the name-match tiers a
+    // real query uses. A non-empty query is byte-identical to before (FR-005).
+    let browse = query.trim().is_empty()
+        && (kind_filter.is_some() || !matches!(options.path_scope, PathScope::Any));
     let mut matches: Vec<ScoredSymbolMatch> = Vec::new();
 
     let mut paths: Vec<&String> = index.all_files().map(|(path, _)| path).collect();
@@ -867,7 +893,9 @@ pub fn search_symbols_with_options(
             }
 
             let name_lower = sym.name.to_lowercase();
-            if !name_lower.contains(&query_lower) {
+            // Browse passes every in-scope symbol; a keyword query keeps the
+            // name-contains gate exactly as before.
+            if !browse && !name_lower.contains(&query_lower) {
                 continue;
             }
 
@@ -880,6 +908,16 @@ pub fn search_symbols_with_options(
                 (SymbolMatchTier::Substring, pos)
             };
 
+            let ref_count = if browse {
+                index
+                    .reverse_index
+                    .get(&sym.name)
+                    .map(|refs| refs.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
             matches.push(ScoredSymbolMatch {
                 tier,
                 tiebreak,
@@ -887,16 +925,29 @@ pub fn search_symbols_with_options(
                 path: path.clone(),
                 kind: sym.kind.to_string(),
                 line: sym.line_range.0 + 1,
+                ref_count,
             });
         }
     }
 
-    matches.sort_by(|a, b| {
-        a.tier
-            .cmp(&b.tier)
-            .then(a.tiebreak.cmp(&b.tiebreak))
-            .then(a.name.cmp(&b.name))
-    });
+    if browse {
+        // Importance order: reference count desc, then a total kind → path →
+        // line tie-break (Constitution IV: identical state ⇒ identical order).
+        matches.sort_by(|a, b| {
+            b.ref_count
+                .cmp(&a.ref_count)
+                .then_with(|| browse_kind_rank(&a.kind).cmp(&browse_kind_rank(&b.kind)))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+    } else {
+        matches.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then(a.tiebreak.cmp(&b.tiebreak))
+                .then(a.name.cmp(&b.name))
+        });
+    }
 
     let total_matches = matches.len();
     let overflow_count = total_matches.saturating_sub(options.result_limit.get());
@@ -2058,6 +2109,162 @@ mod tests {
         let result = search_symbols(&index, "job", Some("all"), 50);
 
         assert_eq!(result.hits.len(), 2);
+    }
+
+    // ── US2 (018): browse-mode importance ranking ──────────────────────────
+    // Browse = empty/whitespace query WITH a scope filter (kind/path_prefix).
+    // These target the engine (`search_symbols_with_options`), the single
+    // source of browse ordering; the reference count comes from `reverse_index`
+    // (the same reverse-reference data `find_references` consumes).
+
+    fn ref_locs(path: &str, n: u32) -> Vec<crate::live_index::store::ReferenceLocation> {
+        (0..n)
+            .map(|i| crate::live_index::store::ReferenceLocation {
+                file_path: path.to_string(),
+                reference_idx: i,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_browse_ranks_referenced_symbol_above_trivial_names() {
+        // T009: a heavily-referenced symbol leads browse results; the generic
+        // short names (add/get/len) that path+line order would surface first
+        // fall behind it.
+        let mut index = make_index(vec![make_file(
+            "src/a.rs",
+            "",
+            vec![
+                make_symbol("important_processor", SymbolKind::Function, 1),
+                make_symbol("add", SymbolKind::Function, 2),
+                make_symbol("get", SymbolKind::Function, 3),
+                make_symbol("len", SymbolKind::Function, 4),
+            ],
+        )]);
+        index
+            .reverse_index
+            .insert("important_processor".to_string(), ref_locs("src/a.rs", 12));
+
+        // Empty query + kind scope = browse.
+        let result = search_symbols(&index, "", Some("fn"), 50);
+
+        let names: Vec<&str> = result.hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("important_processor"),
+            "heavily-referenced symbol must lead browse results, got {names:?}"
+        );
+        let processor_pos = names
+            .iter()
+            .position(|&n| n == "important_processor")
+            .expect("processor present");
+        for trivial in ["add", "get", "len"] {
+            let pos = names
+                .iter()
+                .position(|&n| n == trivial)
+                .expect("trivial name present");
+            assert!(
+                processor_pos < pos,
+                "{trivial} outranked the referenced processor: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_browse_ordering_is_deterministic() {
+        // T010 (Constitution IV): identical state ⇒ identical order. Equal
+        // reference counts fall through to the total kind → path → line chain.
+        let mut index = make_index(vec![
+            make_file(
+                "src/a.rs",
+                "",
+                vec![
+                    make_symbol("alpha", SymbolKind::Function, 1),
+                    make_symbol("beta", SymbolKind::Struct, 2),
+                ],
+            ),
+            make_file(
+                "src/b.rs",
+                "",
+                vec![make_symbol("gamma", SymbolKind::Function, 1)],
+            ),
+        ]);
+        index
+            .reverse_index
+            .insert("alpha".to_string(), ref_locs("src/a.rs", 3));
+        index
+            .reverse_index
+            .insert("gamma".to_string(), ref_locs("src/b.rs", 3));
+
+        let first = search_symbols(&index, "", Some("all"), 50);
+        let second = search_symbols(&index, "", Some("all"), 50);
+
+        let order = |r: &SymbolSearchResult| -> Vec<(String, String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.name.clone(), h.path.clone(), h.line))
+                .collect()
+        };
+        assert_eq!(order(&first), order(&second));
+    }
+
+    #[test]
+    fn test_browse_is_frecency_neutral() {
+        // T011 (Constitution V): browse READS reference counts and writes
+        // nothing back. The engine takes `&LiveIndex` and has no frecency handle
+        // (frecency lives outside the index, keyed by repo root), so neutrality
+        // is structural; this guards the ranking-signal source (reverse_index
+        // counts) stays byte-identical across a browse call.
+        let mut index = make_index(vec![make_file(
+            "src/a.rs",
+            "",
+            vec![
+                make_symbol("widely_used", SymbolKind::Function, 1),
+                make_symbol("add", SymbolKind::Function, 2),
+            ],
+        )]);
+        index
+            .reverse_index
+            .insert("widely_used".to_string(), ref_locs("src/a.rs", 7));
+
+        let counts = |idx: &LiveIndex| -> std::collections::HashMap<String, usize> {
+            idx.reverse_index
+                .iter()
+                .map(|(name, refs)| (name.clone(), refs.len()))
+                .collect()
+        };
+        let before = counts(&index);
+        let _ = search_symbols(&index, "", Some("fn"), 50);
+        assert_eq!(
+            before,
+            counts(&index),
+            "browse ranking must not mutate the reference index (frecency-neutral)"
+        );
+    }
+
+    #[test]
+    fn test_non_empty_query_ignores_reference_counts() {
+        // T012 (FR-005): a real query keeps the exact tier ordering; reference
+        // counts must NOT reorder it — the non-browse path is byte-identical to
+        // before US2. The exact match (0 refs) still beats a 50-ref substring.
+        let mut index = make_index(vec![make_file(
+            "src/a.rs",
+            "",
+            vec![
+                make_symbol("jobxxxxxxx", SymbolKind::Function, 1),
+                make_symbol("job", SymbolKind::Function, 2),
+            ],
+        )]);
+        index
+            .reverse_index
+            .insert("jobxxxxxxx".to_string(), ref_locs("src/a.rs", 50));
+
+        let result = search_symbols(&index, "job", None, 50);
+
+        assert_eq!(result.hits[0].name, "job");
+        assert_eq!(result.hits[0].tier, SymbolMatchTier::Exact);
+        assert_eq!(result.hits[1].name, "jobxxxxxxx");
+        assert_eq!(result.hits[1].tier, SymbolMatchTier::Prefix);
     }
 
     #[test]
