@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.13.9](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.8...v8.13.9) (2026-07-09)
+
+
+### Bug Fixes
+
+* edit_plan resolves Type::method selectors ([c4e7fac](https://github.com/special-place-ai-heaven/symforge/commit/c4e7fac0a15183a679285fd8904d8e1d764617ab))
+* explore ranking surfaces concept-central symbols ([f45bd1f](https://github.com/special-place-ai-heaven/symforge/commit/f45bd1fc96f4a4db29a4d7692bf0456519f1354b))
+
 ## [8.13.8](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.7...v8.13.8) (2026-07-07)
 
 
