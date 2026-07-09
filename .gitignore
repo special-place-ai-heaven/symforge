@@ -12,6 +12,9 @@
 # Nested SymForge local cache (e.g. npm/.symforge/) — local state, never tracked.
 **/.symforge/
 
+# Grok CLI per-project MCP working dir (created during dogfooding) — not repo content.
+/mcps/
+
 npm/*.tgz
 .env
 spacetime/*/target/
