@@ -2970,6 +2970,17 @@ fn explore_path_penalty(
     8
 }
 
+// Explore scorer tuning (US2). The score blends a saturating NAME signal with an
+// additive concept-PROXIMITY term instead of multiplying correlated name-overlap
+// factors. Caps keep both signals bounded so no single symbol can run away and
+// pin the max-normalized top to 1.00 while the rest crater. W_NAME >= W_PROX
+// guarantees an exact-name query still ranks its target at/near the top.
+const EXPLORE_RAW_CAP: u64 = 8;
+const EXPLORE_COVERAGE_CAP: u64 = 8;
+const EXPLORE_PROX_CAP: u64 = 12;
+const EXPLORE_W_NAME: u64 = 3;
+const EXPLORE_W_PROX: u64 = 2;
+
 fn explore_fallback_alignment_multiplier(
     query_term_count: usize,
     matched_term_count: usize,
@@ -8947,10 +8958,6 @@ impl SymForgeServer {
                     .count() as u64;
                 let effective_terms =
                     score_data.matched_terms.len() as u64 + 2 * specific_match_count;
-                let coverage_bonus: u64 = match effective_terms {
-                    0 | 1 => 1,
-                    n => n * n,
-                };
                 let alignment_multiplier = if fallback_mode {
                     explore_fallback_alignment_multiplier(
                         symbol_queries.len(),
@@ -8959,11 +8966,37 @@ impl SymForgeServer {
                 } else {
                     8
                 };
-                let score = (score_data.raw_count as u64)
-                    * kind_weight
+                // Saturating NAME signal. The old score multiplied three
+                // correlated name-overlap factors — raw_count * coverage^2 *
+                // alignment — which scaled the query-dependent part like
+                // k * k^2 * f(k) (~1:32:216 for 1/2/3-token matches). After the
+                // max-normalization below that pinned the best name match to 1.00
+                // and cratered everyone else onto a cliff ("lone 1.00, then
+                // crater"). Fold raw hit strength and term coverage into ONE
+                // additive, saturated value (coverage is now LINEAR, not squared)
+                // and scale by the bounded alignment/coverage-quality gate.
+                let raw_component = (score_data.raw_count as u64).min(EXPLORE_RAW_CAP);
+                let coverage_component = effective_terms.min(EXPLORE_COVERAGE_CAP);
+                let name_signal = (raw_component + 3 * coverage_component) * alignment_multiplier;
+                // Concept PROXIMITY: a symbol living in a file that >=2 query
+                // terms point at (path segment / content / co-located symbol name)
+                // earns an additive lift even when its own NAME shares no query
+                // token. This consumes `file_signals`, the per-file concept signal
+                // that was computed but previously never read by the scorer. Gated
+                // on the same >=2-term threshold `derive_explore_cluster` uses, so
+                // a coincidental single-term file cannot inflate everything in it.
+                let prox = file_signals
+                    .get(&path)
+                    .filter(|signal| signal.matched_terms.len() >= 2)
+                    .map(|signal| signal.raw_score.min(EXPLORE_PROX_CAP))
+                    .unwrap_or(0);
+                // Blend name and proximity ADDITIVELY with W_NAME >= W_PROX so an
+                // exact-name query still ranks its target top (no over-correction),
+                // while proximity can lift a concept-central symbol out of the
+                // crater the multiplicative curve used to bury it in.
+                let score = kind_weight
                     * path_penalty
-                    * coverage_bonus
-                    * alignment_multiplier;
+                    * (EXPLORE_W_NAME * name_signal + EXPLORE_W_PROX * prox);
                 ((name, kind, path), score)
             })
             .collect();
@@ -8991,7 +9024,16 @@ impl SymForgeServer {
         };
 
         let mut ranked = scored;
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+        // Deterministic order (Constitution IV): score desc, then the full
+        // (name, kind, path) key ascending. HashMap iteration order is
+        // nondeterministic and the stable sort would otherwise preserve it for
+        // equal scores; the key is unique so this is a total order.
+        ranked.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then(a.0.0.cmp(&b.0.0))
+                .then(a.0.1.cmp(&b.0.1))
+                .then(a.0.2.cmp(&b.0.2))
+        });
         // Filter out weak matches (score < 8 means single text-only hit in a doc file).
         ranked.retain(|(_, score)| *score >= 8);
         // SF-STRESS-013: drop hidden vendor/generated/test symbols BEFORE the
@@ -21255,6 +21297,325 @@ mod tests {
         assert!(
             result.contains("WatcherInfo"),
             "WatcherInfo should appear via module-path boosting: {result}"
+        );
+    }
+
+    // ── US2 (017): explore concept-ranking fidelity ──────────────────────────
+    // Helpers for the anchor tests below. The pre-fix scorer multiplied three
+    // correlated name-overlap factors (raw_count * coverage^2 * alignment), which
+    // pinned the best name match to 1.00 under max-normalization and cratered every
+    // other symbol; it also never read the per-file concept-proximity signal. These
+    // tests assert the rebalanced curve surfaces concept-central symbols and no
+    // longer buries them.
+
+    fn explore_input(query: &str, limit: usize) -> super::ExploreInput {
+        super::ExploreInput {
+            query: query.to_string(),
+            limit: Some(limit as u32),
+            depth: None,
+            include_noise: None,
+            include_vendor: None,
+            include_personal_tooling: None,
+            language: None,
+            path_prefix: None,
+            estimate: None,
+            max_tokens: None,
+        }
+    }
+
+    fn explore_fixture_symbol(name: &str, kind: SymbolKind) -> SymbolRecord {
+        SymbolRecord {
+            name: name.to_string(),
+            kind,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, 10),
+            line_range: (0, 0),
+            doc_byte_range: None,
+            item_byte_range: None,
+        }
+    }
+
+    /// Ranked "Symbols (N found):" lines carry a trailing `[score; reason: ...]`
+    /// suffix; promoted-signals bare-name mentions live outside the block and carry
+    /// no suffix. Return the (name, normalized-score) pairs in rank order.
+    fn explore_ranked_scores(output: &str) -> Vec<(String, f32)> {
+        let mut out = Vec::new();
+        let mut in_block = false;
+        for line in output.lines() {
+            if line.starts_with("Symbols (") {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if line.trim().is_empty() {
+                    break;
+                }
+                let Some(open) = line.rfind('[') else {
+                    continue;
+                };
+                let rest = &line[open + 1..];
+                let Some(semi) = rest.find(';') else { continue };
+                let Ok(score) = rest[..semi].trim().parse::<f32>() else {
+                    continue;
+                };
+                // "  {kind} {name}  {path}  [..]" — name is the 2nd whitespace token.
+                let head = &line[..open];
+                let mut toks = head.split_whitespace();
+                let _kind = toks.next();
+                if let Some(name) = toks.next() {
+                    out.push((name.to_string(), score));
+                }
+            }
+        }
+        out
+    }
+
+    fn explore_ranked_score(output: &str, name: &str) -> Option<f32> {
+        explore_ranked_scores(output)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s)
+    }
+
+    #[tokio::test]
+    async fn explore_surfaces_concept_central_symbols_without_cratering() {
+        // T011: "worktree routing hook registration in the daemon". The concept-
+        // central code (WorktreeAwareEditHook, register_if_feature_enabled) lives in
+        // the daemon file; the probe/* symbols share query tokens by name only.
+        let files = vec![
+            make_file(
+                "src/daemon/worktree_routing.rs",
+                b"pub struct WorktreeAwareEditHook;\npub fn register_if_feature_enabled() {}\n",
+                vec![
+                    explore_fixture_symbol("WorktreeAwareEditHook", SymbolKind::Struct),
+                    explore_fixture_symbol("register_if_feature_enabled", SymbolKind::Function),
+                ],
+            ),
+            make_file(
+                "src/probe/a.rs",
+                b"pub fn worktree_routing_alpha() {}\n",
+                vec![explore_fixture_symbol(
+                    "worktree_routing_alpha",
+                    SymbolKind::Function,
+                )],
+            ),
+            make_file(
+                "src/probe/b.rs",
+                b"pub fn hook_registration_beta() {}\n",
+                vec![explore_fixture_symbol(
+                    "hook_registration_beta",
+                    SymbolKind::Function,
+                )],
+            ),
+            make_file(
+                "src/probe/c.rs",
+                b"pub fn worktree_hook_gamma() {}\n",
+                vec![explore_fixture_symbol(
+                    "worktree_hook_gamma",
+                    SymbolKind::Function,
+                )],
+            ),
+            make_file(
+                "src/probe/d.rs",
+                b"pub fn routing_registration_delta() {}\n",
+                vec![explore_fixture_symbol(
+                    "routing_registration_delta",
+                    SymbolKind::Function,
+                )],
+            ),
+        ];
+        let server = make_server(make_live_index_ready(files));
+        let out = server
+            .explore(Parameters(explore_input(
+                "worktree routing hook registration in the daemon",
+                5,
+            )))
+            .await;
+
+        // SC-003 / FR-005: both concept-central symbols are surfaced in the ranked
+        // list (not just the single best name-token match).
+        assert!(
+            explore_ranked_score(&out, "register_if_feature_enabled").is_some(),
+            "register_if_feature_enabled must be in ranked results: {out}"
+        );
+        assert!(
+            explore_ranked_score(&out, "WorktreeAwareEditHook").is_some(),
+            "WorktreeAwareEditHook must be in ranked results: {out}"
+        );
+
+        // FR-006 anti-crater: pre-fix only 2 symbols cleared 0.50 (1.00, 0.80) while
+        // the n^2 curve cratered the rest to 0.43 / 0.43 / 0.06. The rebalanced curve
+        // keeps the concept-central cohort in the strong band.
+        let non_cratered = explore_ranked_scores(&out)
+            .iter()
+            .filter(|(_, s)| *s >= 0.50)
+            .count();
+        assert!(
+            non_cratered >= 3,
+            "expected >=3 non-cratered symbols (score >= 0.50), got {non_cratered}: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_lifts_concept_central_over_literal_token_noise() {
+        // T012: "watcher interact with analyze_file_impact". run_setup is unrelated —
+        // it matches only because its BODY mentions the literal token. The watcher/
+        // interact cluster is the concept-central code.
+        let setup_body =
+            b"pub fn run_setup() {\n    // dispatches to analyze_file_impact\n    let _ = \"analyze_file_impact\";\n}\n";
+        let mut run_setup = explore_fixture_symbol("run_setup", SymbolKind::Function);
+        run_setup.line_range = (0, 3);
+        run_setup.byte_range = (0, setup_body.len() as u32);
+        let files = vec![
+            make_file("src/cli/setup.rs", setup_body, vec![run_setup]),
+            make_file(
+                "src/watcher/reconcile.rs",
+                b"pub fn watcher_edit_bridge() {}\npub fn interact_edit_hook() {}\n",
+                vec![
+                    explore_fixture_symbol("watcher_edit_bridge", SymbolKind::Function),
+                    explore_fixture_symbol("interact_edit_hook", SymbolKind::Function),
+                ],
+            ),
+        ];
+        let server = make_server(make_live_index_ready(files));
+        let out = server
+            .explore(Parameters(explore_input(
+                "watcher interact with analyze_file_impact",
+                5,
+            )))
+            .await;
+
+        let ranked = explore_ranked_scores(&out);
+        let (top_name, _) = ranked.first().expect("at least one ranked symbol");
+        // FR-006: the single top score is a watcher/interact-central symbol, not the
+        // unrelated literal-token hit.
+        assert_ne!(
+            top_name, "run_setup",
+            "unrelated literal-token symbol must not hold the top score: {out}"
+        );
+        assert!(
+            top_name == "interact_edit_hook" || top_name == "watcher_edit_bridge",
+            "top score should be watcher/interact-central, got {top_name}: {out}"
+        );
+        // Anti-crater: the co-central watcher symbol is no longer buried near zero
+        // (pre-fix 0.09).
+        let bridge = explore_ranked_score(&out, "watcher_edit_bridge")
+            .expect("watcher_edit_bridge must be ranked");
+        assert!(
+            bridge >= 0.25,
+            "watcher_edit_bridge cratered at {bridge}: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_exact_name_query_keeps_target_on_top() {
+        // T013 guard (must pass): naming a symbol's tokens exactly must still rank
+        // that symbol first — W_NAME >= W_PROX, so a proximity-rich decoy cluster
+        // cannot displace the exact-name target (no over-correction, FR-006 edge).
+        let files =
+            vec![
+            make_file(
+                "src/loader.rs",
+                b"pub fn parse_admission_tier() {}\n",
+                vec![explore_fixture_symbol("parse_admission_tier", SymbolKind::Function)],
+            ),
+            make_file(
+                "src/admission/tier.rs",
+                b"pub fn admission_gate() {}\npub fn tier_probe() {}\npub fn parse_helper() {}\n",
+                vec![
+                    explore_fixture_symbol("admission_gate", SymbolKind::Function),
+                    explore_fixture_symbol("tier_probe", SymbolKind::Function),
+                    explore_fixture_symbol("parse_helper", SymbolKind::Function),
+                ],
+            ),
+        ];
+        let server = make_server(make_live_index_ready(files));
+        let out = server
+            .explore(Parameters(explore_input("parse admission tier", 5)))
+            .await;
+        let ranked = explore_ranked_scores(&out);
+        let (top_name, _) = ranked.first().expect("at least one ranked symbol");
+        assert_eq!(
+            top_name, "parse_admission_tier",
+            "exact-name target must stay on top despite the proximity-rich decoy cluster: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_ranking_is_deterministic() {
+        // T014 (Constitution IV): identical query + index => identical order, even
+        // with score ties (worktree_routing_alpha / hook_registration_beta tie).
+        let build =
+            || {
+                make_live_index_ready(vec![
+                make_file(
+                    "src/daemon/worktree_routing.rs",
+                    b"pub struct WorktreeAwareEditHook;\npub fn register_if_feature_enabled() {}\n",
+                    vec![
+                        explore_fixture_symbol("WorktreeAwareEditHook", SymbolKind::Struct),
+                        explore_fixture_symbol("register_if_feature_enabled", SymbolKind::Function),
+                    ],
+                ),
+                make_file(
+                    "src/probe/a.rs",
+                    b"pub fn worktree_routing_alpha() {}\n",
+                    vec![explore_fixture_symbol("worktree_routing_alpha", SymbolKind::Function)],
+                ),
+                make_file(
+                    "src/probe/b.rs",
+                    b"pub fn hook_registration_beta() {}\n",
+                    vec![explore_fixture_symbol("hook_registration_beta", SymbolKind::Function)],
+                ),
+            ])
+            };
+        let query = "worktree routing hook registration in the daemon";
+        let first = make_server(build())
+            .explore(Parameters(explore_input(query, 5)))
+            .await;
+        let second = make_server(build())
+            .explore(Parameters(explore_input(query, 5)))
+            .await;
+        assert_eq!(
+            explore_ranked_scores(&first),
+            explore_ranked_scores(&second),
+            "explore ranking must be deterministic across identical runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_is_frecency_neutral() {
+        // T015 (Constitution V): explore is a discovery tool and must not bump
+        // frecency. With a real repo_root a bump WOULD register in the session store;
+        // a fresh unique root that explore leaves untouched yields no ranking history.
+        use std::path::Path;
+        let root = TempDir::new().expect("tempdir");
+        let files = vec![make_file(
+            "src/watcher/reconcile.rs",
+            b"pub fn watcher_edit_bridge() {}\npub fn interact_edit_hook() {}\n",
+            vec![
+                explore_fixture_symbol("watcher_edit_bridge", SymbolKind::Function),
+                explore_fixture_symbol("interact_edit_hook", SymbolKind::Function),
+            ],
+        )];
+        let server = make_server_with_root(
+            make_live_index_ready(files),
+            Some(root.path().to_path_buf()),
+        );
+        let _ = server
+            .explore(Parameters(explore_input("watcher interact reconcile", 5)))
+            .await;
+
+        let now = 0i64;
+        let snapshot = crate::live_index::frecency::ranking_scores_for_paths(
+            root.path(),
+            &[Path::new("src/watcher/reconcile.rs")],
+            now,
+        )
+        .expect("frecency ranking probe");
+        assert!(
+            snapshot.is_none(),
+            "explore must not bump frecency; found history: {snapshot:?}"
         );
     }
 
