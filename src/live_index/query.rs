@@ -13,6 +13,11 @@ use super::disambiguation::kind_disambiguation_tier;
 pub(crate) use super::disambiguation::{
     SymbolSelectorMatch, render_symbol_selector, resolve_symbol_selector,
 };
+// Only consumed by the server-gated `plan_edit` (protocol::edit_plan); gate the
+// re-export so the engine-only `embed` build stays free of an unused-import
+// error under `warnings = "deny"` (the consumer is absent when `server` is off).
+#[cfg(feature = "server")]
+pub(crate) use super::disambiguation::symbol_belongs_to_type;
 use super::disambiguation::{
     is_receiver_method_call, matches_exact_symbol_qualified_name, matches_exact_symbol_reference,
     parse_reference_kind_filter,
