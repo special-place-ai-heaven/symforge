@@ -357,3 +357,50 @@ cd E:\project\symforge
 
 - SFB07 acceptance criteria passed: the KEEP_DOC_MARKDOWN_USAGE_VISIBLE decision is recorded in test comments, regression tests cover ordinary comments, doc comments, and markdown, and existing `search_text` tests plus full verification passed.
 - Changes stayed inside the allowed tracked files/areas plus the copied ignored goal-status file. No `docs/**`, `plans/**`, `.planning/**`, `openspec/**`, `npm/**`, daemon, edit protocol, or parsing files were modified.
+
+---
+
+# Outstanding-Work Hardening (2026-07-10)
+
+## Plan
+
+- [x] Audit `docs/OUTSTANDING-WORK.md` against current code, tests, runtime,
+  memory, vault, releases, and live dogfood.
+- [x] Approve and commit the code-first architecture design.
+- [x] Convert product intent into explicit trust, tool-substitution, and token-
+  economy acceptance gates.
+- [ ] Close Feature 018 browse/frecency/docs/task residuals.
+- [ ] Replace inline daemon project instances with per-project slots.
+- [ ] Make daemon home immutable and `index_folder` additive/persistent.
+- [ ] Route read, guidance, compact, and structural-edit tools explicitly by
+  project.
+- [ ] Replace the global snapshot write lock with same-path serialization.
+- [ ] Carry selected-project/freshness evidence and expose project inventory.
+- [ ] Make reconnect and runtime descriptors multi-session safe.
+- [ ] Enforce daemon uniqueness and reap expired sessions.
+- [ ] Preserve generated-output admission through watcher single-file updates.
+- [ ] Add native, preserving Grok initialization.
+- [ ] Create the canonical Grok dogfood prompt and common-tool substitution
+  scorecard.
+- [ ] Resolve every outstanding-work ledger entry with executable evidence.
+- [ ] Run focused/full Terminal Commander gates, release-binary multi-project
+  dogfood, and adversarial review.
+- [ ] Stop for explicit approval before push/PR/merge/publish/`cargo clean`.
+
+## Evidence Log
+
+- Design: `docs/superpowers/specs/2026-07-10-outstanding-work-hardening-design.md`
+  committed as `1608433`.
+- Executable plan: `docs/superpowers/plans/2026-07-10-outstanding-work-hardening.md`.
+- Current code truth: the daemon already has deterministic project IDs and a
+  multi-project `WorkingSet`, but ordinary `index_folder` still destructively
+  mutates `active_project_id` while holding the project-map write lock through
+  reload.
+- Product gate: hardening is enabling work. Completion requires proving common
+  repository-tool substitution and measured token savings with retained-answer
+  checks, not merely green infrastructure tests.
+
+## Review
+
+- In progress. Add verified commits, focused/full gate receipts, scorecard,
+  adversarial findings, and remaining operator gates here before completion.

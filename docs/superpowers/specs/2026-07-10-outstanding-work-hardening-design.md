@@ -137,8 +137,9 @@ same multi-process sprawl already observed.
 - **Open project:** any project present in the session `WorkingSet`, including
   home.
 - **Project ID:** the existing deterministic canonical-root hash.
-- **Project alias:** a human-readable basename accepted only when it resolves
-  to exactly one open project. Ambiguity returns candidate IDs and roots.
+- **Project name selector:** the existing human-readable `project_name` may be
+  accepted when it resolves to exactly one open project. It is display-derived,
+  not a new persistent alias entity. Ambiguity returns candidate IDs and roots.
 
 `path` remains a within-project path filter. It never means project selection.
 
@@ -159,6 +160,9 @@ Daemon-backed mode changes deliberately:
   `checkpoint_now(verify_after_write=true)` remains the operator-grade verified
   checkpoint.
 - Replays preserve the same project identity and checkpoint receipt.
+- The ordinary open/refresh path uses the same durable idempotency ledger
+  whether `add` is omitted or explicitly true. A daemon-proxy failure must not
+  silently fall back to the local destructive reset semantics.
 
 No public remove operation is added. Session close and stale-session reaping
 already provide the required ownership cleanup; add removal only when a real
@@ -166,14 +170,15 @@ long-lived-session pressure case exists.
 
 ### 4.3 Project inventory
 
-`status(detail="projects")` exposes the current session inventory without a
-new management tool:
+`status(detail="projects")` exposes the current session inventory on the
+compact surface, while full-surface `health`/`health_compact` expose the same
+facts without a new management tool:
 
-- project ID and alias;
+- project ID and human-readable project name;
 - canonical root;
 - `home` marker;
 - index/watcher state and generation;
-- opened/last-used timestamps;
+- opened timestamp and session last-seen evidence;
 - snapshot/checkpoint state.
 
 Default `status` output remains byte-compatible except for existing truthful
@@ -186,7 +191,7 @@ health corrections.
 Add one shared resolver used by every project-scoped handler:
 
 ```text
-explicit project ID/alias -> selected open project
+explicit project ID/name  -> selected open project
 omitted project          -> immutable home project
 unknown/ambiguous target -> deterministic error with candidates
 ```
@@ -210,9 +215,10 @@ where supported:
 - `search_symbols`, `search_text`, `search_files`, `find_references`.
 
 Structural edits accept one optional `project`. Existing
-`working_directory` routing remains authoritative for worktrees and must lie
-inside the selected project; disagreement fails before writing. Batch edits may
-target multiple explicit projects only when every edit names its project.
+`working_directory` routing remains authoritative for worktrees and must be the
+selected root or a worktree proven by Git to belong to that repository;
+unrelated roots fail before writing. Each batch stays single-project so its
+validation, rollback, and idempotency remain one transaction.
 
 Unqualified calls remain on home. No operation silently changes another
 caller's default.
@@ -221,6 +227,12 @@ caller's default.
 
 Change the registry value from an inline mutable `ProjectInstance` to an
 `Arc<ProjectSlot>` (or the smallest equivalent existing-type refactor).
+
+The slot separates a short metadata lock from a project-local mutation lane.
+Reload builds through `SharedIndex`'s atomic publication path without holding
+the metadata lock, so same-project reads continue on the previously published
+generation while the new tree is parsed. The mutation lane serializes reload,
+watcher replacement, and checkpoint transitions for that project.
 
 The daemon-wide project-map lock may only:
 
@@ -239,7 +251,16 @@ operation.
 
 Replace the process-global snapshot write bottleneck with same-project/path
 serialization. Distinct `.symforge/index.bin` paths must checkpoint
-independently; same-path writes remain serialized and atomic.
+independently; same-path writes remain serialized and atomic. Unique
+same-directory temp names prevent local/daemon processes from clobbering one
+fixed temp artifact; cross-process last-complete-writer behavior must never
+produce a corrupt snapshot.
+
+`SymForgeServer` request/session state must not be cached once per shared
+project. Keep the `SharedIndex` project-wide, but partition `SessionContext`,
+CCR retrieval/cache state, and other caller commitment state per daemon session
+and open project. Two sessions on one root may share indexed facts, never
+session-local context.
 
 ## 7. Reconnect, descriptors, and daemon uniqueness
 
@@ -259,9 +280,11 @@ Reconnect never falls back to a stale mutable `project_root` field.
 
 Replace last-writer-wins fixed session ownership with per-session descriptors.
 Each adapter removes only its own descriptor. Hook lookup selects a live
-descriptor matching the caller root and reports ambiguity rather than silently
-choosing another session. Retain a compatibility pointer only if existing
-clients require it.
+descriptor matching the caller root/project identity. Multiple healthy sessions
+with that same immutable identity are equivalent for root-bound hook reads, so
+choose the freshest with a deterministic tie break; conflicting identities
+fail rather than silently choosing another root. Retain a compatibility pointer
+only if existing clients require it.
 
 ### 7.3 Daemon singleton and stale sessions
 
@@ -269,8 +292,11 @@ clients require it.
   check as auto-spawn. If a live daemon exists, report and reuse/refuse instead
   of overwriting the runtime record.
 - Different `SYMFORGE_HOME` values remain intentionally isolated.
-- A bounded reaper closes sessions whose heartbeat expired, exercising the
-  existing close/GC path. TTL and last-seen evidence are visible in status.
+- A bounded reaper rechecks the observed heartbeat under the session write lock
+  before atomically claiming an expired session, then exercises the shared
+  close/GC path. A concurrent heartbeat either wins before the claim or fails
+  after it; no resurrection race. TTL and last-seen evidence are visible in
+  status.
 
 ## 8. Feature 018 closure
 
@@ -340,7 +366,7 @@ CCR. Compact/tree maps remain bounded summaries.
 ## 10. Error handling and trust
 
 - Unknown project: `not_found`, names target, lists open candidates.
-- Ambiguous alias: `ambiguous`, lists candidate IDs and roots.
+- Ambiguous project name: `ambiguous`, lists candidate IDs and roots.
 - Project not open: explicit corrective `index_folder(path)` guidance.
 - Cross-project mode unsupported by a tool: `invalid_request`, never silent
   fallback to home.
@@ -370,7 +396,10 @@ All behavior changes follow red-green-refactor. Minimum regression witnesses:
 
 - Artificially slow project-A index while project-B reads complete without
   waiting on the registry lock.
-- Same-project concurrent reloads serialize; different projects proceed.
+- Same-project concurrent reloads serialize while reads continue on the prior
+  published generation; different projects proceed.
+- Two sessions on one project share indexed facts but not session context or
+  CCR cache/retrieval state.
 - Kill daemon after opening B; reconnect restores home and open-project routing.
 - Two adapters on one root keep independent descriptors; one shutdown does not
   delete the other.
