@@ -5,7 +5,8 @@
 /// Background verification corrects stale entries after loading a snapshot.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -25,11 +26,77 @@ use crate::domain::ParseDiagnostic;
 const CURRENT_VERSION: u32 = 4;
 const INDEX_FILENAME: &str = "index.bin";
 const INDEX_TMP_FILENAME: &str = "index.bin.tmp";
+const INDEX_TMP_PREFIX: &str = "index.bin.tmp.";
 pub const SNAPSHOT_RESET_SCOPE_LABEL: &str = ".symforge/index.bin,.symforge/index.bin.tmp";
 pub const CHECKPOINT_INTERVAL_ENV: &str = "SYMFORGE_CHECKPOINT_INTERVAL_SECS";
 pub const MIN_CHECKPOINT_INTERVAL_SECS: u64 = 30;
 pub const MAX_CHECKPOINT_INTERVAL_SECS: u64 = 3600;
-static SNAPSHOT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+type SnapshotPathLocks = HashMap<PathBuf, Weak<Mutex<()>>>;
+static SNAPSHOT_PATH_LOCKS: OnceLock<Mutex<SnapshotPathLocks>> = OnceLock::new();
+static SNAPSHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn snapshot_path_and_lock(project_root: &Path) -> anyhow::Result<(PathBuf, Arc<Mutex<()>>)> {
+    let dir = paths::ensure_symforge_dir(project_root)?;
+    let canonical_dir = std::fs::canonicalize(&dir).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalizing symforge data dir {}: {}",
+            dir.display(),
+            error
+        )
+    })?;
+    let snapshot_path = canonical_dir.join(INDEX_FILENAME);
+
+    let registry = SNAPSHOT_PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot path-lock registry poisoned"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+
+    if let Some(lock) = locks.get(&snapshot_path).and_then(Weak::upgrade) {
+        return Ok((snapshot_path, lock));
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(snapshot_path.clone(), Arc::downgrade(&lock));
+    Ok((snapshot_path, lock))
+}
+
+fn next_snapshot_temp_path(dir: &Path) -> PathBuf {
+    let counter = SNAPSHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        "{INDEX_TMP_PREFIX}{}.{counter}",
+        std::process::id()
+    ))
+}
+
+fn is_unique_snapshot_temp_name(name: &std::ffi::OsStr) -> bool {
+    let Some(suffix) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix(INDEX_TMP_PREFIX))
+    else {
+        return false;
+    };
+    let mut parts = suffix.split('.');
+    let (Some(pid), Some(counter), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+
+    !pid.is_empty()
+        && !counter.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn cleanup_snapshot_temp(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %path.display(),
+            "failed to clean snapshot temp file after write error: {error}"
+        ),
+    }
+}
 
 // ── Snapshot types ────────────────────────────────────────────────────────────
 
@@ -169,8 +236,36 @@ pub fn checkpoint_interval_from_env() -> Option<Duration> {
 }
 
 pub fn reset_snapshot_state(project_root: &Path) -> anyhow::Result<SnapshotResetReport> {
-    let dir = paths::resolve_symforge_dir(project_root);
-    let targets = [dir.join(INDEX_FILENAME), dir.join(INDEX_TMP_FILENAME)];
+    let (snapshot_path, snapshot_lock) = snapshot_path_and_lock(project_root)?;
+    let _reset_guard = snapshot_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot path lock poisoned"))?;
+    let dir = snapshot_path
+        .parent()
+        .expect("snapshot path must have a parent directory")
+        .to_path_buf();
+    let mut targets = vec![snapshot_path, dir.join(INDEX_TMP_FILENAME)];
+    let entries = std::fs::read_dir(&dir).map_err(|error| {
+        anyhow::anyhow!(
+            "listing snapshot reset directory {}: {}",
+            dir.display(),
+            error
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            anyhow::anyhow!(
+                "reading snapshot reset directory {}: {}",
+                dir.display(),
+                error
+            )
+        })?;
+        if is_unique_snapshot_temp_name(&entry.file_name()) {
+            targets.push(entry.path());
+        }
+    }
+    targets.sort();
+    targets.dedup();
     let mut removed = Vec::new();
     let mut missing = Vec::new();
 
@@ -614,30 +709,34 @@ fn write_snapshot(
     let bytes = postcard::to_stdvec(&snapshot)?;
     let file_count = snapshot.files.len();
 
-    let _write_guard = SNAPSHOT_WRITE_LOCK
+    let (final_path, write_lock) = snapshot_path_and_lock(project_root)?;
+    let _write_guard = write_lock
         .lock()
-        .map_err(|_| anyhow::anyhow!("snapshot write lock poisoned"))?;
-    let dir = paths::ensure_symforge_dir(project_root)?;
+        .map_err(|_| anyhow::anyhow!("snapshot path lock poisoned"))?;
+    let dir = final_path
+        .parent()
+        .expect("snapshot path must have a parent directory");
 
     // Atomic write: tmp file then rename
-    let final_path = dir.join(INDEX_FILENAME);
-    let tmp_path = dir.join(INDEX_TMP_FILENAME);
+    let tmp_path = next_snapshot_temp_path(dir);
 
-    std::fs::write(&tmp_path, &bytes).map_err(|e| {
-        anyhow::anyhow!(
+    if let Err(error) = std::fs::write(&tmp_path, &bytes) {
+        cleanup_snapshot_temp(&tmp_path);
+        return Err(anyhow::anyhow!(
             "writing index snapshot tmp at {}: {}",
             tmp_path.display(),
-            e
-        )
-    })?;
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-        anyhow::anyhow!(
+            error
+        ));
+    }
+    if let Err(error) = std::fs::rename(&tmp_path, &final_path) {
+        cleanup_snapshot_temp(&tmp_path);
+        return Err(anyhow::anyhow!(
             "renaming index snapshot {} -> {}: {}",
             tmp_path.display(),
             final_path.display(),
-            e
-        )
-    })?;
+            error
+        ));
+    }
 
     info!(
         bytes = bytes.len(),
@@ -2405,6 +2504,137 @@ mod tests {
     // ── Snapshot atomicity test ───────────────────────────────────────────────
 
     #[test]
+    fn test_snapshot_path_locks_isolate_distinct_projects() {
+        let first = TempDir::new().expect("create first project");
+        let second = TempDir::new().expect("create second project");
+
+        let (_, first_lock) =
+            snapshot_path_and_lock(first.path()).expect("resolve first snapshot lock");
+        let (_, same_lock) = snapshot_path_and_lock(&first.path().join("."))
+            .expect("resolve canonical-equivalent snapshot lock");
+        let (_, second_lock) =
+            snapshot_path_and_lock(second.path()).expect("resolve second snapshot lock");
+
+        assert!(
+            Arc::ptr_eq(&first_lock, &same_lock),
+            "canonical-equivalent snapshot paths must share one lock"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_lock, &second_lock),
+            "different snapshot paths must not share a lock"
+        );
+
+        let first_guard = first_lock.lock().expect("lock first snapshot path");
+        assert!(
+            same_lock.try_lock().is_err(),
+            "same-path writes must serialize"
+        );
+        assert!(
+            second_lock.try_lock().is_ok(),
+            "different snapshot paths must not block each other"
+        );
+        drop(first_guard);
+    }
+
+    #[test]
+    fn test_reset_snapshot_state_waits_for_snapshot_path_lock() {
+        let tmp = TempDir::new().expect("create project");
+        let symforge_dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&symforge_dir).expect("create .symforge");
+        let snapshot_path = symforge_dir.join(INDEX_FILENAME);
+        std::fs::write(&snapshot_path, b"complete snapshot").expect("write snapshot");
+
+        let (_, snapshot_lock) = snapshot_path_and_lock(tmp.path()).expect("resolve snapshot lock");
+        let write_guard = snapshot_lock.lock().expect("hold snapshot write lock");
+        let project_root = tmp.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reset_thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal reset start");
+            let report = reset_snapshot_state(&project_root);
+            done_tx.send(report).expect("send reset result");
+        });
+
+        started_rx.recv().expect("reset thread started");
+        let early_result = done_rx.recv_timeout(Duration::from_millis(200)).ok();
+        let snapshot_survived_while_locked = snapshot_path.exists();
+        drop(write_guard);
+
+        let completed_early = early_result.is_some();
+        let report = match early_result {
+            Some(report) => report,
+            None => done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reset should finish after releasing lock"),
+        }
+        .expect("reset snapshot state");
+        reset_thread.join().expect("join reset thread");
+
+        assert!(
+            !completed_early,
+            "reset must block while a snapshot write owns the path lock"
+        );
+        assert!(
+            snapshot_survived_while_locked,
+            "reset must not delete the published snapshot during a write"
+        );
+        assert_eq!(report.removed_count(), 1);
+        assert!(!snapshot_path.exists());
+    }
+
+    #[test]
+    fn test_snapshot_temp_paths_are_unique_and_process_scoped() {
+        let tmp = TempDir::new().expect("create project");
+        let symforge_dir = paths::ensure_symforge_dir(tmp.path()).expect("create .symforge");
+
+        let first = next_snapshot_temp_path(&symforge_dir);
+        let second = next_snapshot_temp_path(&symforge_dir);
+        let process_prefix = format!("{INDEX_TMP_FILENAME}.{}.", std::process::id());
+
+        assert_ne!(
+            first, second,
+            "each snapshot write needs a unique temp path"
+        );
+        for path in [first, second] {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("temp path has a UTF-8 file name");
+            assert!(
+                name.starts_with(&process_prefix),
+                "temp name must include the writer PID and counter: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_write_error_removes_owned_temp_file() {
+        let tmp = TempDir::new().expect("create project");
+        let symforge_dir = paths::ensure_symforge_dir(tmp.path()).expect("create .symforge");
+        let blocking_final_path = symforge_dir.join(INDEX_FILENAME);
+        std::fs::create_dir(&blocking_final_path).expect("block snapshot rename with directory");
+        std::fs::write(
+            blocking_final_path.join("sentinel"),
+            b"keep directory non-empty",
+        )
+        .expect("write blocking sentinel");
+        let index = make_live_index_with_files(vec![("src/lib.rs", b"fn lib() {}")]);
+
+        serialize_index(&index, tmp.path()).expect_err("snapshot rename should fail");
+
+        let leftover_temps: Vec<_> = std::fs::read_dir(&symforge_dir)
+            .expect("list .symforge")
+            .map(|entry| entry.expect("read .symforge entry"))
+            .filter(|entry| is_unique_snapshot_temp_name(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "failed writes must remove their own temp file: {leftover_temps:?}"
+        );
+    }
+
+    #[test]
     fn test_serialize_creates_symforge_dir() {
         let tmp = TempDir::new().unwrap();
         let index = make_live_index_with_files(vec![("src/lib.rs", b"fn lib() {}")]);
@@ -2427,13 +2657,22 @@ mod tests {
         std::fs::write(source_dir.join("lib.rs"), "fn source_file() {}\n").expect("write source");
         std::fs::write(symforge_dir.join("index.bin"), b"stale snapshot").expect("write snapshot");
         std::fs::write(symforge_dir.join("index.bin.tmp"), b"stale tmp").expect("write tmp");
+        let stale_unique_tmp = symforge_dir.join("index.bin.tmp.4242.7");
+        let unrelated_similar_name = symforge_dir.join("index.bin.tmp.not-owned");
+        std::fs::write(&stale_unique_tmp, b"stale unique tmp").expect("write unique tmp");
+        std::fs::write(&unrelated_similar_name, b"unrelated").expect("write similar sentinel");
         std::fs::write(symforge_dir.join("frecency.db"), b"unrelated").expect("write sentinel");
 
         let report = reset_snapshot_state(tmp.path()).expect("reset snapshot state");
 
-        assert_eq!(report.removed_count(), 2);
+        assert_eq!(report.removed_count(), 3);
         assert!(!symforge_dir.join("index.bin").exists());
         assert!(!symforge_dir.join("index.bin.tmp").exists());
+        assert!(!stale_unique_tmp.exists());
+        assert!(
+            unrelated_similar_name.exists(),
+            "reset must only remove PID-and-counter temp names"
+        );
         assert!(
             symforge_dir.join("frecency.db").exists(),
             "reset must preserve unrelated .symforge state"
