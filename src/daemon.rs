@@ -4841,7 +4841,7 @@ mod tests {
 
     // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
     #[test]
-    fn test_retarget_reseeds_working_set_active_entry() {
+    fn test_default_index_folder_open_keeps_home_and_adds_to_working_set() {
         let project_a = project_dir("symforge-reseed-a");
         let project_b = project_dir("symforge-reseed-b");
         std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
@@ -4857,8 +4857,7 @@ mod tests {
             .expect("open A");
         let active_a = opened.project_id.clone();
 
-        // Retarget (add: None) to B — the destructive path.
-        state
+        let output = state
             .index_folder_for_session(
                 &opened.session_id,
                 IndexFolderInput {
@@ -4867,28 +4866,38 @@ mod tests {
                     add: None,
                 },
             )
-            .expect("retarget to B");
+            .expect("open B");
         let project_b_id =
             project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
 
+        assert!(
+            output.contains(&format!("project_id={project_b_id}")),
+            "receipt must identify the opened project: {output}"
+        );
+        assert!(
+            output.contains("checkpoint=written"),
+            "successful daemon reload must report its checkpoint: {output}"
+        );
+
         let sessions = state.sessions.read();
         let session = sessions.get(&opened.session_id).expect("session");
-        assert_eq!(session.active_project_id, project_b_id, "active is now B");
+        assert_eq!(
+            session.active_project_id, active_a,
+            "default index_folder must preserve immutable home A"
+        );
         let ws = session.working_set.read();
-        // The working set's active entry was re-seeded to B (the retarget seam fix):
-        // the stale A entry is gone and B is present and consistent with active.
-        assert_eq!(ws.len(), 1, "single re-seeded active entry after retarget");
+        assert_eq!(ws.len(), 2, "default open must keep A and add B");
         assert!(
-            ws.get(&active_a).is_none(),
-            "stale pre-retarget entry (A) must be dropped"
+            ws.get(&active_a).is_some(),
+            "home project A must stay in the working set"
         );
         let entry = ws
             .get(&project_b_id)
-            .expect("working set re-seeded with the new active project B");
+            .expect("working set gains newly opened project B");
         assert_eq!(
             entry.overlay.delta_count(),
             0,
-            "re-seeded overlay must be empty"
+            "opened-project overlay must be empty"
         );
         assert!(
             entry.overlay.is_valid_against(&entry.base),
@@ -7494,7 +7503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_folder_rebinds_session_to_new_project_root() {
+    async fn test_index_folder_open_keeps_immutable_home() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -7554,7 +7563,7 @@ mod tests {
             "index_folder should report success, got: {reload}"
         );
 
-        let sessions = client
+        let target_sessions = client
             .get(format!(
                 "{base_url}/v1/projects/{}/sessions",
                 project_key(&canonical_project_root(project_b.path()).expect("canonical root"))
@@ -7567,8 +7576,24 @@ mod tests {
             .json::<Vec<SessionSummary>>()
             .await
             .expect("session list body");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, opened.session_id);
+        assert_eq!(target_sessions.len(), 1);
+        assert_eq!(target_sessions[0].session_id, opened.session_id);
+
+        let home_sessions = client
+            .get(format!(
+                "{base_url}/v1/projects/{}/sessions",
+                opened.project_id
+            ))
+            .send()
+            .await
+            .expect("home session list request")
+            .error_for_status()
+            .expect("home session list status")
+            .json::<Vec<SessionSummary>>()
+            .await
+            .expect("home session list body");
+        assert_eq!(home_sessions.len(), 1, "opening B must not evict home A");
+        assert_eq!(home_sessions[0].session_id, opened.session_id);
 
         let outline = client
             .post(format!(
@@ -7587,12 +7612,12 @@ mod tests {
             .await
             .expect("outline body");
         assert!(
-            outline.contains("new.rs"),
-            "rebound session should see new root: {outline}"
+            outline.contains("old.rs"),
+            "unqualified reads must remain bound to immutable home A: {outline}"
         );
         assert!(
-            !outline.contains("old.rs"),
-            "rebound session should no longer point at old root: {outline}"
+            !outline.contains("new.rs"),
+            "opening B must not retarget unqualified reads away from home A: {outline}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -8162,7 +8187,7 @@ mod tests {
     /// two projects in one session while health/get_repo_map/index_folder
     /// follow the switch.
     #[tokio::test]
-    async fn test_index_folder_proxy_switch_invalidates_stale_local_index() {
+    async fn test_index_folder_proxy_open_preserves_local_home_fallback() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -8236,8 +8261,8 @@ mod tests {
             "precondition: stale local index holds the OLD project"
         );
 
-        // Switch projects via the proxy path. The daemon answers "Indexed ..."
-        // and rebinds the session to project B.
+        // Open project B via the proxy path. This must not change the immutable
+        // home binding or invalidate its local fallback state.
         let result = server
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
@@ -8250,38 +8275,85 @@ mod tests {
             "daemon proxy index_folder should report success, got: {result}"
         );
 
-        // The fix: the stale local index must be invalidated so no local
-        // fallback can serve the OLD project after the switch.
+        // The immutable-home contract keeps the existing local fallback for A.
         assert_eq!(
             server.index.published_state().file_count,
-            0,
-            "stale local index must be reset to empty after a proxy project switch, got: {result}"
+            1,
+            "opening B must not reset the local home-A fallback, got: {result}"
         );
         assert!(
-            server.index.read().get_file("src/old.rs").is_none(),
-            "OLD-project file must be unreachable from the local index after switch"
+            server.index.read().get_file("src/old.rs").is_some(),
+            "home-A fallback must remain reachable after opening B"
         );
 
-        // And repo_root must follow the switch so the next local fallback
-        // reloads project B (not project A).
-        let switched_root = server.capture_repo_root().expect("repo root after switch");
+        let home_root = server.capture_repo_root().expect("home root after open");
         assert_eq!(
-            switched_root,
-            project_b.path().to_path_buf(),
-            "repo_root must point at the new project after a proxy switch"
+            home_root,
+            project_a.path().to_path_buf(),
+            "repo_root must remain bound to immutable home A"
         );
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
-    /// 012 C4 (D4 retarget + D6-a bound-root visibility): after a daemon-proxy
-    /// session is retargeted from project A to project B at runtime via
-    /// `index_folder`, the `status` and `symforge` surfaces must report the NEW
-    /// project's bound root — never the stale one. This is the field wrong-repo
-    /// bug made observable: a stale binding can no longer read as a working one.
     #[tokio::test]
-    async fn test_retarget_updates_bound_root_in_status_and_symforge_surfaces() {
+    async fn test_index_folder_proxy_failure_refuses_destructive_local_fallback() {
+        let project_a = project_dir("symforge-proxy-refusal-a");
+        let project_b = project_dir("symforge-proxy-refusal-b");
+        std::fs::write(
+            project_a.path().join("src").join("home.rs"),
+            "fn home() {}\n",
+        )
+        .expect("write home source");
+        std::fs::write(
+            project_b.path().join("src").join("other.rs"),
+            "fn other() {}\n",
+        )
+        .expect("write other source");
+
+        let home_root = canonical_project_root(project_a.path()).expect("canonical home A");
+        let client = DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            project_key(&home_root),
+            "unreachable-session".to_string(),
+            "home-a".to_string(),
+        )
+        .with_project_root(home_root.clone());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        server
+            .index
+            .reload(&home_root)
+            .expect("seed local home fallback");
+
+        let output = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            output.contains("daemon") && output.contains("refus"),
+            "daemon-proxy failure must refuse destructive local index_folder: {output}"
+        );
+        assert_eq!(
+            server.capture_repo_root().as_deref(),
+            Some(home_root.as_path()),
+            "failed proxy open must keep home root"
+        );
+        let guard = server.index.read();
+        assert!(guard.get_file("src/home.rs").is_some());
+        assert!(
+            guard.get_file("src/other.rs").is_none(),
+            "failed proxy open must not replace home index with B"
+        );
+    }
+
+    /// Opening another project must not move connection-scoped surfaces away
+    /// from the immutable home project.
+    #[tokio::test]
+    async fn test_index_folder_open_preserves_home_in_status_and_symforge_surfaces() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -8341,7 +8413,7 @@ mod tests {
             "pre-retarget status must surface project A root, got:\n{status_before}"
         );
 
-        // Retarget to project B via the explicit `index_folder` verb (D4-C).
+        // Open project B via the explicit `index_folder` verb.
         let indexed = server
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
@@ -8351,34 +8423,31 @@ mod tests {
             .await;
         assert!(
             indexed.starts_with("Indexed "),
-            "daemon proxy retarget must succeed, got: {indexed}"
+            "daemon proxy open must succeed, got: {indexed}"
         );
 
-        // (a) The bound root followed the switch.
-        let switched = server
-            .capture_repo_root()
-            .expect("repo root after retarget");
+        // (a) The bound root remains the connection's home A.
+        let bound = server.capture_repo_root().expect("repo root after open");
         assert_eq!(
-            switched,
-            project_b.path().to_path_buf(),
-            "repo_root must point at project B after retarget"
+            bound,
+            project_a.path().to_path_buf(),
+            "repo_root must remain at immutable home A after opening B"
         );
 
-        // (b) `status` (local render path) now reflects project B's root, not A.
+        // (b) `status` (local render path) still reflects home A.
         let root_b_norm = project_b.path().display().to_string().replace('\\', "/");
         let status_after =
             server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
         assert!(
-            status_after.contains(&format!("project_root: {root_b_norm}")),
-            "post-retarget status must surface project B root, got:\n{status_after}"
+            status_after.contains(&format!("project_root: {root_a_norm}")),
+            "post-open status must preserve home A root, got:\n{status_after}"
         );
         assert!(
-            !status_after.contains(&format!("project_root: {root_a_norm}")),
-            "stale project A root must NOT survive in status after retarget, got:\n{status_after}"
+            !status_after.contains(&format!("project_root: {root_b_norm}")),
+            "opened B must not replace home A in status, got:\n{status_after}"
         );
 
-        // (c) the `symforge` facade envelope also carries the bound root line so a
-        // wrong-repo binding is loud on the primary read surface too.
+        // (c) the `symforge` facade envelope carries the same home root.
         // `SymforgeCallInput` flattens the `StelRequest`, so `query` is top-level.
         let symforge_input = serde_json::from_value(serde_json::json!({
             "query": "find beta_symbol"
@@ -8394,8 +8463,8 @@ mod tests {
             .expect("symforge result text")
             .to_string();
         assert!(
-            symforge_body.contains(&format!("project_root: {root_b_norm}")),
-            "symforge envelope must surface the bound project B root, got:\n{symforge_body}"
+            symforge_body.contains(&format!("project_root: {root_a_norm}")),
+            "symforge envelope must preserve home project A, got:\n{symforge_body}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -8516,6 +8585,135 @@ mod tests {
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    #[test]
+    fn test_index_folder_additive_replays_and_conflicts() {
+        let project_a = project_dir("symforge-idempotency-home-a");
+        let project_b = project_dir("symforge-idempotency-open-b");
+        let project_c = project_dir("symforge-idempotency-conflict-c");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        std::fs::write(project_c.path().join("src").join("c.rs"), "fn c() {}\n")
+            .expect("write source c");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "idempotency".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let first = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: None,
+                },
+            )
+            .expect("default open B");
+        assert!(first.contains("project_id="), "identity receipt: {first}");
+        assert!(
+            first.contains("checkpoint=written"),
+            "checkpoint receipt: {first}"
+        );
+
+        std::fs::write(
+            project_b.path().join("src").join("second.rs"),
+            "fn second() {}\n",
+        )
+        .expect("write second source b");
+        let replay = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: Some(true),
+                },
+            )
+            .expect("compatibility add=true replay B");
+        assert_eq!(
+            replay, first,
+            "default and add=true must share one canonical replay contract"
+        );
+
+        let conflict = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_c.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: Some(true),
+                },
+            )
+            .expect("conflicting open C");
+        assert!(
+            conflict.contains("Idempotency conflict"),
+            "same key with another target must fail deterministically: {conflict}"
+        );
+        assert!(
+            !state.projects.read().contains_key(&project_key(
+                &canonical_project_root(project_c.path()).expect("canonical C")
+            )),
+            "conflict must be rejected before project C is loaded"
+        );
+    }
+
+    #[test]
+    fn test_index_folder_open_persists_snapshot_for_restore() {
+        let project_a = project_dir("symforge-snapshot-home-a");
+        let project_b = project_dir("symforge-snapshot-open-b");
+        std::fs::write(
+            project_b.path().join("src").join("restored.rs"),
+            "fn restored() {}\n",
+        )
+        .expect("write source b");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "snapshot".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let receipt = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("open B");
+        assert!(
+            receipt.contains("checkpoint=written"),
+            "successful open must expose durable checkpoint outcome: {receipt}"
+        );
+        assert!(
+            project_b
+                .path()
+                .join(".symforge")
+                .join("index.bin")
+                .is_file(),
+            "successful daemon reload must atomically persist B"
+        );
+
+        drop(state);
+        let canonical_b = canonical_project_root(project_b.path()).expect("canonical B");
+        let restored = bootstrap_project_index(&canonical_b).expect("restore B from snapshot");
+        let guard = restored.read();
+        assert_eq!(
+            guard.load_source(),
+            crate::live_index::store::IndexLoadSource::SnapshotRestore
+        );
+        assert_eq!(guard.file_count(), 1);
+        assert!(guard.get_file("src/restored.rs").is_some());
     }
 
     #[tokio::test]

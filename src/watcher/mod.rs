@@ -961,8 +961,84 @@ pub fn restart_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::index::SkipReason;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    static GENERATED_OUTPUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct GeneratedOutputEnvGuard(Option<std::ffi::OsString>);
+
+    impl GeneratedOutputEnvGuard {
+        #[allow(unsafe_code)]
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var_os("SYMFORGE_INDEX_GENERATED_OUTPUT");
+            // SAFETY: generated-output tests serialize mutations with
+            // GENERATED_OUTPUT_ENV_LOCK and restore the prior value on drop.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("SYMFORGE_INDEX_GENERATED_OUTPUT", value),
+                    None => std::env::remove_var("SYMFORGE_INDEX_GENERATED_OUTPUT"),
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for GeneratedOutputEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard is dropped while GENERATED_OUTPUT_ENV_LOCK is held.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("SYMFORGE_INDEX_GENERATED_OUTPUT", value),
+                    None => std::env::remove_var("SYMFORGE_INDEX_GENERATED_OUTPUT"),
+                }
+            }
+        }
+    }
+
+    fn create_test_source(root: &Path, relative_path: &str, content: &[u8]) -> PathBuf {
+        let absolute_path = root.join(relative_path);
+        std::fs::create_dir_all(
+            absolute_path
+                .parent()
+                .expect("test source must have a parent directory"),
+        )
+        .expect("create test source directory");
+        std::fs::write(&absolute_path, content).expect("write test source");
+        absolute_path
+    }
+
+    fn stage_test_path(repository: &git2::Repository, relative_path: &str) {
+        let mut index = repository.index().expect("open git index");
+        index
+            .add_path(Path::new(relative_path))
+            .expect("stage test path");
+        index.write().expect("write git index");
+    }
+
+    fn init_test_git_repository(root: &Path) -> git2::Repository {
+        let repository = git2::Repository::init(root).expect("initialize git repository");
+        create_test_source(root, "src/main.rs", b"fn main() {}\n");
+        stage_test_path(&repository, "src/main.rs");
+        repository
+    }
+
+    fn assert_generated_output_skip(shared: &SharedIndex, relative_path: &str) {
+        let index = shared.read();
+        assert!(
+            index.get_file(relative_path).is_none(),
+            "{relative_path} must not be present in Tier 1"
+        );
+        let skipped = index
+            .skipped_files()
+            .iter()
+            .find(|skipped| skipped.path == relative_path)
+            .unwrap_or_else(|| panic!("{relative_path} must have a skip record"));
+        assert_eq!(skipped.decision.tier, AdmissionTier::MetadataOnly);
+        assert_eq!(skipped.decision.reason, Some(SkipReason::GeneratedOutput));
+    }
 
     // --- BurstTracker tests from Plan 01 (preserved) ---
 
@@ -1796,6 +1872,201 @@ mod tests {
             (0, 1, 0),
             "tier counts must reflect the demotion: 0 Tier-1, 1 Tier-2"
         );
+    }
+
+    #[test]
+    fn test_new_generated_output_directory_stays_metadata_only() {
+        let _env_lock = GENERATED_OUTPUT_ENV_LOCK.lock().unwrap();
+        let _env = GeneratedOutputEnvGuard::set(None);
+        let tmp = TempDir::new().unwrap();
+        let _repository = init_test_git_repository(tmp.path());
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+
+        let relative_path = "graphify-out/cache/new.rs";
+        let absolute_path =
+            create_test_source(tmp.path(), relative_path, b"fn generated_after_load() {}\n");
+        let result = maybe_reindex(
+            relative_path,
+            &absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+
+        assert_eq!(
+            result,
+            ReindexResult::Skipped,
+            "a generated directory created after load must follow bulk admission"
+        );
+        assert_generated_output_skip(&shared, relative_path);
+        assert_eq!(shared.read().tier_counts(), (1, 1, 0));
+    }
+
+    #[test]
+    fn test_bulk_demoted_generated_output_stays_metadata_only_on_watcher_event() {
+        let _env_lock = GENERATED_OUTPUT_ENV_LOCK.lock().unwrap();
+        let _env = GeneratedOutputEnvGuard::set(None);
+        let tmp = TempDir::new().unwrap();
+        let _repository = init_test_git_repository(tmp.path());
+        let relative_path = "graphify-out/cache/existing.rs";
+        let absolute_path = create_test_source(
+            tmp.path(),
+            relative_path,
+            b"fn generated_before_load() {}\n",
+        );
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+
+        assert_generated_output_skip(&shared, relative_path);
+        std::fs::write(&absolute_path, b"fn generated_before_load_changed() {}\n").unwrap();
+        let result = maybe_reindex(
+            relative_path,
+            &absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+
+        assert_eq!(
+            result,
+            ReindexResult::Skipped,
+            "watcher must not promote a bulk-demoted generated file"
+        );
+        assert_generated_output_skip(&shared, relative_path);
+        assert_eq!(
+            shared
+                .read()
+                .skipped_files()
+                .iter()
+                .filter(|skipped| skipped.path == relative_path)
+                .count(),
+            1,
+            "repeated demotion must retain exactly one skip record"
+        );
+    }
+
+    #[test]
+    fn test_tracked_and_prefix_rescue_re_admit_generated_output() {
+        let _env_lock = GENERATED_OUTPUT_ENV_LOCK.lock().unwrap();
+        let _env = GeneratedOutputEnvGuard::set(None);
+        let tmp = TempDir::new().unwrap();
+        let repository = init_test_git_repository(tmp.path());
+        let tracked_relative_path = "graphify-out/cache/tracked.rs";
+        let sibling_relative_path = "graphify-out/cache/sibling.rs";
+        let tracked_absolute_path = create_test_source(
+            tmp.path(),
+            tracked_relative_path,
+            b"fn tracked_generated() {}\n",
+        );
+        let sibling_absolute_path = create_test_source(
+            tmp.path(),
+            sibling_relative_path,
+            b"fn untracked_sibling() {}\n",
+        );
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+
+        assert_generated_output_skip(&shared, tracked_relative_path);
+        assert_generated_output_skip(&shared, sibling_relative_path);
+        stage_test_path(&repository, tracked_relative_path);
+
+        let tracked_result = maybe_reindex(
+            tracked_relative_path,
+            &tracked_absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+        let sibling_result = maybe_reindex(
+            sibling_relative_path,
+            &sibling_absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+
+        assert_eq!(tracked_result, ReindexResult::Reindexed);
+        assert_eq!(
+            sibling_result,
+            ReindexResult::Reindexed,
+            "one tracked file must rescue the entire generated-output prefix"
+        );
+        let index = shared.read();
+        assert!(index.get_file(tracked_relative_path).is_some());
+        assert!(index.get_file(sibling_relative_path).is_some());
+        assert!(
+            index
+                .skipped_files()
+                .iter()
+                .all(|skipped| skipped.path != tracked_relative_path
+                    && skipped.path != sibling_relative_path),
+            "Tier-2 skip records must be cleared after tracked-prefix rescue"
+        );
+        assert_eq!(index.tier_counts(), (3, 0, 0));
+    }
+
+    #[test]
+    fn test_generated_output_opt_in_re_admits_tier_one() {
+        let _env_lock = GENERATED_OUTPUT_ENV_LOCK.lock().unwrap();
+        let _env = GeneratedOutputEnvGuard::set(None);
+        let tmp = TempDir::new().unwrap();
+        let _repository = init_test_git_repository(tmp.path());
+        let relative_path = "graphify-out/cache/opted_in.rs";
+        let absolute_path = create_test_source(tmp.path(), relative_path, b"fn opted_in() {}\n");
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+
+        assert_generated_output_skip(&shared, relative_path);
+        let _enabled = GeneratedOutputEnvGuard::set(Some("1"));
+        let result = maybe_reindex(
+            relative_path,
+            &absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+
+        assert_eq!(result, ReindexResult::Reindexed);
+        let index = shared.read();
+        assert!(index.get_file(relative_path).is_some());
+        assert!(
+            index
+                .skipped_files()
+                .iter()
+                .all(|skipped| skipped.path != relative_path)
+        );
+        assert_eq!(index.tier_counts(), (2, 0, 0));
+    }
+
+    #[test]
+    fn test_generated_output_watcher_non_git_tree_fails_open() {
+        let _env_lock = GENERATED_OUTPUT_ENV_LOCK.lock().unwrap();
+        let _env = GeneratedOutputEnvGuard::set(None);
+        let tmp = TempDir::new().unwrap();
+        create_test_source(tmp.path(), "src/main.rs", b"fn main() {}\n");
+        let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
+        let expected_gen = shared.current_project_generation();
+        let relative_path = "graphify-out/cache/non_git.rs";
+        let absolute_path =
+            create_test_source(tmp.path(), relative_path, b"fn non_git_generated() {}\n");
+
+        let result = maybe_reindex(
+            relative_path,
+            &absolute_path,
+            &shared,
+            LanguageId::Rust,
+            expected_gen,
+        );
+
+        assert_eq!(
+            result,
+            ReindexResult::Reindexed,
+            "without readable Git evidence the watcher must fail open"
+        );
+        let index = shared.read();
+        assert!(index.get_file(relative_path).is_some());
+        assert_eq!(index.tier_counts(), (2, 0, 0));
     }
 
     /// A previously-skipped file (Tier 2 oversized) that shrinks back under the

@@ -36,6 +36,7 @@ struct InitPaths {
     claude_desktop_config: PathBuf,
     codex_config: PathBuf,
     codex_agents: PathBuf,
+    grok_config: PathBuf,
     gemini_settings: PathBuf,
     gemini_memory: PathBuf,
     gemini_trusted_folders: PathBuf,
@@ -66,6 +67,7 @@ impl InitPaths {
             claude_desktop_config,
             codex_config: home.join(".codex").join("config.toml"),
             codex_agents: home.join(".codex").join("AGENTS.md"),
+            grok_config: home.join(".grok").join("config.toml"),
             gemini_settings: home.join(".gemini").join("settings.json"),
             gemini_memory: home.join(".gemini").join("GEMINI.md"),
             gemini_trusted_folders: home.join(".gemini").join("trustedFolders.json"),
@@ -297,6 +299,14 @@ fn run_init_with_paths(
         eprintln!("Codex guidance written to {}", paths.codex_agents.display());
         eprintln!(
             "note: Codex gets MCP tools only. No documented Codex hook/session-start enrichment interface was found, so transparent enrichment remains Claude-only."
+        );
+    }
+
+    if matches!(client, InitClient::Grok | InitClient::All) {
+        register_grok_mcp_server(&paths.grok_config, &binary_path_str, working_dir)?;
+        eprintln!(
+            "Grok MCP server registered in {}",
+            paths.grok_config.display()
         );
     }
 
@@ -966,6 +976,86 @@ pub fn register_codex_mcp_server(
     std::fs::write(codex_config_path, config.to_string())
         .with_context(|| format!("writing {}", codex_config_path.display()))?;
 
+    Ok(())
+}
+
+fn set_toml_item_preserving_decor(table: &mut dyn toml_edit::TableLike, key: &str, new_item: Item) {
+    let decor = table
+        .get(key)
+        .and_then(Item::as_value)
+        .map(|value| value.decor().clone());
+    table.insert(key, new_item);
+    if let Some(decor) = decor {
+        *table
+            .get_mut(key)
+            .and_then(Item::as_value_mut)
+            .expect("replacement must be a TOML value")
+            .decor_mut() = decor;
+    }
+}
+/// Register symforge as an MCP server in `~/.grok/config.toml`.
+///
+/// Grok stores MCP servers under `[mcp_servers.<name>]` TOML tables.
+/// We update only managed SymForge fields and preserve all other content.
+pub fn register_grok_mcp_server(
+    grok_config_path: &std::path::Path,
+    binary_path: &str,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = grok_config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let config_toml = if grok_config_path.exists() {
+        read_config_text(grok_config_path)?
+    } else {
+        String::new()
+    };
+    let mut config = if config_toml.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        config_toml
+            .parse::<DocumentMut>()
+            .with_context(|| format!("parsing {}", grok_config_path.display()))?
+    };
+
+    if !config.as_table().contains_key("mcp_servers") || !config["mcp_servers"].is_table_like() {
+        config["mcp_servers"] = Item::Table(Table::new());
+    }
+    let mcp_servers = config["mcp_servers"]
+        .as_table_like_mut()
+        .expect("mcp_servers must be a table or inline table");
+    if mcp_servers
+        .get("symforge")
+        .is_none_or(|item| !item.is_table_like())
+    {
+        mcp_servers.insert("symforge", Item::Table(Table::new()));
+    }
+    let symforge = mcp_servers
+        .get_mut("symforge")
+        .and_then(Item::as_table_like_mut)
+        .expect("symforge server entry must be a table or inline table");
+
+    set_toml_item_preserving_decor(symforge, "command", value(native_command_path(binary_path)));
+    set_toml_item_preserving_decor(symforge, "args", value(Array::new()));
+    set_toml_item_preserving_decor(symforge, "enabled", value(true));
+    if symforge.get("env").is_none_or(|item| !item.is_table_like()) {
+        symforge.insert("env", Item::Table(Table::new()));
+    }
+    let env = symforge
+        .get_mut("env")
+        .and_then(Item::as_table_like_mut)
+        .expect("env must be a table or inline table");
+    set_toml_item_preserving_decor(env, "RUST_LOG", value("off"));
+    set_toml_item_preserving_decor(
+        env,
+        "SYMFORGE_WORKSPACE_ROOT",
+        value(working_dir.display().to_string()),
+    );
+
+    std::fs::write(grok_config_path, config.to_string())
+        .with_context(|| format!("writing {}", grok_config_path.display()))?;
     Ok(())
 }
 
