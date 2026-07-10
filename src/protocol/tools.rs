@@ -4847,7 +4847,7 @@ impl SymForgeServer {
     /// NOT for text content search (use search_text). NOT for file path search (use search_files).
     #[tool(
         name = "search_symbols",
-        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, sorted by path+line). At least one of query, kind, or path_prefix is required. Large result sets may CCR-compress; use symforge_retrieve with the footer hash for the full ranked list. NOT for text content search (use search_text). NOT for file path search (use search_files).",
+        description = "Prefer this before grep when you are looking for a function, class, type, or other symbol by name. Finds symbols across the repository in milliseconds and returns name, kind, file, and line range. Use when you know part of a symbol name but not the file. Supports kind filter, language filter, and path prefix scope. Query is optional — omit it to browse all symbols matching kind/path_prefix (browse mode defaults to limit=20, ranks by reference count/kind/path/line, and returns one representative per exact name+kind). At least one of query, kind, or path_prefix is required. Large result sets may CCR-compress; use symforge_retrieve with the footer hash for the full ranked list. NOT for text content search (use search_text). NOT for file path search (use search_files).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn search_symbols_tool(
@@ -15233,6 +15233,70 @@ mod tests {
         assert!(
             !result.contains("Worker"),
             "browse mode kind filter should exclude structs, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_browse_handler_is_frecency_neutral() {
+        use std::path::Path;
+
+        let root = TempDir::new().expect("temp repo");
+        let _frecency = EnvVarGuard::set(crate::live_index::frecency::FRECENCY_FLAG_ENV, "1");
+        let (key, file) = make_file(
+            "src/lib.rs",
+            b"pub fn new() {}\n",
+            vec![make_symbol("new", SymbolKind::Function, 1, 1)],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(root.path().to_path_buf()),
+        );
+        let probe = || {
+            crate::live_index::frecency::ranking_scores_for_paths(
+                root.path(),
+                &[Path::new("src/lib.rs")],
+                0,
+            )
+            .expect("frecency ranking probe")
+        };
+
+        assert!(
+            probe().is_none(),
+            "fixture must start without frecency history"
+        );
+        let result = server
+            .search_symbols(Parameters(super::SearchSymbolsInput {
+                query: None,
+                kind: Some("fn".to_string()),
+                path_prefix: Some("src/".to_string()),
+                language: None,
+                limit: Some(5),
+                include_generated: None,
+                include_tests: None,
+                include_vendor: None,
+                include_personal_tooling: None,
+                estimate: None,
+                max_tokens: None,
+                project: None,
+                projects: None,
+            }))
+            .await;
+        assert!(
+            result.contains("new"),
+            "browse fixture must return its symbol: {result}"
+        );
+        assert!(
+            probe().is_none(),
+            "public browse handler must not record a commitment signal"
+        );
+
+        let content = server
+            .get_file_content(Parameters(get_file_content_input("src/lib.rs")))
+            .await;
+        assert!(content.contains("pub fn new"));
+        assert!(
+            probe().is_some(),
+            "positive-control commitment read must exercise the real frecency store"
         );
     }
 

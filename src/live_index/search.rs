@@ -940,6 +940,8 @@ pub fn search_symbols_with_options(
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.line.cmp(&b.line))
         });
+        let mut seen = HashSet::new();
+        matches.retain(|candidate| seen.insert((candidate.name.clone(), candidate.kind.clone())));
     } else {
         matches.sort_by(|a, b| {
             a.tier
@@ -2209,12 +2211,95 @@ mod tests {
     }
 
     #[test]
-    fn test_browse_is_frecency_neutral() {
-        // T011 (Constitution V): browse READS reference counts and writes
-        // nothing back. The engine takes `&LiveIndex` and has no frecency handle
-        // (frecency lives outside the index, keyed by repo root), so neutrality
-        // is structural; this guards the ranking-signal source (reverse_index
-        // counts) stays byte-identical across a browse call.
+    fn test_browse_deduplicates_repeated_generic_names() {
+        let mut files = Vec::new();
+        for index in 0..6 {
+            let path = format!("src/generic_{index}.rs");
+            files.push(make_file(
+                &path,
+                "",
+                vec![make_symbol("new", SymbolKind::Function, 1)],
+            ));
+        }
+        files.extend([
+            make_file(
+                "src/load.rs",
+                "",
+                vec![make_symbol("load_workspace", SymbolKind::Function, 1)],
+            ),
+            make_file(
+                "src/route.rs",
+                "",
+                vec![make_symbol("route_request", SymbolKind::Function, 1)],
+            ),
+            make_file(
+                "src/persist.rs",
+                "",
+                vec![make_symbol("persist_snapshot", SymbolKind::Function, 1)],
+            ),
+        ]);
+        let mut index = make_index(files);
+        index
+            .reverse_index
+            .insert("new".to_string(), ref_locs("src/generic_0.rs", 50));
+        index
+            .reverse_index
+            .insert("load_workspace".to_string(), ref_locs("src/load.rs", 12));
+        index
+            .reverse_index
+            .insert("route_request".to_string(), ref_locs("src/route.rs", 8));
+        index.reverse_index.insert(
+            "persist_snapshot".to_string(),
+            ref_locs("src/persist.rs", 4),
+        );
+
+        let first = search_symbols(&index, "", Some("fn"), 4);
+        let second = search_symbols(&index, "", Some("fn"), 4);
+        let order = |result: &SymbolSearchResult| {
+            result
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.name.clone(),
+                        hit.kind.clone(),
+                        hit.path.clone(),
+                        hit.line,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            order(&first),
+            order(&second),
+            "browse order must be deterministic"
+        );
+        assert_eq!(
+            first
+                .hits
+                .iter()
+                .filter(|hit| hit.name == "new" && hit.kind == "fn")
+                .count(),
+            1,
+            "one generic (name, kind) must not occupy the whole browse page: {:?}",
+            order(&first)
+        );
+        assert_eq!(
+            first
+                .hits
+                .iter()
+                .map(|hit| hit.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new", "load_workspace", "route_request", "persist_snapshot"]
+        );
+    }
+
+    #[test]
+    fn test_browse_does_not_mutate_reference_ranking_input() {
+        // The pure engine owns no frecency store. This structural witness guards only
+        // the reverse-reference counts that browse ranking reads; handler-level
+        // frecency neutrality is covered by test_browse_handler_is_frecency_neutral.
         let mut index = make_index(vec![make_file(
             "src/a.rs",
             "",
@@ -2238,7 +2323,7 @@ mod tests {
         assert_eq!(
             before,
             counts(&index),
-            "browse ranking must not mutate the reference index (frecency-neutral)"
+            "pure browse engine must not mutate its reverse-reference ranking input"
         );
     }
 
