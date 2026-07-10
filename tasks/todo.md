@@ -369,12 +369,15 @@ cd E:\project\symforge
 - [x] Approve and commit the code-first architecture design.
 - [x] Convert product intent into explicit trust, tool-substitution, and token-
   economy acceptance gates.
-- [ ] Close Feature 018 browse/frecency/docs/task residuals.
-- [ ] Replace inline daemon project instances with per-project slots.
+- [x] Close Feature 018 browse/frecency code residuals.
+- [ ] Close Feature 018 documentation/task residuals with the canonical dogfood
+  artifacts in Task 12.
+- [x] Replace inline daemon project instances with per-project slots and
+  partition per-session protocol/cache state.
 - [ ] Make daemon home immutable and `index_folder` additive/persistent.
 - [ ] Route read, guidance, compact, and structural-edit tools explicitly by
   project.
-- [ ] Replace the global snapshot write lock with same-path serialization.
+- [x] Replace the global snapshot write lock with same-path serialization.
 - [ ] Carry selected-project/freshness evidence and expose project inventory.
 - [ ] Make reconnect and runtime descriptors multi-session safe.
 - [ ] Enforce daemon uniqueness and reap expired sessions.
@@ -399,6 +402,18 @@ cd E:\project\symforge
 - Product gate: hardening is enabling work. Completion requires proving common
   repository-tool substitution and measured token savings with retained-answer
   checks, not merely green infrastructure tests.
+- Feature 018 browse closure: `a646f23`; the repeated generic-name RED failed
+  with four `new` hits, then the exact diversity and real-store frecency tests
+  passed.
+- Snapshot isolation: `3e756ee`; 42 persistence tests passed, including
+  same-path serialization, distinct-path independence, reset locking, unique
+  temp names, stale-temp cleanup, and failed-write cleanup.
+- Daemon project isolation: `b729164`; exact cross-project, prior-generation,
+  reload-serialization, and cross-session cache tests passed; daemon suite
+  passed 68/68.
+- Integrated verification after all three slices: `cargo fmt --check`,
+  `cargo check`, `cargo clippy --lib -- -D warnings`, and the full library suite
+  passed (`2709 passed; 0 failed; 2 ignored`).
 
 ## Review
 

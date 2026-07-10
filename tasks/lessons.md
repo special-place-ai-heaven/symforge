@@ -1,0 +1,6 @@
+# Lessons
+
+- 2026-07-10: For SymForge repository work, use the full SymForge MCP surface for code inspection and editing after a fresh `index_folder` plus `checkpoint_now(verify_after_write=true)`. If the connector is compact or unbound, report that limitation and repair/reconnect it; never silently fall back to `Get-Content`, Read, Grep, or Glob. Use direct reads only for exact docs/configs or after an explicit SymForge failure.
+- 2026-07-10: Run and monitor long or noisy commands such as Cargo builds/tests through Terminal Commander with structured rules and bounded summaries. Never stream raw build logs through repeated terminal polling; report only matched failures and the final exit verdict.
+- 2026-07-10: Delegated code tasks must include the full-surface SymForge helper path (`.symforge/codex-mcp-call.ps1 -UseRelease`). A compact or unbound registered connector is not permission for a subagent to inspect source through Terminal Commander or raw file tools; re-run any fallback inspection through SymForge before editing.
+- 2026-07-10: In a shared worktree, serialize TDD slices that introduce compile-red tests. An unrelated missing symbol prevents every other focused Cargo test from reaching its test body. Use one compile-red slice at a time (or an isolated worktree), restore a compiling tree, then release the next Cargo gate.
