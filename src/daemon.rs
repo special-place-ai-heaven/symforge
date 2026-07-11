@@ -3792,6 +3792,7 @@ async fn execute_tool_call(
             let sections = tp.sections.unwrap_or_default();
             let output = server
                 .get_symbol_context(Parameters(GetSymbolContextInput {
+                    project: None,
                     name: tp.name,
                     file: None,
                     path: Some(tp.path),
@@ -3949,7 +3950,7 @@ fn canonical_project_root(root: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))
 }
 
-fn project_key(root: &Path) -> String {
+pub(crate) fn project_key(root: &Path) -> String {
     let normalized = normalized_path_string(root);
     let stable_path = if cfg!(windows) {
         normalized.to_lowercase()

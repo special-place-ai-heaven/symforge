@@ -160,6 +160,12 @@ pub struct SearchTextInput {
 /// Input for `search_files`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct SearchFilesInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Filename, folder name, or partial path. Required for search and resolve modes. Optional when `changed_with` is provided.
     #[serde(default)]
     pub query: String,

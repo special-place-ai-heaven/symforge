@@ -451,6 +451,12 @@ impl HealthInput {
 /// Input for `what_changed`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct WhatChangedInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Optional Unix timestamp (seconds since epoch). Files newer than this are returned.
     #[serde(default, deserialize_with = "lenient_i64")]
     pub since: Option<i64>,
@@ -552,6 +558,12 @@ pub struct DetectImpactInput {
 /// Input for `analyze_file_impact`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct AnalyzeFileImpactInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative path to the file to re-read from disk.
     pub path: String,
     /// When true, treat the file as newly created and index it.
@@ -571,6 +583,12 @@ pub struct AnalyzeFileImpactInput {
 /// Input for `explore`.
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
 pub struct ExploreInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Natural-language concept or topic to explore (e.g., "error handling", "concurrency", "database").
     pub query: String,
     /// Maximum number of results per category (default 10).
@@ -607,6 +625,12 @@ pub struct ExploreInput {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SmartQueryInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Natural language question about the codebase. Examples:
     /// "who calls optimize_deterministic", "where is LiveIndex defined",
     /// "how does the parser work", "what changed", "find file tools.rs"
@@ -618,12 +642,24 @@ pub struct SmartQueryInput {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct EditPlanInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// The symbol name or file path you want to edit.
     pub target: String,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub struct InvestigationInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Optional focus area to filter suggestions.
     pub focus: Option<String>,
 }
@@ -631,6 +667,12 @@ pub struct InvestigationInput {
 /// Input for `diff_symbols`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DiffSymbolsInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Base git ref to compare from (default: "main").
     pub base: Option<String>,
     /// Target git ref to compare to (default: "HEAD").
@@ -3840,6 +3882,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_symbol", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
 
         // Batch mode: targets[] provided
         if let Some(ref targets) = params.0.targets {
@@ -4122,6 +4167,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_repo_map", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         // Single loading guard covering EVERY local path (estimate, compact, and
         // the `full`/`tree` outline branches), consistent with how
         // `search_symbols`/`search_text` guard at the top. Without this, an
@@ -4296,6 +4344,9 @@ impl SymForgeServer {
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("get_file_context", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         let force_refresh = params.0.force_refresh == Some(true);
         let params_hash = crate::protocol::session::hash_file_context_params(
@@ -4485,6 +4536,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
             let repo_root = self.capture_repo_root();
             let degraded = {
@@ -4642,6 +4696,9 @@ impl SymForgeServer {
         // Default: symbol context mode
         if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         let file_path_hint = params.0.path.as_deref().or(params.0.file.as_deref());
         // Auto-resolve path from index when not provided
@@ -4813,6 +4870,9 @@ impl SymForgeServer {
     ) -> String {
         if let Some(result) = self.proxy_tool_call("analyze_file_impact", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let with_co = params.0.include_co_changes.unwrap_or(false);
@@ -5452,6 +5512,9 @@ impl SymForgeServer {
     pub(crate) async fn search_files(&self, params: Parameters<SearchFilesInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_files", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         let include_vendor = params.0.include_vendor.unwrap_or(false);
         let include_personal_tooling = params.0.include_personal_tooling.unwrap_or(false);
@@ -6656,6 +6719,41 @@ impl SymForgeServer {
         }
     }
 
+    /// Task 4: local/embedded servers are bound to exactly ONE project. When a
+    /// tool call reaches local execution (stdio/embed, or a degraded daemon
+    /// fallback) carrying an explicit `project` selector that does not match
+    /// the bound project, refuse deterministically instead of silently serving
+    /// the wrong project. The selector matches when it equals the bound
+    /// project name, the bound root's deterministic project key, or the bound
+    /// root path itself. Returns `None` (proceed) when the selector is absent
+    /// or matches.
+    pub(crate) fn foreign_project_refusal(&self, project: Option<&str>) -> Option<String> {
+        let selector = project.map(str::trim).filter(|p| !p.is_empty())?;
+        if selector == self.project_name {
+            return None;
+        }
+        let bound_root = self.capture_repo_root();
+        if let Some(root) = bound_root.as_deref() {
+            if selector == crate::daemon::project_key(root) {
+                return None;
+            }
+            let root_text = root.display().to_string();
+            if selector == root_text || selector == root_text.replace('\\', "/") {
+                return None;
+            }
+        }
+        Some(format!(
+            "project '{selector}' is not available on this connection: this server is bound \
+             to the single project '{}'{}. Explicit project routing requires the daemon \
+             transport with the target project opened via index_folder(path=...).",
+            self.project_name,
+            bound_root
+                .as_deref()
+                .map(|root| format!(" ({})", root.display()))
+                .unwrap_or_default()
+        ))
+    }
+
     /// Reindex a directory from scratch — replaces the current index, restarts watcher, triggers
     /// git temporal analysis. Use when switching projects. Destructive to current index.
     #[tool(
@@ -6899,6 +6997,9 @@ impl SymForgeServer {
     pub(crate) async fn what_changed(&self, params: Parameters<WhatChangedInput>) -> String {
         if let Some(result) = self.proxy_tool_call("what_changed", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let with_diff = params.0.include_symbol_diff.unwrap_or(false);
@@ -7498,6 +7599,9 @@ impl SymForgeServer {
                 explicit_max_tokens,
             );
         }
+        if let Some(refusal) = self.foreign_project_refusal(input.project.as_deref()) {
+            return refusal;
+        }
         // Estimate mode: return token cost without reading content
         if input.estimate == Some(true) {
             let indexed = {
@@ -7685,6 +7789,9 @@ impl SymForgeServer {
 
         if let Some(result) = self.proxy_tool_call("validate_file_syntax", &input).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(input.project.as_deref()) {
+            return refusal;
         }
 
         let path_scope = search::PathScope::exact(&input.path);
@@ -8088,6 +8195,9 @@ impl SymForgeServer {
         }
         if let Some(result) = self.proxy_tool_call("find_dependents", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         let input = &params.0;
         let view = {
@@ -8577,6 +8687,9 @@ impl SymForgeServer {
     pub(crate) async fn explore(&self, params: Parameters<ExploreInput>) -> String {
         if let Some(result) = self.proxy_tool_call("explore", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let depth = params.0.depth.unwrap_or(1);
@@ -9345,6 +9458,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("edit_plan", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         let guard = self.index.read();
         loading_guard!(guard);
         let temporal = self.index.git_temporal();
@@ -9369,6 +9485,9 @@ impl SymForgeServer {
             .await
         {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         let guard = self.index.read();
         loading_guard!(guard);
@@ -10359,6 +10478,9 @@ impl SymForgeServer {
     pub(crate) async fn ask(&self, params: Parameters<SmartQueryInput>) -> String {
         use crate::protocol::smart_query;
 
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         let original_q = params.0.query.trim();
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
@@ -10426,6 +10548,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::FindFile { hint } => {
                 let input = SearchFilesInput {
+                    project: None,
                     query: hint.clone(),
                     limit: None,
                     current_file: None,
@@ -10444,6 +10567,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::FindChanges => {
                 let input = WhatChangedInput {
+                    project: None,
                     since: None,
                     git_ref: None,
                     uncommitted: Some(true),
@@ -10458,6 +10582,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::Understand { concept } => {
                 let input = ExploreInput {
+                    project: None,
                     query: concept.clone(),
                     limit: None,
                     depth: Some(2),
@@ -10473,6 +10598,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::UnderstandSymbol { symbol } => {
                 let input = GetSymbolContextInput {
+                    project: None,
                     name: symbol.clone(),
                     file: None,
                     path: None,
@@ -10537,6 +10663,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::FindDependents { target } => {
                 let input = FindDependentsInput {
+                    project: None,
                     path: target.clone(),
                     name: None,
                     limit: None,
@@ -10572,6 +10699,7 @@ impl SymForgeServer {
             }
             smart_query::QueryIntent::Explore { query } => {
                 let input = ExploreInput {
+                    project: None,
                     query: query.clone(),
                     limit: None,
                     depth: Some(2),
@@ -10618,6 +10746,9 @@ impl SymForgeServer {
     pub(crate) async fn diff_symbols(&self, params: Parameters<DiffSymbolsInput>) -> String {
         if let Some(result) = self.proxy_tool_call("diff_symbols", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         if params.0.estimate == Some(true) {
             let compact = params.0.compact.unwrap_or(false);
@@ -11919,6 +12050,7 @@ mod tests {
 
     fn get_file_content_input(path: &str) -> super::GetFileContentInput {
         super::GetFileContentInput {
+            project: None,
             path: path.to_string(),
             mode: None,
             start_line: None,
@@ -11943,6 +12075,7 @@ mod tests {
 
     fn get_symbol_input(path: &str, name: &str) -> super::GetSymbolInput {
         super::GetSymbolInput {
+            project: None,
             path: path.to_string(),
             name: name.to_string(),
             kind: None,
@@ -11974,6 +12107,7 @@ mod tests {
 
     fn search_files_input(query: &str) -> super::SearchFilesInput {
         super::SearchFilesInput {
+            project: None,
             query: query.to_string(),
             limit: None,
             current_file: None,
@@ -12126,6 +12260,7 @@ mod tests {
         // Any non-health tool should return the empty guard message
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
                 kind: None,
@@ -12152,6 +12287,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("full".to_string()),
                 path: None,
                 depth: None,
@@ -12169,6 +12305,7 @@ mod tests {
         // The `tree` outline branch must guard identically.
         let tree_result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("tree".to_string()),
                 path: None,
                 depth: None,
@@ -12186,6 +12323,7 @@ mod tests {
         // And the default compact branch.
         let compact_result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: None,
                 path: None,
                 depth: None,
@@ -12217,6 +12355,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             Some(crate::protocol::surface_probe::SurfaceProfile::Compact),
             server.get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("full".to_string()),
                 path: None,
                 depth: None,
@@ -12252,6 +12391,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             Some(crate::protocol::surface_probe::SurfaceProfile::Full),
             server.get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
                 kind: None,
@@ -12287,6 +12427,7 @@ mod tests {
         let result = crate::protocol::surface_probe::with_connection_surface(
             None,
             server.get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
                 kind: None,
@@ -12315,6 +12456,7 @@ mod tests {
         let server = make_server(make_live_index_tripped());
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: "anything.rs".to_string(),
                 name: "anything".to_string(),
                 kind: None,
@@ -12358,6 +12500,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/main.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -12382,6 +12525,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
                 kind: None,
@@ -12415,6 +12559,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: String::new(),
                 name: "foo".to_string(),
                 kind: None,
@@ -12642,6 +12787,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("full".to_string()),
                 path: None,
                 depth: None,
@@ -12661,6 +12807,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("full".to_string()),
                 path: None,
                 depth: None,
@@ -12716,6 +12863,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("full".to_string()),
                 path: None,
                 depth: None,
@@ -12780,6 +12928,7 @@ mod tests {
 
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: None,
                 path: None,
                 depth: None,
@@ -12838,6 +12987,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -12901,6 +13051,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -12955,6 +13106,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "Cargo.toml".to_string(),
                 max_tokens: Some(2000),
                 sections: Some(vec!["outline".to_string()]),
@@ -12990,6 +13142,7 @@ mod tests {
 
         let result = server
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
                 path: "Cargo.toml".to_string(),
                 estimate: None,
             }))
@@ -13071,6 +13224,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "package-lock.json".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -13128,6 +13282,7 @@ mod tests {
         for path in ["scripts/setup.sh", "LICENSE"] {
             let result = server
                 .get_file_context(Parameters(super::GetFileContextInput {
+                    project: None,
                     path: path.to_string(),
                     max_tokens: None,
                     force_refresh: None,
@@ -13158,6 +13313,7 @@ mod tests {
         // found" — real and absent files remain distinguishable to an agent.
         let absent = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "does/not/exist.tcl".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -13340,6 +13496,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "totally/absent/file.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -13461,6 +13618,7 @@ mod tests {
 
         let result = server
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
                 path: "broken.py".to_string(),
                 estimate: None,
             }))
@@ -13495,6 +13653,7 @@ mod tests {
 
         let result = server
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
                 path: "broken.rs".to_string(),
                 estimate: None,
             }))
@@ -13558,6 +13717,7 @@ mod tests {
         // Check caller.rs — should have "Imports from" section.
         let caller_result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/caller.rs".to_string(),
                 max_tokens: Some(2000),
                 sections: None,
@@ -13577,6 +13737,7 @@ mod tests {
         // Check target.rs — should have "Used by" section.
         let target_result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 max_tokens: Some(2000),
                 sections: None,
@@ -13617,6 +13778,7 @@ mod tests {
 
         let result = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/target.py".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -13661,6 +13823,7 @@ mod tests {
 
             let result = server
                 .get_file_context(Parameters(super::super::GetFileContextInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     max_tokens: Some(2000),
                     sections: None,
@@ -13716,6 +13879,7 @@ mod tests {
             let started = Instant::now();
             let result = server
                 .get_symbol_context(Parameters(super::super::GetSymbolContextInput {
+                    project: None,
                     name: "function_000".to_string(),
                     file: None,
                     path: Some("src/large.rs".to_string()),
@@ -13770,6 +13934,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "target".to_string(),
                 file: None,
                 path: None,
@@ -13822,6 +13987,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "target".to_string(),
                 file: None,
                 path: None,
@@ -13888,6 +14054,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "ProjectOrchestratorActor".to_string(),
                 file: None,
                 path: Some("src/actors.rs".to_string()),
@@ -13947,6 +14114,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: Some("src/db.rs".to_string()),
@@ -13988,6 +14156,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: Some("src/db.rs".to_string()),
@@ -14041,6 +14210,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: None,
@@ -14098,6 +14268,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: Some("src/beta.rs".to_string()),
@@ -14141,6 +14312,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: None,
@@ -14246,6 +14418,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: Some("src/service.rs".to_string()),
                 path: Some("src/db.rs".to_string()),
@@ -14279,6 +14452,7 @@ mod tests {
 
         let result = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 new_file: None,
                 include_co_changes: None,
@@ -14303,6 +14477,7 @@ mod tests {
 
         let result = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 new_file: None,
                 include_co_changes: None,
@@ -14336,6 +14511,7 @@ mod tests {
 
         let result = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 new_file: None,
                 include_co_changes: None,
@@ -14365,6 +14541,7 @@ mod tests {
 
         let result = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "src/fresh.rs".to_string(),
                 new_file: None,
                 include_co_changes: None,
@@ -14410,6 +14587,7 @@ mod tests {
 
         let impact = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "scratch/impact_case.rs".to_string(),
                 new_file: None,
                 include_co_changes: None,
@@ -14425,6 +14603,7 @@ mod tests {
 
         let outline = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "scratch/impact_case.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -14470,6 +14649,7 @@ mod tests {
 
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -14549,6 +14729,7 @@ mod tests {
 
         let outline = server
             .get_file_context(Parameters(super::GetFileContextInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 max_tokens: None,
                 force_refresh: None,
@@ -16237,6 +16418,7 @@ mod tests {
         ]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "protocol/tools.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16365,6 +16547,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "src/service.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -16411,6 +16594,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "src/new_service.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -16463,6 +16647,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "service.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -16493,6 +16678,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: String::new(),
                 limit: None,
                 current_file: None,
@@ -16562,6 +16748,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: String::new(),
                 limit: None,
                 current_file: None,
@@ -16615,6 +16802,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16668,6 +16856,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16709,6 +16898,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16749,6 +16939,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16786,6 +16977,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16823,6 +17015,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16863,6 +17056,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16898,6 +17092,7 @@ mod tests {
         ));
         let default = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16916,6 +17111,7 @@ mod tests {
 
         let path_cochange = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16956,6 +17152,7 @@ mod tests {
         ]));
         let default = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -16974,6 +17171,7 @@ mod tests {
 
         let path_cochange = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
                 current_file: None,
@@ -17011,6 +17209,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17050,6 +17249,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17081,6 +17281,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17120,6 +17321,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17155,6 +17357,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "vendor/**/*.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17191,6 +17394,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "src/protocol/tools.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17225,6 +17429,7 @@ mod tests {
         ]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                project: None,
                 query: "lib.rs".to_string(),
                 limit: None,
                 current_file: None,
@@ -17723,6 +17928,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: String::new(),
                 name: String::new(),
                 kind: None,
@@ -17757,6 +17963,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_symbol(Parameters(super::GetSymbolInput {
+                project: None,
                 path: String::new(),
                 name: String::new(),
                 kind: None,
@@ -17791,6 +17998,7 @@ mod tests {
         // since=0 (far past) → all files are "newer"
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: Some(0),
                 git_ref: None,
                 uncommitted: None,
@@ -17822,6 +18030,7 @@ mod tests {
         ]));
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: Some(0),
                 git_ref: None,
                 uncommitted: None,
@@ -17871,6 +18080,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -17921,6 +18131,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: Some(true),
@@ -17976,6 +18187,7 @@ mod tests {
 
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18005,6 +18217,7 @@ mod tests {
 
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18064,6 +18277,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: Some("HEAD".to_string()),
                 uncommitted: None,
@@ -18111,6 +18325,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18153,6 +18368,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18183,6 +18399,7 @@ mod tests {
         ]));
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: Some(0),
                 git_ref: None,
                 uncommitted: None,
@@ -18223,6 +18440,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: Some("HEAD".to_string()),
                 uncommitted: None,
@@ -18271,6 +18489,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18317,6 +18536,7 @@ mod tests {
         );
         let result = server
             .what_changed(Parameters(super::WhatChangedInput {
+                project: None,
                 since: None,
                 git_ref: None,
                 uncommitted: None,
@@ -18420,6 +18640,41 @@ mod tests {
         );
     }
 
+    /// Task 4: a local/embedded server is bound to ONE project. An explicit
+    /// `project` selector that doesn't match refuses deterministically; a
+    /// matching selector (bound project name) proceeds normally.
+    #[tokio::test]
+    async fn test_local_server_refuses_foreign_project_selector() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let foreign: super::GetFileContentInput = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "project": "some-other-project"
+        }))
+        .expect("foreign input");
+        let refused = server.get_file_content(Parameters(foreign)).await;
+        assert!(
+            refused.contains("not available on this connection"),
+            "foreign selector must refuse: {refused}"
+        );
+        assert!(
+            !refused.contains("fn foo"),
+            "foreign selector must not serve the bound project's bytes: {refused}"
+        );
+
+        let matching: super::GetFileContentInput = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "project": "test_project"
+        }))
+        .expect("matching input");
+        let served = server.get_file_content(Parameters(matching)).await;
+        assert!(
+            served.contains("fn foo"),
+            "matching selector must proceed locally: {served}"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_file_content_returns_content() {
         let content = b"line 1\nline 2\nline 3";
@@ -18427,6 +18682,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -18461,6 +18717,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let human_text = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19510,6 +19767,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19550,6 +19808,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "nonexistent.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19584,6 +19843,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(2),
@@ -19615,6 +19875,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19646,6 +19907,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(2),
@@ -19677,6 +19939,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19708,6 +19971,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19747,6 +20011,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(2),
@@ -19781,6 +20046,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19812,6 +20078,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19846,6 +20113,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19877,6 +20145,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19908,6 +20177,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19939,6 +20209,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -19982,6 +20253,7 @@ mod tests {
 
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20030,6 +20302,7 @@ mod tests {
 
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "./src\\lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20073,6 +20346,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20111,6 +20385,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20152,6 +20427,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20187,6 +20463,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20221,6 +20498,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(2),
@@ -20255,6 +20533,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20289,6 +20568,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(2),
@@ -20323,6 +20603,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20357,6 +20638,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20397,6 +20679,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("symbol".to_string()),
                 start_line: None,
@@ -20431,6 +20714,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("symbol".to_string()),
                 start_line: None,
@@ -20462,6 +20746,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("lines".to_string()),
                 start_line: Some(1),
@@ -20500,6 +20785,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("lines".to_string()),
                 start_line: Some(1),
@@ -20538,6 +20824,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(1),
@@ -20572,6 +20859,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("search".to_string()),
                 start_line: None,
@@ -20607,6 +20895,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("symbol".to_string()),
                 start_line: None,
@@ -20645,6 +20934,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("symbol".to_string()),
                 start_line: None,
@@ -20679,6 +20969,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("fancy".to_string()),
                 start_line: None,
@@ -20713,6 +21004,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("match".to_string()),
                 start_line: None,
@@ -20744,6 +21036,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -20778,6 +21071,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("match".to_string()),
                 start_line: None,
@@ -20812,6 +21106,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("chunk".to_string()),
                 start_line: None,
@@ -20843,6 +21138,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("chunk".to_string()),
                 start_line: None,
@@ -20877,6 +21173,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: Some("chunk".to_string()),
                 start_line: None,
@@ -20962,6 +21259,7 @@ mod tests {
 
     fn make_alias_input(offset: Option<u32>, limit: Option<u32>) -> super::GetFileContentInput {
         super::GetFileContentInput {
+            project: None,
             path: "x".to_string(),
             mode: None,
             start_line: None,
@@ -21090,6 +21388,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: None,
@@ -21122,6 +21421,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_file_content(Parameters(super::GetFileContentInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 mode: None,
                 start_line: Some(1),
@@ -21159,6 +21459,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: None,
                 depth: None,
@@ -21195,6 +21496,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(5),
                 depth: None,
@@ -21236,6 +21538,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(5),
                 depth: None,
@@ -21295,6 +21598,7 @@ mod tests {
         ]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(5),
                 depth: None,
@@ -21321,6 +21625,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "process data".to_string(),
                 limit: Some(5),
                 depth: None,
@@ -21344,6 +21649,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "".to_string(),
                 limit: None,
                 depth: None,
@@ -21379,6 +21685,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(5),
                 depth: Some(2),
@@ -21418,6 +21725,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "burst debounce".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21467,6 +21775,7 @@ mod tests {
 
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "actor supervision and error recovery".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21524,6 +21833,7 @@ mod tests {
 
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "event fanout delivery".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21619,6 +21929,7 @@ mod tests {
 
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "authentication middleware".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21673,6 +21984,7 @@ mod tests {
 
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "authentication middleware guard".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21715,6 +22027,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "watcher".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -21743,6 +22056,7 @@ mod tests {
 
     fn explore_input(query: &str, limit: usize) -> super::ExploreInput {
         super::ExploreInput {
+            project: None,
             query: query.to_string(),
             limit: Some(limit as u32),
             depth: None,
@@ -22069,6 +22383,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling in the watcher".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22152,6 +22467,7 @@ mod tests {
 
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "admission tiering decide which files get indexed".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22213,6 +22529,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22261,6 +22578,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(vkey, vfile), (skey, sfile)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22300,6 +22618,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(vkey, vfile)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22335,6 +22654,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(vkey, vfile)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(10),
                 depth: None,
@@ -22457,6 +22777,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(vkey, vfile), (skey, sfile)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(1),
                 depth: None,
@@ -22499,6 +22820,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .explore(Parameters(super::ExploreInput {
+                project: None,
                 query: "error handling".to_string(),
                 limit: Some(5),
                 depth: None,
@@ -22788,6 +23110,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "process".to_string(),
                 file: None,
                 path: Some("src/lib.rs".to_string()),
@@ -22818,6 +23141,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "process".to_string(),
                 file: None,
                 path: None,
@@ -22982,6 +23306,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("tree".to_string()),
                 path: None,
                 depth: None,
@@ -23005,6 +23330,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_repo_map(Parameters(super::GetRepoMapInput {
+                project: None,
                 detail: Some("tree".to_string()),
                 path: None,
                 depth: None,
@@ -23293,6 +23619,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: None,
                 limit: None,
@@ -23311,6 +23638,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "process".to_string(),
                 file: None,
                 path: Some("src/lib.rs".to_string()),
@@ -23331,6 +23659,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "process".to_string(),
                 file: None,
                 path: Some("src/nonexistent.rs".to_string()),
@@ -23381,6 +23710,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: Some("src/db.rs".to_string()),
@@ -23430,6 +23760,7 @@ mod tests {
 
         let result = server
             .get_symbol_context(Parameters(super::GetSymbolContextInput {
+                project: None,
                 name: "connect".to_string(),
                 file: None,
                 path: Some("src/db.rs".to_string()),
@@ -23588,6 +23919,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/nonexistent.rs".to_string(),
                 name: None,
                 limit: None,
@@ -23613,6 +23945,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: Some("my_symbol".to_string()),
                 limit: None,
@@ -23645,6 +23978,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/nonexistent.rs".to_string(),
                 name: Some("   ".to_string()),
                 limit: None,
@@ -23689,6 +24023,7 @@ mod tests {
 
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 name: None,
                 compact: None,
@@ -23741,6 +24076,7 @@ mod tests {
 
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 name: None,
                 compact: None,
@@ -23794,6 +24130,7 @@ mod tests {
 
         let result = server
             .find_dependents(Parameters(super::FindDependentsInput {
+                project: None,
                 path: "src/target.rs".to_string(),
                 name: None,
                 compact: None,
@@ -24440,6 +24777,7 @@ mod tests {
         let server = make_server(make_live_index_empty());
         let result = server
             .analyze_file_impact(Parameters(super::AnalyzeFileImpactInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 new_file: None,
                 include_co_changes: Some(true),
@@ -26281,6 +26619,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "who calls helper".to_string(),
             max_tokens: None,
         };
@@ -26321,6 +26660,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "what tools can I use for impact analysis?".to_string(),
             max_tokens: None,
         };
@@ -26362,6 +26702,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "LiveIndex".to_string(),
             max_tokens: None,
         };
@@ -26404,6 +26745,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "Where is TestingController defined and what module imports it?".to_string(),
             max_tokens: None,
         };
@@ -26439,6 +26781,7 @@ mod tests {
     async fn test_ask_reports_fallback_route_confidence() {
         let server = make_server(make_live_index_ready(vec![]));
         let input = super::SmartQueryInput {
+            project: None,
             query: "error handling patterns".to_string(),
             max_tokens: None,
         };
@@ -26475,6 +26818,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "how does BusActor work?".to_string(),
             max_tokens: None,
         };
@@ -26539,6 +26883,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "how does MyHandler work?".to_string(),
             max_tokens: None,
         };
@@ -26575,6 +26920,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "how does BusActor interact with WorkerActor?".to_string(),
             max_tokens: None,
         };
@@ -26605,6 +26951,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "how does handle work?".to_string(),
             max_tokens: None,
         };
@@ -26635,6 +26982,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "what are the main actor types?".to_string(),
             max_tokens: None,
         };
@@ -26677,6 +27025,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "what are the main types?".to_string(),
             max_tokens: None,
         };
@@ -26707,6 +27056,7 @@ mod tests {
         );
 
         let input = super::SmartQueryInput {
+            project: None,
             query: "who calls helper in src/lib.rs".to_string(),
             max_tokens: None,
         };
@@ -26738,6 +27088,7 @@ mod tests {
         );
 
         let input = super::EditPlanInput {
+            project: None,
             target: "src/lib.rs::helper".to_string(),
         };
         let result = server.edit_plan(Parameters(input)).await;
@@ -27016,6 +27367,7 @@ mod tests {
         );
         let result = server
             .diff_symbols(Parameters(super::DiffSymbolsInput {
+                project: None,
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 path_prefix: None,

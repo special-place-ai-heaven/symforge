@@ -489,6 +489,29 @@ cd E:\project\symforge
   --test-threads=1` = 1 passed;
   `daemon::tests::test_runtime_for_target_resolution_contract` = 1 passed;
   `cargo test --lib daemon:: -- --test-threads=1` = 74 passed / 0 failed.
+- Explicit project routing, schema + local-guard slice (2026-07-11): added the
+  optional `project` selector field (serde default, documented) to the 15
+  routed input structs (GetSymbol/GetSymbolContext/GetFileContext/
+  GetFileContent/GetRepoMap/SearchFiles/FindDependents/DiffSymbols/
+  WhatChanged/AnalyzeFileImpact/ValidateFileSyntax/Explore/SmartQuery/
+  EditPlan/Investigation), including both manual `Deserialize` Raw structs;
+  added `SymForgeServer::foreign_project_refusal` and wired it after the proxy
+  attempt in all 16 local handlers (`ask` included) so a stdio/embed/degraded
+  server refuses a non-matching explicit selector instead of silently serving
+  the bound project; 200 struct-literal sites updated mechanically from cargo
+  E0063 spans. Receipts: `cargo test --test strict_client_schema_compat` = 1
+  passed; focused `test_local_server_refuses_foreign_project_selector` = 1
+  passed; full `cargo test --lib -- --test-threads=1` = 2728 passed / 0
+  failed; `cargo clippy --all-targets -- -D warnings` exit 0. NOTE: Terminal
+  Commander daemon became unavailable mid-session (health probe
+  daemon_unavailable); remaining commands ran through the harness's headless
+  shell — no visible terminals — until TC returns.
+- New dogfood defect (2026-07-11, unfiled): the watcher demoted
+  `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
+  "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels
+  a large text source file as binary, and a Tier-2 core source file breaks
+  symbol navigation on the project's own biggest module. Needs a red fixture
+  (admission reason honesty + threshold review) before the final gate.
 - New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
   on a conflict-markered Rust file reported `Completeness: full` with a symbol
   count in the header while rendering no outline entries (only the tail of the
