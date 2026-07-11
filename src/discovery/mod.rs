@@ -993,9 +993,17 @@ pub fn is_binary_content(content: &[u8]) -> bool {
         return true;
     }
 
-    // Heuristic 2: Invalid UTF-8
-    if std::str::from_utf8(window).is_err() {
-        return true;
+    // Heuristic 2: Invalid UTF-8. An INCOMPLETE multibyte sequence at the end
+    // of a TRUNCATED window is a sampling artifact (the cut landed mid-char),
+    // not binary evidence — `error_len() == None` means "unexpected end of
+    // data", and more bytes exist beyond the window to complete the sequence.
+    // (Dogfood 2026-07-11: the 8KB cut split a `─` in src/protocol/tools.rs
+    // at byte 8190 and demoted 1.1 MB of pure-UTF-8 Rust to Tier 2 "binary".)
+    if let Err(error) = std::str::from_utf8(window) {
+        let boundary_cut = error.error_len().is_none() && check_len < content.len();
+        if !boundary_cut {
+            return true;
+        }
     }
 
     // Heuristic 3: High control byte ratio
@@ -2021,6 +2029,40 @@ mod tests {
     fn test_binary_sniff_detects_invalid_utf8() {
         let content: &[u8] = &[0x80, 0x81, 0x82, 0x83, 0x84];
         assert!(is_binary_content(content));
+    }
+
+    /// Dogfood 2026-07-11: the 8KB sniff window cut `src/protocol/tools.rs`
+    /// (pure-UTF-8 Rust, 1.1 MB, box-drawing `─` chars) mid-multibyte
+    /// sequence at byte 8190, and the resulting "unexpected end of data"
+    /// decode error demoted the project's biggest source file to Tier 2 as
+    /// "binary". An INCOMPLETE sequence at the truncation boundary is a
+    /// sampling artifact, not binary evidence.
+    #[test]
+    fn test_binary_sniff_forgives_multibyte_cut_at_window_boundary() {
+        let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
+        // Valid ASCII up to two bytes before the window edge, then a 3-byte
+        // `─` (U+2500) straddling the cut, then more valid text beyond it.
+        let mut content = vec![b'a'; sniff - 2];
+        content.extend_from_slice("─".as_bytes());
+        content.extend_from_slice(b" trailing source text beyond the sniff window");
+        assert!(
+            !is_binary_content(&content),
+            "a multibyte char cut by the sniff window must not read as binary"
+        );
+    }
+
+    /// Genuinely invalid bytes INSIDE the window (not a boundary cut) must
+    /// still classify as binary — the boundary forgiveness is narrow.
+    #[test]
+    fn test_binary_sniff_still_detects_interior_invalid_utf8() {
+        let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
+        let mut content = vec![b'a'; 100];
+        content.push(0x80); // orphan continuation byte, interior
+        content.extend(vec![b'b'; sniff]); // window extends well past it
+        assert!(
+            is_binary_content(&content),
+            "interior invalid UTF-8 must stay classified as binary"
+        );
     }
 
     #[test]

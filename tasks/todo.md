@@ -665,12 +665,18 @@ cd E:\project\symforge
   `live_index::view::tests::cross_project_search_files_attributes_hits_per_target`
   green; daemon lib 81 passed; view 13 passed; strict_client_schema_compat +
   stel_param_disposition green; clippy/fmt clean; full-suite receipt pending.
-- New dogfood defect (2026-07-11, unfiled): the watcher demoted
-  `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
-  "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels
-  a large text source file as binary, and a Tier-2 core source file breaks
-  symbol navigation on the project's own biggest module. Needs a red fixture
-  (admission reason honesty + threshold review) before the final gate.
+- Watcher "binary" mislabel FIXED (2026-07-11): root cause was NOT the size
+  threshold (code files already get 4 MB) — `is_binary_content`'s 8 KB sniff
+  window cut `src/protocol/tools.rs` mid-multibyte `─` at byte 8190
+  (empirically verified against the real file), and the "unexpected end of
+  data" decode error read as invalid UTF-8 → Tier 2 "binary". Fix: an
+  incomplete sequence at the truncation boundary (`error_len() == None` with
+  bytes remaining past the window) is a sampling artifact, not binary
+  evidence; genuinely invalid interior bytes still classify as binary.
+  Receipts: red→green
+  `test_binary_sniff_forgives_multibyte_cut_at_window_boundary` +
+  `test_binary_sniff_still_detects_interior_invalid_utf8`; discovery 74,
+  watcher 38, store 62 passed; clippy/fmt clean.
 - New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
   on a conflict-markered Rust file reported `Completeness: full` with a symbol
   count in the header while rendering no outline entries (only the tail of the
