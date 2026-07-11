@@ -694,7 +694,69 @@ cd E:\project\symforge
   CONSUMING harness's display truncation; the tool-side dishonesty window was
   real regardless and is now closed.
 
-## Review
+## Review (2026-07-11, Task 13 — campaign closure)
 
-- In progress. Add verified commits, focused/full gate receipts, scorecard,
-  adversarial findings, and remaining operator gates here before completion.
+### Verified commits (this campaign, `4cd9b34..HEAD`)
+
+`ea342f8` immutable-home/additive index_folder · `f4e972c` watcher
+generated-output parity · `ce554b1` recovered-review blockers · `d651ba5` +
+`3d5a209` + `489c285` explicit project routing (reads + edits) · `7be810e`
+project inventory · `c0e6307` session reaper · `ed143c4` typed
+ProjectEvidence · `671b281` fork-bomb guards + owner-checked cleanup +
+reconnect restore · `8899957` hidden_command sweep + tripwire · `bc96594`
+per-session descriptors · `d0623f5` guarded-start singleton + TTL evidence ·
+`f40352d` search_files fan-out + facade project routing · `7656699` binary
+sniff boundary fix · `51bda85` ledger closure docs · `6f6eac6` completeness
+downgrade after truncation.
+
+### Final gate receipts (at `6f6eac6`; later commits are docs-only)
+
+- `cargo fmt --check` ✓ · `git diff --check` ✓ · `cargo check` ✓ ·
+  `cargo clippy --all-targets -- -D warnings` ✓
+- `cargo test --all-targets -- --test-threads=1`: **110 test binaries, 3460
+  passed, 0 failed, exit 0** (`suite-envelope.log`)
+- `cargo build --release` exit 0 · `cargo check --no-default-features
+  --features embed` ✓ · `npm test` 31/31
+- Tool-correctness harness on the RELEASE binary: `verify-tools` 8 PASS +
+  `verify-tools-real` 11 PASS, 0 REVIEW, 0 FAIL
+- Release-binary multi-project dogfood (isolated `SYMFORGE_HOME`, real
+  daemon, 2 projects, sibling adapters): **17/17 checks PASS** — additive
+  receipt + checkpoint evidence, inventory with home marker +
+  `last_seen`/`ttl_secs`, immutable-home routing (no B-byte leak), explicit-B
+  reads, `projects=["*"]` fan-out attributed for files+symbols, unknown
+  selector candidates, sibling shutdown does not break the surviving session.
+- Tool-substitution scorecard filled from measured transcripts
+  (`docs/reviews/2026-07-10-tool-substitution-scorecard.md`): aggregate ~7.8×
+  token advantage with all facts retained; unfavorable rows (narrow `rg`
+  queries) recorded honestly.
+
+### Adversarial findings (self-review; delegation forbidden by handoff)
+
+1. **Stale-snapshot serving (existing behavior, NOT fixed here):** a fresh
+   local session over a repo with an old `.symforge` snapshot served stale
+   index content as `current index` (daemon.rs at 210 symbols vs. current
+   314) until an explicit `index_folder`. Same class as the known
+   external-edit staleness finding; follow-up candidate.
+2. **Trust-envelope gap:** `get_symbol`, `find_dependents`, `edit_plan`
+   responses carry no trust envelope (scorecard rows 2/6/8) while
+   search/context tools do. Follow-up candidate, not a regression.
+3. **Facade injection edge (accepted risk):** the per-step `project`
+   injection skips a non-object step `args` silently; the planner only emits
+   object args, and the all-or-nothing tool check guards the honest case.
+4. **Behavior change (deliberate):** routed verbs now reject
+   `project`+`projects` together (previously a stray `projects` on a routed
+   tool was silently ignored). Honest-refusal improvement; pinned by test.
+5. **Guarded start residuals (bounded):** a crashed lock-holder stalls a
+   foreground start for up to the 30s stale-lock threshold; a narrow race can
+   transiently spawn a second child which exits cleanly via
+   `AlreadyRunning` without touching the winner's runtime record (pinned by
+   `tests/daemon_singleton.rs`).
+6. **Environment evidence:** during review the machine ran 3 daemons + 5
+   adapters of the INSTALLED 8.13.9 (pre-campaign) binary, and this repo's
+   hooks were served by a daemon rooted at another project — live
+   confirmation of the sprawl/retarget class this branch fixes.
+
+### Remaining operator gates
+
+Merge approval → merge with the release-please guard → publish → restart
+harness sessions (installed daemons pick up the fixes) → `cargo clean`.
