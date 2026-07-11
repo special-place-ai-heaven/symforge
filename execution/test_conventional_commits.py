@@ -110,6 +110,20 @@ class ConventionalCommitTests(unittest.TestCase):
             [],
         )
 
+    def test_ignores_wip_checkpoint_subjects(self) -> None:
+        """A `wip:` checkpoint is an explicit changelog opt-out (release-please
+        skips non-conventional subjects), not the typo this gate catches —
+        one historical checkpoint must not wedge the Release run on main."""
+        self.assertEqual(
+            conventional_commits.check_subjects(
+                ["wip: checkpoint outstanding-work hardening"]
+            ),
+            [],
+        )
+        # A bare `wip` without the marker shape is still a problem.
+        problems = conventional_commits.check_subjects(["wip checkpoint"])
+        self.assertEqual(len(problems), 1)
+
     def test_rejects_nonconventional_subject(self) -> None:
         problems = conventional_commits.check_subjects(["Add conformance suite for MCP tool surface"])
         self.assertEqual(len(problems), 1)

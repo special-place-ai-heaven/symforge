@@ -27,6 +27,12 @@ IGNORED_PREFIXES = (
     "Merge pull request #",
     "Merge branch ",
     "Merge remote-tracking branch ",
+    # `wip:` checkpoints are an EXPLICIT changelog opt-out: release-please
+    # ignores non-conventional subjects, and a deliberately-typed checkpoint
+    # inside a merged feature branch is not the typo this gate exists to
+    # catch. Without this, one historical `wip:` commit wedges every
+    # subsequent Release run on main (2026-07-11, run #763 on 77990fb).
+    "wip: ",
 )
 
 
