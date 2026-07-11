@@ -6719,6 +6719,30 @@ impl SymForgeServer {
         }
     }
 
+    /// Task 7: the LOCAL bound-project trust evidence — what this in-process
+    /// index would serve. Used as the seed for the per-dispatch evidence slot;
+    /// a daemon receipt overwrites it when the proxy answers.
+    pub(crate) fn local_project_evidence(
+        &self,
+    ) -> Option<crate::protocol::result_status::ProjectEvidence> {
+        let root = self.capture_repo_root();
+        let published = self.index.published_state();
+        let load_source = format!("{:?}", self.index.read().load_source());
+        Some(crate::protocol::result_status::ProjectEvidence {
+            project_id: root
+                .as_deref()
+                .map(crate::daemon::project_key)
+                .unwrap_or_else(|| "unbound".to_string()),
+            project_name: self.project_name.clone(),
+            canonical_root: root.map(|r| r.display().to_string().replace('\\', "/")),
+            generation: self.index.current_project_generation(),
+            index_state: published.status_label().to_string(),
+            load_source,
+            index_files: published.file_count,
+            index_symbols: published.symbol_count,
+        })
+    }
+
     /// Task 4: local/embedded servers are bound to exactly ONE project. When a
     /// tool call reaches local execution (stdio/embed, or a degraded daemon
     /// fallback) carrying an explicit `project` selector that does not match
@@ -18639,6 +18663,39 @@ mod tests {
         assert!(
             result.contains("include_data"),
             "the disclosure must name the include_data recovery lever: {result}"
+        );
+    }
+
+    /// Task 7: a statused local tool result carries the bound project's trust
+    /// evidence in `_meta` (project id/root, generation, index state, load
+    /// source) when rendered inside a dispatch scope — the machine-readable
+    /// receipt for "which project actually served this".
+    #[tokio::test]
+    async fn test_local_tool_meta_carries_project_evidence() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let input: super::GetFileContentInput =
+            serde_json::from_value(serde_json::json!({"path": "src/lib.rs"})).expect("input");
+        let result = crate::protocol::result_status::with_project_evidence_scope(
+            server.local_project_evidence(),
+            server.get_file_content_tool(Parameters(input)),
+        )
+        .await
+        .expect("tool result");
+        let serialized = serde_json::to_value(&result).expect("serialize");
+        let evidence = &serialized["_meta"]["symforge/project_evidence"];
+        assert_eq!(
+            evidence["project_name"], "test_project",
+            "local evidence must name the bound project: {serialized}"
+        );
+        assert!(
+            evidence["index_state"].is_string() && evidence["load_source"].is_string(),
+            "evidence must carry index state and load source: {serialized}"
+        );
+        assert!(
+            evidence["generation"].is_number(),
+            "evidence must carry the serving generation: {serialized}"
         );
     }
 

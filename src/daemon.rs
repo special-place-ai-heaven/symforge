@@ -1881,6 +1881,20 @@ impl DaemonSessionClient {
             .error_for_status()
             .with_context(|| format!("daemon rejected tool '{tool_name}'"))?;
 
+        // Task 7: the daemon's selected-project receipt arrives out-of-band as
+        // a response header; parse the typed evidence and record it in the
+        // per-dispatch slot so the statused wrapper attaches it to `_meta`.
+        // Never reconstructed from the text body.
+        if let Some(header) = response
+            .headers()
+            .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+            && let Ok(text) = header.to_str()
+            && let Ok(evidence) =
+                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(text)
+        {
+            crate::protocol::result_status::record_project_evidence(evidence);
+        }
+
         response
             .text()
             .await
@@ -2937,7 +2951,8 @@ async fn call_tool_handler(
     headers: HeaderMap,
     AxumPath((session_id, tool_name)): AxumPath<(String, String)>,
     Json(params): Json<serde_json::Value>,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
     authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     if tool_name == "index_folder" {
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
@@ -2954,7 +2969,8 @@ async fn call_tool_handler(
             })
             .await
             .map_err(|gov_err| bad_request(gov_err.into()))?
-            .map_err(bad_request);
+            .map_err(bad_request)
+            .map(|text| text.into_response());
     }
 
     // Task 7: `status(detail="projects")` renders the SESSION's open-project
@@ -2977,7 +2993,8 @@ async fn call_tool_handler(
                         StatusCode::NOT_FOUND,
                         format!("unknown session '{session_id}'"),
                     )
-                });
+                })
+                .map(|text| text.into_response());
         }
     }
 
@@ -3012,7 +3029,7 @@ async fn call_tool_handler(
             // Deterministic routing errors surface as HTTP 200 tool text (same
             // convention as tool errors below) so the MCP client sees the
             // candidates immediately instead of a transport failure.
-            Err(message) => return Ok(message),
+            Err(message) => return Ok(message.into_response()),
         }
     } else {
         state.session_runtime(&session_id).ok_or_else(|| {
@@ -3030,6 +3047,30 @@ async fn call_tool_handler(
     // spawn_blocking moves execution to tokio's blocking thread pool (default
     // 512 threads), keeping async worker threads free for I/O, MCP transport,
     // and new request acceptance.
+    // Task 7: the selected-project trust evidence for THIS call, captured from
+    // the resolved runtime before dispatch. Returned out-of-band as a response
+    // header so the human-readable body stays byte-identical; the adapter
+    // parses it into the typed receipt and attaches it to `_meta`.
+    let call_evidence_json = {
+        let published = runtime.index.published_state();
+        serde_json::to_string(&crate::protocol::result_status::ProjectEvidence {
+            project_id: runtime.project_id.clone(),
+            project_name: runtime
+                .canonical_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string(),
+            canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
+            generation: runtime.index.current_project_generation(),
+            index_state: published.status_label().to_string(),
+            load_source: format!("{:?}", runtime.index.read().load_source()),
+            index_files: published.file_count,
+            index_symbols: published.symbol_count,
+        })
+        .ok()
+    };
+
     let tool_name_owned = tool_name.clone();
     let tool_name_for_panic = tool_name.clone();
     let state_for_refresh = Arc::clone(&state);
@@ -3078,12 +3119,21 @@ async fn call_tool_handler(
                 result.push('\n');
                 result.push_str(&inventory);
             }
-            Ok(result)
+            let mut response = result.into_response();
+            if let Some(json) = call_evidence_json
+                && let Ok(value) = axum::http::HeaderValue::try_from(json)
+            {
+                response.headers_mut().insert(
+                    crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+                    value,
+                );
+            }
+            Ok(response)
         }
         Ok(Err(tool_err)) => {
             // Tool returned an error — surface it as HTTP 200 so the MCP client
             // gets the message immediately instead of entering reconnect/timeout.
-            Ok(format!("Error in {}: {}", tool_name_for_panic, tool_err))
+            Ok(format!("Error in {}: {}", tool_name_for_panic, tool_err).into_response())
         }
         Err(gov_err) => {
             // Governor error (timeout, queue full, panic) — return as HTTP 200
@@ -3093,7 +3143,7 @@ async fn call_tool_handler(
                 tool_name_for_panic, gov_err
             );
             tracing::error!(tool = %tool_name_for_panic, "tool execution failed: {gov_err}");
-            Ok(msg)
+            Ok(msg.into_response())
         }
     }
 }
@@ -8170,6 +8220,118 @@ mod tests {
         assert!(
             unknown.contains("not open") && unknown.contains(&project_b_id),
             "unknown selector must return candidates: {unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 7: every routed daemon tool response carries a machine-readable
+    /// selected-project receipt (out-of-band header) identifying the project
+    /// that actually served — home by default, the routed sibling when
+    /// `project` was explicit.
+    #[tokio::test]
+    async fn test_tool_receipt_carries_project_evidence() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-receipt-home-a");
+        let project_b = project_dir("symforge-receipt-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "receipt".to_string(),
+                pid: Some(80),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let evidence_for = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/get_repo_map",
+                opened.session_id
+            );
+            async move {
+                let response = client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status");
+                let header = response
+                    .headers()
+                    .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+                    .expect("evidence header must be present")
+                    .to_str()
+                    .expect("evidence header must be ASCII")
+                    .to_string();
+                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(&header)
+                    .expect("evidence header must parse as typed evidence")
+            }
+        };
+
+        let home_evidence = evidence_for(serde_json::json!({"detail": "compact"})).await;
+        assert_eq!(
+            home_evidence.project_id, opened.project_id,
+            "omitted project must be served (and attested) by home"
+        );
+        assert!(
+            home_evidence.canonical_root.is_some() && !home_evidence.index_state.is_empty(),
+            "evidence carries root and index state: {home_evidence:?}"
+        );
+
+        let routed_evidence =
+            evidence_for(serde_json::json!({"detail": "compact", "project": project_b_id})).await;
+        assert_eq!(
+            routed_evidence.project_id, project_b_id,
+            "explicit project must be attested by the routed sibling"
         );
 
         let _ = handle.shutdown_tx.send(());

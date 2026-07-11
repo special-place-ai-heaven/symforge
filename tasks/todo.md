@@ -553,6 +553,22 @@ cd E:\project\symforge
   failed; full lib 2731 passed / 0 failed; clippy/fmt clean. REMAINING from
   Task 9: the guarded-start seam for foreground `symforge daemon` vs auto-spawn
   (tests/daemon_singleton.rs) and last-seen/TTL evidence in detailed status.
+- Typed project-evidence receipt (2026-07-11, Task 7 part 2): new
+  `ProjectEvidence` contract (project_id, project_name, canonical_root,
+  generation, index_state, load_source, index counts) in
+  `protocol::result_status`; the daemon returns it OUT-OF-BAND as the
+  `x-symforge-project-evidence` response header built from the RESOLVED
+  runtime (so an explicitly routed sibling is attested as itself, never home)
+  while the text body stays byte-identical; `call_tool_value` parses the
+  typed header into a per-dispatch task-local slot (same bound-to-the-future
+  pattern as the D23 connection surface — never reconstructed from body
+  text); `ServerHandler::call_tool` seeds the slot with the LOCAL bound
+  project so stdio/embed responses attest themselves; statused results attach
+  the current evidence under `_meta["symforge/project_evidence"]`. Receipts:
+  `daemon::tests::test_tool_receipt_carries_project_evidence` +
+  `protocol::tools::tests::test_local_tool_meta_carries_project_evidence` =
+  2 passed; full lib 2733 passed / 0 failed; full all-targets suite 0
+  failures; clippy/fmt/diff-check clean.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

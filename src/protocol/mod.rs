@@ -1321,7 +1321,15 @@ impl ServerHandler for SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        // Task 7: bind the selected-project evidence slot for this dispatch,
+        // seeded with the LOCAL bound project; the daemon proxy layer
+        // overwrites it with the daemon's receipt when it answers. Statused
+        // results attach whatever is current at render time.
+        result_status::with_project_evidence_scope(
+            self.local_project_evidence(),
+            self.tool_router.call(tcc),
+        )
+        .await
     }
 
     async fn list_tools(
