@@ -231,6 +231,15 @@ pub(crate) fn maybe_reindex(
     ReindexResult::Removed
 }
 
+/// Recover the project root by walking up from the absolute event path once per
+/// component of the relative path. Both come from the same watcher event (or
+/// freshen-on-read call), so the suffix relationship holds by construction;
+/// `None` only if the relative path is deeper than the absolute one.
+fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathBuf> {
+    let depth = Path::new(relative_path).components().count();
+    abs_path.ancestors().nth(depth).map(|p| p.to_path_buf())
+}
+
 fn read_and_index(
     relative_path: &str,
     abs_path: &Path,
@@ -346,6 +355,42 @@ fn read_and_index(
             return ReindexResult::Skipped;
         }
         AdmissionTier::Normal => {}
+    }
+
+    // 3b. F5 parity: the bulk discovery walk demotes files under UNTRACKED
+    //     generated-output directories to Tier-2 metadata-only; without the same
+    //     policy here, a generated directory created (or repopulated) after the
+    //     initial load would silently re-enter Tier 1 through watcher events.
+    //     `is_untracked_generated_output_path` checks the path shape FIRST
+    //     (pure string work) and consults git evidence only when a
+    //     generated-looking component is present, so ordinary events never scan
+    //     the tracked set. Fails open on non-git trees; honors the
+    //     `SYMFORGE_INDEX_GENERATED_OUTPUT` opt-in; a tracked file (or any
+    //     tracked sibling under the same prefix) rescues the path back to
+    //     Tier 1 exactly like the bulk walk.
+    if let Some(root) = project_root_from_paths(abs_path, relative_path)
+        && crate::discovery::is_untracked_generated_output_path(&root, relative_path)
+    {
+        let extension = abs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_string());
+        drop(bytes);
+        let sf = SkippedFile {
+            path: relative_path.to_string(),
+            size: file_size,
+            extension,
+            decision: crate::domain::index::AdmissionDecision::skip(
+                AdmissionTier::MetadataOnly,
+                crate::domain::index::SkipReason::GeneratedOutput,
+            ),
+        };
+        if shared.demote_to_skipped_at_generation(relative_path, sf, expected_gen) {
+            debug!("watcher: generated-output demotion {relative_path}");
+        } else {
+            trace!("watcher: generated-output demotion stale generation rejected: {relative_path}");
+        }
+        return ReindexResult::Skipped;
     }
 
     // 4. Parse outside the lock (Tier-1 only).

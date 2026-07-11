@@ -1230,6 +1230,54 @@ pub fn untracked_generated_output_demotions(
     untracked_generated_output_demotions_inner(entries, &tracked)
 }
 
+/// Shallowest DIRECTORY component (never the file name) of `relative_path`
+/// matching [`is_generated_output_dir_name`]; returns the prefix up to and
+/// including that component. `None` for root-level files and paths with no
+/// generated-looking directory. The ONE path-shape rule shared by the bulk
+/// demotion walk and the watcher single-file parity check.
+fn shallowest_generated_output_prefix(relative_path: &str) -> Option<&str> {
+    let (dirs, _file) = relative_path.rsplit_once('/')?;
+    let mut end = 0usize;
+    for comp in dirs.split('/') {
+        end += comp.len();
+        if is_generated_output_dir_name(comp) {
+            return Some(&relative_path[..end]);
+        }
+        end += 1; // the '/' separator
+    }
+    None
+}
+
+/// F5 watcher parity: does ONE relative path fall under the untracked
+/// generated-output demotion policy? Same contract as the bulk
+/// [`untracked_generated_output_demotions`] walk, evaluated per event:
+///
+/// - no generated-looking directory component → `false` (checked FIRST, pure
+///   string work, so ordinary watcher events never touch git);
+/// - `SYMFORGE_INDEX_GENERATED_OUTPUT` opt-in → `false`;
+/// - no git repo / unreadable index / empty tracked set → `false` (fail open,
+///   exactly like the bulk walk);
+/// - the file itself is tracked → `false` (operator versioned it);
+/// - ANY tracked file beneath the candidate prefix → `false` (prefix-wide
+///   tracked rescue);
+/// - otherwise → `true` (demote to Tier-2 `GeneratedOutput`).
+pub(crate) fn is_untracked_generated_output_path(root: &Path, relative_path: &str) -> bool {
+    let Some(candidate) = shallowest_generated_output_prefix(relative_path) else {
+        return false;
+    };
+    if index_generated_output_enabled() {
+        return false;
+    }
+    let Some(tracked) = tracked_path_set_for_build_dir_rescue(root) else {
+        return false;
+    };
+    if tracked.contains(relative_path) {
+        return false;
+    }
+    let prefix = format!("{candidate}/");
+    !tracked.iter().any(|t| t.starts_with(&prefix))
+}
+
 /// Env-free core of [`untracked_generated_output_demotions`], unit-testable
 /// without process-global state.
 fn untracked_generated_output_demotions_inner(
@@ -1249,22 +1297,9 @@ fn untracked_generated_output_demotions_inner(
         if tracked.contains(rel) {
             continue; // tracked file: never demoted by this policy
         }
-        // Shallowest DIRECTORY component (never the file name) matching the
-        // generated-output heuristic defines the candidate directory prefix.
-        let Some((dirs, _file)) = rel.rsplit_once('/') else {
-            continue; // root-level file, no directory to classify
+        let Some(candidate) = shallowest_generated_output_prefix(rel) else {
+            continue;
         };
-        let mut candidate: Option<&str> = None;
-        let mut end = 0usize;
-        for comp in dirs.split('/') {
-            end += comp.len();
-            if is_generated_output_dir_name(comp) {
-                candidate = Some(&rel[..end]);
-                break;
-            }
-            end += 1; // the '/' separator
-        }
-        let Some(candidate) = candidate else { continue };
         let has_tracked = *dir_has_tracked
             .entry(candidate.to_string())
             .or_insert_with(|| {

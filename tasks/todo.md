@@ -381,7 +381,7 @@ cd E:\project\symforge
 - [ ] Carry selected-project/freshness evidence and expose project inventory.
 - [ ] Make reconnect and runtime descriptors multi-session safe.
 - [ ] Enforce daemon uniqueness and reap expired sessions.
-- [ ] Preserve generated-output admission through watcher single-file updates.
+- [x] Preserve generated-output admission through watcher single-file updates.
 - [ ] Add native, preserving Grok initialization.
 - [ ] Create the canonical Grok dogfood prompt and common-tool substitution
   scorecard.
@@ -437,6 +437,20 @@ cd E:\project\symforge
   2714 passed / 5 failed — the 5 failures are exactly the still-red watcher
   generated-output fixtures owned by the next slice; `cargo clippy --lib -- -D
   warnings`, `cargo fmt --check`, `git diff --check` all exit 0.
+- Watcher generated-output parity (2026-07-11): extracted the ONE path-shape
+  rule (`shallowest_generated_output_prefix`) shared by the bulk demotion walk
+  and a new per-event `discovery::is_untracked_generated_output_path`; wired it
+  into `read_and_index` after the admission gate (path-shape checked first so
+  ordinary events never touch git; git evidence consulted only for
+  generated-looking components; fail-open on non-git trees; opt-in env honored;
+  tracked file or tracked sibling under the prefix rescues to Tier 1; skip
+  records deduped by the existing `demote_to_skipped_at_generation`). Receipts:
+  `cargo test --lib watcher::tests:: -- --test-threads=1` = 38 passed / 0
+  failed (all five previously-red fixtures green); `cargo test --lib --
+  discovery:: live_index::store:: --test-threads=1` = 134 passed / 0 failed;
+  full `cargo test --lib -- --test-threads=1` = 2719 passed / 0 failed /
+  2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` all exit 0.
 - New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
   on a conflict-markered Rust file reported `Completeness: full` with a symbol
   count in the header while rendering no outline entries (only the tail of the
