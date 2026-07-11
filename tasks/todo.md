@@ -523,6 +523,20 @@ cd E:\project\symforge
   failed; full `cargo test --all-targets -- --test-threads=1` = 0 failures;
   `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
   `git diff --check` exit 0.
+- Project inventory surfaces (2026-07-11, Task 7 part 1):
+  `DaemonState::render_session_project_inventory` renders one row per open
+  project (deterministic ID, display name/root, home marker, published
+  counts/index state, generation, opened timestamp, snapshot presence) plus
+  session last-seen; `status(detail="projects")` (new `StelStatusDetail::
+  Projects` variant; local render lists the single bound project) is
+  intercepted on the daemon route to serve the full session inventory; full-
+  surface `health`/`health_compact` append the same inventory once MORE than
+  one project is open (single-project outputs stay byte-compatible). Receipts:
+  `daemon::tests::test_status_projects_detail_lists_session_inventory` = 1
+  passed; full lib = 2730 passed / 0 failed; strict schema + stel param
+  disposition tests pass; clippy/fmt clean. REMAINING from Task 7: the typed
+  daemon tool receipt (machine-readable project/generation/load-source
+  metadata through call_tool_value -> proxy -> statused wrapper).
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

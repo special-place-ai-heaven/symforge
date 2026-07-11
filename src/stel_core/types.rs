@@ -214,6 +214,11 @@ impl StelEditOp {
 pub enum StelStatusDetail {
     Compact,
     Full,
+    /// Session project inventory (Task 7): one row per open project with
+    /// identity, root, counts, index state, and home marker. On the daemon
+    /// route this lists every project open in the session; a local/embedded
+    /// server lists its single bound project.
+    Projects,
 }
 
 /// MCP input for the `status` compact-surface tool.

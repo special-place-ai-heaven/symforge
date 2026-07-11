@@ -1558,6 +1558,84 @@ impl DaemonState {
         })
     }
 
+    /// Task 7: render the session's open-project inventory — one row per open
+    /// project with deterministic ID, display name/root, home marker, published
+    /// counts and index state, current generation, opened timestamp, and
+    /// snapshot presence — plus the session's last-seen evidence. `project_name`
+    /// is display text, never a persistent alias. Returns `None` for an unknown
+    /// session.
+    fn render_session_project_inventory(&self, session_id: &str) -> Option<String> {
+        let session = self.sessions.read().get(session_id).cloned()?;
+        let open_ids: Vec<String> = session
+            .working_set
+            .read()
+            .iter()
+            .map(|entry| entry.project_id.clone())
+            .collect();
+        let mut lines = vec!["── projects ──".to_string()];
+        {
+            let projects = self.projects.read();
+            for id in &open_ids {
+                let Some(slot) = projects.get(id) else {
+                    lines.push(format!(
+                        "{id} state=missing (open in working set but not loaded)"
+                    ));
+                    continue;
+                };
+                let meta = slot.metadata.read();
+                let published = meta.index.published_state();
+                let home = if *id == session.active_project_id {
+                    " home=yes"
+                } else {
+                    ""
+                };
+                let snapshot = if meta
+                    .canonical_root
+                    .join(".symforge")
+                    .join("index.bin")
+                    .is_file()
+                {
+                    "present"
+                } else {
+                    "absent"
+                };
+                lines.push(format!(
+                    "{id}{home} name={} root={} files={} symbols={} index={} generation={} opened={} snapshot={}",
+                    meta.project_name,
+                    normalized_path_string(&meta.canonical_root),
+                    published.file_count,
+                    published.symbol_count,
+                    published.status_label(),
+                    meta.index.current_project_generation(),
+                    unix_seconds(meta.opened_at),
+                    snapshot,
+                ));
+            }
+        }
+        lines.push(format!(
+            "session={} last_seen={}",
+            session.session_id,
+            unix_seconds(session.last_seen_at_time())
+        ));
+        Some(lines.join("\n"))
+    }
+
+    /// The inventory above, but only when the session holds MORE than one open
+    /// project — the append-to-`health` path stays byte-compatible for the
+    /// single-project sessions that existed before multi-project opens.
+    fn render_session_project_inventory_if_multi(&self, session_id: &str) -> Option<String> {
+        let multi = {
+            let sessions = self.sessions.read();
+            let session = sessions.get(session_id)?;
+            session.working_set.read().len() > 1
+        };
+        if multi {
+            self.render_session_project_inventory(session_id)
+        } else {
+            None
+        }
+    }
+
     pub fn health(&self) -> DaemonHealth {
         DaemonHealth {
             project_count: self.projects.read().len(),
@@ -2765,6 +2843,30 @@ async fn call_tool_handler(
             .map_err(bad_request);
     }
 
+    // Task 7: `status(detail="projects")` renders the SESSION's open-project
+    // inventory (the daemon owns that state; the per-project server cannot see
+    // sibling projects). Intercept before dispatch. Other detail levels keep
+    // the existing per-project dispatch unchanged.
+    if tool_name == "status" {
+        #[derive(serde::Deserialize)]
+        struct DetailPeek {
+            #[serde(default)]
+            detail: Option<String>,
+        }
+        let peek: DetailPeek =
+            serde_json::from_value(params.clone()).unwrap_or(DetailPeek { detail: None });
+        if peek.detail.as_deref() == Some("projects") {
+            return state
+                .render_session_project_inventory(&session_id)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("unknown session '{session_id}'"),
+                    )
+                });
+        }
+    }
+
     // Task 4 (outstanding-work hardening): explicit single-project routing.
     // For the routed read/guidance verbs, peek the optional `project` selector,
     // resolve the target runtime through the ONE shared resolver, strip the
@@ -2850,7 +2952,20 @@ async fn call_tool_handler(
         })
         .await
     {
-        Ok(Ok(result)) => Ok(result),
+        Ok(Ok(mut result)) => {
+            // Task 7: full-surface `health`/`health_compact` gain the session's
+            // open-project inventory once MORE than one project is open — the
+            // 36-tool surface can then list and select projects without the
+            // compact `status` tool. Single-project sessions stay byte-identical.
+            if matches!(tool_name_for_panic.as_str(), "health" | "health_compact")
+                && let Some(inventory) =
+                    state.render_session_project_inventory_if_multi(&session_id)
+            {
+                result.push('\n');
+                result.push_str(&inventory);
+            }
+            Ok(result)
+        }
         Ok(Err(tool_err)) => {
             // Tool returned an error — surface it as HTTP 200 so the MCP client
             // gets the message immediately instead of entering reconnect/timeout.
@@ -7941,6 +8056,139 @@ mod tests {
         assert!(
             unknown.contains("not open") && unknown.contains(&project_b_id),
             "unknown selector must return candidates: {unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 7: `status(detail="projects")` renders the session's open-project
+    /// inventory (ids, home marker, counts, snapshot evidence), and full-surface
+    /// `health` gains the same inventory once more than one project is open.
+    #[tokio::test]
+    async fn test_status_projects_detail_lists_session_inventory() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-inventory-home-a");
+        let project_b = project_dir("symforge-inventory-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "inventory".to_string(),
+                pid: Some(79),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // health BEFORE the second open: no inventory section (compatibility).
+        let health_single = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health_compact",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("health request")
+            .error_for_status()
+            .expect("health status")
+            .text()
+            .await
+            .expect("health body");
+        assert!(
+            !health_single.contains("── projects ──"),
+            "single-project health must stay byte-compatible: {health_single}"
+        );
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let inventory = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/status",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({"detail": "projects"}))
+            .send()
+            .await
+            .expect("status request")
+            .error_for_status()
+            .expect("status status")
+            .text()
+            .await
+            .expect("status body");
+        assert!(
+            inventory.contains(&opened.project_id) && inventory.contains(&project_b_id),
+            "inventory must list both open projects: {inventory}"
+        );
+        assert!(
+            inventory.contains(&format!("{} home=yes", opened.project_id)),
+            "home project must carry the home marker: {inventory}"
+        );
+        assert!(
+            inventory.contains("snapshot=present") || inventory.contains("snapshot=absent"),
+            "inventory rows must carry snapshot evidence: {inventory}"
+        );
+
+        let health_multi = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health_compact",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("health multi request")
+            .error_for_status()
+            .expect("health multi status")
+            .text()
+            .await
+            .expect("health multi body");
+        assert!(
+            health_multi.contains("── projects ──") && health_multi.contains(&project_b_id),
+            "multi-project health must expose the inventory: {health_multi}"
         );
 
         let _ = handle.shutdown_tx.send(());
