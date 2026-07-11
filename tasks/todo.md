@@ -375,8 +375,14 @@ cd E:\project\symforge
 - [x] Replace inline daemon project instances with per-project slots and
   partition per-session protocol/cache state.
 - [x] Make daemon home immutable and `index_folder` additive/persistent.
-- [ ] Route read, guidance, compact, and structural-edit tools explicitly by
-  project.
+- [~] Route read, guidance, compact, and structural-edit tools explicitly by
+  project. (Daemon-route core DONE 2026-07-11: `runtime_for_target` shared
+  resolver + `single_project_routed_tool` peek/strip routing in
+  `call_tool_handler` for the 16 read/guidance verbs; parity table + resolver
+  contract tests green. REMAINING: `project` fields in tool input schemas +
+  strict-client schema pins, local-mode explicit-project refusal guards,
+  set-valued `search_files` cross-target merge, compact `symforge` facade
+  routing through stel planner/executor, project-explicit structural edits.)
 - [x] Replace the global snapshot write lock with same-path serialization.
 - [ ] Carry selected-project/freshness evidence and expose project inventory.
 - [ ] Make reconnect and runtime descriptors multi-session safe.
@@ -470,6 +476,19 @@ cd E:\project\symforge
   full `cargo test --lib -- --test-threads=1` = 2725 passed / 0 failed /
   2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
   `git diff --check` all exit 0.
+- Explicit project routing, daemon-route core (2026-07-11):
+  `DaemonState::runtime_for_target(session_id, project)` is the one shared
+  resolver (omission -> immutable home; open project ID first; unique current
+  `project_name` among the session's OPEN projects as display text only;
+  unknown/ambiguous -> deterministic candidate errors, no indexing, no
+  frecency); `call_tool_handler` peeks/strips the `project` field for the 16
+  routed read/guidance verbs and dispatches the existing per-project
+  implementation; the three cross-project discovery verbs keep their own
+  `project`/`projects` handling. Receipts:
+  `cargo test --lib daemon::tests::test_project_routing_parity_table -- --exact
+  --test-threads=1` = 1 passed;
+  `daemon::tests::test_runtime_for_target_resolution_contract` = 1 passed;
+  `cargo test --lib daemon:: -- --test-threads=1` = 74 passed / 0 failed.
 - New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
   on a conflict-markered Rust file reported `Completeness: full` with a symbol
   count in the header while rendering no outline entries (only the tail of the

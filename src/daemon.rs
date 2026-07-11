@@ -1460,30 +1460,100 @@ impl DaemonState {
     }
 
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
-        // Clone the session and project slot in separate short critical sections;
-        // no daemon-map locks overlap. Feature 012: resolution is via
-        // `active_project_id` — the single active project — so the single-project
-        // path is byte-for-byte unchanged. Phase 3 ALSO carries the session's
-        // `working_set` handle (an `Arc` clone, O(1)) so the cross-project read
-        // route can read it; the single-active path never touches it.
-        let session = {
-            let sessions = self.sessions.read();
-            sessions.get(session_id)?.clone()
+        self.runtime_for_target(session_id, None).ok()
+    }
+
+    /// Task 4 (outstanding-work hardening): the ONE shared resolver from a
+    /// session plus an optional explicit `project` selector to the bound
+    /// per-project runtime. Omission selects the immutable home project.
+    /// An explicit selector resolves an open project ID first, then a UNIQUE
+    /// current `project_name` among the session's OPEN working-set projects —
+    /// display text, not a persistent alias. Unknown/not-open/ambiguous
+    /// selectors return deterministic candidate data and never trigger
+    /// indexing or frecency.
+    fn runtime_for_target(
+        &self,
+        session_id: &str,
+        project: Option<&str>,
+    ) -> Result<SessionRuntime, String> {
+        // Clone the session and project slot in separate short critical
+        // sections; no daemon-map locks overlap.
+        let session = self
+            .sessions
+            .read()
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown session '{session_id}'"))?;
+
+        let target_id = match project.map(str::trim).filter(|p| !p.is_empty()) {
+            None => session.active_project_id.clone(),
+            Some(selector) => {
+                let open_ids: Vec<String> = session
+                    .working_set
+                    .read()
+                    .iter()
+                    .map(|entry| entry.project_id.clone())
+                    .collect();
+                if open_ids.iter().any(|id| id == selector) {
+                    selector.to_string()
+                } else {
+                    let mut matches: Vec<String> = Vec::new();
+                    let mut candidates: Vec<String> = Vec::new();
+                    {
+                        let projects = self.projects.read();
+                        for id in &open_ids {
+                            if let Some(slot) = projects.get(id) {
+                                let meta = slot.metadata.read();
+                                candidates.push(format!("{} ({id})", meta.project_name));
+                                if meta.project_name == selector {
+                                    matches.push(id.clone());
+                                }
+                            }
+                        }
+                    }
+                    candidates.sort();
+                    match matches.len() {
+                        1 => matches.remove(0),
+                        0 => {
+                            return Err(format!(
+                                "project '{selector}' is not open in this session. Open \
+                                 projects: [{}]. Open it first with index_folder(path=...).",
+                                candidates.join(", ")
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "project selector '{selector}' is ambiguous among open \
+                                 projects: [{}]. Use the project id.",
+                                candidates.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
         };
+
         let slot = self
             .projects
             .read()
-            .get(&session.active_project_id)
-            .cloned()?;
-        let project = slot.metadata.read();
-        Some(SessionRuntime {
-            canonical_root: project.canonical_root.clone(),
-            project_id: session.active_project_id.clone(),
+            .get(&target_id)
+            .cloned()
+            .ok_or_else(|| format!("project '{target_id}' is not loaded in the daemon"))?;
+        let server = session.servers.get(&target_id).cloned().ok_or_else(|| {
+            format!(
+                "project '{target_id}' has no session server; reopen it with \
+                 index_folder(path=...)"
+            )
+        })?;
+        let project_meta = slot.metadata.read();
+        Ok(SessionRuntime {
+            canonical_root: project_meta.canonical_root.clone(),
+            project_id: target_id.clone(),
             session_id: session.session_id.clone(),
-            index: Arc::clone(&project.index),
-            token_stats: Arc::clone(&project.token_stats),
-            symbol_cache: Arc::clone(&project.symbol_cache),
-            server: session.servers.get(&session.active_project_id)?.clone(),
+            index: Arc::clone(&project_meta.index),
+            token_stats: Arc::clone(&project_meta.token_stats),
+            symbol_cache: Arc::clone(&project_meta.symbol_cache),
+            server,
             working_set: Arc::clone(&session.working_set),
         })
     }
@@ -2695,12 +2765,47 @@ async fn call_tool_handler(
             .map_err(bad_request);
     }
 
-    let runtime = state.session_runtime(&session_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("unknown session '{session_id}'"),
-        )
-    })?;
+    // Task 4 (outstanding-work hardening): explicit single-project routing.
+    // For the routed read/guidance verbs, peek the optional `project` selector,
+    // resolve the target runtime through the ONE shared resolver, strip the
+    // routing-only field, and dispatch the existing per-project implementation
+    // unchanged. Omission selects the immutable home. The three cross-project
+    // discovery verbs (search_symbols/search_text/find_references) keep their
+    // own `project`/`projects` handling inside `execute_tool_call`.
+    let mut params = params;
+    let runtime = if single_project_routed_tool(&tool_name) {
+        #[derive(serde::Deserialize)]
+        struct ProjectPeek {
+            #[serde(default)]
+            project: Option<String>,
+        }
+        let peek: ProjectPeek =
+            serde_json::from_value(params.clone()).unwrap_or(ProjectPeek { project: None });
+        match state.runtime_for_target(&session_id, peek.project.as_deref()) {
+            Ok(runtime) => {
+                if peek.project.is_some()
+                    && let Some(object) = params.as_object_mut()
+                {
+                    object.remove("project");
+                }
+                runtime
+            }
+            Err(message) if message.starts_with("unknown session") => {
+                return Err((StatusCode::NOT_FOUND, message));
+            }
+            // Deterministic routing errors surface as HTTP 200 tool text (same
+            // convention as tool errors below) so the MCP client sees the
+            // candidates immediately instead of a transport failure.
+            Err(message) => return Ok(message),
+        }
+    } else {
+        state.session_runtime(&session_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("unknown session '{session_id}'"),
+            )
+        })?
+    };
 
     // Tool handlers acquire parking_lot::RwLock on the shared index, which
     // blocks the OS thread. Running them directly on the async runtime starves
@@ -3088,6 +3193,34 @@ fn is_cross_project_read_verb(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "search_symbols" | "search_text" | "find_references"
+    )
+}
+
+/// Task 4 (outstanding-work hardening): the read/guidance verbs that accept ONE
+/// optional `project` selector, resolved by `DaemonState::runtime_for_target`
+/// in `call_tool_handler` before decode. Exactly the plan's parity table minus
+/// the three set-valued discovery verbs above (which own `project`/`projects`
+/// in `execute_tool_call`) and minus `context_inventory` (session-scoped, no
+/// selector). Edits stay single-project until the project-explicit edit slice.
+fn single_project_routed_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "get_symbol"
+            | "get_symbol_context"
+            | "get_file_context"
+            | "get_file_content"
+            | "get_repo_map"
+            | "search_files"
+            | "find_dependents"
+            | "diff_symbols"
+            | "what_changed"
+            | "analyze_file_impact"
+            | "validate_file_syntax"
+            | "explore"
+            | "ask"
+            | "conventions"
+            | "edit_plan"
+            | "investigation_suggest"
     )
 }
 
@@ -4797,6 +4930,81 @@ mod tests {
                 entry.project_id
             );
         }
+    }
+
+    /// Task 4 resolver: omission -> home; explicit id -> target; unique display
+    /// name -> target; unknown -> deterministic candidates; ambiguous display
+    /// name -> deterministic ambiguity error naming the ids.
+    #[test]
+    fn test_runtime_for_target_resolution_contract() {
+        let project_a = project_dir("symforge-resolver-home-a");
+        let parent_one = TempDir::new().expect("parent one");
+        let parent_two = TempDir::new().expect("parent two");
+        // Two OPEN projects with the SAME display name under different parents.
+        let same_name_one = parent_one.path().join("samename");
+        let same_name_two = parent_two.path().join("samename");
+        for root in [&same_name_one, &same_name_two] {
+            std::fs::create_dir_all(root.join("src")).expect("create src");
+            std::fs::write(root.join("src").join("lib.rs"), "fn f() {}\n").expect("write src");
+        }
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "resolver".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+        for root in [&same_name_one, &same_name_two] {
+            state
+                .index_folder_for_session(
+                    &opened.session_id,
+                    IndexFolderInput {
+                        path: root.display().to_string(),
+                        idempotency_key: None,
+                        add: None,
+                    },
+                )
+                .expect("open same-name project");
+        }
+        let id_one = project_key(&canonical_project_root(&same_name_one).expect("canonical 1"));
+        let id_two = project_key(&canonical_project_root(&same_name_two).expect("canonical 2"));
+
+        // Omission -> immutable home.
+        let home = state
+            .runtime_for_target(&opened.session_id, None)
+            .expect("home runtime");
+        assert_eq!(home.project_id, opened.project_id);
+        // Explicit id -> that project.
+        let by_id = state
+            .runtime_for_target(&opened.session_id, Some(&id_one))
+            .expect("runtime by id");
+        assert_eq!(by_id.project_id, id_one);
+        // Unique display name -> home project's name resolves to home.
+        let by_name = state
+            .runtime_for_target(&opened.session_id, Some(&opened.project_name))
+            .expect("runtime by unique name");
+        assert_eq!(by_name.project_id, opened.project_id);
+        // Ambiguous display name -> deterministic error naming both ids.
+        let ambiguous = match state.runtime_for_target(&opened.session_id, Some("samename")) {
+            Err(message) => message,
+            Ok(_) => panic!("ambiguous name must not resolve"),
+        };
+        assert!(
+            ambiguous.contains("ambiguous")
+                && ambiguous.contains(&id_one)
+                && ambiguous.contains(&id_two),
+            "ambiguity error must name candidates: {ambiguous}"
+        );
+        // Unknown selector -> candidates, no load.
+        let unknown = match state.runtime_for_target(&opened.session_id, Some("nope")) {
+            Err(message) => message,
+            Ok(_) => panic!("unknown selector must not resolve"),
+        };
+        assert!(
+            unknown.contains("not open") && unknown.contains(&opened.project_id),
+            "unknown-selector error must list open projects: {unknown}"
+        );
     }
 
     // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
@@ -7578,6 +7786,149 @@ mod tests {
         assert!(
             !outline.contains("new.rs"),
             "opening B must not retarget unqualified reads away from home A: {outline}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 4 parity table (daemon route): explicit `project` selects the open
+    /// project B, omission stays bound to immutable home A, and an unknown
+    /// selector returns deterministic candidates without touching any index.
+    #[tokio::test]
+    async fn test_project_routing_parity_table() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-route-home-a");
+        let project_b = project_dir("symforge-route-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "route-parity".to_string(),
+                pid: Some(77),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let call = |tool: &str, body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{base_url}/v1/sessions/{}/tools/{tool}", opened.session_id);
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status")
+                    .text()
+                    .await
+                    .expect("tool body")
+            }
+        };
+
+        // get_repo_map: explicit B vs omitted home A.
+        let map_b = call(
+            "get_repo_map",
+            serde_json::json!({"detail": "full", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "explicit project must serve B: {map_b}"
+        );
+        let map_home = call("get_repo_map", serde_json::json!({"detail": "full"})).await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "omission must serve immutable home A: {map_home}"
+        );
+
+        // get_file_content: exact read routed to B; home cannot see B's file.
+        let content_b = call(
+            "get_file_content",
+            serde_json::json!({"path": "src/new.rs", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            content_b.contains("fn new_fn"),
+            "explicit project read must return B's bytes: {content_b}"
+        );
+        let content_home = call(
+            "get_file_content",
+            serde_json::json!({"path": "src/new.rs"}),
+        )
+        .await;
+        assert!(
+            !content_home.contains("fn new_fn"),
+            "home read must not leak B's bytes: {content_home}"
+        );
+
+        // search_files: discovery routed by explicit project.
+        let files_b = call(
+            "search_files",
+            serde_json::json!({"query": "new.rs", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            files_b.contains("new.rs"),
+            "explicit project search_files must serve B: {files_b}"
+        );
+
+        // Unknown selector: deterministic candidates, no index mutation.
+        let unknown = call(
+            "get_repo_map",
+            serde_json::json!({"detail": "full", "project": "no-such-project"}),
+        )
+        .await;
+        assert!(
+            unknown.contains("not open") && unknown.contains(&project_b_id),
+            "unknown selector must return candidates: {unknown}"
         );
 
         let _ = handle.shutdown_tx.send(());
