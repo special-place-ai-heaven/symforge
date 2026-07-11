@@ -50,7 +50,8 @@ pub mod observability;
 pub mod path_shadow;
 // Console-flash-free child spawning (CREATE_NO_WINDOW on Windows); used by the
 // daemon's helper spawns, worktree listing, PATH-shadow probes, and the updater.
-#[cfg(feature = "server")]
+// NOT server-gated: std-only, and embed-cfg'd test code in git/store/discovery
+// spawns git through it (the embed --lib test build compiles those modules).
 #[doc(hidden)] // public so integration tests share the no-console spawn helper
 pub mod process_util;
 #[cfg(feature = "server")]
