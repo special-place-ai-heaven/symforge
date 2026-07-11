@@ -3201,7 +3201,11 @@ fn is_cross_project_read_verb(tool_name: &str) -> bool {
 /// in `call_tool_handler` before decode. Exactly the plan's parity table minus
 /// the three set-valued discovery verbs above (which own `project`/`projects`
 /// in `execute_tool_call`) and minus `context_inventory` (session-scoped, no
-/// selector). Edits stay single-project until the project-explicit edit slice.
+/// selector). Structural edits route the same way (Task 5): the selector is
+/// batch-level only — each call stays one single-project transaction, and the
+/// existing worktree/`working_directory` validation then runs against the
+/// SELECTED project's repository, so an unrelated root rejects before preview
+/// or apply.
 fn single_project_routed_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -3221,6 +3225,13 @@ fn single_project_routed_tool(tool_name: &str) -> bool {
             | "conventions"
             | "edit_plan"
             | "investigation_suggest"
+            | "replace_symbol_body"
+            | "edit_within_symbol"
+            | "insert_symbol"
+            | "delete_symbol"
+            | "batch_edit"
+            | "batch_insert"
+            | "batch_rename"
     )
 }
 
@@ -7930,6 +7941,150 @@ mod tests {
         assert!(
             unknown.contains("not open") && unknown.contains(&project_b_id),
             "unknown selector must return candidates: {unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 5: structural edits route by explicit project. An explicit B edit
+    /// mutates ONLY B, an omitted edit mutates immutable home A, and an
+    /// unknown/ambiguous target writes NOTHING anywhere. Worktree routing and
+    /// `working_directory` validation run against the SELECTED project's
+    /// repository (the existing per-project edit safety, now bound by the
+    /// resolver).
+    #[tokio::test]
+    async fn test_explicit_project_edit_routes_and_preserves_worktree() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-edit-route-a");
+        let project_b = project_dir("symforge-edit-route-b");
+        let file_a = project_a.path().join("src").join("lib.rs");
+        let file_b = project_b.path().join("src").join("lib.rs");
+        std::fs::write(&file_a, "pub fn shared_name() -> u32 { 1 }\n").expect("write source a");
+        std::fs::write(&file_b, "pub fn shared_name() -> u32 { 1 }\n").expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "edit-route".to_string(),
+                pid: Some(78),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let edit = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/replace_symbol_body",
+                opened.session_id
+            );
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("edit request")
+                    .error_for_status()
+                    .expect("edit status")
+                    .text()
+                    .await
+                    .expect("edit body")
+            }
+        };
+
+        // Explicit B edit mutates ONLY B.
+        let result_b = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 2 }",
+            "project": project_b_id,
+        }))
+        .await;
+        let on_disk_b = std::fs::read_to_string(&file_b).expect("read B");
+        let on_disk_a = std::fs::read_to_string(&file_a).expect("read A");
+        assert!(
+            on_disk_b.contains("{ 2 }"),
+            "explicit B edit must mutate B: {result_b}\n{on_disk_b}"
+        );
+        assert!(
+            on_disk_a.contains("{ 1 }"),
+            "explicit B edit must not touch home A: {on_disk_a}"
+        );
+
+        // Omitted edit mutates immutable home A.
+        let result_a = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 3 }",
+        }))
+        .await;
+        let on_disk_a = std::fs::read_to_string(&file_a).expect("read A after");
+        let on_disk_b = std::fs::read_to_string(&file_b).expect("read B after");
+        assert!(
+            on_disk_a.contains("{ 3 }"),
+            "omitted edit must mutate home A: {result_a}\n{on_disk_a}"
+        );
+        assert!(
+            on_disk_b.contains("{ 2 }"),
+            "omitted edit must not touch B: {on_disk_b}"
+        );
+
+        // Unknown target writes NOTHING.
+        let refused = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 4 }",
+            "project": "no-such-project",
+        }))
+        .await;
+        assert!(
+            refused.contains("not open"),
+            "unknown edit target must refuse with candidates: {refused}"
+        );
+        assert!(
+            !std::fs::read_to_string(&file_a)
+                .expect("read A final")
+                .contains("{ 4 }")
+                && !std::fs::read_to_string(&file_b)
+                    .expect("read B final")
+                    .contains("{ 4 }"),
+            "unknown edit target must write nothing"
         );
 
         let _ = handle.shutdown_tx.send(());

@@ -272,20 +272,35 @@ fn index_folder_for_session_signals_token_before_drop() {
 
         tokio::time::sleep(Duration::from_millis(3_200)).await;
 
+        // Immutable home (outstanding-work hardening): opening B is ADDITIVE.
+        // Home A stays open alongside B; nothing is evicted.
         let projects = daemon.state.list_projects();
         assert_eq!(
             projects.len(),
-            1,
-            "session rebind should remove the old project after moving the session"
+            2,
+            "additive open must keep home A and add B (no eviction)"
         );
+        let canonical_b = project_b
+            .path()
+            .canonicalize()
+            .expect("canonicalize project b");
+        let project_b_summary = projects
+            .iter()
+            .find(|summary| {
+                std::path::Path::new(&summary.canonical_root)
+                    .file_name()
+                    .map(|name| Some(name) == canonical_b.file_name())
+                    .unwrap_or(false)
+            })
+            .expect("project B present after additive open");
         let health = daemon
             .state
-            .project_health(&projects[0].project_id)
+            .project_health(&project_b_summary.project_id)
             .expect("target project health");
         assert_eq!(
             health.file_count,
             b_paths.len(),
-            "target project should retain all files after the old project is dropped"
+            "opened project B should retain all its files"
         );
 
         let _ = daemon.shutdown_tx.send(());

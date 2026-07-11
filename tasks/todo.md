@@ -506,6 +506,23 @@ cd E:\project\symforge
   Commander daemon became unavailable mid-session (health probe
   daemon_unavailable); remaining commands ran through the harness's headless
   shell — no visible terminals — until TC returns.
+- Project-explicit structural edits (2026-07-11): the 7 edit verbs
+  (replace_symbol_body/edit_within_symbol/insert_symbol/delete_symbol/
+  batch_edit/batch_insert/batch_rename) joined the routed set — the batch-level
+  `project` selector resolves through the same `runtime_for_target`, so
+  worktree/`working_directory` validation runs against the SELECTED project;
+  the selector was added to the 7 edit input structs only (NOT SingleEdit/
+  InsertTarget — no nested conflicting routing); local handlers refuse foreign
+  selectors via `foreign_project_refusal`; 51 more struct-literal sites updated
+  from cargo spans. `tests/watcher_reload_cancellation.rs` updated from the old
+  destructive-retarget contract to the immutable-home additive contract
+  (2 projects after open, B healthy, nothing evicted). Receipts:
+  `daemon::tests::test_explicit_project_edit_routes_and_preserves_worktree` =
+  1 passed (explicit-B mutates only B, omitted mutates home A, unknown writes
+  nothing); full `cargo test --lib -- --test-threads=1` = 2729 passed / 0
+  failed; full `cargo test --all-targets -- --test-threads=1` = 0 failures;
+  `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` exit 0.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

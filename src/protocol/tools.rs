@@ -13528,6 +13528,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "target".to_string(),
             kind: None,
@@ -13568,6 +13569,7 @@ mod tests {
 
         let result = server
             .edit_within_symbol(Parameters(crate::protocol::edit::EditWithinSymbolInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "target".to_string(),
                 kind: None,
@@ -19101,6 +19103,7 @@ mod tests {
         let success = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "present".to_string(),
                     kind: None,
@@ -19126,6 +19129,7 @@ mod tests {
         let dry_run = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "present".to_string(),
                     kind: None,
@@ -19149,6 +19153,7 @@ mod tests {
         let not_found = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "missing_symbol".to_string(),
                     kind: None,
@@ -19169,6 +19174,7 @@ mod tests {
         let ambiguous = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "duplicate".to_string(),
                     kind: None,
@@ -19187,6 +19193,7 @@ mod tests {
         let invalid_request = serialized_tool_result(
             server
                 .batch_edit_tool(Parameters(crate::protocol::edit::BatchEditInput {
+                    project: None,
                     edits: vec![crate::protocol::edit::SingleEdit {
                         path: "../outside.rs".to_string(),
                         name: "duplicate".to_string(),
@@ -19218,6 +19225,7 @@ mod tests {
         let internal_failure = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "present".to_string(),
                     kind: None,
@@ -19275,6 +19283,7 @@ mod tests {
         let dry_run_edit = serialized_tool_result(
             server
                 .replace_symbol_body_tool(Parameters(ReplaceSymbolBodyInput {
+                    project: None,
                     path: "src/lib.rs".to_string(),
                     name: "present".to_string(),
                     kind: None,
@@ -19405,6 +19414,7 @@ mod tests {
         let dry_run_batch_edit = serialized_tool_result(
             server
                 .batch_edit_tool(Parameters(BatchEditInput {
+                    project: None,
                     edits: vec![
                         SingleEdit {
                             path: "src/a.rs".to_string(),
@@ -19451,6 +19461,7 @@ mod tests {
         let successful_batch_insert = serialized_tool_result(
             server
                 .batch_insert_tool(Parameters(BatchInsertInput {
+                    project: None,
                     content: "fn logging() {}".to_string(),
                     position: InsertPosition::After,
                     targets: vec![
@@ -19490,6 +19501,7 @@ mod tests {
         let failed_batch_edit = serialized_tool_result(
             server
                 .batch_edit_tool(Parameters(BatchEditInput {
+                    project: None,
                     edits: vec![
                         SingleEdit {
                             path: "src/a.rs".to_string(),
@@ -24964,6 +24976,7 @@ mod tests {
         let (dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25016,6 +25029,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "add".to_string(),
             kind: None,
@@ -25054,6 +25068,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "add".to_string(),
             kind: None,
@@ -25095,6 +25110,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "add".to_string(),
             kind: None,
@@ -25132,6 +25148,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "add".to_string(),
             kind: None,
@@ -25182,6 +25199,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/math.ts".to_string(),
             name: "add".to_string(),
             kind: None,
@@ -25223,6 +25241,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/legacy.ts".to_string(),
             name: "legacy".to_string(),
             kind: None,
@@ -25258,6 +25277,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "legacy".to_string(),
             kind: None,
@@ -25295,6 +25315,7 @@ mod tests {
 
         // Provide unindented replacement — tool should auto-indent to match.
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "inner".to_string(),
             kind: None,
@@ -25322,6 +25343,7 @@ mod tests {
         let (_dir, server, _) = setup_edit_test(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "nonexistent.rs".to_string(),
             name: "foo".to_string(),
             kind: None,
@@ -25345,6 +25367,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::InsertSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25377,6 +25400,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::InsertSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "world".to_string(),
             kind: None,
@@ -25403,6 +25427,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::DeleteSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25474,6 +25499,7 @@ mod tests {
         let (_dir, server, file_path) = setup_edit_test(original);
 
         let input = crate::protocol::edit::EditWithinSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25504,6 +25530,7 @@ mod tests {
         new_text: &str,
     ) -> crate::protocol::edit::EditWithinSymbolInput {
         crate::protocol::edit::EditWithinSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25618,6 +25645,7 @@ mod tests {
         );
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25645,6 +25673,7 @@ mod tests {
         let (_dir, server, _) = setup_edit_test(original);
 
         let input = crate::protocol::edit::EditWithinSymbolInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "hello".to_string(),
             kind: None,
@@ -25669,6 +25698,7 @@ mod tests {
 
         let result = server
             .replace_symbol_body(Parameters(crate::protocol::edit::ReplaceSymbolBodyInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
                 kind: None,
@@ -25701,6 +25731,7 @@ mod tests {
 
         let result = server
             .insert_symbol(Parameters(crate::protocol::edit::InsertSymbolInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "anchor".to_string(),
                 kind: None,
@@ -25733,6 +25764,7 @@ mod tests {
 
         let result = server
             .delete_symbol(Parameters(crate::protocol::edit::DeleteSymbolInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "target".to_string(),
                 kind: None,
@@ -25763,6 +25795,7 @@ mod tests {
 
         let result = server
             .edit_within_symbol(Parameters(crate::protocol::edit::EditWithinSymbolInput {
+                project: None,
                 path: "src/lib.rs".to_string(),
                 name: "foo".to_string(),
                 kind: None,
@@ -25821,6 +25854,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchEditInput {
+            project: None,
             edits: vec![
                 SingleEdit {
                     path: "src/a.rs".to_string(),
@@ -25909,6 +25943,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchEditInput {
+            project: None,
             edits: vec![SingleEdit {
                 path: "src/a.rs".to_string(),
                 name: "alpha".to_string(),
@@ -25967,6 +26002,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "old_name".to_string(),
             kind: None,
@@ -26023,6 +26059,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "old_name".to_string(),
             kind: None,
@@ -26081,6 +26118,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "Widget".to_string(),
             kind: None,
@@ -26138,6 +26176,7 @@ mod tests {
 
         // Do the rename
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "Widget".to_string(),
             kind: None,
@@ -26224,6 +26263,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "OldType".to_string(),
             kind: None,
@@ -26279,6 +26319,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "OldType".to_string(),
             kind: None,
@@ -26334,6 +26375,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "OldType".to_string(),
             kind: None,
@@ -26390,6 +26432,7 @@ mod tests {
 
         // Rename the Target struct itself, not its "new" method.
         let input = BatchRenameInput {
+            project: None,
             path: "src/lib.rs".to_string(),
             name: "Target".to_string(),
             kind: None,
@@ -26445,6 +26488,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() {}".to_string(),
             position: InsertPosition::After,
             targets: vec![
@@ -26507,6 +26551,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() {}".to_string(),
             position: InsertPosition::After,
             targets: vec![InsertTarget {
@@ -26564,6 +26609,7 @@ mod tests {
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() {}".to_string(),
             position: InsertPosition::After,
             targets: vec![
