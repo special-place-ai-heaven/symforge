@@ -2,7 +2,6 @@
 #![cfg(feature = "server")]
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use symforge::stel::{
     self, GateStatus, compute_phase2_gates, normalize_battery_results, phase2_minimum_gates_pass,
@@ -52,7 +51,7 @@ fn synthetic_h4_fail_detects_negative_session_net_accepted() {
 #[test]
 fn compare_results_script_matches_rust_gate_computation() {
     let fixture = fixture_path("synthetic-pass.json");
-    let output = Command::new("node")
+    let output = symforge::process_util::hidden_command("node")
         .arg("scripts/compare-results.cjs")
         .arg(&fixture)
         .current_dir(repo_root())
@@ -73,7 +72,7 @@ fn compare_results_script_matches_rust_gate_computation() {
 #[test]
 fn compare_results_script_fails_on_h4_negative_net() {
     let fixture = fixture_path("synthetic-h4-fail.json");
-    let output = Command::new("node")
+    let output = symforge::process_util::hidden_command("node")
         .arg("scripts/compare-results.cjs")
         .arg(&fixture)
         .current_dir(repo_root())

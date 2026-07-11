@@ -4,7 +4,6 @@
 #![cfg(feature = "server")]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -14,8 +13,8 @@ use symforge::analytics::{
 use symforge::protocol::SymForgeServer;
 use symforge::protocol::result_status::OutcomeClass;
 
-fn symforge_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_symforge"))
+fn symforge_command() -> std::process::Command {
+    symforge::process_util::hidden_command(env!("CARGO_BIN_EXE_symforge"))
 }
 
 fn run_json(args: &[&str]) -> Value {

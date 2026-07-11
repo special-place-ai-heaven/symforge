@@ -4042,7 +4042,6 @@ mod tests {
     mod sf009_untracked_surfacing {
         use super::*;
         use crate::discovery::{self, EXCLUDE_UNTRACKED_ENV};
-        use std::process::Command;
 
         /// Serialize all tests that touch the process-global
         /// `SYMFORGE_EXCLUDE_UNTRACKED` env var.
@@ -4097,7 +4096,7 @@ mod tests {
         }
 
         fn git(root: &Path, args: &[&str]) {
-            let status = Command::new("git")
+            let status = crate::process_util::hidden_command("git")
                 .args(args)
                 .current_dir(root)
                 .output()

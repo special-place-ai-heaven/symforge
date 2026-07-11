@@ -601,6 +601,18 @@ cd E:\project\symforge
   restores with its deterministic id before serving. REMAINING from Task 8:
   per-adapter/session runtime descriptors replacing the fixed sidecar
   port/pid/session files + hook lookup freshest-healthy selection.
+- No-visible-terminal invariant (2026-07-11, user mandate): EVERY process
+  spawn in src/ and tests/ now routes through
+  `process_util::hidden_command` (CREATE_NO_WINDOW on Windows) — 21 src/test
+  call sites swept plus 12 more integration-test sites the new tripwire
+  caught; `hidden_command` and its module are now pub (#[doc(hidden)]) so
+  integration tests share the helper; the ONE deliberate exception is
+  `spawn_daemon_process` (its own DETACHED_PROCESS | CREATE_NO_WINDOW).
+  Permanent tripwire `process_util::tests::
+  test_no_raw_command_spawns_outside_hidden_command` scans src/ + tests/
+  (fixtures excluded) and fails on any new raw `Command::new(` call site.
+  Receipts: tripwire green; full `cargo test --all-targets -- --test-threads=1`
+  = 0 failures; clippy/fmt clean; zero symforge processes after the suite.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

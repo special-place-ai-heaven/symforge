@@ -1676,14 +1676,13 @@ mod tests {
     // ── SF-012(B): build-dir heuristic rescues tracked source dirs ──
     mod build_dir_tracked_rescue {
         use super::*;
-        use std::process::Command;
 
         #[test]
         fn discover_all_files_rescues_tracked_target_specs_dir() {
             let tmp = TempDir::new().unwrap();
             let root = tmp.path();
             let run = |args: &[&str]| {
-                Command::new("git")
+                crate::process_util::hidden_command("git")
                     .args(args)
                     .current_dir(root)
                     .output()
@@ -1750,7 +1749,6 @@ mod tests {
 
     mod generated_output_demotion {
         use super::*;
-        use std::process::Command;
 
         // Serializes the opt-in test (which mutates the process-global
         // SYMFORGE_INDEX_GENERATED_OUTPUT) against the sibling tests that read it via
@@ -1760,7 +1758,7 @@ mod tests {
 
         fn init_git(root: &Path) -> impl Fn(&[&str]) + '_ {
             let run = move |args: &[&str]| {
-                Command::new("git")
+                crate::process_util::hidden_command("git")
                     .args(args)
                     .current_dir(root)
                     .output()

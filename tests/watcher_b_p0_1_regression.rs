@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -21,7 +21,7 @@ struct McpClient {
 impl McpClient {
     fn spawn(cwd: &Path, home: &Path) -> Self {
         let binary = env!("CARGO_BIN_EXE_symforge");
-        let mut child = Command::new(binary)
+        let mut child = symforge::process_util::hidden_command(binary)
             .current_dir(cwd)
             .env("RUST_LOG", "error")
             .env("SYMFORGE_AUTO_INDEX", "false")

@@ -7791,7 +7791,7 @@ mod tests {
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
         #[cfg(windows)]
-        let mut child = std::process::Command::new("powershell")
+        let mut child = crate::process_util::hidden_command("powershell")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -7800,7 +7800,7 @@ mod tests {
             .expect("spawn long-running child");
 
         #[cfg(not(windows))]
-        let mut child = std::process::Command::new("sleep")
+        let mut child = crate::process_util::hidden_command("sleep")
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -9242,7 +9242,7 @@ mod tests {
         let main_file = main_root.join("src").join("lib.rs");
         std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_util::hidden_command("git")
                 .current_dir(&main_root)
                 .args(args)
                 .output()
@@ -9413,7 +9413,7 @@ mod tests {
         let main_file = main_root.join("src").join("lib.rs");
         std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_util::hidden_command("git")
                 .current_dir(&main_root)
                 .args(args)
                 .output()

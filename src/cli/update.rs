@@ -1156,7 +1156,7 @@ mod tests {
         let ping = std::path::Path::new(r"C:\Windows\System32\PING.EXE");
         std::fs::copy(ping, &fake).expect("copy ping.exe to symforge.exe");
         // `ping -n 30 127.0.0.1` stays alive ~30s; far longer than the test.
-        let child = std::process::Command::new(&fake)
+        let child = crate::process_util::hidden_command(&fake)
             .args(["-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

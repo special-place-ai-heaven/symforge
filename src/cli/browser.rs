@@ -5,7 +5,7 @@
 //! skips (never an error). Tests use a no-op opener that records the URL. No new
 //! dependency (no `open`/`webbrowser` crate) — D4 / ponytail rung 4.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Outcome of a browser-open attempt.
 ///
@@ -78,7 +78,7 @@ impl BrowserOpener for OsBrowserOpener {
 /// browser launcher commonly stays resident — so success means "the opener
 /// process started", which is the meaningful signal for `Opened` vs `Skipped`.
 fn run_opener(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
+    crate::process_util::hidden_command(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

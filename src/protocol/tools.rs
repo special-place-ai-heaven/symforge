@@ -10901,7 +10901,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -12260,7 +12259,7 @@ mod tests {
     }
 
     fn run_git(repo_root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::process_util::hidden_command("git")
             .arg("-C")
             .arg(repo_root)
             .args(args)

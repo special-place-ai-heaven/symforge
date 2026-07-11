@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use symforge::live_index::persist;
@@ -223,7 +223,7 @@ fn test_startup_binary_reports_branch_health() {
     };
 
     // Force local-only mode so the test doesn't spawn/contend with daemon processes.
-    let mut child = Command::new(&binary_path)
+    let mut child = symforge::process_util::hidden_command(&binary_path)
         .current_dir(dir.path())
         .env("RUST_LOG", "info")
         .env("SYMFORGE_NO_DAEMON", "1")
@@ -491,7 +491,7 @@ fn test_stdout_purity() {
         exe.join("symforge")
     };
 
-    let output = std::process::Command::new(&binary_path)
+    let output = symforge::process_util::hidden_command(&binary_path)
         .current_dir(dir.path())
         .env("RUST_LOG", "error") // suppress stderr noise in test output
         .env("SYMFORGE_AUTO_INDEX", "false") // start with empty index for speed

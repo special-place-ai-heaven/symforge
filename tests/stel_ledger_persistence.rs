@@ -588,7 +588,7 @@ fn recorded_event_survives_abrupt_drop_without_clean_shutdown() {
     let dir = tmp.path();
 
     let exe = std::env::current_exe().expect("current_exe for re-exec");
-    let status = std::process::Command::new(exe)
+    let status = symforge::process_util::hidden_command(exe)
         .args([
             "--exact",
             "recorded_event_survives_abrupt_drop_without_clean_shutdown",

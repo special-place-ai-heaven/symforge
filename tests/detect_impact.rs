@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{Value, json};
 use symforge::live_index::LiveIndex;
@@ -25,7 +24,7 @@ const FIXTURE_FILES: &[&str] = &[
 ];
 
 fn git(args: &[&str], root: &Path) {
-    let output = Command::new("git")
+    let output = symforge::process_util::hidden_command("git")
         .args(args)
         .current_dir(root)
         .output()
