@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -192,7 +191,7 @@ fn init_git_repo_with_git2(root: &Path) -> String {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = symforge::process_util::hidden_command("git")
         .current_dir(cwd)
         .args(args)
         .output()

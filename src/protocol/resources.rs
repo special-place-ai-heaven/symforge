@@ -152,6 +152,7 @@ impl SymForgeServer {
             }
             ResourceRequest::RepoOutline => {
                 self.get_repo_map(Parameters(GetRepoMapInput {
+                    project: None,
                     detail: Some("full".to_string()),
                     path: None,
                     depth: None,
@@ -163,6 +164,7 @@ impl SymForgeServer {
             }
             ResourceRequest::RepoMap => {
                 self.get_repo_map(Parameters(GetRepoMapInput {
+                    project: None,
                     detail: None,
                     path: None,
                     depth: None,
@@ -174,6 +176,7 @@ impl SymForgeServer {
             }
             ResourceRequest::RepoChangesUncommitted => {
                 self.what_changed(Parameters(WhatChangedInput {
+                    project: None,
                     since: None,
                     git_ref: None,
                     uncommitted: None,
@@ -190,6 +193,7 @@ impl SymForgeServer {
             ResourceRequest::Glossary => render_glossary(),
             ResourceRequest::FileContext { path, max_tokens } => {
                 self.get_file_context(Parameters(GetFileContextInput {
+                    project: None,
                     path,
                     max_tokens,
                     sections: None,
@@ -210,6 +214,7 @@ impl SymForgeServer {
                 header,
             } => {
                 self.get_file_content(Parameters(GetFileContentInput {
+                    project: None,
                     path,
                     mode: None,
                     start_line,
@@ -234,6 +239,7 @@ impl SymForgeServer {
             }
             ResourceRequest::SymbolDetail { path, name, kind } => {
                 self.get_symbol(Parameters(GetSymbolInput {
+                    project: None,
                     path,
                     name,
                     kind,
@@ -247,6 +253,7 @@ impl SymForgeServer {
             }
             ResourceRequest::SymbolContext { name, file } => {
                 self.get_symbol_context(Parameters(GetSymbolContextInput {
+                    project: None,
                     name,
                     file,
                     path: None,

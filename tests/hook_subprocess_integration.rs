@@ -40,7 +40,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -295,7 +295,7 @@ fn run_hook_stale_sidecar_and_dead_daemon_degrades_to_pass_through() {
 fn run_hook_stdin_held_open_exits_fail_open_within_deadline() {
     let tmp = TempDir::new().expect("tempdir creation");
     let bin = env!("CARGO_BIN_EXE_symforge");
-    let mut child = Command::new(bin)
+    let mut child = symforge::process_util::hidden_command(bin)
         .arg("hook")
         .current_dir(tmp.path())
         .stdin(Stdio::piped())
@@ -409,7 +409,7 @@ fn run_hook_in_tempdir_with_env(
     extra_env: &[(&str, &str)],
 ) -> (String, String) {
     let bin = env!("CARGO_BIN_EXE_symforge");
-    let mut command = Command::new(bin);
+    let mut command = symforge::process_util::hidden_command(bin);
     command
         .arg("hook")
         .current_dir(cwd)

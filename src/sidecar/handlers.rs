@@ -1677,14 +1677,23 @@ pub async fn workflow_repo_start_handler(
 /// Heuristic: whether an indexed path looks like it belongs to the
 /// active workspace.
 ///
-/// Rejects any path containing `:` (Windows drive letter — `C:\…`) or
-/// starting with `/` (POSIX absolute). Kept loose on purpose: a legit
-/// file literally named `src/a:b.rs` on POSIX would also be filtered,
-/// but we accept that edge case in exchange for matching the pre-existing
-/// guard at the header-stats loop exactly and blocking the octogent-style
+/// Rejects any path containing `:` (Windows drive letter — `C:\…`), starting
+/// with `/` (POSIX absolute) or `\` (backslash-rooted / UNC), or containing a
+/// `..` segment (parent-relative escape) — the same containment classes the
+/// full/tree outline guard (`path_within_indexed_root`) drops (recovered
+/// finding #7). Kept lexical on purpose: indexed workspace paths are stored as
+/// relative forward-slash paths, so anything outside that shape is foreign. A
+/// legit file literally named `src/a:b.rs` on POSIX would also be filtered,
+/// but we accept that edge case in exchange for blocking the octogent-style
 /// cross-workspace leak that motivated Unit 1.
 fn is_intra_workspace_path(path: &str) -> bool {
-    !(path.contains(':') || path.starts_with('/'))
+    if path.contains(':') || path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    !path
+        .replace('\\', "/")
+        .split('/')
+        .any(|segment| segment == "..")
 }
 pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> {
     // Single lock acquisition covers both the directory stats and key-types passes.
@@ -3564,6 +3573,19 @@ mod tests {
         ));
         // POSIX absolute paths.
         assert!(!is_intra_workspace_path("/usr/local/project/src/main.rs"));
+    }
+
+    /// Recovered finding #7: the compact repo map's containment guard must also
+    /// reject parent-relative escapes, UNC paths, and backslash-rooted paths —
+    /// the same classes the full/tree outline guard drops.
+    #[test]
+    fn test_is_intra_workspace_path_rejects_parent_relative_unc_and_backslash_rooted() {
+        assert!(is_intra_workspace_path("src/main.rs"));
+        assert!(!is_intra_workspace_path("../evil.rs"));
+        assert!(!is_intra_workspace_path("src/../../evil.rs"));
+        assert!(!is_intra_workspace_path("..\\evil.rs"));
+        assert!(!is_intra_workspace_path("\\\\server\\share\\evil.rs"));
+        assert!(!is_intra_workspace_path("\\evil.rs"));
     }
 
     #[tokio::test]

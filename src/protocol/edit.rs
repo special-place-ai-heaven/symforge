@@ -1378,6 +1378,13 @@ pub(crate) fn try_whitespace_flexible_replace(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct ReplaceSymbolBodyInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path.
     pub path: String,
     /// Symbol name to replace.
@@ -1431,6 +1438,13 @@ pub struct ReplaceSymbolBodyInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct InsertSymbolInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path.
     pub path: String,
     /// Name of the reference symbol to insert adjacent to.
@@ -1461,6 +1475,13 @@ pub struct InsertSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct DeleteSymbolInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path.
     pub path: String,
     /// Symbol name to delete.
@@ -1486,6 +1507,13 @@ pub struct DeleteSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct EditWithinSymbolInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path.
     pub path: String,
     /// Symbol name that scopes the edit.
@@ -1532,6 +1560,13 @@ pub struct EditWithinSymbolInput {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchEditInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// List of individual edits to apply atomically.
     #[serde(deserialize_with = "super::tools::lenient_vec_required")]
     #[schemars(with = "Vec<SingleEdit>")]
@@ -2142,6 +2177,13 @@ pub(crate) fn execute_batch_edit(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchRenameInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path containing the symbol definition.
     pub path: String,
     /// Current symbol name.
@@ -2581,6 +2623,13 @@ pub(crate) fn execute_batch_rename(
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BatchInsertInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. The whole call is single-project: cross-project
+    /// mixtures are rejected rather than distributed. Local/embedded servers
+    /// are bound to one project and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Code to insert at each target location.
     pub content: String,
     /// Where to insert: before or after.
@@ -4317,6 +4366,7 @@ mod tests {
         }
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() { log::info!(\"called\"); }".to_string(),
             position: InsertPosition::After,
             targets: vec![
@@ -4368,6 +4418,7 @@ mod tests {
         }
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() {}".to_string(),
             position: InsertPosition::After,
             targets: vec![
@@ -4442,6 +4493,7 @@ mod tests {
         std::fs::create_dir(&b_path).unwrap();
 
         let input = BatchInsertInput {
+            project: None,
             content: "fn logging() {}".to_string(),
             position: InsertPosition::After,
             targets: vec![
@@ -4646,6 +4698,7 @@ mod tests {
         handle.update_file("src/a.rs".to_string(), indexed);
 
         let input = crate::protocol::edit::BatchRenameInput {
+            project: None,
             path: "src/a.rs".to_string(),
             name: "OldName".to_string(),
             new_name: "NewName".to_string(),
@@ -4716,6 +4769,7 @@ mod tests {
         std::fs::create_dir(&b_path).unwrap();
 
         let input = crate::protocol::edit::BatchRenameInput {
+            project: None,
             path: "src/a.rs".to_string(),
             name: "OldName".to_string(),
             new_name: "NewName".to_string(),

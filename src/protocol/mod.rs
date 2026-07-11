@@ -696,15 +696,9 @@ impl SymForgeServer {
         max_tokens: Option<u64>,
     ) -> String {
         let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
-        let Some(tokens) = budget else {
-            return result;
-        };
-        if ccr::profile_for_tool(tool_name).is_some_and(|p| p.ccr_eligible)
-            && result.len() > tokens as usize * 4
-        {
-            let summary = format::enforce_token_budget(result.clone(), Some(tokens));
+        if ccr::profile_for_tool(tool_name).is_some_and(|p| p.ccr_eligible) {
             let mut store = self.ccr_store.lock();
-            return ccr::apply_ccr_overflow(&mut store, tool_name, summary, result, tokens);
+            return ccr::enforce_token_budget_with_ccr(&mut store, tool_name, result, budget);
         }
         format::enforce_token_budget(result, budget)
     }
@@ -1327,7 +1321,15 @@ impl ServerHandler for SymForgeServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        // Task 7: bind the selected-project evidence slot for this dispatch,
+        // seeded with the LOCAL bound project; the daemon proxy layer
+        // overwrites it with the daemon's receipt when it answers. Statused
+        // results attach whatever is current at render time.
+        result_status::with_project_evidence_scope(
+            self.local_project_evidence(),
+            self.tool_router.call(tcc),
+        )
+        .await
     }
 
     async fn list_tools(

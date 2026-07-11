@@ -104,6 +104,7 @@ pub enum InitClient {
     ClaudeDesktop,
     Codex,
     Gemini,
+    Grok,
     #[value(name = "kilo-code", alias = "kilo")]
     KiloCode,
     Cursor,
@@ -162,6 +163,17 @@ mod tests {
 
         match cli.command {
             Some(Commands::Init { client, .. }) => assert_eq!(client, InitClient::Gemini),
+            _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_accepts_grok_client() {
+        let cli = Cli::try_parse_from(["symforge", "init", "--client", "grok"])
+            .expect("grok must be a supported init client");
+
+        match cli.command {
+            Some(Commands::Init { client, .. }) => assert_eq!(format!("{client:?}"), "Grok"),
             _ => panic!("expected init command"),
         }
     }

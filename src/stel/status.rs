@@ -283,7 +283,28 @@ pub fn format_stel_status(request: &StelStatusRequest, ctx: &StelStatusContext<'
     match detail {
         StelStatusDetail::Compact => format_compact_status(ctx),
         StelStatusDetail::Full => format_full_status(ctx),
+        StelStatusDetail::Projects => format_projects_status(ctx),
     }
+}
+
+/// `detail: projects` — the LOCAL single-project inventory row. A local or
+/// embedded server is bound to exactly one project, so this lists that one
+/// row; the daemon route intercepts the same request and renders the full
+/// session inventory (one row per open project, home marked) instead.
+fn format_projects_status(ctx: &StelStatusContext<'_>) -> String {
+    let mut lines = vec!["── projects ──".to_string()];
+    lines.push(format!(
+        "name={} root={} home=yes files={} symbols={} index_ready={}",
+        ctx.project_name,
+        ctx.project_root.as_deref().unwrap_or("(unbound)"),
+        ctx.index_files,
+        ctx.index_symbols,
+        ctx.index_ready,
+    ));
+    lines.join(
+        "
+",
+    )
 }
 
 fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {

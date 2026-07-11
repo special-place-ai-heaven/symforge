@@ -101,7 +101,7 @@ fn isolated_data_home(data_home: &Path) -> Vec<EnvGuard> {
 }
 
 fn symforge_command(data_home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_symforge"));
+    let mut command = symforge::process_util::hidden_command(env!("CARGO_BIN_EXE_symforge"));
     command
         .env("LOCALAPPDATA", data_home)
         .env("XDG_DATA_HOME", data_home)

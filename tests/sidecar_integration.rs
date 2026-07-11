@@ -147,31 +147,39 @@ async fn test_sidecar_binds_ephemeral_port() {
 
     assert!(handle.port > 0, "port must be a valid non-zero value");
 
-    // The sidecar writes OS-tagged runtime files (sidecar.<os>.port); this test runs on
-    // the same OS as the spawned sidecar, so std::env::consts::OS matches the tag.
-    let sf = tmp.path().join(".symforge");
-    let port_file = sf.join(format!("sidecar.{}.port", std::env::consts::OS));
-    assert!(port_file.exists(), "OS-tagged sidecar port file must exist");
-    let content = std::fs::read_to_string(&port_file).unwrap();
-    let file_port: u16 = content
-        .trim()
-        .parse()
-        .expect("port file must contain a valid u16");
-    assert_eq!(file_port, handle.port, "port file must match handle port");
-
-    let pid_file = sf.join(format!("sidecar.{}.pid", std::env::consts::OS));
-    assert!(pid_file.exists(), "OS-tagged sidecar pid file must exist");
+    // Task 8: the sidecar writes ONE per-process OS-tagged JSON descriptor
+    // under `.symforge/sessions/` (the fixed sidecar.<os>.{port,pid} files are
+    // a read-only migration aid, no longer written).
+    let descriptor = tmp.path().join(".symforge").join("sessions").join(format!(
+        "sidecar.{}.{}.json",
+        std::process::id(),
+        std::env::consts::OS
+    ));
+    assert!(
+        descriptor.exists(),
+        "per-process sidecar descriptor must exist at {}",
+        descriptor.display()
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&descriptor).unwrap())
+            .expect("descriptor must be valid JSON");
+    assert_eq!(
+        value["port"].as_u64(),
+        Some(handle.port as u64),
+        "descriptor port must match handle port"
+    );
+    assert_eq!(
+        value["pid"].as_u64(),
+        Some(std::process::id() as u64),
+        "descriptor pid must be this process"
+    );
 
     // Send shutdown and await server-task completion (listener fully dropped).
     handle.shutdown_and_join().await;
 
     assert!(
-        !port_file.exists(),
-        "sidecar.port file must be cleaned up after shutdown"
-    );
-    assert!(
-        !pid_file.exists(),
-        "sidecar.pid file must be cleaned up after shutdown"
+        !descriptor.exists(),
+        "sidecar descriptor must be cleaned up after shutdown"
     );
 
     restore_cwd(&original);

@@ -94,6 +94,8 @@ fn clear_dead_sidecar_record() -> Option<String> {
 
     let dir = std::path::Path::new(".symforge");
     let status = read_sidecar_status_at(dir, "127.0.0.1");
+    // Task 8: purge stale per-adapter descriptors alongside the legacy files.
+    crate::sidecar::port_file::cleanup_stale_descriptors_at(dir, "127.0.0.1");
     if matches!(status.liveness, SidecarLiveness::Dead) {
         cleanup_files_at(dir);
         Some("cleared a stale sidecar record".to_string())
@@ -1156,7 +1158,7 @@ mod tests {
         let ping = std::path::Path::new(r"C:\Windows\System32\PING.EXE");
         std::fs::copy(ping, &fake).expect("copy ping.exe to symforge.exe");
         // `ping -n 30 127.0.0.1` stays alive ~30s; far longer than the test.
-        let child = std::process::Command::new(&fake)
+        let child = crate::process_util::hidden_command(&fake)
             .args(["-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

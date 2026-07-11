@@ -258,6 +258,12 @@ where
 /// Input for `get_symbol`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct GetSymbolInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative path to the file. OPTIONAL: when omitted, the symbol is resolved
     /// by an exact `name` search across the index (pass `symbol_line`/`kind` to
     /// disambiguate a common name). Provide `path` to skip the search and go
@@ -316,6 +322,12 @@ pub struct SymbolTarget {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetFileContentInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative path to the file.
     pub path: String,
     /// Selection mode: `lines`, `symbol`, `match`, `chunk`.
@@ -388,6 +400,12 @@ pub struct SymforgeRetrieveInput {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct ValidateFileSyntaxInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     pub path: String,
     /// When true, return an approximate token cost estimate instead of actual content.
     #[serde(default, deserialize_with = "lenient_bool")]
@@ -397,6 +415,12 @@ pub(crate) struct ValidateFileSyntaxInput {
 /// Input for `find_dependents`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct FindDependentsInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative file path to find dependents for.
     pub path: String,
     /// Symbol name. NOT a valid parameter for file-level dependents — present
@@ -430,6 +454,12 @@ pub struct FindDependentsInput {
 /// Input for `get_repo_map`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct GetRepoMapInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Detail level: "compact" (default — ~500 token project overview), "full" (complete symbol outline of every file), "tree" (browsable file tree with per-file stats).
     pub detail: Option<String>,
     /// Subtree path to browse (only used when detail="tree", default: project root).
@@ -452,6 +482,12 @@ pub struct GetRepoMapInput {
 #[derive(Serialize, JsonSchema)]
 #[schemars(transform = add_include_tests_schema)]
 pub struct GetFileContextInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Relative path to the file.
     pub path: String,
     /// Optional max token budget, matching hook behavior.
@@ -473,6 +509,8 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
+            #[serde(default)]
+            project: Option<String>,
             path: String,
             #[serde(default, deserialize_with = "lenient_u64")]
             max_tokens: Option<u64>,
@@ -488,6 +526,7 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
 
         let raw = Raw::deserialize(deserializer)?;
         Ok(Self {
+            project: raw.project,
             path: raw.path,
             max_tokens: raw.max_tokens,
             sections: encode_include_tests_marker(raw.sections, raw.include_tests),
@@ -501,6 +540,12 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
 #[derive(Serialize, JsonSchema)]
 #[schemars(transform = add_include_tests_schema)]
 pub struct GetSymbolContextInput {
+    /// Optional explicit project selector (daemon sessions with multiple open
+    /// projects): an open project ID or unique project name. Omit for the
+    /// session's home project. Local/embedded servers are bound to one project
+    /// and refuse a non-matching selector.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Symbol name to inspect.
     pub name: String,
     /// Optional file filter (ignored when bundle=true; use path instead).
@@ -540,6 +585,8 @@ impl<'de> Deserialize<'de> for GetSymbolContextInput {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Raw {
+            #[serde(default)]
+            project: Option<String>,
             name: String,
             file: Option<String>,
             path: Option<String>,
@@ -565,6 +612,7 @@ impl<'de> Deserialize<'de> for GetSymbolContextInput {
             None => None,
         };
         Ok(Self {
+            project: raw.project,
             name: raw.name,
             file: raw.file,
             path: raw.path,

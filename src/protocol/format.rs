@@ -4783,20 +4783,56 @@ fn format_bundle_truncation_notice(max_tokens: u64, omitted_dependencies: Option
 /// boundary and a clear notice is appended.  Returns the original string
 /// unchanged when no budget is set or the output fits within the budget.
 pub fn enforce_token_budget(output: String, max_tokens: Option<u64>) -> String {
+    enforce_token_budget_flagged(output, max_tokens).0
+}
+
+/// [`enforce_token_budget`] that also reports WHETHER it truncated, so callers
+/// that already stamped a trust envelope can downgrade a now-stale
+/// `Completeness: full` claim (dogfood 2026-07-11: `get_file_context` cut its
+/// assembled output after the sidecar stamped `full`).
+pub fn enforce_token_budget_flagged(output: String, max_tokens: Option<u64>) -> (String, bool) {
     let max_tokens = match max_tokens {
         Some(t) if t > 0 => t,
-        _ => return output,
+        _ => return (output, false),
     };
     let max_bytes = (max_tokens as usize).saturating_mul(4);
     if output.len() <= max_bytes {
-        return output;
+        return (output, false);
     }
     let actual_tokens_est = approx_tokens_from_bytes(output.len());
     let mut truncated = truncate_text_at_line_boundary(&output, max_bytes);
     let detail =
         format!("Original output is ~{actual_tokens_est} tokens; budget is {max_tokens} tokens.");
     truncated.push_str(&token_truncation_footer(max_tokens, Some(detail.as_str())));
-    truncated
+    (truncated, true)
+}
+
+/// Rewrite a stamped `full` completeness claim to `budget-limited` after a
+/// post-assembly truncation invalidated it. Handles both envelope forms: the
+/// compact one-liner (`Trust: <match> | <authority> | <parse> | full...`) and
+/// the expanded `Completeness: full...` line. Only the envelope region (the
+/// leading lines) is rewritten; body text is never touched.
+pub fn downgrade_full_completeness_after_truncation(output: &str) -> String {
+    let mut lines: Vec<String> = output.lines().map(str::to_string).collect();
+    for line in lines.iter_mut().take(6) {
+        if let Some(rest) = line.strip_prefix("Trust: ") {
+            let mut parts: Vec<&str> = rest.splitn(4, " | ").collect();
+            if parts.len() == 4 && parts[3].starts_with("full") {
+                let downgraded = format!("budget-limited (was: {})", parts[3]);
+                parts[3] = &downgraded;
+                *line = format!("Trust: {}", parts.join(" | "));
+            }
+        } else if let Some(rest) = line.strip_prefix("Completeness: ")
+            && rest.starts_with("full")
+        {
+            *line = format!("Completeness: budget-limited (was: {rest})");
+        }
+    }
+    let mut rewritten = lines.join("\n");
+    if output.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
 }
 
 fn truncate_text_at_line_boundary(text: &str, max_bytes: usize) -> String {

@@ -121,6 +121,14 @@ impl CcrStore {
     pub fn insert(&mut self, tool_name: &str, formatted: String) -> String {
         let handle = mint_handle(tool_name, &formatted);
         let byte_len = formatted.len();
+        // Content-addressed handle: re-inserting identical output refreshes the
+        // stored blob's age and must not re-count bytes or offloads (recovered
+        // finding #8 — the old unconditional add double-counted `total_bytes`
+        // and the economics counters on every duplicate).
+        if let Some(existing) = self.blobs.get_mut(&handle) {
+            existing.created_at = Instant::now();
+            return handle;
+        }
         while self.total_bytes.saturating_add(byte_len) > self.max_bytes
             || self.blobs.len() >= self.max_entries
         {
@@ -194,7 +202,11 @@ pub fn apply_ccr_overflow(
     if full.len() <= max_bytes {
         return full;
     }
-    if summary.len() > max_bytes {
+    // ponytail: `summary` carries enforce_token_budget's own budget footer, so on
+    // a real truncation it always sits a hair over max_bytes — the old
+    // `summary.len() > max_bytes` guard therefore fired every time and suppressed
+    // the retrieve handle. Only skip CCR when the summary saved nothing.
+    if summary.len() >= full.len() {
         return summary;
     }
     let handle = store.insert(tool_name, full);
@@ -202,6 +214,31 @@ pub fn apply_ccr_overflow(
     format!(
         "{summary}\n---\nCCR: {omitted_note} · retrieve: symforge_retrieve with hash=\"{handle}\"\n"
     )
+}
+
+/// Enforce a token budget with CCR overflow — the single decision point for
+/// "big response → truncate and offer retrieval".
+///
+/// Within budget the payload is returned unchanged (no footer, FR-008). Over
+/// budget the complete payload is stored and the truncated summary gains a
+/// `symforge_retrieve` footer whose hash fetches the full pre-truncation output
+/// (SC-005). The CCR decision runs on the COMPLETE payload before the hard cut,
+/// so the retrieve hash always resolves to the full result, never a
+/// pre-truncated one.
+pub fn enforce_token_budget_with_ccr(
+    store: &mut CcrStore,
+    tool_name: &str,
+    result: String,
+    max_tokens: Option<u64>,
+) -> String {
+    let Some(tokens) = max_tokens.filter(|t| *t > 0) else {
+        return result;
+    };
+    if result.len() <= (tokens as usize).saturating_mul(4) {
+        return result;
+    }
+    let summary = super::format::enforce_token_budget(result.clone(), Some(tokens));
+    apply_ccr_overflow(store, tool_name, summary, result, tokens)
 }
 
 fn line_is_error_severity(line: &str) -> bool {
@@ -322,6 +359,32 @@ fn cap_file_matches(matches: &mut Vec<TextLineMatch>, query: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Recovered finding #8: a duplicate insert of identical content (same
+    /// content-addressed handle) must not double-count `total_bytes` or the
+    /// economics counters — it replaces/refreshes the same stored blob.
+    #[test]
+    fn ccr_insert_duplicate_does_not_double_count() {
+        let mut store = CcrStore::new();
+        let h1 = store.insert("search_text", "payload".to_string());
+        let before = store.economics();
+        let total_before = store.total_bytes;
+        let h2 = store.insert("search_text", "payload".to_string());
+        assert_eq!(h1, h2, "identical content mints the same handle");
+        let after = store.economics();
+        assert_eq!(
+            after.bytes_stored, before.bytes_stored,
+            "duplicate insert must not re-count stored bytes"
+        );
+        assert_eq!(
+            after.offloads, before.offloads,
+            "duplicate insert must not re-count offloads"
+        );
+        assert_eq!(
+            store.total_bytes, total_before,
+            "duplicate insert must not inflate total_bytes"
+        );
+    }
+
     #[test]
     fn ccr_round_trip() {
         let mut store = CcrStore::new();
@@ -343,6 +406,56 @@ mod tests {
         assert_eq!(retrieved, full);
         assert_eq!(store.economics().retrieves, 1);
         assert_eq!(store.economics().bytes_retrieved, econ.bytes_stored);
+    }
+
+    // T020 (SC-005): a builder response that truncates under a tight budget must
+    // emit a `symforge_retrieve` footer whose hash resolves to the full payload.
+    // Reproduces the production path: `enforce_token_budget` appends its own
+    // budget footer, so the intermediate summary sits a hair over max_bytes —
+    // which used to trip apply_ccr_overflow's guard and suppress the handle.
+    #[test]
+    fn ccr_footer_emitted_when_builder_truncates() {
+        let mut store = CcrStore::new();
+        let full = "outline symbol line of repo map text\n".repeat(2000);
+        let out =
+            enforce_token_budget_with_ccr(&mut store, "get_repo_map", full.clone(), Some(300));
+        assert!(
+            out.contains("symforge_retrieve"),
+            "truncated output must offer a retrieve handle; tail: {}",
+            &out[out.len().saturating_sub(160)..]
+        );
+        let handle = out
+            .split("hash=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("retrieve hash present");
+        assert_eq!(
+            store.get(handle).expect("blob stored").formatted_bytes,
+            full,
+            "retrieve hash must resolve to the full pre-truncation payload"
+        );
+    }
+
+    // T021 (FR-008): a within-budget response gains no footer and stores nothing.
+    #[test]
+    fn ccr_no_footer_within_budget() {
+        let mut store = CcrStore::new();
+        let small = "fits\n".repeat(10);
+        let out =
+            enforce_token_budget_with_ccr(&mut store, "get_repo_map", small.clone(), Some(1000));
+        assert_eq!(
+            out, small,
+            "within-budget output must be returned unchanged"
+        );
+        assert!(
+            !out.contains("symforge_retrieve"),
+            "no retrieve footer within budget"
+        );
+        assert_eq!(
+            store.economics().offloads,
+            0,
+            "no blob stored for a within-budget response"
+        );
     }
 
     #[test]

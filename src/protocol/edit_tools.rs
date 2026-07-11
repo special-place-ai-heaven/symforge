@@ -649,6 +649,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("replace_symbol_body", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
             let guard = self.index.read();
@@ -925,6 +928,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("insert_symbol", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         let position = params.0.position.as_deref().unwrap_or("after");
         if position != "before" && position != "after" {
@@ -1115,6 +1121,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("delete_symbol", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
             let guard = self.index.read();
@@ -1297,6 +1306,9 @@ impl SymForgeServer {
     ) -> String {
         if let Some(result) = self.proxy_tool_call("edit_within_symbol", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
@@ -1704,6 +1716,9 @@ impl SymForgeServer {
         if let Some(result) = self.proxy_tool_call("batch_edit", &params.0).await {
             return result;
         }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
+        }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {
             let guard = self.index.read();
@@ -1803,6 +1818,9 @@ impl SymForgeServer {
         // `batch_edit`. Not plumbed here by design.
         if let Some(result) = self.proxy_tool_call("batch_rename", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         let repo_root = match self.capture_repo_root() {
@@ -1907,6 +1925,9 @@ impl SymForgeServer {
         // `batch_edit`. Not plumbed here by design.
         if let Some(result) = self.proxy_tool_call("batch_insert", &params.0).await {
             return result;
+        }
+        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
+            return refusal;
         }
         self.note_worktree_misuse_if_active(params.0.working_directory.as_deref());
         {

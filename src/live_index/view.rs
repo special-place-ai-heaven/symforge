@@ -31,12 +31,14 @@ use std::sync::Arc;
 use crate::domain::{ReferenceKind, ReferenceRecord};
 
 use super::search::{
-    DEFAULT_MAX_PER_FILE, SymbolMatchTier, SymbolSearchOptions, TextSearchError, TextSearchOptions,
-    TextSearchResult, compute_test_ranges, current_code_search_keeps_file,
-    search_symbols_with_options, search_text_with_options, truncate_display_line,
+    DEFAULT_MAX_PER_FILE, PathScope, SymbolMatchTier, SymbolSearchOptions, TextSearchError,
+    TextSearchOptions, TextSearchResult, browse_kind_rank, compute_test_ranges,
+    current_code_search_keeps_file, search_symbols_with_options, search_text_with_options,
+    truncate_display_line,
 };
 use super::store::{IndexedFile, LiveIndex};
 use crate::live_index::query::is_filtered_name;
+use crate::live_index::query::{SearchFilesHit, SearchFilesView};
 
 /// The commit identity component of a [`BaseKey`].
 ///
@@ -329,7 +331,16 @@ impl<'a> IndexView<'a> {
         }
 
         let query_lower = query.to_lowercase();
-        let mut hits: Vec<ViewSymbolHit> = Vec::new();
+        // Same browse intent as the base engine (search.rs): an empty/whitespace
+        // query WITH a scope filter ranks by importance, not name-match tiers.
+        // Keeps the browse-vs-name-match distinction consistent across both
+        // `search_symbols` call sites (018 US2).
+        let browse = query.trim().is_empty()
+            && (kind_filter.is_some() || !matches!(options.path_scope, PathScope::Any));
+        // Carry the reverse-reference count alongside each hit for browse ranking
+        // (0 on the keyword path). Reference counts come from the base's
+        // `reverse_index` — the same source the engine uses.
+        let mut hits: Vec<(ViewSymbolHit, usize)> = Vec::new();
         let mut resolved = self.all_files();
         // Stable ordering before tiering so equal-tier ties are deterministic.
         resolved.sort_by(|a, b| a.0.cmp(&b.0));
@@ -343,7 +354,7 @@ impl<'a> IndexView<'a> {
                     continue;
                 }
                 let name_lower = sym.name.to_lowercase();
-                if !name_lower.contains(&query_lower) {
+                if !browse && !name_lower.contains(&query_lower) {
                     continue;
                 }
                 let tier = if name_lower == query_lower {
@@ -353,23 +364,46 @@ impl<'a> IndexView<'a> {
                 } else {
                     SymbolMatchTier::Substring
                 };
-                hits.push(ViewSymbolHit {
-                    name: sym.name.clone(),
-                    path: path.clone(),
-                    kind: sym.kind.to_string(),
-                    line: sym.line_range.0 + 1,
-                    tier,
-                });
+                let ref_count = if browse {
+                    self.base
+                        .reverse_index
+                        .get(&sym.name)
+                        .map(|refs| refs.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                hits.push((
+                    ViewSymbolHit {
+                        name: sym.name.clone(),
+                        path: path.clone(),
+                        kind: sym.kind.to_string(),
+                        line: sym.line_range.0 + 1,
+                        tier,
+                    },
+                    ref_count,
+                ));
             }
         }
 
-        hits.sort_by(|a, b| {
-            a.tier
-                .cmp(&b.tier)
-                .then(a.name.cmp(&b.name))
-                .then(a.path.cmp(&b.path))
-        });
-        hits
+        if browse {
+            // Importance order: reference count desc, then a total kind → path →
+            // line tie-break (Constitution IV).
+            hits.sort_by(|(a, ca), (b, cb)| {
+                cb.cmp(ca)
+                    .then_with(|| browse_kind_rank(&a.kind).cmp(&browse_kind_rank(&b.kind)))
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+        } else {
+            hits.sort_by(|(a, _), (b, _)| {
+                a.tier
+                    .cmp(&b.tier)
+                    .then(a.name.cmp(&b.name))
+                    .then(a.path.cmp(&b.path))
+            });
+        }
+        hits.into_iter().map(|(hit, _)| hit).collect()
     }
 
     /// Text search served BASE-ONLY + an overlay POST-FILTER over the dirty set
@@ -996,6 +1030,52 @@ impl WorkingSet {
         Ok(out)
     }
 
+    /// Cross-project file search (outstanding-work Task 4): per targeted
+    /// entry, run the EXISTING per-project ranked file search
+    /// ([`LiveIndex::capture_search_files_view_with_noise`]) on the entry's
+    /// base index and tag each ranked hit by project. Plain fuzzy-query mode
+    /// only — resolve/coupling modes stay single-project. Each project's hits
+    /// arrive internally rank-ordered and `per_project_limit`-bounded; the
+    /// caller applies the ONE global cross-project cap after merging.
+    ///
+    /// File-path search reads only the file map (overlays carry content
+    /// deltas, not path membership), so the base index is the honest source.
+    pub fn search_files(
+        &self,
+        targets: &Targets,
+        query: &str,
+        per_project_limit: usize,
+        include_vendor: bool,
+        include_personal_tooling: bool,
+        path_scope: &PathScope,
+    ) -> Vec<ProjectHit<SearchFilesHit>> {
+        let mut out = Vec::new();
+        for entry in self
+            .entries
+            .iter()
+            .filter(|e| targets.selects(&e.project_id))
+        {
+            let view = entry.base.index.capture_search_files_view_with_noise(
+                query,
+                per_project_limit,
+                None,
+                None,
+                include_vendor,
+                include_personal_tooling,
+                path_scope,
+            );
+            if let SearchFilesView::Found { hits, .. } = view {
+                for hit in hits {
+                    out.push(ProjectHit {
+                        project_id: entry.project_id.clone(),
+                        hit,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Cross-project reference search (FR-004 / SC-001): per targeted entry, run
     /// the overlay-post-filtered [`IndexView::find_references`] and tag each
     /// `(path, ReferenceRecord)` hit by project.
@@ -1583,5 +1663,112 @@ mod tests {
             "dirty-tree overlay must preserve the base test-match suppression count, got {}",
             result.suppressed_by_noise
         );
+    }
+
+    // ── US2 (018): overlay-path browse ranks by importance too (T014) ─────────
+    #[test]
+    fn overlay_browse_ranks_referenced_symbol_first() {
+        // Base file defines a heavily-referenced function plus generic short
+        // names; the base reverse_index gives the referenced symbol its weight.
+        let content = "fn important_handler() {}\nfn add() {}\nfn get() {}\n";
+        let mut lib = make_file("src/lib.rs", content);
+        let mk = |name: &str, line: u32| SymbolRecord {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            depth: 0,
+            sort_order: 0,
+            byte_range: (0, 0),
+            line_range: (line, line),
+            doc_byte_range: None,
+            item_byte_range: None,
+        };
+        lib.symbols = vec![mk("important_handler", 0), mk("add", 1), mk("get", 2)];
+        let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+        map.insert("src/lib.rs".to_string(), Arc::new(lib));
+        let mut idx = LiveIndex::empty_live_index();
+        idx.is_empty = false;
+        idx.loaded_at = Instant::now();
+        idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);
+        idx.files = map;
+        idx.reverse_index.insert(
+            "important_handler".to_string(),
+            (0..9u32)
+                .map(|i| crate::live_index::store::ReferenceLocation {
+                    file_path: "src/lib.rs".to_string(),
+                    reference_idx: i,
+                })
+                .collect(),
+        );
+        let base = Arc::new(IndexBase::new(base_key("c0"), Arc::new(idx), 1));
+
+        // A dirty delta forces the overlay (with-deltas) branch, not the
+        // engine-delegating no-delta path.
+        let mut overlay = Overlay::fresh(&base);
+        overlay.deltas.insert(
+            "src/other.rs".to_string(),
+            FileDelta::Upsert(Arc::new(make_file("src/other.rs", "fn other() {}\n"))),
+        );
+        let view = IndexView::new(&base, Some(&overlay)).expect("overlay view");
+
+        // Browse: empty query + kind scope.
+        let opts = SymbolSearchOptions::for_current_code_search(usize::MAX);
+        let hits = view.search_symbols("", Some("fn"), &opts);
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("important_handler"),
+            "overlay browse must lead with the referenced symbol, got {names:?}"
+        );
+    }
+
+    // ── Task 4 leftover — cross-project search_files fan-out ─────────────────
+    #[test]
+    fn cross_project_search_files_attributes_hits_per_target() {
+        let mut index_a = synthetic_index(0);
+        index_a.files.insert(
+            "widget_alpha.rs".to_string(),
+            Arc::new(make_file("widget_alpha.rs", "fn a() {}")),
+        );
+        let mut index_b = synthetic_index(0);
+        index_b.files.insert(
+            "widget_beta.rs".to_string(),
+            Arc::new(make_file("widget_beta.rs", "fn b() {}")),
+        );
+
+        let mut set = WorkingSet::new();
+        set.add(
+            "proj-a",
+            Arc::new(IndexBase::new(base_key("ca"), Arc::new(index_a), 1)),
+        );
+        set.add(
+            "proj-b",
+            Arc::new(IndexBase::new(base_key("cb"), Arc::new(index_b), 1)),
+        );
+
+        // All targets: hits from BOTH projects, each attributed to its source.
+        let all = set.search_files(&Targets::All, "widget", 20, false, false, &PathScope::Any);
+        let mut attributed: Vec<(&str, &str)> = all
+            .iter()
+            .map(|hit| (hit.project_id.as_str(), hit.hit.path.as_str()))
+            .collect();
+        attributed.sort_unstable();
+        assert_eq!(
+            attributed,
+            vec![("proj-a", "widget_alpha.rs"), ("proj-b", "widget_beta.rs")],
+            "fan-out must return each project's ranked hit with attribution"
+        );
+
+        // One target: only that project's hits.
+        let only_b = set.search_files(
+            &Targets::One("proj-b".to_string()),
+            "widget",
+            20,
+            false,
+            false,
+            &PathScope::Any,
+        );
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].project_id, "proj-b");
+        assert_eq!(only_b[0].hit.path, "widget_beta.rs");
     }
 }

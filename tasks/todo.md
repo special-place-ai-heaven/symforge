@@ -357,3 +357,406 @@ cd E:\project\symforge
 
 - SFB07 acceptance criteria passed: the KEEP_DOC_MARKDOWN_USAGE_VISIBLE decision is recorded in test comments, regression tests cover ordinary comments, doc comments, and markdown, and existing `search_text` tests plus full verification passed.
 - Changes stayed inside the allowed tracked files/areas plus the copied ignored goal-status file. No `docs/**`, `plans/**`, `.planning/**`, `openspec/**`, `npm/**`, daemon, edit protocol, or parsing files were modified.
+
+---
+
+# Outstanding-Work Hardening (2026-07-10)
+
+## Plan
+
+- [x] Audit `docs/OUTSTANDING-WORK.md` against current code, tests, runtime,
+  memory, vault, releases, and live dogfood.
+- [x] Approve and commit the code-first architecture design.
+- [x] Convert product intent into explicit trust, tool-substitution, and token-
+  economy acceptance gates.
+- [x] Close Feature 018 browse/frecency code residuals.
+- [ ] Close Feature 018 documentation/task residuals with the canonical dogfood
+  artifacts in Task 12.
+- [x] Replace inline daemon project instances with per-project slots and
+  partition per-session protocol/cache state.
+- [x] Make daemon home immutable and `index_folder` additive/persistent.
+- [~] Route read, guidance, compact, and structural-edit tools explicitly by
+  project. (Daemon-route core DONE 2026-07-11: `runtime_for_target` shared
+  resolver + `single_project_routed_tool` peek/strip routing in
+  `call_tool_handler` for the 16 read/guidance verbs; parity table + resolver
+  contract tests green. REMAINING: `project` fields in tool input schemas +
+  strict-client schema pins, local-mode explicit-project refusal guards,
+  set-valued `search_files` cross-target merge, compact `symforge` facade
+  routing through stel planner/executor, project-explicit structural edits.)
+- [x] Replace the global snapshot write lock with same-path serialization.
+- [ ] Carry selected-project/freshness evidence and expose project inventory.
+- [ ] Make reconnect and runtime descriptors multi-session safe.
+- [ ] Enforce daemon uniqueness and reap expired sessions.
+- [x] Preserve generated-output admission through watcher single-file updates.
+- [ ] Add native, preserving Grok initialization.
+- [ ] Create the canonical Grok dogfood prompt and common-tool substitution
+  scorecard.
+- [ ] Resolve every outstanding-work ledger entry with executable evidence.
+- [ ] Run focused/full Terminal Commander gates, release-binary multi-project
+  dogfood, and adversarial review.
+- [ ] Stop for explicit approval before push/PR/merge/publish/`cargo clean`.
+
+## Evidence Log
+
+- Design: `docs/superpowers/specs/2026-07-10-outstanding-work-hardening-design.md`
+  committed as `1608433`.
+- Executable plan: `docs/superpowers/plans/2026-07-10-outstanding-work-hardening.md`.
+- Current code truth: the daemon already has deterministic project IDs and a
+  multi-project `WorkingSet`, but ordinary `index_folder` still destructively
+  mutates `active_project_id` while holding the project-map write lock through
+  reload.
+- Product gate: hardening is enabling work. Completion requires proving common
+  repository-tool substitution and measured token savings with retained-answer
+  checks, not merely green infrastructure tests.
+- Feature 018 browse closure: `a646f23`; the repeated generic-name RED failed
+  with four `new` hits, then the exact diversity and real-store frecency tests
+  passed.
+- Snapshot isolation: `3e756ee`; 42 persistence tests passed, including
+  same-path serialization, distinct-path independence, reset locking, unique
+  temp names, stale-temp cleanup, and failed-write cleanup.
+- Daemon project isolation: `b729164`; exact cross-project, prior-generation,
+  reload-serialization, and cross-session cache tests passed; daemon suite
+  passed 68/68.
+- Integrated verification after all three slices: `cargo fmt --check`,
+  `cargo check`, `cargo clippy --lib -- -D warnings`, and the full library suite
+  passed (`2709 passed; 0 failed; 2 ignored`).
+- Immutable-home/additive `index_folder` (2026-07-11, resumed on
+  `C:\AI_STUFF\PROGRAMMING\symforge`): destructive retarget removed;
+  `open_project_for_session` is the one canonical open path for omitted `add`
+  and `add=true` (shared durable idempotency ledger stored under the HOME
+  project so same-key/different-target conflicts reject before load); reload
+  persists an atomic snapshot with `checkpoint=written` / honest
+  `checkpoint=degraded: ...` receipts; proxy success no longer resets
+  local home fallback; daemon-proxy failure refuses destructive local
+  fallback; stale per-session server replaced via `Arc::ptr_eq` index
+  identity; slot cleanup/reinsertion closed by `ensure_project_slot_for_session`
+  (join under authoritative registry write lock, reused by session open);
+  session-close attach race closed (close removes the session record first,
+  `add_project_to_session` undoes the join via `detach_project_membership`);
+  proxy-failure test made hermetic (ephemeral bound-then-released port +
+  pre-degraded flag, no port-1 assumption, no reconnect autospawn); new
+  checkpoint-failure coverage
+  (`test_index_folder_open_reports_degraded_checkpoint_on_snapshot_failure`).
+  Receipts: `cargo test --lib daemon::tests::test_index_folder -- --test-threads=1`
+  = 10 passed / 0 failed; `cargo test --lib daemon:: -- --test-threads=1` =
+  72 passed / 0 failed; full `cargo test --lib -- --test-threads=1` =
+  2714 passed / 5 failed — the 5 failures are exactly the still-red watcher
+  generated-output fixtures owned by the next slice; `cargo clippy --lib -- -D
+  warnings`, `cargo fmt --check`, `git diff --check` all exit 0.
+- Watcher generated-output parity (2026-07-11): extracted the ONE path-shape
+  rule (`shallowest_generated_output_prefix`) shared by the bulk demotion walk
+  and a new per-event `discovery::is_untracked_generated_output_path`; wired it
+  into `read_and_index` after the admission gate (path-shape checked first so
+  ordinary events never touch git; git evidence consulted only for
+  generated-looking components; fail-open on non-git trees; opt-in env honored;
+  tracked file or tracked sibling under the prefix rescues to Tier 1; skip
+  records deduped by the existing `demote_to_skipped_at_generation`). Receipts:
+  `cargo test --lib watcher::tests:: -- --test-threads=1` = 38 passed / 0
+  failed (all five previously-red fixtures green); `cargo test --lib --
+  discovery:: live_index::store:: --test-threads=1` = 134 passed / 0 failed;
+  full `cargo test --lib -- --test-threads=1` = 2719 passed / 0 failed /
+  2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` all exit 0.
+- Recovered-review blockers (2026-07-11, code slice): #1 `detect_impact`
+  payload now carries a `source_filter` object (applied/excluded_paths/hint
+  naming `include_data=true`); #2 empty filtered `what_changed` (uncommitted)
+  disclosure now reports the filtered-out count, the source-focused default,
+  and `code_only=false`; #3 `code_only` keeps unknown-extension source via
+  `is_unparsed_source_path` allowlist (.sql/.sh/.bash/.zsh/.ps1/.psm1/.psd1/
+  .bat/.cmd/.proto/.tf/.tfvars/.cmake/.gradle + Dockerfile/Makefile/
+  GNUmakefile/justfile); #7 compact repo-map `is_intra_workspace_path` now
+  also rejects `..` segments, UNC, and backslash-rooted paths; #8 CCR
+  duplicate insert (same content-addressed handle) refreshes age instead of
+  double-counting `total_bytes`/economics; #10 `quarantine_bad_snapshot` now
+  holds the per-path snapshot lock (red test mirrors the reset-lock witness);
+  #4/#18 018 tool-behavior contract reconciled (browse `(name,kind)` dedup,
+  compact/tree containment parity, both new disclosures). Receipts: red
+  witnesses failed first (3 FAILED), then targeted suites green
+  (what_changed/detect_impact 15 passed; ccr+persist+sidecar 117 passed);
+  full `cargo test --lib -- --test-threads=1` = 2725 passed / 0 failed /
+  2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` all exit 0.
+- Explicit project routing, daemon-route core (2026-07-11):
+  `DaemonState::runtime_for_target(session_id, project)` is the one shared
+  resolver (omission -> immutable home; open project ID first; unique current
+  `project_name` among the session's OPEN projects as display text only;
+  unknown/ambiguous -> deterministic candidate errors, no indexing, no
+  frecency); `call_tool_handler` peeks/strips the `project` field for the 16
+  routed read/guidance verbs and dispatches the existing per-project
+  implementation; the three cross-project discovery verbs keep their own
+  `project`/`projects` handling. Receipts:
+  `cargo test --lib daemon::tests::test_project_routing_parity_table -- --exact
+  --test-threads=1` = 1 passed;
+  `daemon::tests::test_runtime_for_target_resolution_contract` = 1 passed;
+  `cargo test --lib daemon:: -- --test-threads=1` = 74 passed / 0 failed.
+- Explicit project routing, schema + local-guard slice (2026-07-11): added the
+  optional `project` selector field (serde default, documented) to the 15
+  routed input structs (GetSymbol/GetSymbolContext/GetFileContext/
+  GetFileContent/GetRepoMap/SearchFiles/FindDependents/DiffSymbols/
+  WhatChanged/AnalyzeFileImpact/ValidateFileSyntax/Explore/SmartQuery/
+  EditPlan/Investigation), including both manual `Deserialize` Raw structs;
+  added `SymForgeServer::foreign_project_refusal` and wired it after the proxy
+  attempt in all 16 local handlers (`ask` included) so a stdio/embed/degraded
+  server refuses a non-matching explicit selector instead of silently serving
+  the bound project; 200 struct-literal sites updated mechanically from cargo
+  E0063 spans. Receipts: `cargo test --test strict_client_schema_compat` = 1
+  passed; focused `test_local_server_refuses_foreign_project_selector` = 1
+  passed; full `cargo test --lib -- --test-threads=1` = 2728 passed / 0
+  failed; `cargo clippy --all-targets -- -D warnings` exit 0. NOTE: Terminal
+  Commander daemon became unavailable mid-session (health probe
+  daemon_unavailable); remaining commands ran through the harness's headless
+  shell — no visible terminals — until TC returns.
+- Project-explicit structural edits (2026-07-11): the 7 edit verbs
+  (replace_symbol_body/edit_within_symbol/insert_symbol/delete_symbol/
+  batch_edit/batch_insert/batch_rename) joined the routed set — the batch-level
+  `project` selector resolves through the same `runtime_for_target`, so
+  worktree/`working_directory` validation runs against the SELECTED project;
+  the selector was added to the 7 edit input structs only (NOT SingleEdit/
+  InsertTarget — no nested conflicting routing); local handlers refuse foreign
+  selectors via `foreign_project_refusal`; 51 more struct-literal sites updated
+  from cargo spans. `tests/watcher_reload_cancellation.rs` updated from the old
+  destructive-retarget contract to the immutable-home additive contract
+  (2 projects after open, B healthy, nothing evicted). Receipts:
+  `daemon::tests::test_explicit_project_edit_routes_and_preserves_worktree` =
+  1 passed (explicit-B mutates only B, omitted mutates home A, unknown writes
+  nothing); full `cargo test --lib -- --test-threads=1` = 2729 passed / 0
+  failed; full `cargo test --all-targets -- --test-threads=1` = 0 failures;
+  `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` exit 0.
+- Project inventory surfaces (2026-07-11, Task 7 part 1):
+  `DaemonState::render_session_project_inventory` renders one row per open
+  project (deterministic ID, display name/root, home marker, published
+  counts/index state, generation, opened timestamp, snapshot presence) plus
+  session last-seen; `status(detail="projects")` (new `StelStatusDetail::
+  Projects` variant; local render lists the single bound project) is
+  intercepted on the daemon route to serve the full session inventory; full-
+  surface `health`/`health_compact` append the same inventory once MORE than
+  one project is open (single-project outputs stay byte-compatible). Receipts:
+  `daemon::tests::test_status_projects_detail_lists_session_inventory` = 1
+  passed; full lib = 2730 passed / 0 failed; strict schema + stel param
+  disposition tests pass; clippy/fmt clean. REMAINING from Task 7: the typed
+  daemon tool receipt (machine-readable project/generation/load-source
+  metadata through call_tool_value -> proxy -> statused wrapper).
+- Session reaper (2026-07-11, Task 9 part 1): daemon-owned bounded interval
+  task (TTL default 86400s via SYMFORGE_SESSION_TTL_SECS, min 60; sweep period
+  ttl/4 clamped [10s, 600s]); candidates collected as (session_id,
+  observed_last_seen) under the read lock, `close_session_if_expired` rechecks
+  the SAME observation under the sessions write lock and atomically claims the
+  record before shared project cleanup — a racing heartbeat wins; a claimed
+  session's later heartbeat fails rather than resurrecting; teardown reuses the
+  extracted `finish_removed_session` (shared with interactive close, so orphan
+  watchers/projects are removed exactly once). Reaper holds a Weak on daemon
+  state (exits on daemon drop) and is aborted in run_daemon_until_shutdown.
+  Receipts: `daemon::tests::test_reaper_rechecks_heartbeat_before_close` = 1
+  passed (first attempt failed on a same-millisecond fixture bug — fixed to a
+  realistic ancient-observation/past-cutoff shape); daemon suite 77 passed / 0
+  failed; full lib 2731 passed / 0 failed; clippy/fmt clean. REMAINING from
+  Task 9: the guarded-start seam for foreground `symforge daemon` vs auto-spawn
+  (tests/daemon_singleton.rs) and last-seen/TTL evidence in detailed status.
+- Typed project-evidence receipt (2026-07-11, Task 7 part 2): new
+  `ProjectEvidence` contract (project_id, project_name, canonical_root,
+  generation, index_state, load_source, index counts) in
+  `protocol::result_status`; the daemon returns it OUT-OF-BAND as the
+  `x-symforge-project-evidence` response header built from the RESOLVED
+  runtime (so an explicitly routed sibling is attested as itself, never home)
+  while the text body stays byte-identical; `call_tool_value` parses the
+  typed header into a per-dispatch task-local slot (same bound-to-the-future
+  pattern as the D23 connection surface — never reconstructed from body
+  text); `ServerHandler::call_tool` seeds the slot with the LOCAL bound
+  project so stdio/embed responses attest themselves; statused results attach
+  the current evidence under `_meta["symforge/project_evidence"]`. Receipts:
+  `daemon::tests::test_tool_receipt_carries_project_evidence` +
+  `protocol::tools::tests::test_local_tool_meta_carries_project_evidence` =
+  2 passed; full lib 2733 passed / 0 failed; full all-targets suite 0
+  failures; clippy/fmt/diff-check clean.
+- INCIDENT + fix (2026-07-11, CRITICAL): running the new reconnect test set
+  off an exponential process fork bomb that flooded the desktop with console
+  windows and made the machine unusable (user had to kill everything). Chain:
+  `reconnect` -> `ensure_daemon_running` -> `spawn_daemon_process` spawns
+  `current_exe()` with arg `daemon`; under `cargo test` that exe is the
+  libtest binary and `daemon` is a TEST FILTER, so each spawn re-ran the
+  daemon test subset, which spawned again; every subprocess those tests
+  launch from a console-less parent popped a new console window. Inner
+  trigger: tests waited on the LEGACY (untagged) daemon port file, which is
+  never written, so daemon 1's graceful-shutdown cleanup raced daemon 2 and
+  DELETED its fresh port+token files (production-relevant restart race:
+  clients went tokenless -> 401 -> "no daemon" -> auto-spawn). Fixes: (1)
+  `spawn_daemon_process` refuses under cfg(test), from any Cargo `deps/`
+  artifact, and under `SYMFORGE_DAEMON_AUTOSPAWN=off`; (2)
+  `ensure_daemon_running` fails fast with the same refusal instead of
+  waiting; (3) shutdown cleanup is now owner-checked
+  (`cleanup_daemon_runtime_files_if_owner` compares file contents to this
+  daemon's port/pid/token before deleting) so a successor's files survive;
+  (4) the Task-8 tests wait on the OS-TAGGED port file. Receipts:
+  `test_test_builds_never_auto_spawn_daemon_processes` pins both refusal
+  seams; `test_reconnect_reopens_home_and_working_set` = 1 passed (home id
+  verified, sibling B reopened + verified, unqualified reads still home);
+  daemon suite 80 passed / 0 failed; full lib 2735 passed / 0 failed; ZERO
+  symforge processes remain after the suite. Lesson recorded in
+  tasks/lessons.md.
+- Reconnect working-set restore (2026-07-11, Task 8 part 1):
+  `DaemonSessionClient` records additively-opened sibling roots (shared,
+  deduplicated, order-preserving); `reconnect` verifies the home project id
+  is unchanged (fail closed), reopens every sibling, and verifies each
+  restores with its deterministic id before serving. REMAINING from Task 8:
+  per-adapter/session runtime descriptors replacing the fixed sidecar
+  port/pid/session files + hook lookup freshest-healthy selection.
+- No-visible-terminal invariant (2026-07-11, user mandate): EVERY process
+  spawn in src/ and tests/ now routes through
+  `process_util::hidden_command` (CREATE_NO_WINDOW on Windows) — 21 src/test
+  call sites swept plus 12 more integration-test sites the new tripwire
+  caught; `hidden_command` and its module are now pub (#[doc(hidden)]) so
+  integration tests share the helper; the ONE deliberate exception is
+  `spawn_daemon_process` (its own DETACHED_PROCESS | CREATE_NO_WINDOW).
+  Permanent tripwire `process_util::tests::
+  test_no_raw_command_spawns_outside_hidden_command` scans src/ + tests/
+  (fixtures excluded) and fails on any new raw `Command::new(` call site.
+  Receipts: tripwire green; full `cargo test --all-targets -- --test-threads=1`
+  = 0 failures; clippy/fmt clean; zero symforge processes after the suite.
+- Per-session runtime descriptors (2026-07-11, Task 8 part 2): each
+  adapter/sidecar now writes ONE atomic per-process OS-tagged JSON descriptor
+  (`.symforge/sessions/sidecar.<pid>.<os>.json` — session_id, project_root,
+  pid, port, updated_at) instead of the fixed sidecar.<os>.{port,pid,session}
+  files; shutdown/panic cleanup removes ONLY the caller's descriptor (sibling
+  adapters on one root can no longer be overwritten or deleted); the reader
+  (`read_sidecar_status_at`, shared by hook lookup and status surfaces) scans
+  descriptors first with identity validation (foreign project_root rejected,
+  never last-writer), live-port-first selection, freshest updated_at, stable
+  smallest-pid tie break, and falls back to the legacy fixed files as a
+  read-only migration aid; `symforge update` purges stale (dead-port)
+  descriptors. Two integration tests that pinned the fixed-file contract were
+  migrated to the descriptor contract. Receipts:
+  `test_per_session_descriptors_do_not_delete_siblings` +
+  `test_reader_selects_live_descriptor_and_rejects_foreign_root` green;
+  port_file suite 14 passed; full lib 2738 passed / 0 failed; full
+  all-targets 0 failures; clippy/fmt/diff-check clean; zero leaked processes.
+- Guarded daemon start + TTL evidence (2026-07-11, Task 9 part 2): new
+  `guarded_daemon_start` seam (pub, `src/daemon.rs`) — acquire the start lock
+  with a bounded 10s wait, re-check for a live compatible daemon UNDER the
+  lock, stop an incompatible recorded daemon, then bind in-process; a live
+  daemon's runtime record is never overwritten. Foreground/service
+  `symforge daemon` (`run_daemon_until_shutdown`) now goes through the seam
+  and refuses with "already running on port N" instead of clobbering.
+  `ensure_daemon_running` drops the start lock immediately after
+  `spawn_daemon_process()` so the spawned child's guard can acquire it (the
+  old hold-through-wait would deadlock parent against child). Detailed status
+  inventory line now carries `ttl_secs=` next to `last_seen=` (reaper TTL
+  evidence). Receipts: new `tests/daemon_singleton.rs`
+  (`test_guarded_start_refuses_to_replace_live_daemon`,
+  `test_concurrent_guarded_starts_yield_one_daemon`) green; inventory test
+  extended with last_seen/ttl assertion, green; daemon lib suite 80 passed;
+  clippy/fmt clean; full all-targets suite receipt below.
+- search_files multi-target merge (2026-07-11, Task 4 leftover part 1):
+  `SearchFilesInput` gains set-valued `projects` (schemars `with="Vec<String>"`
+  for strict-client schema parity); `search_files` joins the cross-project
+  read verbs — the fan-out reuses the EXISTING per-project ranked file search
+  (`WorkingSet::search_files` → `capture_search_files_view_with_noise` on each
+  targeted entry's base index, honoring `path_prefix` via `PathScope`), merges
+  attributed hits under the shared deterministic global cap
+  (`cross_project_result_cap`) and `max_tokens` budget, and renders
+  `── project: <id> ──` sections via `format_cross_project_files`
+  (metadata-only reasons disclosed). Lone `project` stays on the FULL
+  single-project routed handler (resolve/coupling modes preserved);
+  resolve/changed_with/anchor_path/rank_by/current_file are honestly REFUSED
+  with cross-project targeting; `project`+`projects` together is rejected
+  deterministically in `call_tool_handler` (the routed strip would otherwise
+  swallow the conflict). Receipts: new
+  `daemon::tests::test_search_files_projects_fan_out` +
+  `live_index::view::tests::cross_project_search_files_attributes_hits_per_target`
+  green; daemon lib 81 passed; view 13 passed; strict_client_schema_compat +
+  stel_param_disposition green; clippy/fmt clean; full-suite receipt pending.
+- Watcher "binary" mislabel FIXED (2026-07-11): root cause was NOT the size
+  threshold (code files already get 4 MB) — `is_binary_content`'s 8 KB sniff
+  window cut `src/protocol/tools.rs` mid-multibyte `─` at byte 8190
+  (empirically verified against the real file), and the "unexpected end of
+  data" decode error read as invalid UTF-8 → Tier 2 "binary". Fix: an
+  incomplete sequence at the truncation boundary (`error_len() == None` with
+  bytes remaining past the window) is a sampling artifact, not binary
+  evidence; genuinely invalid interior bytes still classify as binary.
+  Receipts: red→green
+  `test_binary_sniff_forgives_multibyte_cut_at_window_boundary` +
+  `test_binary_sniff_still_detects_interior_invalid_utf8`; discovery 74,
+  watcher 38, store 62 passed; clippy/fmt clean.
+- get_file_context completeness lie FIXED (2026-07-11): the sidecar stamps the
+  trust envelope (incl. `Completeness: full`) BEFORE `get_file_context` runs a
+  SECOND budget pass (`enforce_token_budget`) over envelope+body+footer with
+  the same byte cap — a body that just fit the sidecar budget was tail-cut
+  after the claim (window exists when the outline symbol cap doesn't fire,
+  i.e. ≤25 symbols; proven red at max_tokens=72 on an 8-symbol fixture). Fix:
+  `enforce_token_budget_flagged` reports the cut and
+  `downgrade_full_completeness_after_truncation` rewrites the stamped claim
+  (both compact `Trust:` and expanded `Completeness:` envelope forms) to
+  `budget-limited (was: ...)`. Receipts: red→green boundary-sweep
+  `test_get_file_context_never_claims_full_after_post_assembly_truncation`
+  (max_tokens 40..=400); get_file_context 10, format 198, sidecar 109 passed;
+  clippy/fmt/diff-check clean; full-suite receipt pending. Note: the original
+  observation's "only next-steps tail visible" shape was most likely the
+  CONSUMING harness's display truncation; the tool-side dishonesty window was
+  real regardless and is now closed.
+
+## Review (2026-07-11, Task 13 — campaign closure)
+
+### Verified commits (this campaign, `4cd9b34..HEAD`)
+
+`ea342f8` immutable-home/additive index_folder · `f4e972c` watcher
+generated-output parity · `ce554b1` recovered-review blockers · `d651ba5` +
+`3d5a209` + `489c285` explicit project routing (reads + edits) · `7be810e`
+project inventory · `c0e6307` session reaper · `ed143c4` typed
+ProjectEvidence · `671b281` fork-bomb guards + owner-checked cleanup +
+reconnect restore · `8899957` hidden_command sweep + tripwire · `bc96594`
+per-session descriptors · `d0623f5` guarded-start singleton + TTL evidence ·
+`f40352d` search_files fan-out + facade project routing · `7656699` binary
+sniff boundary fix · `51bda85` ledger closure docs · `6f6eac6` completeness
+downgrade after truncation.
+
+### Final gate receipts (at `6f6eac6`; later commits are docs-only)
+
+- `cargo fmt --check` ✓ · `git diff --check` ✓ · `cargo check` ✓ ·
+  `cargo clippy --all-targets -- -D warnings` ✓
+- `cargo test --all-targets -- --test-threads=1`: **110 test binaries, 3460
+  passed, 0 failed, exit 0** (`suite-envelope.log`)
+- `cargo build --release` exit 0 · `cargo check --no-default-features
+  --features embed` ✓ · `npm test` 31/31
+- Tool-correctness harness on the RELEASE binary: `verify-tools` 8 PASS +
+  `verify-tools-real` 11 PASS, 0 REVIEW, 0 FAIL
+- Release-binary multi-project dogfood (isolated `SYMFORGE_HOME`, real
+  daemon, 2 projects, sibling adapters): **17/17 checks PASS** — additive
+  receipt + checkpoint evidence, inventory with home marker +
+  `last_seen`/`ttl_secs`, immutable-home routing (no B-byte leak), explicit-B
+  reads, `projects=["*"]` fan-out attributed for files+symbols, unknown
+  selector candidates, sibling shutdown does not break the surviving session.
+- Tool-substitution scorecard filled from measured transcripts
+  (`docs/reviews/2026-07-10-tool-substitution-scorecard.md`): aggregate ~7.8×
+  token advantage with all facts retained; unfavorable rows (narrow `rg`
+  queries) recorded honestly.
+
+### Adversarial findings (self-review; delegation forbidden by handoff)
+
+1. **Stale-snapshot serving (existing behavior, NOT fixed here):** a fresh
+   local session over a repo with an old `.symforge` snapshot served stale
+   index content as `current index` (daemon.rs at 210 symbols vs. current
+   314) until an explicit `index_folder`. Same class as the known
+   external-edit staleness finding; follow-up candidate.
+2. **Trust-envelope gap:** `get_symbol`, `find_dependents`, `edit_plan`
+   responses carry no trust envelope (scorecard rows 2/6/8) while
+   search/context tools do. Follow-up candidate, not a regression.
+3. **Facade injection edge (accepted risk):** the per-step `project`
+   injection skips a non-object step `args` silently; the planner only emits
+   object args, and the all-or-nothing tool check guards the honest case.
+4. **Behavior change (deliberate):** routed verbs now reject
+   `project`+`projects` together (previously a stray `projects` on a routed
+   tool was silently ignored). Honest-refusal improvement; pinned by test.
+5. **Guarded start residuals (bounded):** a crashed lock-holder stalls a
+   foreground start for up to the 30s stale-lock threshold; a narrow race can
+   transiently spawn a second child which exits cleanly via
+   `AlreadyRunning` without touching the winner's runtime record (pinned by
+   `tests/daemon_singleton.rs`).
+6. **Environment evidence:** during review the machine ran 3 daemons + 5
+   adapters of the INSTALLED 8.13.9 (pre-campaign) binary, and this repo's
+   hooks were served by a daemon rooted at another project — live
+   confirmation of the sprawl/retarget class this branch fixes.
+
+### Remaining operator gates
+
+Merge approval → merge with the release-please guard → publish → restart
+harness sessions (installed daemons pick up the fixes) → `cargo clean`.

@@ -25,7 +25,6 @@ mod stel_surface_env;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -52,7 +51,7 @@ fn library_with_one_dependent() -> Vec<(&'static str, &'static str)> {
 }
 
 fn git(args: &[&str], root: &Path) {
-    let output = Command::new("git")
+    let output = symforge::process_util::hidden_command("git")
         .args(args)
         .current_dir(root)
         .output()

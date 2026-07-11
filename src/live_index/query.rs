@@ -1106,6 +1106,44 @@ pub struct RepoOutlineView {
     pub files: Vec<RepoOutlineFileView>,
 }
 
+/// Lexically normalize a path, resolving `.`/`..` segments WITHOUT touching the
+/// filesystem. Absolute prefixes and the path root are preserved, and `..` never
+/// pops past the root or a drive/UNC prefix. Kept self-contained in the
+/// `live_index` layer (it must not depend on the protocol layer's copy).
+fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether a stored `relative_path` resolves WITHIN the indexed workspace `root`.
+/// A relative path is joined onto `root`; an absolute stored path is used as-is
+/// (so it must equal-or-descend `root` to pass). Purely lexical — no filesystem
+/// access — so an out-of-root or `..`-escaping path is rejected even when it does
+/// not exist on disk. `root` is the already-normalized `indexed_root`.
+fn path_within_indexed_root(relative_path: &str, root: &std::path::Path) -> bool {
+    let raw = std::path::Path::new(relative_path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        root.join(raw)
+    };
+    normalize_lexically(&resolved).starts_with(normalize_lexically(root))
+}
+
 impl LiveIndex {
     /// O(1) lookup of a file by its relative path.
     pub fn get_file(&self, relative_path: &str) -> Option<&IndexedFile> {
@@ -2388,8 +2426,15 @@ impl LiveIndex {
     pub fn capture_repo_outline_view(&self) -> RepoOutlineView {
         use crate::live_index::search::NoisePolicy;
         let gi_ref = self.gitignore.as_ref();
+        // US3 / SC-004: when the index knows its canonical root, drop any stored
+        // path that resolves outside it (absolute-escape or `..`-escape). No root
+        // recorded (empty/bootstrap index) => no filtering.
+        let root = self.indexed_root.as_deref();
         let mut files: Vec<RepoOutlineFileView> = self
             .all_files()
+            .filter(|(relative_path, _)| {
+                root.is_none_or(|root| path_within_indexed_root(relative_path.as_str(), root))
+            })
             .map(|(relative_path, file)| RepoOutlineFileView {
                 noise_class: NoisePolicy::classify_path(relative_path, gi_ref),
                 relative_path: relative_path.clone(),
@@ -3385,6 +3430,86 @@ mod tests {
         );
         assert_eq!(view.files[0].symbol_count, 1);
         assert_eq!(view.files[1].symbol_count, 2);
+    }
+
+    #[test]
+    fn test_capture_repo_outline_view_drops_out_of_root_paths() {
+        // US3 / SC-004: with a known workspace root, the full outline must not
+        // surface a stored path that escapes it (absolute or `..`-escape).
+        let root = std::env::temp_dir().join("sf_us3_root");
+        let outside = std::env::temp_dir().join("sf_us3_outside").join("leak.rs");
+        let abs_key = outside.to_string_lossy().into_owned();
+
+        let in_root = make_indexed_file(
+            "src/main.rs",
+            vec![make_symbol("main")],
+            ParseStatus::Parsed,
+        );
+        let dotdot =
+            make_indexed_file("../evil.rs", vec![make_symbol("evil")], ParseStatus::Parsed);
+        let abs = make_indexed_file(&abs_key, vec![make_symbol("leak")], ParseStatus::Parsed);
+
+        let mut index = make_index(
+            vec![
+                ("src/main.rs", in_root),
+                ("../evil.rs", dotdot),
+                (abs_key.as_str(), abs),
+            ],
+            false,
+        );
+        index.indexed_root = Some(root);
+
+        let view = index.capture_repo_outline_view();
+        let paths: Vec<&str> = view
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/main.rs"],
+            "out-of-root and `..`-escaping paths must be omitted"
+        );
+        assert_eq!(view.total_files, 1);
+
+        // Fallback: no recorded root => no filtering (leave the set unchanged).
+        index.indexed_root = None;
+        let unguarded = index.capture_repo_outline_view();
+        assert_eq!(
+            unguarded.total_files, 3,
+            "with no indexed_root the guard must not drop anything"
+        );
+    }
+
+    #[test]
+    fn test_capture_repo_outline_view_keeps_all_in_root_paths() {
+        // US3 guard (must stay green): a clean in-root repo's full outline
+        // file count is unchanged by the containment guard.
+        let root = std::env::temp_dir().join("sf_us3_clean_root");
+        let f1 = make_indexed_file(
+            "src/alpha.rs",
+            vec![make_symbol("alpha")],
+            ParseStatus::Parsed,
+        );
+        let f2 = make_indexed_file(
+            "src/nested/beta.rs",
+            vec![make_symbol("beta")],
+            ParseStatus::Parsed,
+        );
+        let mut index = make_index(
+            vec![("src/alpha.rs", f1), ("src/nested/beta.rs", f2)],
+            false,
+        );
+        index.indexed_root = Some(root);
+
+        let view = index.capture_repo_outline_view();
+        assert_eq!(view.total_files, 2, "in-root files must be unaffected");
+        let paths: Vec<&str> = view
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["src/alpha.rs", "src/nested/beta.rs"]);
     }
 
     #[test]

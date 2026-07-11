@@ -993,9 +993,17 @@ pub fn is_binary_content(content: &[u8]) -> bool {
         return true;
     }
 
-    // Heuristic 2: Invalid UTF-8
-    if std::str::from_utf8(window).is_err() {
-        return true;
+    // Heuristic 2: Invalid UTF-8. An INCOMPLETE multibyte sequence at the end
+    // of a TRUNCATED window is a sampling artifact (the cut landed mid-char),
+    // not binary evidence — `error_len() == None` means "unexpected end of
+    // data", and more bytes exist beyond the window to complete the sequence.
+    // (Dogfood 2026-07-11: the 8KB cut split a `─` in src/protocol/tools.rs
+    // at byte 8190 and demoted 1.1 MB of pure-UTF-8 Rust to Tier 2 "binary".)
+    if let Err(error) = std::str::from_utf8(window) {
+        let boundary_cut = error.error_len().is_none() && check_len < content.len();
+        if !boundary_cut {
+            return true;
+        }
     }
 
     // Heuristic 3: High control byte ratio
@@ -1230,6 +1238,54 @@ pub fn untracked_generated_output_demotions(
     untracked_generated_output_demotions_inner(entries, &tracked)
 }
 
+/// Shallowest DIRECTORY component (never the file name) of `relative_path`
+/// matching [`is_generated_output_dir_name`]; returns the prefix up to and
+/// including that component. `None` for root-level files and paths with no
+/// generated-looking directory. The ONE path-shape rule shared by the bulk
+/// demotion walk and the watcher single-file parity check.
+fn shallowest_generated_output_prefix(relative_path: &str) -> Option<&str> {
+    let (dirs, _file) = relative_path.rsplit_once('/')?;
+    let mut end = 0usize;
+    for comp in dirs.split('/') {
+        end += comp.len();
+        if is_generated_output_dir_name(comp) {
+            return Some(&relative_path[..end]);
+        }
+        end += 1; // the '/' separator
+    }
+    None
+}
+
+/// F5 watcher parity: does ONE relative path fall under the untracked
+/// generated-output demotion policy? Same contract as the bulk
+/// [`untracked_generated_output_demotions`] walk, evaluated per event:
+///
+/// - no generated-looking directory component → `false` (checked FIRST, pure
+///   string work, so ordinary watcher events never touch git);
+/// - `SYMFORGE_INDEX_GENERATED_OUTPUT` opt-in → `false`;
+/// - no git repo / unreadable index / empty tracked set → `false` (fail open,
+///   exactly like the bulk walk);
+/// - the file itself is tracked → `false` (operator versioned it);
+/// - ANY tracked file beneath the candidate prefix → `false` (prefix-wide
+///   tracked rescue);
+/// - otherwise → `true` (demote to Tier-2 `GeneratedOutput`).
+pub(crate) fn is_untracked_generated_output_path(root: &Path, relative_path: &str) -> bool {
+    let Some(candidate) = shallowest_generated_output_prefix(relative_path) else {
+        return false;
+    };
+    if index_generated_output_enabled() {
+        return false;
+    }
+    let Some(tracked) = tracked_path_set_for_build_dir_rescue(root) else {
+        return false;
+    };
+    if tracked.contains(relative_path) {
+        return false;
+    }
+    let prefix = format!("{candidate}/");
+    !tracked.iter().any(|t| t.starts_with(&prefix))
+}
+
 /// Env-free core of [`untracked_generated_output_demotions`], unit-testable
 /// without process-global state.
 fn untracked_generated_output_demotions_inner(
@@ -1249,22 +1305,9 @@ fn untracked_generated_output_demotions_inner(
         if tracked.contains(rel) {
             continue; // tracked file: never demoted by this policy
         }
-        // Shallowest DIRECTORY component (never the file name) matching the
-        // generated-output heuristic defines the candidate directory prefix.
-        let Some((dirs, _file)) = rel.rsplit_once('/') else {
-            continue; // root-level file, no directory to classify
+        let Some(candidate) = shallowest_generated_output_prefix(rel) else {
+            continue;
         };
-        let mut candidate: Option<&str> = None;
-        let mut end = 0usize;
-        for comp in dirs.split('/') {
-            end += comp.len();
-            if is_generated_output_dir_name(comp) {
-                candidate = Some(&rel[..end]);
-                break;
-            }
-            end += 1; // the '/' separator
-        }
-        let Some(candidate) = candidate else { continue };
         let has_tracked = *dir_has_tracked
             .entry(candidate.to_string())
             .or_insert_with(|| {
@@ -1641,14 +1684,13 @@ mod tests {
     // ── SF-012(B): build-dir heuristic rescues tracked source dirs ──
     mod build_dir_tracked_rescue {
         use super::*;
-        use std::process::Command;
 
         #[test]
         fn discover_all_files_rescues_tracked_target_specs_dir() {
             let tmp = TempDir::new().unwrap();
             let root = tmp.path();
             let run = |args: &[&str]| {
-                Command::new("git")
+                crate::process_util::hidden_command("git")
                     .args(args)
                     .current_dir(root)
                     .output()
@@ -1715,7 +1757,6 @@ mod tests {
 
     mod generated_output_demotion {
         use super::*;
-        use std::process::Command;
 
         // Serializes the opt-in test (which mutates the process-global
         // SYMFORGE_INDEX_GENERATED_OUTPUT) against the sibling tests that read it via
@@ -1725,7 +1766,7 @@ mod tests {
 
         fn init_git(root: &Path) -> impl Fn(&[&str]) + '_ {
             let run = move |args: &[&str]| {
-                Command::new("git")
+                crate::process_util::hidden_command("git")
                     .args(args)
                     .current_dir(root)
                     .output()
@@ -1988,6 +2029,40 @@ mod tests {
     fn test_binary_sniff_detects_invalid_utf8() {
         let content: &[u8] = &[0x80, 0x81, 0x82, 0x83, 0x84];
         assert!(is_binary_content(content));
+    }
+
+    /// Dogfood 2026-07-11: the 8KB sniff window cut `src/protocol/tools.rs`
+    /// (pure-UTF-8 Rust, 1.1 MB, box-drawing `─` chars) mid-multibyte
+    /// sequence at byte 8190, and the resulting "unexpected end of data"
+    /// decode error demoted the project's biggest source file to Tier 2 as
+    /// "binary". An INCOMPLETE sequence at the truncation boundary is a
+    /// sampling artifact, not binary evidence.
+    #[test]
+    fn test_binary_sniff_forgives_multibyte_cut_at_window_boundary() {
+        let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
+        // Valid ASCII up to two bytes before the window edge, then a 3-byte
+        // `─` (U+2500) straddling the cut, then more valid text beyond it.
+        let mut content = vec![b'a'; sniff - 2];
+        content.extend_from_slice("─".as_bytes());
+        content.extend_from_slice(b" trailing source text beyond the sniff window");
+        assert!(
+            !is_binary_content(&content),
+            "a multibyte char cut by the sniff window must not read as binary"
+        );
+    }
+
+    /// Genuinely invalid bytes INSIDE the window (not a boundary cut) must
+    /// still classify as binary — the boundary forgiveness is narrow.
+    #[test]
+    fn test_binary_sniff_still_detects_interior_invalid_utf8() {
+        let sniff = crate::domain::index::BINARY_SNIFF_BYTES;
+        let mut content = vec![b'a'; 100];
+        content.push(0x80); // orphan continuation byte, interior
+        content.extend(vec![b'b'; sniff]); // window extends well past it
+        assert!(
+            is_binary_content(&content),
+            "interior invalid UTF-8 must stay classified as binary"
+        );
     }
 
     #[test]

@@ -440,10 +440,9 @@ impl Default for WorktreeMisuseCounter {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
 
     fn run_git(args: &[&str], cwd: &Path) {
-        let output = Command::new("git")
+        let output = crate::process_util::hidden_command("git")
             .args(args)
             .current_dir(cwd)
             .output()

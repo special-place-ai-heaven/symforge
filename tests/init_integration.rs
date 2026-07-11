@@ -382,6 +382,123 @@ command = "other.exe"
 }
 
 #[test]
+fn test_run_init_grok_preserves_toml_and_is_idempotent() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let grok_dir = home.path().join(".grok");
+    let grok_config = grok_dir.join("config.toml");
+    std::fs::create_dir_all(&grok_dir).unwrap();
+    std::fs::write(
+        &grok_config,
+        r#"# keep this comment
+theme = "dark"
+
+[mcp_servers.other]
+command = "other.exe"
+enabled = false
+
+[mcp_servers.symforge]
+command = "stale.exe" # keep command comment
+args = ["--stale"]
+enabled = false
+custom = "keep"
+
+[mcp_servers.symforge.env]
+KEEP_ME = "yes"
+RUST_LOG = "debug" # keep env comment
+SYMFORGE_SURFACE = "compact"
+SYMFORGE_WORKSPACE_ROOT = "stale-root"
+"#,
+    )
+    .unwrap();
+    let binary_path = fake_binary_path();
+    let client = <InitClient as clap::ValueEnum>::from_str("grok", true)
+        .expect("grok must be a supported init client");
+
+    run_init_with_context(client, home.path(), cwd.path(), &binary_path)
+        .expect("grok init must succeed");
+    let first = read_text(&grok_config);
+    run_init_with_context(client, home.path(), cwd.path(), &binary_path)
+        .expect("repeated grok init must succeed");
+    let second = read_text(&grok_config);
+
+    assert_eq!(first, second, "Grok registration must be idempotent");
+    assert!(first.contains("# keep this comment"));
+    assert!(first.contains("theme = \"dark\""));
+    assert!(first.contains("[mcp_servers.other]"));
+    assert!(first.contains("custom = \"keep\""));
+    assert!(first.contains("# keep command comment"));
+    assert!(first.contains("# keep env comment"));
+
+    let config = first.parse::<toml_edit::DocumentMut>().unwrap();
+    let symforge = &config["mcp_servers"]["symforge"];
+    let expected_command = if cfg!(windows) {
+        FAKE_BINARY.replace('/', "\\")
+    } else {
+        FAKE_BINARY.to_string()
+    };
+    assert_eq!(
+        symforge["command"].as_str(),
+        Some(expected_command.as_str())
+    );
+    assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
+    assert_eq!(symforge["enabled"].as_bool(), Some(true));
+    assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
+    assert_eq!(
+        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
+        Some(cwd.path().display().to_string().as_str())
+    );
+    assert_eq!(symforge["env"]["KEEP_ME"].as_str(), Some("yes"));
+    assert_eq!(
+        symforge["env"]["SYMFORGE_SURFACE"].as_str(),
+        Some("compact"),
+        "unmanaged Grok env values must be preserved"
+    );
+    assert!(!home.path().join(".codex").join("config.toml").exists());
+    assert!(!home.path().join(".claude.json").exists());
+    assert!(!home.path().join(".gemini").join("settings.json").exists());
+    assert!(!cwd.path().join(".kilocode").join("mcp.json").exists());
+}
+
+#[test]
+fn test_run_init_grok_preserves_inline_tables() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let grok_dir = home.path().join(".grok");
+    let grok_config = grok_dir.join("config.toml");
+    std::fs::create_dir_all(&grok_dir).unwrap();
+    std::fs::write(
+        &grok_config,
+        r#"mcp_servers = { other = { command = "x" }, symforge = { command = "stale", custom = "keep", env = { KEEP_ME = "yes" } } }
+"#,
+    )
+    .unwrap();
+    let binary_path = fake_binary_path();
+    let client = <InitClient as clap::ValueEnum>::from_str("grok", true).unwrap();
+
+    run_init_with_context(client, home.path(), cwd.path(), &binary_path).unwrap();
+    let first = read_text(&grok_config);
+    run_init_with_context(client, home.path(), cwd.path(), &binary_path).unwrap();
+    let second = read_text(&grok_config);
+
+    assert_eq!(first, second);
+
+    let config = first.parse::<toml_edit::DocumentMut>().unwrap();
+    let servers = &config["mcp_servers"];
+    let symforge = &servers["symforge"];
+    assert_eq!(servers["other"]["command"].as_str(), Some("x"));
+    assert_eq!(symforge["custom"].as_str(), Some("keep"));
+    assert_eq!(symforge["env"]["KEEP_ME"].as_str(), Some("yes"));
+    assert_eq!(symforge["args"].as_array().map(|args| args.len()), Some(0));
+    assert_eq!(symforge["enabled"].as_bool(), Some(true));
+    assert_eq!(symforge["env"]["RUST_LOG"].as_str(), Some("off"));
+    assert_eq!(
+        symforge["env"]["SYMFORGE_WORKSPACE_ROOT"].as_str(),
+        Some(cwd.path().display().to_string().as_str())
+    );
+}
+
+#[test]
 fn test_init_registers_kilo_mcp_server() {
     let dir = TempDir::new().unwrap();
     let kilo_config_path = dir.path().join(".kilocode").join("mcp.json");
@@ -577,6 +694,10 @@ fn test_run_init_all_updates_both_clients() {
     assert!(
         home.path().join(".codex").join("config.toml").exists(),
         "Codex config must be created"
+    );
+    assert!(
+        home.path().join(".grok").join("config.toml").exists(),
+        "Grok config must be created"
     );
     assert!(
         home.path().join(".claude.json").exists(),

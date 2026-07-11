@@ -84,6 +84,23 @@ fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io:
 }
 const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
 const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
+/// Task 9: seconds a session may go without a heartbeat before the daemon
+/// reaper closes it through the normal close path. Override with
+/// `SYMFORGE_SESSION_TTL_SECS` (clamped to >= 60). The default is deliberately
+/// long — a reaped session cannot be resurrected, so only clearly abandoned
+/// sessions qualify.
+const SESSION_TTL_ENV: &str = "SYMFORGE_SESSION_TTL_SECS";
+const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
+
+fn session_ttl_from_env() -> std::time::Duration {
+    let secs = std::env::var(SESSION_TTL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
+        .max(60);
+    std::time::Duration::from_secs(secs)
+}
+
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
@@ -106,6 +123,11 @@ pub struct DaemonHandle {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub state: SharedDaemonState,
     server_task: tokio::task::JoinHandle<()>,
+    /// Task 9: the daemon-owned session reaper. Holds a `Weak` on the
+    /// daemon state, so it exits on its own once the daemon shuts down
+    /// and the state drops; `run_daemon_until_shutdown` also aborts it
+    /// explicitly so restarts/tests cannot leak the interval task.
+    reaper_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -115,6 +137,11 @@ pub struct DaemonSessionClient {
     project_id: String,
     session_id: String,
     project_name: String,
+    /// Task 8: roots of projects this connection successfully opened
+    /// ADDITIVELY (beyond the immutable home in `project_root`). Ordered,
+    /// deduplicated, shared across clones so a reconnect can reopen the
+    /// whole working set and verify deterministic IDs before serving.
+    opened_roots: std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>,
     auth_token: Option<String>,
     /// Stored so reconnection can re-open a session at the same project root.
     project_root: Option<PathBuf>,
@@ -122,15 +149,9 @@ pub struct DaemonSessionClient {
 
 pub struct DaemonState {
     next_session_id: AtomicU64,
-    // LOCK ORDER (Feature 012): `bases` -> `projects` -> `sessions`.
-    // Acquire only DOWNWARD; never acquire an earlier lock while holding a later
-    // one. The pre-012 rule was `projects` -> `sessions` (see `close_session`,
-    // `index_folder_for_session`, `session_runtime`); 012 prepends `bases` at the
-    // top because base interning (`intern_base`) may run just before a project
-    // insert. `intern_base` itself acquires ONLY `bases` and touches no other
-    // lock, so call sites stay free to order the rest. Per-session `working_set`
-    // is an `Arc<RwLock<WorkingSet>>` OUTSIDE this hierarchy (its own lock, never
-    // held across a daemon-map lock), so it cannot participate in an inversion.
+    // Registry/session guards protect only map membership and short metadata
+    // updates. Project load, reload, watcher lifecycle, and git/file IO always run
+    // after those guards are released. Per-session `working_set` is independent.
     /// Per-daemon base intern table (Feature 012). Equal `(canonical_root,
     /// commit)` keys MUST share ONE `Arc<IndexBase>` (SC-002): `intern_base`
     /// returns the existing Arc on a key hit and only mints a new base (drawing a
@@ -145,7 +166,7 @@ pub struct DaemonState {
     /// keeps its original generation, so this is strictly increasing across
     /// distinct published bases (the D2 fence the engine asserts on).
     base_generation_seq: AtomicU64,
-    projects: RwLock<HashMap<String, ProjectInstance>>,
+    projects: RwLock<HashMap<String, Arc<ProjectSlot>>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     identity: DaemonIdentity,
     /// The bearer token this daemon requires on every authenticated route.
@@ -183,9 +204,13 @@ struct ProjectInstance {
     session_ids: HashSet<String>,
     opened_at: SystemTime,
     activation_state: ActivationState,
-    /// Cached `SymForgeServer` instance — constructed once per project and
-    /// reused for all tool calls, avoiding per-call router/prompt table allocation.
-    server: SymForgeServer,
+}
+
+struct ProjectSlot {
+    metadata: RwLock<ProjectInstance>,
+    /// Serializes project mutation without blocking registry lookup or reads of
+    /// the currently published SharedIndex generation.
+    mutation: Mutex<()>,
 }
 
 struct SessionRecord {
@@ -208,6 +233,9 @@ struct SessionRecord {
     /// cloned on every `session_runtime` call and `WorkingSet: Clone` deep-clones
     /// overlays, so the `Arc` keeps the clone O(1) and the overlay state singular.
     working_set: Arc<RwLock<WorkingSet>>,
+    /// Session-private protocol state, partitioned by project while shared index
+    /// and project metrics remain owned by the project instance.
+    servers: HashMap<String, SymForgeServer>,
     client_name: String,
     pid: Option<u32>,
     opened_at: SystemTime,
@@ -222,6 +250,7 @@ impl Clone for SessionRecord {
             active_project_id: self.active_project_id.clone(),
             // Share the SAME working-set lock across clones (O(1), singular state).
             working_set: Arc::clone(&self.working_set),
+            servers: self.servers.clone(),
             client_name: self.client_name.clone(),
             pid: self.pid,
             opened_at: self.opened_at,
@@ -590,7 +619,7 @@ struct SessionRuntime {
     index: SharedIndex,
     token_stats: Arc<TokenStats>,
     symbol_cache: Arc<RwLock<HashMap<String, Vec<SymbolSnapshot>>>>,
-    /// Cached `SymForgeServer` clone — cheap because all inner state is `Arc`-wrapped.
+    /// Session-private, project-keyed `SymForgeServer` clone.
     server: SymForgeServer,
     /// Feature 012 (Phase 3): the session's working set, shared by `Arc` so the
     /// cross-project read route (`search_symbols`/`search_text`/`find_references`
@@ -619,6 +648,12 @@ impl DaemonState {
     /// file is the one the state enforces.
     pub fn new() -> Self {
         Self::with_token(establish_daemon_auth_token())
+    }
+
+    /// The token this daemon enforces — used by the owner-checked shutdown
+    /// cleanup to prove a runtime file still belongs to this daemon.
+    fn auth_token_for_cleanup(&self) -> String {
+        self.auth_token.clone()
     }
 
     /// Construct daemon state bound to a specific, already-established token.
@@ -686,21 +721,11 @@ impl DaemonState {
     }
 
     /// Intern the base for `project_id` if the project is currently loaded
-    /// (Feature 012, Phase 0). Reads the project under `projects.read()` to build
-    /// the candidate base, releases that lock, then interns under `bases.write()`.
-    ///
-    /// LOCK ORDER NOTE: this takes `projects` THEN `bases`, which is the REVERSE
-    /// of the declared `bases -> projects` order. It is safe ONLY because the two
-    /// guards never overlap — the `projects` read guard is dropped at the end of
-    /// the inner block BEFORE `intern_base` acquires `bases`. The hierarchy
-    /// forbids HOLDING `projects` while acquiring `bases`, not acquiring them in
-    /// sequence with no overlap. Returns `None` if the project is not loaded.
+    /// (Feature 012, Phase 0). Clones the project slot under the registry lock,
+    /// then builds and interns the candidate without holding the registry.
     fn intern_base_for_project(&self, project_id: &str) -> Option<Arc<IndexBase>> {
-        let candidate = {
-            let projects = self.projects.read();
-            projects.get(project_id).map(ProjectInstance::base)
-        }; // projects read guard dropped here, before bases.write() below
-        candidate.map(|candidate| self.intern_base(candidate))
+        let slot = self.projects.read().get(project_id).cloned()?;
+        Some(self.intern_base(slot.base()))
     }
 
     /// B2/D12 freshness refresh: lazily re-intern + replace the working-set base
@@ -725,16 +750,16 @@ impl DaemonState {
     /// `published_state().generation` stamped into `IndexBase`; not taken now.)
     ///
     /// MISMATCH-GATED: the warm path takes NO write lock. It snapshots the targeted
-    /// entries' base pointers under `working_set.read()`, compares them under
-    /// `projects.read()`, and returns early if all are fresh. Only when ≥1 entry is
-    /// stale does it intern fresh bases and take `working_set.write()`.
+    /// entries' base pointers under `working_set.read()`, clones the targeted
+    /// slots under the registry, and returns early if all are fresh. Only when ≥1
+    /// entry is stale does it intern fresh bases and take `working_set.write()`.
     ///
     /// LOCK ORDER (`bases -> projects -> sessions`; `working_set` is outside the
     /// hierarchy, never held across a daemon-map lock): snapshot under
-    /// `working_set.read()` -> drop; compare + build candidates under
-    /// `projects.read()` -> drop; `intern_base_refresh` under `bases.write()` ->
-    /// drop; finally `working_set.write()` with NO daemon-map lock held — the same
-    /// intern-then-`working_set.add` sequence the retarget/additive paths use.
+    /// `working_set.read()` -> drop; clone slots under the registry -> drop;
+    /// compare through per-slot metadata -> `intern_base_refresh` under
+    /// `bases.write()` -> drop; finally `working_set.write()` with NO daemon-map
+    /// lock held — the same intern-then-`working_set.add` sequence used elsewhere.
     ///
     /// SC-002 preserved: `intern_base_refresh` REPLACES the map value for the key
     /// (one Arc per `BaseKey`). FRECENCY-NEUTRAL: no edit-commit hook fires on this
@@ -756,30 +781,40 @@ impl DaemonState {
 
         // (2) Build fresh candidate bases ONLY for entries whose interned index Arc
         // no longer matches the project's current published index (ptr_eq). Compare
-        // and snapshot each `(project_id, candidate)` under one `projects.read()`,
-        // then drop it. The project_id is carried through because a `BaseKey` keys
-        // on `(canonical_root, commit)`, NOT the working-set project id.
-        let stale: Vec<(String, Arc<IndexBase>)> = {
+        // after cloning targeted slots under one registry read. The project_id is
+        // carried through because a `BaseKey` keys on `(canonical_root, commit)`,
+        // NOT the working-set project id.
+        let slots: HashMap<String, Arc<ProjectSlot>> = {
             let projects = self.projects.read();
             targeted
                 .iter()
-                .filter_map(|(project_id, entry_index)| {
-                    let project = projects.get(project_id)?;
-                    // `read()` yields an arc_swap Guard derefing to the current
-                    // `Arc<LiveIndex>`; `&current` deref-coerces to the
-                    // `&Arc<LiveIndex>` ptr_eq wants (as `base()` does for clone).
-                    // Every publish stores a fresh Arc, so an equal pointer means
-                    // the published index has not advanced since intern.
-                    let current = project.index.read();
-                    if Arc::ptr_eq(&current, entry_index) {
-                        None // fresh — no re-intern
-                    } else {
-                        // candidate wrapping the current snapshot
-                        Some((project_id.clone(), project.base()))
-                    }
+                .filter_map(|(project_id, _)| {
+                    projects
+                        .get(project_id)
+                        .cloned()
+                        .map(|slot| (project_id.clone(), slot))
                 })
                 .collect()
-        }; // projects read guard dropped here, before bases.write() below
+        };
+        let stale: Vec<(String, Arc<IndexBase>)> = targeted
+            .iter()
+            .filter_map(|(project_id, entry_index)| {
+                let slot = slots.get(project_id)?;
+                let index = Arc::clone(&slot.metadata.read().index);
+                // `read()` yields an arc_swap Guard derefing to the current
+                // `Arc<LiveIndex>`; `&current` deref-coerces to the
+                // `&Arc<LiveIndex>` ptr_eq wants (as `base()` does for clone).
+                // Every publish stores a fresh Arc, so an equal pointer means
+                // the published index has not advanced since intern.
+                let current = index.read();
+                if Arc::ptr_eq(&current, entry_index) {
+                    None // fresh — no re-intern
+                } else {
+                    // candidate wrapping the current snapshot
+                    Some((project_id.clone(), slot.base()))
+                }
+            })
+            .collect();
         if stale.is_empty() {
             return; // warm path: every targeted entry already fresh, zero writes
         }
@@ -844,6 +879,51 @@ impl DaemonState {
             .retain(|_key, base| Arc::strong_count(base) > 1);
     }
 
+    /// Ensure a live slot for `project_id` and join `session_id` to it, with the
+    /// join recorded under the same `projects` write lock that proves the slot is
+    /// the map's CURRENT entry. This closes the cleanup/reinsertion race
+    /// (recovered finding #15): a slot observed via the read lock may be removed
+    /// by a concurrent close before we join it — joining such a zombie (or
+    /// re-inserting it) would resurrect a stopped slot. The loop retries against
+    /// the authoritative entry instead; a cold load happens OUTSIDE the registry
+    /// lock (a racing opener may win insertion; the inactive loser has no
+    /// background work and is simply dropped).
+    fn ensure_project_slot_for_session(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        canonical_root: &Path,
+    ) -> anyhow::Result<Arc<ProjectSlot>> {
+        loop {
+            let existing = self.projects.read().get(project_id).cloned();
+            if let Some(slot) = existing {
+                let projects = self.projects.write();
+                if projects
+                    .get(project_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    slot.metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    return Ok(slot);
+                }
+                // The map entry changed under us (concurrent cleanup or a fresh
+                // reinsert); retry against the current authoritative entry.
+                continue;
+            }
+
+            let candidate = Arc::new(ProjectSlot::new(ProjectInstance::load(canonical_root)?));
+            let mut projects = self.projects.write();
+            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
+            slot.metadata
+                .write()
+                .session_ids
+                .insert(session_id.to_string());
+            return Ok(slot);
+        }
+    }
+
     fn register_session_for_existing_project(
         &self,
         project_id: &str,
@@ -855,56 +935,32 @@ impl DaemonState {
             self.next_session_id.fetch_add(1, Ordering::Relaxed)
         );
         let now = SystemTime::now();
+        let slot = self.ensure_project_slot_for_session(&session_id, project_id, canonical_root)?;
 
-        // D17 (atomic open, fail-never): ensure the project EXISTS and register
-        // this session's id under a SINGLE `projects.write()` hold, so a
-        // concurrent `close_session` cannot reap the project in a
-        // check-then-register window. If a concurrent close removed it between
-        // `open_project_session`'s probe and here, RECOVER by reloading +
-        // activating under the held write lock (rare path; load-under-lock is
-        // acceptable and is what makes open fail-never) instead of bailing
-        // "was removed between check and session registration". Once our
-        // `session_ids` entry is in, close will not reap the project.
+        // The session id pins the winning slot before activation begins, so close
+        // cannot reap it while watcher startup runs outside the registry lock.
+        slot.activate();
         let (project_name, canonical_root_text, session_count) = {
-            let mut projects = self.projects.write();
-            if !projects.contains_key(project_id) {
-                let mut reloaded = ProjectInstance::load(canonical_root)?;
-                if reloaded.activation_state == ActivationState::Inactive {
-                    reloaded.activate();
-                }
-                projects.insert(project_id.to_string(), reloaded);
-            }
-            let project = projects
-                .get_mut(project_id)
-                .expect("project present: inserted above under this same write lock when absent");
-            project.session_ids.insert(session_id.clone());
+            let project = slot.metadata.read();
             (
                 project.project_name.clone(),
                 normalized_path_string(&project.canonical_root),
                 project.session_ids.len(),
             )
         };
+        let server = slot.server_for_session();
 
-        // Intern the base AFTER the project is guaranteed present and the session
-        // is registered. `bases -> projects -> sessions` order holds: `bases` is
-        // acquired (inside `intern_base_for_project`) only after the
-        // `projects.write()` above is released, never while another daemon lock is
-        // held. Our `session_ids` entry already pins the project, so it cannot
-        // vanish during interning. Seed the session's working set with ONE entry:
-        // the active project, its interned shared base, and an EMPTY overlay
-        // (Phase 1, no-overlay-writes invariant). If interning returns `None` the
-        // working set stays empty and `session_runtime` still resolves via
-        // `active_project_id`, so behavior is unchanged.
-        let base = self.intern_base_for_project(project_id);
+        // Intern after releasing registry/metadata guards. The session id already
+        // pins the slot, so it cannot vanish while git identity is resolved.
+        let base = self.intern_base(slot.base());
         let mut working_set = WorkingSet::new();
-        if let Some(base) = base {
-            working_set.add(project_id.to_string(), base);
-        }
+        working_set.add(project_id.to_string(), base);
 
         let session = SessionRecord {
             session_id: session_id.clone(),
             active_project_id: project_id.to_string(),
             working_set: Arc::new(RwLock::new(working_set)),
+            servers: HashMap::from([(project_id.to_string(), server)]),
             client_name: request.client_name.clone(),
             pid: request.pid,
             opened_at: now,
@@ -947,41 +1003,6 @@ impl DaemonState {
             );
         }
         let project_id = project_key(&canonical_root);
-
-        // Fast path: project already loaded — just add session.
-        {
-            let projects = self.projects.read();
-            if projects.contains_key(&project_id) {
-                drop(projects);
-                return self.register_session_for_existing_project(
-                    &project_id,
-                    &request,
-                    &canonical_root,
-                );
-            }
-        }
-
-        // Slow path: project not loaded — load unlocked, then re-check under write lock.
-        let new_project = ProjectInstance::load(&canonical_root)?;
-
-        {
-            let mut projects = self.projects.write();
-            if projects.contains_key(&project_id) {
-                // Another thread won the race — discard our loaded instance.
-                // Instance is Inactive with no spawned tasks, safe to drop.
-            } else {
-                // We won — insert as Inactive, then activate under the same lock
-                // to avoid a second write-lock acquisition.
-                projects.insert(project_id.clone(), new_project);
-                if let Some(project) = projects.get_mut(&project_id)
-                    && project.activation_state == ActivationState::Inactive
-                {
-                    project.activate();
-                }
-            }
-        }
-
-        // Register session (works whether we inserted or another thread did).
         self.register_session_for_existing_project(&project_id, &request, &canonical_root)
     }
 
@@ -1005,8 +1026,8 @@ impl DaemonState {
     }
 
     pub fn close_session(&self, session_id: &str) -> Option<CloseSessionResponse> {
-        // Lock ordering: projects write first, then sessions write.
-        // Scan ALL projects instead of relying on session.project_id, which can be
+        // Snapshot session identity, then scan projects in a separate critical
+        // section instead of relying on session.project_id, which can be
         // stale if index_folder_for_session reassigned concurrently.
         //
         // Feature 012 (Phase 2): a session may now reference MORE THAN ONE project
@@ -1018,36 +1039,56 @@ impl DaemonState {
         // / `remaining_sessions` / `project_removed` describe the session's ACTIVE
         // project (its primary association), preserving the wire contract; sibling
         // additive projects are reaped silently.
-        let active_project_id = self
-            .sessions
-            .read()
-            .get(session_id)
-            .map(|s| s.active_project_id.clone());
+        // Remove the session record FIRST so a concurrent additive open observes
+        // the session as gone and undoes its own attach (recovered finding #16);
+        // the membership sweep below then cannot miss a join recorded after the
+        // sweep ran. The record — critically its `working_set`, which holds the
+        // `Arc<IndexBase>` clones — is dropped BEFORE the GC below, or the bases
+        // would never look orphaned.
+        let session = self.sessions.write().remove(session_id)?;
+        Some(self.finish_removed_session(session))
+    }
+
+    /// Shared post-removal cleanup for a session record that has already been
+    /// claimed out of the sessions map (interactive close or reaper expiry):
+    /// detach the session from EVERY project that lists it, tear down projects
+    /// whose membership empties, GC orphaned bases, and report the active
+    /// project's outcome.
+    fn finish_removed_session(&self, session: SessionRecord) -> CloseSessionResponse {
+        let session_id = session.session_id.clone();
+        let active_project_id = Some(session.active_project_id.clone());
+        let closed_session_id = session.session_id.clone();
+        // Drop the record — critically its `working_set`, which holds the
+        // `Arc<IndexBase>` clones — BEFORE the GC below, or the bases would
+        // never look orphaned.
+        drop(session);
 
         let mut active_remaining = 0usize;
         let mut active_removed = false;
         let mut active_pid_seen = false;
+        let mut removed_slots = Vec::new();
         {
             let mut projects = self.projects.write();
             // All projects that list this session (active + additive siblings).
             let owning: Vec<String> = projects
                 .iter()
-                .filter(|(_, project)| project.session_ids.contains(session_id))
+                .filter(|(_, slot)| slot.metadata.read().session_ids.contains(&session_id))
                 .map(|(id, _)| id.clone())
                 .collect();
 
             for pid in owning {
                 let is_active = active_project_id.as_deref() == Some(pid.as_str());
                 let remaining = {
-                    let Some(project) = projects.get_mut(&pid) else {
+                    let Some(slot) = projects.get(&pid) else {
                         continue;
                     };
-                    project.session_ids.remove(session_id);
+                    let mut project = slot.metadata.write();
+                    project.session_ids.remove(&session_id);
                     project.session_ids.len()
                 };
                 let removed = if remaining == 0 {
-                    if let Some(mut removed) = projects.remove(&pid) {
-                        abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
+                    if let Some(removed) = projects.remove(&pid) {
+                        removed_slots.push(removed);
                     }
                     true
                 } else {
@@ -1060,48 +1101,99 @@ impl DaemonState {
                 }
             }
         }
-
-        let session = self.sessions.write().remove(session_id)?;
-        // Take only what the response needs, then DROP the rest of the session —
-        // critically its `working_set`, which holds the `Arc<IndexBase>` clones.
-        // The GC below relies on those being released first; keeping `session`
-        // live across the sweep would keep its bases at strong_count >= 2 and
-        // defeat the reclaim (the base would never look orphaned).
-        let closed_session_id = session.session_id.clone();
-        drop(session);
+        for slot in removed_slots {
+            slot.stop();
+        }
 
         // If this was the last session on a BaseKey, that map value is now a
-        // map-only orphan (strong_count == 1) — the same unbounded-growth defect
-        // class as commit-advance, via a parallel path. Sweep it. LOCK ORDER safe:
-        // `gc_orphaned_bases` takes ONLY `bases.write()`, no other map lock held.
+        // map-only orphan — sweep it. LOCK ORDER safe: `gc_orphaned_bases`
+        // takes ONLY `bases.write()`, no other map lock held.
         self.gc_orphaned_bases();
 
-        // If the session referenced no project, or its active project was already
-        // gone (e.g. concurrent reassignment), report an orphan close — the
-        // session record is still cleaned up above.
         let project_id = match (active_project_id, active_pid_seen) {
             (Some(pid), true) => pid,
             _ => "orphan".to_string(),
         };
 
-        Some(CloseSessionResponse {
+        CloseSessionResponse {
             session_id: closed_session_id,
             project_id,
             remaining_sessions: active_remaining,
             project_removed: active_removed,
-        })
+        }
+    }
+
+    /// Task 9 reaper claim: re-check the SAME last-seen observation under the
+    /// sessions write lock and atomically remove the record before any shared
+    /// project cleanup. A heartbeat that advanced `last_seen` (or crossed the
+    /// cutoff) WINS and preserves the session; once the reaper claims it, a
+    /// later heartbeat fails as unknown-session rather than resurrecting it.
+    fn close_session_if_expired(
+        &self,
+        session_id: &str,
+        observed_last_seen: u64,
+        cutoff: u64,
+    ) -> bool {
+        let session = {
+            let mut sessions = self.sessions.write();
+            let Some(record) = sessions.get(session_id) else {
+                return false;
+            };
+            let current = record.last_seen_at.load(Ordering::Relaxed);
+            if current != observed_last_seen || current >= cutoff {
+                return false;
+            }
+            sessions.remove(session_id)
+        };
+        let Some(session) = session else {
+            return false;
+        };
+        let response = self.finish_removed_session(session);
+        tracing::info!(
+            session_id = %response.session_id,
+            project_id = %response.project_id,
+            "reaper closed expired session"
+        );
+        true
+    }
+
+    /// Task 9: sweep sessions whose heartbeat is older than `ttl`. Candidates
+    /// are collected as `(session_id, observed_last_seen)` under a read lock;
+    /// each claim re-validates under the write lock in
+    /// `close_session_if_expired`. Returns the number of sessions reaped.
+    pub fn reap_expired_sessions(&self, ttl: std::time::Duration) -> usize {
+        let cutoff = now_epoch_millis().saturating_sub(ttl.as_millis() as u64);
+        let candidates: Vec<(String, u64)> = self
+            .sessions
+            .read()
+            .iter()
+            .filter_map(|(id, session)| {
+                let seen = session.last_seen_at.load(Ordering::Relaxed);
+                (seen < cutoff).then(|| (id.clone(), seen))
+            })
+            .collect();
+        let mut reaped = 0usize;
+        for (session_id, observed) in candidates {
+            if self.close_session_if_expired(&session_id, observed, cutoff) {
+                reaped += 1;
+            }
+        }
+        reaped
     }
 
     pub fn list_projects(&self) -> Vec<ProjectSummary> {
-        let projects = self.projects.read();
-        let mut summaries: Vec<ProjectSummary> = projects
-            .values()
-            .map(|project| ProjectSummary {
-                project_id: project.project_id.clone(),
-                project_name: project.project_name.clone(),
-                canonical_root: normalized_path_string(&project.canonical_root),
-                session_count: project.session_ids.len(),
-                opened_at_unix_secs: unix_seconds(project.opened_at),
+        let slots: Vec<Arc<ProjectSlot>> = self.projects.read().values().cloned().collect();
+        let mut summaries: Vec<ProjectSummary> = slots
+            .iter()
+            .map(|slot| {
+                let project = slot.metadata.read();
+                ProjectSummary {
+                    project_id: project.project_id.clone(),
+                    project_name: project.project_name.clone(),
+                    canonical_root: normalized_path_string(&project.canonical_root),
+                    session_count: project.session_ids.len(),
+                    opened_at_unix_secs: unix_seconds(project.opened_at),
+                }
             })
             .collect();
         summaries.sort_by(|a, b| a.canonical_root.cmp(&b.canonical_root));
@@ -1109,8 +1201,8 @@ impl DaemonState {
     }
 
     pub fn project_health(&self, project_id: &str) -> Option<ProjectHealth> {
-        let projects = self.projects.read();
-        let project = projects.get(project_id)?;
+        let slot = self.projects.read().get(project_id).cloned()?;
+        let project = slot.metadata.read();
         let published = project.index.published_state();
 
         Some(ProjectHealth {
@@ -1127,8 +1219,8 @@ impl DaemonState {
 
     pub fn list_sessions(&self, project_id: &str) -> Option<Vec<SessionSummary>> {
         let session_ids: Vec<String> = {
-            let projects = self.projects.read();
-            let project = projects.get(project_id)?;
+            let slot = self.projects.read().get(project_id).cloned()?;
+            let project = slot.metadata.read();
             project.session_ids.iter().cloned().collect()
         };
 
@@ -1168,9 +1260,7 @@ impl DaemonState {
         // Fail-closed daemon auth is now in force: the daemon ALWAYS establishes
         // a token at startup and `authorize_daemon_request` rejects any caller
         // that does not present it, so this route (like every authenticated
-        // route) is unreachable by an unauthenticated local process. The
-        // ambient-authority surface is closed. See `establish_daemon_auth_token`
-        // / `write_daemon_token_file` / `authorize_daemon_request`.
+        // route) is unreachable by an unauthenticated local process.
         //
         // Trust boundary: refuse sensitive system paths before any reload/IO.
         // The local `tools::index_folder` already guards this; the daemon path
@@ -1186,222 +1276,124 @@ impl DaemonState {
         }
         let target_project_id = project_key(&target_root);
 
-        // Feature 012 (Phase 2): ADDITIVE open. A NEW code path, distinct from
-        // the destructive `needs_reassign` retarget below: it adds `target_root`
-        // as a SECOND project in the session's working set (intern its base, join
-        // `session_ids` additively, `working_set.add(..)`) WITHOUT evicting the
-        // current project or changing `active_project_id`. This is what enables
-        // cross-project reads (Phase 3). No overlay is written (invariant).
-        if input.add == Some(true) {
-            return self.index_folder_additive(session_id, &target_project_id, &target_root);
-        }
-
-        let current_session_root = {
-            let projects = self.projects.read();
-            let sessions = self.sessions.read();
-            let session = sessions
+        // Immutable home: `index_folder` NEVER retargets the session. The
+        // omitted-`add` default and the compatibility spelling `add=true` share
+        // this ONE canonical open contract — open/refresh `target_root` as a
+        // working-set project while unqualified reads stay bound to the home
+        // project. The `add` spelling is deliberately NOT part of the canonical
+        // idempotency request, so both spellings replay each other.
+        //
+        // The durable replay ledger lives in the HOME project's `.symforge`
+        // store: home is immutable for the session's lifetime, so one stable
+        // store observes every open the session performs, which is what makes
+        // same-key/different-target conflicts detectable BEFORE the conflicting
+        // project is loaded.
+        let home_root = {
+            let home_project_id = self
+                .sessions
+                .read()
                 .get(session_id)
+                .map(|session| session.active_project_id.clone())
                 .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
-            projects
-                .get(&session.active_project_id)
-                .map(|project| project.canonical_root.clone())
+            let slot = self.projects.read().get(&home_project_id).cloned();
+            slot.map(|slot| slot.metadata.read().canonical_root.clone())
         };
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
         let idempotency = match input.idempotency_key.as_deref() {
-            Some(raw_key) => match crate::idempotency::begin_index_folder_replay(
-                &target_root,
-                current_session_root.as_deref(),
-                &target_root,
-                raw_key,
-                reset_requested,
-            ) {
-                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
-                Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
-                Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
-            },
+            Some(raw_key) => {
+                let store_root = home_root.as_deref().unwrap_or(&target_root);
+                match crate::idempotency::begin_index_folder_replay(
+                    store_root,
+                    None,
+                    &target_root,
+                    raw_key,
+                    reset_requested,
+                ) {
+                    Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
+                    Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
+                    Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
+                }
+            }
             None => None,
         };
 
-        // All project-map mutations happen inside this block so the write guard
-        // is fully released before we touch sessions.write() below — preventing
-        // the lock-order inversion with close_session (sessions → projects).
-        let reload_result = (|| -> anyhow::Result<(usize, usize, bool)> {
-            let mut projects = self.projects.write();
-
-            // Re-read current_project_id under projects write lock to handle
-            // concurrent reassignment by another index_folder_for_session call.
-            let current_project_id = {
-                let sessions = self.sessions.read();
-                sessions
-                    .get(session_id)
-                    .map(|s| s.active_project_id.clone())
-                    .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?
-            };
-            let needs_reassign = current_project_id != target_project_id;
-
-            if needs_reassign {
-                if !projects.contains_key(&target_project_id) {
-                    let mut project = ProjectInstance::load(&target_root)?;
-                    debug_assert_eq!(
-                        project.activation_state,
-                        ActivationState::Inactive,
-                        "freshly loaded project must be Inactive"
-                    );
-                    project.activate();
-                    projects.insert(target_project_id.clone(), project);
-                }
-
-                if let Some(current_project) = projects.get_mut(&current_project_id) {
-                    current_project.session_ids.remove(session_id);
-                }
-
-                if let Some(target_project) = projects.get_mut(&target_project_id) {
-                    target_project.session_ids.insert(session_id.to_string());
-                }
-
-                let should_remove_old = projects
-                    .get(&current_project_id)
-                    .map(|project| project.session_ids.is_empty())
-                    .unwrap_or(false);
-                if should_remove_old && let Some(mut removed) = projects.remove(&current_project_id)
+        match self.open_project_for_session(session_id, &target_project_id, &target_root) {
+            Ok(mut output) => {
+                if let Some(idempotency) = &idempotency
+                    && let Err(error) = idempotency.complete(output.clone())
                 {
-                    abort_watcher_task(&mut removed.watcher_task, &removed.stop_token);
+                    output.push_str(&format!(
+                        "\nIdempotency warning: failed to store replay result: {error}"
+                    ));
                 }
+                Ok(output)
             }
-
-            let target_project = projects
-                .get_mut(&target_project_id)
-                .ok_or_else(|| anyhow::anyhow!("missing target project after reload"))?;
-            let counts = target_project.reload(&target_root)?;
-            Ok((counts.0, counts.1, needs_reassign))
-        })(); // projects write lock released here
-
-        let (file_count, symbol_count, needs_reassign) = match reload_result {
-            Ok(counts) => counts,
             Err(error) => {
                 if let Some(idempotency) = &idempotency {
                     let _ = idempotency.fail(format!("Index failed: {error}"));
                 }
-                return Err(error);
-            }
-        };
-
-        // Update the session's project association *after* the projects lock is
-        // released to maintain lock order (projects before sessions everywhere).
-        if needs_reassign {
-            // Feature 012 (Phase 2) — CLOSE THE RETARGET SEAM. Phase 0/1 updated
-            // ONLY `active_project_id`, leaving the seeded `working_set` entry
-            // pointing at the pre-retarget (now-evicted) project, so the working
-            // set was inconsistent with the active project. Now that Phase 3
-            // reads the working set, re-seed it: swap the OLD active entry for the
-            // freshly retargeted project + its interned base + a fresh EMPTY
-            // overlay. Additively-opened sibling projects (if any) are left
-            // intact — retarget only swaps the ACTIVE slot. The base is interned
-            // FIRST, holding no session lock (`intern_base_for_project` takes
-            // `projects` then `bases` with no overlap), then applied under
-            // `sessions.write()`. No overlay is written (invariant).
-            let new_base = self.intern_base_for_project(&target_project_id);
-            if let Some(session) = self.sessions.write().get_mut(session_id) {
-                let old_active =
-                    std::mem::replace(&mut session.active_project_id, target_project_id.clone());
-                if let Some(base) = new_base {
-                    let mut working_set = session.working_set.write();
-                    // Drop the stale active entry (its project was evicted on the
-                    // retarget) before adding the new active project. If `add`
-                    // already holds an entry for `target_project_id` (an additive
-                    // open that we are now promoting to active), it is replaced
-                    // with a fresh overlay — still single-overlay, still empty.
-                    if old_active != target_project_id {
-                        working_set.remove(&old_active);
-                    }
-                    working_set.add(target_project_id.clone(), base);
-                }
-                session
-                    .last_seen_at
-                    .store(now_epoch_millis(), Ordering::Relaxed);
+                Err(error)
             }
         }
-
-        let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
-        if let Some(idempotency) = &idempotency
-            && let Err(error) = idempotency.complete(output.clone())
-        {
-            output.push_str(&format!(
-                "\nIdempotency warning: failed to store replay result: {error}"
-            ));
-        }
-        Ok(output)
     }
 
-    /// Feature 012 (Phase 2): the ADDITIVE `index_folder(add:true)` code path.
+    /// The ONE canonical daemon open path behind `index_folder` (immutable
+    /// home): opens/refreshes `target_root` as a working-set project WITHOUT
+    /// touching `active_project_id`. Both the omitted-`add` default and the
+    /// compatibility spelling `add=true` land here.
     ///
-    /// Opens `target_root` as an ADDITIONAL project in `session_id`'s working set
-    /// without retargeting: the session keeps its active project and gains this
-    /// one, so a later cross-project read can target both. Concretely it
-    /// (1) loads+activates the target project if not already loaded and joins the
-    /// session to it additively (no evict, no `active_project_id` change), then
-    /// (2) interns the target base and `working_set.add(..)`s it with a fresh
-    /// EMPTY overlay. Re-adding an already-open project re-indexes it and refreshes
-    /// its working-set entry (fresh empty overlay) — idempotent at the open level.
+    /// Steps:
+    /// 1. ensure + join the authoritative project slot — session membership is
+    ///    recorded under the same `projects` write lock that proves the slot is
+    ///    the map's current entry, so concurrent cleanup cannot remove the slot
+    ///    and orphan the join;
+    /// 2. activate and reload through the slot's mutation lane (same-project
+    ///    reads keep serving the previously published generation);
+    /// 3. persist the successfully published generation as an atomic snapshot —
+    ///    a snapshot failure does NOT roll back the in-memory open, it degrades
+    ///    the checkpoint receipt and leaves any prior valid snapshot in place;
+    /// 4. attach the project to the session working set with a freshly interned
+    ///    base (fresh EMPTY overlay — the no-overlay-writes invariant holds).
     ///
-    /// LOCK ORDER (`bases -> projects -> sessions`): the `projects` write guard is
-    /// fully released before `intern_base_for_project` (which takes `projects`
-    /// then `bases` with no overlap) and before `sessions.write()`. No overlay is
-    /// written (invariant). No idempotency-key replay here — additive opens are
-    /// not part of the retarget replay ledger.
-    fn index_folder_additive(
+    /// LOCK ORDER (`bases -> projects -> sessions`) is preserved: the reload and
+    /// checkpoint run with no registry lock held; the attach helper interns the
+    /// base first, then takes `projects`/`sessions` without overlap.
+    fn open_project_for_session(
         &self,
         session_id: &str,
         target_project_id: &str,
         target_root: &Path,
     ) -> anyhow::Result<String> {
-        // (1) Load/activate the target project if absent and join the session to
-        // it additively, then reload to index the current tree. All project-map
-        // mutation is scoped to this block so the write guard is released before
-        // we touch `bases`/`sessions` below (lock order).
-        let (file_count, symbol_count) = {
-            let mut projects = self.projects.write();
+        let target_slot =
+            self.ensure_project_slot_for_session(session_id, target_project_id, target_root)?;
+        target_slot.activate();
+        let (file_count, symbol_count) = target_slot.reload(target_root)?;
 
-            // Confirm the session exists (fail loud on an unknown session) under
-            // the same projects guard ordering used elsewhere.
-            {
-                let sessions = self.sessions.read();
-                if !sessions.contains_key(session_id) {
-                    return Err(anyhow::anyhow!("unknown session '{session_id}'"));
-                }
-            }
+        // Persist the published generation. `checkpoint_shared_index` writes via
+        // unique-temp + atomic rename, so a failure here cannot corrupt or drop
+        // the prior valid snapshot — report the degraded outcome honestly.
+        let index = Arc::clone(&target_slot.metadata.read().index);
+        let checkpoint =
+            match crate::live_index::persist::checkpoint_shared_index(&index, target_root) {
+                Ok(_) => "checkpoint=written".to_string(),
+                Err(error) => format!("checkpoint=degraded: {error}"),
+            };
 
-            if !projects.contains_key(target_project_id) {
-                let mut project = ProjectInstance::load(target_root)?;
-                debug_assert_eq!(
-                    project.activation_state,
-                    ActivationState::Inactive,
-                    "freshly loaded project must be Inactive"
-                );
-                project.activate();
-                projects.insert(target_project_id.to_string(), project);
-            }
-
-            let target_project = projects
-                .get_mut(target_project_id)
-                .ok_or_else(|| anyhow::anyhow!("missing target project after load"))?;
-            // Additive join: the session now references this project too.
-            target_project.session_ids.insert(session_id.to_string());
-            target_project.reload(target_root)?
-        }; // projects write guard released here
-
-        // (2) Attach the freshly-indexed project to the session's working set
-        // (intern base under `bases`, join session_ids, add a fresh EMPTY overlay)
-        // via the shared `add_project_to_session` helper — same lock order, one
-        // implementation of the attach step.
         if !self.add_project_to_session(session_id, target_project_id) {
             return Err(anyhow::anyhow!(
-                "failed to attach project to session working set after additive load"
+                "session '{session_id}' closed before the opened project could be attached"
             ));
         }
 
+        let (project_name, root_text) = {
+            let project = target_slot.metadata.read();
+            (
+                project.project_name.clone(),
+                normalized_path_string(&project.canonical_root),
+            )
+        };
         Ok(format!(
-            "Indexed {file_count} files, {symbol_count} symbols (added to working set)."
+            "Indexed {file_count} files, {symbol_count} symbols (added to working set).\nproject_id={target_project_id} project_name={project_name} root={root_text} {checkpoint}"
         ))
     }
 
@@ -1410,19 +1402,41 @@ impl DaemonState {
     /// the project is unknown. The base is interned FIRST (no session lock held)
     /// to preserve the `bases -> projects -> sessions` order; a fresh EMPTY overlay
     /// is attached (no overlay write). Idempotent: re-adding refreshes the entry.
+    ///
+    /// Two lifecycle hardenings (recovered findings #14/#16):
+    /// - a session-local server whose `SharedIndex` no longer matches the slot's
+    ///   current index (the project was evicted and re-loaded since) is REPLACED,
+    ///   never reused — a stale server would silently serve a dead index;
+    /// - if the session closed while the attach was in flight, the membership
+    ///   join is undone (and the slot reaped if that was its last session), so a
+    ///   closed session cannot pin a project forever.
     fn add_project_to_session(&self, session_id: &str, project_id: &str) -> bool {
         let Some(base) = self.intern_base_for_project(project_id) else {
             return false;
         };
-        {
-            let mut projects = self.projects.write();
-            let Some(project) = projects.get_mut(project_id) else {
+        let slot = {
+            let projects = self.projects.read();
+            let Some(slot) = projects.get(project_id) else {
                 return false;
             };
-            project.session_ids.insert(session_id.to_string());
-        }
-        match self.sessions.write().get_mut(session_id) {
+            Arc::clone(slot)
+        };
+        let server = slot.server_for_session();
+        let slot_index = Arc::clone(&slot.metadata.read().index);
+        slot.metadata
+            .write()
+            .session_ids
+            .insert(session_id.to_string());
+        let attached = match self.sessions.write().get_mut(session_id) {
             Some(session) => {
+                let replace_server = session
+                    .servers
+                    .get(project_id)
+                    .map(|existing| !Arc::ptr_eq(&existing.index, &slot_index))
+                    .unwrap_or(true);
+                if replace_server {
+                    session.servers.insert(project_id.to_string(), server);
+                }
                 session
                     .working_set
                     .write()
@@ -1430,6 +1444,35 @@ impl DaemonState {
                 true
             }
             None => false,
+        };
+        if !attached {
+            self.detach_project_membership(session_id, project_id);
+        }
+        attached
+    }
+
+    /// Remove `session_id` from `project_id`'s membership set, reaping the slot
+    /// when that membership was its last. Used to undo an attach that raced a
+    /// session close (recovered finding #16); safe to call when either side is
+    /// already gone.
+    fn detach_project_membership(&self, session_id: &str, project_id: &str) {
+        let removed = {
+            let mut projects = self.projects.write();
+            let Some(slot) = projects.get(project_id).cloned() else {
+                return;
+            };
+            let mut project = slot.metadata.write();
+            project.session_ids.remove(session_id);
+            let empty = project.session_ids.is_empty();
+            drop(project);
+            if empty {
+                projects.remove(project_id)
+            } else {
+                None
+            }
+        };
+        if let Some(slot) = removed {
+            slot.stop();
         }
     }
 
@@ -1480,7 +1523,12 @@ impl DaemonState {
                     return false;
                 }
                 let mut working_set = session.working_set.write();
-                working_set.remove(project_id).is_some()
+                let removed = working_set.remove(project_id).is_some();
+                drop(working_set);
+                if removed {
+                    session.servers.remove(project_id);
+                }
+                removed
             }
             None => false,
         };
@@ -1490,43 +1538,203 @@ impl DaemonState {
         // Detach the session from the project; tear the project down if this was
         // its last session (mirrors the retarget eviction in
         // `index_folder_for_session`).
-        let mut projects = self.projects.write();
-        if let Some(project) = projects.get_mut(project_id) {
+        let evicted = {
+            let mut projects = self.projects.write();
+            let Some(slot) = projects.get(project_id).cloned() else {
+                return true;
+            };
+            let mut project = slot.metadata.write();
             project.session_ids.remove(session_id);
-            if project.session_ids.is_empty()
-                && let Some(mut evicted) = projects.remove(project_id)
-            {
-                abort_watcher_task(&mut evicted.watcher_task, &evicted.stop_token);
+            let empty = project.session_ids.is_empty();
+            drop(project);
+            if empty {
+                projects.remove(project_id)
+            } else {
+                None
             }
+        };
+        if let Some(slot) = evicted {
+            slot.stop();
         }
         true
     }
 
     fn session_runtime(&self, session_id: &str) -> Option<SessionRuntime> {
-        // Acquire projects read lock BEFORE sessions read lock so that
-        // the active_project_id we read from the session is still valid while
-        // we look it up in the projects map. (Lock order: projects -> sessions;
-        // `bases` is not taken here.) Feature 012: resolution is via
-        // `active_project_id` — the single active project — so the single-project
-        // path is byte-for-byte unchanged. Phase 3 ALSO carries the session's
-        // `working_set` handle (an `Arc` clone, O(1)) so the cross-project read
-        // route can read it; the single-active path never touches it.
-        let projects = self.projects.read();
-        let session = {
-            let sessions = self.sessions.read();
-            sessions.get(session_id)?.clone()
+        self.runtime_for_target(session_id, None).ok()
+    }
+
+    /// Task 4 (outstanding-work hardening): the ONE shared resolver from a
+    /// session plus an optional explicit `project` selector to the bound
+    /// per-project runtime. Omission selects the immutable home project.
+    /// An explicit selector resolves an open project ID first, then a UNIQUE
+    /// current `project_name` among the session's OPEN working-set projects —
+    /// display text, not a persistent alias. Unknown/not-open/ambiguous
+    /// selectors return deterministic candidate data and never trigger
+    /// indexing or frecency.
+    fn runtime_for_target(
+        &self,
+        session_id: &str,
+        project: Option<&str>,
+    ) -> Result<SessionRuntime, String> {
+        // Clone the session and project slot in separate short critical
+        // sections; no daemon-map locks overlap.
+        let session = self
+            .sessions
+            .read()
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown session '{session_id}'"))?;
+
+        let target_id = match project.map(str::trim).filter(|p| !p.is_empty()) {
+            None => session.active_project_id.clone(),
+            Some(selector) => {
+                let open_ids: Vec<String> = session
+                    .working_set
+                    .read()
+                    .iter()
+                    .map(|entry| entry.project_id.clone())
+                    .collect();
+                if open_ids.iter().any(|id| id == selector) {
+                    selector.to_string()
+                } else {
+                    let mut matches: Vec<String> = Vec::new();
+                    let mut candidates: Vec<String> = Vec::new();
+                    {
+                        let projects = self.projects.read();
+                        for id in &open_ids {
+                            if let Some(slot) = projects.get(id) {
+                                let meta = slot.metadata.read();
+                                candidates.push(format!("{} ({id})", meta.project_name));
+                                if meta.project_name == selector {
+                                    matches.push(id.clone());
+                                }
+                            }
+                        }
+                    }
+                    candidates.sort();
+                    match matches.len() {
+                        1 => matches.remove(0),
+                        0 => {
+                            return Err(format!(
+                                "project '{selector}' is not open in this session. Open \
+                                 projects: [{}]. Open it first with index_folder(path=...).",
+                                candidates.join(", ")
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "project selector '{selector}' is ambiguous among open \
+                                 projects: [{}]. Use the project id.",
+                                candidates.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
         };
-        let project = projects.get(&session.active_project_id)?;
-        Some(SessionRuntime {
-            canonical_root: project.canonical_root.clone(),
-            project_id: session.active_project_id.clone(),
+
+        let slot = self
+            .projects
+            .read()
+            .get(&target_id)
+            .cloned()
+            .ok_or_else(|| format!("project '{target_id}' is not loaded in the daemon"))?;
+        let server = session.servers.get(&target_id).cloned().ok_or_else(|| {
+            format!(
+                "project '{target_id}' has no session server; reopen it with \
+                 index_folder(path=...)"
+            )
+        })?;
+        let project_meta = slot.metadata.read();
+        Ok(SessionRuntime {
+            canonical_root: project_meta.canonical_root.clone(),
+            project_id: target_id.clone(),
             session_id: session.session_id.clone(),
-            index: Arc::clone(&project.index),
-            token_stats: Arc::clone(&project.token_stats),
-            symbol_cache: Arc::clone(&project.symbol_cache),
-            server: project.server.clone(),
+            index: Arc::clone(&project_meta.index),
+            token_stats: Arc::clone(&project_meta.token_stats),
+            symbol_cache: Arc::clone(&project_meta.symbol_cache),
+            server,
             working_set: Arc::clone(&session.working_set),
         })
+    }
+
+    /// Task 7: render the session's open-project inventory — one row per open
+    /// project with deterministic ID, display name/root, home marker, published
+    /// counts and index state, current generation, opened timestamp, and
+    /// snapshot presence — plus the session's last-seen evidence. `project_name`
+    /// is display text, never a persistent alias. Returns `None` for an unknown
+    /// session.
+    fn render_session_project_inventory(&self, session_id: &str) -> Option<String> {
+        let session = self.sessions.read().get(session_id).cloned()?;
+        let open_ids: Vec<String> = session
+            .working_set
+            .read()
+            .iter()
+            .map(|entry| entry.project_id.clone())
+            .collect();
+        let mut lines = vec!["── projects ──".to_string()];
+        {
+            let projects = self.projects.read();
+            for id in &open_ids {
+                let Some(slot) = projects.get(id) else {
+                    lines.push(format!(
+                        "{id} state=missing (open in working set but not loaded)"
+                    ));
+                    continue;
+                };
+                let meta = slot.metadata.read();
+                let published = meta.index.published_state();
+                let home = if *id == session.active_project_id {
+                    " home=yes"
+                } else {
+                    ""
+                };
+                let snapshot = if meta
+                    .canonical_root
+                    .join(".symforge")
+                    .join("index.bin")
+                    .is_file()
+                {
+                    "present"
+                } else {
+                    "absent"
+                };
+                lines.push(format!(
+                    "{id}{home} name={} root={} files={} symbols={} index={} generation={} opened={} snapshot={}",
+                    meta.project_name,
+                    normalized_path_string(&meta.canonical_root),
+                    published.file_count,
+                    published.symbol_count,
+                    published.status_label(),
+                    meta.index.current_project_generation(),
+                    unix_seconds(meta.opened_at),
+                    snapshot,
+                ));
+            }
+        }
+        lines.push(format!(
+            "session={} last_seen={} ttl_secs={}",
+            session.session_id,
+            unix_seconds(session.last_seen_at_time()),
+            session_ttl_from_env().as_secs()
+        ));
+        Some(lines.join("\n"))
+    }
+
+    /// The inventory above, but only when the session holds MORE than one open
+    /// project — the append-to-`health` path stays byte-compatible for the
+    /// single-project sessions that existed before multi-project opens.
+    fn render_session_project_inventory_if_multi(&self, session_id: &str) -> Option<String> {
+        let multi = {
+            let sessions = self.sessions.read();
+            let session = sessions.get(session_id)?;
+            session.working_set.read().len() > 1
+        };
+        if multi {
+            self.render_session_project_inventory(session_id)
+        } else {
+            None
+        }
     }
 
     pub fn health(&self) -> DaemonHealth {
@@ -1580,12 +1788,27 @@ impl DaemonSessionClient {
             project_name,
             auth_token,
             project_root: None,
+            opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
     fn with_project_root(mut self, root: PathBuf) -> Self {
         self.project_root = Some(root);
         self
+    }
+
+    /// Task 8: remember a sibling root this connection opened additively so
+    /// a reconnect can restore the full working set. Home is never recorded
+    /// here (it lives in the immutable `project_root`). Deduplicated, order
+    /// preserved.
+    pub(crate) fn record_opened_root(&self, root: PathBuf) {
+        if self.project_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        let mut roots = self.opened_roots.lock();
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
     }
 
     #[cfg(test)]
@@ -1650,7 +1873,48 @@ impl DaemonSessionClient {
         );
         let new_client =
             connect_or_spawn_session(project_root, "mcp-stdio", Some(std::process::id())).await?;
-        Ok(new_client.with_project_root(project_root.to_path_buf()))
+        let new_client = new_client.with_project_root(project_root.to_path_buf());
+
+        // Task 8: home is immutable across reconnects — the fresh session
+        // must resolve to the SAME deterministic project id, or something
+        // rebound the identity underneath us. Fail closed instead of serving
+        // a different project as "home".
+        if let Ok(canonical_home) = canonical_project_root(project_root) {
+            let expected_home = project_key(&canonical_home);
+            anyhow::ensure!(
+                new_client.project_id == expected_home,
+                "reconnect produced a different home project id (expected {expected_home}, got {}); refusing to serve",
+                new_client.project_id
+            );
+        }
+
+        // Reopen every additively-opened sibling and verify each restores
+        // with its deterministic id. A sibling that fails to reopen or
+        // verifies to a different id fails the whole reconnect (fail closed:
+        // a silently missing sibling would turn explicit reads into
+        // not-open errors, and a mismatched one would serve the wrong code).
+        let siblings: Vec<PathBuf> = self.opened_roots.lock().clone();
+        for root in &siblings {
+            let response = new_client
+                .call_tool_value(
+                    "index_folder",
+                    serde_json::json!({ "path": root.display().to_string() }),
+                )
+                .await
+                .with_context(|| {
+                    format!("reconnect failed to reopen sibling {}", root.display())
+                })?;
+            let expected = canonical_project_root(root).map(|c| project_key(&c));
+            if let Ok(expected) = expected {
+                anyhow::ensure!(
+                    response.contains(&format!("project_id={expected}")),
+                    "reconnect reopened sibling {} with an unexpected identity; refusing to serve (receipt: {response})",
+                    root.display()
+                );
+            }
+            new_client.record_opened_root(root.clone());
+        }
+        Ok(new_client)
     }
 
     pub async fn call_tool_value(
@@ -1684,6 +1948,20 @@ impl DaemonSessionClient {
             .with_context(|| format!("calling daemon tool '{tool_name}'"))?
             .error_for_status()
             .with_context(|| format!("daemon rejected tool '{tool_name}'"))?;
+
+        // Task 7: the daemon's selected-project receipt arrives out-of-band as
+        // a response header; parse the typed evidence and record it in the
+        // per-dispatch slot so the statused wrapper attaches it to `_meta`.
+        // Never reconstructed from the text body.
+        if let Some(header) = response
+            .headers()
+            .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+            && let Ok(text) = header.to_str()
+            && let Ok(evidence) =
+                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(text)
+        {
+            crate::protocol::result_status::record_project_evidence(evidence);
+        }
 
         response
             .text()
@@ -1783,7 +2061,17 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         return Ok(port);
     }
 
-    if let Some(_lock) = try_acquire_start_lock()? {
+    // INCIDENT GUARD (2026-07-11): when auto-spawn cannot happen (test
+    // build, deps/ artifact, or operator kill-switch), fail fast HERE with a
+    // clear error instead of acquiring the start lock and waiting for a
+    // daemon that nothing is allowed to start.
+    if cfg!(test) || daemon_autospawn_disabled() {
+        anyhow::bail!(
+            "no running compatible daemon found and auto-spawn is disabled (test build or {DAEMON_AUTOSPAWN_ENV}); start `symforge daemon` explicitly"
+        );
+    }
+
+    if let Some(lock) = try_acquire_start_lock()? {
         if let Some(port) = daemon_port_if_compatible(&identity).await? {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
             return Ok(port);
@@ -1791,11 +2079,59 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         tracing::info!("acquired start lock, spawning new daemon");
         stop_incompatible_recorded_daemon(&identity).await?;
         spawn_daemon_process()?;
+        // Task 9: release the lock as soon as the child is spawned — the
+        // child's `guarded_daemon_start` acquires the SAME lock before
+        // binding, so holding it through `wait_for_daemon_ready` would
+        // deadlock parent (waiting for the child's port file) against child
+        // (waiting for the lock).
+        drop(lock);
         wait_for_daemon_ready(&identity).await
     } else {
         tracing::info!("start lock held by another process, waiting for daemon");
         wait_for_daemon_ready(&identity).await
     }
+}
+
+/// Outcome of [`guarded_daemon_start`].
+pub enum GuardedStart {
+    /// This process acquired the guard and bound the daemon.
+    Started(DaemonHandle),
+    /// A live compatible daemon already owns this `SYMFORGE_HOME`; its
+    /// runtime record was left untouched.
+    AlreadyRunning { port: u16 },
+}
+
+/// Task 9: the single safe way to BIND a daemon for the current
+/// `SYMFORGE_HOME`. Acquires the start lock (bounded wait), re-checks for a
+/// live compatible daemon UNDER the lock, stops an incompatible recorded
+/// daemon, and only then binds in the current process — so a foreground
+/// `symforge daemon` racing an auto-spawn (or another foreground start) can
+/// never overwrite a live daemon's runtime record.
+pub async fn guarded_daemon_start(bind_host: &str) -> anyhow::Result<GuardedStart> {
+    let identity = current_daemon_identity();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let _lock = loop {
+        if let Some(port) = daemon_port_if_compatible(&identity).await? {
+            return Ok(GuardedStart::AlreadyRunning { port });
+        }
+        if let Some(lock) = try_acquire_start_lock()? {
+            break lock;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the symforge daemon start lock; another start is in progress"
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    };
+    // Re-check under the lock: a racer may have bound between our probe and
+    // the acquisition.
+    if let Some(port) = daemon_port_if_compatible(&identity).await? {
+        return Ok(GuardedStart::AlreadyRunning { port });
+    }
+    stop_incompatible_recorded_daemon(&identity).await?;
+    let handle = spawn_daemon(bind_host).await?;
+    Ok(GuardedStart::Started(handle))
 }
 
 async fn daemon_port_if_compatible(identity: &DaemonIdentity) -> anyhow::Result<Option<u16>> {
@@ -2091,8 +2427,54 @@ fn try_acquire_start_lock() -> anyhow::Result<Option<DaemonStartLock>> {
     }
 }
 
+/// Operator kill-switch for daemon auto-spawn: set
+/// `SYMFORGE_DAEMON_AUTOSPAWN=off` (or `0`/`false`/`no`) to make
+/// `ensure_daemon_running` connect-only — it will attach to an already
+/// running compatible daemon but never start one.
+pub const DAEMON_AUTOSPAWN_ENV: &str = "SYMFORGE_DAEMON_AUTOSPAWN";
+
+fn daemon_autospawn_disabled() -> bool {
+    std::env::var(DAEMON_AUTOSPAWN_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn spawn_daemon_process() -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("locating current symforge executable")?;
+    // INCIDENT GUARD (2026-07-11): under `cargo test`, `current_exe` is the
+    // libtest binary and the `daemon` argument below is interpreted as a TEST
+    // FILTER — spawning it recursively re-runs the daemon test subset, which
+    // spawns again: an exponential fork bomb whose child processes flood the
+    // desktop with console windows and steal focus. Three independent locks:
+    // (1) a test build refuses statically; (2) a binary living in a Cargo
+    // `deps/` directory (every test/bench artifact) refuses by path; (3) the
+    // operator kill-switch refuses by env. Production `symforge.exe` (durable
+    // install or `target/release/symforge.exe`) passes all three.
+    if cfg!(test) {
+        anyhow::bail!(
+            "refusing to auto-spawn a daemon from a test build; start `symforge daemon` explicitly"
+        );
+    }
+    if current_exe
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "deps")
+    {
+        anyhow::bail!(
+            "refusing to auto-spawn a daemon from a Cargo deps/ test artifact: {}",
+            current_exe.display()
+        );
+    }
+    if daemon_autospawn_disabled() {
+        anyhow::bail!(
+            "daemon auto-spawn disabled by {DAEMON_AUTOSPAWN_ENV}; start `symforge daemon` explicitly"
+        );
+    }
     let mut command = std::process::Command::new(current_exe);
     command
         .arg("daemon")
@@ -2240,14 +2622,6 @@ impl ProjectInstance {
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
 
-        let server = SymForgeServer::new(
-            Arc::clone(&index),
-            project_name.clone(),
-            Arc::clone(&watcher_info),
-            Some(canonical_root.to_path_buf()),
-            Some(Arc::clone(&token_stats)),
-        );
-
         Ok(Self {
             project_id: project_key(canonical_root),
             canonical_root: canonical_root.to_path_buf(),
@@ -2261,42 +2635,7 @@ impl ProjectInstance {
             session_ids: HashSet::new(),
             opened_at: SystemTime::now(),
             activation_state: ActivationState::Inactive,
-            server,
         })
-    }
-
-    /// Build a candidate [`IndexBase`] for this project (Feature 012, Phase 0).
-    ///
-    /// Wraps the project's CURRENT published snapshot (`index.read()` ->
-    /// `Arc<LiveIndex>`, the SAME shared handle the project already serves, so no
-    /// second store and no `LiveIndex` change — Principle I) with a sharable
-    /// [`BaseKey`] = `(canonical_root, commit)`. `commit` is the git HEAD sha for
-    /// the root, or [`CommitId::Dirtyless`] when the root is not a git repository
-    /// (so a non-git tree still has a stable, shareable identity).
-    ///
-    /// STALENESS: the captured `Arc<LiveIndex>` is a SNAPSHOT frozen at this
-    /// instant. Once interned, the watcher's later `ArcSwap` reloads (this project
-    /// re-indexing files that changed on disk) do NOT rewrite the interned handle,
-    /// so a cross-project read off the interned base goes stale after ANY
-    /// watcher-picked-up change — not only after a git commit. See
-    /// [`crate::live_index::view::IndexBase::index`]. Re-interning on
-    /// watcher-observed change (live-freshness rebase) is the deferred Phase 4.
-    ///
-    /// The returned base carries `base_generation = 1` (the start value). This is
-    /// a CANDIDATE only: [`DaemonState::intern_base`] is the authority on
-    /// generation and identity. On an intern cache hit it returns the EXISTING
-    /// shared `Arc<IndexBase>` (SC-002) and discards this candidate; on a miss it
-    /// re-stamps the generation from the daemon's monotonic sequence before
-    /// publishing. Callers should therefore route every base through
-    /// `intern_base` rather than using this value directly.
-    fn base(&self) -> Arc<IndexBase> {
-        let index = Arc::clone(&self.index.read());
-        let commit = match crate::git::head_sha(&self.canonical_root) {
-            Ok(sha) => CommitId::Sha(sha),
-            Err(_) => CommitId::Dirtyless,
-        };
-        let key = BaseKey::new(self.canonical_root.clone(), commit);
-        Arc::new(IndexBase::new(key, index, 1))
     }
 
     /// Activate background tasks (watcher + git temporal) for this project.
@@ -2331,49 +2670,126 @@ impl ProjectInstance {
 
         self.activation_state = ActivationState::Active;
     }
+}
 
-    fn reload(&mut self, canonical_root: &Path) -> anyhow::Result<(usize, usize)> {
-        abort_watcher_task(&mut self.watcher_task, &self.stop_token);
+impl ProjectSlot {
+    fn new(project: ProjectInstance) -> Self {
+        Self {
+            metadata: RwLock::new(project),
+            mutation: Mutex::new(()),
+        }
+    }
 
-        self.index.reload(canonical_root)?;
-        let published = self.index.published_state();
-        let file_count = published.file_count;
-        let symbol_count = published.symbol_count;
+    fn activate(&self) {
+        let _mutation = self.mutation.lock();
+        let mut project = self.metadata.write();
+        if project.activation_state == ActivationState::Inactive {
+            project.activate();
+        }
+    }
 
-        self.stop_token = Arc::new(AtomicBool::new(false));
-        self.watcher_task = start_project_watcher(
+    fn stop(&self) {
+        let _mutation = self.mutation.lock();
+        let (mut watcher_task, stop_token) = {
+            let mut project = self.metadata.write();
+            (project.watcher_task.take(), Arc::clone(&project.stop_token))
+        };
+        abort_watcher_task(&mut watcher_task, &stop_token);
+    }
+
+    fn base(&self) -> Arc<IndexBase> {
+        let (canonical_root, index) = {
+            let project = self.metadata.read();
+            (
+                project.canonical_root.clone(),
+                Arc::clone(&project.index.read()),
+            )
+        };
+        let commit = match crate::git::head_sha(&canonical_root) {
+            Ok(sha) => CommitId::Sha(sha),
+            Err(_) => CommitId::Dirtyless,
+        };
+        Arc::new(IndexBase::new(
+            BaseKey::new(canonical_root, commit),
+            index,
+            1,
+        ))
+    }
+
+    fn server_for_session(&self) -> SymForgeServer {
+        let (index, project_name, watcher_info, canonical_root, token_stats) = {
+            let project = self.metadata.read();
+            (
+                Arc::clone(&project.index),
+                project.project_name.clone(),
+                Arc::clone(&project.watcher_info),
+                project.canonical_root.clone(),
+                Arc::clone(&project.token_stats),
+            )
+        };
+        SymForgeServer::new(
+            index,
+            project_name,
+            watcher_info,
+            Some(canonical_root),
+            Some(token_stats),
+        )
+    }
+
+    fn reload(&self, canonical_root: &Path) -> anyhow::Result<(usize, usize)> {
+        self.reload_with(canonical_root, |index, root| index.reload(root))
+    }
+
+    fn reload_with<F>(
+        &self,
+        canonical_root: &Path,
+        reload_index: F,
+    ) -> anyhow::Result<(usize, usize)>
+    where
+        F: FnOnce(&SharedIndex, &Path) -> anyhow::Result<()>,
+    {
+        let _mutation = self.mutation.lock();
+        let (index, watcher_info, mut watcher_task, old_stop_token) = {
+            let mut project = self.metadata.write();
+            (
+                Arc::clone(&project.index),
+                Arc::clone(&project.watcher_info),
+                project.watcher_task.take(),
+                Arc::clone(&project.stop_token),
+            )
+        };
+        abort_watcher_task(&mut watcher_task, &old_stop_token);
+
+        reload_index(&index, canonical_root)?;
+        let published = index.published_state();
+        let counts = (published.file_count, published.symbol_count);
+        let stop_token = Arc::new(AtomicBool::new(false));
+        let watcher_task = start_project_watcher(
             canonical_root.to_path_buf(),
-            Arc::clone(&self.index),
-            Arc::clone(&self.watcher_info),
-            Arc::clone(&self.stop_token),
+            Arc::clone(&index),
+            watcher_info,
+            Arc::clone(&stop_token),
         );
-        self.canonical_root = canonical_root.to_path_buf();
-        self.project_name = canonical_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("project")
-            .to_string();
-        self.project_id = project_key(canonical_root);
+        {
+            let mut project = self.metadata.write();
+            project.stop_token = stop_token;
+            project.watcher_task = watcher_task;
+            project.canonical_root = canonical_root.to_path_buf();
+            project.project_name = canonical_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string();
+            project.project_id = project_key(canonical_root);
+        }
 
-        // Rebuild cached server so it picks up the new project name / root.
-        // The index Arc is the same handle, so the server sees updated data.
-        self.server = SymForgeServer::new(
-            Arc::clone(&self.index),
-            self.project_name.clone(),
-            Arc::clone(&self.watcher_info),
-            Some(canonical_root.to_path_buf()),
-            Some(Arc::clone(&self.token_stats)),
-        );
-
-        // Refresh git temporal data after reload.
-        let expected_gen = self.index.current_project_generation();
+        let expected_gen = index.current_project_generation();
         live_index::git_temporal::spawn_git_temporal_computation(
-            Arc::clone(&self.index),
+            index,
             canonical_root.to_path_buf(),
             expected_gen,
         );
-
-        Ok((file_count, symbol_count))
+        Ok(counts)
     }
 }
 
@@ -2552,6 +2968,7 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
     let app = build_router(Arc::clone(&state));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+    let owned_token = state.auth_token_for_cleanup();
     let server_task = tokio::spawn(async move {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
@@ -2564,7 +2981,30 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
             tracing::error!("daemon server error: {error}");
         }
 
-        cleanup_daemon_runtime_files();
+        // Owner-checked: never delete a successor daemon's fresh runtime files.
+        cleanup_daemon_runtime_files_if_owner(port, std::process::id(), &owned_token);
+    });
+
+    // Task 9: one daemon-owned bounded reaper. The interval is derived from
+    // the TTL (quarter period, clamped to [10s, 600s]) so a shortened test TTL
+    // sweeps promptly while production stays quiet. The task holds only a
+    // `Weak` on the state: it exits when the daemon state drops.
+    let ttl = session_ttl_from_env();
+    let reaper_state = Arc::downgrade(&state);
+    let reaper_task = tokio::spawn(async move {
+        let period_secs = (ttl.as_secs() / 4).clamp(10, 600);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(period_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let Some(state) = reaper_state.upgrade() else {
+                break;
+            };
+            let reaped = state.reap_expired_sessions(ttl);
+            if reaped > 0 {
+                tracing::info!(reaped, ttl_secs = ttl.as_secs(), "session reaper sweep");
+            }
+        }
     });
 
     Ok(DaemonHandle {
@@ -2572,11 +3012,21 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
         shutdown_tx,
         state,
         server_task,
+        reaper_task,
     })
 }
 
 pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
-    let handle = spawn_daemon(bind_host).await?;
+    // Task 9: foreground/service starts go through the guarded seam so they
+    // can never clobber a live daemon's runtime record.
+    let handle = match guarded_daemon_start(bind_host).await? {
+        GuardedStart::Started(handle) => handle,
+        GuardedStart::AlreadyRunning { port } => {
+            anyhow::bail!(
+                "a compatible symforge daemon is already running on port {port}; not starting a second one"
+            );
+        }
+    };
     tracing::info!(port = handle.port, "shared daemon started");
     // Wait for either SIGINT (Ctrl+C) or SIGTERM (kill, systemd, containers).
     // Both trigger the same graceful shutdown path.
@@ -2601,8 +3051,10 @@ pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
     let DaemonHandle {
         shutdown_tx,
         server_task,
+        reaper_task,
         ..
     } = handle;
+    reaper_task.abort();
     let _ = shutdown_tx.send(());
     match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_task).await {
         Ok(Ok(())) => {}
@@ -2682,7 +3134,8 @@ async fn call_tool_handler(
     headers: HeaderMap,
     AxumPath((session_id, tool_name)): AxumPath<(String, String)>,
     Json(params): Json<serde_json::Value>,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
     authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     if tool_name == "index_folder" {
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
@@ -2699,15 +3152,92 @@ async fn call_tool_handler(
             })
             .await
             .map_err(|gov_err| bad_request(gov_err.into()))?
-            .map_err(bad_request);
+            .map_err(bad_request)
+            .map(|text| text.into_response());
     }
 
-    let runtime = state.session_runtime(&session_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("unknown session '{session_id}'"),
-        )
-    })?;
+    // Task 7: `status(detail="projects")` renders the SESSION's open-project
+    // inventory (the daemon owns that state; the per-project server cannot see
+    // sibling projects). Intercept before dispatch. Other detail levels keep
+    // the existing per-project dispatch unchanged.
+    if tool_name == "status" {
+        #[derive(serde::Deserialize)]
+        struct DetailPeek {
+            #[serde(default)]
+            detail: Option<String>,
+        }
+        let peek: DetailPeek =
+            serde_json::from_value(params.clone()).unwrap_or(DetailPeek { detail: None });
+        if peek.detail.as_deref() == Some("projects") {
+            return state
+                .render_session_project_inventory(&session_id)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("unknown session '{session_id}'"),
+                    )
+                })
+                .map(|text| text.into_response());
+        }
+    }
+
+    // Task 4 (outstanding-work hardening): explicit single-project routing.
+    // For the routed read/guidance verbs, peek the optional `project` selector,
+    // resolve the target runtime through the ONE shared resolver, strip the
+    // routing-only field, and dispatch the existing per-project implementation
+    // unchanged. Omission selects the immutable home. The three cross-project
+    // discovery verbs (search_symbols/search_text/find_references) keep their
+    // own `project`/`projects` handling inside `execute_tool_call`.
+    let mut params = params;
+    let runtime = if single_project_routed_tool(&tool_name) {
+        #[derive(serde::Deserialize)]
+        struct ProjectPeek {
+            #[serde(default)]
+            project: Option<String>,
+            #[serde(default)]
+            projects: Option<Vec<String>>,
+        }
+        let peek: ProjectPeek = serde_json::from_value(params.clone()).unwrap_or(ProjectPeek {
+            project: None,
+            projects: None,
+        });
+        // `search_files` is BOTH single-project routed (lone `project` keeps
+        // the full handler with resolve/coupling modes) and set-valued
+        // (`projects` fans out via the cross-project read route). The routed
+        // strip below would silently swallow a `project`+`projects` conflict
+        // before `resolve_targets` could see it, so reject it here.
+        if peek.project.is_some() && peek.projects.is_some() {
+            return Ok(
+                "project and projects are mutually exclusive: pass exactly one (a single \
+                 id in `project`, or a list/`[\"*\"]` in `projects`)."
+                    .into_response(),
+            );
+        }
+        match state.runtime_for_target(&session_id, peek.project.as_deref()) {
+            Ok(runtime) => {
+                if peek.project.is_some()
+                    && let Some(object) = params.as_object_mut()
+                {
+                    object.remove("project");
+                }
+                runtime
+            }
+            Err(message) if message.starts_with("unknown session") => {
+                return Err((StatusCode::NOT_FOUND, message));
+            }
+            // Deterministic routing errors surface as HTTP 200 tool text (same
+            // convention as tool errors below) so the MCP client sees the
+            // candidates immediately instead of a transport failure.
+            Err(message) => return Ok(message.into_response()),
+        }
+    } else {
+        state.session_runtime(&session_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("unknown session '{session_id}'"),
+            )
+        })?
+    };
 
     // Tool handlers acquire parking_lot::RwLock on the shared index, which
     // blocks the OS thread. Running them directly on the async runtime starves
@@ -2716,6 +3246,30 @@ async fn call_tool_handler(
     // spawn_blocking moves execution to tokio's blocking thread pool (default
     // 512 threads), keeping async worker threads free for I/O, MCP transport,
     // and new request acceptance.
+    // Task 7: the selected-project trust evidence for THIS call, captured from
+    // the resolved runtime before dispatch. Returned out-of-band as a response
+    // header so the human-readable body stays byte-identical; the adapter
+    // parses it into the typed receipt and attaches it to `_meta`.
+    let call_evidence_json = {
+        let published = runtime.index.published_state();
+        serde_json::to_string(&crate::protocol::result_status::ProjectEvidence {
+            project_id: runtime.project_id.clone(),
+            project_name: runtime
+                .canonical_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string(),
+            canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
+            generation: runtime.index.current_project_generation(),
+            index_state: published.status_label().to_string(),
+            load_source: format!("{:?}", runtime.index.read().load_source()),
+            index_files: published.file_count,
+            index_symbols: published.symbol_count,
+        })
+        .ok()
+    };
+
     let tool_name_owned = tool_name.clone();
     let tool_name_for_panic = tool_name.clone();
     let state_for_refresh = Arc::clone(&state);
@@ -2752,11 +3306,33 @@ async fn call_tool_handler(
         })
         .await
     {
-        Ok(Ok(result)) => Ok(result),
+        Ok(Ok(mut result)) => {
+            // Task 7: full-surface `health`/`health_compact` gain the session's
+            // open-project inventory once MORE than one project is open — the
+            // 36-tool surface can then list and select projects without the
+            // compact `status` tool. Single-project sessions stay byte-identical.
+            if matches!(tool_name_for_panic.as_str(), "health" | "health_compact")
+                && let Some(inventory) =
+                    state.render_session_project_inventory_if_multi(&session_id)
+            {
+                result.push('\n');
+                result.push_str(&inventory);
+            }
+            let mut response = result.into_response();
+            if let Some(json) = call_evidence_json
+                && let Ok(value) = axum::http::HeaderValue::try_from(json)
+            {
+                response.headers_mut().insert(
+                    crate::protocol::result_status::PROJECT_EVIDENCE_HEADER,
+                    value,
+                );
+            }
+            Ok(response)
+        }
         Ok(Err(tool_err)) => {
             // Tool returned an error — surface it as HTTP 200 so the MCP client
             // gets the message immediately instead of entering reconnect/timeout.
-            Ok(format!("Error in {}: {}", tool_name_for_panic, tool_err))
+            Ok(format!("Error in {}: {}", tool_name_for_panic, tool_err).into_response())
         }
         Err(gov_err) => {
             // Governor error (timeout, queue full, panic) — return as HTTP 200
@@ -2766,7 +3342,7 @@ async fn call_tool_handler(
                 tool_name_for_panic, gov_err
             );
             tracing::error!(tool = %tool_name_for_panic, "tool execution failed: {gov_err}");
-            Ok(msg)
+            Ok(msg.into_response())
         }
     }
 }
@@ -3094,7 +3670,48 @@ fn targets_selects(targets: &Targets, project_id: &str) -> bool {
 fn is_cross_project_read_verb(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "search_symbols" | "search_text" | "find_references"
+        "search_symbols" | "search_text" | "find_references" | "search_files"
+    )
+}
+
+/// Task 4 (outstanding-work hardening): the read/guidance verbs that accept ONE
+/// optional `project` selector, resolved by `DaemonState::runtime_for_target`
+/// in `call_tool_handler` before decode. Exactly the plan's parity table minus
+/// the set-valued discovery verbs above (which own `project`/`projects` in
+/// `execute_tool_call`) and minus `context_inventory` (session-scoped, no
+/// selector). `search_files` is deliberately in BOTH sets: a lone `project`
+/// routes here to the FULL single-project handler (resolve/coupling modes),
+/// while `projects` fans out via the cross-project read route. Structural edits route the same way (Task 5): the selector is
+/// batch-level only — each call stays one single-project transaction, and the
+/// existing worktree/`working_directory` validation then runs against the
+/// SELECTED project's repository, so an unrelated root rejects before preview
+/// or apply.
+pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "get_symbol"
+            | "get_symbol_context"
+            | "get_file_context"
+            | "get_file_content"
+            | "get_repo_map"
+            | "search_files"
+            | "find_dependents"
+            | "diff_symbols"
+            | "what_changed"
+            | "analyze_file_impact"
+            | "validate_file_syntax"
+            | "explore"
+            | "ask"
+            | "conventions"
+            | "edit_plan"
+            | "investigation_suggest"
+            | "replace_symbol_body"
+            | "edit_within_symbol"
+            | "insert_symbol"
+            | "delete_symbol"
+            | "batch_edit"
+            | "batch_insert"
+            | "batch_rename"
     )
 }
 
@@ -3276,6 +3893,16 @@ fn reject_unsupported_cross_project_scoping(
         direction: Option<String>,
         #[serde(default)]
         structural: Option<bool>,
+        #[serde(default)]
+        resolve: Option<bool>,
+        #[serde(default)]
+        changed_with: Option<String>,
+        #[serde(default)]
+        anchor_path: Option<String>,
+        #[serde(default)]
+        rank_by: Option<String>,
+        #[serde(default)]
+        current_file: Option<String>,
     }
     let peek: ScopePeek = serde_json::from_value(params.clone()).unwrap_or_default();
     let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
@@ -3295,6 +3922,25 @@ fn reject_unsupported_cross_project_scoping(
             }
             if present(&peek.direction) {
                 return refuse("direction");
+            }
+        }
+        "search_files" => {
+            // resolve/coupling/ranking modes are single-project pipelines:
+            // refuse honestly instead of silently ignoring the mode.
+            if peek.resolve == Some(true) {
+                return refuse("resolve");
+            }
+            if present(&peek.changed_with) {
+                return refuse("changed_with");
+            }
+            if present(&peek.anchor_path) {
+                return refuse("anchor_path");
+            }
+            if present(&peek.rank_by) {
+                return refuse("rank_by");
+            }
+            if present(&peek.current_file) {
+                return refuse("current_file");
             }
         }
         _ => {}
@@ -3410,8 +4056,81 @@ fn execute_cross_project_read(
             let body = format_cross_project_references(&hits, name, multi, cap);
             Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
+        "search_files" => {
+            let input: SearchFilesInput = decode_params(params)?;
+            let query = input.query.trim();
+            if query.is_empty() {
+                anyhow::bail!("cross-project search_files requires a non-empty query.");
+            }
+            let path_scope = match input.path_prefix.as_deref().map(str::trim) {
+                Some(prefix) if !prefix.is_empty() => {
+                    crate::live_index::search::PathScope::Prefix(prefix.to_string())
+                }
+                _ => crate::live_index::search::PathScope::Any,
+            };
+            let cap = cross_project_result_cap(input.limit);
+            // The same per-project bound the single-project path applies
+            // (default 20, clamped to the engine's 1..=50); the global `cap`
+            // then bounds the merged total.
+            let per_project_limit = input.limit.unwrap_or(20).clamp(1, 50) as usize;
+            let hits = working_set.search_files(
+                &targets,
+                query,
+                per_project_limit,
+                input.include_vendor.unwrap_or(false),
+                input.include_personal_tooling.unwrap_or(false),
+                &path_scope,
+            );
+            let body = format_cross_project_files(&hits, query, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+        }
         other => anyhow::bail!("'{other}' is not a cross-project read verb"),
     }
+}
+
+/// Format cross-project file hits, grouped by project (`── project: <id> ──`
+/// headers when `multi`). Each project's hits arrive already rank-ordered from
+/// the per-project file search.
+///
+/// BOUNDED: at most `cap` hits are rendered across all projects (the shared
+/// cross-project total cap); a surplus is dropped and disclosed honestly with
+/// shown/total counts and the corrective hint.
+fn format_cross_project_files(
+    hits: &[crate::live_index::view::ProjectHit<crate::live_index::SearchFilesHit>],
+    query: &str,
+    multi: bool,
+    cap: usize,
+) -> String {
+    if hits.is_empty() {
+        return format!("No files matching '{query}' in the targeted project(s).");
+    }
+    let total = hits.len();
+    let shown = total.min(cap);
+    let mut out = String::new();
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} file matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} file matches across projects\n"));
+    }
+    let mut current: Option<&str> = None;
+    for ph in hits.iter().take(shown) {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let h = &ph.hit;
+        match &h.metadata_reason {
+            Some(reason) => out.push_str(&format!("  {} [metadata-only: {reason}]\n", h.path)),
+            None => out.push_str(&format!("  {}\n", h.path)),
+        }
+    }
+    out
 }
 
 /// Format cross-project symbol hits, grouped by project (`── project: <id> ──`
@@ -3666,6 +4385,7 @@ async fn execute_tool_call(
             let sections = tp.sections.unwrap_or_default();
             let output = server
                 .get_symbol_context(Parameters(GetSymbolContextInput {
+                    project: None,
                     name: tp.name,
                     file: None,
                     path: Some(tp.path),
@@ -3823,7 +4543,7 @@ fn canonical_project_root(root: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))
 }
 
-fn project_key(root: &Path) -> String {
+pub(crate) fn project_key(root: &Path) -> String {
     let normalized = normalized_path_string(root);
     let stable_path = if cfg!(windows) {
         normalized.to_lowercase()
@@ -3894,6 +4614,39 @@ fn cleanup_daemon_files() {
     if let Ok(dir) = daemon_dir() {
         let _ = std::fs::remove_file(dir.join(daemon_start_lock_file_name()));
         let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_START_LOCK_FILE));
+    }
+}
+
+/// Shutdown-side cleanup that removes a runtime file ONLY when its content
+/// still identifies THIS daemon. A dying daemon's graceful shutdown can race a
+/// successor that already wrote fresh port/token/pid files into the same
+/// `daemon_dir()`; unconditional removal here deletes the successor's files,
+/// leaving clients tokenless (401) or daemon-less — the 2026-07-11 fork-bomb
+/// incident's inner trigger. Startup cleanup stays unconditional (there is no
+/// live owner to protect before the new files are written).
+fn cleanup_daemon_runtime_files_if_owner(port: u16, pid: u32, token: &str) {
+    if let Ok(dir) = daemon_dir() {
+        let owns = |path: &std::path::Path, expected: &str| {
+            std::fs::read_to_string(path)
+                .map(|contents| contents.trim() == expected)
+                .unwrap_or(false)
+        };
+        let port_path = dir.join(daemon_port_file_name());
+        if owns(&port_path, &port.to_string()) {
+            let _ = std::fs::remove_file(&port_path);
+        }
+        let pid_path = dir.join(daemon_pid_file_name());
+        if owns(&pid_path, &pid.to_string()) {
+            let _ = std::fs::remove_file(&pid_path);
+        }
+        let token_path = dir.join(daemon_token_file_name());
+        if owns(&token_path, token) {
+            let _ = std::fs::remove_file(&token_path);
+        }
+        // Legacy untagged names are never written by current builds; removing
+        // them can only clear stale artifacts.
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PORT_FILE));
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PID_FILE));
     }
 }
 
@@ -4806,9 +5559,84 @@ mod tests {
         }
     }
 
+    /// Task 4 resolver: omission -> home; explicit id -> target; unique display
+    /// name -> target; unknown -> deterministic candidates; ambiguous display
+    /// name -> deterministic ambiguity error naming the ids.
+    #[test]
+    fn test_runtime_for_target_resolution_contract() {
+        let project_a = project_dir("symforge-resolver-home-a");
+        let parent_one = TempDir::new().expect("parent one");
+        let parent_two = TempDir::new().expect("parent two");
+        // Two OPEN projects with the SAME display name under different parents.
+        let same_name_one = parent_one.path().join("samename");
+        let same_name_two = parent_two.path().join("samename");
+        for root in [&same_name_one, &same_name_two] {
+            std::fs::create_dir_all(root.join("src")).expect("create src");
+            std::fs::write(root.join("src").join("lib.rs"), "fn f() {}\n").expect("write src");
+        }
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "resolver".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+        for root in [&same_name_one, &same_name_two] {
+            state
+                .index_folder_for_session(
+                    &opened.session_id,
+                    IndexFolderInput {
+                        path: root.display().to_string(),
+                        idempotency_key: None,
+                        add: None,
+                    },
+                )
+                .expect("open same-name project");
+        }
+        let id_one = project_key(&canonical_project_root(&same_name_one).expect("canonical 1"));
+        let id_two = project_key(&canonical_project_root(&same_name_two).expect("canonical 2"));
+
+        // Omission -> immutable home.
+        let home = state
+            .runtime_for_target(&opened.session_id, None)
+            .expect("home runtime");
+        assert_eq!(home.project_id, opened.project_id);
+        // Explicit id -> that project.
+        let by_id = state
+            .runtime_for_target(&opened.session_id, Some(&id_one))
+            .expect("runtime by id");
+        assert_eq!(by_id.project_id, id_one);
+        // Unique display name -> home project's name resolves to home.
+        let by_name = state
+            .runtime_for_target(&opened.session_id, Some(&opened.project_name))
+            .expect("runtime by unique name");
+        assert_eq!(by_name.project_id, opened.project_id);
+        // Ambiguous display name -> deterministic error naming both ids.
+        let ambiguous = match state.runtime_for_target(&opened.session_id, Some("samename")) {
+            Err(message) => message,
+            Ok(_) => panic!("ambiguous name must not resolve"),
+        };
+        assert!(
+            ambiguous.contains("ambiguous")
+                && ambiguous.contains(&id_one)
+                && ambiguous.contains(&id_two),
+            "ambiguity error must name candidates: {ambiguous}"
+        );
+        // Unknown selector -> candidates, no load.
+        let unknown = match state.runtime_for_target(&opened.session_id, Some("nope")) {
+            Err(message) => message,
+            Ok(_) => panic!("unknown selector must not resolve"),
+        };
+        assert!(
+            unknown.contains("not open") && unknown.contains(&opened.project_id),
+            "unknown-selector error must list open projects: {unknown}"
+        );
+    }
+
     // ── Feature 012 Phase 2 — retarget re-seeds the working set's active entry ───
     #[test]
-    fn test_retarget_reseeds_working_set_active_entry() {
+    fn test_default_index_folder_open_keeps_home_and_adds_to_working_set() {
         let project_a = project_dir("symforge-reseed-a");
         let project_b = project_dir("symforge-reseed-b");
         std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
@@ -4824,8 +5652,7 @@ mod tests {
             .expect("open A");
         let active_a = opened.project_id.clone();
 
-        // Retarget (add: None) to B — the destructive path.
-        state
+        let output = state
             .index_folder_for_session(
                 &opened.session_id,
                 IndexFolderInput {
@@ -4834,28 +5661,38 @@ mod tests {
                     add: None,
                 },
             )
-            .expect("retarget to B");
+            .expect("open B");
         let project_b_id =
             project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
 
+        assert!(
+            output.contains(&format!("project_id={project_b_id}")),
+            "receipt must identify the opened project: {output}"
+        );
+        assert!(
+            output.contains("checkpoint=written"),
+            "successful daemon reload must report its checkpoint: {output}"
+        );
+
         let sessions = state.sessions.read();
         let session = sessions.get(&opened.session_id).expect("session");
-        assert_eq!(session.active_project_id, project_b_id, "active is now B");
+        assert_eq!(
+            session.active_project_id, active_a,
+            "default index_folder must preserve immutable home A"
+        );
         let ws = session.working_set.read();
-        // The working set's active entry was re-seeded to B (the retarget seam fix):
-        // the stale A entry is gone and B is present and consistent with active.
-        assert_eq!(ws.len(), 1, "single re-seeded active entry after retarget");
+        assert_eq!(ws.len(), 2, "default open must keep A and add B");
         assert!(
-            ws.get(&active_a).is_none(),
-            "stale pre-retarget entry (A) must be dropped"
+            ws.get(&active_a).is_some(),
+            "home project A must stay in the working set"
         );
         let entry = ws
             .get(&project_b_id)
-            .expect("working set re-seeded with the new active project B");
+            .expect("working set gains newly opened project B");
         assert_eq!(
             entry.overlay.delta_count(),
             0,
-            "re-seeded overlay must be empty"
+            "opened-project overlay must be empty"
         );
         assert!(
             entry.overlay.is_valid_against(&entry.base),
@@ -5132,8 +5969,10 @@ mod tests {
         // Under the multi-thread runtime, activate()/reload() spawned real watchers.
         let (token_a, token_b, watcher_a_live, watcher_b_live) = {
             let projects = state.projects.read();
-            let a = projects.get(&active_a).expect("A loaded");
-            let b = projects.get(&project_b_id).expect("B loaded");
+            let a_slot = projects.get(&active_a).expect("A loaded");
+            let b_slot = projects.get(&project_b_id).expect("B loaded");
+            let a = a_slot.metadata.read();
+            let b = b_slot.metadata.read();
             (
                 Arc::clone(&a.stop_token),
                 Arc::clone(&b.stop_token),
@@ -5227,6 +6066,7 @@ mod tests {
                 session_id: session_id.clone(),
                 active_project_id: "missing-project".to_string(),
                 working_set: Arc::new(RwLock::new(WorkingSet::new())),
+                servers: HashMap::new(),
                 client_name: "codex".to_string(),
                 pid: Some(777),
                 opened_at: SystemTime::now(),
@@ -5309,6 +6149,251 @@ mod tests {
         assert!(sessions.iter().any(|session| session.pid == Some(111)));
         assert!(sessions.iter().any(|session| session.pid == Some(222)));
         assert_ne!(first.session_id, second.session_id);
+    }
+
+    #[test]
+    fn test_sessions_on_same_project_do_not_share_context_cache() {
+        let project = project_dir("symforge-session-state-isolation");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn shared_project() {}\n",
+        )
+        .expect("write source");
+        let state = DaemonState::new();
+
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "first".to_string(),
+                pid: None,
+            })
+            .expect("first session");
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "second".to_string(),
+                pid: None,
+            })
+            .expect("second session");
+
+        let first_runtime = state
+            .session_runtime(&first.session_id)
+            .expect("first runtime");
+        let second_runtime = state
+            .session_runtime(&second.session_id)
+            .expect("second runtime");
+
+        first_runtime
+            .server
+            .session_context
+            .record_file_content_fetch("src/lib.rs", 42, 100);
+        assert!(
+            first_runtime
+                .server
+                .session_context
+                .try_file_content_cache_hit("src/lib.rs", 42, false)
+                .is_some(),
+            "the originating session should observe its own cache entry"
+        );
+        assert!(
+            second_runtime
+                .server
+                .session_context
+                .try_file_content_cache_hit("src/lib.rs", 42, false)
+                .is_none(),
+            "a second session on the same project must not inherit the first session's cache"
+        );
+        assert!(!Arc::ptr_eq(
+            &first_runtime.server.session_context,
+            &second_runtime.server.session_context,
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_runtime.server.ccr_store,
+            &second_runtime.server.ccr_store,
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_runtime.server.stel_ledger,
+            &second_runtime.server.stel_ledger,
+        ));
+        assert!(Arc::ptr_eq(&first_runtime.index, &second_runtime.index,));
+        assert!(Arc::ptr_eq(
+            &first_runtime.token_stats,
+            &second_runtime.token_stats,
+        ));
+    }
+
+    #[test]
+    fn test_project_b_reads_while_project_a_reloads() {
+        let project_a = project_dir("symforge-slot-isolation-a");
+        let project_b = project_dir("symforge-slot-isolation-b");
+        std::fs::write(
+            project_a.path().join("src").join("lib.rs"),
+            "pub fn project_a() {}\n",
+        )
+        .expect("write A");
+        std::fs::write(
+            project_b.path().join("src").join("lib.rs"),
+            "pub fn project_b() {}\n",
+        )
+        .expect("write B");
+
+        let state = Arc::new(DaemonState::new());
+        let opened_a = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "a".to_string(),
+                pid: None,
+            })
+            .expect("open A");
+        let opened_b = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_b.path().display().to_string(),
+                client_name: "b".to_string(),
+                pid: None,
+            })
+            .expect("open B");
+        let root_a = canonical_project_root(project_a.path()).expect("canonical A");
+        let slot_a = state
+            .projects
+            .read()
+            .get(&opened_a.project_id)
+            .cloned()
+            .expect("A slot");
+
+        let (reload_entered_tx, reload_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_reload_tx, release_reload_rx) = std::sync::mpsc::sync_channel(1);
+        let reload = std::thread::spawn(move || {
+            slot_a.reload_with(&root_a, |index, root| {
+                reload_entered_tx.send(()).expect("signal reload entered");
+                release_reload_rx.recv().expect("release reload");
+                index.reload(root)
+            })
+        });
+        reload_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("A reload should enter its mutation lane");
+
+        let state_for_read = Arc::clone(&state);
+        let session_b = opened_b.session_id.clone();
+        let project_b_id = opened_b.project_id.clone();
+        let (read_done_tx, read_done_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let runtime = state_for_read.session_runtime(&session_b).is_some();
+            let health = state_for_read.project_health(&project_b_id).is_some();
+            let sessions = state_for_read.list_sessions(&project_b_id).is_some();
+            read_done_tx
+                .send((runtime, health, sessions))
+                .expect("report B reads");
+        });
+        assert_eq!(
+            read_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("project B reads must not wait for project A reload"),
+            (true, true, true)
+        );
+
+        release_reload_tx.send(()).expect("release A reload");
+        reload
+            .join()
+            .expect("A reload thread")
+            .expect("A reload result");
+        reader.join().expect("B reader thread");
+    }
+
+    #[test]
+    fn test_same_project_reads_prior_generation_during_reload() {
+        let project = project_dir("symforge-slot-same-project");
+        let source = project.path().join("src").join("lib.rs");
+        std::fs::write(&source, "pub fn prior_generation() {}\n").expect("write prior");
+        let state = Arc::new(DaemonState::new());
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "same-project".to_string(),
+                pid: None,
+            })
+            .expect("open project");
+        let prior = Arc::clone(
+            &state
+                .session_runtime(&opened.session_id)
+                .expect("prior runtime")
+                .index
+                .read(),
+        );
+        std::fs::write(&source, "pub fn next_generation() {}\n").expect("write next");
+
+        let slot = state
+            .projects
+            .read()
+            .get(&opened.project_id)
+            .cloned()
+            .expect("project slot");
+        let root = canonical_project_root(project.path()).expect("canonical project");
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(1);
+        let first_slot = Arc::clone(&slot);
+        let first_root = root.clone();
+        let first_reload = std::thread::spawn(move || {
+            first_slot.reload_with(&first_root, |index, root| {
+                first_entered_tx.send(()).expect("signal first reload");
+                release_first_rx.recv().expect("release first reload");
+                index.reload(root)
+            })
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first reload should enter");
+
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let second_reload = std::thread::spawn(move || {
+            slot.reload_with(&root, |index, root| {
+                second_entered_tx.send(()).expect("signal second reload");
+                index.reload(root)
+            })
+        });
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "same-project reloads must serialize on the mutation lane"
+        );
+
+        let during = Arc::clone(
+            &state
+                .session_runtime(&opened.session_id)
+                .expect("runtime during reload")
+                .index
+                .read(),
+        );
+        assert!(
+            Arc::ptr_eq(&prior, &during),
+            "reads must retain the prior published index while reload builds"
+        );
+
+        release_first_tx.send(()).expect("release first reload");
+        first_reload
+            .join()
+            .expect("first reload thread")
+            .expect("first reload result");
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second reload should enter after first finishes");
+        second_reload
+            .join()
+            .expect("second reload thread")
+            .expect("second reload result");
+
+        let after = Arc::clone(
+            &state
+                .session_runtime(&opened.session_id)
+                .expect("runtime after reload")
+                .index
+                .read(),
+        );
+        assert!(
+            !Arc::ptr_eq(&prior, &after),
+            "successful reload must atomically publish a new index generation"
+        );
     }
 
     #[tokio::test]
@@ -6092,12 +7177,14 @@ mod tests {
         std::fs::write(&b_source, "pub fn xproj_marker_gamma() -> u32 { 3 }\n")
             .expect("rewrite source b");
         {
-            let projects = handle.state.projects.read();
-            let project_b_inst = projects
-                .get(&project_b_id)
-                .expect("project B loaded in daemon");
-            project_b_inst
-                .index
+            let index = {
+                let projects = handle.state.projects.read();
+                let slot = projects
+                    .get(&project_b_id)
+                    .expect("project B loaded in daemon");
+                Arc::clone(&slot.metadata.read().index)
+            };
+            index
                 .reload(&canonical_b)
                 .expect("deterministic B reload (watcher-equivalent publish)");
         }
@@ -6178,11 +7265,14 @@ mod tests {
         std::fs::write(&b_source, "pub fn xproj_marker_delta() -> u32 { 4 }\n")
             .expect("rewrite source b (delta)");
         {
-            let projects = handle.state.projects.read();
-            projects
-                .get(&project_b_id)
-                .expect("project B loaded in daemon")
-                .index
+            let index = {
+                let projects = handle.state.projects.read();
+                let slot = projects
+                    .get(&project_b_id)
+                    .expect("project B loaded in daemon");
+                Arc::clone(&slot.metadata.read().index)
+            };
+            index
                 .reload(&canonical_b)
                 .expect("deterministic B reload (delta)");
         }
@@ -6879,7 +7969,7 @@ mod tests {
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
         #[cfg(windows)]
-        let mut child = std::process::Command::new("powershell")
+        let mut child = crate::process_util::hidden_command("powershell")
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -6888,7 +7978,7 @@ mod tests {
             .expect("spawn long-running child");
 
         #[cfg(not(windows))]
-        let mut child = std::process::Command::new("sleep")
+        let mut child = crate::process_util::hidden_command("sleep")
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -7208,7 +8298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_folder_rebinds_session_to_new_project_root() {
+    async fn test_index_folder_open_keeps_immutable_home() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -7268,7 +8358,7 @@ mod tests {
             "index_folder should report success, got: {reload}"
         );
 
-        let sessions = client
+        let target_sessions = client
             .get(format!(
                 "{base_url}/v1/projects/{}/sessions",
                 project_key(&canonical_project_root(project_b.path()).expect("canonical root"))
@@ -7281,8 +8371,24 @@ mod tests {
             .json::<Vec<SessionSummary>>()
             .await
             .expect("session list body");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, opened.session_id);
+        assert_eq!(target_sessions.len(), 1);
+        assert_eq!(target_sessions[0].session_id, opened.session_id);
+
+        let home_sessions = client
+            .get(format!(
+                "{base_url}/v1/projects/{}/sessions",
+                opened.project_id
+            ))
+            .send()
+            .await
+            .expect("home session list request")
+            .error_for_status()
+            .expect("home session list status")
+            .json::<Vec<SessionSummary>>()
+            .await
+            .expect("home session list body");
+        assert_eq!(home_sessions.len(), 1, "opening B must not evict home A");
+        assert_eq!(home_sessions[0].session_id, opened.session_id);
 
         let outline = client
             .post(format!(
@@ -7301,12 +8407,899 @@ mod tests {
             .await
             .expect("outline body");
         assert!(
-            outline.contains("new.rs"),
-            "rebound session should see new root: {outline}"
+            outline.contains("old.rs"),
+            "unqualified reads must remain bound to immutable home A: {outline}"
         );
         assert!(
-            !outline.contains("old.rs"),
-            "rebound session should no longer point at old root: {outline}"
+            !outline.contains("new.rs"),
+            "opening B must not retarget unqualified reads away from home A: {outline}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 4 parity table (daemon route): explicit `project` selects the open
+    /// project B, omission stays bound to immutable home A, and an unknown
+    /// selector returns deterministic candidates without touching any index.
+    #[tokio::test]
+    async fn test_project_routing_parity_table() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-route-home-a");
+        let project_b = project_dir("symforge-route-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "route-parity".to_string(),
+                pid: Some(77),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let call = |tool: &str, body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{base_url}/v1/sessions/{}/tools/{tool}", opened.session_id);
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status")
+                    .text()
+                    .await
+                    .expect("tool body")
+            }
+        };
+
+        // get_repo_map: explicit B vs omitted home A.
+        let map_b = call(
+            "get_repo_map",
+            serde_json::json!({"detail": "full", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "explicit project must serve B: {map_b}"
+        );
+        let map_home = call("get_repo_map", serde_json::json!({"detail": "full"})).await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "omission must serve immutable home A: {map_home}"
+        );
+
+        // get_file_content: exact read routed to B; home cannot see B's file.
+        let content_b = call(
+            "get_file_content",
+            serde_json::json!({"path": "src/new.rs", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            content_b.contains("fn new_fn"),
+            "explicit project read must return B's bytes: {content_b}"
+        );
+        let content_home = call(
+            "get_file_content",
+            serde_json::json!({"path": "src/new.rs"}),
+        )
+        .await;
+        assert!(
+            !content_home.contains("fn new_fn"),
+            "home read must not leak B's bytes: {content_home}"
+        );
+
+        // search_files: discovery routed by explicit project.
+        let files_b = call(
+            "search_files",
+            serde_json::json!({"query": "new.rs", "project": project_b_id}),
+        )
+        .await;
+        assert!(
+            files_b.contains("new.rs"),
+            "explicit project search_files must serve B: {files_b}"
+        );
+
+        // Unknown selector: deterministic candidates, no index mutation.
+        let unknown = call(
+            "get_repo_map",
+            serde_json::json!({"detail": "full", "project": "no-such-project"}),
+        )
+        .await;
+        assert!(
+            unknown.contains("not open") && unknown.contains(&project_b_id),
+            "unknown selector must return candidates: {unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 4 leftover: set-valued `search_files` fans out across targeted
+    /// projects with attributed hits, one deterministic global cap, and honest
+    /// refusals for the modes that stay single-project (resolve/coupling) and
+    /// for a `project`+`projects` mutual-exclusion violation. A lone `project`
+    /// selector keeps the FULL single-project handler (envelope, modes).
+    #[tokio::test]
+    async fn test_search_files_projects_fan_out() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-files-home-a");
+        let project_b = project_dir("symforge-files-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("widget_old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("widget_new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "files-fan-out".to_string(),
+                pid: Some(78),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let call = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/search_files",
+                opened.session_id
+            );
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status")
+                    .text()
+                    .await
+                    .expect("tool body")
+            }
+        };
+
+        // All projects: attributed hits from BOTH, with project headers.
+        let all = call(serde_json::json!({"query": "widget", "projects": ["*"]})).await;
+        assert!(
+            all.contains("widget_old.rs") && all.contains("widget_new.rs"),
+            "wildcard fan-out must surface both projects' files: {all}"
+        );
+        assert!(
+            all.contains(&format!("project: {}", opened.project_id))
+                && all.contains(&format!("project: {project_b_id}")),
+            "multi-target output must attribute hits by project: {all}"
+        );
+
+        // Explicit subset of one: only B's hits, flat (no headers).
+        let only_b = call(serde_json::json!({"query": "widget", "projects": [project_b_id]})).await;
+        assert!(
+            only_b.contains("widget_new.rs") && !only_b.contains("widget_old.rs"),
+            "single-target fan-out must serve only B: {only_b}"
+        );
+        assert!(
+            !only_b.contains("── project:"),
+            "single-target output renders flat: {only_b}"
+        );
+
+        // resolve mode stays single-project: honest refusal, no silent drop.
+        let refused =
+            call(serde_json::json!({"query": "widget", "resolve": true, "projects": ["*"]})).await;
+        assert!(
+            refused.contains("not supported with cross-project targeting"),
+            "resolve mode must refuse cross-project targeting: {refused}"
+        );
+
+        // project + projects together: deterministic mutual-exclusion error.
+        let conflict = call(serde_json::json!({
+            "query": "widget",
+            "project": opened.project_id,
+            "projects": [project_b_id],
+        }))
+        .await;
+        assert!(
+            conflict.contains("mutually exclusive"),
+            "project+projects must be rejected: {conflict}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// INCIDENT GUARD (2026-07-11): a test build must NEVER auto-spawn a
+    /// daemon process — under `cargo test` the spawned `current_exe()` is the
+    /// libtest binary and the `daemon` argument is a test FILTER, so spawning
+    /// recursively re-runs the suite (exponential fork bomb, console-window
+    /// flood). This pins the refusal at both seams.
+    #[tokio::test]
+    async fn test_test_builds_never_auto_spawn_daemon_processes() {
+        let error = spawn_daemon_process().expect_err("test build must refuse to spawn");
+        assert!(
+            error.to_string().contains("test build"),
+            "refusal must name the test-build guard: {error}"
+        );
+
+        // ensure_daemon_running with no daemon reachable must fail fast with
+        // the same refusal instead of spawning or waiting on the start lock.
+        let _env_lock = env_lock().await;
+        let empty_home = TempDir::new().expect("empty home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", empty_home.path());
+        let error = ensure_daemon_running()
+            .await
+            .expect_err("no daemon + no spawn must error");
+        assert!(
+            error.to_string().contains("auto-spawn is disabled"),
+            "ensure_daemon_running must fail fast without spawning: {error}"
+        );
+    }
+
+    /// Task 8: after the daemon dies and a replacement comes up, the proxy
+    /// reconnect must restore the WHOLE working set — home A stays home (same
+    /// deterministic id) and additively-opened B is reopened and explicitly
+    /// routable with the same id — before any read is served.
+    #[tokio::test]
+    async fn test_reconnect_reopens_home_and_working_set() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-reconnect-home-a");
+        let project_b = project_dir("symforge-reconnect-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let first = spawn_daemon("127.0.0.1").await.expect("spawn first daemon");
+        let base_url = format!("http://127.0.0.1:{}", first.port);
+        let http = authed_client(&first);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reconnect".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Open B additively through the proxy so the sibling root is recorded.
+        let opened_b = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(opened_b.starts_with("Indexed "), "open B: {opened_b}");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Kill the first daemon and bring up a replacement on the SAME home.
+        // Wait on the OS-TAGGED port file — the one daemons actually write —
+        // so daemon 1's shutdown cleanup provably finished before daemon 2
+        // writes its own files (the untagged legacy name never exists, so
+        // waiting on it is a no-op that races the cleanup).
+        let _ = first.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(daemon_port_file_name())).await;
+        let second = spawn_daemon("127.0.0.1")
+            .await
+            .expect("spawn second daemon");
+
+        // A routed read through the stale proxy: the first attempt fails, the
+        // reconnect discovers the replacement, reopens home + B, verifies ids,
+        // and the retry serves B.
+        let map_b_input = serde_json::from_value(serde_json::json!({
+            "detail": "full",
+            "project": project_b_id,
+        }))
+        .expect("map input");
+        let map_b = server.get_repo_map(Parameters(map_b_input)).await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "explicit B must remain routable after reconnect: {map_b}"
+        );
+
+        // Unqualified reads still serve immutable home A.
+        let map_home_input =
+            serde_json::from_value(serde_json::json!({"detail": "full"})).expect("home input");
+        let map_home = server.get_repo_map(Parameters(map_home_input)).await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "home must survive reconnect unchanged: {map_home}"
+        );
+
+        let _ = second.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 7: every routed daemon tool response carries a machine-readable
+    /// selected-project receipt (out-of-band header) identifying the project
+    /// that actually served — home by default, the routed sibling when
+    /// `project` was explicit.
+    #[tokio::test]
+    async fn test_tool_receipt_carries_project_evidence() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-receipt-home-a");
+        let project_b = project_dir("symforge-receipt-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "receipt".to_string(),
+                pid: Some(80),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let evidence_for = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/get_repo_map",
+                opened.session_id
+            );
+            async move {
+                let response = client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status");
+                let header = response
+                    .headers()
+                    .get(crate::protocol::result_status::PROJECT_EVIDENCE_HEADER)
+                    .expect("evidence header must be present")
+                    .to_str()
+                    .expect("evidence header must be ASCII")
+                    .to_string();
+                serde_json::from_str::<crate::protocol::result_status::ProjectEvidence>(&header)
+                    .expect("evidence header must parse as typed evidence")
+            }
+        };
+
+        let home_evidence = evidence_for(serde_json::json!({"detail": "compact"})).await;
+        assert_eq!(
+            home_evidence.project_id, opened.project_id,
+            "omitted project must be served (and attested) by home"
+        );
+        assert!(
+            home_evidence.canonical_root.is_some() && !home_evidence.index_state.is_empty(),
+            "evidence carries root and index state: {home_evidence:?}"
+        );
+
+        let routed_evidence =
+            evidence_for(serde_json::json!({"detail": "compact", "project": project_b_id})).await;
+        assert_eq!(
+            routed_evidence.project_id, project_b_id,
+            "explicit project must be attested by the routed sibling"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 9: the reaper re-checks the SAME last-seen observation under the
+    /// sessions write lock before claiming — a heartbeat that advances the
+    /// timestamp between candidate collection and the claim WINS and preserves
+    /// the session; an actually-expired session closes through the normal
+    /// close path, removing orphan project membership exactly once.
+    #[test]
+    fn test_reaper_rechecks_heartbeat_before_close() {
+        let project = project_dir("symforge-reaper");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "reaper".to_string(),
+                pid: None,
+            })
+            .expect("open session");
+
+        // Simulate a real sweep: an ANCIENT observation and a cutoff in the
+        // recent past (now - ttl), exactly the shape reap_expired_sessions
+        // produces. A heartbeat between observation and claim advances
+        // last_seen past the cutoff, so the claim must lose.
+        let ancient: u64 = 1_000;
+        let store_last_seen = |value: u64| {
+            let sessions = state.sessions.read();
+            sessions
+                .get(&opened.session_id)
+                .expect("session")
+                .last_seen_at
+                .store(value, Ordering::Relaxed);
+        };
+        store_last_seen(ancient);
+        let cutoff = now_epoch_millis().saturating_sub(60_000);
+        assert!(
+            ancient < cutoff,
+            "test premise: ancient observation expired"
+        );
+
+        state.heartbeat(&opened.session_id); // advances last_seen to now > cutoff
+        assert!(
+            !state.close_session_if_expired(&opened.session_id, ancient, cutoff),
+            "a heartbeat between observation and claim must preserve the session"
+        );
+        assert!(
+            state.sessions.read().contains_key(&opened.session_id),
+            "session survives the losing claim"
+        );
+
+        // Genuinely expired: same ancient observation, no heartbeat since.
+        // Claim wins, the session closes through the normal path, and the
+        // project whose only member it was is torn down exactly once.
+        store_last_seen(ancient);
+        assert!(
+            state.close_session_if_expired(&opened.session_id, ancient, cutoff),
+            "an expired unchanged observation must be claimed"
+        );
+        assert!(
+            !state.sessions.read().contains_key(&opened.session_id),
+            "claimed session is removed"
+        );
+        assert!(
+            !state.projects.read().contains_key(&opened.project_id),
+            "orphan project membership is removed once"
+        );
+        // A late heartbeat cannot resurrect the claimed session.
+        assert!(
+            !state.heartbeat(&opened.session_id).known_session,
+            "heartbeat after the claim must fail, not resurrect"
+        );
+
+        // Sweep entry point: an expired session found by reap_expired_sessions
+        // is closed with the same guarantees.
+        let reopened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "reaper-sweep".to_string(),
+                pid: None,
+            })
+            .expect("reopen session");
+        {
+            let sessions = state.sessions.read();
+            sessions
+                .get(&reopened.session_id)
+                .expect("session")
+                .last_seen_at
+                .store(1, Ordering::Relaxed); // ancient heartbeat
+        }
+        let reaped = state.reap_expired_sessions(std::time::Duration::from_secs(60));
+        assert_eq!(reaped, 1, "sweep must reap exactly the expired session");
+        assert!(!state.sessions.read().contains_key(&reopened.session_id));
+    }
+
+    /// Task 7: `status(detail="projects")` renders the session's open-project
+    /// inventory (ids, home marker, counts, snapshot evidence), and full-surface
+    /// `health` gains the same inventory once more than one project is open.
+    #[tokio::test]
+    async fn test_status_projects_detail_lists_session_inventory() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-inventory-home-a");
+        let project_b = project_dir("symforge-inventory-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "inventory".to_string(),
+                pid: Some(79),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // health BEFORE the second open: no inventory section (compatibility).
+        let health_single = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health_compact",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("health request")
+            .error_for_status()
+            .expect("health status")
+            .text()
+            .await
+            .expect("health body");
+        assert!(
+            !health_single.contains("── projects ──"),
+            "single-project health must stay byte-compatible: {health_single}"
+        );
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let inventory = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/status",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({"detail": "projects"}))
+            .send()
+            .await
+            .expect("status request")
+            .error_for_status()
+            .expect("status status")
+            .text()
+            .await
+            .expect("status body");
+        assert!(
+            inventory.contains(&opened.project_id) && inventory.contains(&project_b_id),
+            "inventory must list both open projects: {inventory}"
+        );
+        assert!(
+            inventory.contains(&format!("{} home=yes", opened.project_id)),
+            "home project must carry the home marker: {inventory}"
+        );
+        assert!(
+            inventory.contains("snapshot=present") || inventory.contains("snapshot=absent"),
+            "inventory rows must carry snapshot evidence: {inventory}"
+        );
+        assert!(
+            inventory.contains("last_seen=") && inventory.contains("ttl_secs="),
+            "inventory must expose session last-seen and reaper TTL evidence: {inventory}"
+        );
+
+        let health_multi = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/health_compact",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("health multi request")
+            .error_for_status()
+            .expect("health multi status")
+            .text()
+            .await
+            .expect("health multi body");
+        assert!(
+            health_multi.contains("── projects ──") && health_multi.contains(&project_b_id),
+            "multi-project health must expose the inventory: {health_multi}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 5: structural edits route by explicit project. An explicit B edit
+    /// mutates ONLY B, an omitted edit mutates immutable home A, and an
+    /// unknown/ambiguous target writes NOTHING anywhere. Worktree routing and
+    /// `working_directory` validation run against the SELECTED project's
+    /// repository (the existing per-project edit safety, now bound by the
+    /// resolver).
+    #[tokio::test]
+    async fn test_explicit_project_edit_routes_and_preserves_worktree() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-edit-route-a");
+        let project_b = project_dir("symforge-edit-route-b");
+        let file_a = project_a.path().join("src").join("lib.rs");
+        let file_b = project_b.path().join("src").join("lib.rs");
+        std::fs::write(&file_a, "pub fn shared_name() -> u32 { 1 }\n").expect("write source a");
+        std::fs::write(&file_b, "pub fn shared_name() -> u32 { 1 }\n").expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "edit-route".to_string(),
+                pid: Some(78),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let edit = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/replace_symbol_body",
+                opened.session_id
+            );
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("edit request")
+                    .error_for_status()
+                    .expect("edit status")
+                    .text()
+                    .await
+                    .expect("edit body")
+            }
+        };
+
+        // Explicit B edit mutates ONLY B.
+        let result_b = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 2 }",
+            "project": project_b_id,
+        }))
+        .await;
+        let on_disk_b = std::fs::read_to_string(&file_b).expect("read B");
+        let on_disk_a = std::fs::read_to_string(&file_a).expect("read A");
+        assert!(
+            on_disk_b.contains("{ 2 }"),
+            "explicit B edit must mutate B: {result_b}\n{on_disk_b}"
+        );
+        assert!(
+            on_disk_a.contains("{ 1 }"),
+            "explicit B edit must not touch home A: {on_disk_a}"
+        );
+
+        // Omitted edit mutates immutable home A.
+        let result_a = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 3 }",
+        }))
+        .await;
+        let on_disk_a = std::fs::read_to_string(&file_a).expect("read A after");
+        let on_disk_b = std::fs::read_to_string(&file_b).expect("read B after");
+        assert!(
+            on_disk_a.contains("{ 3 }"),
+            "omitted edit must mutate home A: {result_a}\n{on_disk_a}"
+        );
+        assert!(
+            on_disk_b.contains("{ 2 }"),
+            "omitted edit must not touch B: {on_disk_b}"
+        );
+
+        // Unknown target writes NOTHING.
+        let refused = edit(serde_json::json!({
+            "path": "src/lib.rs",
+            "name": "shared_name",
+            "new_body": "pub fn shared_name() -> u32 { 4 }",
+            "project": "no-such-project",
+        }))
+        .await;
+        assert!(
+            refused.contains("not open"),
+            "unknown edit target must refuse with candidates: {refused}"
+        );
+        assert!(
+            !std::fs::read_to_string(&file_a)
+                .expect("read A final")
+                .contains("{ 4 }")
+                && !std::fs::read_to_string(&file_b)
+                    .expect("read B final")
+                    .contains("{ 4 }"),
+            "unknown edit target must write nothing"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -7564,7 +9557,7 @@ mod tests {
         let main_file = main_root.join("src").join("lib.rs");
         std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_util::hidden_command("git")
                 .current_dir(&main_root)
                 .args(args)
                 .output()
@@ -7735,7 +9728,7 @@ mod tests {
         let main_file = main_root.join("src").join("lib.rs");
         std::fs::write(&main_file, "pub fn wt_edit() -> u32 { 1 }\n").expect("write source");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::process_util::hidden_command("git")
                 .current_dir(&main_root)
                 .args(args)
                 .output()
@@ -7876,7 +9869,7 @@ mod tests {
     /// two projects in one session while health/get_repo_map/index_folder
     /// follow the switch.
     #[tokio::test]
-    async fn test_index_folder_proxy_switch_invalidates_stale_local_index() {
+    async fn test_index_folder_proxy_open_preserves_local_home_fallback() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -7950,8 +9943,8 @@ mod tests {
             "precondition: stale local index holds the OLD project"
         );
 
-        // Switch projects via the proxy path. The daemon answers "Indexed ..."
-        // and rebinds the session to project B.
+        // Open project B via the proxy path. This must not change the immutable
+        // home binding or invalidate its local fallback state.
         let result = server
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
@@ -7964,38 +9957,100 @@ mod tests {
             "daemon proxy index_folder should report success, got: {result}"
         );
 
-        // The fix: the stale local index must be invalidated so no local
-        // fallback can serve the OLD project after the switch.
+        // The immutable-home contract keeps the existing local fallback for A.
         assert_eq!(
             server.index.published_state().file_count,
-            0,
-            "stale local index must be reset to empty after a proxy project switch, got: {result}"
+            1,
+            "opening B must not reset the local home-A fallback, got: {result}"
         );
         assert!(
-            server.index.read().get_file("src/old.rs").is_none(),
-            "OLD-project file must be unreachable from the local index after switch"
+            server.index.read().get_file("src/old.rs").is_some(),
+            "home-A fallback must remain reachable after opening B"
         );
 
-        // And repo_root must follow the switch so the next local fallback
-        // reloads project B (not project A).
-        let switched_root = server.capture_repo_root().expect("repo root after switch");
+        let home_root = server.capture_repo_root().expect("home root after open");
         assert_eq!(
-            switched_root,
-            project_b.path().to_path_buf(),
-            "repo_root must point at the new project after a proxy switch"
+            home_root,
+            project_a.path().to_path_buf(),
+            "repo_root must remain bound to immutable home A"
         );
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
-    /// 012 C4 (D4 retarget + D6-a bound-root visibility): after a daemon-proxy
-    /// session is retargeted from project A to project B at runtime via
-    /// `index_folder`, the `status` and `symforge` surfaces must report the NEW
-    /// project's bound root — never the stale one. This is the field wrong-repo
-    /// bug made observable: a stale binding can no longer read as a working one.
     #[tokio::test]
-    async fn test_retarget_updates_bound_root_in_status_and_symforge_surfaces() {
+    async fn test_index_folder_proxy_failure_refuses_destructive_local_fallback() {
+        let project_a = project_dir("symforge-proxy-refusal-a");
+        let project_b = project_dir("symforge-proxy-refusal-b");
+        std::fs::write(
+            project_a.path().join("src").join("home.rs"),
+            "fn home() {}\n",
+        )
+        .expect("write home source");
+        std::fs::write(
+            project_b.path().join("src").join("other.rs"),
+            "fn other() {}\n",
+        )
+        .expect("write other source");
+
+        let home_root = canonical_project_root(project_a.path()).expect("canonical home A");
+        // Hermetic unreachable endpoint: bind an ephemeral port, then release it.
+        // Nothing is listening there afterwards, so the proxy call fails fast and
+        // deterministically — no assumption that a fixed port (e.g. 1) is free.
+        let dead_port = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral probe port");
+            listener.local_addr().expect("probe port local addr").port()
+        };
+        let client = DaemonSessionClient::new_for_test(
+            format!("http://127.0.0.1:{dead_port}"),
+            project_key(&home_root),
+            "unreachable-session".to_string(),
+            "home-a".to_string(),
+        )
+        .with_project_root(home_root.clone());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        // Mark the daemon connection as already degraded so `proxy_tool_call`
+        // fails over immediately instead of entering the reconnect path, which
+        // would try to discover or SPAWN a real daemon — the opposite of a
+        // hermetic unit test.
+        server
+            .daemon_degraded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        server
+            .index
+            .reload(&home_root)
+            .expect("seed local home fallback");
+
+        let output = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            output.contains("daemon") && output.contains("refus"),
+            "daemon-proxy failure must refuse destructive local index_folder: {output}"
+        );
+        assert_eq!(
+            server.capture_repo_root().as_deref(),
+            Some(home_root.as_path()),
+            "failed proxy open must keep home root"
+        );
+        let guard = server.index.read();
+        assert!(guard.get_file("src/home.rs").is_some());
+        assert!(
+            guard.get_file("src/other.rs").is_none(),
+            "failed proxy open must not replace home index with B"
+        );
+    }
+
+    /// Opening another project must not move connection-scoped surfaces away
+    /// from the immutable home project.
+    #[tokio::test]
+    async fn test_index_folder_open_preserves_home_in_status_and_symforge_surfaces() {
         let _env_lock = env_lock().await;
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
@@ -8055,7 +10110,7 @@ mod tests {
             "pre-retarget status must surface project A root, got:\n{status_before}"
         );
 
-        // Retarget to project B via the explicit `index_folder` verb (D4-C).
+        // Open project B via the explicit `index_folder` verb.
         let indexed = server
             .index_folder(Parameters(IndexFolderInput {
                 path: project_b.path().display().to_string(),
@@ -8065,34 +10120,31 @@ mod tests {
             .await;
         assert!(
             indexed.starts_with("Indexed "),
-            "daemon proxy retarget must succeed, got: {indexed}"
+            "daemon proxy open must succeed, got: {indexed}"
         );
 
-        // (a) The bound root followed the switch.
-        let switched = server
-            .capture_repo_root()
-            .expect("repo root after retarget");
+        // (a) The bound root remains the connection's home A.
+        let bound = server.capture_repo_root().expect("repo root after open");
         assert_eq!(
-            switched,
-            project_b.path().to_path_buf(),
-            "repo_root must point at project B after retarget"
+            bound,
+            project_a.path().to_path_buf(),
+            "repo_root must remain at immutable home A after opening B"
         );
 
-        // (b) `status` (local render path) now reflects project B's root, not A.
+        // (b) `status` (local render path) still reflects home A.
         let root_b_norm = project_b.path().display().to_string().replace('\\', "/");
         let status_after =
             server.render_stel_status_body(&crate::stel::StelStatusRequest::default());
         assert!(
-            status_after.contains(&format!("project_root: {root_b_norm}")),
-            "post-retarget status must surface project B root, got:\n{status_after}"
+            status_after.contains(&format!("project_root: {root_a_norm}")),
+            "post-open status must preserve home A root, got:\n{status_after}"
         );
         assert!(
-            !status_after.contains(&format!("project_root: {root_a_norm}")),
-            "stale project A root must NOT survive in status after retarget, got:\n{status_after}"
+            !status_after.contains(&format!("project_root: {root_b_norm}")),
+            "opened B must not replace home A in status, got:\n{status_after}"
         );
 
-        // (c) the `symforge` facade envelope also carries the bound root line so a
-        // wrong-repo binding is loud on the primary read surface too.
+        // (c) the `symforge` facade envelope carries the same home root.
         // `SymforgeCallInput` flattens the `StelRequest`, so `query` is top-level.
         let symforge_input = serde_json::from_value(serde_json::json!({
             "query": "find beta_symbol"
@@ -8108,8 +10160,8 @@ mod tests {
             .expect("symforge result text")
             .to_string();
         assert!(
-            symforge_body.contains(&format!("project_root: {root_b_norm}")),
-            "symforge envelope must surface the bound project B root, got:\n{symforge_body}"
+            symforge_body.contains(&format!("project_root: {root_a_norm}")),
+            "symforge envelope must preserve home project A, got:\n{symforge_body}"
         );
 
         let _ = handle.shutdown_tx.send(());
@@ -8232,6 +10284,198 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
+    #[test]
+    fn test_index_folder_additive_replays_and_conflicts() {
+        let project_a = project_dir("symforge-idempotency-home-a");
+        let project_b = project_dir("symforge-idempotency-open-b");
+        let project_c = project_dir("symforge-idempotency-conflict-c");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        std::fs::write(project_c.path().join("src").join("c.rs"), "fn c() {}\n")
+            .expect("write source c");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "idempotency".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let first = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: None,
+                },
+            )
+            .expect("default open B");
+        assert!(first.contains("project_id="), "identity receipt: {first}");
+        assert!(
+            first.contains("checkpoint=written"),
+            "checkpoint receipt: {first}"
+        );
+
+        std::fs::write(
+            project_b.path().join("src").join("second.rs"),
+            "fn second() {}\n",
+        )
+        .expect("write second source b");
+        let replay = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: Some(true),
+                },
+            )
+            .expect("compatibility add=true replay B");
+        assert_eq!(
+            replay, first,
+            "default and add=true must share one canonical replay contract"
+        );
+
+        let conflict = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_c.path().display().to_string(),
+                    idempotency_key: Some("shared-open-key".to_string()),
+                    add: Some(true),
+                },
+            )
+            .expect("conflicting open C");
+        assert!(
+            conflict.contains("Idempotency conflict"),
+            "same key with another target must fail deterministically: {conflict}"
+        );
+        assert!(
+            !state.projects.read().contains_key(&project_key(
+                &canonical_project_root(project_c.path()).expect("canonical C")
+            )),
+            "conflict must be rejected before project C is loaded"
+        );
+    }
+
+    #[test]
+    fn test_index_folder_open_persists_snapshot_for_restore() {
+        let project_a = project_dir("symforge-snapshot-home-a");
+        let project_b = project_dir("symforge-snapshot-open-b");
+        std::fs::write(
+            project_b.path().join("src").join("restored.rs"),
+            "fn restored() {}\n",
+        )
+        .expect("write source b");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "snapshot".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let receipt = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("open B");
+        assert!(
+            receipt.contains("checkpoint=written"),
+            "successful open must expose durable checkpoint outcome: {receipt}"
+        );
+        assert!(
+            project_b
+                .path()
+                .join(".symforge")
+                .join("index.bin")
+                .is_file(),
+            "successful daemon reload must atomically persist B"
+        );
+
+        drop(state);
+        let canonical_b = canonical_project_root(project_b.path()).expect("canonical B");
+        let restored = bootstrap_project_index(&canonical_b).expect("restore B from snapshot");
+        let guard = restored.read();
+        assert_eq!(
+            guard.load_source(),
+            crate::live_index::store::IndexLoadSource::SnapshotRestore
+        );
+        assert_eq!(guard.file_count(), 1);
+        assert!(guard.get_file("src/restored.rs").is_some());
+    }
+
+    /// Snapshot persistence failure must NOT fail the open: the in-memory
+    /// generation stays published and attached, and the receipt reports the
+    /// degraded checkpoint outcome honestly instead of claiming `written`.
+    #[test]
+    fn test_index_folder_open_reports_degraded_checkpoint_on_snapshot_failure() {
+        let project_a = project_dir("symforge-degraded-home-a");
+        let project_b = project_dir("symforge-degraded-open-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        // Block snapshot persistence: a FILE at `.symforge` makes the snapshot
+        // directory creation fail while indexing itself is unaffected.
+        std::fs::write(project_b.path().join(".symforge"), "not a directory")
+            .expect("write .symforge blocker");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "degraded-checkpoint".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let receipt = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("open B must succeed despite checkpoint failure");
+        assert!(
+            receipt.starts_with("Indexed "),
+            "open itself must succeed: {receipt}"
+        );
+        assert!(
+            receipt.contains("checkpoint=degraded"),
+            "snapshot failure must surface a degraded checkpoint outcome: {receipt}"
+        );
+        assert!(
+            !receipt.contains("checkpoint=written"),
+            "degraded checkpoint must not claim a durable write: {receipt}"
+        );
+
+        // The in-memory open stayed published: B is attached to the working set
+        // and home A is untouched.
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        assert_eq!(session.active_project_id, opened.project_id, "home stays A");
+        assert!(
+            session.working_set.read().get(&project_b_id).is_some(),
+            "B must be attached despite the degraded checkpoint"
+        );
+        // No snapshot artifact was fabricated behind the failure.
+        assert!(
+            project_b.path().join(".symforge").is_file(),
+            "the blocking file must remain in place (no destructive recovery)"
+        );
+    }
+
     #[tokio::test]
     async fn test_analyze_file_impact_uses_session_project_root_not_process_cwd() {
         let _env_lock = env_lock().await;
@@ -8341,7 +10585,8 @@ mod tests {
 
         let project_id = &projects[0].project_id;
         let projects_lock = state.projects.read();
-        let instance = projects_lock.get(project_id).expect("project must exist");
+        let slot = projects_lock.get(project_id).expect("project must exist");
+        let instance = slot.metadata.read();
         assert_eq!(
             instance.activation_state,
             ActivationState::Active,
@@ -8505,7 +10750,8 @@ mod tests {
 
         let project_id = &projects[0].project_id;
         let projects_lock = state.projects.read();
-        let instance = projects_lock.get(project_id).expect("project must exist");
+        let slot = projects_lock.get(project_id).expect("project must exist");
+        let instance = slot.metadata.read();
 
         assert_eq!(
             instance.activation_state,

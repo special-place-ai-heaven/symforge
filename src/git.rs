@@ -1,6 +1,6 @@
 //! In-process git operations via libgit2.
 //!
-//! Replaces all `Command::new("git")` usage with library calls.
+//! Replaces all `crate::process_util::hidden_command("git")` usage with library calls.
 //! Zero child processes, zero console windows, faster execution.
 
 use std::path::Path;
@@ -190,7 +190,7 @@ impl GitRepo {
     ///    (staged + unstaged + untracked).
     /// 4. Dedupe, sort, reject any path escaping the repo root.
     ///
-    /// No shell is invoked (this crate uses `git2`, never `Command::new("git")`
+    /// No shell is invoked (this crate uses `git2`, never `crate::process_util::hidden_command("git")`
     /// for production paths — see module docs), so shell-metacharacter
     /// injection does not apply here; an invalid `since`/`base_branch` ref is
     /// still rejected via `git2`'s own ref resolution error.
@@ -521,7 +521,6 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
 
     /// Create a temp git repo with a few commits for testing.
     fn make_test_repo() -> (tempfile::TempDir, GitRepo) {
@@ -530,7 +529,7 @@ mod tests {
 
         // Use git CLI for repo setup only (not production code).
         let run = |args: &[&str]| {
-            Command::new("git")
+            crate::process_util::hidden_command("git")
                 .args(args)
                 .current_dir(root)
                 .output()
@@ -623,7 +622,7 @@ mod tests {
         fs::write(dir.path().join("file1.rs"), "fn changed() {}").unwrap();
         fs::write(dir.path().join("new_file.rs"), "fn new() {}").unwrap();
         fs::write(dir.path().join("staged_new.rs"), "fn staged() {}").unwrap();
-        Command::new("git")
+        crate::process_util::hidden_command("git")
             .args(["add", "staged_new.rs"])
             .current_dir(dir.path())
             .output()
@@ -654,7 +653,7 @@ mod tests {
     #[test]
     fn test_tracked_paths_empty_repo_has_no_tracked_files() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        Command::new("git")
+        crate::process_util::hidden_command("git")
             .arg("init")
             .current_dir(dir.path())
             .output()
@@ -700,7 +699,7 @@ mod tests {
     fn test_head_sha_matches_rev_parse() {
         let (dir, _repo) = make_test_repo();
         let cli_sha = String::from_utf8(
-            Command::new("git")
+            crate::process_util::hidden_command("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(dir.path())
                 .output()
@@ -718,14 +717,14 @@ mod tests {
     fn test_head_sha_detached_head() {
         let (dir, _repo) = make_test_repo();
         // Detach HEAD onto the first commit.
-        let output = Command::new("git")
+        let output = crate::process_util::hidden_command("git")
             .args(["rev-parse", "HEAD~1"])
             .current_dir(dir.path())
             .output()
             .expect("git rev-parse HEAD~1");
         let first_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
 
-        Command::new("git")
+        crate::process_util::hidden_command("git")
             .args(["checkout", "--detach", &first_commit])
             .current_dir(dir.path())
             .output()
@@ -741,7 +740,7 @@ mod tests {
     #[test]
     fn test_head_sha_no_commits_errors() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        Command::new("git")
+        crate::process_util::hidden_command("git")
             .arg("init")
             .current_dir(dir.path())
             .output()
@@ -874,7 +873,7 @@ mod tests {
         let (dir, _repo) = make_test_repo();
         let root = dir.path();
         let run = |args: &[&str]| {
-            Command::new("git")
+            crate::process_util::hidden_command("git")
                 .args(args)
                 .current_dir(root)
                 .output()

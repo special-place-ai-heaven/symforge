@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use symforge::live_index::persist;
@@ -77,11 +77,45 @@ fn read_runtime(dir: &Path, stem: &str, ext: &str) -> Option<String> {
     read_trimmed(&sf.join(&tagged)).or_else(|| read_trimmed(&sf.join(format!("{stem}.{ext}"))))
 }
 
+/// Task 8: adapters now write one per-process JSON descriptor under
+/// `.symforge/sessions/` instead of the fixed port/pid/session files. Read
+/// the descriptor first; fall back to the legacy fixed files so the probe
+/// still understands records from older binaries.
+fn read_session_descriptor(dir: &Path) -> Option<(u16, Option<String>)> {
+    let sessions = dir.join(".symforge").join("sessions");
+    let os_tag = format!(".{}.json", std::env::consts::OS);
+    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("sidecar.") || !name.ends_with(&os_tag) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        let Some(port) = value["port"].as_u64() else {
+            continue;
+        };
+        let session = value["session_id"].as_str().map(str::to_string);
+        return Some((port as u16, session));
+    }
+    None
+}
+
 fn read_sidecar_port(dir: &Path) -> Option<u16> {
+    if let Some((port, _)) = read_session_descriptor(dir) {
+        return Some(port);
+    }
     read_runtime(dir, "sidecar", "port")?.parse().ok()
 }
 
 fn read_session_id(dir: &Path) -> Option<String> {
+    if let Some((_, session)) = read_session_descriptor(dir) {
+        return session;
+    }
     read_runtime(dir, "sidecar", "session")
 }
 
@@ -223,7 +257,7 @@ fn test_startup_binary_reports_branch_health() {
     };
 
     // Force local-only mode so the test doesn't spawn/contend with daemon processes.
-    let mut child = Command::new(&binary_path)
+    let mut child = symforge::process_util::hidden_command(&binary_path)
         .current_dir(dir.path())
         .env("RUST_LOG", "info")
         .env("SYMFORGE_NO_DAEMON", "1")
@@ -491,7 +525,7 @@ fn test_stdout_purity() {
         exe.join("symforge")
     };
 
-    let output = std::process::Command::new(&binary_path)
+    let output = symforge::process_util::hidden_command(&binary_path)
         .current_dir(dir.path())
         .env("RUST_LOG", "error") // suppress stderr noise in test output
         .env("SYMFORGE_AUTO_INDEX", "false") // start with empty index for speed

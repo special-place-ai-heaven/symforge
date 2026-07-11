@@ -31,7 +31,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -97,7 +96,7 @@ impl Drop for WorktreePolicyEnvGuard {
 // ─── Git helpers (shell out; git is required dev tooling) ───────────────────
 
 fn run_git(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = symforge::process_util::hidden_command("git")
         .current_dir(cwd)
         .args(args)
         .output()
