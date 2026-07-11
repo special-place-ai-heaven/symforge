@@ -6632,51 +6632,28 @@ impl SymForgeServer {
         )
     )]
     pub async fn index_folder(&self, params: Parameters<IndexFolderInput>) -> String {
-        let is_additive = params.0.add == Some(true);
         if let Some(result) = self.proxy_tool_call("index_folder", &params.0).await {
-            // Feature 012 (Phase 2): an ADDITIVE open does NOT retarget the
-            // session — it adds a second project to the daemon-owned working set
-            // while the active project (and this front-end's `repo_root` /
-            // `self.index`) stays put. So skip the retarget bookkeeping below;
-            // resetting the local index here would wrongly drop the active
-            // project's local-fallback state.
-            if is_additive {
-                return result;
-            }
-            // The daemon has rebound the session to the new project. Update our
-            // local repo_root so that local-fallback tools (what_changed,
-            // analyze_file_impact) and ensure_local_index use the correct root
-            // if the daemon connection degrades later.
-            if result.starts_with("Indexed ") {
-                let new_root = PathBuf::from(&params.0.path);
-                // Root actually changed → session accounting recorded under the
-                // previous root (context_inventory) would double-count; start
-                // fresh. A same-root retarget keeps accounting intact. Compare
-                // canonicalized forms so a raw vs canonical path spelling of the
-                // same directory does not spuriously wipe the session.
-                let previous_root = self.capture_repo_root();
-                let root_changed = new_root
-                    .canonicalize()
-                    .ok()
-                    .map(|canonical| previous_root.as_deref() != Some(canonical.as_path()))
-                    .unwrap_or(true);
-                if root_changed {
-                    self.session_context.reset();
-                }
-                self.set_repo_root(Some(new_root));
-                // Trust-critical: invalidate any stale in-process index left
-                // over from a previous local-fallback load. Without this, a
-                // server that already populated `self.index` for the OLD
-                // project (via `ensure_local_index`) would keep serving the old
-                // project from every tool that falls back to local execution
-                // (search_symbols, search_text, get_file_context, conventions,
-                // explore, ...), because `ensure_local_index` only reloads when
-                // the index is empty. Resetting to empty forces the next local
-                // fallback to reload from the NEW root, so no tool can silently
-                // mix projects after a daemon-proxied `index_folder` switch.
-                self.index.reset_to_empty();
-            }
+            // Immutable home: a daemon `index_folder` (default or `add=true`)
+            // opens/refreshes the target in the daemon-owned working set and
+            // NEVER retargets this connection. The bound `repo_root` and any
+            // local home-fallback state in `self.index` stay exactly as they
+            // are — unqualified reads remain bound to home.
             return result;
+        }
+        if self.daemon_client.is_some() {
+            // Daemon-proxy topology with an unreachable daemon: executing the
+            // same call locally would destructively replace this connection's
+            // single in-process index (the home fallback) with the requested
+            // project. Refuse instead of degrading a non-destructive open into
+            // a destructive local reset (recovered finding: proxy-failure
+            // fallback hijacked home).
+            return format!(
+                "index_folder refused: the daemon is unreachable, and a local fallback would \
+                 destructively replace this connection's home index with '{}'. Unqualified \
+                 reads continue to serve the local home fallback; restore the daemon \
+                 connection and retry.",
+                params.0.path
+            );
         }
         let input = params.0;
         // Feature 012 (Phase 2), Principle VII honesty: additive multi-project

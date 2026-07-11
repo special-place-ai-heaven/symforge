@@ -846,20 +846,49 @@ impl DaemonState {
             .retain(|_key, base| Arc::strong_count(base) > 1);
     }
 
-    fn load_project_slot(
+    /// Ensure a live slot for `project_id` and join `session_id` to it, with the
+    /// join recorded under the same `projects` write lock that proves the slot is
+    /// the map's CURRENT entry. This closes the cleanup/reinsertion race
+    /// (recovered finding #15): a slot observed via the read lock may be removed
+    /// by a concurrent close before we join it — joining such a zombie (or
+    /// re-inserting it) would resurrect a stopped slot. The loop retries against
+    /// the authoritative entry instead; a cold load happens OUTSIDE the registry
+    /// lock (a racing opener may win insertion; the inactive loser has no
+    /// background work and is simply dropped).
+    fn ensure_project_slot_for_session(
         &self,
+        session_id: &str,
         project_id: &str,
         canonical_root: &Path,
     ) -> anyhow::Result<Arc<ProjectSlot>> {
-        if let Some(slot) = self.projects.read().get(project_id).cloned() {
+        loop {
+            let existing = self.projects.read().get(project_id).cloned();
+            if let Some(slot) = existing {
+                let projects = self.projects.write();
+                if projects
+                    .get(project_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    slot.metadata
+                        .write()
+                        .session_ids
+                        .insert(session_id.to_string());
+                    return Ok(slot);
+                }
+                // The map entry changed under us (concurrent cleanup or a fresh
+                // reinsert); retry against the current authoritative entry.
+                continue;
+            }
+
+            let candidate = Arc::new(ProjectSlot::new(ProjectInstance::load(canonical_root)?));
+            let mut projects = self.projects.write();
+            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
+            slot.metadata
+                .write()
+                .session_ids
+                .insert(session_id.to_string());
             return Ok(slot);
         }
-
-        let candidate = Arc::new(ProjectSlot::new(ProjectInstance::load(canonical_root)?));
-        let mut projects = self.projects.write();
-        Ok(Arc::clone(
-            projects.entry(project_id.to_string()).or_insert(candidate),
-        ))
     }
 
     fn register_session_for_existing_project(
@@ -873,28 +902,7 @@ impl DaemonState {
             self.next_session_id.fetch_add(1, Ordering::Relaxed)
         );
         let now = SystemTime::now();
-        let slot = loop {
-            let existing = self.projects.read().get(project_id).cloned();
-            if let Some(slot) = existing {
-                let projects = self.projects.write();
-                if projects
-                    .get(project_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
-                {
-                    slot.metadata.write().session_ids.insert(session_id.clone());
-                    break slot;
-                }
-                continue;
-            }
-
-            // Cold load is intentionally outside the registry lock. A racing
-            // opener may win insertion; the inactive loser has no background work.
-            let candidate = Arc::new(ProjectSlot::new(ProjectInstance::load(canonical_root)?));
-            let mut projects = self.projects.write();
-            let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
-            slot.metadata.write().session_ids.insert(session_id.clone());
-            break slot;
-        };
+        let slot = self.ensure_project_slot_for_session(&session_id, project_id, canonical_root)?;
 
         // The session id pins the winning slot before activation begins, so close
         // cannot reap it while watcher startup runs outside the registry lock.
@@ -998,11 +1006,16 @@ impl DaemonState {
         // / `remaining_sessions` / `project_removed` describe the session's ACTIVE
         // project (its primary association), preserving the wire contract; sibling
         // additive projects are reaped silently.
-        let active_project_id = self
-            .sessions
-            .read()
-            .get(session_id)
-            .map(|s| s.active_project_id.clone());
+        // Remove the session record FIRST so a concurrent additive open observes
+        // the session as gone and undoes its own attach (recovered finding #16);
+        // the membership sweep below then cannot miss a join recorded after the
+        // sweep ran. The record — critically its `working_set`, which holds the
+        // `Arc<IndexBase>` clones — is dropped BEFORE the GC below, or the bases
+        // would never look orphaned.
+        let session = self.sessions.write().remove(session_id)?;
+        let active_project_id = Some(session.active_project_id.clone());
+        let closed_session_id = session.session_id.clone();
+        drop(session);
 
         let mut active_remaining = 0usize;
         let mut active_removed = false;
@@ -1045,15 +1058,6 @@ impl DaemonState {
         for slot in removed_slots {
             slot.stop();
         }
-
-        let session = self.sessions.write().remove(session_id)?;
-        // Take only what the response needs, then DROP the rest of the session —
-        // critically its `working_set`, which holds the `Arc<IndexBase>` clones.
-        // The GC below relies on those being released first; keeping `session`
-        // live across the sweep would keep its bases at strong_count >= 2 and
-        // defeat the reclaim (the base would never look orphaned).
-        let closed_session_id = session.session_id.clone();
-        drop(session);
 
         // If this was the last session on a BaseKey, that map value is now a
         // map-only orphan (strong_count == 1) — the same unbounded-growth defect
@@ -1156,9 +1160,7 @@ impl DaemonState {
         // Fail-closed daemon auth is now in force: the daemon ALWAYS establishes
         // a token at startup and `authorize_daemon_request` rejects any caller
         // that does not present it, so this route (like every authenticated
-        // route) is unreachable by an unauthenticated local process. The
-        // ambient-authority surface is closed. See `establish_daemon_auth_token`
-        // / `write_daemon_token_file` / `authorize_daemon_request`.
+        // route) is unreachable by an unauthenticated local process.
         //
         // Trust boundary: refuse sensitive system paths before any reload/IO.
         // The local `tools::index_folder` already guards this; the daemon path
@@ -1174,208 +1176,124 @@ impl DaemonState {
         }
         let target_project_id = project_key(&target_root);
 
-        // Feature 012 (Phase 2): ADDITIVE open. A NEW code path, distinct from
-        // the destructive `needs_reassign` retarget below: it adds `target_root`
-        // as a SECOND project in the session's working set (intern its base, join
-        // `session_ids` additively, `working_set.add(..)`) WITHOUT evicting the
-        // current project or changing `active_project_id`. This is what enables
-        // cross-project reads (Phase 3). No overlay is written (invariant).
-        if input.add == Some(true) {
-            return self.index_folder_additive(session_id, &target_project_id, &target_root);
-        }
-
-        let current_session_root = {
-            let project_id = self
+        // Immutable home: `index_folder` NEVER retargets the session. The
+        // omitted-`add` default and the compatibility spelling `add=true` share
+        // this ONE canonical open contract — open/refresh `target_root` as a
+        // working-set project while unqualified reads stay bound to the home
+        // project. The `add` spelling is deliberately NOT part of the canonical
+        // idempotency request, so both spellings replay each other.
+        //
+        // The durable replay ledger lives in the HOME project's `.symforge`
+        // store: home is immutable for the session's lifetime, so one stable
+        // store observes every open the session performs, which is what makes
+        // same-key/different-target conflicts detectable BEFORE the conflicting
+        // project is loaded.
+        let home_root = {
+            let home_project_id = self
                 .sessions
                 .read()
                 .get(session_id)
                 .map(|session| session.active_project_id.clone())
                 .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
-            let slot = self.projects.read().get(&project_id).cloned();
+            let slot = self.projects.read().get(&home_project_id).cloned();
             slot.map(|slot| slot.metadata.read().canonical_root.clone())
         };
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
         let idempotency = match input.idempotency_key.as_deref() {
-            Some(raw_key) => match crate::idempotency::begin_index_folder_replay(
-                &target_root,
-                current_session_root.as_deref(),
-                &target_root,
-                raw_key,
-                reset_requested,
-            ) {
-                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
-                Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
-                Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
-            },
+            Some(raw_key) => {
+                let store_root = home_root.as_deref().unwrap_or(&target_root);
+                match crate::idempotency::begin_index_folder_replay(
+                    store_root,
+                    None,
+                    &target_root,
+                    raw_key,
+                    reset_requested,
+                ) {
+                    Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
+                    Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
+                    Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
+                }
+            }
             None => None,
         };
 
-        let current_project_id = self
-            .sessions
-            .read()
-            .get(session_id)
-            .map(|session| session.active_project_id.clone())
-            .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
-        let needs_reassign = current_project_id != target_project_id;
-        let mut target_slot = self.load_project_slot(&target_project_id, &target_root)?;
-        let mut removed_old = None;
-        if needs_reassign {
-            {
-                let mut projects = self.projects.write();
-                target_slot = Arc::clone(
-                    projects
-                        .entry(target_project_id.clone())
-                        .or_insert_with(|| Arc::clone(&target_slot)),
-                );
-                target_slot
-                    .metadata
-                    .write()
-                    .session_ids
-                    .insert(session_id.to_string());
-                let remove_current = projects
-                    .get(&current_project_id)
-                    .map(|slot| {
-                        let mut project = slot.metadata.write();
-                        project.session_ids.remove(session_id);
-                        project.session_ids.is_empty()
-                    })
-                    .unwrap_or(false);
-                if remove_current {
-                    removed_old = projects.remove(&current_project_id);
+        match self.open_project_for_session(session_id, &target_project_id, &target_root) {
+            Ok(mut output) => {
+                if let Some(idempotency) = &idempotency
+                    && let Err(error) = idempotency.complete(output.clone())
+                {
+                    output.push_str(&format!(
+                        "\nIdempotency warning: failed to store replay result: {error}"
+                    ));
                 }
+                Ok(output)
             }
-            target_slot.activate();
-            if let Some(slot) = removed_old {
-                slot.stop();
-            }
-        }
-
-        let reload_result = target_slot
-            .reload(&target_root)
-            .map(|(files, symbols)| (files, symbols, needs_reassign));
-
-        let (file_count, symbol_count, needs_reassign) = match reload_result {
-            Ok(counts) => counts,
             Err(error) => {
                 if let Some(idempotency) = &idempotency {
                     let _ = idempotency.fail(format!("Index failed: {error}"));
                 }
-                return Err(error);
-            }
-        };
-
-        // Update the session only after project mutation and reload are complete;
-        // no registry or metadata guard is held here.
-        if needs_reassign {
-            // Feature 012 (Phase 2) — CLOSE THE RETARGET SEAM. Phase 0/1 updated
-            // ONLY `active_project_id`, leaving the seeded `working_set` entry
-            // pointing at the pre-retarget (now-evicted) project, so the working
-            // set was inconsistent with the active project. Now that Phase 3
-            // reads the working set, re-seed it: swap the OLD active entry for the
-            // freshly retargeted project + its interned base + a fresh EMPTY
-            // overlay. Additively-opened sibling projects (if any) are left
-            // intact — retarget only swaps the ACTIVE slot. The base is interned
-            // FIRST, holding no session lock (`intern_base_for_project` takes
-            // `projects` then `bases` with no overlap), then applied under
-            // `sessions.write()`. No overlay is written (invariant).
-            let new_base = self.intern_base_for_project(&target_project_id);
-            let new_server = self
-                .projects
-                .read()
-                .get(&target_project_id)
-                .map(|slot| slot.server_for_session());
-            if let Some(session) = self.sessions.write().get_mut(session_id) {
-                let old_active =
-                    std::mem::replace(&mut session.active_project_id, target_project_id.clone());
-                if let Some(base) = new_base {
-                    let mut working_set = session.working_set.write();
-                    // Drop the stale active entry (its project was evicted on the
-                    // retarget) before adding the new active project. If `add`
-                    // already holds an entry for `target_project_id` (an additive
-                    // open that we are now promoting to active), it is replaced
-                    // with a fresh overlay — still single-overlay, still empty.
-                    if old_active != target_project_id {
-                        working_set.remove(&old_active);
-                    }
-                    working_set.add(target_project_id.clone(), base);
-                }
-                if let Some(server) = new_server {
-                    session
-                        .servers
-                        .entry(target_project_id.clone())
-                        .or_insert(server);
-                }
-                session
-                    .last_seen_at
-                    .store(now_epoch_millis(), Ordering::Relaxed);
+                Err(error)
             }
         }
-
-        let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
-        if let Some(idempotency) = &idempotency
-            && let Err(error) = idempotency.complete(output.clone())
-        {
-            output.push_str(&format!(
-                "\nIdempotency warning: failed to store replay result: {error}"
-            ));
-        }
-        Ok(output)
     }
 
-    /// Feature 012 (Phase 2): the ADDITIVE `index_folder(add:true)` code path.
+    /// The ONE canonical daemon open path behind `index_folder` (immutable
+    /// home): opens/refreshes `target_root` as a working-set project WITHOUT
+    /// touching `active_project_id`. Both the omitted-`add` default and the
+    /// compatibility spelling `add=true` land here.
     ///
-    /// Opens `target_root` as an ADDITIONAL project in `session_id`'s working set
-    /// without retargeting: the session keeps its active project and gains this
-    /// one, so a later cross-project read can target both. Concretely it
-    /// (1) loads+activates the target project if not already loaded and joins the
-    /// session to it additively (no evict, no `active_project_id` change), then
-    /// (2) interns the target base and `working_set.add(..)`s it with a fresh
-    /// EMPTY overlay. Re-adding an already-open project re-indexes it and refreshes
-    /// its working-set entry (fresh empty overlay) — idempotent at the open level.
+    /// Steps:
+    /// 1. ensure + join the authoritative project slot — session membership is
+    ///    recorded under the same `projects` write lock that proves the slot is
+    ///    the map's current entry, so concurrent cleanup cannot remove the slot
+    ///    and orphan the join;
+    /// 2. activate and reload through the slot's mutation lane (same-project
+    ///    reads keep serving the previously published generation);
+    /// 3. persist the successfully published generation as an atomic snapshot —
+    ///    a snapshot failure does NOT roll back the in-memory open, it degrades
+    ///    the checkpoint receipt and leaves any prior valid snapshot in place;
+    /// 4. attach the project to the session working set with a freshly interned
+    ///    base (fresh EMPTY overlay — the no-overlay-writes invariant holds).
     ///
-    /// LOCK ORDER (`bases -> projects -> sessions`): the `projects` write guard is
-    /// fully released before `intern_base_for_project` (which takes `projects`
-    /// then `bases` with no overlap) and before `sessions.write()`. No overlay is
-    /// written (invariant). No idempotency-key replay here — additive opens are
-    /// not part of the retarget replay ledger.
-    fn index_folder_additive(
+    /// LOCK ORDER (`bases -> projects -> sessions`) is preserved: the reload and
+    /// checkpoint run with no registry lock held; the attach helper interns the
+    /// base first, then takes `projects`/`sessions` without overlap.
+    fn open_project_for_session(
         &self,
         session_id: &str,
         target_project_id: &str,
         target_root: &Path,
     ) -> anyhow::Result<String> {
-        if !self.sessions.read().contains_key(session_id) {
-            return Err(anyhow::anyhow!("unknown session '{session_id}'"));
-        }
-        let mut target_slot = self.load_project_slot(target_project_id, target_root)?;
-        {
-            let mut projects = self.projects.write();
-            target_slot = Arc::clone(
-                projects
-                    .entry(target_project_id.to_string())
-                    .or_insert_with(|| Arc::clone(&target_slot)),
-            );
-            target_slot
-                .metadata
-                .write()
-                .session_ids
-                .insert(session_id.to_string());
-        }
+        let target_slot =
+            self.ensure_project_slot_for_session(session_id, target_project_id, target_root)?;
         target_slot.activate();
         let (file_count, symbol_count) = target_slot.reload(target_root)?;
 
-        // (2) Attach the freshly-indexed project to the session's working set
-        // (intern base under `bases`, join session_ids, add a fresh EMPTY overlay)
-        // via the shared `add_project_to_session` helper — same lock order, one
-        // implementation of the attach step.
+        // Persist the published generation. `checkpoint_shared_index` writes via
+        // unique-temp + atomic rename, so a failure here cannot corrupt or drop
+        // the prior valid snapshot — report the degraded outcome honestly.
+        let index = Arc::clone(&target_slot.metadata.read().index);
+        let checkpoint =
+            match crate::live_index::persist::checkpoint_shared_index(&index, target_root) {
+                Ok(_) => "checkpoint=written".to_string(),
+                Err(error) => format!("checkpoint=degraded: {error}"),
+            };
+
         if !self.add_project_to_session(session_id, target_project_id) {
             return Err(anyhow::anyhow!(
-                "failed to attach project to session working set after additive load"
+                "session '{session_id}' closed before the opened project could be attached"
             ));
         }
 
+        let (project_name, root_text) = {
+            let project = target_slot.metadata.read();
+            (
+                project.project_name.clone(),
+                normalized_path_string(&project.canonical_root),
+            )
+        };
         Ok(format!(
-            "Indexed {file_count} files, {symbol_count} symbols (added to working set)."
+            "Indexed {file_count} files, {symbol_count} symbols (added to working set).\nproject_id={target_project_id} project_name={project_name} root={root_text} {checkpoint}"
         ))
     }
 
@@ -1384,6 +1302,14 @@ impl DaemonState {
     /// the project is unknown. The base is interned FIRST (no session lock held)
     /// to preserve the `bases -> projects -> sessions` order; a fresh EMPTY overlay
     /// is attached (no overlay write). Idempotent: re-adding refreshes the entry.
+    ///
+    /// Two lifecycle hardenings (recovered findings #14/#16):
+    /// - a session-local server whose `SharedIndex` no longer matches the slot's
+    ///   current index (the project was evicted and re-loaded since) is REPLACED,
+    ///   never reused — a stale server would silently serve a dead index;
+    /// - if the session closed while the attach was in flight, the membership
+    ///   join is undone (and the slot reaped if that was its last session), so a
+    ///   closed session cannot pin a project forever.
     fn add_project_to_session(&self, session_id: &str, project_id: &str) -> bool {
         let Some(base) = self.intern_base_for_project(project_id) else {
             return false;
@@ -1396,16 +1322,21 @@ impl DaemonState {
             Arc::clone(slot)
         };
         let server = slot.server_for_session();
+        let slot_index = Arc::clone(&slot.metadata.read().index);
         slot.metadata
             .write()
             .session_ids
             .insert(session_id.to_string());
-        match self.sessions.write().get_mut(session_id) {
+        let attached = match self.sessions.write().get_mut(session_id) {
             Some(session) => {
-                session
+                let replace_server = session
                     .servers
-                    .entry(project_id.to_string())
-                    .or_insert(server);
+                    .get(project_id)
+                    .map(|existing| !Arc::ptr_eq(&existing.index, &slot_index))
+                    .unwrap_or(true);
+                if replace_server {
+                    session.servers.insert(project_id.to_string(), server);
+                }
                 session
                     .working_set
                     .write()
@@ -1413,6 +1344,35 @@ impl DaemonState {
                 true
             }
             None => false,
+        };
+        if !attached {
+            self.detach_project_membership(session_id, project_id);
+        }
+        attached
+    }
+
+    /// Remove `session_id` from `project_id`'s membership set, reaping the slot
+    /// when that membership was its last. Used to undo an attach that raced a
+    /// session close (recovered finding #16); safe to call when either side is
+    /// already gone.
+    fn detach_project_membership(&self, session_id: &str, project_id: &str) {
+        let removed = {
+            let mut projects = self.projects.write();
+            let Some(slot) = projects.get(project_id).cloned() else {
+                return;
+            };
+            let mut project = slot.metadata.write();
+            project.session_ids.remove(session_id);
+            let empty = project.session_ids.is_empty();
+            drop(project);
+            if empty {
+                projects.remove(project_id)
+            } else {
+                None
+            }
+        };
+        if let Some(slot) = removed {
+            slot.stop();
         }
     }
 
@@ -8313,14 +8273,29 @@ mod tests {
         .expect("write other source");
 
         let home_root = canonical_project_root(project_a.path()).expect("canonical home A");
+        // Hermetic unreachable endpoint: bind an ephemeral port, then release it.
+        // Nothing is listening there afterwards, so the proxy call fails fast and
+        // deterministically — no assumption that a fixed port (e.g. 1) is free.
+        let dead_port = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral probe port");
+            listener.local_addr().expect("probe port local addr").port()
+        };
         let client = DaemonSessionClient::new_for_test(
-            "http://127.0.0.1:1".to_string(),
+            format!("http://127.0.0.1:{dead_port}"),
             project_key(&home_root),
             "unreachable-session".to_string(),
             "home-a".to_string(),
         )
         .with_project_root(home_root.clone());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+        // Mark the daemon connection as already degraded so `proxy_tool_call`
+        // fails over immediately instead of entering the reconnect path, which
+        // would try to discover or SPAWN a real daemon — the opposite of a
+        // hermetic unit test.
+        server
+            .daemon_degraded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         server
             .index
             .reload(&home_root)
@@ -8714,6 +8689,69 @@ mod tests {
         );
         assert_eq!(guard.file_count(), 1);
         assert!(guard.get_file("src/restored.rs").is_some());
+    }
+
+    /// Snapshot persistence failure must NOT fail the open: the in-memory
+    /// generation stays published and attached, and the receipt reports the
+    /// degraded checkpoint outcome honestly instead of claiming `written`.
+    #[test]
+    fn test_index_folder_open_reports_degraded_checkpoint_on_snapshot_failure() {
+        let project_a = project_dir("symforge-degraded-home-a");
+        let project_b = project_dir("symforge-degraded-open-b");
+        std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
+            .expect("write source b");
+        // Block snapshot persistence: a FILE at `.symforge` makes the snapshot
+        // directory creation fail while indexing itself is unaffected.
+        std::fs::write(project_b.path().join(".symforge"), "not a directory")
+            .expect("write .symforge blocker");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "degraded-checkpoint".to_string(),
+                pid: None,
+            })
+            .expect("open home A");
+
+        let receipt = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: project_b.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                },
+            )
+            .expect("open B must succeed despite checkpoint failure");
+        assert!(
+            receipt.starts_with("Indexed "),
+            "open itself must succeed: {receipt}"
+        );
+        assert!(
+            receipt.contains("checkpoint=degraded"),
+            "snapshot failure must surface a degraded checkpoint outcome: {receipt}"
+        );
+        assert!(
+            !receipt.contains("checkpoint=written"),
+            "degraded checkpoint must not claim a durable write: {receipt}"
+        );
+
+        // The in-memory open stayed published: B is attached to the working set
+        // and home A is untouched.
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+        let sessions = state.sessions.read();
+        let session = sessions.get(&opened.session_id).expect("session");
+        assert_eq!(session.active_project_id, opened.project_id, "home stays A");
+        assert!(
+            session.working_set.read().get(&project_b_id).is_some(),
+            "B must be attached despite the degraded checkpoint"
+        );
+        // No snapshot artifact was fabricated behind the failure.
+        assert!(
+            project_b.path().join(".symforge").is_file(),
+            "the blocking file must remain in place (no destructive recovery)"
+        );
     }
 
     #[tokio::test]

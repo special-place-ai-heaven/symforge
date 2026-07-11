@@ -374,7 +374,7 @@ cd E:\project\symforge
   artifacts in Task 12.
 - [x] Replace inline daemon project instances with per-project slots and
   partition per-session protocol/cache state.
-- [ ] Make daemon home immutable and `index_folder` additive/persistent.
+- [x] Make daemon home immutable and `index_folder` additive/persistent.
 - [ ] Route read, guidance, compact, and structural-edit tools explicitly by
   project.
 - [x] Replace the global snapshot write lock with same-path serialization.
@@ -414,6 +414,35 @@ cd E:\project\symforge
 - Integrated verification after all three slices: `cargo fmt --check`,
   `cargo check`, `cargo clippy --lib -- -D warnings`, and the full library suite
   passed (`2709 passed; 0 failed; 2 ignored`).
+- Immutable-home/additive `index_folder` (2026-07-11, resumed on
+  `C:\AI_STUFF\PROGRAMMING\symforge`): destructive retarget removed;
+  `open_project_for_session` is the one canonical open path for omitted `add`
+  and `add=true` (shared durable idempotency ledger stored under the HOME
+  project so same-key/different-target conflicts reject before load); reload
+  persists an atomic snapshot with `checkpoint=written` / honest
+  `checkpoint=degraded: ...` receipts; proxy success no longer resets
+  local home fallback; daemon-proxy failure refuses destructive local
+  fallback; stale per-session server replaced via `Arc::ptr_eq` index
+  identity; slot cleanup/reinsertion closed by `ensure_project_slot_for_session`
+  (join under authoritative registry write lock, reused by session open);
+  session-close attach race closed (close removes the session record first,
+  `add_project_to_session` undoes the join via `detach_project_membership`);
+  proxy-failure test made hermetic (ephemeral bound-then-released port +
+  pre-degraded flag, no port-1 assumption, no reconnect autospawn); new
+  checkpoint-failure coverage
+  (`test_index_folder_open_reports_degraded_checkpoint_on_snapshot_failure`).
+  Receipts: `cargo test --lib daemon::tests::test_index_folder -- --test-threads=1`
+  = 10 passed / 0 failed; `cargo test --lib daemon:: -- --test-threads=1` =
+  72 passed / 0 failed; full `cargo test --lib -- --test-threads=1` =
+  2714 passed / 5 failed — the 5 failures are exactly the still-red watcher
+  generated-output fixtures owned by the next slice; `cargo clippy --lib -- -D
+  warnings`, `cargo fmt --check`, `git diff --check` all exit 0.
+- New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
+  on a conflict-markered Rust file reported `Completeness: full` with a symbol
+  count in the header while rendering no outline entries (only the tail of the
+  next-steps list) under `max_tokens=3000` — either the partial-parse path drops
+  the outline while stamping `full`, or budget trimming fails to downgrade
+  completeness to `budget-limited`. Needs a red fixture before the final gate.
 
 ## Review
 
