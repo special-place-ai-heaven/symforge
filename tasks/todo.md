@@ -677,12 +677,22 @@ cd E:\project\symforge
   `test_binary_sniff_forgives_multibyte_cut_at_window_boundary` +
   `test_binary_sniff_still_detects_interior_invalid_utf8`; discovery 74,
   watcher 38, store 62 passed; clippy/fmt clean.
-- New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
-  on a conflict-markered Rust file reported `Completeness: full` with a symbol
-  count in the header while rendering no outline entries (only the tail of the
-  next-steps list) under `max_tokens=3000` — either the partial-parse path drops
-  the outline while stamping `full`, or budget trimming fails to downgrade
-  completeness to `budget-limited`. Needs a red fixture before the final gate.
+- get_file_context completeness lie FIXED (2026-07-11): the sidecar stamps the
+  trust envelope (incl. `Completeness: full`) BEFORE `get_file_context` runs a
+  SECOND budget pass (`enforce_token_budget`) over envelope+body+footer with
+  the same byte cap — a body that just fit the sidecar budget was tail-cut
+  after the claim (window exists when the outline symbol cap doesn't fire,
+  i.e. ≤25 symbols; proven red at max_tokens=72 on an 8-symbol fixture). Fix:
+  `enforce_token_budget_flagged` reports the cut and
+  `downgrade_full_completeness_after_truncation` rewrites the stamped claim
+  (both compact `Trust:` and expanded `Completeness:` envelope forms) to
+  `budget-limited (was: ...)`. Receipts: red→green boundary-sweep
+  `test_get_file_context_never_claims_full_after_post_assembly_truncation`
+  (max_tokens 40..=400); get_file_context 10, format 198, sidecar 109 passed;
+  clippy/fmt/diff-check clean; full-suite receipt pending. Note: the original
+  observation's "only next-steps tail visible" shape was most likely the
+  CONSUMING harness's display truncation; the tool-side dishonesty window was
+  real regardless and is now closed.
 
 ## Review
 

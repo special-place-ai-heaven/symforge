@@ -4462,8 +4462,17 @@ impl SymForgeServer {
                 }
                 let body = result;
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let mut output =
-                    format::enforce_token_budget(format!("{body}{footer}"), context_max_tokens);
+                let (mut output, truncated_after_assembly) = format::enforce_token_budget_flagged(
+                    format!("{body}{footer}"),
+                    context_max_tokens,
+                );
+                if truncated_after_assembly {
+                    // The sidecar stamped the trust envelope (possibly
+                    // `Completeness: full`) BEFORE this post-assembly cut —
+                    // downgrade the claim so the envelope stays honest
+                    // (dogfood 2026-07-11).
+                    output = format::downgrade_full_completeness_after_truncation(&output);
+                }
                 let tokens = (output.len() / 4) as u32;
                 let prior_dedup = if force_refresh {
                     self.session_context.prior_fetch_for_dedup(
@@ -13158,6 +13167,53 @@ mod tests {
             !result.contains("Used by") && !result.contains("Key references"),
             "large default should skip expensive dependent/reference sections: {result}"
         );
+    }
+
+    /// Dogfood 2026-07-11: the sidecar stamps the trust envelope (including
+    /// `Completeness: full`) BEFORE `get_file_context` runs its own
+    /// post-assembly `enforce_token_budget` pass over envelope+body+footer
+    /// with the same byte cap — so a body that just fit the sidecar's budget
+    /// was tail-truncated while the envelope still claimed `full`. Sweep
+    /// `max_tokens` across the assembly boundary and assert the claim is
+    /// downgraded whenever the final output was actually cut.
+    #[tokio::test]
+    async fn test_get_file_context_never_claims_full_after_post_assembly_truncation() {
+        let mut content = String::new();
+        let mut symbols = Vec::new();
+        // Few symbols on purpose: the outline symbol cap (min clamp 25) never
+        // fires, so the sidecar body legitimately reaches `full` right where
+        // the envelope+footer overhead pushes the ASSEMBLED output past the
+        // same byte cap — the exact dishonesty window.
+        for i in 0..8u32 {
+            let name = format!("symbol_{i:03}");
+            content.push_str(&format!("pub fn {name}() {{}}\n"));
+            symbols.push(make_symbol(&name, SymbolKind::Function, i, i));
+        }
+        let target_file = make_file("src/target.rs", content.as_bytes(), symbols);
+        let server = make_server(make_live_index_ready(vec![target_file]));
+
+        for max_tokens in (40u64..=400).step_by(2) {
+            let result = server
+                .get_file_context(Parameters(super::GetFileContextInput {
+                    project: None,
+                    path: "src/target.rs".to_string(),
+                    max_tokens: Some(max_tokens),
+                    force_refresh: Some(true), // bypass the repeat-read cache
+                    sections: Some(vec!["outline".to_string()]),
+                    estimate: None,
+                }))
+                .await;
+            let truncated_after_assembly = result.contains("Original output is ~");
+            let claims_full = result
+                .lines()
+                .take(6)
+                .any(|line| line.contains("| full") || line.contains("Completeness: full"));
+            assert!(
+                !(truncated_after_assembly && claims_full),
+                "max_tokens={max_tokens}: envelope claims full but the assembled output \
+                 was truncated after stamping:\n{result}"
+            );
+        }
     }
 
     #[tokio::test]
