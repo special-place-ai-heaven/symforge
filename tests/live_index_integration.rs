@@ -77,11 +77,45 @@ fn read_runtime(dir: &Path, stem: &str, ext: &str) -> Option<String> {
     read_trimmed(&sf.join(&tagged)).or_else(|| read_trimmed(&sf.join(format!("{stem}.{ext}"))))
 }
 
+/// Task 8: adapters now write one per-process JSON descriptor under
+/// `.symforge/sessions/` instead of the fixed port/pid/session files. Read
+/// the descriptor first; fall back to the legacy fixed files so the probe
+/// still understands records from older binaries.
+fn read_session_descriptor(dir: &Path) -> Option<(u16, Option<String>)> {
+    let sessions = dir.join(".symforge").join("sessions");
+    let os_tag = format!(".{}.json", std::env::consts::OS);
+    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("sidecar.") || !name.ends_with(&os_tag) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        let Some(port) = value["port"].as_u64() else {
+            continue;
+        };
+        let session = value["session_id"].as_str().map(str::to_string);
+        return Some((port as u16, session));
+    }
+    None
+}
+
 fn read_sidecar_port(dir: &Path) -> Option<u16> {
+    if let Some((port, _)) = read_session_descriptor(dir) {
+        return Some(port);
+    }
     read_runtime(dir, "sidecar", "port")?.parse().ok()
 }
 
 fn read_session_id(dir: &Path) -> Option<String> {
+    if let Some((_, session)) = read_session_descriptor(dir) {
+        return session;
+    }
     read_runtime(dir, "sidecar", "session")
 }
 

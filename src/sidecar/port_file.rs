@@ -121,6 +121,212 @@ fn read_pid_at(dir: &Path) -> io::Result<u32> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+// ── Per-adapter session descriptors (Task 8) ──────────────────────────────
+//
+// The fixed `sidecar.<os>.{port,pid,session}` files are a single slot: with
+// two adapters on one project root, the second overwrites the first and one
+// adapter's shutdown deletes the other's records. Each adapter now writes ONE
+// atomic JSON descriptor keyed by its own PID under `.symforge/sessions/`;
+// cleanup removes only the caller's descriptor, and readers scan the
+// directory, validate identity, and select the freshest LIVE record. The
+// fixed files remain as a read-compatible migration aid only — no longer
+// written.
+
+const SESSIONS_DIR: &str = "sessions";
+
+/// OS-tagged descriptor filename for one adapter process, e.g.
+/// `sidecar.12345.windows.json`.
+fn descriptor_file_name(pid: u32) -> String {
+    crate::paths::os_tagged_runtime_file_name(&format!("sidecar.{pid}"), "json")
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// One adapter/session runtime record (Task 8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionDescriptor {
+    /// Daemon session id when this adapter proxies a daemon session; `None`
+    /// for a purely local sidecar.
+    pub session_id: Option<String>,
+    /// The project root this adapter serves, for identity validation.
+    pub project_root: Option<String>,
+    pub pid: u32,
+    pub port: u16,
+    /// Heartbeat/update time; refreshed on every write.
+    pub updated_at_unix_secs: u64,
+}
+
+/// Write THIS process's descriptor atomically (temp + rename) under
+/// `<dir>/sessions/`. Idempotent: rewriting refreshes `updated_at`.
+pub(crate) fn write_descriptor_for_pid_at(
+    dir: &Path,
+    pid: u32,
+    port: u16,
+    session_id: Option<&str>,
+    project_root: Option<&Path>,
+) -> io::Result<()> {
+    let sessions = dir.join(SESSIONS_DIR);
+    std::fs::create_dir_all(&sessions)?;
+    let descriptor = SessionDescriptor {
+        session_id: session_id.map(str::to_string),
+        project_root: project_root.map(|root| root.display().to_string()),
+        pid,
+        port,
+        updated_at_unix_secs: now_unix_secs(),
+    };
+    let bytes = serde_json::to_vec_pretty(&descriptor)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let final_path = sessions.join(descriptor_file_name(pid));
+    let tmp_path = sessions.join(format!("{}.tmp", descriptor_file_name(pid)));
+    std::fs::write(&tmp_path, &bytes)?;
+    match std::fs::rename(&tmp_path, &final_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(error)
+        }
+    }
+}
+
+/// Public writer: this adapter's descriptor for `port`/`session_id` under the
+/// project's runtime `.symforge/` dir.
+pub fn write_session_descriptor(
+    port: u16,
+    session_id: Option<&str>,
+    project_root: Option<&Path>,
+) -> io::Result<()> {
+    let dir = ensure_symforge_dir(project_root)?;
+    write_descriptor_for_pid_at(&dir, std::process::id(), port, session_id, project_root)
+}
+
+/// Remove exactly one pid's descriptor. Never touches siblings.
+pub(crate) fn cleanup_descriptor_for_pid_at(dir: &Path, pid: u32) {
+    let _ = std::fs::remove_file(dir.join(SESSIONS_DIR).join(descriptor_file_name(pid)));
+    let _ = std::fs::remove_file(
+        dir.join(SESSIONS_DIR)
+            .join(format!("{}.tmp", descriptor_file_name(pid))),
+    );
+}
+
+/// Remove ONLY this process's descriptor (Task 8 contract: an adapter's
+/// shutdown can never delete or invalidate a sibling adapter's record).
+pub fn cleanup_own_descriptor(project_root: Option<&Path>) {
+    cleanup_descriptor_for_pid_at(&resolve_symforge_dir(project_root), std::process::id());
+}
+
+/// Same, against an explicit dir (panic hooks cannot rely on CWD).
+pub fn cleanup_own_descriptor_at(dir: &Path) {
+    cleanup_descriptor_for_pid_at(dir, std::process::id());
+}
+
+/// Remove descriptors whose port no longer answers — the update/repair path's
+/// stale-record hygiene. Live descriptors are untouched.
+pub fn cleanup_stale_descriptors_at(dir: &Path, bind_host: &str) {
+    for descriptor in read_descriptors_at(dir) {
+        let alive = sidecar_port_is_alive(bind_host, descriptor.port).unwrap_or(false);
+        if !alive {
+            cleanup_descriptor_for_pid_at(dir, descriptor.pid);
+        }
+    }
+}
+
+/// All parseable descriptors for THIS OS under `<dir>/sessions/`.
+fn read_descriptors_at(dir: &Path) -> Vec<SessionDescriptor> {
+    let os_tag = format!(".{}.json", std::env::consts::OS);
+    let mut descriptors = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir.join(SESSIONS_DIR)) else {
+        return descriptors;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("sidecar.") || !name.ends_with(&os_tag) {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(entry.path())
+            && let Ok(descriptor) = serde_json::from_str::<SessionDescriptor>(&contents)
+        {
+            descriptors.push(descriptor);
+        }
+    }
+    descriptors
+}
+
+/// Select the best descriptor for `dir`: identity-validated (a descriptor
+/// naming a DIFFERENT project root than this dir's project is rejected, never
+/// "last writer wins"), live port first, then freshest `updated_at`, with a
+/// stable smallest-pid tie break.
+fn select_descriptor_status(dir: &Path, bind_host: &str) -> Option<SidecarStatus> {
+    let expected_root = dir.parent().map(|parent| parent.display().to_string());
+    let mut candidates: Vec<(SessionDescriptor, bool)> = Vec::new();
+    let mut rejected = 0usize;
+    for descriptor in read_descriptors_at(dir) {
+        if let (Some(declared), Some(expected)) =
+            (descriptor.project_root.as_deref(), expected_root.as_deref())
+            && !same_root_identity(declared, expected)
+        {
+            rejected += 1;
+            continue;
+        }
+        let alive = sidecar_port_is_alive(bind_host, descriptor.port).unwrap_or(false);
+        candidates.push((descriptor, alive));
+    }
+    if candidates.is_empty() {
+        return (rejected > 0).then(|| SidecarStatus {
+            pid: None,
+            port: None,
+            liveness: SidecarLiveness::NoSidecar,
+            detail: Some(format!(
+                "{rejected} descriptor(s) rejected: project-root identity mismatch"
+            )),
+        });
+    }
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1) // alive first
+            .then(b.0.updated_at_unix_secs.cmp(&a.0.updated_at_unix_secs))
+            .then(a.0.pid.cmp(&b.0.pid))
+    });
+    let (best, alive) = &candidates[0];
+    Some(SidecarStatus {
+        pid: Some(best.pid),
+        port: Some(best.port),
+        liveness: if *alive {
+            SidecarLiveness::Alive
+        } else {
+            SidecarLiveness::Dead
+        },
+        detail: Some(format!(
+            "descriptor sidecar.{} ({} candidate(s){})",
+            best.pid,
+            candidates.len(),
+            if rejected > 0 {
+                format!(", {rejected} identity-rejected")
+            } else {
+                String::new()
+            }
+        )),
+    })
+}
+
+/// Case-tolerant, separator-tolerant root comparison (Windows paths).
+fn same_root_identity(a: &str, b: &str) -> bool {
+    let canon = |raw: &str| {
+        let normalized = raw.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            trimmed.to_lowercase()
+        } else {
+            trimmed
+        }
+    };
+    canon(a) == canon(b)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarLiveness {
     Alive,
@@ -184,6 +390,12 @@ fn sidecar_port_is_alive(bind_host: &str, port: u16) -> io::Result<bool> {
 }
 
 pub fn read_sidecar_status_at(symforge_dir: &Path, bind_host: &str) -> SidecarStatus {
+    // Task 8: per-adapter descriptors are authoritative; the fixed files below
+    // are only a read-compatible migration aid for records written by older
+    // binaries.
+    if let Some(status) = select_descriptor_status(symforge_dir, bind_host) {
+        return status;
+    }
     if !sidecar_files_exist(symforge_dir) {
         return SidecarStatus::no_sidecar();
     }
@@ -318,6 +530,91 @@ mod tests {
         drop(tmp);
         if let Err(e) = result {
             std::panic::resume_unwind(e);
+        }
+    }
+
+    /// Task 8 (recovered finding): closing one adapter must not delete or
+    /// invalidate a sibling adapter's runtime record on the same root.
+    #[test]
+    fn test_per_session_descriptors_do_not_delete_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        {
+            write_descriptor_for_pid_at(dir, 111, 40001, Some("session-a"), None)
+                .expect("write descriptor A");
+            write_descriptor_for_pid_at(dir, 222, 40002, Some("session-b"), None)
+                .expect("write descriptor B");
+            assert_eq!(read_descriptors_at(dir).len(), 2, "both descriptors exist");
+
+            cleanup_descriptor_for_pid_at(dir, 111);
+
+            let remaining = read_descriptors_at(dir);
+            assert_eq!(
+                remaining.len(),
+                1,
+                "only the caller's descriptor is removed"
+            );
+            assert_eq!(remaining[0].pid, 222, "sibling descriptor survives");
+            assert_eq!(remaining[0].session_id.as_deref(), Some("session-b"));
+        }
+    }
+
+    /// Task 8: the reader selects a LIVE descriptor over a fresher dead one,
+    /// and rejects a descriptor whose project-root identity does not match
+    /// this directory's project instead of choosing last-writer.
+    #[test]
+    fn test_reader_selects_live_descriptor_and_rejects_foreign_root() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        {
+            // A live port: keep the listener open for the duration.
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind live probe port");
+            let live_port = listener.local_addr().expect("live addr").port();
+            // A dead port: bind then release.
+            let dead_port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead port");
+                l.local_addr().expect("dead addr").port()
+            };
+
+            write_descriptor_for_pid_at(dir, 111, live_port, Some("session-live"), None)
+                .expect("write live descriptor");
+            write_descriptor_for_pid_at(dir, 222, dead_port, Some("session-dead"), None)
+                .expect("write dead descriptor");
+            // The dead one is FRESHER (rewrite bumps updated_at); force order by
+            // rewriting it after the live one.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            write_descriptor_for_pid_at(dir, 222, dead_port, Some("session-dead"), None)
+                .expect("refresh dead descriptor");
+
+            let status = read_sidecar_status_at(dir, "127.0.0.1");
+            assert_eq!(status.liveness, SidecarLiveness::Alive);
+            assert_eq!(
+                status.pid,
+                Some(111),
+                "live beats fresher-but-dead: {status:?}"
+            );
+            assert_eq!(status.port, Some(live_port));
+
+            // Identity validation: a descriptor claiming a DIFFERENT project
+            // root is rejected, not last-writer-selected.
+            cleanup_descriptor_for_pid_at(dir, 111);
+            cleanup_descriptor_for_pid_at(dir, 222);
+            write_descriptor_for_pid_at(
+                dir,
+                333,
+                live_port,
+                Some("session-foreign"),
+                Some(std::path::Path::new("/somewhere/else/entirely")),
+            )
+            .expect("write foreign descriptor");
+            let status = read_sidecar_status_at(dir, "127.0.0.1");
+            assert_ne!(
+                status.pid,
+                Some(333),
+                "foreign-root descriptor must be identity-rejected: {status:?}"
+            );
+            drop(listener);
         }
     }
 

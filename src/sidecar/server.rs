@@ -63,9 +63,10 @@ pub async fn spawn_sidecar(
     let listener = TcpListener::from_std(std_listener)?;
     let port = listener.local_addr()?.port();
 
-    // Write port and PID files so hook scripts can locate the sidecar.
-    port_file::write_port_file(port, repo_root.as_deref())?;
-    port_file::write_pid_file(std::process::id(), repo_root.as_deref())?;
+    // Task 8: one atomic per-adapter descriptor (no daemon session for a
+    // purely local sidecar) so hook scripts can locate this sidecar without
+    // clobbering a sibling's record.
+    port_file::write_session_descriptor(port, None, repo_root.as_deref())?;
 
     // Install panic hook to clean up port files if the process panics.
     let symforge_dir = crate::paths::select_runtime_data_base(
@@ -74,7 +75,7 @@ pub async fn spawn_sidecar(
     );
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        port_file::cleanup_files_at(&symforge_dir);
+        port_file::cleanup_own_descriptor_at(&symforge_dir);
         previous_hook(info);
     }));
 
@@ -112,9 +113,9 @@ pub async fn spawn_sidecar(
             tracing::error!("sidecar server error: {e}");
         }
 
-        // Clean up port/PID files after shutdown.
-        port_file::cleanup_files();
-        tracing::info!("sidecar shut down, port/PID files cleaned up");
+        // Task 8: remove ONLY this sidecar's descriptor after shutdown.
+        port_file::cleanup_own_descriptor(None);
+        tracing::info!("sidecar shut down, session descriptor cleaned up");
     });
 
     Ok(SidecarHandle {

@@ -254,10 +254,14 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
 
 async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> anyhow::Result<()> {
     if let Some(port) = session.port() {
-        let project_root = session.project_root();
-        sidecar::port_file::write_port_file(port, project_root)?;
-        sidecar::port_file::write_pid_file(std::process::id(), project_root)?;
-        sidecar::port_file::write_session_file(session.session_id(), project_root)?;
+        // Task 8: one atomic per-adapter descriptor instead of the fixed
+        // port/pid/session files — a second adapter on the same root can no
+        // longer be overwritten or deleted by this one.
+        sidecar::port_file::write_session_descriptor(
+            port,
+            Some(session.session_id()),
+            session.project_root(),
+        )?;
     }
 
     let heartbeat_client = session.clone();
@@ -320,7 +324,9 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
 
     heartbeat_task.abort();
     let _ = session.close().await;
-    sidecar::port_file::cleanup_files();
+    // Task 8: remove ONLY this adapter's descriptor; sibling adapters on the
+    // same root keep theirs.
+    sidecar::port_file::cleanup_own_descriptor(session.project_root());
     tracing::info!("daemon-backed MCP server shut down cleanly");
     Ok(())
 }

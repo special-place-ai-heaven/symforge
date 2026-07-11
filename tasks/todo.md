@@ -613,6 +613,23 @@ cd E:\project\symforge
   (fixtures excluded) and fails on any new raw `Command::new(` call site.
   Receipts: tripwire green; full `cargo test --all-targets -- --test-threads=1`
   = 0 failures; clippy/fmt clean; zero symforge processes after the suite.
+- Per-session runtime descriptors (2026-07-11, Task 8 part 2): each
+  adapter/sidecar now writes ONE atomic per-process OS-tagged JSON descriptor
+  (`.symforge/sessions/sidecar.<pid>.<os>.json` — session_id, project_root,
+  pid, port, updated_at) instead of the fixed sidecar.<os>.{port,pid,session}
+  files; shutdown/panic cleanup removes ONLY the caller's descriptor (sibling
+  adapters on one root can no longer be overwritten or deleted); the reader
+  (`read_sidecar_status_at`, shared by hook lookup and status surfaces) scans
+  descriptors first with identity validation (foreign project_root rejected,
+  never last-writer), live-port-first selection, freshest updated_at, stable
+  smallest-pid tie break, and falls back to the legacy fixed files as a
+  read-only migration aid; `symforge update` purges stale (dead-port)
+  descriptors. Two integration tests that pinned the fixed-file contract were
+  migrated to the descriptor contract. Receipts:
+  `test_per_session_descriptors_do_not_delete_siblings` +
+  `test_reader_selects_live_descriptor_and_rejects_foreign_root` green;
+  port_file suite 14 passed; full lib 2738 passed / 0 failed; full
+  all-targets 0 failures; clippy/fmt/diff-check clean; zero leaked processes.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels
