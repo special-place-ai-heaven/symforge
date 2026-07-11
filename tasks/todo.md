@@ -630,6 +630,22 @@ cd E:\project\symforge
   `test_reader_selects_live_descriptor_and_rejects_foreign_root` green;
   port_file suite 14 passed; full lib 2738 passed / 0 failed; full
   all-targets 0 failures; clippy/fmt/diff-check clean; zero leaked processes.
+- Guarded daemon start + TTL evidence (2026-07-11, Task 9 part 2): new
+  `guarded_daemon_start` seam (pub, `src/daemon.rs`) — acquire the start lock
+  with a bounded 10s wait, re-check for a live compatible daemon UNDER the
+  lock, stop an incompatible recorded daemon, then bind in-process; a live
+  daemon's runtime record is never overwritten. Foreground/service
+  `symforge daemon` (`run_daemon_until_shutdown`) now goes through the seam
+  and refuses with "already running on port N" instead of clobbering.
+  `ensure_daemon_running` drops the start lock immediately after
+  `spawn_daemon_process()` so the spawned child's guard can acquire it (the
+  old hold-through-wait would deadlock parent against child). Detailed status
+  inventory line now carries `ttl_secs=` next to `last_seen=` (reaper TTL
+  evidence). Receipts: new `tests/daemon_singleton.rs`
+  (`test_guarded_start_refuses_to_replace_live_daemon`,
+  `test_concurrent_guarded_starts_yield_one_daemon`) green; inventory test
+  extended with last_seen/ttl assertion, green; daemon lib suite 80 passed;
+  clippy/fmt clean; full all-targets suite receipt below.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

@@ -1713,9 +1713,10 @@ impl DaemonState {
             }
         }
         lines.push(format!(
-            "session={} last_seen={}",
+            "session={} last_seen={} ttl_secs={}",
             session.session_id,
-            unix_seconds(session.last_seen_at_time())
+            unix_seconds(session.last_seen_at_time()),
+            session_ttl_from_env().as_secs()
         ));
         Some(lines.join("\n"))
     }
@@ -2070,7 +2071,7 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         );
     }
 
-    if let Some(_lock) = try_acquire_start_lock()? {
+    if let Some(lock) = try_acquire_start_lock()? {
         if let Some(port) = daemon_port_if_compatible(&identity).await? {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
             return Ok(port);
@@ -2078,11 +2079,59 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         tracing::info!("acquired start lock, spawning new daemon");
         stop_incompatible_recorded_daemon(&identity).await?;
         spawn_daemon_process()?;
+        // Task 9: release the lock as soon as the child is spawned — the
+        // child's `guarded_daemon_start` acquires the SAME lock before
+        // binding, so holding it through `wait_for_daemon_ready` would
+        // deadlock parent (waiting for the child's port file) against child
+        // (waiting for the lock).
+        drop(lock);
         wait_for_daemon_ready(&identity).await
     } else {
         tracing::info!("start lock held by another process, waiting for daemon");
         wait_for_daemon_ready(&identity).await
     }
+}
+
+/// Outcome of [`guarded_daemon_start`].
+pub enum GuardedStart {
+    /// This process acquired the guard and bound the daemon.
+    Started(DaemonHandle),
+    /// A live compatible daemon already owns this `SYMFORGE_HOME`; its
+    /// runtime record was left untouched.
+    AlreadyRunning { port: u16 },
+}
+
+/// Task 9: the single safe way to BIND a daemon for the current
+/// `SYMFORGE_HOME`. Acquires the start lock (bounded wait), re-checks for a
+/// live compatible daemon UNDER the lock, stops an incompatible recorded
+/// daemon, and only then binds in the current process — so a foreground
+/// `symforge daemon` racing an auto-spawn (or another foreground start) can
+/// never overwrite a live daemon's runtime record.
+pub async fn guarded_daemon_start(bind_host: &str) -> anyhow::Result<GuardedStart> {
+    let identity = current_daemon_identity();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    let _lock = loop {
+        if let Some(port) = daemon_port_if_compatible(&identity).await? {
+            return Ok(GuardedStart::AlreadyRunning { port });
+        }
+        if let Some(lock) = try_acquire_start_lock()? {
+            break lock;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for the symforge daemon start lock; another start is in progress"
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    };
+    // Re-check under the lock: a racer may have bound between our probe and
+    // the acquisition.
+    if let Some(port) = daemon_port_if_compatible(&identity).await? {
+        return Ok(GuardedStart::AlreadyRunning { port });
+    }
+    stop_incompatible_recorded_daemon(&identity).await?;
+    let handle = spawn_daemon(bind_host).await?;
+    Ok(GuardedStart::Started(handle))
 }
 
 async fn daemon_port_if_compatible(identity: &DaemonIdentity) -> anyhow::Result<Option<u16>> {
@@ -2968,7 +3017,16 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
 }
 
 pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
-    let handle = spawn_daemon(bind_host).await?;
+    // Task 9: foreground/service starts go through the guarded seam so they
+    // can never clobber a live daemon's runtime record.
+    let handle = match guarded_daemon_start(bind_host).await? {
+        GuardedStart::Started(handle) => handle,
+        GuardedStart::AlreadyRunning { port } => {
+            anyhow::bail!(
+                "a compatible symforge daemon is already running on port {port}; not starting a second one"
+            );
+        }
+    };
     tracing::info!(port = handle.port, "shared daemon started");
     // Wait for either SIGINT (Ctrl+C) or SIGTERM (kill, systemd, containers).
     // Both trigger the same graceful shutdown path.
@@ -8822,6 +8880,10 @@ mod tests {
         assert!(
             inventory.contains("snapshot=present") || inventory.contains("snapshot=absent"),
             "inventory rows must carry snapshot evidence: {inventory}"
+        );
+        assert!(
+            inventory.contains("last_seen=") && inventory.contains("ttl_secs="),
+            "inventory must expose session last-seen and reaper TTL evidence: {inventory}"
         );
 
         let health_multi = client
