@@ -6800,6 +6800,15 @@ impl SymForgeServer {
             // NEVER retargets this connection. The bound `repo_root` and any
             // local home-fallback state in `self.index` stay exactly as they
             // are — unqualified reads remain bound to home.
+            //
+            // Task 8: remember the successfully opened sibling root so a
+            // reconnect can restore the whole working set.
+            if result.starts_with("Indexed ")
+                && let Some(daemon_lock) = self.daemon_client.as_ref()
+                && let Ok(root) = std::path::Path::new(&params.0.path).canonicalize()
+            {
+                daemon_lock.read().await.record_opened_root(root);
+            }
             return result;
         }
         if self.daemon_client.is_some() {

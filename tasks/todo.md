@@ -569,6 +569,38 @@ cd E:\project\symforge
   `protocol::tools::tests::test_local_tool_meta_carries_project_evidence` =
   2 passed; full lib 2733 passed / 0 failed; full all-targets suite 0
   failures; clippy/fmt/diff-check clean.
+- INCIDENT + fix (2026-07-11, CRITICAL): running the new reconnect test set
+  off an exponential process fork bomb that flooded the desktop with console
+  windows and made the machine unusable (user had to kill everything). Chain:
+  `reconnect` -> `ensure_daemon_running` -> `spawn_daemon_process` spawns
+  `current_exe()` with arg `daemon`; under `cargo test` that exe is the
+  libtest binary and `daemon` is a TEST FILTER, so each spawn re-ran the
+  daemon test subset, which spawned again; every subprocess those tests
+  launch from a console-less parent popped a new console window. Inner
+  trigger: tests waited on the LEGACY (untagged) daemon port file, which is
+  never written, so daemon 1's graceful-shutdown cleanup raced daemon 2 and
+  DELETED its fresh port+token files (production-relevant restart race:
+  clients went tokenless -> 401 -> "no daemon" -> auto-spawn). Fixes: (1)
+  `spawn_daemon_process` refuses under cfg(test), from any Cargo `deps/`
+  artifact, and under `SYMFORGE_DAEMON_AUTOSPAWN=off`; (2)
+  `ensure_daemon_running` fails fast with the same refusal instead of
+  waiting; (3) shutdown cleanup is now owner-checked
+  (`cleanup_daemon_runtime_files_if_owner` compares file contents to this
+  daemon's port/pid/token before deleting) so a successor's files survive;
+  (4) the Task-8 tests wait on the OS-TAGGED port file. Receipts:
+  `test_test_builds_never_auto_spawn_daemon_processes` pins both refusal
+  seams; `test_reconnect_reopens_home_and_working_set` = 1 passed (home id
+  verified, sibling B reopened + verified, unqualified reads still home);
+  daemon suite 80 passed / 0 failed; full lib 2735 passed / 0 failed; ZERO
+  symforge processes remain after the suite. Lesson recorded in
+  tasks/lessons.md.
+- Reconnect working-set restore (2026-07-11, Task 8 part 1):
+  `DaemonSessionClient` records additively-opened sibling roots (shared,
+  deduplicated, order-preserving); `reconnect` verifies the home project id
+  is unchanged (fail closed), reopens every sibling, and verifies each
+  restores with its deterministic id before serving. REMAINING from Task 8:
+  per-adapter/session runtime descriptors replacing the fixed sidecar
+  port/pid/session files + hook lookup freshest-healthy selection.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

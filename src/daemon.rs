@@ -137,6 +137,11 @@ pub struct DaemonSessionClient {
     project_id: String,
     session_id: String,
     project_name: String,
+    /// Task 8: roots of projects this connection successfully opened
+    /// ADDITIVELY (beyond the immutable home in `project_root`). Ordered,
+    /// deduplicated, shared across clones so a reconnect can reopen the
+    /// whole working set and verify deterministic IDs before serving.
+    opened_roots: std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>,
     auth_token: Option<String>,
     /// Stored so reconnection can re-open a session at the same project root.
     project_root: Option<PathBuf>,
@@ -643,6 +648,12 @@ impl DaemonState {
     /// file is the one the state enforces.
     pub fn new() -> Self {
         Self::with_token(establish_daemon_auth_token())
+    }
+
+    /// The token this daemon enforces — used by the owner-checked shutdown
+    /// cleanup to prove a runtime file still belongs to this daemon.
+    fn auth_token_for_cleanup(&self) -> String {
+        self.auth_token.clone()
     }
 
     /// Construct daemon state bound to a specific, already-established token.
@@ -1776,12 +1787,27 @@ impl DaemonSessionClient {
             project_name,
             auth_token,
             project_root: None,
+            opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
     fn with_project_root(mut self, root: PathBuf) -> Self {
         self.project_root = Some(root);
         self
+    }
+
+    /// Task 8: remember a sibling root this connection opened additively so
+    /// a reconnect can restore the full working set. Home is never recorded
+    /// here (it lives in the immutable `project_root`). Deduplicated, order
+    /// preserved.
+    pub(crate) fn record_opened_root(&self, root: PathBuf) {
+        if self.project_root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        let mut roots = self.opened_roots.lock();
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
     }
 
     #[cfg(test)]
@@ -1846,7 +1872,48 @@ impl DaemonSessionClient {
         );
         let new_client =
             connect_or_spawn_session(project_root, "mcp-stdio", Some(std::process::id())).await?;
-        Ok(new_client.with_project_root(project_root.to_path_buf()))
+        let new_client = new_client.with_project_root(project_root.to_path_buf());
+
+        // Task 8: home is immutable across reconnects — the fresh session
+        // must resolve to the SAME deterministic project id, or something
+        // rebound the identity underneath us. Fail closed instead of serving
+        // a different project as "home".
+        if let Ok(canonical_home) = canonical_project_root(project_root) {
+            let expected_home = project_key(&canonical_home);
+            anyhow::ensure!(
+                new_client.project_id == expected_home,
+                "reconnect produced a different home project id (expected {expected_home}, got {}); refusing to serve",
+                new_client.project_id
+            );
+        }
+
+        // Reopen every additively-opened sibling and verify each restores
+        // with its deterministic id. A sibling that fails to reopen or
+        // verifies to a different id fails the whole reconnect (fail closed:
+        // a silently missing sibling would turn explicit reads into
+        // not-open errors, and a mismatched one would serve the wrong code).
+        let siblings: Vec<PathBuf> = self.opened_roots.lock().clone();
+        for root in &siblings {
+            let response = new_client
+                .call_tool_value(
+                    "index_folder",
+                    serde_json::json!({ "path": root.display().to_string() }),
+                )
+                .await
+                .with_context(|| {
+                    format!("reconnect failed to reopen sibling {}", root.display())
+                })?;
+            let expected = canonical_project_root(root).map(|c| project_key(&c));
+            if let Ok(expected) = expected {
+                anyhow::ensure!(
+                    response.contains(&format!("project_id={expected}")),
+                    "reconnect reopened sibling {} with an unexpected identity; refusing to serve (receipt: {response})",
+                    root.display()
+                );
+            }
+            new_client.record_opened_root(root.clone());
+        }
+        Ok(new_client)
     }
 
     pub async fn call_tool_value(
@@ -1991,6 +2058,16 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
     if let Some(port) = daemon_port_if_compatible(&identity).await? {
         tracing::debug!("daemon already running on port {port}");
         return Ok(port);
+    }
+
+    // INCIDENT GUARD (2026-07-11): when auto-spawn cannot happen (test
+    // build, deps/ artifact, or operator kill-switch), fail fast HERE with a
+    // clear error instead of acquiring the start lock and waiting for a
+    // daemon that nothing is allowed to start.
+    if cfg!(test) || daemon_autospawn_disabled() {
+        anyhow::bail!(
+            "no running compatible daemon found and auto-spawn is disabled (test build or {DAEMON_AUTOSPAWN_ENV}); start `symforge daemon` explicitly"
+        );
     }
 
     if let Some(_lock) = try_acquire_start_lock()? {
@@ -2301,8 +2378,54 @@ fn try_acquire_start_lock() -> anyhow::Result<Option<DaemonStartLock>> {
     }
 }
 
+/// Operator kill-switch for daemon auto-spawn: set
+/// `SYMFORGE_DAEMON_AUTOSPAWN=off` (or `0`/`false`/`no`) to make
+/// `ensure_daemon_running` connect-only — it will attach to an already
+/// running compatible daemon but never start one.
+pub const DAEMON_AUTOSPAWN_ENV: &str = "SYMFORGE_DAEMON_AUTOSPAWN";
+
+fn daemon_autospawn_disabled() -> bool {
+    std::env::var(DAEMON_AUTOSPAWN_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn spawn_daemon_process() -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("locating current symforge executable")?;
+    // INCIDENT GUARD (2026-07-11): under `cargo test`, `current_exe` is the
+    // libtest binary and the `daemon` argument below is interpreted as a TEST
+    // FILTER — spawning it recursively re-runs the daemon test subset, which
+    // spawns again: an exponential fork bomb whose child processes flood the
+    // desktop with console windows and steal focus. Three independent locks:
+    // (1) a test build refuses statically; (2) a binary living in a Cargo
+    // `deps/` directory (every test/bench artifact) refuses by path; (3) the
+    // operator kill-switch refuses by env. Production `symforge.exe` (durable
+    // install or `target/release/symforge.exe`) passes all three.
+    if cfg!(test) {
+        anyhow::bail!(
+            "refusing to auto-spawn a daemon from a test build; start `symforge daemon` explicitly"
+        );
+    }
+    if current_exe
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "deps")
+    {
+        anyhow::bail!(
+            "refusing to auto-spawn a daemon from a Cargo deps/ test artifact: {}",
+            current_exe.display()
+        );
+    }
+    if daemon_autospawn_disabled() {
+        anyhow::bail!(
+            "daemon auto-spawn disabled by {DAEMON_AUTOSPAWN_ENV}; start `symforge daemon` explicitly"
+        );
+    }
     let mut command = std::process::Command::new(current_exe);
     command
         .arg("daemon")
@@ -2796,6 +2919,7 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
     let app = build_router(Arc::clone(&state));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+    let owned_token = state.auth_token_for_cleanup();
     let server_task = tokio::spawn(async move {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
@@ -2808,7 +2932,8 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
             tracing::error!("daemon server error: {error}");
         }
 
-        cleanup_daemon_runtime_files();
+        // Owner-checked: never delete a successor daemon's fresh runtime files.
+        cleanup_daemon_runtime_files_if_owner(port, std::process::id(), &owned_token);
     });
 
     // Task 9: one daemon-owned bounded reaper. The interval is derived from
@@ -4311,6 +4436,39 @@ fn cleanup_daemon_files() {
     if let Ok(dir) = daemon_dir() {
         let _ = std::fs::remove_file(dir.join(daemon_start_lock_file_name()));
         let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_START_LOCK_FILE));
+    }
+}
+
+/// Shutdown-side cleanup that removes a runtime file ONLY when its content
+/// still identifies THIS daemon. A dying daemon's graceful shutdown can race a
+/// successor that already wrote fresh port/token/pid files into the same
+/// `daemon_dir()`; unconditional removal here deletes the successor's files,
+/// leaving clients tokenless (401) or daemon-less — the 2026-07-11 fork-bomb
+/// incident's inner trigger. Startup cleanup stays unconditional (there is no
+/// live owner to protect before the new files are written).
+fn cleanup_daemon_runtime_files_if_owner(port: u16, pid: u32, token: &str) {
+    if let Ok(dir) = daemon_dir() {
+        let owns = |path: &std::path::Path, expected: &str| {
+            std::fs::read_to_string(path)
+                .map(|contents| contents.trim() == expected)
+                .unwrap_or(false)
+        };
+        let port_path = dir.join(daemon_port_file_name());
+        if owns(&port_path, &port.to_string()) {
+            let _ = std::fs::remove_file(&port_path);
+        }
+        let pid_path = dir.join(daemon_pid_file_name());
+        if owns(&pid_path, &pid.to_string()) {
+            let _ = std::fs::remove_file(&pid_path);
+        }
+        let token_path = dir.join(daemon_token_file_name());
+        if owns(&token_path, token) {
+            let _ = std::fs::remove_file(&token_path);
+        }
+        // Legacy untagged names are never written by current builds; removing
+        // them can only clear stale artifacts.
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PORT_FILE));
+        let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_PID_FILE));
     }
 }
 
@@ -8223,6 +8381,133 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// INCIDENT GUARD (2026-07-11): a test build must NEVER auto-spawn a
+    /// daemon process — under `cargo test` the spawned `current_exe()` is the
+    /// libtest binary and the `daemon` argument is a test FILTER, so spawning
+    /// recursively re-runs the suite (exponential fork bomb, console-window
+    /// flood). This pins the refusal at both seams.
+    #[tokio::test]
+    async fn test_test_builds_never_auto_spawn_daemon_processes() {
+        let error = spawn_daemon_process().expect_err("test build must refuse to spawn");
+        assert!(
+            error.to_string().contains("test build"),
+            "refusal must name the test-build guard: {error}"
+        );
+
+        // ensure_daemon_running with no daemon reachable must fail fast with
+        // the same refusal instead of spawning or waiting on the start lock.
+        let _env_lock = env_lock().await;
+        let empty_home = TempDir::new().expect("empty home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", empty_home.path());
+        let error = ensure_daemon_running()
+            .await
+            .expect_err("no daemon + no spawn must error");
+        assert!(
+            error.to_string().contains("auto-spawn is disabled"),
+            "ensure_daemon_running must fail fast without spawning: {error}"
+        );
+    }
+
+    /// Task 8: after the daemon dies and a replacement comes up, the proxy
+    /// reconnect must restore the WHOLE working set — home A stays home (same
+    /// deterministic id) and additively-opened B is reopened and explicitly
+    /// routable with the same id — before any read is served.
+    #[tokio::test]
+    async fn test_reconnect_reopens_home_and_working_set() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-reconnect-home-a");
+        let project_b = project_dir("symforge-reconnect-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let first = spawn_daemon("127.0.0.1").await.expect("spawn first daemon");
+        let base_url = format!("http://127.0.0.1:{}", first.port);
+        let http = authed_client(&first);
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "reconnect".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(project_a.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        // Open B additively through the proxy so the sibling root is recorded.
+        let opened_b = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(opened_b.starts_with("Indexed "), "open B: {opened_b}");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        // Kill the first daemon and bring up a replacement on the SAME home.
+        // Wait on the OS-TAGGED port file — the one daemons actually write —
+        // so daemon 1's shutdown cleanup provably finished before daemon 2
+        // writes its own files (the untagged legacy name never exists, so
+        // waiting on it is a no-op that races the cleanup).
+        let _ = first.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(daemon_port_file_name())).await;
+        let second = spawn_daemon("127.0.0.1")
+            .await
+            .expect("spawn second daemon");
+
+        // A routed read through the stale proxy: the first attempt fails, the
+        // reconnect discovers the replacement, reopens home + B, verifies ids,
+        // and the retry serves B.
+        let map_b_input = serde_json::from_value(serde_json::json!({
+            "detail": "full",
+            "project": project_b_id,
+        }))
+        .expect("map input");
+        let map_b = server.get_repo_map(Parameters(map_b_input)).await;
+        assert!(
+            map_b.contains("new.rs") && !map_b.contains("old.rs"),
+            "explicit B must remain routable after reconnect: {map_b}"
+        );
+
+        // Unqualified reads still serve immutable home A.
+        let map_home_input =
+            serde_json::from_value(serde_json::json!({"detail": "full"})).expect("home input");
+        let map_home = server.get_repo_map(Parameters(map_home_input)).await;
+        assert!(
+            map_home.contains("old.rs") && !map_home.contains("new.rs"),
+            "home must survive reconnect unchanged: {map_home}"
+        );
+
+        let _ = second.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
