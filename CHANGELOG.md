@@ -26,6 +26,39 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.14.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.9...v8.14.0) (2026-07-11)
+
+
+### Features
+
+* expose explicit project selector on routed tool schemas ([3d5a209](https://github.com/special-place-ai-heaven/symforge/commit/3d5a20950769a1a4ea13899ef9e8d68c592513cc))
+* expose project-scoped trust evidence ([ed143c4](https://github.com/special-place-ai-heaven/symforge/commit/ed143c41c99f24b29091a5a47c8664f041b8ac1f))
+* expose session project inventory in status and health ([7be810e](https://github.com/special-place-ai-heaven/symforge/commit/7be810ead1af0f6a98889d2f16ba6b8729192e4b))
+* fan out search_files and route facade project selector ([f40352d](https://github.com/special-place-ai-heaven/symforge/commit/f40352deab9d792a7e7a0a308341fabeac35926d))
+* make daemon project opens non-destructive ([ea342f8](https://github.com/special-place-ai-heaven/symforge/commit/ea342f8cd6b509c60119eaa8e019b333e970543a))
+* make structural edits project-explicit ([489c285](https://github.com/special-place-ai-heaven/symforge/commit/489c285c2133acea4f672d53a765e9503074c77d))
+* route repository tools by explicit project (daemon core) ([d651ba5](https://github.com/special-place-ai-heaven/symforge/commit/d651ba54889fb96eadaf34de961505f17da31bdb))
+
+
+### Bug Fixes
+
+* downgrade stamped full completeness after budget truncation ([6f6eac6](https://github.com/special-place-ai-heaven/symforge/commit/6f6eac6d139400406111500259191fc86b4b881d))
+* emit symforge_retrieve footer when big responses truncate ([f5cad59](https://github.com/special-place-ai-heaven/symforge/commit/f5cad59f9f6d106300e0bf131f8e2373b508909b))
+* enforce one daemon and reap stale sessions ([d0623f5](https://github.com/special-place-ai-heaven/symforge/commit/d0623f5267432fd441a76626b60a2800f5531b0a))
+* expose process_util without the server feature gate ([4f5160e](https://github.com/special-place-ai-heaven/symforge/commit/4f5160e38df6c867f801a6848639aa6308fd30b6))
+* finish source-focused browse hardening ([a646f23](https://github.com/special-place-ai-heaven/symforge/commit/a646f2310c43e2fff83daeb3785221bf97009f90))
+* get_repo_map full detail guards against out-of-root paths ([1f67ff5](https://github.com/special-place-ai-heaven/symforge/commit/1f67ff54580fadd2289eeb83ffaad5aa87dc339c))
+* keep watcher admission aligned with bulk indexing ([f4e972c](https://github.com/special-place-ai-heaven/symforge/commit/f4e972c08aea3ad6d0dc1377f79e3cc7f9f16a54))
+* never spawn a visible console window ([8899957](https://github.com/special-place-ai-heaven/symforge/commit/889995711821a47da64661900e44bcb8da196263))
+* reap stale daemon sessions through the normal close path ([c0e6307](https://github.com/special-place-ai-heaven/symforge/commit/c0e6307efb088a518da3b9eba9560548da8913cb))
+* recover daemon sessions without descriptor races ([bc96594](https://github.com/special-place-ai-heaven/symforge/commit/bc96594385a0b2fe850f3a8d65a1d320cf071911))
+* resolve recovered-review disclosure and integrity blockers ([ce554b1](https://github.com/special-place-ai-heaven/symforge/commit/ce554b1a3847ed2b9089abb574318322d3d886d6))
+* search_symbols browse mode ranks by importance ([4c41272](https://github.com/special-place-ai-heaven/symforge/commit/4c412720334e71f69b55cdb405f7c9d43a16ab75))
+* serialize snapshots per project path ([3e756ee](https://github.com/special-place-ai-heaven/symforge/commit/3e756ee02f9050af02e0ace8954b488cf12cc88c))
+* stop binary sniff misreading multibyte boundary cuts ([7656699](https://github.com/special-place-ai-heaven/symforge/commit/76566992684826bfac59f4e34a11aaaef2ddc2b7))
+* stop daemon auto-spawn fork bomb and shutdown cleanup race ([671b281](https://github.com/special-place-ai-heaven/symforge/commit/671b281c05a20fc27f8feceed32d11eec74194aa))
+* what_changed and detect_impact default to source-focused ([dd132d6](https://github.com/special-place-ai-heaven/symforge/commit/dd132d62c69dab5b6fec7dc1a73e551063358ae8))
+
 ## [8.13.9](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.8...v8.13.9) (2026-07-09)
 
 
