@@ -84,6 +84,23 @@ fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io:
 }
 const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
 const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
+/// Task 9: seconds a session may go without a heartbeat before the daemon
+/// reaper closes it through the normal close path. Override with
+/// `SYMFORGE_SESSION_TTL_SECS` (clamped to >= 60). The default is deliberately
+/// long — a reaped session cannot be resurrected, so only clearly abandoned
+/// sessions qualify.
+const SESSION_TTL_ENV: &str = "SYMFORGE_SESSION_TTL_SECS";
+const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
+
+fn session_ttl_from_env() -> std::time::Duration {
+    let secs = std::env::var(SESSION_TTL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_TTL_SECS)
+        .max(60);
+    std::time::Duration::from_secs(secs)
+}
+
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
@@ -106,6 +123,11 @@ pub struct DaemonHandle {
     pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
     pub state: SharedDaemonState,
     server_task: tokio::task::JoinHandle<()>,
+    /// Task 9: the daemon-owned session reaper. Holds a `Weak` on the
+    /// daemon state, so it exits on its own once the daemon shuts down
+    /// and the state drops; `run_daemon_until_shutdown` also aborts it
+    /// explicitly so restarts/tests cannot leak the interval task.
+    reaper_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -1013,8 +1035,21 @@ impl DaemonState {
         // `Arc<IndexBase>` clones — is dropped BEFORE the GC below, or the bases
         // would never look orphaned.
         let session = self.sessions.write().remove(session_id)?;
+        Some(self.finish_removed_session(session))
+    }
+
+    /// Shared post-removal cleanup for a session record that has already been
+    /// claimed out of the sessions map (interactive close or reaper expiry):
+    /// detach the session from EVERY project that lists it, tear down projects
+    /// whose membership empties, GC orphaned bases, and report the active
+    /// project's outcome.
+    fn finish_removed_session(&self, session: SessionRecord) -> CloseSessionResponse {
+        let session_id = session.session_id.clone();
         let active_project_id = Some(session.active_project_id.clone());
         let closed_session_id = session.session_id.clone();
+        // Drop the record — critically its `working_set`, which holds the
+        // `Arc<IndexBase>` clones — BEFORE the GC below, or the bases would
+        // never look orphaned.
         drop(session);
 
         let mut active_remaining = 0usize;
@@ -1026,7 +1061,7 @@ impl DaemonState {
             // All projects that list this session (active + additive siblings).
             let owning: Vec<String> = projects
                 .iter()
-                .filter(|(_, slot)| slot.metadata.read().session_ids.contains(session_id))
+                .filter(|(_, slot)| slot.metadata.read().session_ids.contains(&session_id))
                 .map(|(id, _)| id.clone())
                 .collect();
 
@@ -1037,7 +1072,7 @@ impl DaemonState {
                         continue;
                     };
                     let mut project = slot.metadata.write();
-                    project.session_ids.remove(session_id);
+                    project.session_ids.remove(&session_id);
                     project.session_ids.len()
                 };
                 let removed = if remaining == 0 {
@@ -1060,25 +1095,79 @@ impl DaemonState {
         }
 
         // If this was the last session on a BaseKey, that map value is now a
-        // map-only orphan (strong_count == 1) — the same unbounded-growth defect
-        // class as commit-advance, via a parallel path. Sweep it. LOCK ORDER safe:
-        // `gc_orphaned_bases` takes ONLY `bases.write()`, no other map lock held.
+        // map-only orphan — sweep it. LOCK ORDER safe: `gc_orphaned_bases`
+        // takes ONLY `bases.write()`, no other map lock held.
         self.gc_orphaned_bases();
 
-        // If the session referenced no project, or its active project was already
-        // gone (e.g. concurrent reassignment), report an orphan close — the
-        // session record is still cleaned up above.
         let project_id = match (active_project_id, active_pid_seen) {
             (Some(pid), true) => pid,
             _ => "orphan".to_string(),
         };
 
-        Some(CloseSessionResponse {
+        CloseSessionResponse {
             session_id: closed_session_id,
             project_id,
             remaining_sessions: active_remaining,
             project_removed: active_removed,
-        })
+        }
+    }
+
+    /// Task 9 reaper claim: re-check the SAME last-seen observation under the
+    /// sessions write lock and atomically remove the record before any shared
+    /// project cleanup. A heartbeat that advanced `last_seen` (or crossed the
+    /// cutoff) WINS and preserves the session; once the reaper claims it, a
+    /// later heartbeat fails as unknown-session rather than resurrecting it.
+    fn close_session_if_expired(
+        &self,
+        session_id: &str,
+        observed_last_seen: u64,
+        cutoff: u64,
+    ) -> bool {
+        let session = {
+            let mut sessions = self.sessions.write();
+            let Some(record) = sessions.get(session_id) else {
+                return false;
+            };
+            let current = record.last_seen_at.load(Ordering::Relaxed);
+            if current != observed_last_seen || current >= cutoff {
+                return false;
+            }
+            sessions.remove(session_id)
+        };
+        let Some(session) = session else {
+            return false;
+        };
+        let response = self.finish_removed_session(session);
+        tracing::info!(
+            session_id = %response.session_id,
+            project_id = %response.project_id,
+            "reaper closed expired session"
+        );
+        true
+    }
+
+    /// Task 9: sweep sessions whose heartbeat is older than `ttl`. Candidates
+    /// are collected as `(session_id, observed_last_seen)` under a read lock;
+    /// each claim re-validates under the write lock in
+    /// `close_session_if_expired`. Returns the number of sessions reaped.
+    pub fn reap_expired_sessions(&self, ttl: std::time::Duration) -> usize {
+        let cutoff = now_epoch_millis().saturating_sub(ttl.as_millis() as u64);
+        let candidates: Vec<(String, u64)> = self
+            .sessions
+            .read()
+            .iter()
+            .filter_map(|(id, session)| {
+                let seen = session.last_seen_at.load(Ordering::Relaxed);
+                (seen < cutoff).then(|| (id.clone(), seen))
+            })
+            .collect();
+        let mut reaped = 0usize;
+        for (session_id, observed) in candidates {
+            if self.close_session_if_expired(&session_id, observed, cutoff) {
+                reaped += 1;
+            }
+        }
+        reaped
     }
 
     pub fn list_projects(&self) -> Vec<ProjectSummary> {
@@ -2708,11 +2797,34 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
         cleanup_daemon_runtime_files();
     });
 
+    // Task 9: one daemon-owned bounded reaper. The interval is derived from
+    // the TTL (quarter period, clamped to [10s, 600s]) so a shortened test TTL
+    // sweeps promptly while production stays quiet. The task holds only a
+    // `Weak` on the state: it exits when the daemon state drops.
+    let ttl = session_ttl_from_env();
+    let reaper_state = Arc::downgrade(&state);
+    let reaper_task = tokio::spawn(async move {
+        let period_secs = (ttl.as_secs() / 4).clamp(10, 600);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(period_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let Some(state) = reaper_state.upgrade() else {
+                break;
+            };
+            let reaped = state.reap_expired_sessions(ttl);
+            if reaped > 0 {
+                tracing::info!(reaped, ttl_secs = ttl.as_secs(), "session reaper sweep");
+            }
+        }
+    });
+
     Ok(DaemonHandle {
         port,
         shutdown_tx,
         state,
         server_task,
+        reaper_task,
     })
 }
 
@@ -2742,8 +2854,10 @@ pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
     let DaemonHandle {
         shutdown_tx,
         server_task,
+        reaper_task,
         ..
     } = handle;
+    reaper_task.abort();
     let _ = shutdown_tx.send(());
     match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_task).await {
         Ok(Ok(())) => {}
@@ -8060,6 +8174,97 @@ mod tests {
 
         let _ = handle.shutdown_tx.send(());
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 9: the reaper re-checks the SAME last-seen observation under the
+    /// sessions write lock before claiming — a heartbeat that advances the
+    /// timestamp between candidate collection and the claim WINS and preserves
+    /// the session; an actually-expired session closes through the normal
+    /// close path, removing orphan project membership exactly once.
+    #[test]
+    fn test_reaper_rechecks_heartbeat_before_close() {
+        let project = project_dir("symforge-reaper");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "reaper".to_string(),
+                pid: None,
+            })
+            .expect("open session");
+
+        // Simulate a real sweep: an ANCIENT observation and a cutoff in the
+        // recent past (now - ttl), exactly the shape reap_expired_sessions
+        // produces. A heartbeat between observation and claim advances
+        // last_seen past the cutoff, so the claim must lose.
+        let ancient: u64 = 1_000;
+        let store_last_seen = |value: u64| {
+            let sessions = state.sessions.read();
+            sessions
+                .get(&opened.session_id)
+                .expect("session")
+                .last_seen_at
+                .store(value, Ordering::Relaxed);
+        };
+        store_last_seen(ancient);
+        let cutoff = now_epoch_millis().saturating_sub(60_000);
+        assert!(
+            ancient < cutoff,
+            "test premise: ancient observation expired"
+        );
+
+        state.heartbeat(&opened.session_id); // advances last_seen to now > cutoff
+        assert!(
+            !state.close_session_if_expired(&opened.session_id, ancient, cutoff),
+            "a heartbeat between observation and claim must preserve the session"
+        );
+        assert!(
+            state.sessions.read().contains_key(&opened.session_id),
+            "session survives the losing claim"
+        );
+
+        // Genuinely expired: same ancient observation, no heartbeat since.
+        // Claim wins, the session closes through the normal path, and the
+        // project whose only member it was is torn down exactly once.
+        store_last_seen(ancient);
+        assert!(
+            state.close_session_if_expired(&opened.session_id, ancient, cutoff),
+            "an expired unchanged observation must be claimed"
+        );
+        assert!(
+            !state.sessions.read().contains_key(&opened.session_id),
+            "claimed session is removed"
+        );
+        assert!(
+            !state.projects.read().contains_key(&opened.project_id),
+            "orphan project membership is removed once"
+        );
+        // A late heartbeat cannot resurrect the claimed session.
+        assert!(
+            !state.heartbeat(&opened.session_id).known_session,
+            "heartbeat after the claim must fail, not resurrect"
+        );
+
+        // Sweep entry point: an expired session found by reap_expired_sessions
+        // is closed with the same guarantees.
+        let reopened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "reaper-sweep".to_string(),
+                pid: None,
+            })
+            .expect("reopen session");
+        {
+            let sessions = state.sessions.read();
+            sessions
+                .get(&reopened.session_id)
+                .expect("session")
+                .last_seen_at
+                .store(1, Ordering::Relaxed); // ancient heartbeat
+        }
+        let reaped = state.reap_expired_sessions(std::time::Duration::from_secs(60));
+        assert_eq!(reaped, 1, "sweep must reap exactly the expired session");
+        assert!(!state.sessions.read().contains_key(&reopened.session_id));
     }
 
     /// Task 7: `status(detail="projects")` renders the session's open-project

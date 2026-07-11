@@ -537,6 +537,22 @@ cd E:\project\symforge
   disposition tests pass; clippy/fmt clean. REMAINING from Task 7: the typed
   daemon tool receipt (machine-readable project/generation/load-source
   metadata through call_tool_value -> proxy -> statused wrapper).
+- Session reaper (2026-07-11, Task 9 part 1): daemon-owned bounded interval
+  task (TTL default 86400s via SYMFORGE_SESSION_TTL_SECS, min 60; sweep period
+  ttl/4 clamped [10s, 600s]); candidates collected as (session_id,
+  observed_last_seen) under the read lock, `close_session_if_expired` rechecks
+  the SAME observation under the sessions write lock and atomically claims the
+  record before shared project cleanup — a racing heartbeat wins; a claimed
+  session's later heartbeat fails rather than resurrecting; teardown reuses the
+  extracted `finish_removed_session` (shared with interactive close, so orphan
+  watchers/projects are removed exactly once). Reaper holds a Weak on daemon
+  state (exits on daemon drop) and is aborted in run_daemon_until_shutdown.
+  Receipts: `daemon::tests::test_reaper_rechecks_heartbeat_before_close` = 1
+  passed (first attempt failed on a same-millisecond fixture bug — fixed to a
+  realistic ancient-observation/past-cutoff shape); daemon suite 77 passed / 0
+  failed; full lib 2731 passed / 0 failed; clippy/fmt clean. REMAINING from
+  Task 9: the guarded-start seam for foreground `symforge daemon` vs auto-spawn
+  (tests/daemon_singleton.rs) and last-seen/TTL evidence in detailed status.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels
