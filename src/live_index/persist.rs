@@ -759,6 +759,16 @@ fn quarantine_bad_snapshot(
     reason: &str,
     detail: String,
 ) -> anyhow::Result<PathBuf> {
+    // Recovered finding #10: quarantine removes the ACTIVE snapshot below, so
+    // it must hold the same per-path lock as `write_snapshot` /
+    // `reset_snapshot_state`; without it, a concurrent atomic publish can have
+    // its freshly renamed `index.bin` deleted out from under it. No caller
+    // holds this lock when quarantining (load/verify paths are lock-free), so
+    // this cannot self-deadlock.
+    let (_canonical_snapshot_path, write_lock) = snapshot_path_and_lock(project_root)?;
+    let _write_guard = write_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot path lock poisoned"))?;
     let dir = paths::ensure_index_snapshot_quarantine_dir(project_root)?;
     let hash = crate::hash::digest_hex(bytes);
     let now = SystemTime::now()
@@ -2580,6 +2590,63 @@ mod tests {
         );
         assert_eq!(report.removed_count(), 1);
         assert!(!snapshot_path.exists());
+    }
+
+    /// Recovered finding #10: quarantine removes the ACTIVE snapshot, so it must
+    /// serialize on the same per-path lock as `write_snapshot` /
+    /// `reset_snapshot_state` — otherwise it can delete `index.bin` in the
+    /// middle of an atomic publish.
+    #[test]
+    fn test_quarantine_waits_for_snapshot_path_lock() {
+        let tmp = TempDir::new().expect("create project");
+        let symforge_dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&symforge_dir).expect("create .symforge");
+        let snapshot_path = symforge_dir.join(INDEX_FILENAME);
+        std::fs::write(&snapshot_path, b"corrupt snapshot bytes").expect("write snapshot");
+
+        let (_, snapshot_lock) = snapshot_path_and_lock(tmp.path()).expect("resolve snapshot lock");
+        let write_guard = snapshot_lock.lock().expect("hold snapshot write lock");
+        let project_root = tmp.path().to_path_buf();
+        let thread_snapshot_path = snapshot_path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let quarantine_thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal quarantine start");
+            let result = quarantine_bad_snapshot(
+                &project_root,
+                &thread_snapshot_path,
+                b"corrupt snapshot bytes",
+                "test-reason",
+                "test detail".to_string(),
+            );
+            done_tx.send(result).expect("send quarantine result");
+        });
+
+        started_rx.recv().expect("quarantine thread started");
+        let early_result = done_rx.recv_timeout(Duration::from_millis(200)).ok();
+        let snapshot_survived_while_locked = snapshot_path.exists();
+        drop(write_guard);
+
+        let completed_early = early_result.is_some();
+        let result = match early_result {
+            Some(result) => result,
+            None => done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("quarantine should finish after releasing lock"),
+        }
+        .expect("quarantine bad snapshot");
+        quarantine_thread.join().expect("join quarantine thread");
+
+        assert!(
+            !completed_early,
+            "quarantine must block while a snapshot write owns the path lock"
+        );
+        assert!(
+            snapshot_survived_while_locked,
+            "quarantine must not delete the published snapshot during a write"
+        );
+        assert!(result.exists(), "quarantine artifact written");
+        assert!(!snapshot_path.exists(), "bad snapshot removed after lock");
     }
 
     #[test]

@@ -758,7 +758,11 @@ fn filter_paths_by_prefix_and_language(
             if code_only && lang_filter.is_none() {
                 let ext = path.rsplit('.').next().unwrap_or("");
                 match crate::domain::index::LanguageId::from_extension(ext) {
-                    None => return false,
+                    // Recovered finding #3: an unknown extension is not proof of
+                    // "data" — SQL, shell, PowerShell, Proto, Terraform,
+                    // Dockerfile, Makefile are legitimate source SymForge just
+                    // cannot parse. Keep them under code_only.
+                    None => return is_unparsed_source_path(path),
                     Some(lang) => {
                         if crate::parsing::config_extractors::is_config_language(&lang) {
                             return false;
@@ -769,6 +773,42 @@ fn filter_paths_by_prefix_and_language(
             true
         })
         .collect())
+}
+
+/// Source formats with no `LanguageId` parser that are nonetheless
+/// unambiguously source, not data — they must survive `code_only` filtering
+/// (recovered finding #3). Deliberately small allowlist; extend as real
+/// misclassifications surface.
+fn is_unparsed_source_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let lower = file_name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "dockerfile" | "makefile" | "gnumakefile" | "justfile"
+    ) {
+        return true;
+    }
+    let Some((_, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext,
+        "sql"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "ps1"
+            | "psm1"
+            | "psd1"
+            | "bat"
+            | "cmd"
+            | "proto"
+            | "tf"
+            | "tfvars"
+            | "cmake"
+            | "gradle"
+            | "dockerfile"
+    )
 }
 
 fn normalize_exact_path(input: &str) -> String {
@@ -6996,8 +7036,20 @@ impl SymForgeServer {
                                     return if total_paths == 0 {
                                         "No uncommitted changes detected.".to_string()
                                     } else {
-                                        "No uncommitted changes matched the requested filters."
-                                            .to_string()
+                                        // Recovered finding #2: an empty filtered
+                                        // result must disclose the (default)
+                                        // source-focus filter and its recovery
+                                        // lever, not read as "nothing changed".
+                                        let default_note = if params.0.code_only.is_none() {
+                                            " Uncommitted mode is source-focused by default (code_only=true);"
+                                        } else {
+                                            ""
+                                        };
+                                        format!(
+                                            "No uncommitted changes matched the requested filters.{default_note} \
+                                             {total_paths} changed path(s) were filtered out — pass \
+                                             code_only=false (or widen path_prefix/language) to see them."
+                                        )
                                     };
                                 }
                                 let include_symbol_diff =
@@ -7240,12 +7292,17 @@ impl SymForgeServer {
         // don't drive the blast radius. `include_data=true` restores the prior
         // inclusive changed-set. language=None never errors, so keep the seed
         // on the impossible Err rather than silently emptying the blast radius.
-        let changed_files = if params.0.include_data.unwrap_or(false) {
+        let include_data = params.0.include_data.unwrap_or(false);
+        let unfiltered_changed_total = changed_files.len();
+        let changed_files = if include_data {
             changed_files
         } else {
             filter_paths_by_prefix_and_language(changed_files.clone(), None, None, true)
                 .unwrap_or(changed_files)
         };
+        // Recovered finding #1: disclose how many changed paths the source-focus
+        // default removed, so an empty/shrunken blast radius is self-describing.
+        let source_filtered_out = unfiltered_changed_total.saturating_sub(changed_files.len());
 
         let (changed_symbols, blast_radius) = {
             let guard = self.index.read();
@@ -7375,6 +7432,14 @@ impl SymForgeServer {
                 "changed_files": list_page(changed_files_total, changed_files_returned),
                 "changed_symbols": list_page(changed_symbols_total, changed_symbols_returned),
                 "blast_radius": list_page(blast_total, blast_returned),
+            },
+            // Recovered finding #1: the source-focus default silently narrowed
+            // the changed-set seed; disclose the exclusion and the recovery
+            // lever so the caller can tell "no impact" from "filtered away".
+            "source_filter": {
+                "applied": !include_data,
+                "excluded_paths": source_filtered_out,
+                "hint": "non-source changed paths are excluded by default; pass include_data=true to include them",
             },
         });
 
@@ -18228,6 +18293,130 @@ mod tests {
         assert!(
             result.contains("code-only filter"),
             "the applied source-focus filter must be disclosed in the envelope (III trust): {result}"
+        );
+    }
+
+    /// Recovered finding #2: when the source-focus default filters EVERY changed
+    /// path away, the empty result must disclose that filtering happened and how
+    /// to widen it — a bare "no changes matched" hides the default filter.
+    #[tokio::test]
+    async fn test_what_changed_uncommitted_empty_result_discloses_source_filter() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn foo() {}\n").expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\n  \"key\": 1\n}\n")
+            .expect("write data file");
+
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .what_changed(Parameters(super::WhatChangedInput {
+                since: None,
+                git_ref: None,
+                uncommitted: None,
+                path_prefix: None,
+                language: None,
+                code_only: None,
+                include_symbol_diff: None,
+                estimate: None,
+                max_tokens: None,
+            }))
+            .await;
+        assert!(
+            result.contains("filtered out"),
+            "an empty filtered result must disclose that paths were excluded: {result}"
+        );
+        assert!(
+            result.contains("code_only=false"),
+            "the empty filtered result must name the recovery lever: {result}"
+        );
+    }
+
+    /// Recovered finding #3: `code_only` filtering must not classify legitimate
+    /// unknown-extension source files (.sql/.sh/.ps1/.proto/.tf, Dockerfile,
+    /// Makefile) as non-source data.
+    #[test]
+    fn test_code_only_keeps_unknown_extension_source_files() {
+        let paths = vec![
+            "src/lib.rs".to_string(),
+            "migrations/001_init.sql".to_string(),
+            "scripts/deploy.sh".to_string(),
+            "scripts/build.ps1".to_string(),
+            "proto/api.proto".to_string(),
+            "infra/main.tf".to_string(),
+            "Dockerfile".to_string(),
+            "Makefile".to_string(),
+            "data/config.json".to_string(),
+        ];
+        let filtered = super::filter_paths_by_prefix_and_language(paths, None, None, true)
+            .expect("code_only filter");
+        for kept in [
+            "src/lib.rs",
+            "migrations/001_init.sql",
+            "scripts/deploy.sh",
+            "scripts/build.ps1",
+            "proto/api.proto",
+            "infra/main.tf",
+            "Dockerfile",
+            "Makefile",
+        ] {
+            assert!(
+                filtered.iter().any(|p| p == kept),
+                "code_only must keep source file {kept}, got: {filtered:?}"
+            );
+        }
+        assert!(
+            !filtered.iter().any(|p| p == "data/config.json"),
+            "code_only still excludes data files: {filtered:?}"
+        );
+    }
+
+    /// Recovered finding #1: `detect_impact`'s default source-focus filter must
+    /// disclose how many changed paths it excluded and the recovery lever.
+    #[tokio::test]
+    async fn test_detect_impact_default_discloses_source_filtered_paths() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        fs::write(repo.path().join("src/lib.rs"), "fn foo() {}\n").expect("write initial file");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        // The only change is an untracked non-source data file.
+        fs::create_dir_all(repo.path().join("data")).expect("create data dir");
+        fs::write(repo.path().join("data/config.json"), "{\n  \"key\": 1\n}\n")
+            .expect("write data file");
+
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}\n", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Files,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        assert!(
+            !result.contains("data/config.json"),
+            "default detect_impact stays source-focused: {result}"
+        );
+        assert!(
+            result.contains("source_filter"),
+            "the applied source filter must be disclosed in the payload: {result}"
+        );
+        assert!(
+            result.contains("include_data"),
+            "the disclosure must name the include_data recovery lever: {result}"
         );
     }
 

@@ -451,6 +451,25 @@ cd E:\project\symforge
   full `cargo test --lib -- --test-threads=1` = 2719 passed / 0 failed /
   2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
   `git diff --check` all exit 0.
+- Recovered-review blockers (2026-07-11, code slice): #1 `detect_impact`
+  payload now carries a `source_filter` object (applied/excluded_paths/hint
+  naming `include_data=true`); #2 empty filtered `what_changed` (uncommitted)
+  disclosure now reports the filtered-out count, the source-focused default,
+  and `code_only=false`; #3 `code_only` keeps unknown-extension source via
+  `is_unparsed_source_path` allowlist (.sql/.sh/.bash/.zsh/.ps1/.psm1/.psd1/
+  .bat/.cmd/.proto/.tf/.tfvars/.cmake/.gradle + Dockerfile/Makefile/
+  GNUmakefile/justfile); #7 compact repo-map `is_intra_workspace_path` now
+  also rejects `..` segments, UNC, and backslash-rooted paths; #8 CCR
+  duplicate insert (same content-addressed handle) refreshes age instead of
+  double-counting `total_bytes`/economics; #10 `quarantine_bad_snapshot` now
+  holds the per-path snapshot lock (red test mirrors the reset-lock witness);
+  #4/#18 018 tool-behavior contract reconciled (browse `(name,kind)` dedup,
+  compact/tree containment parity, both new disclosures). Receipts: red
+  witnesses failed first (3 FAILED), then targeted suites green
+  (what_changed/detect_impact 15 passed; ccr+persist+sidecar 117 passed);
+  full `cargo test --lib -- --test-threads=1` = 2725 passed / 0 failed /
+  2 ignored; `cargo clippy --lib -- -D warnings`, `cargo fmt --check`,
+  `git diff --check` all exit 0.
 - New defect observed while dogfooding (2026-07-11, unfiled): `get_file_context`
   on a conflict-markered Rust file reported `Completeness: full` with a symbol
   count in the header while rendering no outline entries (only the tail of the

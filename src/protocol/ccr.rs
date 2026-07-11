@@ -121,6 +121,14 @@ impl CcrStore {
     pub fn insert(&mut self, tool_name: &str, formatted: String) -> String {
         let handle = mint_handle(tool_name, &formatted);
         let byte_len = formatted.len();
+        // Content-addressed handle: re-inserting identical output refreshes the
+        // stored blob's age and must not re-count bytes or offloads (recovered
+        // finding #8 — the old unconditional add double-counted `total_bytes`
+        // and the economics counters on every duplicate).
+        if let Some(existing) = self.blobs.get_mut(&handle) {
+            existing.created_at = Instant::now();
+            return handle;
+        }
         while self.total_bytes.saturating_add(byte_len) > self.max_bytes
             || self.blobs.len() >= self.max_entries
         {
@@ -350,6 +358,32 @@ fn cap_file_matches(matches: &mut Vec<TextLineMatch>, query: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recovered finding #8: a duplicate insert of identical content (same
+    /// content-addressed handle) must not double-count `total_bytes` or the
+    /// economics counters — it replaces/refreshes the same stored blob.
+    #[test]
+    fn ccr_insert_duplicate_does_not_double_count() {
+        let mut store = CcrStore::new();
+        let h1 = store.insert("search_text", "payload".to_string());
+        let before = store.economics();
+        let total_before = store.total_bytes;
+        let h2 = store.insert("search_text", "payload".to_string());
+        assert_eq!(h1, h2, "identical content mints the same handle");
+        let after = store.economics();
+        assert_eq!(
+            after.bytes_stored, before.bytes_stored,
+            "duplicate insert must not re-count stored bytes"
+        );
+        assert_eq!(
+            after.offloads, before.offloads,
+            "duplicate insert must not re-count offloads"
+        );
+        assert_eq!(
+            store.total_bytes, total_before,
+            "duplicate insert must not inflate total_bytes"
+        );
+    }
 
     #[test]
     fn ccr_round_trip() {
