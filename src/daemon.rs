@@ -3194,9 +3194,25 @@ async fn call_tool_handler(
         struct ProjectPeek {
             #[serde(default)]
             project: Option<String>,
+            #[serde(default)]
+            projects: Option<Vec<String>>,
         }
-        let peek: ProjectPeek =
-            serde_json::from_value(params.clone()).unwrap_or(ProjectPeek { project: None });
+        let peek: ProjectPeek = serde_json::from_value(params.clone()).unwrap_or(ProjectPeek {
+            project: None,
+            projects: None,
+        });
+        // `search_files` is BOTH single-project routed (lone `project` keeps
+        // the full handler with resolve/coupling modes) and set-valued
+        // (`projects` fans out via the cross-project read route). The routed
+        // strip below would silently swallow a `project`+`projects` conflict
+        // before `resolve_targets` could see it, so reject it here.
+        if peek.project.is_some() && peek.projects.is_some() {
+            return Ok(
+                "project and projects are mutually exclusive: pass exactly one (a single \
+                 id in `project`, or a list/`[\"*\"]` in `projects`)."
+                    .into_response(),
+            );
+        }
         match state.runtime_for_target(&session_id, peek.project.as_deref()) {
             Ok(runtime) => {
                 if peek.project.is_some()
@@ -3654,21 +3670,23 @@ fn targets_selects(targets: &Targets, project_id: &str) -> bool {
 fn is_cross_project_read_verb(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "search_symbols" | "search_text" | "find_references"
+        "search_symbols" | "search_text" | "find_references" | "search_files"
     )
 }
 
 /// Task 4 (outstanding-work hardening): the read/guidance verbs that accept ONE
 /// optional `project` selector, resolved by `DaemonState::runtime_for_target`
 /// in `call_tool_handler` before decode. Exactly the plan's parity table minus
-/// the three set-valued discovery verbs above (which own `project`/`projects`
-/// in `execute_tool_call`) and minus `context_inventory` (session-scoped, no
-/// selector). Structural edits route the same way (Task 5): the selector is
+/// the set-valued discovery verbs above (which own `project`/`projects` in
+/// `execute_tool_call`) and minus `context_inventory` (session-scoped, no
+/// selector). `search_files` is deliberately in BOTH sets: a lone `project`
+/// routes here to the FULL single-project handler (resolve/coupling modes),
+/// while `projects` fans out via the cross-project read route. Structural edits route the same way (Task 5): the selector is
 /// batch-level only — each call stays one single-project transaction, and the
 /// existing worktree/`working_directory` validation then runs against the
 /// SELECTED project's repository, so an unrelated root rejects before preview
 /// or apply.
-fn single_project_routed_tool(tool_name: &str) -> bool {
+pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "get_symbol"
@@ -3875,6 +3893,16 @@ fn reject_unsupported_cross_project_scoping(
         direction: Option<String>,
         #[serde(default)]
         structural: Option<bool>,
+        #[serde(default)]
+        resolve: Option<bool>,
+        #[serde(default)]
+        changed_with: Option<String>,
+        #[serde(default)]
+        anchor_path: Option<String>,
+        #[serde(default)]
+        rank_by: Option<String>,
+        #[serde(default)]
+        current_file: Option<String>,
     }
     let peek: ScopePeek = serde_json::from_value(params.clone()).unwrap_or_default();
     let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
@@ -3894,6 +3922,25 @@ fn reject_unsupported_cross_project_scoping(
             }
             if present(&peek.direction) {
                 return refuse("direction");
+            }
+        }
+        "search_files" => {
+            // resolve/coupling/ranking modes are single-project pipelines:
+            // refuse honestly instead of silently ignoring the mode.
+            if peek.resolve == Some(true) {
+                return refuse("resolve");
+            }
+            if present(&peek.changed_with) {
+                return refuse("changed_with");
+            }
+            if present(&peek.anchor_path) {
+                return refuse("anchor_path");
+            }
+            if present(&peek.rank_by) {
+                return refuse("rank_by");
+            }
+            if present(&peek.current_file) {
+                return refuse("current_file");
             }
         }
         _ => {}
@@ -4009,8 +4056,81 @@ fn execute_cross_project_read(
             let body = format_cross_project_references(&hits, name, multi, cap);
             Ok(apply_cross_project_token_budget(body, input.max_tokens))
         }
+        "search_files" => {
+            let input: SearchFilesInput = decode_params(params)?;
+            let query = input.query.trim();
+            if query.is_empty() {
+                anyhow::bail!("cross-project search_files requires a non-empty query.");
+            }
+            let path_scope = match input.path_prefix.as_deref().map(str::trim) {
+                Some(prefix) if !prefix.is_empty() => {
+                    crate::live_index::search::PathScope::Prefix(prefix.to_string())
+                }
+                _ => crate::live_index::search::PathScope::Any,
+            };
+            let cap = cross_project_result_cap(input.limit);
+            // The same per-project bound the single-project path applies
+            // (default 20, clamped to the engine's 1..=50); the global `cap`
+            // then bounds the merged total.
+            let per_project_limit = input.limit.unwrap_or(20).clamp(1, 50) as usize;
+            let hits = working_set.search_files(
+                &targets,
+                query,
+                per_project_limit,
+                input.include_vendor.unwrap_or(false),
+                input.include_personal_tooling.unwrap_or(false),
+                &path_scope,
+            );
+            let body = format_cross_project_files(&hits, query, multi, cap);
+            Ok(apply_cross_project_token_budget(body, input.max_tokens))
+        }
         other => anyhow::bail!("'{other}' is not a cross-project read verb"),
     }
+}
+
+/// Format cross-project file hits, grouped by project (`── project: <id> ──`
+/// headers when `multi`). Each project's hits arrive already rank-ordered from
+/// the per-project file search.
+///
+/// BOUNDED: at most `cap` hits are rendered across all projects (the shared
+/// cross-project total cap); a surplus is dropped and disclosed honestly with
+/// shown/total counts and the corrective hint.
+fn format_cross_project_files(
+    hits: &[crate::live_index::view::ProjectHit<crate::live_index::SearchFilesHit>],
+    query: &str,
+    multi: bool,
+    cap: usize,
+) -> String {
+    if hits.is_empty() {
+        return format!("No files matching '{query}' in the targeted project(s).");
+    }
+    let total = hits.len();
+    let shown = total.min(cap);
+    let mut out = String::new();
+    if shown < total {
+        out.push_str(&format!(
+            "{shown} of {total} file matches across projects (truncated; cross-project results \
+             are capped — pass a larger `limit` or query a single project for the full set)\n"
+        ));
+    } else {
+        out.push_str(&format!("{total} file matches across projects\n"));
+    }
+    let mut current: Option<&str> = None;
+    for ph in hits.iter().take(shown) {
+        if multi && current != Some(ph.project_id.as_str()) {
+            current = Some(ph.project_id.as_str());
+            out.push_str(&format!(
+                "\n\u{2500}\u{2500} project: {} \u{2500}\u{2500}\n",
+                ph.project_id
+            ));
+        }
+        let h = &ph.hit;
+        match &h.metadata_reason {
+            Some(reason) => out.push_str(&format!("  {} [metadata-only: {reason}]\n", h.path)),
+            None => out.push_str(&format!("  {}\n", h.path)),
+        }
+    }
+    out
 }
 
 /// Format cross-project symbol hits, grouped by project (`── project: <id> ──`
@@ -8436,6 +8556,139 @@ mod tests {
         assert!(
             unknown.contains("not open") && unknown.contains(&project_b_id),
             "unknown selector must return candidates: {unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
+    /// Task 4 leftover: set-valued `search_files` fans out across targeted
+    /// projects with attributed hits, one deterministic global cap, and honest
+    /// refusals for the modes that stay single-project (resolve/coupling) and
+    /// for a `project`+`projects` mutual-exclusion violation. A lone `project`
+    /// selector keeps the FULL single-project handler (envelope, modes).
+    #[tokio::test]
+    async fn test_search_files_projects_fan_out() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let project_a = project_dir("symforge-files-home-a");
+        let project_b = project_dir("symforge-files-open-b");
+        std::fs::write(
+            project_a.path().join("src").join("widget_old.rs"),
+            "fn old_fn() {}\n",
+        )
+        .expect("write source a");
+        std::fs::write(
+            project_b.path().join("src").join("widget_new.rs"),
+            "fn new_fn() {}\n",
+        )
+        .expect("write source b");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let client = authed_client(&handle);
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+
+        let opened = client
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "files-fan-out".to_string(),
+                pid: Some(78),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical b"));
+
+        let opened_b = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/index_folder",
+                opened.session_id
+            ))
+            .json(&IndexFolderInput {
+                path: project_b.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            })
+            .send()
+            .await
+            .expect("open B request")
+            .error_for_status()
+            .expect("open B status")
+            .text()
+            .await
+            .expect("open B body");
+        assert!(opened_b.contains("Indexed"), "open B: {opened_b}");
+
+        let call = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/search_files",
+                opened.session_id
+            );
+            async move {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("tool request")
+                    .error_for_status()
+                    .expect("tool status")
+                    .text()
+                    .await
+                    .expect("tool body")
+            }
+        };
+
+        // All projects: attributed hits from BOTH, with project headers.
+        let all = call(serde_json::json!({"query": "widget", "projects": ["*"]})).await;
+        assert!(
+            all.contains("widget_old.rs") && all.contains("widget_new.rs"),
+            "wildcard fan-out must surface both projects' files: {all}"
+        );
+        assert!(
+            all.contains(&format!("project: {}", opened.project_id))
+                && all.contains(&format!("project: {project_b_id}")),
+            "multi-target output must attribute hits by project: {all}"
+        );
+
+        // Explicit subset of one: only B's hits, flat (no headers).
+        let only_b = call(serde_json::json!({"query": "widget", "projects": [project_b_id]})).await;
+        assert!(
+            only_b.contains("widget_new.rs") && !only_b.contains("widget_old.rs"),
+            "single-target fan-out must serve only B: {only_b}"
+        );
+        assert!(
+            !only_b.contains("── project:"),
+            "single-target output renders flat: {only_b}"
+        );
+
+        // resolve mode stays single-project: honest refusal, no silent drop.
+        let refused =
+            call(serde_json::json!({"query": "widget", "resolve": true, "projects": ["*"]})).await;
+        assert!(
+            refused.contains("not supported with cross-project targeting"),
+            "resolve mode must refuse cross-project targeting: {refused}"
+        );
+
+        // project + projects together: deterministic mutual-exclusion error.
+        let conflict = call(serde_json::json!({
+            "query": "widget",
+            "project": opened.project_id,
+            "projects": [project_b_id],
+        }))
+        .await;
+        assert!(
+            conflict.contains("mutually exclusive"),
+            "project+projects must be rejected: {conflict}"
         );
 
         let _ = handle.shutdown_tx.send(());

@@ -184,8 +184,8 @@ fn disposition_of(
 #[test]
 fn current_dispositions_pin_the_post_a1b_baseline() {
     // Constant across routes: query/intent are always consumed; max_tokens /
-    // preview are handler-forwarded (post-planner); project / projects are
-    // loudly refused (D9).
+    // preview are handler-forwarded (post-planner); project is forwarded into step args
+    // (Task 4 Step 5); projects stays loudly refused (D9).
     let populated = fully_populated_request("stel planner find helper", Some(IntentBucket::Find));
     let populated_plan = build_plan(&populated);
     let populated_d = classify_param_dispositions(&populated, &populated_plan);
@@ -198,9 +198,11 @@ fn current_dispositions_pin_the_post_a1b_baseline() {
         disposition_of(&populated_d, "intent"),
         ParamDisposition::Routed
     );
+    // Task 4 Step 5: a single `project` is now Forwarded (the facade handler
+    // injects it into every planned step's `project` arg at serve time).
     assert!(matches!(
         disposition_of(&populated_d, "project"),
-        ParamDisposition::Refused { .. }
+        ParamDisposition::Forwarded { .. }
     ));
     assert!(matches!(
         disposition_of(&populated_d, "projects"),

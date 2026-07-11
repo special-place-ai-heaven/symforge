@@ -38,6 +38,7 @@ use super::search::{
 };
 use super::store::{IndexedFile, LiveIndex};
 use crate::live_index::query::is_filtered_name;
+use crate::live_index::query::{SearchFilesHit, SearchFilesView};
 
 /// The commit identity component of a [`BaseKey`].
 ///
@@ -1029,6 +1030,52 @@ impl WorkingSet {
         Ok(out)
     }
 
+    /// Cross-project file search (outstanding-work Task 4): per targeted
+    /// entry, run the EXISTING per-project ranked file search
+    /// ([`LiveIndex::capture_search_files_view_with_noise`]) on the entry's
+    /// base index and tag each ranked hit by project. Plain fuzzy-query mode
+    /// only — resolve/coupling modes stay single-project. Each project's hits
+    /// arrive internally rank-ordered and `per_project_limit`-bounded; the
+    /// caller applies the ONE global cross-project cap after merging.
+    ///
+    /// File-path search reads only the file map (overlays carry content
+    /// deltas, not path membership), so the base index is the honest source.
+    pub fn search_files(
+        &self,
+        targets: &Targets,
+        query: &str,
+        per_project_limit: usize,
+        include_vendor: bool,
+        include_personal_tooling: bool,
+        path_scope: &PathScope,
+    ) -> Vec<ProjectHit<SearchFilesHit>> {
+        let mut out = Vec::new();
+        for entry in self
+            .entries
+            .iter()
+            .filter(|e| targets.selects(&e.project_id))
+        {
+            let view = entry.base.index.capture_search_files_view_with_noise(
+                query,
+                per_project_limit,
+                None,
+                None,
+                include_vendor,
+                include_personal_tooling,
+                path_scope,
+            );
+            if let SearchFilesView::Found { hits, .. } = view {
+                for hit in hits {
+                    out.push(ProjectHit {
+                        project_id: entry.project_id.clone(),
+                        hit,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Cross-project reference search (FR-004 / SC-001): per targeted entry, run
     /// the overlay-post-filtered [`IndexView::find_references`] and tag each
     /// `(path, ReferenceRecord)` hit by project.
@@ -1672,5 +1719,56 @@ mod tests {
             Some("important_handler"),
             "overlay browse must lead with the referenced symbol, got {names:?}"
         );
+    }
+
+    // ── Task 4 leftover — cross-project search_files fan-out ─────────────────
+    #[test]
+    fn cross_project_search_files_attributes_hits_per_target() {
+        let mut index_a = synthetic_index(0);
+        index_a.files.insert(
+            "widget_alpha.rs".to_string(),
+            Arc::new(make_file("widget_alpha.rs", "fn a() {}")),
+        );
+        let mut index_b = synthetic_index(0);
+        index_b.files.insert(
+            "widget_beta.rs".to_string(),
+            Arc::new(make_file("widget_beta.rs", "fn b() {}")),
+        );
+
+        let mut set = WorkingSet::new();
+        set.add(
+            "proj-a",
+            Arc::new(IndexBase::new(base_key("ca"), Arc::new(index_a), 1)),
+        );
+        set.add(
+            "proj-b",
+            Arc::new(IndexBase::new(base_key("cb"), Arc::new(index_b), 1)),
+        );
+
+        // All targets: hits from BOTH projects, each attributed to its source.
+        let all = set.search_files(&Targets::All, "widget", 20, false, false, &PathScope::Any);
+        let mut attributed: Vec<(&str, &str)> = all
+            .iter()
+            .map(|hit| (hit.project_id.as_str(), hit.hit.path.as_str()))
+            .collect();
+        attributed.sort_unstable();
+        assert_eq!(
+            attributed,
+            vec![("proj-a", "widget_alpha.rs"), ("proj-b", "widget_beta.rs")],
+            "fan-out must return each project's ranked hit with attribution"
+        );
+
+        // One target: only that project's hits.
+        let only_b = set.search_files(
+            &Targets::One("proj-b".to_string()),
+            "widget",
+            20,
+            false,
+            false,
+            &PathScope::Any,
+        );
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].project_id, "proj-b");
+        assert_eq!(only_b[0].hit.path, "widget_beta.rs");
     }
 }

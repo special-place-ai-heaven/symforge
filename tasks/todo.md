@@ -646,6 +646,25 @@ cd E:\project\symforge
   `test_concurrent_guarded_starts_yield_one_daemon`) green; inventory test
   extended with last_seen/ttl assertion, green; daemon lib suite 80 passed;
   clippy/fmt clean; full all-targets suite receipt below.
+- search_files multi-target merge (2026-07-11, Task 4 leftover part 1):
+  `SearchFilesInput` gains set-valued `projects` (schemars `with="Vec<String>"`
+  for strict-client schema parity); `search_files` joins the cross-project
+  read verbs — the fan-out reuses the EXISTING per-project ranked file search
+  (`WorkingSet::search_files` → `capture_search_files_view_with_noise` on each
+  targeted entry's base index, honoring `path_prefix` via `PathScope`), merges
+  attributed hits under the shared deterministic global cap
+  (`cross_project_result_cap`) and `max_tokens` budget, and renders
+  `── project: <id> ──` sections via `format_cross_project_files`
+  (metadata-only reasons disclosed). Lone `project` stays on the FULL
+  single-project routed handler (resolve/coupling modes preserved);
+  resolve/changed_with/anchor_path/rank_by/current_file are honestly REFUSED
+  with cross-project targeting; `project`+`projects` together is rejected
+  deterministically in `call_tool_handler` (the routed strip would otherwise
+  swallow the conflict). Receipts: new
+  `daemon::tests::test_search_files_projects_fan_out` +
+  `live_index::view::tests::cross_project_search_files_attributes_hits_per_target`
+  green; daemon lib 81 passed; view 13 passed; strict_client_schema_compat +
+  stel_param_disposition green; clippy/fmt clean; full-suite receipt pending.
 - New dogfood defect (2026-07-11, unfiled): the watcher demoted
   `src/protocol/tools.rs` (UTF-8 Rust source, ~1.1 MB) to Tier 2 with reason
   "binary, size 1.1 MB" after an edit — the size-threshold demotion mislabels

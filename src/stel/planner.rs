@@ -160,14 +160,16 @@ pub fn classify_param_dispositions(
         ParamDisposition::NotApplicable
     };
 
+    // Task 4 Step 5: a single `project` selector IS routed — the facade
+    // handler injects it into every planned step's `project` arg at serve
+    // time (post-planner, mirroring the `max_tokens` Forwarded contract).
     let project = if request
         .project
         .as_deref()
         .is_some_and(|p| !p.trim().is_empty())
     {
-        ParamDisposition::Refused {
-            reason: "cross-project targeting is not routed through the `symforge` facade"
-                .to_string(),
+        ParamDisposition::Forwarded {
+            into_arg: "each planned step's `project` selector".to_string(),
         }
     } else {
         ParamDisposition::NotApplicable

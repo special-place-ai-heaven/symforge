@@ -6128,6 +6128,19 @@ impl SymForgeServer {
             .find_map(top_hit)
     }
 
+    /// Task 4 Step 5: whether a planned facade step's tool accepts the single
+    /// `project` selector the facade routes — the daemon's single-project
+    /// routed set plus the set-valued discovery verbs (which take `project`
+    /// too). A plan containing any other tool refuses project routing
+    /// all-or-nothing rather than part-routing the chain.
+    fn facade_step_accepts_project(tool: &str) -> bool {
+        crate::daemon::single_project_routed_tool(tool)
+            || matches!(
+                tool,
+                "search_symbols" | "search_text" | "find_references" | "search_files"
+            )
+    }
+
     /// Inject the resolved co-change anchor into a fused-find `search_files` step.
     ///
     /// Recognizes the find-fusion path step by its exact emitted shape
@@ -9652,23 +9665,26 @@ impl SymForgeServer {
             );
         }
 
-        // Surface-honesty (012 Phase 3 / Principle VII): `StelRequest` carries
-        // `project`/`projects` for schema parity with the direct tools, but the L1
-        // planner does NOT route them into its read steps. Accepting them silently
-        // would single-project-resolve a `projects:["*"]` caller and hand back
-        // partial results that LOOK cross-project — a silent drop. Refuse honestly
-        // instead: name the supported vehicle. A blank `project` / empty `projects`
-        // is treated as "not set" (it would target the active project anyway), so
-        // the refusal fires only on a meaningful cross-project request.
-        let has_project = request
+        // Surface-honesty (012 Phase 3 / Principle VII, revised by outstanding-
+        // work Task 4 Step 5): a single `project` selector IS routed — the
+        // handler injects it into every planned step's `project` arg at serve
+        // time (see the serve loop below), so the same explicit-project routing
+        // the direct tools honor works through the facade. Set-valued
+        // `projects` stays refused: the L1 planner plans single-project reads,
+        // and silently single-project-resolving a `projects:["*"]` caller would
+        // hand back partial results that LOOK cross-project (a silent drop).
+        // A blank `project` / empty `projects` is treated as "not set".
+        let facade_project = request
             .project
             .as_deref()
-            .is_some_and(|p| !p.trim().is_empty());
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         let has_projects = request
             .projects
             .as_deref()
             .is_some_and(|ids| ids.iter().any(|id| !id.trim().is_empty()));
-        if has_project || has_projects {
+        if has_projects {
             return Ok(
                 ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(
                     "cross-project targeting is not routed through the `symforge` facade; \
@@ -9788,6 +9804,28 @@ impl SymForgeServer {
         // only abort on a genuine error (InternalFailure/InvalidRequest); a
         // dependent chain keeps its existing fail-fast on any non-success.
         let is_fusion_union = crate::stel::is_find_fusion_plan(&exec_plan);
+
+        // Task 4 Step 5: route the caller's single `project` selector through
+        // every planned primitive. All-or-nothing: if ANY planned step's tool
+        // has no `project` selector (e.g. git-scoped `detect_impact`), refuse
+        // the whole call honestly instead of part-routing a plan (results that
+        // MIX projects would mislead worse than a refusal).
+        if let Some(project) = facade_project.as_deref()
+            && let Some(step) = exec_plan
+                .steps
+                .iter()
+                .find(|step| !Self::facade_step_accepts_project(&step.tool))
+        {
+            return Ok(
+                ResultStatus::new(OutcomeClass::InvalidRequest).into_call_tool_result(format!(
+                    "project '{project}' cannot be routed through this plan: planned step \
+                     `{}` has no project selector. Call the primitive tools directly with \
+                     `project`.",
+                    step.tool
+                )),
+            );
+        }
+
         let mut step_results = Vec::new();
         let mut outcome_class = OutcomeClass::Found;
         let mut chain_failed = false;
@@ -9796,7 +9834,17 @@ impl SymForgeServer {
             // `rank_by="path+cochange"` and no anchor (it has no index). Resolve
             // and inject the co-change anchor here, where the index lives. A
             // weak/absent anchor degrades to pure path ranking with no error.
-            let step_args = self.inject_find_fusion_cochange_anchor(&step.tool, &step.args);
+            let mut step_args = self.inject_find_fusion_cochange_anchor(&step.tool, &step.args);
+            // Task 4 Step 5: inject the routed `project` selector (validated
+            // above to be accepted by every step tool). Never overwrite an
+            // explicit per-step selector the planner set.
+            if let Some(project) = facade_project.as_deref()
+                && let serde_json::Value::Object(ref mut object) = step_args
+            {
+                object
+                    .entry("project")
+                    .or_insert_with(|| serde_json::Value::String(project.to_string()));
+            }
             let tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
             step_results.push(ServedStepResult {
                 tool: step.tool.clone(),
@@ -10582,6 +10630,7 @@ impl SymForgeServer {
             smart_query::QueryIntent::FindFile { hint } => {
                 let input = SearchFilesInput {
                     project: None,
+                    projects: None,
                     query: hint.clone(),
                     limit: None,
                     current_file: None,
@@ -12139,6 +12188,7 @@ mod tests {
 
     fn search_files_input(query: &str) -> super::SearchFilesInput {
         super::SearchFilesInput {
+            projects: None,
             project: None,
             query: query.to_string(),
             limit: None,
@@ -16452,6 +16502,7 @@ mod tests {
         ]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "protocol/tools.rs".to_string(),
                 limit: Some(20),
@@ -16581,6 +16632,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "src/service.rs".to_string(),
                 limit: None,
@@ -16628,6 +16680,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "src/new_service.rs".to_string(),
                 limit: None,
@@ -16681,6 +16734,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "service.rs".to_string(),
                 limit: None,
@@ -16712,6 +16766,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: String::new(),
                 limit: None,
@@ -16782,6 +16837,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: String::new(),
                 limit: None,
@@ -16836,6 +16892,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -16890,6 +16947,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -16932,6 +16990,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -16973,6 +17032,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17011,6 +17071,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17049,6 +17110,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17090,6 +17152,7 @@ mod tests {
 
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17126,6 +17189,7 @@ mod tests {
         ));
         let default = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17145,6 +17209,7 @@ mod tests {
 
         let path_cochange = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17186,6 +17251,7 @@ mod tests {
         ]));
         let default = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17205,6 +17271,7 @@ mod tests {
 
         let path_cochange = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "routes.rs".to_string(),
                 limit: Some(20),
@@ -17243,6 +17310,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
@@ -17283,6 +17351,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
@@ -17315,6 +17384,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
@@ -17355,6 +17425,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "bar.rs".to_string(),
                 limit: None,
@@ -17391,6 +17462,7 @@ mod tests {
         let server = make_server(make_live_index_ready_with_vendor_file());
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "vendor/**/*.rs".to_string(),
                 limit: None,
@@ -17428,6 +17500,7 @@ mod tests {
         let server = make_server(make_live_index_ready(vec![(key, file)]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "src/protocol/tools.rs".to_string(),
                 limit: None,
@@ -17463,6 +17536,7 @@ mod tests {
         ]));
         let result = server
             .search_files(Parameters(super::SearchFilesInput {
+                projects: None,
                 project: None,
                 query: "lib.rs".to_string(),
                 limit: None,
@@ -27671,11 +27745,11 @@ mod tests {
     // ── Feature 012 hardening — `symforge` facade REFUSES cross-project targeting ─
     //
     // `StelRequest` carries `project`/`projects` for schema parity, but the L1
-    // planner does not route them, so accepting one would silently single-project-
-    // resolve a `projects:["*"]` caller (a silent drop, Principle VII). The facade
-    // must refuse honestly with an InvalidRequest naming the direct-tool vehicle.
+    // planner plans single-project reads, so set-valued `projects` is refused
+    // honestly (routing it would silently single-project-resolve, Principle VII)
+    // while a single `project` IS routed into every planned step (Task 4 Step 5).
     #[tokio::test]
-    async fn symforge_facade_rejects_cross_project_targeting() {
+    async fn symforge_facade_routes_project_and_refuses_projects() {
         use crate::stel::{StelRequest, SymforgeCallInput};
 
         let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
@@ -27707,7 +27781,11 @@ mod tests {
             "refusal must name the direct-tool vehicle: {text}"
         );
 
-        // `project: "proj-x"` -> refused identically.
+        // Task 4 Step 5: a single `project` is ROUTED into the planned steps,
+        // not refused at the facade. On this single-project local server a
+        // FOREIGN selector surfaces the primitives' own per-step refusal
+        // (naming the bound project) — never the facade-level refusal, and
+        // never a silently-ignored selector.
         let project_call = SymforgeCallInput {
             request: StelRequest {
                 query: "where is thing defined".to_string(),
@@ -27721,7 +27799,15 @@ mod tests {
             .await
             .expect("facade dispatch");
         let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
-        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            !text.contains("cross-project targeting is not routed through the `symforge` facade"),
+            "a single `project` must be routed, not facade-refused: {text}"
+        );
+        assert!(
+            text.contains("not available on this connection"),
+            "a foreign selector must surface the primitives' own refusal: {text}"
+        );
 
         // A blank `project` is treated as not-set: the facade must NOT refuse on it
         // (it would target the active project anyway). It proceeds past the

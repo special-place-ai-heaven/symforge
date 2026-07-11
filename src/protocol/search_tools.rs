@@ -166,6 +166,17 @@ pub struct SearchFilesInput {
     /// and refuse a non-matching selector.
     #[serde(default)]
     pub project: Option<String>,
+    /// Target an EXPLICIT subset of open projects by id/name, or `["*"]` for
+    /// every open project. Mutually exclusive with `project`. Plain fuzzy
+    /// query mode only — resolve/coupling modes stay single-project.
+    /// Daemon-only.
+    // `#[schemars(with = "Vec<String>")]` keeps this a plain `type: "array"`
+    // schema, NOT the `type: ["array", "null"]` union that strict MCP clients
+    // reject (mirrors the sibling discovery verbs; enforced by
+    // `tests/strict_client_schema_compat.rs`); serde keeps the field optional.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub projects: Option<Vec<String>>,
     /// Filename, folder name, or partial path. Required for search and resolve modes. Optional when `changed_with` is provided.
     #[serde(default)]
     pub query: String,
