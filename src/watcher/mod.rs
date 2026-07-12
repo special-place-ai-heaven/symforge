@@ -484,20 +484,6 @@ pub(crate) fn freshen_file_if_stale(
     }
 }
 
-fn freshen_file_if_stale_at_generation(
-    relative_path: &str,
-    abs_path: &Path,
-    shared: &SharedIndex,
-    expected_gen: u64,
-) -> bool {
-    matches!(
-        freshen_file_if_stale(relative_path, abs_path, shared, expected_gen),
-        FreshenResult::StaleReindexed
-            | FreshenResult::StaleRemoved
-            | FreshenResult::GenerationMismatch
-    )
-}
-
 /// Resolve the generation the watcher should fence its mutations against for
 /// the commit boundary about to run.
 ///
@@ -574,8 +560,14 @@ pub(crate) fn reconcile_stale_files_with_stop(
             break;
         }
         let abs_path = repo_root.join(relative_path);
-        if freshen_file_if_stale_at_generation(relative_path, &abs_path, shared, fence_gen) {
-            stale_count += 1;
+        // Count ONLY genuine repairs. A `GenerationMismatch` outcome is a no-op
+        // that repaired zero bytes (the store rejected the stale-generation
+        // mutation, incrementing `rejected_stale_mutations` instead), so folding
+        // it into the repair count would falsely inflate health's "reconcile
+        // repairs" figure during any restart/reset window.
+        match freshen_file_if_stale(relative_path, &abs_path, shared, fence_gen) {
+            FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => stale_count += 1,
+            FreshenResult::Fresh | FreshenResult::GenerationMismatch => {}
         }
     }
 
@@ -1827,11 +1819,13 @@ mod tests {
         let rejected_before = shared.current_rejected_stale_mutations();
         shared.reload(project_b.path()).unwrap();
 
-        let stale = reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        let repairs =
+            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
 
         assert_eq!(
-            stale, 1,
-            "stale doomed reconcile should visit B's path once"
+            repairs, 0,
+            "a GenerationMismatch reconcile repairs zero bytes; it is a rejected \
+             mutation, not a repair, so it must not count toward the repair total"
         );
         assert!(
             shared.current_rejected_stale_mutations() > rejected_before,
@@ -1904,6 +1898,64 @@ mod tests {
         assert!(
             file.symbols.iter().any(|s| s.name == "healed"),
             "the reconcile must re-index the edited file so the new symbol appears"
+        );
+    }
+
+    /// Repair-count honesty: `reconcile_stale_files_with_stop` returns the number
+    /// of GENUINE repairs (files actually re-indexed or removed), which health
+    /// renders as "reconcile repairs". A `GenerationMismatch` outcome is a NO-OP
+    /// that repaired zero bytes (a cross-project retarget kept the stale fence and
+    /// the store rejected the mutation), so it must NOT inflate the repair count.
+    ///
+    /// This is deliberately distinct from the store's `rejected_stale_mutations`
+    /// counter, which DOES increment for the rejection (asserted by
+    /// `slipped_past_cancellation_fence_increments_counter`). The two figures
+    /// answer different questions: "how many files did we repair" vs. "how many
+    /// stale-generation mutations did the fence reject".
+    #[test]
+    fn reconcile_repair_count_excludes_generation_mismatch_noops() {
+        // --- Case 1: pure GenerationMismatch no-ops must NOT count as repairs. ---
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(project_a.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(project_b.path().join("src/b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let stale_gen = shared.current_project_generation();
+        // Retarget to B: advances the generation AND swaps `indexed_root`, so
+        // `effective_fence_generation` keeps the stale spawn gen and every file
+        // reconcile below resolves to `GenerationMismatch` (a repaired-zero no-op).
+        shared.reload(project_b.path()).unwrap();
+
+        let repairs =
+            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        assert_eq!(
+            repairs, 0,
+            "GenerationMismatch no-ops repair zero bytes and must not inflate the \
+             repair count (they are rejected mutations, not repairs)"
+        );
+
+        // --- Case 2: a genuine StaleReindexed edit MUST count as a repair. ---
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        let rel = "src/edited.rs";
+        let abs = project.path().join(rel);
+        std::fs::write(&abs, b"fn before() {}").unwrap();
+
+        let shared2 = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared2.current_project_generation();
+
+        // Edit the tracked file so the reconcile sweep sees it as stale.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&abs, b"fn before() {}\nfn after() {}").unwrap();
+
+        let repairs2 =
+            reconcile_stale_files_with_stop(project.path(), &shared2, || false, expected_gen);
+        assert_eq!(
+            repairs2, 1,
+            "a genuinely stale, re-indexed file must count as one repair"
         );
     }
 
