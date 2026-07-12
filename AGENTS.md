@@ -101,7 +101,7 @@ Failure should degrade safely:
 - parser failures should isolate a file, not poison a run
 - bad symbol spans should never be served silently
 
-Current v7.13.x recovery contract:
+Current v8.14.0 recovery contract:
 
 - `checkpoint_now(verify_after_write=true)` is the explicit checkpoint path for
   forcing `.symforge/index.bin` persistence before risky operations.
@@ -119,7 +119,7 @@ Current v7.13.x recovery contract:
 
 ## MCP Surface
 
-The shipped v7.13.x MCP surface includes tools, resources, and prompts. Do not
+The shipped v8.14.0 MCP surface includes tools, resources, and prompts. Do not
 design for tools only.
 
 The **default** `tools/list` surface is the full **36-tool** surface below
@@ -127,17 +127,18 @@ The **default** `tools/list` surface is the full **36-tool** surface below
 `symforge_edit`, `status` — is a documented opt-in escape hatch via
 `SYMFORGE_SURFACE=compact`:
 
-- Runtime and index: `health`, `health_compact`, `index_folder`,
-  `checkpoint_now`, `analyze_file_impact`, `what_changed`, `diff_symbols`,
-  `validate_file_syntax`
+- Runtime and index: `health`, `health_compact`, `status`, `index_folder`,
+  `checkpoint_now`, `analyze_file_impact`, `detect_impact`, `what_changed`,
+  `diff_symbols`, `validate_file_syntax`
 - Read and search: `get_repo_map`, `get_file_context`, `get_file_content`,
   `get_symbol`, `get_symbol_context`, `inspect_match`, `search_symbols`,
-  `search_text`, `search_files`, `find_references`, `find_dependents`
+  `search_text`, `search_files`, `find_references`, `find_dependents`,
+  `symforge_retrieve`
 - Guidance: `explore`, `ask`, `conventions`, `edit_plan`,
   `context_inventory`, `investigation_suggest`
 - Structural edits: `replace_symbol_body`, `edit_within_symbol`,
   `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`,
-  `batch_rename`
+  `batch_rename`, `symforge_edit`
 
 Ranking signal invariants:
 - `search_symbols`, `search_text`, `search_files`, `explore`, `ask`, and
@@ -150,18 +151,20 @@ Current resources:
 
 - Static repository resources: `symforge://repo/health`,
   `symforge://repo/outline`, `symforge://repo/map`,
-  `symforge://repo/changes/uncommitted`
+  `symforge://repo/changes/uncommitted`, `symforge://tools/catalog`,
+  `symforge://glossary`
 - Templates: `symforge://file/context`, `symforge://file/content`,
   `symforge://symbol/detail`, `symforge://symbol/context`
 
 Current prompts:
 
-- `symforge-review`, `symforge-architecture`, `symforge-triage`,
-  `symforge-onboard`, `symforge-refactor`, `symforge-debug`
+- `symforge-admin`, `symforge-review`, `symforge-architecture`,
+  `symforge-triage`, `symforge-onboard`, `symforge-refactor`,
+  `symforge-debug`
 
 Name migration and deferred-surface table:
 
-| Old, removed, or future name | Current v7.13.x status |
+| Old, removed, or future name | Current v8.14.0 status |
 |---|---|
 | `get_repo_outline` | Use `get_repo_map`; repository outline also exists as a resource. |
 | `get_file_outline` | Use `get_file_context`. |
