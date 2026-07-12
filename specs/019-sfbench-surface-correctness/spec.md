@@ -4,7 +4,10 @@
 
 **Created**: 2026-07-12
 
-**Status**: Draft
+**Status**: Implemented (2026-07-12) — all 8 stories landed on branch
+`019-sfbench-surface-correctness`, each RED-first + full-gate-green; the two P0s
+additionally upgraded with a research-verified qualifier→owner recall recovery.
+Pending final integrated branch gate + PR.
 
 **Input**: The SFBENCH-1.0 full-surface benchmark of `symforge 8.14.0`
 (`docs/dogfood/2026-07-12-symforge-8.14.0-full-surface-benchmark-report.md`)
