@@ -26,6 +26,21 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.14.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.0...v8.14.1) (2026-07-12)
+
+
+### Bug Fixes
+
+* **batch_rename:** fail closed on ambiguous names (US1, P0 safety) ([3776c15](https://github.com/special-place-ai-heaven/symforge/commit/3776c15af06666f42459a7065c91e513049c68f2))
+* **detect_impact:** body-delta seed + ambiguity-scoped edges + identity nodes (US2, P0) ([1c26aaa](https://github.com/special-place-ai-heaven/symforge/commit/1c26aaaaa9b76f3fef3c35e92ae916552699620d))
+* **health:** count only genuine reconcile repairs, not generation-mismatch no-ops (US5a, P2) ([b2925e6](https://github.com/special-place-ai-heaven/symforge/commit/b2925e6ab900b14e0ca410bad9378ebd6f44dabd))
+* **resolution:** recover Target::method recall via qualifier-owner match (US1b/US2b) ([4ead522](https://github.com/special-place-ai-heaven/symforge/commit/4ead5221cecbb623a41d35568fcb57682e79cec0))
+* **selectors,python:** allow matching-local selector; resolve Python relative imports (US3, P1) ([62a4c18](https://github.com/special-place-ai-heaven/symforge/commit/62a4c1882facbcf5bb84d1183e427143b34a24e8))
+* **status:** daemon reset_calibration actually clears the proxy-owned store (US5c, P2) ([01d6a20](https://github.com/special-place-ai-heaven/symforge/commit/01d6a20a994c9fc2c5755c2394d317f84966b7f2))
+* **symforge_edit:** idempotent replay short-circuits stale if_match (US4, P2) ([e40bf36](https://github.com/special-place-ai-heaven/symforge/commit/e40bf369055849f1bcd6c336ed0f42610b6f73f4))
+* **validate_file_syntax:** accept BOM JSON; drop inert estimate flag (US6, P3) ([3bc6eae](https://github.com/special-place-ai-heaven/symforge/commit/3bc6eae678f5581f9de3f7a5f345e77b25ee1ad8))
+* **watcher:** re-sync generation fence so cold-start indexing self-heals (US5b, P1) ([565f341](https://github.com/special-place-ai-heaven/symforge/commit/565f341ae9d01184b1ae58b8029d01f2d25c67b8))
+
 ## [8.14.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.13.9...v8.14.0) (2026-07-11)
 
 
