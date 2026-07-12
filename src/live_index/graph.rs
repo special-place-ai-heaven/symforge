@@ -118,7 +118,7 @@ impl GraphProjection {
                 // by the call site's module qualifier, else drop the edge.
                 let resolved: Option<&SymbolId> = match callees.as_slice() {
                     [only] => Some(only),
-                    many => resolve_ambiguous_callee(many, r.qualified_name.as_deref()),
+                    many => resolve_ambiguous_callee(many, r.qualified_name.as_deref(), index),
                 };
                 let Some(callee) = resolved else {
                     // ponytail: an ambiguous bare-name call with no resolving
@@ -289,30 +289,45 @@ pub struct BlastNode {
 }
 
 /// Disambiguate a `Call` to an ambiguous bare name (>1 same-name def) using the
-/// call site's `qualified_name` module segment (e.g. `"a::run"` -> module hint
-/// `"a"`). Returns `Some(def)` only when exactly ONE candidate's path matches
-/// the hint (file stem or a path component); otherwise `None`, so the caller
-/// drops the edge rather than fanning out to all N candidates.
+/// call site's `qualified_name` immediate qualifier (e.g. `"a::run"` -> hint
+/// `"a"`; `"Target::m"` -> hint `"Target"`). Returns `Some(def)` only when the
+/// hint picks exactly ONE candidate; otherwise `None`, so the caller drops the
+/// edge rather than fanning out to all N candidates.
 ///
-/// ponytail: the hint match is a syntactic path-segment heuristic, not real
-/// name resolution. It recovers the common `mod::name` case (the qualified
-/// module-call fixture) without inventing wrong edges; the resolver at
-/// C-S2-001 supersedes it. When the hint is absent or matches zero/multiple
-/// candidates, we return `None` (drop) — safety over recall.
+/// Two disambiguation signals are tried, both gated by the same "matched more
+/// than one -> None" discipline (safety over recall):
+///
+/// 1. **Module-stem match** (original): the hint == a candidate's file stem or a
+///    path component recovers the common `mod::name` case.
+/// 2. **Owner-name match** (019 recall-recovery): the hint == the target type of
+///    a candidate's enclosing `impl` block recovers `Target::method` calls that
+///    the module-stem match cannot. Computed from physical defs via
+///    [`enclosing_impl_owner`]; if two physical defs share that owner name
+///    (twin `impl Target` in different files), the hint does NOT disambiguate
+///    and we drop — mirroring the module-stem uniqueness guard.
+///
+/// ponytail: both matches are syntactic heuristics, not real name resolution;
+/// the resolver at C-S2-001 supersedes them. Owner-name recovery is
+/// Rust-`impl`-shaped (see [`enclosing_impl_owner`]) — non-Rust grammars whose
+/// containers aren't `SymbolKind::Impl` yield no owner and keep the drop path.
 fn resolve_ambiguous_callee<'a>(
     candidates: &'a [SymbolId],
     qualified_name: Option<&str>,
+    index: &LiveIndex,
 ) -> Option<&'a SymbolId> {
-    // Module hint = the segment before the last `::` (last `::` separates the
-    // module path from the called name). No `::` -> no hint -> drop.
+    // Immediate qualifier = the segment before the last `::` (last `::`
+    // separates the qualifier from the called leaf name). No `::` -> no hint.
     let qn = qualified_name?;
     let module_hint = qn.rsplit_once("::").map(|(head, _)| head)?;
-    // Use the innermost module segment (e.g. `crate::a` -> `a`).
+    // Use the innermost segment (e.g. `crate::a` -> `a`, `Target` -> `Target`).
     let hint = module_hint.rsplit("::").next().unwrap_or(module_hint);
     if hint.is_empty() {
         return None;
     }
+
+    // Signal 1: module-stem match (file stem or path component == hint).
     let mut matched: Option<&SymbolId> = None;
+    let mut stem_ambiguous = false;
     for cand in candidates {
         let path_matches = std::path::Path::new(&cand.path)
             .file_stem()
@@ -325,12 +340,54 @@ fn resolve_ambiguous_callee<'a>(
                 .any(|component| component == hint);
         if path_matches {
             if matched.is_some() {
-                return None; // hint matched more than one candidate -> ambiguous
+                stem_ambiguous = true;
+                break;
             }
             matched = Some(cand);
         }
     }
-    matched
+    if stem_ambiguous {
+        return None; // hint matched more than one candidate path -> ambiguous
+    }
+    if matched.is_some() {
+        return matched;
+    }
+
+    // Signal 2: owner-name match. For each physical def of the callee leaf name,
+    // compute its enclosing-`impl` owner type and match it against the hint.
+    // Keep the edge only when EXACTLY ONE physical def's owner == hint (the
+    // uniqueness guard); a shared owner name (twin `impl Target`) -> drop.
+    let leaf = &candidates.first()?.name;
+    let mut owner_matched: Option<&SymbolId> = None;
+    for cand in candidates {
+        let Some(file) = index.files.get(&cand.path) else {
+            continue;
+        };
+        // A candidate `SymbolId` collapses same-name/kind defs in one file, so
+        // scan every physical def of the leaf name in this file and check each
+        // one's owner independently (twin `impl` in the SAME file is caught).
+        let mut file_owner_hits = 0usize;
+        for phys in &file.symbols {
+            if phys.name != *leaf || phys.kind != cand.kind {
+                continue;
+            }
+            if crate::live_index::enclosing_impl_owner(&file.symbols, phys.line_range.0).as_deref()
+                == Some(hint)
+            {
+                file_owner_hits += 1;
+            }
+        }
+        if file_owner_hits == 0 {
+            continue;
+        }
+        // >1 owner-matching def in one file, or a second file already matched
+        // -> the hint can't disambiguate. Drop (soundness over recall).
+        if file_owner_hits > 1 || owner_matched.is_some() {
+            return None;
+        }
+        owner_matched = Some(cand);
+    }
+    owner_matched
 }
 
 /// A `fn main` is the conventional program entry point across every language
@@ -538,6 +595,97 @@ mod tests {
             hits <= 1,
             "bare ambiguous run() must not link drive to BOTH run defs \
              (reaches_a={reaches_a} reaches_b={reaches_b})"
+        );
+    }
+
+    // 019 recall-recovery: an ambiguous callee `m` (2 defs, `impl Target` and
+    // `impl Other`) called as `Target::m()` must edge ONLY to Target's `m`
+    // (owner-name recovery), not fan out and not drop. The immediate qualifier
+    // `Target` == the enclosing-impl owner of exactly ONE candidate def.
+    #[test]
+    fn ambiguous_call_recovers_edge_via_unique_owner_qualifier() {
+        let graph = build_graph(&[
+            (
+                "a.rs",
+                "pub struct Target;\nimpl Target {\n    pub fn m(&self) -> u32 { 1 }\n}\n",
+            ),
+            (
+                "b.rs",
+                "pub struct Other;\nimpl Other {\n    pub fn m(&self) -> u32 { 2 }\n}\n",
+            ),
+            ("caller.rs", "fn drive() -> u32 { Target::m(&Target) }\n"),
+        ]);
+        let drive = sym("caller.rs", "drive");
+        // Target::m() is a method; its SymbolId kind is Method, not Function.
+        let target_m = SymbolId {
+            path: "a.rs".to_string(),
+            name: "m".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let other_m = SymbolId {
+            path: "b.rs".to_string(),
+            name: "m".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let reaches_target = graph
+            .inbound_bfs(&target_m, 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        let reaches_other = graph
+            .inbound_bfs(&other_m, 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        assert!(
+            reaches_target,
+            "Target::m() must edge to Target's m (owner-name recovery)"
+        );
+        assert!(
+            !reaches_other,
+            "Target::m() must NOT edge to Other's m (wrong owner)"
+        );
+    }
+
+    // 019 recall-recovery soundness: TWIN OWNERS. Two `impl Target` in distinct
+    // files, each with `fn m`. A `Target::m()` call cannot disambiguate between
+    // them (both owners are named "Target"), so the edge is DROPPED, not
+    // fanned out. This is the uniqueness-guard case.
+    #[test]
+    fn ambiguous_call_with_twin_owner_qualifier_drops_edge() {
+        let graph = build_graph(&[
+            (
+                "a.rs",
+                "pub struct Target;\nimpl Target {\n    pub fn m(&self) -> u32 { 1 }\n}\n",
+            ),
+            (
+                "c.rs",
+                "impl Target {\n    pub fn m(&self) -> u32 { 2 }\n}\n",
+            ),
+            ("caller.rs", "fn drive() -> u32 { Target::m(&Target) }\n"),
+        ]);
+        let drive = sym("caller.rs", "drive");
+        let a_m = SymbolId {
+            path: "a.rs".to_string(),
+            name: "m".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let c_m = SymbolId {
+            path: "c.rs".to_string(),
+            name: "m".to_string(),
+            kind: SymbolKind::Method,
+        };
+        let reaches_a = graph
+            .inbound_bfs(&a_m, 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        let reaches_c = graph
+            .inbound_bfs(&c_m, 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        let hits = usize::from(reaches_a) + usize::from(reaches_c);
+        assert_eq!(
+            hits, 0,
+            "twin `impl Target` owners cannot disambiguate Target::m() -> \
+             edge must be dropped (reaches_a={reaches_a} reaches_c={reaches_c})"
         );
     }
 }

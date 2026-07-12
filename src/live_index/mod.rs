@@ -1,6 +1,7 @@
 mod context_bundle;
 pub mod coupling;
 mod disambiguation;
+pub(crate) use disambiguation::enclosing_impl_owner;
 pub mod frecency;
 pub mod git_temporal;
 // Program 015 SP-0A spike -> C-S1A-002: name-based call graph + inbound BFS,

@@ -26927,11 +26927,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_rename_ambiguous_method_demotes_bare_refs() {
-        // Renaming the SHARED METHOD `new` scoped to Target::new must NOT rewrite
-        // SomeOther::new. `new` has 2 definitions (Target::new, SomeOther::new),
-        // so the bare-name reverse-index refs AND the unscoped qualified matches
-        // are all ambiguous: they are demoted to the uncertain/surfaced-only set.
-        // Only the definition site is renamed.
+        // Renaming the SHARED METHOD `new` scoped to Target::new. `new` has 2
+        // definitions (Target::new, SomeOther::new), so the leaf name alone is
+        // ambiguous. 019 recall-recovery: a call whose IMMEDIATE QUALIFIER equals
+        // the resolved target's UNIQUE `impl` owner IS attributable and stays
+        // writable, so `Target::new()` is RECOVERED (Target and SomeOther are
+        // DISTINCT owner names -> Target is unique). The core SAFETY invariant is
+        // preserved: `SomeOther::new()` (wrong owner) is NEVER rewritten. Before
+        // the recovery upgrade this test asserted main.rs was byte-identical; the
+        // upgrade makes the qualified Target::new() site the correct write, while
+        // the wrong-owner site stays untouched.
         use crate::protocol::edit::BatchRenameInput;
 
         let dir = tempfile::tempdir().unwrap();
@@ -26970,7 +26975,7 @@ mod tests {
             code_only: None,
             working_directory: None,
         };
-        let result = server.batch_rename(Parameters(input)).await;
+        let _result = server.batch_rename(Parameters(input)).await;
 
         // The definition site (Target::new in lib.rs) IS renamed.
         let lib = std::fs::read_to_string(src_dir.join("lib.rs")).unwrap();
@@ -26984,24 +26989,187 @@ mod tests {
             "SomeOther::new definition must be untouched, got: {lib}"
         );
 
-        // main.rs must be BYTE-IDENTICAL to the original: neither call site is a
-        // safe write because `new` is ambiguous across 2 definitions.
+        // RECOVERY: Target::new() call site rewritten to Target::make_new()
+        // because "Target" is a unique owner among `new`'s defs.
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            main.contains("Target::make_new()"),
+            "Target::new() call site must be recovered (unique owner), got: {main}"
+        );
+        // CORE SAFETY: SomeOther::new() (wrong owner) is NEVER rewritten.
+        assert!(
+            main.contains("SomeOther::new()"),
+            "SomeOther::new() call site must be untouched, got: {main}"
+        );
+        assert!(
+            !main.contains("SomeOther::make_new"),
+            "SomeOther::new() must never be rewritten, got: {main}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_rename_ambiguous_method_recovers_unique_owner_calls() {
+        // 019 recall-recovery: `new` is ambiguous (Target::new in a.rs,
+        // Other::new in b.rs). Renaming Target::new must RECOVER the
+        // `Target::new()` call site (Target is a UNIQUE owner among `new`'s
+        // owners) while leaving `Other::new()` and any bare `new()` untouched.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let a_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        let b_content = b"pub struct Other;\nimpl Other {\n    pub fn new() -> Self { Other }\n}\n";
+        // A bare (unqualified) `new()` call carries NO qualifier, so it must
+        // stay demoted (the "bare still demotes" invariant).
+        let main_content =
+            b"fn make() { let _a = Target::new(); let _b = Other::new(); let _c = new(); }\n";
+        std::fs::write(src_dir.join("a.rs"), a_content).unwrap();
+        std::fs::write(src_dir.join("b.rs"), b_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/a.rs", a_content as &[u8]),
+            ("src/b.rs", b_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Target the `new` in a.rs (Target::new).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/a.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let _result = server.batch_rename(Parameters(input)).await;
+
+        // Definition site renamed.
+        let a = std::fs::read_to_string(src_dir.join("a.rs")).unwrap();
+        assert!(
+            a.contains("pub fn make_new() -> Self { Target }"),
+            "Target::new definition must be renamed, got: {a}"
+        );
+        // Other::new definition untouched.
+        let b = std::fs::read_to_string(src_dir.join("b.rs")).unwrap();
+        assert!(
+            b.contains("pub fn new() -> Self { Other }"),
+            "Other::new definition must be untouched, got: {b}"
+        );
+        // RECOVERY: Target::new() call site rewritten to Target::make_new().
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            main.contains("Target::make_new()"),
+            "Target::new() call site must be RECOVERED (unique owner), got: {main}"
+        );
+        // SAFETY: Other::new() call site never touched.
+        assert!(
+            main.contains("Other::new()"),
+            "Other::new() call site must be untouched (wrong owner), got: {main}"
+        );
+        assert!(
+            !main.contains("Other::make_new"),
+            "Other::new() must never be rewritten, got: {main}"
+        );
+        // BARE-DEMOTE invariant: the unqualified `new()` call has no qualifier
+        // to attribute, so it must NOT be rewritten (stays ` new()`, not
+        // ` make_new()`).
+        assert!(
+            main.contains("let _c = new();"),
+            "bare unqualified new() must stay demoted (not rewritten), got: {main}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_rename_twin_owner_demotes_both_call_sites() {
+        // 019 recall-recovery SOUNDNESS (twin-owner guard): TWO `impl Target`
+        // (a.rs and c.rs), both with `fn new`. Renaming one Target::new must
+        // NOT rewrite EITHER `Target::new()` call site — the qualifier
+        // "Target" cannot disambiguate between the two same-owner defs, so the
+        // uniqueness guard fires and both call sites are demoted. This is the
+        // test a demolition of the guard would target; it MUST pass.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let a_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        // Second `impl Target` in a different file, same owner name.
+        let c_content = b"impl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        let main_content = b"fn make() { let _a = Target::new(); }\n";
+        std::fs::write(src_dir.join("a.rs"), a_content).unwrap();
+        std::fs::write(src_dir.join("c.rs"), c_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/a.rs", a_content as &[u8]),
+            ("src/c.rs", c_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Rename the Target::new in a.rs (line 3).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/a.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let result = server.batch_rename(Parameters(input)).await;
+
+        // Definition site (a.rs) IS renamed.
+        let a = std::fs::read_to_string(src_dir.join("a.rs")).unwrap();
+        assert!(
+            a.contains("pub fn make_new() -> Self { Target }"),
+            "targeted Target::new definition must be renamed, got: {a}"
+        );
+
+        // SOUNDNESS: the Target::new() call site must NOT be rewritten — the
+        // twin `impl Target` in c.rs makes the "Target" qualifier ambiguous.
         let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
         assert_eq!(
             main.as_bytes(),
             main_content as &[u8],
-            "main.rs must be byte-unchanged for ambiguous method rename, got: {main}"
+            "twin-owner ambiguity must demote the call site (no write), got: {main}"
         );
         assert!(
             !main.contains("make_new"),
-            "no call site in main.rs may be rewritten, got: {main}"
+            "no call site may be rewritten under twin-owner ambiguity, got: {main}"
         );
-
-        // The demoted bare refs must be surfaced as uncertain / not applied, so the
-        // result does NOT silently claim `constrained` coverage over them.
+        // Must be surfaced as uncertain, not silently claimed.
         assert!(
             result.contains("Uncertain matches") || result.contains("NOT applied"),
-            "ambiguous bare refs must be surfaced as uncertain, got: {result}"
+            "demoted twin-owner call must be surfaced as uncertain, got: {result}"
         );
     }
 

@@ -58,6 +58,40 @@ reconstructed independently. P0-04 failed all three (non-bug) and is excluded.
   The type-scoped reasoning only held for the struct-rename honeytrap (`Target`
   has 1 def). This is why the rule was wrong: it generalized from the honeytrap.
 
+## US1b/US2b — qualifier→owner recall recovery (SUPERIOR fix, research-verified 2026-07-12)
+
+The initial US1/US2 fixes are SOUND but lose recall: an ambiguous name demotes
+(batch_rename) or drops (detect_impact edges) ALL name-only matches, including
+legitimate `Target::method` sites. A tech-researcher investigation (STAY AND FIX,
+high confidence, source-grounded) proved the recall is **recoverable at Tier-0
+with existing machinery** — refuting the spec's earlier "SymbolRecord has no
+owner → must fall back to bare name" assumption:
+
+- `ReferenceRecord.qualified_name: Option<String>` (`src/domain/index.rs`:496)
+  ALREADY retains the qualifier (`Target::new` keeps `Target`; `a::call_a` keeps
+  `a`), built at `src/parsing/xref.rs`:1462-1493.
+- The definition's owner = innermost enclosing `Impl` symbol, found via the
+  EXISTING `find_enclosing_symbol` (`index.rs`:549) + impl-name parse
+  (`src/parsing/languages/rust.rs`:159-191).
+- The write range is already LEAF-only (`xref.rs`:1489), so rewriting
+  `Target::new` never touches the qualifier — recovery is surgical.
+
+**Rule 1 (qualifier→owner match), gated by a uniqueness guard**: keep a
+reference/edge when its immediate qualifier == the resolved target's owner name,
+BUT only if no OTHER ambiguous def shares that owner name (twin `impl Target` in
+two files → qualifier does not disambiguate → MUST demote/drop). Reuse
+`resolve_ambiguous_callee`'s existing "matched more than one → None" drop guard
+(`graph.rs`:322-325). Bare unqualified calls stay demoted/dropped (the sound
+ceiling — defer to the semantic tier). **The twin-owner uniqueness guard is the
+single soundness-critical test.**
+
+**Verdict**: reject `github/stack-graphs` (archived read-only 2025-09-09;
+20 grammars = 20 DSL rule-sets; violates the dependency-freshness invariant).
+Targeted qualifier-match wins on recall-per-soundness-risk. Enable Rust first,
+extend per-grammar with a fixture each. This UPGRADES US1/US2 from
+sound-but-low-recall to sound-AND-high-recall — a proper fix, not a heuristic
+ceiling. Reversible (additive, guard-gated; the fallback IS the shipped behavior).
+
 ## US2 — `detect_impact` confidently wrong (P0)
 
 - **Source**: seed loop (`src/protocol/tools.rs` ~L7463–7476) pushes every
