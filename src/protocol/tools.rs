@@ -7460,17 +7460,114 @@ impl SymForgeServer {
         // default removed, so an empty/shrunken blast radius is self-describing.
         let source_filtered_out = unfiltered_changed_total.saturating_sub(changed_files.len());
 
+        // PART A (019): the seed is a BODY delta, not every symbol of a changed
+        // file. Reparse each changed file's BASE blob and its CURRENT working
+        // tree with the same extractor `diff_symbols` uses
+        // (`extract_symbols_for_diff` -> name+body-hash pairs), then seed only
+        // the symbols whose body was added, modified, or removed. A 1-line edit
+        // in a 20-symbol file now seeds 1 symbol, not 20; a comment/whitespace
+        // shift that leaves every body byte-identical seeds 0.
+        //
+        // Base ref: mirror `merge_git_changed_paths`'s OWN base selection so the
+        // body-delta compares against the same base the changed-file set came
+        // from. `since=<ref>` diffs `<ref>...HEAD`; the `WORKTREE` sentinel and
+        // `base_branch` both diff against the committed tip / branch, with the
+        // working tree as the current side. A mismatched base (e.g. always HEAD)
+        // would find zero deltas for a committed `since` range on a clean tree.
+        let since_trimmed = params
+            .0
+            .since
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let seed_base_ref = match since_trimmed {
+            Some("WORKTREE") => "HEAD",
+            Some(since_ref) => since_ref,
+            None => base_branch.as_deref().unwrap_or("HEAD"),
+        };
         let (changed_symbols, blast_radius) = {
             let guard = self.index.read();
             let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
             for path in &changed_files {
-                if let Some(file) = guard.files.get(path) {
-                    for sym in &file.symbols {
-                        changed_symbols.push(crate::live_index::graph::SymbolId {
-                            path: path.clone(),
-                            name: sym.name.clone(),
-                            kind: sym.kind,
-                        });
+                // Kind lookup for the CURRENT symbols comes from the live index;
+                // removed symbols (absent from current) default to Function to
+                // match the graph's own entry-point default.
+                let kind_by_name: HashMap<&str, crate::domain::SymbolKind> = guard
+                    .files
+                    .get(path)
+                    .map(|f| {
+                        f.symbols
+                            .iter()
+                            .map(|s| (s.name.as_str(), s.kind))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let base_content = repo
+                    .file_at_ref(seed_base_ref, path)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let current_content = repo
+                    .file_from_workdir(path)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+
+                // Unsupported/config languages return None from the extractor;
+                // we cannot body-diff them, so fall back to seeding every
+                // indexed symbol of the file (the old conservative behavior)
+                // rather than silently seeding nothing.
+                let base_syms = crate::parsing::extract_symbols_for_diff(&base_content, path);
+                let current_syms = crate::parsing::extract_symbols_for_diff(&current_content, path);
+                let (Some(base_syms), Some(current_syms)) = (base_syms, current_syms) else {
+                    if let Some(file) = guard.files.get(path) {
+                        for sym in &file.symbols {
+                            changed_symbols.push(crate::live_index::graph::SymbolId {
+                                path: path.clone(),
+                                name: sym.name.clone(),
+                                kind: sym.kind,
+                            });
+                        }
+                    }
+                    continue;
+                };
+
+                // ponytail: name-keyed body-hash maps, matching `diff_symbols`'
+                // own name-keyed comparison. Same-name overloads in one file
+                // collapse to their last body hash; a resolver-aware seed
+                // (C-S2-001) would key on a stable symbol id instead.
+                let base_by_name: HashMap<&str, &str> = base_syms
+                    .iter()
+                    .map(|(n, h)| (n.as_str(), h.as_str()))
+                    .collect();
+                let current_by_name: HashMap<&str, &str> = current_syms
+                    .iter()
+                    .map(|(n, h)| (n.as_str(), h.as_str()))
+                    .collect();
+
+                let mut seed = |name: &str| {
+                    changed_symbols.push(crate::live_index::graph::SymbolId {
+                        path: path.clone(),
+                        name: name.to_string(),
+                        kind: kind_by_name
+                            .get(name)
+                            .copied()
+                            .unwrap_or(crate::domain::SymbolKind::Function),
+                    });
+                };
+
+                // Added (in current, not base) or modified (body hash differs).
+                for (name, cur_hash) in &current_by_name {
+                    match base_by_name.get(name) {
+                        None => seed(name),
+                        Some(base_hash) if base_hash != cur_hash => seed(name),
+                        _ => {}
+                    }
+                }
+                // Removed (in base, not current) — seeded so downstream callers
+                // of a deleted symbol still appear in the blast radius.
+                for name in base_by_name.keys() {
+                    if !current_by_name.contains_key(name) {
+                        seed(name);
                     }
                 }
             }
@@ -7490,7 +7587,20 @@ impl SymForgeServer {
             match params.0.scope {
                 ImpactScope::Symbols => blast_radius
                     .iter()
-                    .map(|node| (node.symbol.name.clone(), node.hop, node.risk))
+                    // PART C (019): carry disambiguating identity. Two blast
+                    // nodes that share a bare name (e.g. `main` in different
+                    // files, or two `run`s the graph kept distinct) must render
+                    // as distinct `path::name` entries, not collapse into one
+                    // indistinguishable `"main"`. The path already disambiguates
+                    // same-name defs across files; kind is folded into the node
+                    // identity by the graph, so `path::name` is sufficient here.
+                    .map(|node| {
+                        (
+                            format!("{}::{}", node.symbol.path, node.symbol.name),
+                            node.hop,
+                            node.risk,
+                        )
+                    })
                     .collect(),
                 ImpactScope::Files => {
                     let mut by_file: HashMap<String, (u32, crate::live_index::graph::RiskTier)> =
@@ -18801,6 +18911,165 @@ mod tests {
         assert!(
             result.contains("include_data"),
             "the disclosure must name the include_data recovery lever: {result}"
+        );
+    }
+
+    /// PART C (019 detect_impact fix): scope=symbols blast entries must carry
+    /// disambiguating identity (path), so two entry points named `main` in
+    /// different files render as DISTINCT lines instead of collapsing into two
+    /// indistinguishable `"main"` entries. RED on the pre-fix formatter, which
+    /// emitted only `node.symbol.name`.
+    #[tokio::test]
+    async fn test_detect_impact_symbols_scope_disambiguates_same_name_nodes() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        // Commit a base `core`, then modify it in the working tree so core.rs
+        // is a changed SOURCE file that seeds the blast.
+        fs::write(
+            repo.path().join("src/core.rs"),
+            "pub fn core() -> u32 { 1 }\n",
+        )
+        .expect("write core");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(
+            repo.path().join("src/core.rs"),
+            "pub fn core() -> u32 { 2 }\n",
+        )
+        .expect("modify core");
+
+        // Index: `core` plus two files whose `main` (enclosing index 0) calls it.
+        // `core` is a UNIQUE name -> PART B one-def rule links both callers.
+        let core_file = make_file(
+            "src/core.rs",
+            b"pub fn core() -> u32 { 2 }\n",
+            vec![make_symbol("core", SymbolKind::Function, 0, 0)],
+        );
+        let a_file = make_file_with_refs(
+            "src/a.rs",
+            b"fn main() { core(); }\n",
+            vec![make_symbol("main", SymbolKind::Function, 0, 0)],
+            vec![make_ref("core", None, ReferenceKind::Call, 0, Some(0))],
+        );
+        let b_file = make_file_with_refs(
+            "src/b.rs",
+            b"fn main() { core(); }\n",
+            vec![make_symbol("main", SymbolKind::Function, 0, 0)],
+            vec![make_ref("core", None, ReferenceKind::Call, 0, Some(0))],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![core_file, a_file, b_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        // Both `main` entry points are in the blast; their labels must be
+        // distinct (path-qualified), not two bare `"main"` collapses.
+        assert!(
+            result.contains("src/a.rs::main") && result.contains("src/b.rs::main"),
+            "two same-name blast nodes must render as distinct path-qualified \
+             entries: {result}"
+        );
+    }
+
+    /// PART A (019 detect_impact fix): the seed must be a BODY delta, not every
+    /// symbol of a changed file. Editing ONLY one function's body in a
+    /// multi-symbol file must seed exactly that ONE symbol as changed — not all
+    /// symbols in the file. RED on the pre-fix seed loop, which pushed every
+    /// `file.symbols` entry.
+    #[tokio::test]
+    async fn test_detect_impact_seeds_only_body_changed_symbols() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        let base = "pub fn kept() -> u32 { 1 }\npub fn changed() -> u32 { 2 }\n";
+        let modified = "pub fn kept() -> u32 { 1 }\npub fn changed() -> u32 { 99 }\n";
+        fs::write(repo.path().join("src/multi.rs"), base).expect("write base");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(repo.path().join("src/multi.rs"), modified).expect("modify changed body");
+
+        // Index mirrors the working tree (both symbols present).
+        let multi_file = make_file(
+            "src/multi.rs",
+            modified.as_bytes(),
+            vec![
+                make_symbol("kept", SymbolKind::Function, 0, 0),
+                make_symbol("changed", SymbolKind::Function, 1, 1),
+            ],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![multi_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        assert!(
+            result.contains("\"changed\""),
+            "the edited function must be seeded as changed: {result}"
+        );
+        assert!(
+            !result.contains("\"kept\""),
+            "an unedited sibling symbol must NOT be seeded as changed: {result}"
+        );
+    }
+
+    /// PART A (019): a comment/whitespace-only shift that leaves every function
+    /// body byte-identical must seed ZERO changed symbols. RED on the pre-fix
+    /// loop, which seeded all symbols regardless of body deltas.
+    #[tokio::test]
+    async fn test_detect_impact_whitespace_only_change_seeds_nothing() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        let base = "pub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n";
+        // Add a leading comment line: symbol bodies are byte-identical, only
+        // their file position shifts.
+        let shifted = "// unrelated comment\npub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n";
+        fs::write(repo.path().join("src/ws.rs"), base).expect("write base");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(repo.path().join("src/ws.rs"), shifted).expect("comment-only shift");
+
+        let ws_file = make_file(
+            "src/ws.rs",
+            shifted.as_bytes(),
+            vec![
+                make_symbol("a", SymbolKind::Function, 1, 1),
+                make_symbol("b", SymbolKind::Function, 2, 2),
+            ],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![ws_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        assert!(
+            result.contains("0 changed symbol(s)"),
+            "a comment/whitespace-only shift must seed zero changed symbols: {result}"
         );
     }
 

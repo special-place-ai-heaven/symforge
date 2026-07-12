@@ -60,9 +60,17 @@ pub struct GraphProjection {
 
 impl GraphProjection {
     /// Build the projection from a frozen index snapshot. Nodes are every
-    /// symbol definition; edges are caller -> callee for each `Call` reference,
-    /// where the callee is every same-name definition in the repo (syntactic,
-    /// name-based — the over-approximation the v1 resolver will later narrow).
+    /// symbol definition; edges are caller -> callee for each `Call` reference.
+    ///
+    /// Callee resolution is ambiguity-scoped (019 detect_impact correctness):
+    /// a `Call` whose bare name maps to exactly ONE definition links that def
+    /// (bare-name resolution is correct and unambiguous). A name that maps to
+    /// MULTIPLE defs is NOT fanned out to all of them — the old v1 behavior
+    /// linked every same-name def, so a call to `run()` became an edge to every
+    /// `run` in the repo, exploding `detect_impact`'s blast radius with wrong
+    /// callers. Instead we try to disambiguate via the call site's
+    /// `qualified_name` module segment; if that does not pick exactly one def,
+    /// the edge is dropped rather than inventing N wrong edges.
     pub fn from_index(index: &LiveIndex) -> Self {
         // Pass 1: collect every definition keyed by name.
         let mut defs_by_name: HashMap<&str, Vec<SymbolId>> = HashMap::new();
@@ -105,15 +113,30 @@ impl GraphProjection {
                 let Some(callees) = defs_by_name.get(r.name.as_str()) else {
                     continue;
                 };
-                for callee in callees {
-                    if *callee == caller {
-                        continue; // skip self-recursion edges
-                    }
-                    in_edges
-                        .entry(callee.clone())
-                        .or_default()
-                        .push(caller.clone());
+                // Ambiguity-scoped callee resolution (SAME principle as Item 1's
+                // ambiguity gate): one def -> link it; many defs -> disambiguate
+                // by the call site's module qualifier, else drop the edge.
+                let resolved: Option<&SymbolId> = match callees.as_slice() {
+                    [only] => Some(only),
+                    many => resolve_ambiguous_callee(many, r.qualified_name.as_deref()),
+                };
+                let Some(callee) = resolved else {
+                    // ponytail: an ambiguous bare-name call with no resolving
+                    // qualifier is dropped (0 edges) rather than fanned out to
+                    // all N same-name defs. A real name resolver (C-S2-001)
+                    // would recover the true edge; until then, dropping keeps
+                    // detect_impact's blast radius honest instead of confidently
+                    // wrong. Ceiling: cross-file overloads that share a name and
+                    // carry no module qualifier lose their (single) true edge.
+                    continue;
+                };
+                if *callee == caller {
+                    continue; // skip self-recursion edges
                 }
+                in_edges
+                    .entry(callee.clone())
+                    .or_default()
+                    .push(caller.clone());
             }
         }
 
@@ -263,6 +286,51 @@ pub struct BlastNode {
     pub symbol: SymbolId,
     pub hop: u32,
     pub risk: RiskTier,
+}
+
+/// Disambiguate a `Call` to an ambiguous bare name (>1 same-name def) using the
+/// call site's `qualified_name` module segment (e.g. `"a::run"` -> module hint
+/// `"a"`). Returns `Some(def)` only when exactly ONE candidate's path matches
+/// the hint (file stem or a path component); otherwise `None`, so the caller
+/// drops the edge rather than fanning out to all N candidates.
+///
+/// ponytail: the hint match is a syntactic path-segment heuristic, not real
+/// name resolution. It recovers the common `mod::name` case (the qualified
+/// module-call fixture) without inventing wrong edges; the resolver at
+/// C-S2-001 supersedes it. When the hint is absent or matches zero/multiple
+/// candidates, we return `None` (drop) — safety over recall.
+fn resolve_ambiguous_callee<'a>(
+    candidates: &'a [SymbolId],
+    qualified_name: Option<&str>,
+) -> Option<&'a SymbolId> {
+    // Module hint = the segment before the last `::` (last `::` separates the
+    // module path from the called name). No `::` -> no hint -> drop.
+    let qn = qualified_name?;
+    let module_hint = qn.rsplit_once("::").map(|(head, _)| head)?;
+    // Use the innermost module segment (e.g. `crate::a` -> `a`).
+    let hint = module_hint.rsplit("::").next().unwrap_or(module_hint);
+    if hint.is_empty() {
+        return None;
+    }
+    let mut matched: Option<&SymbolId> = None;
+    for cand in candidates {
+        let path_matches = std::path::Path::new(&cand.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| stem == hint)
+            .unwrap_or(false)
+            || cand
+                .path
+                .split(['/', '\\'])
+                .any(|component| component == hint);
+        if path_matches {
+            if matched.is_some() {
+                return None; // hint matched more than one candidate -> ambiguous
+            }
+            matched = Some(cand);
+        }
+    }
+    matched
 }
 
 /// A `fn main` is the conventional program entry point across every language
@@ -438,5 +506,38 @@ mod tests {
     fn compute_impact_empty_changed_set_yields_empty_blast() {
         let graph = build_graph(&[("lib.rs", "pub fn core() -> u32 { 1 }\n")]);
         assert!(compute_impact(&graph, &[], 5).is_empty());
+    }
+
+    // PART B (019 detect_impact fix): a bare `run()` call must NOT fan out to
+    // every `run` definition in the repo. When the callee name is ambiguous and
+    // the call site carries no disambiguating qualifier, the edge is dropped
+    // rather than inventing N wrong caller->callee edges. Changing either `run`
+    // must therefore reach AT MOST the correctly-scoped one — never both.
+    #[test]
+    fn ambiguous_bare_call_does_not_fan_out_to_all_same_name_defs() {
+        let graph = build_graph(&[
+            ("a.rs", "pub fn run() -> u32 { 1 }\n"),
+            ("b.rs", "pub fn run() -> u32 { 2 }\n"),
+            ("caller.rs", "fn drive() -> u32 { run() }\n"),
+        ]);
+        // Inspect the raw call edges, not the deduped blast (compute_impact
+        // collapses a node reached from two seeds into one entry, which would
+        // mask the fan-out). `drive` must be an inbound caller of AT MOST one
+        // `run` def, not both.
+        let drive = sym("caller.rs", "drive");
+        let reaches_a = graph
+            .inbound_bfs(&sym("a.rs", "run"), 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        let reaches_b = graph
+            .inbound_bfs(&sym("b.rs", "run"), 2, 100)
+            .iter()
+            .any(|(id, _)| *id == drive);
+        let hits = usize::from(reaches_a) + usize::from(reaches_b);
+        assert!(
+            hits <= 1,
+            "bare ambiguous run() must not link drive to BOTH run defs \
+             (reaches_a={reaches_a} reaches_b={reaches_b})"
+        );
     }
 }

@@ -220,13 +220,31 @@ Disk discipline (CLAUDE.md): `target/` is on E:. Run full gates locally, but
   `projects` incl. `"*"`. **RED (import)**: Python pkg with `from .b import f`;
   assert `find_dependents(pkg/b.py)` includes `pkg/a.py` and excludes an
   unrelated same-stem module.
-- **GREEN**: centralize selector validation so all selector-bearing tools use
-  one guard covering both params and both directions (match-local → proceed;
-  foreign/over-broad → typed refuse) — **do not** naively swap the three tools to
-  `foreign_project_refusal` (it takes only singular `project` and, per P2-10,
-  under-refuses `projects=["*"]`). Add a `relative_import` capture to
-  `PYTHON_XREF_QUERY` and resolve the target by counting `import_prefix` dots
-  against the importer's package directory.
+- **GREEN**: the new guard for the three tools MUST satisfy ALL THREE
+  simultaneously (verified against `tests/serve_http_attach.rs:354`
+  `cross_project_targeting_is_refused_over_http`, which is test-locked):
+  1. a selector that **resolves to the bound project** (name / key / root, like
+     `foreign_project_refusal`) → **proceed** (`None`) — this is the benchmark's
+     actual fix (matching-local currently wrongly refused);
+  2. a **foreign** (`"other-proj"`), **multi** (`["a","b"]`), or **wildcard**
+     (`["*"]`) selector → **refuse** (the locked test asserts refusal on exactly
+     these three);
+  3. the no-daemon refusal message MUST still contain the substring
+     **"/mcp HTTP transport"** (the locked test asserts this) — so DO NOT reuse
+     `foreign_project_refusal`'s "not available on this connection" wording
+     verbatim; the transport-honest message must be preserved for the no-daemon
+     path. This is a constraint the benchmark report and the first-pass review
+     both missed — a naive swap to `foreign_project_refusal` breaks the message
+     assertion even though it satisfies (1) and (2).
+  Cleanest shape: extend `local_cross_project_refusal` to take the bound project
+  identity and return `None` when the selector resolves to it, else the existing
+  transport-naming refusal — covering both `project` and `projects`. Also add a
+  `relative_import` capture to `PYTHON_XREF_QUERY` and resolve the target by
+  counting `import_prefix` dots against the importer's package directory.
+- **NOTE (verified)**: the `/mcp` cross-project refusal is DELIBERATE D16
+  containment (see `docs/reviews/symforge-defect-ledger.md:82,102`), NOT a bug to
+  remove. The bug is only that it's **over-broad** — it refuses a matching-local
+  selector too. Narrow it to foreign/multi/wildcard; keep the containment.
 - **NEIGHBORS**: `get_symbol`/`search_files`/`get_file_context` selector paths
   (must stay correct); daemon vs local path (selector bug only manifests
   local); `find_dependents` TS/Go cyclic/aliased import cases; 017 selector
