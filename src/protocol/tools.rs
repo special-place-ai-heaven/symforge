@@ -10454,6 +10454,21 @@ impl SymForgeServer {
             .to_string(),
         );
         if let Some(result) = self.proxy_tool_call("status", &request).await {
+            // US5c (P2 correctness/trust): `reset_calibration=true` MUST reset the
+            // PROXY-owned durable store HERE. The proxy owns `stel_ledger_store`;
+            // the storeless worker it proxied to resets nothing, so without this
+            // the call returned success-shaped `Found` while the durable
+            // calibration was left byte-identical — a silent no-op. Reset BEFORE
+            // building `proxy_owned_status_lines` below so the overlaid
+            // calibration lines reflect the post-reset (`deferred`) state, not
+            // stale pre-reset samples. The receipt mirrors the local path's
+            // `reset_note` wording and is appended to the body so the operator
+            // sees the reset actually happened (or an honest no-store note).
+            let reset_receipt = if request.reset_calibration == Some(true) {
+                Some(self.proxy_reset_calibration_receipt())
+            } else {
+                None
+            };
             // D2-ROOT: the daemon worker owns the populated INDEX but has an EMPTY
             // session ledger + NO durable store, so its proxied body reads
             // `ledger_events: 0`, `last_ledger_*: none`, `durable_ledger:
@@ -10468,7 +10483,12 @@ impl SymForgeServer {
             let result = overlay_proxy_status_lines(result, &self.proxy_owned_status_lines());
             // Mirror `health`: warn loudly if the daemon we proxied to runs an
             // older binary than this front-end.
-            let body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
+            let mut body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
+            // Surface the honest reset receipt, mirroring the local path's
+            // `format!("{body}\n{note}")` placement.
+            if let Some(note) = reset_receipt {
+                body = format!("{body}\n{note}");
+            }
             return statused_tool_result(body, OutcomeClass::Found);
         }
 
@@ -10629,6 +10649,44 @@ impl SymForgeServer {
             ctx = ctx.with_calibration_verdict(verdict);
         }
         crate::stel::render_proxy_owned_lines(&ctx)
+    }
+
+    /// US5c (P2 correctness/trust): reset the PROXY-owned durable calibration
+    /// store and return an honest receipt line.
+    ///
+    /// In the default daemon-proxy topology the PROXY owns `stel_ledger_store`;
+    /// the storeless daemon worker it proxies to has nothing to reset. So a
+    /// `status(reset_calibration=true)` MUST reset HERE, or it returns a
+    /// success-shaped `Found` while the durable calibration is left
+    /// byte-identical — a silent no-op that lies to the operator. Called by the
+    /// proxy branch of [`Self::status_stel_tool`] BEFORE building
+    /// [`Self::proxy_owned_status_lines`], so the overlaid calibration lines
+    /// reflect the post-reset (`deferred`) state, not stale pre-reset samples.
+    ///
+    /// The receipt wording mirrors `render_stel_status_body`'s `reset_note` (the
+    /// local/no-daemon path) verbatim, so the operator sees identical honest
+    /// language whether the reset ran locally or through the proxy: a real
+    /// cleared-sample count with a store, or the "no durable store" no-op note
+    /// without one.
+    #[cfg(feature = "server")]
+    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
+        match self.reset_calibration() {
+            Some(cleared) => format!(
+                "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
+            ),
+            None => {
+                "calibration_reset: no durable store; in-memory calibration is already deferred"
+                    .to_string()
+            }
+        }
+    }
+
+    /// Embed/no-`server` builds have no durable calibration store wired, so the
+    /// reset is an honest no-op — mirrors the `reset_calibration() == None` arm
+    /// of the local path.
+    #[cfg(not(feature = "server"))]
+    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
+        "calibration_reset: no durable store; in-memory calibration is already deferred".to_string()
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -11449,6 +11507,96 @@ mod tests {
         assert!(
             bare_overlaid.contains("durable_ledger: unavailable"),
             "a no-store proxy stays unavailable after overlay:\n{bare_overlaid}"
+        );
+    }
+
+    /// US5c (P2 correctness/trust): in the daemon-proxy topology,
+    /// `status(reset_calibration=true)` MUST actually reset the PROXY-owned
+    /// durable calibration store (the proxy owns it; the storeless worker it
+    /// proxies to resets nothing) AND surface an honest receipt. Before the fix
+    /// the proxy branch returned success-shaped `Found` while leaving the durable
+    /// store byte-identical — a silent no-op. This pins the reset + receipt the
+    /// proxy branch now performs, and that the post-reset verdict overlaid onto
+    /// the worker body reads `deferred`, not the stale pre-reset `accumulating`.
+    #[test]
+    fn daemon_proxy_reset_calibration_clears_proxy_store_and_reports_receipt() {
+        use crate::stel::calibration::CalibrationVerdict;
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        // Seed the PROXY's durable store with samples so calibration accumulates
+        // HERE — exactly the state a real proxy carries while the worker is blind.
+        let store =
+            StelLedgerStore::open_in_memory("proxy-reset").expect("in-memory durable store");
+        store.record(&sample_durable_event());
+        store.record(&sample_durable_event());
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+
+        // Precondition: the proxy store is accumulating (2 samples).
+        match proxy.durable_calibration_verdict() {
+            Some(CalibrationVerdict::Accumulating { n, .. }) => assert_eq!(n, 2),
+            other => panic!("expected accumulating precondition, got {other:?}"),
+        }
+
+        // The proxy-branch reset the fix performs: clear the PROXY-owned store and
+        // return an honest receipt. This is what `status_stel_tool`'s proxy branch
+        // invokes when `reset_calibration == Some(true)`.
+        let receipt = proxy.proxy_reset_calibration_receipt();
+
+        // 1) The durable store was actually cleared to deferred (the reset is real,
+        //    not a success-shaped no-op).
+        assert_eq!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Deferred),
+            "reset_calibration in the proxy branch must clear the proxy's durable store to deferred"
+        );
+
+        // 2) The receipt mirrors `render_stel_status_body`'s reset_note wording, and
+        //    reports the 2 cleared samples honestly.
+        assert_eq!(
+            receipt, "calibration_reset: cleared 2 sample(s) + active tuning (state -> deferred)",
+            "proxy reset receipt must mirror the local reset_note wording"
+        );
+
+        // 3) The proxy-owned overlay lines built AFTER the reset reflect the
+        //    post-reset (deferred) state, not the stale pre-reset accumulating one.
+        let overlaid = super::overlay_proxy_status_lines(
+            worker_full_status_body(),
+            &proxy.proxy_owned_status_lines(),
+        );
+        assert!(
+            overlaid.contains("calibration: deferred"),
+            "overlay after reset must show deferred calibration:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("calibration: accumulating"),
+            "overlay after reset must NOT show stale accumulating calibration:\n{overlaid}"
+        );
+    }
+
+    /// Honesty for the no-store proxy: `reset_calibration=true` in the proxy
+    /// branch with NO durable store attached must NOT claim a reset it did not
+    /// perform — it returns the honest "no durable store" receipt, matching the
+    /// local path's wording.
+    #[test]
+    fn daemon_proxy_reset_calibration_no_store_reports_honest_no_op() {
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let bare = SymForgeServer::new_daemon_proxy(client);
+        assert_eq!(
+            bare.proxy_reset_calibration_receipt(),
+            "calibration_reset: no durable store; in-memory calibration is already deferred",
+            "a no-store proxy must report the honest no-op receipt, not a false reset"
         );
     }
 
