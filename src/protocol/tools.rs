@@ -2772,37 +2772,6 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
     anchored_search_evidence(anchors, "reference anchors")
 }
 
-/// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
-/// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
-/// stdio/embed, or daemon-degraded) execution path. When a `project`/`projects`
-/// param is present and we are about to run LOCALLY, return an honest refusal
-/// instead of silently ignoring the target and serving the active project only.
-/// Returns the refusal message when the request is cross-project, else `None`.
-///
-/// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
-/// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
-/// is `None`), so this is the guard that contains D16's silent-wrong half —
-/// `/mcp` loudly refuses cross-project targeting rather than silently serving the
-/// single bound index. `tests/serve_http_attach.rs` locks it end-to-end.
-fn local_cross_project_refusal(
-    project: Option<&str>,
-    projects: Option<&[String]>,
-) -> Option<String> {
-    let has_project = project.map(|p| !p.trim().is_empty()).unwrap_or(false);
-    let has_projects = projects.map(|p| !p.is_empty()).unwrap_or(false);
-    if has_project || has_projects {
-        Some(
-            "Cross-project queries (project/projects) require the daemon: the \
-             working set of open projects lives on the daemon transport, not on \
-             the /mcp HTTP transport, stdio/embed, or while the daemon is \
-             unreachable. Start the daemon to query across projects."
-                .to_string(),
-        )
-    } else {
-        None
-    }
-}
-
 fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
     match kind_filter {
         Some("call") => Some(ReferenceKind::Call),
@@ -4982,8 +4951,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): no daemon here -> no working set. Honest refusal
         // for a cross-project request instead of a silent single-project answer.
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -5145,8 +5114,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): honest refusal for a cross-project request with
         // no daemon (no working set on the local path).
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -6765,6 +6734,32 @@ impl SymForgeServer {
         })
     }
 
+    /// True when an explicit `project`/`projects` selector RESOLVES TO THE BOUND
+    /// project: it equals the bound project name, the bound root's deterministic
+    /// project key, or the bound root path (either slash flavor). Shared by both
+    /// project-refusal guards so the two agree on what "local" means; an empty or
+    /// whitespace-only selector is treated as absent (returns false — the caller
+    /// decides how to handle "no selector").
+    fn selector_matches_bound_project(&self, selector: &str) -> bool {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return false;
+        }
+        if selector == self.project_name {
+            return true;
+        }
+        if let Some(root) = self.capture_repo_root().as_deref() {
+            if selector == crate::daemon::project_key(root) {
+                return true;
+            }
+            let root_text = root.display().to_string();
+            if selector == root_text || selector == root_text.replace('\\', "/") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Task 4: local/embedded servers are bound to exactly ONE project. When a
     /// tool call reaches local execution (stdio/embed, or a degraded daemon
     /// fallback) carrying an explicit `project` selector that does not match
@@ -6775,19 +6770,10 @@ impl SymForgeServer {
     /// or matches.
     pub(crate) fn foreign_project_refusal(&self, project: Option<&str>) -> Option<String> {
         let selector = project.map(str::trim).filter(|p| !p.is_empty())?;
-        if selector == self.project_name {
+        if self.selector_matches_bound_project(selector) {
             return None;
         }
         let bound_root = self.capture_repo_root();
-        if let Some(root) = bound_root.as_deref() {
-            if selector == crate::daemon::project_key(root) {
-                return None;
-            }
-            let root_text = root.display().to_string();
-            if selector == root_text || selector == root_text.replace('\\', "/") {
-                return None;
-            }
-        }
         Some(format!(
             "project '{selector}' is not available on this connection: this server is bound \
              to the single project '{}'{}. Explicit project routing requires the daemon \
@@ -6798,6 +6784,64 @@ impl SymForgeServer {
                 .map(|root| format!(" ({})", root.display()))
                 .unwrap_or_default()
         ))
+    }
+
+    /// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
+    /// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
+    /// stdio/embed, or daemon-degraded) execution path. `search_symbols`,
+    /// `search_text`, and `find_references` gate their no-daemon local path on this
+    /// guard. Returns the refusal message when the request is GENUINELY
+    /// cross-project, else `None` (proceed).
+    ///
+    /// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
+    /// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
+    /// is `None`), so this contains D16's silent-wrong half — `/mcp` LOUDLY refuses
+    /// cross-project targeting rather than silently serving the single bound index.
+    /// `tests/serve_http_attach.rs` locks it end-to-end.
+    ///
+    /// The containment is deliberately NARROW: a selector that RESOLVES TO THE BOUND
+    /// project (its name, its root's project key, or its root path) is answerable
+    /// locally, so it PROCEEDS — only foreign, multi-project, or wildcard (`*`)
+    /// selectors, which need the daemon working set, are refused. This shares
+    /// `selector_matches_bound_project` with `foreign_project_refusal` so both guards
+    /// agree on what counts as local; only the refusal MESSAGE differs (this one
+    /// names the `/mcp` transport for the no-daemon path).
+    fn local_cross_project_refusal(
+        &self,
+        project: Option<&str>,
+        projects: Option<&[String]>,
+    ) -> Option<String> {
+        // Gather every non-empty selector from both the singular and plural params.
+        let mut selectors: Vec<&str> = Vec::new();
+        if let Some(p) = project.map(str::trim).filter(|p| !p.is_empty()) {
+            selectors.push(p);
+        }
+        if let Some(list) = projects {
+            selectors.extend(list.iter().map(|p| p.trim()).filter(|p| !p.is_empty()));
+        }
+
+        // No selector at all -> proceed on the normal single-project path.
+        if selectors.is_empty() {
+            return None;
+        }
+
+        // A wildcard, or ANY selector that does not resolve to the bound project,
+        // requires the daemon working set -> refuse honestly. Only when EVERY
+        // selector resolves to the bound project can we answer locally.
+        let all_local = selectors
+            .iter()
+            .all(|selector| *selector != "*" && self.selector_matches_bound_project(selector));
+        if all_local {
+            return None;
+        }
+
+        Some(
+            "Cross-project queries (project/projects) require the daemon: the \
+             working set of open projects lives on the daemon transport, not on \
+             the /mcp HTTP transport, stdio/embed, or while the daemon is \
+             unreachable. Start the daemon to query across projects."
+                .to_string(),
+        )
     }
 
     /// Reindex a directory from scratch — replaces the current index, restarts watcher, triggers
@@ -8047,8 +8091,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): honest refusal for a cross-project request with
         // no daemon (no working set on the local path).
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -15162,6 +15206,90 @@ mod tests {
         assert!(
             !conflict.starts_with("Indexed "),
             "conflict must not report synthetic indexing success: {conflict}"
+        );
+    }
+
+    #[test]
+    fn local_cross_project_refusal_allows_matching_local_selector() {
+        // SUB-FIX A: search_symbols/search_text/find_references gate their no-daemon
+        // local path on `local_cross_project_refusal`. It must PROCEED (return None,
+        // same as no selector) when the selector RESOLVES TO THE BOUND PROJECT — by
+        // name, by the bound root's project key, or by the root path — and only
+        // refuse foreign/multi/wildcard targets. Pre-fix it refused ANY non-empty
+        // selector, wrongly rejecting a matching-local one.
+        let repo = TempDir::new().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let server = make_server_with_root(make_live_index_empty(), Some(root.clone()));
+
+        // No selector at all -> proceed (control).
+        assert!(
+            server.local_cross_project_refusal(None, None).is_none(),
+            "no selector must proceed"
+        );
+
+        // Matching-local by project NAME -> proceed (the fix).
+        assert!(
+            server
+                .local_cross_project_refusal(Some("test_project"), None)
+                .is_none(),
+            "a selector equal to the bound project name must PROCEED, not refuse"
+        );
+
+        // Matching-local by the bound root's deterministic project key -> proceed.
+        let key = crate::daemon::project_key(&root);
+        assert!(
+            server
+                .local_cross_project_refusal(Some(key.as_str()), None)
+                .is_none(),
+            "a selector equal to the bound root's project key must PROCEED"
+        );
+
+        // Matching-local by root PATH (forward-slash form) -> proceed.
+        let root_fwd = root.display().to_string().replace('\\', "/");
+        assert!(
+            server
+                .local_cross_project_refusal(Some(root_fwd.as_str()), None)
+                .is_none(),
+            "a selector equal to the bound root path must PROCEED"
+        );
+
+        // Matching-local through the PLURAL `projects` selector -> proceed.
+        let plural_local = vec!["test_project".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(plural_local.as_slice()))
+                .is_none(),
+            "a plural projects=[bound name] must PROCEED"
+        );
+
+        // Foreign singular selector -> refuse, and the message must still name the
+        // /mcp transport (the D16 containment wording is preserved).
+        let foreign = server
+            .local_cross_project_refusal(Some("other-proj"), None)
+            .expect("a foreign project selector must still refuse");
+        assert!(
+            foreign.contains("/mcp HTTP transport"),
+            "the foreign refusal must still name the /mcp transport, got: {foreign}"
+        );
+
+        // Wildcard -> refuse (cross-project unanswerable without a daemon working set).
+        let wildcard = vec!["*".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(wildcard.as_slice()))
+                .expect("wildcard projects must refuse")
+                .contains("/mcp HTTP transport"),
+            "wildcard refusal must name the /mcp transport"
+        );
+
+        // Multiple distinct non-bound projects -> refuse.
+        let multi = vec!["a".to_string(), "b".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(multi.as_slice()))
+                .expect("multi-project projects must refuse")
+                .contains("/mcp HTTP transport"),
+            "multi-project refusal must name the /mcp transport"
         );
     }
 

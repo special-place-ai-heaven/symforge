@@ -83,6 +83,12 @@ const PYTHON_XREF_QUERY: &str = r#"
 (import_from_statement module_name: (dotted_name (identifier) @ref.import))
 (import_from_statement name: (dotted_name (identifier) @ref.import))
 
+; Relative from-imports: from .b import f / from ..pkg import y
+; The module lives on a `relative_import` node (import_prefix dots + optional
+; dotted_name). Capture the whole node so its text ("." / ".b" / "..pkg")
+; reaches the consumer, which resolves it against the importer's package.
+(import_from_statement module_name: (relative_import) @ref.import_relative)
+
 ; Import alias: import numpy as np
 (aliased_import name: (dotted_name (identifier) @import.original) alias: (identifier) @import.alias)
 
@@ -1394,6 +1400,7 @@ pub fn extract_references(
         let mut ref_qualified_call: Option<Node> = None;
         let mut ref_method_call: Option<Node> = None;
         let mut ref_import: Option<Node> = None;
+        let mut ref_import_relative: Option<Node> = None;
         let mut ref_type: Option<Node> = None;
         let mut ref_macro: Option<Node> = None;
         let mut import_original: Option<Node> = None;
@@ -1416,6 +1423,9 @@ pub fn extract_references(
                 }
                 "ref.import" => {
                     ref_import = Some(node);
+                }
+                "ref.import_relative" => {
+                    ref_import_relative = Some(node);
                 }
                 "ref.type" => {
                     ref_type = Some(node);
@@ -1542,6 +1552,25 @@ pub fn extract_references(
 
             for import_text in import_texts {
                 push_import_reference(&mut references, &import_text, import_node);
+            }
+        }
+
+        // Python relative from-import: `from .b import f` / `from ..pkg import y`.
+        // The captured `relative_import` node text is the module path WITH its
+        // leading import_prefix dots (".b", "..pkg", or a bare "."/".." when no
+        // module segment follows). Preserve the dots verbatim in `qualified_name`
+        // so the dependents resolver can count them against the importer's
+        // package; `push_import_reference` reduces the trailing segment to the
+        // reference `name`. A bare "."/".." (no dotted_name) names no module, so
+        // there is nothing to emit.
+        if let Some(rel_node) = ref_import_relative
+            && let Ok(rel_text) = rel_node.utf8_text(source_bytes)
+        {
+            let rel_text = rel_text.trim();
+            if rel_text.trim_start_matches('.').is_empty() {
+                // `from . import x` — package-only import, no module segment.
+            } else {
+                push_import_reference(&mut references, rel_text, rel_node);
             }
         }
 
@@ -2497,6 +2526,44 @@ fn run() {
             refs.iter().any(|r| r.kind == ReferenceKind::Import),
             "should have Import ref, refs: {:?}",
             refs
+        );
+    }
+
+    #[test]
+    fn test_python_relative_import_single_dot_captures_module_with_prefix() {
+        // `from .b import f` — the module lives on a `relative_import` node
+        // (import_prefix `.` + dotted_name `b`), which the pre-fix query did not
+        // capture at all, so `find_dependents` missed the real importer.
+        let (refs, _) = parse_and_extract("from .b import f", LanguageId::Python);
+        let import_ref = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Import && r.name == "b")
+            .unwrap_or_else(|| {
+                panic!("relative import `.b` should yield an Import ref, refs: {refs:?}")
+            });
+        // The leading dot MUST be preserved on the qualified path so the consumer
+        // can resolve the module against the importer's package.
+        assert_eq!(
+            import_ref.qualified_name.as_deref(),
+            Some(".b"),
+            "relative import qualified_name should retain the import_prefix dots, refs: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_relative_import_parent_dot_captures_module_with_prefix() {
+        // `from ..pkg import y` — two dots (parent package) + dotted_name `pkg`.
+        let (refs, _) = parse_and_extract("from ..pkg import y", LanguageId::Python);
+        let import_ref = refs
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Import && r.name == "pkg")
+            .unwrap_or_else(|| {
+                panic!("relative import `..pkg` should yield an Import ref, refs: {refs:?}")
+            });
+        assert_eq!(
+            import_ref.qualified_name.as_deref(),
+            Some("..pkg"),
+            "parent relative import should retain both leading dots, refs: {refs:?}"
         );
     }
 
