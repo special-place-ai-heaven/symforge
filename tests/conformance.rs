@@ -493,7 +493,11 @@ fn estimate_parameter_on_read_tools() {
         "analyze_file_impact",
         "what_changed",
         "diff_symbols",
-        "validate_file_syntax",
+        // NOTE: validate_file_syntax is intentionally NOT here. Its output is a
+        // small, deterministic diagnostic (Status/Diagnostic/Byte span), so an
+        // `estimate` token-preview mode has no meaningful semantics — the field
+        // was removed rather than left as a silent inert flag. Do not re-add it
+        // without wiring real estimate behaviour into the handler.
     ];
 
     for tool_name in estimate_tools {

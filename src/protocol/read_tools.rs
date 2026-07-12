@@ -407,9 +407,6 @@ pub(crate) struct ValidateFileSyntaxInput {
     #[serde(default)]
     pub project: Option<String>,
     pub path: String,
-    /// When true, return an approximate token cost estimate instead of actual content.
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub estimate: Option<bool>,
 }
 
 /// Input for `find_dependents`.

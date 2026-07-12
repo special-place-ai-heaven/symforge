@@ -13630,7 +13630,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "Cargo.toml".to_string(),
-                estimate: None,
             }))
             .await;
 
@@ -14108,7 +14107,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "broken.py".to_string(),
-                estimate: None,
             }))
             .await;
 
@@ -14143,7 +14141,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "broken.rs".to_string(),
-                estimate: None,
             }))
             .await;
 
