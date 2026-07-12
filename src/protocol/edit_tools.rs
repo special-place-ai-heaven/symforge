@@ -511,6 +511,98 @@ fn begin_mutation_replay<T: Serialize>(
     }
 }
 
+/// NON-RESERVING replay probe mirroring [`begin_mutation_replay`]'s hashing.
+///
+/// The request hash MUST be computed over exactly the same value
+/// `begin_mutation_replay` stores (the typed tool `input`, with
+/// `idempotency_key` stripped, hashed under `tool_name`). Reproducing that
+/// transformation here — rather than hashing a facade-level request — is what
+/// makes an identical `symforge_edit` apply replay hit the record the legacy
+/// tool stored on the first apply.
+///
+/// Returns:
+/// - `Ok(Some(response))` — identical key+request already has a stored result;
+///   the caller returns it and writes zero bytes.
+/// - `Ok(None)` — no reservation exists (first execution, or `dry_run`, or no
+///   key); the caller proceeds through its normal gates.
+/// - `Err(output)` — an idempotency conflict (same key, different request) or a
+///   store error, already formatted for return to the client.
+fn probe_mutation_replay<T: Serialize>(
+    repo_root: &Path,
+    tool_name: &str,
+    input: &T,
+    idempotency_key: Option<&str>,
+    dry_run: bool,
+) -> Result<Option<String>, String> {
+    if dry_run {
+        return Ok(None);
+    }
+    let Some(raw_key) = idempotency_key else {
+        return Ok(None);
+    };
+
+    let mut request = serde_json::to_value(input)
+        .map_err(|error| crate::idempotency::format_tool_error(&error.into()))?;
+    if let serde_json::Value::Object(map) = &mut request {
+        map.remove("idempotency_key");
+    }
+
+    crate::idempotency::probe_tool_replay(repo_root, tool_name, raw_key, &request)
+        .map_err(|error| crate::idempotency::format_tool_error(&error))
+}
+
+/// NON-RESERVING replay probe for a `symforge_edit` apply, keyed off the plan
+/// step the facade will dispatch.
+///
+/// The `symforge_edit` local-apply path runs `run_pre_apply_gates` (including
+/// the Replace `if_match` guard) BEFORE the legacy tool's own
+/// `begin_mutation_replay`. After a first successful apply the body has changed,
+/// so an identical replay carrying the ORIGINAL `if_match` would be wrongly
+/// rejected by that now-stale guard before the replay lookup could serve the
+/// stored result. This probe runs FIRST and short-circuits an identical
+/// key+request replay without re-validating `if_match`.
+///
+/// `step_args` is the planner's step args (which already carry the injected
+/// `idempotency_key` and, for Replace, `if_match`). Deserializing it into the
+/// SAME typed input the legacy tool receives, then reusing
+/// [`probe_mutation_replay`], guarantees the probe hashes the exact value the
+/// legacy tool stored on the first apply — so `if_match` presence never
+/// reintroduces a hash mismatch.
+///
+/// Returns the same tri-state as [`probe_mutation_replay`]:
+/// `Ok(Some(stored_response))` on an identical replay hit (return it, zero
+/// writes), `Ok(None)` on a miss (proceed through the normal gates), and
+/// `Err(output)` on an idempotency conflict or store error.
+pub(crate) fn probe_symforge_edit_apply_replay(
+    repo_root: &Path,
+    step_tool: &str,
+    step_args: &serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    // A dry_run never reserves, so it can never have a stored result to replay.
+    // The facade only reaches this probe on apply, but honor the flag defensively.
+    let dry_run = step_args
+        .get("dry_run")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    macro_rules! probe_as {
+        ($input:ty) => {{
+            let input: $input = serde_json::from_value(step_args.clone())
+                .map_err(|error| crate::idempotency::format_tool_error(&error.into()))?;
+            probe_mutation_replay(repo_root, step_tool, &input, idempotency_key, dry_run)
+        }};
+    }
+
+    match step_tool {
+        "replace_symbol_body" => probe_as!(edit::ReplaceSymbolBodyInput),
+        "insert_symbol" => probe_as!(edit::InsertSymbolInput),
+        "edit_within_symbol" => probe_as!(edit::EditWithinSymbolInput),
+        // No other tool is a `symforge_edit` apply target; nothing to replay.
+        _ => Ok(None),
+    }
+}
+
 fn complete_mutation_replay(
     idempotency: &Option<crate::idempotency::ActiveReplay>,
     output: &mut String,

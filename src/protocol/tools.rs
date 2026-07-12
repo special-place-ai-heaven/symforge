@@ -10224,6 +10224,52 @@ impl SymForgeServer {
                             .into_call_tool_result(message));
                     }
                 };
+
+            // US4 (019): NON-RESERVING replay probe BEFORE `run_pre_apply_gates`.
+            // The Replace `if_match` guard inside the gates compares against the
+            // CURRENT symbol body, which has already changed after a first
+            // successful apply — so an identical idempotent replay carrying the
+            // ORIGINAL `if_match` would be wrongly rejected there before the
+            // replay lookup could serve the stored result. This probe short
+            // circuits an identical key+request replay without re-validating the
+            // now-stale `if_match`. It NEVER reserves and NEVER mutates store
+            // state (read-only `replay_if_present`), so the reservation the
+            // legacy tool takes on the miss path is untouched. A miss falls
+            // through to the gates (preserving new-key optimistic concurrency);
+            // a same-key/different-request hit surfaces the store's conflict
+            // rather than silently replaying.
+            if let Some(key) = request.idempotency_key.as_deref()
+                && let Some(repo_root) = self.capture_repo_root()
+            {
+                // A planning failure here is re-surfaced by the authoritative
+                // `build_edit_plan` call below; don't duplicate the error path.
+                if let Ok(probe_plan) = build_edit_plan(request) {
+                    let step = probe_plan
+                        .steps
+                        .first()
+                        .expect("edit planner always emits at least one step");
+                    match super::edit_tools::probe_symforge_edit_apply_replay(
+                        &repo_root,
+                        &step.tool,
+                        &step.args,
+                        Some(key),
+                    ) {
+                        Ok(Some(stored_response)) => {
+                            self.session_context.record_summary_output(
+                                "symforge_edit",
+                                handler::estimate_tokens(&stored_response),
+                            );
+                            return statused_tool_result(stored_response, OutcomeClass::Found);
+                        }
+                        Ok(None) => {}
+                        Err(output) => {
+                            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                                .into_call_tool_result(output));
+                        }
+                    }
+                }
+            }
+
             match run_pre_apply_gates(&self.index, request, &abs_path) {
                 Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
                 // F6: the already-applied check compares against the INDEXED
@@ -28440,6 +28486,169 @@ mod tests {
         assert!(
             !on_disk.contains("old"),
             "negative control must replace the old body:\n{on_disk}"
+        );
+    }
+
+    /// US4 (019): an identical idempotent `symforge_edit` apply replay — same
+    /// `idempotency_key`, same request INCLUDING the original `if_match` — must
+    /// return the STORED result and write ZERO bytes, NOT be rejected by the now
+    /// stale `if_match` guard.
+    ///
+    /// Before this fix, the local-apply branch ran `run_pre_apply_gates`' Replace
+    /// `if_match` guard BEFORE any replay lookup. After the first apply the body
+    /// changed, so the original `if_match` no longer matched the current body and
+    /// the replay was wrongly rejected with "if_match does not match current
+    /// symbol body". A non-reserving replay probe now short-circuits the identical
+    /// key+request replay before that guard.
+    #[tokio::test]
+    async fn symforge_edit_idempotent_replay_short_circuits_stale_if_match() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let file_path = dir.path().join("src/lib.rs");
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("replay-key-1".to_string()),
+            ..Default::default()
+        };
+
+        // First apply: commits the write.
+        let first = server
+            .symforge_edit_facade_tool(Parameters(request.clone()))
+            .await
+            .expect("first symforge_edit dispatch");
+        let first_serialized = serde_json::to_value(&first).expect("serialize first");
+        let first_text = tool_result_text(&first_serialized);
+        assert!(
+            first_text.contains("Write semantics: atomic write + reindex"),
+            "first apply must commit the write:\n{first_text}"
+        );
+
+        let after_first = std::fs::read_to_string(&file_path).expect("read after first apply");
+        assert!(
+            after_first.contains("agent_edit"),
+            "first apply must land the edit:\n{after_first}"
+        );
+
+        // Replay: IDENTICAL request (same key, same if_match, same body). The
+        // body on disk has changed, so the original if_match no longer matches
+        // the current body — yet the replay must succeed by returning the stored
+        // result, writing ZERO new bytes.
+        let replay = server
+            .symforge_edit_facade_tool(Parameters(request.clone()))
+            .await
+            .expect("replay symforge_edit dispatch");
+        let replay_serialized = serde_json::to_value(&replay).expect("serialize replay");
+        let replay_text = tool_result_text(&replay_serialized);
+
+        assert!(
+            !replay_text.contains("if_match does not match current symbol body"),
+            "idempotent replay must NOT be rejected by the stale if_match guard:\n{replay_text}"
+        );
+        assert_ne!(
+            replay_serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::InvalidRequest.as_str()),
+            "idempotent replay must not classify as an invalid request:\n{replay_text}"
+        );
+
+        // ZERO new bytes: the on-disk content is byte-identical after the replay.
+        let after_replay = std::fs::read_to_string(&file_path).expect("read after replay");
+        assert_eq!(
+            after_first, after_replay,
+            "idempotent replay must write zero bytes (byte-identical file)"
+        );
+    }
+
+    /// US4 (019): a replay carrying the SAME `idempotency_key` but a CHANGED
+    /// request (different body) must be an idempotency conflict, NOT a silent
+    /// replay of the stored result. The non-reserving probe must surface the
+    /// store's `Conflict` rather than swallowing it.
+    #[tokio::test]
+    async fn symforge_edit_same_key_changed_request_is_conflict_not_replay() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (_dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let first = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("conflict-key-1".to_string()),
+            ..Default::default()
+        };
+        server
+            .symforge_edit_facade_tool(Parameters(first))
+            .await
+            .expect("first apply");
+
+        // Same key, DIFFERENT body → the request hash differs.
+        let changed = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { different_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("conflict-key-1".to_string()),
+            ..Default::default()
+        };
+        let result = server
+            .symforge_edit_facade_tool(Parameters(changed))
+            .await
+            .expect("conflict dispatch");
+        let conflict_serialized = serde_json::to_value(&result).expect("serialize conflict");
+        let output = tool_result_text(&conflict_serialized);
+        assert!(
+            output.contains("Idempotency conflict"),
+            "same key + changed request must be a conflict, not a silent replay:\n{output}"
+        );
+    }
+
+    /// US4 (019) MUST-NOT-REGRESS: a NEW idempotency key whose `if_match` does
+    /// not match the current body has no stored result, so the probe returns
+    /// `None` and the genuine optimistic-concurrency guard still rejects it.
+    #[tokio::test]
+    async fn symforge_edit_new_key_stale_if_match_still_rejected() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (_dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            // if_match does NOT match the current body.
+            if_match: Some("fn target() { wrong }".to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("fresh-key-1".to_string()),
+            ..Default::default()
+        };
+        let result = server
+            .symforge_edit_facade_tool(Parameters(request))
+            .await
+            .expect("stale if_match dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize");
+        let output = tool_result_text(&serialized);
+        assert!(
+            output.contains("if_match does not match current symbol body"),
+            "a new key with stale if_match must still be rejected by the concurrency guard:\n{output}"
+        );
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::InvalidRequest.as_str()),
+            "stale-if_match rejection must classify as an invalid request:\n{output}"
         );
     }
 
