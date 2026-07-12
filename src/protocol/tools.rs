@@ -26657,6 +26657,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batch_rename_ambiguous_method_demotes_bare_refs() {
+        // Renaming the SHARED METHOD `new` scoped to Target::new must NOT rewrite
+        // SomeOther::new. `new` has 2 definitions (Target::new, SomeOther::new),
+        // so the bare-name reverse-index refs AND the unscoped qualified matches
+        // are all ambiguous: they are demoted to the uncertain/surfaced-only set.
+        // Only the definition site is renamed.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let lib_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\npub struct SomeOther;\nimpl SomeOther {\n    pub fn new() -> Self { SomeOther }\n}\n";
+        let main_content = b"fn make() { let _a = Target::new(); let _b = SomeOther::new(); }\n";
+        std::fs::write(src_dir.join("lib.rs"), lib_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/lib.rs", lib_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Target the `new` at line 3 (Target::new), NOT SomeOther::new (line 7).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/lib.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let result = server.batch_rename(Parameters(input)).await;
+
+        // The definition site (Target::new in lib.rs) IS renamed.
+        let lib = std::fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+        assert!(
+            lib.contains("pub fn make_new() -> Self { Target }"),
+            "Target::new definition must be renamed, got: {lib}"
+        );
+        // SomeOther::new definition in lib.rs is a distinct symbol — untouched.
+        assert!(
+            lib.contains("pub fn new() -> Self { SomeOther }"),
+            "SomeOther::new definition must be untouched, got: {lib}"
+        );
+
+        // main.rs must be BYTE-IDENTICAL to the original: neither call site is a
+        // safe write because `new` is ambiguous across 2 definitions.
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert_eq!(
+            main.as_bytes(),
+            main_content as &[u8],
+            "main.rs must be byte-unchanged for ambiguous method rename, got: {main}"
+        );
+        assert!(
+            !main.contains("make_new"),
+            "no call site in main.rs may be rewritten, got: {main}"
+        );
+
+        // The demoted bare refs must be surfaced as uncertain / not applied, so the
+        // result does NOT silently claim `constrained` coverage over them.
+        assert!(
+            result.contains("Uncertain matches") || result.contains("NOT applied"),
+            "ambiguous bare refs must be surfaced as uncertain, got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_batch_insert_adds_to_multiple_files() {
         use crate::protocol::edit::{BatchInsertInput, InsertPosition, InsertTarget};
 

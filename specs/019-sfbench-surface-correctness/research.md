@@ -46,6 +46,17 @@ reconstructed independently. P0-04 failed all three (non-bug) and is excluded.
   alone, so the *safe* default for name-only matches is uncertain/non-writable,
   not "guess and write". This is the correct fail-closed ceiling, not a
   limitation to be engineered away in this feature.
+- **Implementation correction (found during Item 1 RED, 2026-07-12)**: the spec
+  originally said demote only the bare `ref_sites` and keep `qualified_confident`
+  writable "because it's type-scoped". That is FALSE for a *method* rename:
+  `find_qualified_usages("new")` (qualified_usages.rs:164-169) matches any `new`
+  adjacent to `::`, so `SomeOther::new` lands in `qualified_confident` too
+  (empirically dumped: byte (56,59) in BOTH sets). Correct rule (Option 1): when
+  `input.name` is index-ambiguous (2+ defs), demote **both** `ref_sites` AND
+  `qualified_confident` to uncertain/surfaced-only; keep only the definition site
+  confident. Both green regression tests are unique names (1 def) → unaffected.
+  The type-scoped reasoning only held for the struct-rename honeytrap (`Target`
+  has 1 def). This is why the rule was wrong: it generalized from the honeytrap.
 
 ## US2 — `detect_impact` confidently wrong (P0)
 

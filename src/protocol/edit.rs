@@ -2291,7 +2291,7 @@ pub(crate) fn execute_batch_rename(
     };
 
     // Filter ref_sites by code_only
-    let ref_sites: Vec<(String, (u32, u32))> = if input.code_only.unwrap_or(false) {
+    let mut ref_sites: Vec<(String, (u32, u32))> = if input.code_only.unwrap_or(false) {
         ref_sites
             .into_iter()
             .filter(|(path, _)| {
@@ -2351,6 +2351,50 @@ pub(crate) fn execute_batch_rename(
         } else {
             qualified_uncertain.push((usage.file_path, usage.line, usage.context));
         }
+    }
+
+    // Phase 2c: Ambiguity gate (P0 safety).
+    // Count how many DEFINITIONS the index holds for `input.name`. The bare-name
+    // reverse-index refs (`ref_sites`) and the unscoped qualified matches
+    // (`qualified_confident`) both key on the leaf name only, so for a name with
+    // 2+ definitions they cannot be attributed to the resolved target definition
+    // (e.g. renaming `Target::new` must not rewrite `SomeOther::new`). When the
+    // name is ambiguous, demote BOTH sets into the uncertain/surfaced-only set;
+    // only the definition site stays confident. A unique name (1 definition)
+    // leaves both sets untouched — behavior unchanged.
+    let def_count = {
+        let guard = index.read();
+        guard
+            .files
+            .values()
+            .flat_map(|file| file.symbols.iter())
+            .filter(|sym| sym.name == input.name)
+            .count()
+    };
+    if def_count >= 2 {
+        // Convert each demoted (path, byte_range) site into an uncertain
+        // (path, line, context) tuple so it flows through the existing
+        // uncertain-warning block instead of the confident write set.
+        let demote = |path: &str, start: u32, sink: &mut Vec<(String, u32, String)>| {
+            let content = file_contents
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, c)| c.as_slice())
+                .unwrap_or(&[]);
+            let text = String::from_utf8_lossy(content);
+            let start = (start as usize).min(text.len());
+            let line = text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
+            let context = text.lines().nth(line - 1).unwrap_or("").trim().to_string();
+            sink.push((path.to_string(), line as u32, context));
+        };
+        for (path, (start, _)) in &ref_sites {
+            demote(path, *start, &mut qualified_uncertain);
+        }
+        for (path, (start, _)) in &qualified_confident {
+            demote(path, *start, &mut qualified_uncertain);
+        }
+        ref_sites.clear();
+        qualified_confident.clear();
     }
 
     // Phase 3: Group rename sites by file.

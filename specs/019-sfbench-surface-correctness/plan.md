@@ -175,15 +175,17 @@ Disk discipline (CLAUDE.md): `target/` is on E:. Run full gates locally, but
   reparse (`tools.rs` ~L10859 `changed_paths_between_refs`); enumerate removed
   symbols from the base parse (they are absent from the current index). The
   "smaller/faster" claim must be re-validated against this added base-parse cost.
-  (b) scope edge resolution so a call does not fan out to every same-bare-name
-  def **BUT keep a bare-name fallback when the callee definition carries no
-  resolvable owner** (review B2) — `SymbolRecord` has no owner field today, so an
-  unconditional owner-equality rule would drop the edge asserted by
-  `compute_impact_reaches_across_qualified_module_call` (`main` → `a::call_a`).
-  Rule: prefer an owner/qualified-scoped edge when both sides resolve an owner;
-  otherwise fall back to bare-name match. Duplicate-`main` fan-out is cut by the
-  formatter carrying identity (c), not by dropping legitimate module-sibling
-  edges. (c) formatter emits path/kind so duplicate `main` nodes are
+  (b) scope edge resolution by **callee-name ambiguity** (refined design, same
+  principle as US1): when a `Call` ref's name resolves to **exactly one
+  definition** in `defs_by_name`, link it (bare-name is correct and unambiguous —
+  this preserves `compute_impact_reaches_across_qualified_module_call`, where
+  `call_a` has one def); when it resolves to **multiple** definitions, the call
+  cannot be attributed to a specific one from syntax alone, so **do not fan out
+  to all of them** — either use the module-qualifier from the call site if
+  present to disambiguate, or drop the ambiguous edge rather than invent N wrong
+  ones. This is what cuts the duplicate-`main` explosion (`main` is multiply
+  defined) without dropping the legitimate single-def module-sibling edge.
+  Formatter identity (c) is the backstop for any remaining same-name nodes. (c) formatter emits path/kind so duplicate `main` nodes are
   distinguishable; (d) tighten `analyze_file_impact`'s residual bare-name lookup
   to typed identity while keeping same-file callers and the parent-type
   narrowing.
