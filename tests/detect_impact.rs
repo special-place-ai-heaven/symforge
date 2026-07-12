@@ -39,9 +39,10 @@ fn git(args: &[&str], root: &Path) {
 /// Copy `tests/fixtures/cbm_impact` into a fresh tempdir, commit it, then
 /// make a real content edit to `src/a.rs` and commit again — the
 /// `commit_2_changes_src_a_rs` scenario from `expected_impact.json`. The edit
-/// only widens a comment; `call_a`'s call-graph edges (it still calls
-/// `core()`) are untouched, so the blast radius is driven purely by who
-/// calls `call_a`, not by what this specific edit changed.
+/// changes `call_a`'s BODY (so it is a genuine body-delta seed under the
+/// PART A (019) body-delta seed) while keeping its `core()` call, so `call_a`'s
+/// call-graph edges are untouched and the blast radius is driven purely by who
+/// calls `call_a`.
 fn bootstrap_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
@@ -65,8 +66,8 @@ fn bootstrap_fixture() -> tempfile::TempDir {
     fs::write(
         root.join("src/a.rs"),
         "use cbm_impact_fixture::core;\n\n\
-         // S1a fixture bootstrap: widened comment, same call graph.\n\
-         pub fn call_a() -> u32 {\n    core()\n}\n",
+         // S1a fixture bootstrap: real body change, same call graph.\n\
+         pub fn call_a() -> u32 {\n    core() + 1\n}\n",
     )
     .expect("rewrite src/a.rs");
     git(&["commit", "-am", "change a"], root);
@@ -132,7 +133,9 @@ async fn detect_impact_fixture_blast_matches_expected() {
         .as_array()
         .expect("blast_radius array");
     assert_eq!(blast.len(), 1, "unexpected blast radius: {blast:?}");
-    assert_eq!(blast[0]["symbol"], json!("main"));
+    // PART C (019): scope=symbols blast entries are path-qualified (`path::name`)
+    // so same-name nodes stay distinguishable.
+    assert_eq!(blast[0]["symbol"], json!("src/main.rs::main"));
     assert_eq!(blast[0]["hop"], json!(1));
     assert_eq!(blast[0]["risk"], json!("critical"));
 
@@ -335,9 +338,15 @@ async fn detect_impact_caps_large_changed_set() {
     git(&["add", "."], root);
     git(&["commit", "-m", "initial"], root);
 
-    // Second commit touches ONLY changed.rs, so the changed-file set is one file
-    // but its 211 symbols all enter changed_symbols.
-    changed.push_str("// widened comment, same symbols.\n");
+    // Second commit touches ONLY changed.rs and modifies EVERY symbol's body
+    // (not just a comment append), so all 211 symbols are genuine body-delta
+    // seeds under the PART A (019) body-delta seed. `core` keeps its name (so
+    // the 210 callers still resolve) but its body changes; each `pad_i` body is
+    // bumped too.
+    let mut changed = String::from("pub fn core() -> u32 {\n    1\n}\n");
+    for i in 0..210 {
+        changed.push_str(&format!("pub fn pad_{i}() -> u32 {{\n    {}\n}}\n", i + 1));
+    }
     fs::write(root.join("src/changed.rs"), &changed).expect("rewrite changed.rs");
     git(&["commit", "-am", "touch changed"], root);
 

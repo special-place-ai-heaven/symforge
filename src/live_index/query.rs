@@ -211,6 +211,7 @@ fn find_reexporters<'a>(
             if matches_target_import(
                 &file.language,
                 target_language,
+                file_path.as_str(),
                 reference,
                 target_stem,
                 target_module_path,
@@ -364,6 +365,7 @@ fn import_languages_compatible(
 fn matches_target_import(
     importer_language: &LanguageId,
     target_language: &LanguageId,
+    importer_path: &str,
     reference: &ReferenceRecord,
     stem: &str,
     module_path: Option<&str>,
@@ -379,6 +381,25 @@ fn matches_target_import(
         return false;
     }
 
+    // Python relative imports (`from .b import f`) carry their leading
+    // import_prefix dots in `qualified_name` (".b", "..pkg"). They name a module
+    // in the IMPORTER's own package, so they must resolve package-aware against
+    // the importer path — never via the package-blind same-stem fallback, which
+    // would wrongly match an unrelated same-stem module in another package.
+    if *importer_language == LanguageId::Python
+        && let Some(qualified) = reference.qualified_name.as_deref()
+        && qualified.starts_with('.')
+    {
+        return match resolve_python_relative_import(importer_path, qualified) {
+            // Resolved to a concrete dotted module — match ONLY the target whose
+            // module path equals it (exact package + module), nothing by stem.
+            Some(resolved) => module_path == Some(resolved.as_str()),
+            // Unresolvable (dots escape the workspace root) — fail closed rather
+            // than fall back to the stem match and invent a foreign dependent.
+            None => false,
+        };
+    }
+
     matches_target_stem(&reference.name, stem)
         || reference
             .qualified_name
@@ -389,6 +410,56 @@ fn matches_target_import(
             })
             .unwrap_or(false)
         || matches_target_module(target_language, &reference.name, module_path)
+}
+
+/// Resolve a Python relative from-import (e.g. `.b`, `..pkg.mod`) to an absolute
+/// dotted module path, relative to the importing file's package.
+///
+/// The leading dots are the `import_prefix`: one dot = the importer's own
+/// package (the file's directory), each additional dot climbs one package up.
+/// The remaining text (after the dots) is the module path within that package.
+///
+/// Example: importer `pkg/sub/a.py`, `..mod` → package `pkg/sub` climbs 1 level
+/// to `pkg`, then module `mod` → `pkg.mod`.
+///
+/// Returns `None` when the dots climb above the indexed workspace root (the
+/// module lives outside the index and cannot be matched to a known file).
+fn resolve_python_relative_import(importer_path: &str, relative_text: &str) -> Option<String> {
+    let dots = relative_text.chars().take_while(|&c| c == '.').count();
+    if dots == 0 {
+        return None;
+    }
+    let module_tail = relative_text[dots..].trim_matches('.');
+
+    // The importer's package = the components of its directory path.
+    let normalized = importer_path.replace('\\', "/");
+    let dir = normalized
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    let mut package: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').filter(|c| !c.is_empty()).collect()
+    };
+
+    // One dot stays in the current package; each extra dot climbs one level.
+    let climb = dots - 1;
+    if climb > package.len() {
+        // Escapes above the workspace root — outside the index.
+        return None;
+    }
+    package.truncate(package.len() - climb);
+
+    if !module_tail.is_empty() {
+        package.extend(module_tail.split('.').filter(|c| !c.is_empty()));
+    }
+
+    if package.is_empty() {
+        None
+    } else {
+        Some(package.join("."))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2815,6 +2886,7 @@ impl LiveIndex {
                     matches_target_import(
                         &file.language,
                         &target_language,
+                        file_path.as_str(),
                         reference,
                         stem,
                         module_path.as_deref(),
@@ -2971,6 +3043,7 @@ impl LiveIndex {
                             matches_target_import(
                                 &file.language,
                                 &target_language,
+                                file_path.as_str(),
                                 reference,
                                 re_stem,
                                 re_module_path.as_deref(),
@@ -6355,6 +6428,52 @@ impl Actor for MyActor {
             dep_paths.len(),
             1,
             "only the same-language Python importer should match, got: {dep_paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_dependents_python_relative_import_resolves_to_own_package_only() {
+        // `pkg/a.py` does `from .b import f`; the single-dot relative import names
+        // the `b` module in a.py's OWN package (pkg/), i.e. `pkg/b.py`. A same-stem
+        // module in an UNRELATED package (`other/b.py`) must NOT be reported: the
+        // relative prefix pins resolution to the importer's package, so the naive
+        // same-stem fallback must not fire for it.
+        let rel_import = make_ref("b", Some(".b"), ReferenceKind::Import, None, 0);
+        let mut f_importer = make_file_with_refs("pkg/a.py", vec![rel_import], HashMap::new());
+        f_importer.language = LanguageId::Python;
+
+        let mut f_target = make_file_with_refs("pkg/b.py", vec![], HashMap::new());
+        f_target.language = LanguageId::Python;
+        f_target.symbols = vec![make_symbol("f")];
+
+        // Unrelated same-stem module in a different package, with NO relative import
+        // of its own — must never be dragged in as a dependent of pkg/b.py.
+        let mut f_other = make_file_with_refs("other/b.py", vec![], HashMap::new());
+        f_other.language = LanguageId::Python;
+
+        let index = make_index(
+            vec![
+                ("pkg/a.py", f_importer),
+                ("pkg/b.py", f_target),
+                ("other/b.py", f_other),
+            ],
+            false,
+        );
+
+        let deps = index.find_dependents_for_file("pkg/b.py");
+        let dep_paths: Vec<&str> = deps.iter().map(|(p, _)| *p).collect();
+        assert!(
+            dep_paths.contains(&"pkg/a.py"),
+            "`from .b import f` in pkg/a.py must make it a dependent of pkg/b.py, got: {dep_paths:?}"
+        );
+
+        // The relative import must NOT invent pkg/a.py as a dependent of other/b.py
+        // (different package): the single dot pins it to pkg/.
+        let other_deps = index.find_dependents_for_file("other/b.py");
+        let other_paths: Vec<&str> = other_deps.iter().map(|(p, _)| *p).collect();
+        assert!(
+            !other_paths.contains(&"pkg/a.py"),
+            "a single-dot relative import in pkg/a.py must NOT resolve to other/b.py, got: {other_paths:?}"
         );
     }
 

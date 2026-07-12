@@ -2772,37 +2772,6 @@ fn find_references_evidence(view: &crate::live_index::FindReferencesView) -> Str
     anchored_search_evidence(anchors, "reference anchors")
 }
 
-/// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
-/// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
-/// stdio/embed, or daemon-degraded) execution path. When a `project`/`projects`
-/// param is present and we are about to run LOCALLY, return an honest refusal
-/// instead of silently ignoring the target and serving the active project only.
-/// Returns the refusal message when the request is cross-project, else `None`.
-///
-/// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
-/// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
-/// is `None`), so this is the guard that contains D16's silent-wrong half —
-/// `/mcp` loudly refuses cross-project targeting rather than silently serving the
-/// single bound index. `tests/serve_http_attach.rs` locks it end-to-end.
-fn local_cross_project_refusal(
-    project: Option<&str>,
-    projects: Option<&[String]>,
-) -> Option<String> {
-    let has_project = project.map(|p| !p.trim().is_empty()).unwrap_or(false);
-    let has_projects = projects.map(|p| !p.is_empty()).unwrap_or(false);
-    if has_project || has_projects {
-        Some(
-            "Cross-project queries (project/projects) require the daemon: the \
-             working set of open projects lives on the daemon transport, not on \
-             the /mcp HTTP transport, stdio/embed, or while the daemon is \
-             unreachable. Start the daemon to query across projects."
-                .to_string(),
-        )
-    } else {
-        None
-    }
-}
-
 fn find_references_kind_filter(kind_filter: Option<&str>) -> Option<ReferenceKind> {
     match kind_filter {
         Some("call") => Some(ReferenceKind::Call),
@@ -4982,8 +4951,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): no daemon here -> no working set. Honest refusal
         // for a cross-project request instead of a silent single-project answer.
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -5145,8 +5114,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): honest refusal for a cross-project request with
         // no daemon (no working set on the local path).
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -6765,6 +6734,32 @@ impl SymForgeServer {
         })
     }
 
+    /// True when an explicit `project`/`projects` selector RESOLVES TO THE BOUND
+    /// project: it equals the bound project name, the bound root's deterministic
+    /// project key, or the bound root path (either slash flavor). Shared by both
+    /// project-refusal guards so the two agree on what "local" means; an empty or
+    /// whitespace-only selector is treated as absent (returns false — the caller
+    /// decides how to handle "no selector").
+    fn selector_matches_bound_project(&self, selector: &str) -> bool {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return false;
+        }
+        if selector == self.project_name {
+            return true;
+        }
+        if let Some(root) = self.capture_repo_root().as_deref() {
+            if selector == crate::daemon::project_key(root) {
+                return true;
+            }
+            let root_text = root.display().to_string();
+            if selector == root_text || selector == root_text.replace('\\', "/") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Task 4: local/embedded servers are bound to exactly ONE project. When a
     /// tool call reaches local execution (stdio/embed, or a degraded daemon
     /// fallback) carrying an explicit `project` selector that does not match
@@ -6775,19 +6770,10 @@ impl SymForgeServer {
     /// or matches.
     pub(crate) fn foreign_project_refusal(&self, project: Option<&str>) -> Option<String> {
         let selector = project.map(str::trim).filter(|p| !p.is_empty())?;
-        if selector == self.project_name {
+        if self.selector_matches_bound_project(selector) {
             return None;
         }
         let bound_root = self.capture_repo_root();
-        if let Some(root) = bound_root.as_deref() {
-            if selector == crate::daemon::project_key(root) {
-                return None;
-            }
-            let root_text = root.display().to_string();
-            if selector == root_text || selector == root_text.replace('\\', "/") {
-                return None;
-            }
-        }
         Some(format!(
             "project '{selector}' is not available on this connection: this server is bound \
              to the single project '{}'{}. Explicit project routing requires the daemon \
@@ -6798,6 +6784,64 @@ impl SymForgeServer {
                 .map(|root| format!(" ({})", root.display()))
                 .unwrap_or_default()
         ))
+    }
+
+    /// Feature 012 (Phase 3), Principle VII honesty: a cross-project read targets
+    /// the daemon-owned working set, which does not exist on the local (`/mcp` HTTP,
+    /// stdio/embed, or daemon-degraded) execution path. `search_symbols`,
+    /// `search_text`, and `find_references` gate their no-daemon local path on this
+    /// guard. Returns the refusal message when the request is GENUINELY
+    /// cross-project, else `None` (proceed).
+    ///
+    /// C-stopgap (D16): on the `/mcp` HTTP transport there is no daemon behind the
+    /// handler (`proxy_tool_call` short-circuits to `None` because `daemon_client`
+    /// is `None`), so this contains D16's silent-wrong half — `/mcp` LOUDLY refuses
+    /// cross-project targeting rather than silently serving the single bound index.
+    /// `tests/serve_http_attach.rs` locks it end-to-end.
+    ///
+    /// The containment is deliberately NARROW: a selector that RESOLVES TO THE BOUND
+    /// project (its name, its root's project key, or its root path) is answerable
+    /// locally, so it PROCEEDS — only foreign, multi-project, or wildcard (`*`)
+    /// selectors, which need the daemon working set, are refused. This shares
+    /// `selector_matches_bound_project` with `foreign_project_refusal` so both guards
+    /// agree on what counts as local; only the refusal MESSAGE differs (this one
+    /// names the `/mcp` transport for the no-daemon path).
+    fn local_cross_project_refusal(
+        &self,
+        project: Option<&str>,
+        projects: Option<&[String]>,
+    ) -> Option<String> {
+        // Gather every non-empty selector from both the singular and plural params.
+        let mut selectors: Vec<&str> = Vec::new();
+        if let Some(p) = project.map(str::trim).filter(|p| !p.is_empty()) {
+            selectors.push(p);
+        }
+        if let Some(list) = projects {
+            selectors.extend(list.iter().map(|p| p.trim()).filter(|p| !p.is_empty()));
+        }
+
+        // No selector at all -> proceed on the normal single-project path.
+        if selectors.is_empty() {
+            return None;
+        }
+
+        // A wildcard, or ANY selector that does not resolve to the bound project,
+        // requires the daemon working set -> refuse honestly. Only when EVERY
+        // selector resolves to the bound project can we answer locally.
+        let all_local = selectors
+            .iter()
+            .all(|selector| *selector != "*" && self.selector_matches_bound_project(selector));
+        if all_local {
+            return None;
+        }
+
+        Some(
+            "Cross-project queries (project/projects) require the daemon: the \
+             working set of open projects lives on the daemon transport, not on \
+             the /mcp HTTP transport, stdio/embed, or while the daemon is \
+             unreachable. Start the daemon to query across projects."
+                .to_string(),
+        )
     }
 
     /// Reindex a directory from scratch — replaces the current index, restarts watcher, triggers
@@ -7460,17 +7504,114 @@ impl SymForgeServer {
         // default removed, so an empty/shrunken blast radius is self-describing.
         let source_filtered_out = unfiltered_changed_total.saturating_sub(changed_files.len());
 
+        // PART A (019): the seed is a BODY delta, not every symbol of a changed
+        // file. Reparse each changed file's BASE blob and its CURRENT working
+        // tree with the same extractor `diff_symbols` uses
+        // (`extract_symbols_for_diff` -> name+body-hash pairs), then seed only
+        // the symbols whose body was added, modified, or removed. A 1-line edit
+        // in a 20-symbol file now seeds 1 symbol, not 20; a comment/whitespace
+        // shift that leaves every body byte-identical seeds 0.
+        //
+        // Base ref: mirror `merge_git_changed_paths`'s OWN base selection so the
+        // body-delta compares against the same base the changed-file set came
+        // from. `since=<ref>` diffs `<ref>...HEAD`; the `WORKTREE` sentinel and
+        // `base_branch` both diff against the committed tip / branch, with the
+        // working tree as the current side. A mismatched base (e.g. always HEAD)
+        // would find zero deltas for a committed `since` range on a clean tree.
+        let since_trimmed = params
+            .0
+            .since
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let seed_base_ref = match since_trimmed {
+            Some("WORKTREE") => "HEAD",
+            Some(since_ref) => since_ref,
+            None => base_branch.as_deref().unwrap_or("HEAD"),
+        };
         let (changed_symbols, blast_radius) = {
             let guard = self.index.read();
             let mut changed_symbols: Vec<crate::live_index::graph::SymbolId> = Vec::new();
             for path in &changed_files {
-                if let Some(file) = guard.files.get(path) {
-                    for sym in &file.symbols {
-                        changed_symbols.push(crate::live_index::graph::SymbolId {
-                            path: path.clone(),
-                            name: sym.name.clone(),
-                            kind: sym.kind,
-                        });
+                // Kind lookup for the CURRENT symbols comes from the live index;
+                // removed symbols (absent from current) default to Function to
+                // match the graph's own entry-point default.
+                let kind_by_name: HashMap<&str, crate::domain::SymbolKind> = guard
+                    .files
+                    .get(path)
+                    .map(|f| {
+                        f.symbols
+                            .iter()
+                            .map(|s| (s.name.as_str(), s.kind))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let base_content = repo
+                    .file_at_ref(seed_base_ref, path)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let current_content = repo
+                    .file_from_workdir(path)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+
+                // Unsupported/config languages return None from the extractor;
+                // we cannot body-diff them, so fall back to seeding every
+                // indexed symbol of the file (the old conservative behavior)
+                // rather than silently seeding nothing.
+                let base_syms = crate::parsing::extract_symbols_for_diff(&base_content, path);
+                let current_syms = crate::parsing::extract_symbols_for_diff(&current_content, path);
+                let (Some(base_syms), Some(current_syms)) = (base_syms, current_syms) else {
+                    if let Some(file) = guard.files.get(path) {
+                        for sym in &file.symbols {
+                            changed_symbols.push(crate::live_index::graph::SymbolId {
+                                path: path.clone(),
+                                name: sym.name.clone(),
+                                kind: sym.kind,
+                            });
+                        }
+                    }
+                    continue;
+                };
+
+                // ponytail: name-keyed body-hash maps, matching `diff_symbols`'
+                // own name-keyed comparison. Same-name overloads in one file
+                // collapse to their last body hash; a resolver-aware seed
+                // (C-S2-001) would key on a stable symbol id instead.
+                let base_by_name: HashMap<&str, &str> = base_syms
+                    .iter()
+                    .map(|(n, h)| (n.as_str(), h.as_str()))
+                    .collect();
+                let current_by_name: HashMap<&str, &str> = current_syms
+                    .iter()
+                    .map(|(n, h)| (n.as_str(), h.as_str()))
+                    .collect();
+
+                let mut seed = |name: &str| {
+                    changed_symbols.push(crate::live_index::graph::SymbolId {
+                        path: path.clone(),
+                        name: name.to_string(),
+                        kind: kind_by_name
+                            .get(name)
+                            .copied()
+                            .unwrap_or(crate::domain::SymbolKind::Function),
+                    });
+                };
+
+                // Added (in current, not base) or modified (body hash differs).
+                for (name, cur_hash) in &current_by_name {
+                    match base_by_name.get(name) {
+                        None => seed(name),
+                        Some(base_hash) if base_hash != cur_hash => seed(name),
+                        _ => {}
+                    }
+                }
+                // Removed (in base, not current) — seeded so downstream callers
+                // of a deleted symbol still appear in the blast radius.
+                for name in base_by_name.keys() {
+                    if !current_by_name.contains_key(name) {
+                        seed(name);
                     }
                 }
             }
@@ -7490,7 +7631,20 @@ impl SymForgeServer {
             match params.0.scope {
                 ImpactScope::Symbols => blast_radius
                     .iter()
-                    .map(|node| (node.symbol.name.clone(), node.hop, node.risk))
+                    // PART C (019): carry disambiguating identity. Two blast
+                    // nodes that share a bare name (e.g. `main` in different
+                    // files, or two `run`s the graph kept distinct) must render
+                    // as distinct `path::name` entries, not collapse into one
+                    // indistinguishable `"main"`. The path already disambiguates
+                    // same-name defs across files; kind is folded into the node
+                    // identity by the graph, so `path::name` is sufficient here.
+                    .map(|node| {
+                        (
+                            format!("{}::{}", node.symbol.path, node.symbol.name),
+                            node.hop,
+                            node.risk,
+                        )
+                    })
                     .collect(),
                 ImpactScope::Files => {
                     let mut by_file: HashMap<String, (u32, crate::live_index::graph::RiskTier)> =
@@ -7937,8 +8091,8 @@ impl SymForgeServer {
         }
         // Feature 012 (Phase 3): honest refusal for a cross-project request with
         // no daemon (no working set on the local path).
-        if let Some(refusal) =
-            local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
         {
             return refusal;
         }
@@ -10070,6 +10224,52 @@ impl SymForgeServer {
                             .into_call_tool_result(message));
                     }
                 };
+
+            // US4 (019): NON-RESERVING replay probe BEFORE `run_pre_apply_gates`.
+            // The Replace `if_match` guard inside the gates compares against the
+            // CURRENT symbol body, which has already changed after a first
+            // successful apply — so an identical idempotent replay carrying the
+            // ORIGINAL `if_match` would be wrongly rejected there before the
+            // replay lookup could serve the stored result. This probe short
+            // circuits an identical key+request replay without re-validating the
+            // now-stale `if_match`. It NEVER reserves and NEVER mutates store
+            // state (read-only `replay_if_present`), so the reservation the
+            // legacy tool takes on the miss path is untouched. A miss falls
+            // through to the gates (preserving new-key optimistic concurrency);
+            // a same-key/different-request hit surfaces the store's conflict
+            // rather than silently replaying.
+            if let Some(key) = request.idempotency_key.as_deref()
+                && let Some(repo_root) = self.capture_repo_root()
+            {
+                // A planning failure here is re-surfaced by the authoritative
+                // `build_edit_plan` call below; don't duplicate the error path.
+                if let Ok(probe_plan) = build_edit_plan(request) {
+                    let step = probe_plan
+                        .steps
+                        .first()
+                        .expect("edit planner always emits at least one step");
+                    match super::edit_tools::probe_symforge_edit_apply_replay(
+                        &repo_root,
+                        &step.tool,
+                        &step.args,
+                        Some(key),
+                    ) {
+                        Ok(Some(stored_response)) => {
+                            self.session_context.record_summary_output(
+                                "symforge_edit",
+                                handler::estimate_tokens(&stored_response),
+                            );
+                            return statused_tool_result(stored_response, OutcomeClass::Found);
+                        }
+                        Ok(None) => {}
+                        Err(output) => {
+                            return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
+                                .into_call_tool_result(output));
+                        }
+                    }
+                }
+            }
+
             match run_pre_apply_gates(&self.index, request, &abs_path) {
                 Ok(PreApplyOutcome::Ready(symbol)) => resolved_symbol = Some(symbol),
                 // F6: the already-applied check compares against the INDEXED
@@ -10254,6 +10454,21 @@ impl SymForgeServer {
             .to_string(),
         );
         if let Some(result) = self.proxy_tool_call("status", &request).await {
+            // US5c (P2 correctness/trust): `reset_calibration=true` MUST reset the
+            // PROXY-owned durable store HERE. The proxy owns `stel_ledger_store`;
+            // the storeless worker it proxied to resets nothing, so without this
+            // the call returned success-shaped `Found` while the durable
+            // calibration was left byte-identical — a silent no-op. Reset BEFORE
+            // building `proxy_owned_status_lines` below so the overlaid
+            // calibration lines reflect the post-reset (`deferred`) state, not
+            // stale pre-reset samples. The receipt mirrors the local path's
+            // `reset_note` wording and is appended to the body so the operator
+            // sees the reset actually happened (or an honest no-store note).
+            let reset_receipt = if request.reset_calibration == Some(true) {
+                Some(self.proxy_reset_calibration_receipt())
+            } else {
+                None
+            };
             // D2-ROOT: the daemon worker owns the populated INDEX but has an EMPTY
             // session ledger + NO durable store, so its proxied body reads
             // `ledger_events: 0`, `last_ledger_*: none`, `durable_ledger:
@@ -10268,7 +10483,12 @@ impl SymForgeServer {
             let result = overlay_proxy_status_lines(result, &self.proxy_owned_status_lines());
             // Mirror `health`: warn loudly if the daemon we proxied to runs an
             // older binary than this front-end.
-            let body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
+            let mut body = append_daemon_staleness_warning(result, env!("CARGO_PKG_VERSION"));
+            // Surface the honest reset receipt, mirroring the local path's
+            // `format!("{body}\n{note}")` placement.
+            if let Some(note) = reset_receipt {
+                body = format!("{body}\n{note}");
+            }
             return statused_tool_result(body, OutcomeClass::Found);
         }
 
@@ -10429,6 +10649,44 @@ impl SymForgeServer {
             ctx = ctx.with_calibration_verdict(verdict);
         }
         crate::stel::render_proxy_owned_lines(&ctx)
+    }
+
+    /// US5c (P2 correctness/trust): reset the PROXY-owned durable calibration
+    /// store and return an honest receipt line.
+    ///
+    /// In the default daemon-proxy topology the PROXY owns `stel_ledger_store`;
+    /// the storeless daemon worker it proxies to has nothing to reset. So a
+    /// `status(reset_calibration=true)` MUST reset HERE, or it returns a
+    /// success-shaped `Found` while the durable calibration is left
+    /// byte-identical — a silent no-op that lies to the operator. Called by the
+    /// proxy branch of [`Self::status_stel_tool`] BEFORE building
+    /// [`Self::proxy_owned_status_lines`], so the overlaid calibration lines
+    /// reflect the post-reset (`deferred`) state, not stale pre-reset samples.
+    ///
+    /// The receipt wording mirrors `render_stel_status_body`'s `reset_note` (the
+    /// local/no-daemon path) verbatim, so the operator sees identical honest
+    /// language whether the reset ran locally or through the proxy: a real
+    /// cleared-sample count with a store, or the "no durable store" no-op note
+    /// without one.
+    #[cfg(feature = "server")]
+    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
+        match self.reset_calibration() {
+            Some(cleared) => format!(
+                "calibration_reset: cleared {cleared} sample(s) + active tuning (state -> deferred)"
+            ),
+            None => {
+                "calibration_reset: no durable store; in-memory calibration is already deferred"
+                    .to_string()
+            }
+        }
+    }
+
+    /// Embed/no-`server` builds have no durable calibration store wired, so the
+    /// reset is an honest no-op — mirrors the `reset_calibration() == None` arm
+    /// of the local path.
+    #[cfg(not(feature = "server"))]
+    pub(crate) fn proxy_reset_calibration_receipt(&self) -> String {
+        "calibration_reset: no durable store; in-memory calibration is already deferred".to_string()
     }
 
     /// Daemon-side `status` entry point (TR-01 / FR-006).
@@ -11249,6 +11507,96 @@ mod tests {
         assert!(
             bare_overlaid.contains("durable_ledger: unavailable"),
             "a no-store proxy stays unavailable after overlay:\n{bare_overlaid}"
+        );
+    }
+
+    /// US5c (P2 correctness/trust): in the daemon-proxy topology,
+    /// `status(reset_calibration=true)` MUST actually reset the PROXY-owned
+    /// durable calibration store (the proxy owns it; the storeless worker it
+    /// proxies to resets nothing) AND surface an honest receipt. Before the fix
+    /// the proxy branch returned success-shaped `Found` while leaving the durable
+    /// store byte-identical — a silent no-op. This pins the reset + receipt the
+    /// proxy branch now performs, and that the post-reset verdict overlaid onto
+    /// the worker body reads `deferred`, not the stale pre-reset `accumulating`.
+    #[test]
+    fn daemon_proxy_reset_calibration_clears_proxy_store_and_reports_receipt() {
+        use crate::stel::calibration::CalibrationVerdict;
+        use crate::stel::ledger_store::StelLedgerStore;
+
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        // Seed the PROXY's durable store with samples so calibration accumulates
+        // HERE — exactly the state a real proxy carries while the worker is blind.
+        let store =
+            StelLedgerStore::open_in_memory("proxy-reset").expect("in-memory durable store");
+        store.record(&sample_durable_event());
+        store.record(&sample_durable_event());
+        let proxy =
+            SymForgeServer::new_daemon_proxy(client).with_stel_ledger_store(Arc::new(store));
+
+        // Precondition: the proxy store is accumulating (2 samples).
+        match proxy.durable_calibration_verdict() {
+            Some(CalibrationVerdict::Accumulating { n, .. }) => assert_eq!(n, 2),
+            other => panic!("expected accumulating precondition, got {other:?}"),
+        }
+
+        // The proxy-branch reset the fix performs: clear the PROXY-owned store and
+        // return an honest receipt. This is what `status_stel_tool`'s proxy branch
+        // invokes when `reset_calibration == Some(true)`.
+        let receipt = proxy.proxy_reset_calibration_receipt();
+
+        // 1) The durable store was actually cleared to deferred (the reset is real,
+        //    not a success-shaped no-op).
+        assert_eq!(
+            proxy.durable_calibration_verdict(),
+            Some(CalibrationVerdict::Deferred),
+            "reset_calibration in the proxy branch must clear the proxy's durable store to deferred"
+        );
+
+        // 2) The receipt mirrors `render_stel_status_body`'s reset_note wording, and
+        //    reports the 2 cleared samples honestly.
+        assert_eq!(
+            receipt, "calibration_reset: cleared 2 sample(s) + active tuning (state -> deferred)",
+            "proxy reset receipt must mirror the local reset_note wording"
+        );
+
+        // 3) The proxy-owned overlay lines built AFTER the reset reflect the
+        //    post-reset (deferred) state, not the stale pre-reset accumulating one.
+        let overlaid = super::overlay_proxy_status_lines(
+            worker_full_status_body(),
+            &proxy.proxy_owned_status_lines(),
+        );
+        assert!(
+            overlaid.contains("calibration: deferred"),
+            "overlay after reset must show deferred calibration:\n{overlaid}"
+        );
+        assert!(
+            !overlaid.contains("calibration: accumulating"),
+            "overlay after reset must NOT show stale accumulating calibration:\n{overlaid}"
+        );
+    }
+
+    /// Honesty for the no-store proxy: `reset_calibration=true` in the proxy
+    /// branch with NO durable store attached must NOT claim a reset it did not
+    /// perform — it returns the honest "no durable store" receipt, matching the
+    /// local path's wording.
+    #[test]
+    fn daemon_proxy_reset_calibration_no_store_reports_honest_no_op() {
+        let client = crate::daemon::DaemonSessionClient::new_for_test(
+            "http://127.0.0.1:1".to_string(),
+            "p".to_string(),
+            "s".to_string(),
+            "proj".to_string(),
+        );
+        let bare = SymForgeServer::new_daemon_proxy(client);
+        assert_eq!(
+            bare.proxy_reset_calibration_receipt(),
+            "calibration_reset: no durable store; in-memory calibration is already deferred",
+            "a no-store proxy must report the honest no-op receipt, not a false reset"
         );
     }
 
@@ -13282,7 +13630,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "Cargo.toml".to_string(),
-                estimate: None,
             }))
             .await;
 
@@ -13760,7 +14107,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "broken.py".to_string(),
-                estimate: None,
             }))
             .await;
 
@@ -13795,7 +14141,6 @@ mod tests {
             .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
                 project: None,
                 path: "broken.rs".to_string(),
-                estimate: None,
             }))
             .await;
 
@@ -15052,6 +15397,90 @@ mod tests {
         assert!(
             !conflict.starts_with("Indexed "),
             "conflict must not report synthetic indexing success: {conflict}"
+        );
+    }
+
+    #[test]
+    fn local_cross_project_refusal_allows_matching_local_selector() {
+        // SUB-FIX A: search_symbols/search_text/find_references gate their no-daemon
+        // local path on `local_cross_project_refusal`. It must PROCEED (return None,
+        // same as no selector) when the selector RESOLVES TO THE BOUND PROJECT — by
+        // name, by the bound root's project key, or by the root path — and only
+        // refuse foreign/multi/wildcard targets. Pre-fix it refused ANY non-empty
+        // selector, wrongly rejecting a matching-local one.
+        let repo = TempDir::new().expect("tempdir");
+        let root = repo.path().to_path_buf();
+        let server = make_server_with_root(make_live_index_empty(), Some(root.clone()));
+
+        // No selector at all -> proceed (control).
+        assert!(
+            server.local_cross_project_refusal(None, None).is_none(),
+            "no selector must proceed"
+        );
+
+        // Matching-local by project NAME -> proceed (the fix).
+        assert!(
+            server
+                .local_cross_project_refusal(Some("test_project"), None)
+                .is_none(),
+            "a selector equal to the bound project name must PROCEED, not refuse"
+        );
+
+        // Matching-local by the bound root's deterministic project key -> proceed.
+        let key = crate::daemon::project_key(&root);
+        assert!(
+            server
+                .local_cross_project_refusal(Some(key.as_str()), None)
+                .is_none(),
+            "a selector equal to the bound root's project key must PROCEED"
+        );
+
+        // Matching-local by root PATH (forward-slash form) -> proceed.
+        let root_fwd = root.display().to_string().replace('\\', "/");
+        assert!(
+            server
+                .local_cross_project_refusal(Some(root_fwd.as_str()), None)
+                .is_none(),
+            "a selector equal to the bound root path must PROCEED"
+        );
+
+        // Matching-local through the PLURAL `projects` selector -> proceed.
+        let plural_local = vec!["test_project".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(plural_local.as_slice()))
+                .is_none(),
+            "a plural projects=[bound name] must PROCEED"
+        );
+
+        // Foreign singular selector -> refuse, and the message must still name the
+        // /mcp transport (the D16 containment wording is preserved).
+        let foreign = server
+            .local_cross_project_refusal(Some("other-proj"), None)
+            .expect("a foreign project selector must still refuse");
+        assert!(
+            foreign.contains("/mcp HTTP transport"),
+            "the foreign refusal must still name the /mcp transport, got: {foreign}"
+        );
+
+        // Wildcard -> refuse (cross-project unanswerable without a daemon working set).
+        let wildcard = vec!["*".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(wildcard.as_slice()))
+                .expect("wildcard projects must refuse")
+                .contains("/mcp HTTP transport"),
+            "wildcard refusal must name the /mcp transport"
+        );
+
+        // Multiple distinct non-bound projects -> refuse.
+        let multi = vec!["a".to_string(), "b".to_string()];
+        assert!(
+            server
+                .local_cross_project_refusal(None, Some(multi.as_slice()))
+                .expect("multi-project projects must refuse")
+                .contains("/mcp HTTP transport"),
+            "multi-project refusal must name the /mcp transport"
         );
     }
 
@@ -18801,6 +19230,165 @@ mod tests {
         assert!(
             result.contains("include_data"),
             "the disclosure must name the include_data recovery lever: {result}"
+        );
+    }
+
+    /// PART C (019 detect_impact fix): scope=symbols blast entries must carry
+    /// disambiguating identity (path), so two entry points named `main` in
+    /// different files render as DISTINCT lines instead of collapsing into two
+    /// indistinguishable `"main"` entries. RED on the pre-fix formatter, which
+    /// emitted only `node.symbol.name`.
+    #[tokio::test]
+    async fn test_detect_impact_symbols_scope_disambiguates_same_name_nodes() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        // Commit a base `core`, then modify it in the working tree so core.rs
+        // is a changed SOURCE file that seeds the blast.
+        fs::write(
+            repo.path().join("src/core.rs"),
+            "pub fn core() -> u32 { 1 }\n",
+        )
+        .expect("write core");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(
+            repo.path().join("src/core.rs"),
+            "pub fn core() -> u32 { 2 }\n",
+        )
+        .expect("modify core");
+
+        // Index: `core` plus two files whose `main` (enclosing index 0) calls it.
+        // `core` is a UNIQUE name -> PART B one-def rule links both callers.
+        let core_file = make_file(
+            "src/core.rs",
+            b"pub fn core() -> u32 { 2 }\n",
+            vec![make_symbol("core", SymbolKind::Function, 0, 0)],
+        );
+        let a_file = make_file_with_refs(
+            "src/a.rs",
+            b"fn main() { core(); }\n",
+            vec![make_symbol("main", SymbolKind::Function, 0, 0)],
+            vec![make_ref("core", None, ReferenceKind::Call, 0, Some(0))],
+        );
+        let b_file = make_file_with_refs(
+            "src/b.rs",
+            b"fn main() { core(); }\n",
+            vec![make_symbol("main", SymbolKind::Function, 0, 0)],
+            vec![make_ref("core", None, ReferenceKind::Call, 0, Some(0))],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![core_file, a_file, b_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        // Both `main` entry points are in the blast; their labels must be
+        // distinct (path-qualified), not two bare `"main"` collapses.
+        assert!(
+            result.contains("src/a.rs::main") && result.contains("src/b.rs::main"),
+            "two same-name blast nodes must render as distinct path-qualified \
+             entries: {result}"
+        );
+    }
+
+    /// PART A (019 detect_impact fix): the seed must be a BODY delta, not every
+    /// symbol of a changed file. Editing ONLY one function's body in a
+    /// multi-symbol file must seed exactly that ONE symbol as changed — not all
+    /// symbols in the file. RED on the pre-fix seed loop, which pushed every
+    /// `file.symbols` entry.
+    #[tokio::test]
+    async fn test_detect_impact_seeds_only_body_changed_symbols() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        let base = "pub fn kept() -> u32 { 1 }\npub fn changed() -> u32 { 2 }\n";
+        let modified = "pub fn kept() -> u32 { 1 }\npub fn changed() -> u32 { 99 }\n";
+        fs::write(repo.path().join("src/multi.rs"), base).expect("write base");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(repo.path().join("src/multi.rs"), modified).expect("modify changed body");
+
+        // Index mirrors the working tree (both symbols present).
+        let multi_file = make_file(
+            "src/multi.rs",
+            modified.as_bytes(),
+            vec![
+                make_symbol("kept", SymbolKind::Function, 0, 0),
+                make_symbol("changed", SymbolKind::Function, 1, 1),
+            ],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![multi_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        assert!(
+            result.contains("\"changed\""),
+            "the edited function must be seeded as changed: {result}"
+        );
+        assert!(
+            !result.contains("\"kept\""),
+            "an unedited sibling symbol must NOT be seeded as changed: {result}"
+        );
+    }
+
+    /// PART A (019): a comment/whitespace-only shift that leaves every function
+    /// body byte-identical must seed ZERO changed symbols. RED on the pre-fix
+    /// loop, which seeded all symbols regardless of body deltas.
+    #[tokio::test]
+    async fn test_detect_impact_whitespace_only_change_seeds_nothing() {
+        let repo = init_git_repo();
+        fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+        let base = "pub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n";
+        // Add a leading comment line: symbol bodies are byte-identical, only
+        // their file position shifts.
+        let shifted = "// unrelated comment\npub fn a() -> u32 { 1 }\npub fn b() -> u32 { 2 }\n";
+        fs::write(repo.path().join("src/ws.rs"), base).expect("write base");
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init", "-q"]);
+        fs::write(repo.path().join("src/ws.rs"), shifted).expect("comment-only shift");
+
+        let ws_file = make_file(
+            "src/ws.rs",
+            shifted.as_bytes(),
+            vec![
+                make_symbol("a", SymbolKind::Function, 1, 1),
+                make_symbol("b", SymbolKind::Function, 2, 2),
+            ],
+        );
+        let server = make_server_with_root(
+            make_live_index_ready(vec![ws_file]),
+            Some(repo.path().to_path_buf()),
+        );
+        let result = server
+            .detect_impact(Parameters(super::DetectImpactInput {
+                base_branch: None,
+                since: Some("WORKTREE".to_string()),
+                depth: 2,
+                scope: super::ImpactScope::Symbols,
+                include_untracked: true,
+                include_data: None,
+            }))
+            .await;
+        assert!(
+            result.contains("0 changed symbol(s)"),
+            "a comment/whitespace-only shift must seed zero changed symbols: {result}"
         );
     }
 
@@ -26657,6 +27245,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batch_rename_ambiguous_method_demotes_bare_refs() {
+        // Renaming the SHARED METHOD `new` scoped to Target::new. `new` has 2
+        // definitions (Target::new, SomeOther::new), so the leaf name alone is
+        // ambiguous. 019 recall-recovery: a call whose IMMEDIATE QUALIFIER equals
+        // the resolved target's UNIQUE `impl` owner IS attributable and stays
+        // writable, so `Target::new()` is RECOVERED (Target and SomeOther are
+        // DISTINCT owner names -> Target is unique). The core SAFETY invariant is
+        // preserved: `SomeOther::new()` (wrong owner) is NEVER rewritten. Before
+        // the recovery upgrade this test asserted main.rs was byte-identical; the
+        // upgrade makes the qualified Target::new() site the correct write, while
+        // the wrong-owner site stays untouched.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let lib_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\npub struct SomeOther;\nimpl SomeOther {\n    pub fn new() -> Self { SomeOther }\n}\n";
+        let main_content = b"fn make() { let _a = Target::new(); let _b = SomeOther::new(); }\n";
+        std::fs::write(src_dir.join("lib.rs"), lib_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/lib.rs", lib_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Target the `new` at line 3 (Target::new), NOT SomeOther::new (line 7).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/lib.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let _result = server.batch_rename(Parameters(input)).await;
+
+        // The definition site (Target::new in lib.rs) IS renamed.
+        let lib = std::fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+        assert!(
+            lib.contains("pub fn make_new() -> Self { Target }"),
+            "Target::new definition must be renamed, got: {lib}"
+        );
+        // SomeOther::new definition in lib.rs is a distinct symbol — untouched.
+        assert!(
+            lib.contains("pub fn new() -> Self { SomeOther }"),
+            "SomeOther::new definition must be untouched, got: {lib}"
+        );
+
+        // RECOVERY: Target::new() call site rewritten to Target::make_new()
+        // because "Target" is a unique owner among `new`'s defs.
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            main.contains("Target::make_new()"),
+            "Target::new() call site must be recovered (unique owner), got: {main}"
+        );
+        // CORE SAFETY: SomeOther::new() (wrong owner) is NEVER rewritten.
+        assert!(
+            main.contains("SomeOther::new()"),
+            "SomeOther::new() call site must be untouched, got: {main}"
+        );
+        assert!(
+            !main.contains("SomeOther::make_new"),
+            "SomeOther::new() must never be rewritten, got: {main}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_rename_ambiguous_method_recovers_unique_owner_calls() {
+        // 019 recall-recovery: `new` is ambiguous (Target::new in a.rs,
+        // Other::new in b.rs). Renaming Target::new must RECOVER the
+        // `Target::new()` call site (Target is a UNIQUE owner among `new`'s
+        // owners) while leaving `Other::new()` and any bare `new()` untouched.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let a_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        let b_content = b"pub struct Other;\nimpl Other {\n    pub fn new() -> Self { Other }\n}\n";
+        // A bare (unqualified) `new()` call carries NO qualifier, so it must
+        // stay demoted (the "bare still demotes" invariant).
+        let main_content =
+            b"fn make() { let _a = Target::new(); let _b = Other::new(); let _c = new(); }\n";
+        std::fs::write(src_dir.join("a.rs"), a_content).unwrap();
+        std::fs::write(src_dir.join("b.rs"), b_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/a.rs", a_content as &[u8]),
+            ("src/b.rs", b_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Target the `new` in a.rs (Target::new).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/a.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let _result = server.batch_rename(Parameters(input)).await;
+
+        // Definition site renamed.
+        let a = std::fs::read_to_string(src_dir.join("a.rs")).unwrap();
+        assert!(
+            a.contains("pub fn make_new() -> Self { Target }"),
+            "Target::new definition must be renamed, got: {a}"
+        );
+        // Other::new definition untouched.
+        let b = std::fs::read_to_string(src_dir.join("b.rs")).unwrap();
+        assert!(
+            b.contains("pub fn new() -> Self { Other }"),
+            "Other::new definition must be untouched, got: {b}"
+        );
+        // RECOVERY: Target::new() call site rewritten to Target::make_new().
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert!(
+            main.contains("Target::make_new()"),
+            "Target::new() call site must be RECOVERED (unique owner), got: {main}"
+        );
+        // SAFETY: Other::new() call site never touched.
+        assert!(
+            main.contains("Other::new()"),
+            "Other::new() call site must be untouched (wrong owner), got: {main}"
+        );
+        assert!(
+            !main.contains("Other::make_new"),
+            "Other::new() must never be rewritten, got: {main}"
+        );
+        // BARE-DEMOTE invariant: the unqualified `new()` call has no qualifier
+        // to attribute, so it must NOT be rewritten (stays ` new()`, not
+        // ` make_new()`).
+        assert!(
+            main.contains("let _c = new();"),
+            "bare unqualified new() must stay demoted (not rewritten), got: {main}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_rename_twin_owner_demotes_both_call_sites() {
+        // 019 recall-recovery SOUNDNESS (twin-owner guard): TWO `impl Target`
+        // (a.rs and c.rs), both with `fn new`. Renaming one Target::new must
+        // NOT rewrite EITHER `Target::new()` call site — the qualifier
+        // "Target" cannot disambiguate between the two same-owner defs, so the
+        // uniqueness guard fires and both call sites are demoted. This is the
+        // test a demolition of the guard would target; it MUST pass.
+        use crate::protocol::edit::BatchRenameInput;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let a_content =
+            b"pub struct Target;\nimpl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        // Second `impl Target` in a different file, same owner name.
+        let c_content = b"impl Target {\n    pub fn new() -> Self { Target }\n}\n";
+        let main_content = b"fn make() { let _a = Target::new(); }\n";
+        std::fs::write(src_dir.join("a.rs"), a_content).unwrap();
+        std::fs::write(src_dir.join("c.rs"), c_content).unwrap();
+        std::fs::write(src_dir.join("main.rs"), main_content).unwrap();
+
+        let mut files = vec![];
+        for (path, content) in [
+            ("src/a.rs", a_content as &[u8]),
+            ("src/c.rs", c_content as &[u8]),
+            ("src/main.rs", main_content as &[u8]),
+        ] {
+            let result = crate::parsing::process_file(path, content, LanguageId::Rust);
+            let indexed =
+                crate::live_index::store::IndexedFile::from_parse_result(result, content.to_vec());
+            files.push((path.to_string(), indexed));
+        }
+        let index = make_live_index_ready(files);
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        // Rename the Target::new in a.rs (line 3).
+        let input = BatchRenameInput {
+            project: None,
+            path: "src/a.rs".to_string(),
+            name: "new".to_string(),
+            kind: None,
+            symbol_line: Some(3),
+            new_name: "make_new".to_string(),
+            dry_run: None,
+            idempotency_key: None,
+            code_only: None,
+            working_directory: None,
+        };
+        let result = server.batch_rename(Parameters(input)).await;
+
+        // Definition site (a.rs) IS renamed.
+        let a = std::fs::read_to_string(src_dir.join("a.rs")).unwrap();
+        assert!(
+            a.contains("pub fn make_new() -> Self { Target }"),
+            "targeted Target::new definition must be renamed, got: {a}"
+        );
+
+        // SOUNDNESS: the Target::new() call site must NOT be rewritten — the
+        // twin `impl Target` in c.rs makes the "Target" qualifier ambiguous.
+        let main = std::fs::read_to_string(src_dir.join("main.rs")).unwrap();
+        assert_eq!(
+            main.as_bytes(),
+            main_content as &[u8],
+            "twin-owner ambiguity must demote the call site (no write), got: {main}"
+        );
+        assert!(
+            !main.contains("make_new"),
+            "no call site may be rewritten under twin-owner ambiguity, got: {main}"
+        );
+        // Must be surfaced as uncertain, not silently claimed.
+        assert!(
+            result.contains("Uncertain matches") || result.contains("NOT applied"),
+            "demoted twin-owner call must be surfaced as uncertain, got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_batch_insert_adds_to_multiple_files() {
         use crate::protocol::edit::{BatchInsertInput, InsertPosition, InsertTarget};
 
@@ -27795,6 +28631,169 @@ mod tests {
         assert!(
             !on_disk.contains("old"),
             "negative control must replace the old body:\n{on_disk}"
+        );
+    }
+
+    /// US4 (019): an identical idempotent `symforge_edit` apply replay — same
+    /// `idempotency_key`, same request INCLUDING the original `if_match` — must
+    /// return the STORED result and write ZERO bytes, NOT be rejected by the now
+    /// stale `if_match` guard.
+    ///
+    /// Before this fix, the local-apply branch ran `run_pre_apply_gates`' Replace
+    /// `if_match` guard BEFORE any replay lookup. After the first apply the body
+    /// changed, so the original `if_match` no longer matched the current body and
+    /// the replay was wrongly rejected with "if_match does not match current
+    /// symbol body". A non-reserving replay probe now short-circuits the identical
+    /// key+request replay before that guard.
+    #[tokio::test]
+    async fn symforge_edit_idempotent_replay_short_circuits_stale_if_match() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let file_path = dir.path().join("src/lib.rs");
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("replay-key-1".to_string()),
+            ..Default::default()
+        };
+
+        // First apply: commits the write.
+        let first = server
+            .symforge_edit_facade_tool(Parameters(request.clone()))
+            .await
+            .expect("first symforge_edit dispatch");
+        let first_serialized = serde_json::to_value(&first).expect("serialize first");
+        let first_text = tool_result_text(&first_serialized);
+        assert!(
+            first_text.contains("Write semantics: atomic write + reindex"),
+            "first apply must commit the write:\n{first_text}"
+        );
+
+        let after_first = std::fs::read_to_string(&file_path).expect("read after first apply");
+        assert!(
+            after_first.contains("agent_edit"),
+            "first apply must land the edit:\n{after_first}"
+        );
+
+        // Replay: IDENTICAL request (same key, same if_match, same body). The
+        // body on disk has changed, so the original if_match no longer matches
+        // the current body — yet the replay must succeed by returning the stored
+        // result, writing ZERO new bytes.
+        let replay = server
+            .symforge_edit_facade_tool(Parameters(request.clone()))
+            .await
+            .expect("replay symforge_edit dispatch");
+        let replay_serialized = serde_json::to_value(&replay).expect("serialize replay");
+        let replay_text = tool_result_text(&replay_serialized);
+
+        assert!(
+            !replay_text.contains("if_match does not match current symbol body"),
+            "idempotent replay must NOT be rejected by the stale if_match guard:\n{replay_text}"
+        );
+        assert_ne!(
+            replay_serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::InvalidRequest.as_str()),
+            "idempotent replay must not classify as an invalid request:\n{replay_text}"
+        );
+
+        // ZERO new bytes: the on-disk content is byte-identical after the replay.
+        let after_replay = std::fs::read_to_string(&file_path).expect("read after replay");
+        assert_eq!(
+            after_first, after_replay,
+            "idempotent replay must write zero bytes (byte-identical file)"
+        );
+    }
+
+    /// US4 (019): a replay carrying the SAME `idempotency_key` but a CHANGED
+    /// request (different body) must be an idempotency conflict, NOT a silent
+    /// replay of the stored result. The non-reserving probe must surface the
+    /// store's `Conflict` rather than swallowing it.
+    #[tokio::test]
+    async fn symforge_edit_same_key_changed_request_is_conflict_not_replay() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (_dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let first = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("conflict-key-1".to_string()),
+            ..Default::default()
+        };
+        server
+            .symforge_edit_facade_tool(Parameters(first))
+            .await
+            .expect("first apply");
+
+        // Same key, DIFFERENT body → the request hash differs.
+        let changed = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            if_match: Some(original.trim().to_string()),
+            body: Some("fn target() { different_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("conflict-key-1".to_string()),
+            ..Default::default()
+        };
+        let result = server
+            .symforge_edit_facade_tool(Parameters(changed))
+            .await
+            .expect("conflict dispatch");
+        let conflict_serialized = serde_json::to_value(&result).expect("serialize conflict");
+        let output = tool_result_text(&conflict_serialized);
+        assert!(
+            output.contains("Idempotency conflict"),
+            "same key + changed request must be a conflict, not a silent replay:\n{output}"
+        );
+    }
+
+    /// US4 (019) MUST-NOT-REGRESS: a NEW idempotency key whose `if_match` does
+    /// not match the current body has no stored result, so the probe returns
+    /// `None` and the genuine optimistic-concurrency guard still rejects it.
+    #[tokio::test]
+    async fn symforge_edit_new_key_stale_if_match_still_rejected() {
+        use crate::stel::StelEditRequest;
+
+        let original = "fn target() { old }\n";
+        let (_dir, server) = setup_loaded_edit_test(&[("src/lib.rs", original)]);
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let request = StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("target".to_string()),
+            // if_match does NOT match the current body.
+            if_match: Some("fn target() { wrong }".to_string()),
+            body: Some("fn target() { agent_edit }".to_string()),
+            apply: Some(true),
+            idempotency_key: Some("fresh-key-1".to_string()),
+            ..Default::default()
+        };
+        let result = server
+            .symforge_edit_facade_tool(Parameters(request))
+            .await
+            .expect("stale if_match dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize");
+        let output = tool_result_text(&serialized);
+        assert!(
+            output.contains("if_match does not match current symbol body"),
+            "a new key with stale if_match must still be rejected by the concurrency guard:\n{output}"
+        );
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::InvalidRequest.as_str()),
+            "stale-if_match rejection must classify as an invalid request:\n{output}"
         );
     }
 

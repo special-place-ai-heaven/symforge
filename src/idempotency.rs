@@ -456,6 +456,40 @@ pub fn begin_tool_replay(
     }
 }
 
+/// NON-RESERVING, read-only replay probe for a tool request.
+///
+/// Unlike [`begin_tool_replay`], this NEVER reserves a record and NEVER mutates
+/// store state. It answers a single question: "does an identical
+/// key+request already have a stored result?"
+///
+/// - `Ok(Some(response))` — an existing record for this key whose request hash
+///   matches; returns the replay response text. The caller may short-circuit
+///   and return it without writing any bytes.
+/// - `Ok(None)` — no record exists for this key. The caller must fall through
+///   to its normal execution path (which reserves via `begin_tool_replay`).
+/// - `Err(Conflict)` — a record exists for this key but the incoming request
+///   hash differs; the caller must surface the conflict, NOT replay.
+///
+/// This is the read-only sibling of `check_or_reserve`'s `FirstExecution`-vs
+/// `Replay` decision: it observes the `Replay`/`Conflict` outcomes without ever
+/// consuming a reservation, so a later `begin_tool_replay` on the miss path
+/// still sees a clean slate.
+pub fn probe_tool_replay(
+    store_root: &Path,
+    tool_name: &str,
+    raw_key: &str,
+    request: &Value,
+) -> Result<Option<String>, IdempotencyError> {
+    let key = IdempotencyKey::new(raw_key)?;
+    let request_hash = RequestHash::for_tool_request(tool_name, request)?;
+    let store = FileReplayStore::open(store_root)?;
+
+    match store.replay_if_present(&key, &request_hash)? {
+        Some(record) => Ok(Some(replay_response(&record))),
+        None => Ok(None),
+    }
+}
+
 fn same_normalized_path(left: &Path, right: &Path) -> bool {
     normalized_path_string(left) == normalized_path_string(right)
 }

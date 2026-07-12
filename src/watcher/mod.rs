@@ -484,30 +484,71 @@ pub(crate) fn freshen_file_if_stale(
     }
 }
 
-fn freshen_file_if_stale_at_generation(
-    relative_path: &str,
-    abs_path: &Path,
+/// Resolve the generation the watcher should fence its mutations against for
+/// the commit boundary about to run.
+///
+/// The watcher snapshots `spawn_gen` ONCE at spawn (`run_watcher_with_stop`).
+/// On COLD START the fire-and-forget `bg_index.reload(&bg_root)` bumps the
+/// project generation AFTER that snapshot, so a fence pinned to `spawn_gen`
+/// would reject (and remove) every subsequent edit forever. This heals that:
+/// when the generation has advanced but the live index STILL serves our own
+/// `repo_root`, the advance was a same-project reload (cold-start or in-place
+/// reindex) and we adopt the current generation so mutations commit again.
+///
+/// The fence stays correct for the genuine cross-project race: a retarget
+/// reload swaps `indexed_root` to a DIFFERENT root, so we keep the stale
+/// `spawn_gen` and the store's under-lock check rejects the now-foreign
+/// mutation (see `slipped_past_cancellation_fence_increments_counter`).
+///
+/// Ordering: `reload` publishes the new live index (with its new
+/// `indexed_root`) BEFORE bumping the generation (`AcqRel`), and we read the
+/// generation before the live root, so a `spawn_gen`-equal read never pairs an
+/// old generation with a new root. The value returned here is only a *better
+/// guess* than the frozen snapshot — the store re-checks the generation under
+/// its write lock, so any residual race still rejects rather than corrupts.
+pub(crate) fn effective_fence_generation(
     shared: &SharedIndex,
-    expected_gen: u64,
-) -> bool {
-    matches!(
-        freshen_file_if_stale(relative_path, abs_path, shared, expected_gen),
-        FreshenResult::StaleReindexed
-            | FreshenResult::StaleRemoved
-            | FreshenResult::GenerationMismatch
-    )
+    repo_root: &Path,
+    spawn_gen: u64,
+) -> u64 {
+    let current_gen = shared.current_project_generation();
+    if current_gen == spawn_gen {
+        return spawn_gen;
+    }
+    // Generation advanced since spawn. Adopt it only if the live index still
+    // serves our repo_root (same-project reload); otherwise keep the stale
+    // spawn generation so the store fence rejects the foreign mutation.
+    let target = crate::live_index::store::normalize_root(repo_root);
+    let same_root = shared
+        .read()
+        .indexed_root
+        .as_deref()
+        .map(crate::live_index::store::normalize_root)
+        .is_some_and(|root| root == target);
+    if same_root { current_gen } else { spawn_gen }
 }
 
 /// Walk all indexed files and re-index any whose on-disk mtime differs from
 /// the stored value. Returns the number of stale files re-indexed.
 ///
 /// Called on watcher overflow and by the periodic reconciliation timer.
+///
+/// `spawn_gen` is the watcher's spawn-time generation snapshot. The fence value
+/// actually used for each file is re-synced via [`effective_fence_generation`]
+/// so a same-root reload (cold-start heal) no longer permanently rejects, while
+/// a cross-project retarget still rejects.
 pub(crate) fn reconcile_stale_files_with_stop(
     repo_root: &Path,
     shared: &SharedIndex,
     should_stop: impl Fn() -> bool,
     expected_gen: u64,
 ) -> usize {
+    // Re-sync the fence to the CURRENT generation when the live index still
+    // serves our repo_root, so a same-root reload that advanced the generation
+    // after watcher spawn (cold start) no longer permanently rejects. A
+    // cross-project retarget keeps the stale spawn generation and is rejected.
+    let fence_gen = effective_fence_generation(shared, repo_root, expected_gen);
+
     let paths: Vec<String> = {
         let index = shared.read();
         index.all_files().map(|(p, _)| p.clone()).collect()
@@ -519,8 +560,14 @@ pub(crate) fn reconcile_stale_files_with_stop(
             break;
         }
         let abs_path = repo_root.join(relative_path);
-        if freshen_file_if_stale_at_generation(relative_path, &abs_path, shared, expected_gen) {
-            stale_count += 1;
+        // Count ONLY genuine repairs. A `GenerationMismatch` outcome is a no-op
+        // that repaired zero bytes (the store rejected the stale-generation
+        // mutation, incrementing `rejected_stale_mutations` instead), so folding
+        // it into the repair count would falsely inflate health's "reconcile
+        // repairs" figure during any restart/reset window.
+        match freshen_file_if_stale(relative_path, &abs_path, shared, fence_gen) {
+            FreshenResult::StaleReindexed | FreshenResult::StaleRemoved => stale_count += 1,
+            FreshenResult::Fresh | FreshenResult::GenerationMismatch => {}
         }
     }
 
@@ -824,12 +871,20 @@ pub async fn run_watcher_with_stop(
                         // per-workspace guard against concurrent refreshes.
                         let root_for_coupling = repo_root.clone();
                         let stop_for_coupling = Arc::clone(&stop_token);
-                        let expected_gen_for_coupling = expected_gen;
+                        let spawn_gen_for_coupling = expected_gen;
                         let shared_for_coupling = shared.clone();
                         tokio::task::spawn_blocking(move || {
                             if stop_for_coupling.load(Ordering::Acquire) {
                                 return;
                             }
+                            // Re-sync against a same-root reload (cold start) so
+                            // the coupling refresh heals like the file reconcile;
+                            // a retarget keeps the stale spawn gen and no-ops.
+                            let expected_gen_for_coupling = effective_fence_generation(
+                                &shared_for_coupling,
+                                &root_for_coupling,
+                                spawn_gen_for_coupling,
+                            );
                             crate::live_index::coupling::refresh_on_reconcile_tick(
                                 &root_for_coupling,
                                 expected_gen_for_coupling,
@@ -848,9 +903,19 @@ pub async fn run_watcher_with_stop(
                             let root_clone = repo_root.clone();
                             let watcher_info_clone = watcher_info.clone();
                             let stop_for_events = Arc::clone(&stop_token);
-                            let expected_gen_for_events = expected_gen;
+                            let spawn_gen_for_events = expected_gen;
                             let mut trackers = std::mem::take(&mut burst_trackers);
                             match tokio::task::spawn_blocking(move || {
+                                // Re-sync the fence at the commit boundary: a
+                                // same-root reload (cold start) that advanced the
+                                // generation after watcher spawn must no longer
+                                // reject events; a cross-project retarget still
+                                // keeps the stale spawn gen and is rejected.
+                                let expected_gen_for_events = effective_fence_generation(
+                                    &shared_clone,
+                                    &root_clone,
+                                    spawn_gen_for_events,
+                                );
                                 process_events(
                                     events,
                                     &root_clone,
@@ -1754,11 +1819,13 @@ mod tests {
         let rejected_before = shared.current_rejected_stale_mutations();
         shared.reload(project_b.path()).unwrap();
 
-        let stale = reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        let repairs =
+            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
 
         assert_eq!(
-            stale, 1,
-            "stale doomed reconcile should visit B's path once"
+            repairs, 0,
+            "a GenerationMismatch reconcile repairs zero bytes; it is a rejected \
+             mutation, not a repair, so it must not count toward the repair total"
         );
         assert!(
             shared.current_rejected_stale_mutations() > rejected_before,
@@ -1768,6 +1835,172 @@ mod tests {
         assert!(
             index.get_file("src/b.rs").is_some(),
             "B file should survive stale-generation reconcile"
+        );
+    }
+
+    /// Cold-start regression: a SAME-ROOT reload (the fire-and-forget
+    /// `bg_index.reload(&bg_root)` main.rs runs when no snapshot exists) bumps
+    /// the project generation AFTER the watcher captured `expected_gen` at spawn.
+    /// The watcher's reconcile must SELF-HEAL against that advance — re-index the
+    /// edited file — instead of pinning the stale spawn generation and removing
+    /// the file forever via `GenerationMismatch`.
+    ///
+    /// Distinguishing signal: the live index still serves the watcher's own
+    /// `repo_root` (`indexed_root` unchanged), so the advance is a same-project
+    /// reload, not a cross-project retarget (which `indexed_root` would show and
+    /// which `slipped_past_cancellation_fence_increments_counter` proves must
+    /// still be rejected).
+    #[test]
+    fn cold_start_same_root_reload_reconcile_heals_not_removes() {
+        let project = TempDir::new().unwrap();
+        let src_dir = project.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let rel = "src/heals.rs";
+        let abs = project.path().join(rel);
+        std::fs::write(&abs, b"fn before() {}").unwrap();
+
+        // Load the index for our project; this is the state the watcher spawns
+        // against. `spawn_gen` is exactly what `run_watcher_with_stop` snapshots
+        // once at L721.
+        let shared = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let spawn_gen = shared.current_project_generation();
+        assert!(
+            shared.read().get_file(rel).is_some(),
+            "precondition: file indexed after load"
+        );
+
+        // Simulate the cold-start fire-and-forget reload: SAME root, generation
+        // advances past the watcher's spawn snapshot.
+        shared.reload(project.path()).unwrap();
+        assert_ne!(
+            shared.current_project_generation(),
+            spawn_gen,
+            "reload must advance the project generation past the spawn snapshot"
+        );
+
+        // Edit the tracked file on disk (bump mtime + change content) so the
+        // reconcile sweep sees it as stale and tries to re-index it.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&abs, b"fn before() {}\nfn healed() {}").unwrap();
+
+        // Reconcile pinned to the STALE spawn generation, exactly as the watcher
+        // does today (`expected_gen_for_reconcile = expected_gen`).
+        let _ = reconcile_stale_files_with_stop(project.path(), &shared, || false, spawn_gen);
+
+        // The edit must be INDEXED, not GenerationMismatch-removed.
+        let index = shared.read();
+        let file = index.get_file(rel).unwrap_or_else(|| {
+            panic!(
+                "cold-start same-root reload must NOT remove the edited file; \
+                 stale spawn generation self-healed instead of rejecting"
+            )
+        });
+        assert!(
+            file.symbols.iter().any(|s| s.name == "healed"),
+            "the reconcile must re-index the edited file so the new symbol appears"
+        );
+    }
+
+    /// Repair-count honesty: `reconcile_stale_files_with_stop` returns the number
+    /// of GENUINE repairs (files actually re-indexed or removed), which health
+    /// renders as "reconcile repairs". A `GenerationMismatch` outcome is a NO-OP
+    /// that repaired zero bytes (a cross-project retarget kept the stale fence and
+    /// the store rejected the mutation), so it must NOT inflate the repair count.
+    ///
+    /// This is deliberately distinct from the store's `rejected_stale_mutations`
+    /// counter, which DOES increment for the rejection (asserted by
+    /// `slipped_past_cancellation_fence_increments_counter`). The two figures
+    /// answer different questions: "how many files did we repair" vs. "how many
+    /// stale-generation mutations did the fence reject".
+    #[test]
+    fn reconcile_repair_count_excludes_generation_mismatch_noops() {
+        // --- Case 1: pure GenerationMismatch no-ops must NOT count as repairs. ---
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(project_a.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(project_b.path().join("src/b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let stale_gen = shared.current_project_generation();
+        // Retarget to B: advances the generation AND swaps `indexed_root`, so
+        // `effective_fence_generation` keeps the stale spawn gen and every file
+        // reconcile below resolves to `GenerationMismatch` (a repaired-zero no-op).
+        shared.reload(project_b.path()).unwrap();
+
+        let repairs =
+            reconcile_stale_files_with_stop(project_a.path(), &shared, || false, stale_gen);
+        assert_eq!(
+            repairs, 0,
+            "GenerationMismatch no-ops repair zero bytes and must not inflate the \
+             repair count (they are rejected mutations, not repairs)"
+        );
+
+        // --- Case 2: a genuine StaleReindexed edit MUST count as a repair. ---
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        let rel = "src/edited.rs";
+        let abs = project.path().join(rel);
+        std::fs::write(&abs, b"fn before() {}").unwrap();
+
+        let shared2 = crate::live_index::LiveIndex::load(project.path()).unwrap();
+        let expected_gen = shared2.current_project_generation();
+
+        // Edit the tracked file so the reconcile sweep sees it as stale.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&abs, b"fn before() {}\nfn after() {}").unwrap();
+
+        let repairs2 =
+            reconcile_stale_files_with_stop(project.path(), &shared2, || false, expected_gen);
+        assert_eq!(
+            repairs2, 1,
+            "a genuinely stale, re-indexed file must count as one repair"
+        );
+    }
+
+    /// `effective_fence_generation` must ADOPT a generation advanced by a
+    /// same-root reload (cold-start heal) but KEEP the stale spawn generation
+    /// after a cross-project retarget (so the store fence still rejects the now
+    /// foreign mutation). This is the exact discriminator the cold-start fix
+    /// relies on; the store's own under-lock generation check remains the final
+    /// arbiter for any residual race.
+    #[test]
+    fn effective_fence_generation_adopts_same_root_keeps_after_retarget() {
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::create_dir_all(project_a.path().join("src")).unwrap();
+        std::fs::create_dir_all(project_b.path().join("src")).unwrap();
+        std::fs::write(project_a.path().join("src/a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(project_b.path().join("src/b.rs"), b"fn b() {}").unwrap();
+
+        let shared = crate::live_index::LiveIndex::load(project_a.path()).unwrap();
+        let spawn_gen = shared.current_project_generation();
+
+        // No reload yet: the effective fence is the spawn snapshot unchanged.
+        assert_eq!(
+            effective_fence_generation(&shared, project_a.path(), spawn_gen),
+            spawn_gen,
+            "no generation advance -> keep spawn snapshot"
+        );
+
+        // Same-root reload: adopt the advanced generation (cold-start heal).
+        shared.reload(project_a.path()).unwrap();
+        let after_same_root = shared.current_project_generation();
+        assert_ne!(after_same_root, spawn_gen);
+        assert_eq!(
+            effective_fence_generation(&shared, project_a.path(), spawn_gen),
+            after_same_root,
+            "same-root reload -> adopt the current generation so mutations commit"
+        );
+
+        // Cross-project retarget: KEEP the stale spawn generation so the store
+        // fence rejects a mutation now computed against a foreign index.
+        shared.reload(project_b.path()).unwrap();
+        assert_eq!(
+            effective_fence_generation(&shared, project_a.path(), spawn_gen),
+            spawn_gen,
+            "cross-project retarget -> keep stale spawn gen so the fence rejects"
         );
     }
 

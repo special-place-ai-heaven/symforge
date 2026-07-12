@@ -260,6 +260,48 @@ fn base_type_token(ty: &str) -> &str {
     ty.rsplit("::").next().unwrap_or(ty).trim()
 }
 
+/// Owner type name of the innermost `impl` block enclosing the symbol that
+/// starts at `def_start_line`, or `None` when no enclosing `impl` exists.
+///
+/// A method definition lives inside its `impl X` / `impl Trait for X` block; the
+/// index stores that block as a `SymbolKind::Impl` symbol whose `line_range`
+/// encloses the method's. We pick the INNERMOST such impl (latest start line,
+/// same "innermost" rule as [`crate::domain::find_enclosing_symbol`]) and parse
+/// its target-type token via [`container_target_type`] (`impl X` and
+/// `impl Trait for X` both → `X`). This is the shared owner-name primitive for
+/// 019 recall-recovery: both `batch_rename` and `detect_impact` compute a def's
+/// owner this way to match a call/ref's immediate qualifier against it.
+///
+/// ponytail: owner recovery is Rust-`impl`-shaped. Non-Rust grammars whose
+/// containers are not modeled as `SymbolKind::Impl` blocks (or whose display
+/// names don't parse via `container_target_type`) yield `None` here, so the
+/// qualifier→owner match simply does not fire and those languages keep today's
+/// demote/drop behavior. Widening owner recovery to more grammars is a future
+/// step, not this fix.
+pub(crate) fn enclosing_impl_owner(
+    symbols: &[SymbolRecord],
+    def_start_line: u32,
+) -> Option<String> {
+    let mut best: Option<(u32, &str)> = None; // (impl_start_line, owner_token)
+    for sym in symbols {
+        if sym.kind != SymbolKind::Impl {
+            continue;
+        }
+        let (start, end) = sym.line_range;
+        if def_start_line < start || def_start_line > end {
+            continue;
+        }
+        let Some(owner) = container_target_type(sym) else {
+            continue;
+        };
+        match best {
+            Some((best_start, _)) if start <= best_start => {}
+            _ => best = Some((start, owner)),
+        }
+    }
+    best.map(|(_, owner)| owner.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Cascading name resolution
 // ---------------------------------------------------------------------------

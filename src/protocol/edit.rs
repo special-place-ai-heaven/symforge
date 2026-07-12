@@ -2259,7 +2259,11 @@ pub(crate) fn execute_batch_rename(
     input: &BatchRenameInput,
 ) -> Result<String, String> {
     // Phase 1: Resolve the definition and find the name within its body.
-    let (def_name_range, language) = {
+    // `target_owner` is the resolved target's enclosing-`impl` owner type (019
+    // recall-recovery): for `Target::new`, `Some("Target")`. `None` when the
+    // def is not inside an `impl` (free fn, non-Rust container) — those keep the
+    // ambiguity demote/drop behavior unchanged.
+    let (def_name_range, language, target_owner) = {
         let guard = index.read();
         let file = guard
             .get_file(&input.path)
@@ -2278,33 +2282,38 @@ pub(crate) fn execute_batch_rename(
             })?;
         let abs_start = sym.byte_range.0 + name_offset as u32;
         let abs_end = abs_start + input.name.len() as u32;
-        ((abs_start, abs_end), file.language.clone())
+        let owner = crate::live_index::enclosing_impl_owner(&file.symbols, sym.line_range.0);
+        ((abs_start, abs_end), file.language.clone(), owner)
     };
 
-    // Phase 2: Find all references across the project.
-    let ref_sites: Vec<(String, (u32, u32))> = {
+    // Phase 2: Find all references across the project. Carry each ref's
+    // `qualified_name` (019 recall-recovery): the immediate qualifier lets the
+    // ambiguity gate recover `Target::new()` call sites whose qualifier matches
+    // the resolved target's owner.
+    let ref_sites: Vec<(String, (u32, u32), Option<String>)> = {
         let guard = index.read();
         let refs = guard.find_references_for_name(&input.name, None, false);
         refs.into_iter()
-            .map(|(path, rr)| (path.to_string(), rr.byte_range))
+            .map(|(path, rr)| (path.to_string(), rr.byte_range, rr.qualified_name.clone()))
             .collect()
     };
 
     // Filter ref_sites by code_only
-    let ref_sites: Vec<(String, (u32, u32))> = if input.code_only.unwrap_or(false) {
-        ref_sites
-            .into_iter()
-            .filter(|(path, _)| {
-                let ext = path.rsplit('.').next().unwrap_or("");
-                match crate::domain::index::LanguageId::from_extension(ext) {
-                    None => false,
-                    Some(lang) => !crate::parsing::config_extractors::is_config_language(&lang),
-                }
-            })
-            .collect()
-    } else {
-        ref_sites
-    };
+    let mut ref_sites: Vec<(String, (u32, u32), Option<String>)> =
+        if input.code_only.unwrap_or(false) {
+            ref_sites
+                .into_iter()
+                .filter(|(path, _, _)| {
+                    let ext = path.rsplit('.').next().unwrap_or("");
+                    match crate::domain::index::LanguageId::from_extension(ext) {
+                        None => false,
+                        Some(lang) => !crate::parsing::config_extractors::is_config_language(&lang),
+                    }
+                })
+                .collect()
+        } else {
+            ref_sites
+        };
 
     // Phase 2b: Supplemental qualified-path scan with confidence classification.
     // The xref index tracks call targets (e.g. "new" in Widget::new()), not
@@ -2353,6 +2362,157 @@ pub(crate) fn execute_batch_rename(
         }
     }
 
+    // Phase 2c: Ambiguity gate (P0 safety) with owner-name recall recovery.
+    // Count how many DEFINITIONS the index holds for `input.name`. The bare-name
+    // reverse-index refs (`ref_sites`) and the unscoped qualified matches
+    // (`qualified_confident`) both key on the leaf name only, so for a name with
+    // 2+ definitions they cannot be attributed to the resolved target definition
+    // by the leaf alone (e.g. renaming `Target::new` must not rewrite
+    // `SomeOther::new`).
+    //
+    // 019 recall-recovery: a qualified ref whose IMMEDIATE QUALIFIER equals the
+    // resolved target's `impl` OWNER (`Target::new()` when renaming Target's
+    // `new`) IS attributable and stays writable — BUT ONLY when that owner name
+    // is UNIQUE among the ambiguous defs' owners. If two unrelated `impl Target`
+    // exist, the qualifier can't disambiguate, so we fall back to demoting. Bare
+    // (unqualified) refs and refs whose qualifier != owner still demote.
+    let def_count = {
+        let guard = index.read();
+        guard
+            .files
+            .values()
+            .flat_map(|file| file.symbols.iter())
+            .filter(|sym| sym.name == input.name)
+            .count()
+    };
+    if def_count >= 2 {
+        // Owner-uniqueness guard: count how many defs of `input.name` share the
+        // resolved target's owner name. Recovery is sound only when EXACTLY ONE
+        // does (mirrors resolve_ambiguous_callee's "matched >1 -> drop"). A `None`
+        // target owner (free fn / non-Rust container) never recovers.
+        let owner_is_unique = if let Some(owner) = target_owner.as_deref() {
+            let guard = index.read();
+            let same_owner_defs = guard
+                .files
+                .values()
+                .flat_map(|file| {
+                    file.symbols.iter().filter_map(move |sym| {
+                        if sym.name != input.name {
+                            return None;
+                        }
+                        crate::live_index::enclosing_impl_owner(&file.symbols, sym.line_range.0)
+                    })
+                })
+                .filter(|o| o == owner)
+                .count();
+            same_owner_defs == 1
+        } else {
+            false
+        };
+
+        // Immediate qualifier of a `qualified_name` string: the segment right
+        // before the leaf (`Target::new` -> `Target`; `a::b::Foo::new` -> `Foo`).
+        let immediate_qualifier = |qn: &str| -> Option<String> {
+            let segs: Vec<&str> = qn
+                .split(['.', ':'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            match segs.len() {
+                0 | 1 => None,
+                n => Some(segs[n - 2].to_string()),
+            }
+        };
+        // Immediate qualifier for a byte-scanned match: the identifier ending at
+        // the `::` immediately before the leaf at `leaf_start`.
+        let qualifier_before = |content: &[u8], leaf_start: u32| -> Option<String> {
+            let leaf_start = leaf_start as usize;
+            if leaf_start < 2
+                || leaf_start > content.len()
+                || content[leaf_start - 2] != b':'
+                || content[leaf_start - 1] != b':'
+            {
+                return None;
+            }
+            let end = leaf_start - 2;
+            let mut start = end;
+            while start > 0 {
+                let b = content[start - 1];
+                if b == b'_' || b.is_ascii_alphanumeric() {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            if start == end {
+                return None;
+            }
+            // Guard the byte slice against multi-byte UTF-8 splits before decode.
+            while start < end && (content[start] & 0b1100_0000) == 0b1000_0000 {
+                start += 1;
+            }
+            std::str::from_utf8(&content[start..end])
+                .ok()
+                .map(|s| s.to_string())
+        };
+
+        // Keep-writable predicate: recovery only when the owner is unique AND the
+        // ref's immediate qualifier equals that owner.
+        let recovers = |qualifier: Option<&str>| -> bool {
+            owner_is_unique
+                && match (qualifier, target_owner.as_deref()) {
+                    (Some(q), Some(owner)) => q == owner,
+                    _ => false,
+                }
+        };
+
+        // Convert each demoted (path, byte_range) site into an uncertain
+        // (path, line, context) tuple so it flows through the existing
+        // uncertain-warning block instead of the confident write set.
+        let demote = |path: &str, start: u32, sink: &mut Vec<(String, u32, String)>| {
+            let content = file_contents
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, c)| c.as_slice())
+                .unwrap_or(&[]);
+            let text = String::from_utf8_lossy(content);
+            let start = (start as usize).min(text.len());
+            let line = text[..start].bytes().filter(|&b| b == b'\n').count() + 1;
+            let context = text.lines().nth(line - 1).unwrap_or("").trim().to_string();
+            sink.push((path.to_string(), line as u32, context));
+        };
+
+        // Partition ref_sites: keep owner-recovered, demote the rest.
+        let mut kept_refs: Vec<(String, (u32, u32), Option<String>)> = Vec::new();
+        for (path, range, qn) in ref_sites.drain(..) {
+            let qualifier = qn.as_deref().and_then(immediate_qualifier);
+            if recovers(qualifier.as_deref()) {
+                kept_refs.push((path, range, qn));
+            } else {
+                demote(&path, range.0, &mut qualified_uncertain);
+            }
+        }
+        ref_sites = kept_refs;
+
+        // Partition qualified_confident the same way, parsing the qualifier out
+        // of the scanned file content (byte-scan matches carry no qualified_name).
+        let mut kept_qual: Vec<(String, (u32, u32))> = Vec::new();
+        for (path, range) in qualified_confident.drain(..) {
+            let content = file_contents
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, c)| c.as_slice())
+                .unwrap_or(&[]);
+            let qualifier = qualifier_before(content, range.0);
+            if recovers(qualifier.as_deref()) {
+                kept_qual.push((path, range));
+            } else {
+                demote(&path, range.0, &mut qualified_uncertain);
+            }
+        }
+        qualified_confident = kept_qual;
+    }
+
     // Phase 3: Group rename sites by file.
     // Confident sources: definition site, indexed refs, qualified confident matches.
     // Uncertain matches are NOT applied — only surfaced in output.
@@ -2362,7 +2522,7 @@ pub(crate) fn execute_batch_rename(
         .entry(input.path.clone())
         .or_default()
         .push(def_name_range);
-    for (path, range) in &ref_sites {
+    for (path, range, _qn) in &ref_sites {
         by_file.entry(path.clone()).or_default().push(*range);
     }
     for (path, range) in &qualified_confident {

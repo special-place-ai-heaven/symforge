@@ -20,8 +20,25 @@ pub struct JsonExtractor;
 /// sequence never occurs in strict JSON outside string literals, so it is safe
 /// globally; string contents are respected in both passes.
 fn normalize_jsonc(input: &[u8]) -> Vec<u8> {
-    let stripped = strip_json_comments(input);
+    let stripped = strip_json_comments(&blank_leading_bom(input));
     blank_trailing_commas(&stripped)
+}
+
+/// Blank a leading 3-byte UTF-8 BOM (`EF BB BF`) at byte offset 0 to three
+/// spaces. A BOM is valid at the start of a JSON document (RFC 8259) but
+/// `serde_json` rejects it; blanking (rather than stripping) keeps every byte
+/// offset and line number unchanged, so diagnostics and symbol spans stay
+/// accurate. `serde_json` tolerates the leading whitespace. Only a BOM at
+/// offset 0 is treated as a BOM — an identical byte sequence mid-document is
+/// ordinary content and is left untouched.
+fn blank_leading_bom(input: &[u8]) -> Vec<u8> {
+    let mut out = input.to_vec();
+    if out.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        out[0] = b' ';
+        out[1] = b' ';
+        out[2] = b' ';
+    }
+    out
 }
 
 /// Blank any trailing comma (a `,` followed only by whitespace before `}` or
@@ -894,5 +911,53 @@ mod tests {
         );
         assert!(result.symbols.iter().any(|s| s.name == "url"));
         assert!(result.symbols.iter().any(|s| s.name == "pattern"));
+    }
+
+    #[test]
+    fn test_utf8_bom_json_validates_and_preserves_offsets() {
+        // A UTF-8 BOM (EF BB BF) is valid at the start of a JSON file per
+        // RFC 8259, but serde_json rejects it. The normalizer must blank the
+        // leading BOM to 3 spaces (offset-preserving), so BOM-prefixed JSON
+        // parses AND every symbol lands at the same byte offset it would with
+        // the BOM replaced by three plain spaces at the head of the buffer.
+        let bom = b"\xEF\xBB\xBF{\"a\": 1, \"b\": 2}";
+        let bom_result = JsonExtractor.extract(bom);
+        assert!(
+            matches!(bom_result.outcome, ExtractionOutcome::Ok),
+            "valid JSON with a leading UTF-8 BOM must validate OK"
+        );
+        assert!(bom_result.symbols.iter().any(|s| s.name == "a"));
+        assert!(bom_result.symbols.iter().any(|s| s.name == "b"));
+
+        // Control: the SAME document with the 3 BOM bytes replaced by 3 spaces
+        // is what the blanking produces. Offsets/spans must be byte-identical,
+        // proving the BOM handling did not shift any offset.
+        let spaced = b"   {\"a\": 1, \"b\": 2}";
+        let spaced_result = JsonExtractor.extract(spaced);
+        assert!(matches!(spaced_result.outcome, ExtractionOutcome::Ok));
+
+        for name in ["a", "b"] {
+            let bom_sym = find_sym(&bom_result.symbols, name);
+            let spaced_sym = find_sym(&spaced_result.symbols, name);
+            assert_eq!(
+                bom_sym.byte_range, spaced_sym.byte_range,
+                "BOM handling must preserve byte offsets for key {name}"
+            );
+            assert_eq!(
+                bom_sym.line_range, spaced_sym.line_range,
+                "BOM handling must preserve line numbers for key {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_without_bom_control_still_ok() {
+        // The plain (no-BOM) control must remain valid — the BOM fix must not
+        // regress ordinary JSON.
+        let content = br#"{"a": 1, "b": 2}"#;
+        let result = JsonExtractor.extract(content);
+        assert!(matches!(result.outcome, ExtractionOutcome::Ok));
+        assert!(result.symbols.iter().any(|s| s.name == "a"));
+        assert!(result.symbols.iter().any(|s| s.name == "b"));
     }
 }
