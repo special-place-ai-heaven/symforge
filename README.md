@@ -60,12 +60,16 @@ SymForge answers the same questions from an in-memory, symbol-level index:
 
 | Instead of | Use | Typical effect |
 |---|---|---|
-| Reading a 2,000-line file | `get_file_context` (outline, imports, consumers) | 70–95% fewer tokens for the same decision |
+| Reading a 2,000-line file | `get_file_context` (outline, imports, consumers) | 70–95% fewer tokens (mean range from tested cases) for the same decision |
 | Broad `grep -r` | `search_text` with enclosing-symbol grouping | Matches arrive with structure, not raw lines |
 | Guessing who calls a function | `find_references` / `get_symbol_context` | Exact call sites, imports, and type usages |
 | Find-and-replace refactors | `replace_symbol_body`, `batch_rename` | Structural edits validated against the index |
 
-Every response carries a machine-readable **trust envelope** so the agent knows exactly how much to believe it — and every truncation is disclosed with the real cost, never silently applied. Measured numbers live in the wiki: [Benchmarks and Token Savings](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings).
+Every response carries a machine-readable **trust envelope** so the agent knows exactly how much to believe it — and every truncation is disclosed with the real cost, never silently applied.
+
+**Token economics (measured, honest)**: The full 36-tool surface carries ~7k tokens of schema/description overhead. The 70–95% savings figures (e.g. for `get_file_context`) are mean ranges from actual test runs on code, not theoretical best-case. When used for code with the right tools (outlines first, compact modes, targeted symbols), net context usage is lower than naive full-file reads + greps because large irrelevant source is avoided. Trivial or prose-only work can lose on the overhead. See `grok-symforge-analysis-report.md` and the wiki benchmarks for the data. For lower overhead use `SYMFORGE_SURFACE=compact`.
+
+Measured numbers also live in the wiki: [Benchmarks and Token Savings](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings).
 
 ## Features
 
