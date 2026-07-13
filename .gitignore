@@ -24,3 +24,6 @@ __pycache__/
 nul
 
 .octogent
+
+# Local analysis reports produced during sessions (e.g. Grok token analysis)
+grok-symforge-analysis-report.md
