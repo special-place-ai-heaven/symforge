@@ -128,7 +128,7 @@ zstd = "0.13"
 # spawned powershell/taskkill/tasklist (taskkill's graceful mode is refused
 # by console daemons, and corporate EDR flags spawned kill tools). Pattern
 # ported from Terminal Commander's supervisor.
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
