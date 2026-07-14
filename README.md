@@ -535,6 +535,7 @@ Common configuration variables:
 | `SYMFORGE_SIDECAR_BIND` | Bind host for local sidecar state |
 | `SYMFORGE_DAEMON_BIND` | Bind host for shared daemon state; loopback hosts are accepted by default |
 | `SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK` | Explicit truthy opt-in required before the daemon binds a non-loopback host |
+| `SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS` | Idle lifetime for the shared daemon; detached auto-spawn defaults to 600 seconds, while an explicit `symforge daemon` stays persistent when unset; nonzero values clamp to at least 60 seconds and `0` disables shutdown |
 | `SYMFORGE_DAEMON_AUTH_TOKEN` | Optional local bearer token for daemon project, session, tool, and sidecar routes |
 | `SYMFORGE_RECONCILE_INTERVAL` | Watcher reconciliation interval in seconds; `0` disables periodic sweeps |
 | `SYMFORGE_CHECKPOINT_INTERVAL_SECS` | Optional periodic snapshot interval for local in-process mode; unset/`0`/false disables it, nonzero values are bounded to 30-3600 seconds |

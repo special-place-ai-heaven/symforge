@@ -101,6 +101,24 @@ fn session_ttl_from_env() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Zombie-daemon guard: seconds without any AUTHENTICATED request before the
+/// daemon shuts itself down. Detached auto-spawn defaults to 600 seconds;
+/// an explicitly managed `symforge daemon` remains persistent unless this
+/// variable is set. Values are clamped to at least 60 seconds; `0` disables.
+const DAEMON_IDLE_SHUTDOWN_ENV: &str = "SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS";
+// Snapshot-backed respawn costs milliseconds, so a short window is cheap:
+// zombies die within ~10 minutes of the last client's death.
+const DEFAULT_DAEMON_IDLE_SHUTDOWN_SECS: u64 = 600;
+
+fn daemon_idle_shutdown_from_env() -> Option<std::time::Duration> {
+    let value = std::env::var(DAEMON_IDLE_SHUTDOWN_ENV).ok()?;
+    let secs = value
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(DEFAULT_DAEMON_IDLE_SHUTDOWN_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs.max(60)))
+}
+
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
@@ -177,6 +195,11 @@ pub struct DaemonState {
     auth_token: String,
     /// Concurrency governor — limits parallel tool calls and enforces timeouts.
     governor: crate::sidecar::governor::RequestGovernor,
+    /// Epoch millis of the last AUTHENTICATED request — the idle-shutdown signal.
+    last_activity_at: AtomicU64,
+    /// Notified by the reaper once the idle-shutdown window elapses;
+    /// `run_daemon_until_shutdown` treats it like a shutdown signal.
+    idle_shutdown: tokio::sync::Notify,
 }
 
 /// Tracks whether a ProjectInstance has been fully activated (watcher + git temporal started).
@@ -528,6 +551,11 @@ fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<
     let expected_digest = crate::hash::digest(expected_token.as_bytes());
     let provided_digest = crate::hash::digest(provided_token.as_bytes());
     if constant_time_eq(&expected_digest, &provided_digest) {
+        // Idle-shutdown signal: only AUTHENTICATED traffic counts as activity,
+        // so unauthenticated probes cannot keep a zombie daemon alive.
+        state
+            .last_activity_at
+            .store(now_epoch_millis(), Ordering::Relaxed);
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -667,6 +695,8 @@ impl DaemonState {
             identity: current_daemon_identity(),
             auth_token,
             governor: crate::sidecar::governor::RequestGovernor::new(),
+            last_activity_at: AtomicU64::new(now_epoch_millis()),
+            idle_shutdown: tokio::sync::Notify::new(),
         }
     }
 
@@ -2476,6 +2506,12 @@ fn spawn_daemon_process() -> anyhow::Result<()> {
         );
     }
     let mut command = std::process::Command::new(current_exe);
+    if std::env::var_os(DAEMON_IDLE_SHUTDOWN_ENV).is_none() {
+        command.env(
+            DAEMON_IDLE_SHUTDOWN_ENV,
+            DEFAULT_DAEMON_IDLE_SHUTDOWN_SECS.to_string(),
+        );
+    }
     command
         .arg("daemon")
         .stdin(Stdio::null())
@@ -2990,11 +3026,19 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
     // sweeps promptly while production stays quiet. The task holds only a
     // `Weak` on the state: it exits when the daemon state drops.
     let ttl = session_ttl_from_env();
+    let idle_shutdown_after = daemon_idle_shutdown_from_env();
     let reaper_state = Arc::downgrade(&state);
     let reaper_task = tokio::spawn(async move {
-        let period_secs = (ttl.as_secs() / 4).clamp(10, 600);
+        let mut period_secs = (ttl.as_secs() / 4).clamp(10, 600);
+        if let Some(idle) = idle_shutdown_after {
+            // Sweep at least 4x per idle window so shutdown is not overly late.
+            period_secs = period_secs.min((idle.as_secs() / 4).max(10));
+        }
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(period_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Fire the idle notification at most once per idle stretch; keep
+        // reaping afterwards for embedders that ignore the notification.
+        let mut idle_fired = false;
         loop {
             interval.tick().await;
             let Some(state) = reaper_state.upgrade() else {
@@ -3003,6 +3047,22 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
             let reaped = state.reap_expired_sessions(ttl);
             if reaped > 0 {
                 tracing::info!(reaped, ttl_secs = ttl.as_secs(), "session reaper sweep");
+            }
+            if let Some(idle) = idle_shutdown_after {
+                let idle_ms = now_epoch_millis()
+                    .saturating_sub(state.last_activity_at.load(Ordering::Relaxed));
+                if idle_ms >= idle.as_millis() as u64 {
+                    if !idle_fired {
+                        idle_fired = true;
+                        tracing::info!(
+                            idle_secs = idle_ms / 1000,
+                            "no authenticated activity within the idle window; requesting daemon shutdown"
+                        );
+                        state.idle_shutdown.notify_one();
+                    }
+                } else {
+                    idle_fired = false;
+                }
             }
         }
     });
@@ -3028,8 +3088,9 @@ pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
         }
     };
     tracing::info!(port = handle.port, "shared daemon started");
-    // Wait for either SIGINT (Ctrl+C) or SIGTERM (kill, systemd, containers).
-    // Both trigger the same graceful shutdown path.
+    // Wait for SIGINT (Ctrl+C), SIGTERM (kill, systemd, containers), or the
+    // reaper's idle-shutdown notification. All trigger the same graceful path.
+    let idle_state = Arc::clone(&handle.state);
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -3041,12 +3102,22 @@ pub async fn run_daemon_until_shutdown(bind_host: &str) -> anyhow::Result<()> {
             _ = sigterm.recv() => {
                 tracing::info!("received SIGTERM, shutting down");
             },
+            _ = idle_state.idle_shutdown.notified() => {
+                tracing::info!("idle-shutdown window elapsed, shutting down");
+            },
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("received Ctrl+C, shutting down");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                tracing::info!("received Ctrl+C, shutting down");
+            },
+            _ = idle_state.idle_shutdown.notified() => {
+                tracing::info!("idle-shutdown window elapsed, shutting down");
+            },
+        }
     }
     let DaemonHandle {
         shutdown_tx,
@@ -4750,6 +4821,82 @@ mod tests {
             .default_headers(headers)
             .build()
             .expect("build authed reqwest client")
+    }
+
+    #[tokio::test]
+    async fn daemon_idle_shutdown_env_parsing() {
+        let _guard = env_lock().await;
+        // Unset: an explicitly managed daemon remains persistent.
+        {
+            let _env = EnvVarGuard::unset(DAEMON_IDLE_SHUTDOWN_ENV);
+            assert_eq!(daemon_idle_shutdown_from_env(), None);
+        }
+        // Explicit 0 disables idle shutdown entirely.
+        {
+            let _env = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "0");
+            assert_eq!(daemon_idle_shutdown_from_env(), None);
+        }
+        // Sub-minimum values clamp up to 60s.
+        {
+            let _env = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "5");
+            assert_eq!(
+                daemon_idle_shutdown_from_env(),
+                Some(Duration::from_secs(60))
+            );
+        }
+        // Garbage falls back to the default rather than disabling the guard.
+        {
+            let _env = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "soon");
+            assert_eq!(
+                daemon_idle_shutdown_from_env(),
+                Some(Duration::from_secs(DEFAULT_DAEMON_IDLE_SHUTDOWN_SECS))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_idle_shutdown_waits_for_authenticated_activity_then_notifies() {
+        let _guard = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _idle = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "60");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let state = Arc::clone(&handle.state);
+        tokio::task::yield_now().await;
+
+        state
+            .last_activity_at
+            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+        authed_client(&handle)
+            .get(format!("http://127.0.0.1:{}/v1/projects", handle.port))
+            .send()
+            .await
+            .expect("authenticated request")
+            .error_for_status()
+            .expect("authenticated status");
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
+                .await
+                .is_err(),
+            "authenticated activity must defer idle shutdown"
+        );
+
+        state
+            .last_activity_at
+            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
+            .await
+            .expect("idle reaper must request shutdown");
+
+        handle.reaper_task.abort();
+        let _ = handle.shutdown_tx.send(());
+        handle.server_task.await.expect("daemon server task");
     }
 
     #[test]
