@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "protocol_id": "SFBENCH-1.0",
+  "system_under_test": {
+    "version": "8.14.0",
+    "binary_sha256": "294ad9fae560ac217b10d685aa06c2a8fbaa63794d6f70bb92c2f5f61f9947fe",
+    "surface_modes": [
+      "full",
+      "compact",
+      "meta"
+    ],
+    "daemon_policy": "isolated_no_daemon_except_explicit_daemon_cases"
+  },
+  "mcp": {
+    "protocol_version": "2025-06-18",
+    "primary_transport": "stdio",
+    "http_status": "blocked_until_official_sdk_parity_runner",
+    "manifest_identity": "surface+tool_name+schema_sha256"
+  },
+  "tokenization": {
+    "package": "tiktoken",
+    "version": "0.13.0",
+    "primary": {
+      "encoding": "cl100k_base",
+      "vocabulary_sha256": "83d6504082a038c7aa769af6e2808471f94bf303ac150db2060cfc2a57020aa4"
+    },
+    "sensitivity": {
+      "encoding": "o200k_base",
+      "vocabulary_sha256": "5d2372a38d68a4f7d6b65369719645d2aad38694af99b2a5274f5649ca47f591"
+    },
+    "provider_usage_is_primary_when_available": true
+  },
+  "repetitions": {
+    "direct_correctness_fresh_sessions": 3,
+    "cold_build_independent_starts": 5,
+    "warm_calls_per_cohort": 20,
+    "discarded_warmups": 2,
+    "paired_llm_seeds": 5
+  },
+  "paired_llm": {
+    "enabled_during_direct_phase": false,
+    "runner": "claude_task_runner.py",
+    "client": "Claude Code",
+    "client_version": "2.1.207",
+    "model_alias": "sonnet",
+    "resolved_model_must_be_recorded_per_trial": true,
+    "effort": "medium",
+    "seed_control": null,
+    "temperature_control": null,
+    "natural_and_forced_workflows_reported_separately": true,
+    "activation_gate": "direct suite complete and maximum campaign cost recorded"
+  },
+  "statistics": {
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000,
+    "report_micro_and_macro_aggregates": true,
+    "strata": [
+      "tiny",
+      "normal",
+      "symbol-poor",
+      "stress"
+    ]
+  },
+  "safety": {
+    "persist_unsanitized_output": false,
+    "source_mirrors_are_immutable": true,
+    "ordinary_cases_use_independent_clones": true,
+    "oracle_visible_to_llm": false,
+    "network_during_measurement": false
+  }
+}
