@@ -64,3 +64,16 @@ For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
 at specs/015-cbm-capability-ports/plan.md
 <!-- SPECKIT END -->
+
+## Documentation hygiene (as_of 2026-07-13 — binding)
+
+This file is the ONLY live-truth document in this repo; volatile claims carry an
+`as_of` stamp. Doc map (enforced by user-level hooks — new .md files prompt the owner):
+
+- `CLAUDE.md` — live state + rules. UPDATE it when a change falsifies a claim here.
+- `specs/NNN-*/` — feature lifecycle (spec-kit), if used.
+- `docs/solutions/` — compounded learnings (`/ce-compound` files them).
+- `docs/archive/` — historical; never trust, never update, only append moves.
+- Other docs are legacy pending triage — verify against code before believing them.
+- Durable decisions/lessons go to agentmemory with the `[symforge]` content prefix;
+  session-start recall injects them automatically.

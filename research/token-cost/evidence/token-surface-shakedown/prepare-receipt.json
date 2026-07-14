@@ -1,0 +1,29 @@
+{
+  "index_folder": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Indexed 726 files, 21830 symbols."
+      }
+    ],
+    "isError": false
+  },
+  "checkpoint_now": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Checkpoint complete: wrote 17222891 bytes for 726 file(s) to \\\\?\\C:\\Users\\rakovnik\\AppData\\Local\\Temp\\symforge-token-shakedown-a10ff102\\.symforge\\index.bin"
+      }
+    ],
+    "isError": false
+  },
+  "health": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Status: Ready | Files: 726 indexed (720 parsed, 4 partial, 2 failed) | Symbols: 21830 | Loaded: 3670ms\nWatcher: active (events: 2, overflows: 0, repairs: 0) | Stale-mutation rejections: 0 | Admission tiers: 726/58/0 (indexed/metadata/skipped)\nParse issues: 0 unexpected partial, 4 expected vendor partial, 2 failed; use full health for path lists\nParse/span quarantine: total=6 unexpected_partial=0 expected_vendor_partial=4 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=2 showing=6 offset=0 omitted=0\nRuntime: mode=local_process | version=8.14.1 | project_root=//?/C:/Users/rakovnik/AppData/Local/Temp/symforge-token-shakedown-a10ff102 | project_id=project-6129eae85a53c45d5c9c8e40268f17c4b98b90d032d2fd8c542d86f5160aa839 | session_id=local-process-21128 | index_id=index-6129eae85a53-p2-g4 | index_generation=4 | project_generation=2 | load_source=fresh_load | reset_state=none | index_state=fresh_process\nSidecar: none (informational: local-process mode keeps no sidecar; hooks fail open by design)\nGit temporal: ready (500 commits over 90d, computed in 2647ms) | Worktree misuse/hour: 0\nCapabilities: frecency=ready/session/no-history fallback-used-on-empty; co-change=preparing/lazy-on-request fallback-used-on-request; worktree=explicit-call enabled; ranking=call-time explain available/default-off"
+      }
+    ],
+    "isError": false
+  }
+}

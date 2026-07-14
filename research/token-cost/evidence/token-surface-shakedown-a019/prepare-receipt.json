@@ -1,0 +1,36 @@
+{
+  "fixture_commit": "a10ff102546241f1ffd49852ba4d3088c0bb8029",
+  "symforge_version": "8.14.1",
+  "symforge_binary": "C:\\Users\\rakovnik\\.codex\\tools\\symforge-token-trust-8.14.1-a019\\symforge.exe",
+  "symforge_binary_sha256": "6C4176E03299B768793ACB64012FDD95783476B6AE59662FC4AD7B8C310FFC3B",
+  "golden_index_sha256": "5941FB75336ADD7DC2D85B5D88E1061466B0C5B6F8FCE26C461757D4CB5654D5",
+  "mcp": {
+    "index_folder": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Indexed 726 files, 21830 symbols."
+        }
+      ],
+      "isError": false
+    },
+    "checkpoint_now": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Checkpoint complete: wrote 17222891 bytes for 726 file(s) to \\\\?\\C:\\Users\\rakovnik\\AppData\\Local\\Temp\\symforge-token-shakedown-a10ff102\\.symforge\\index.bin"
+        }
+      ],
+      "isError": false
+    },
+    "health": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Status: Ready | Files: 726 indexed (720 parsed, 4 partial, 2 failed) | Symbols: 21830 | Loaded: 2956ms\nWatcher: active (events: 2, overflows: 0, repairs: 0) | Stale-mutation rejections: 0 | Admission tiers: 726/58/0 (indexed/metadata/skipped)\nParse issues: 0 unexpected partial, 4 expected vendor partial, 2 failed; use full health for path lists\nParse/span quarantine: total=6 unexpected_partial=0 expected_vendor_partial=4 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=2 showing=6 offset=0 omitted=0\nRuntime: mode=local_process | version=8.14.1 | project_root=//?/C:/Users/rakovnik/AppData/Local/Temp/symforge-token-shakedown-a10ff102 | project_id=project-6129eae85a53c45d5c9c8e40268f17c4b98b90d032d2fd8c542d86f5160aa839 | session_id=local-process-44120 | index_id=index-6129eae85a53-p1-g3 | index_generation=3 | project_generation=1 | load_source=fresh_load | reset_state=none | index_state=fresh_process\nSidecar: none (informational: local-process mode keeps no sidecar; hooks fail open by design)\nGit temporal: computing... | Worktree misuse/hour: 0\nCapabilities: frecency=ready/session/no-history fallback-used-on-empty; co-change=preparing/lazy-on-request fallback-used-on-request; worktree=explicit-call enabled; ranking=call-time explain available/default-off\nWARNING: PATH shadow [foreign-prefix shadow]: bare `symforge` runs C:\\Users\\rakovnik\\.npm-global\\symforge.cmd (version unknown), not your install C:\\Users\\rakovnik\\.codex\\tools\\symforge-token-trust-8.14.1-a019\\symforge.exe (8.14.1); run full `health` for the exact fix."
+        }
+      ],
+      "isError": false
+    }
+  }
+}

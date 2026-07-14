@@ -1,0 +1,25 @@
+{
+  "checkpoint": "post-run-01",
+  "reviewer": "Claude Code Opus",
+  "verdict": "APPROVE_CONTINUE",
+  "reviewed_at": "2026-07-13T13:13:02Z",
+  "run_id": 1,
+  "canonical_total_tokens": 240645,
+  "usage_event_count": 1,
+  "symforge_completed_calls": 8,
+  "semantic_readiness_verified": true,
+  "teardown_verified": true,
+  "configuration_diagnostic_count": 0,
+  "potential_secret_line_count": 0,
+  "oracle_pass": false,
+  "oracle_failures": [
+    "Criterion 4: substitutes compact_surface_tools for required compact_probe_tools.",
+    "Criterion 5: omits surface_probe.rs:253-285 evidence for compact_probe_tools."
+  ],
+  "findings": [
+    "S1's frozen probe-constructor requirement may penalize the actual production constructor; retain the preregistered grade for this shakedown and resolve the oracle before the confirmatory pilot.",
+    "Incremental-versus-cumulative token semantics remain observationally indistinguishable until a trace emits more than one usage event; the harness halts if that occurs.",
+    "The root-agent teardown audit confirmed the single worktree and zero owned processes after the reviewer could not run its own process/worktree commands."
+  ],
+  "authorized_next_runs": "02-20"
+}

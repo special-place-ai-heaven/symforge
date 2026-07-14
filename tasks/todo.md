@@ -1,3 +1,151 @@
+# SymForge MCP Token-Economics Evaluation
+
+## Release train — 2026-07-14
+
+- [x] Inventory local changes, branches/worktrees, remote divergence, open PRs, checks, and the release workflow.
+- [x] Validate the complete commit scope and scan it for secrets or oversized artifacts.
+- [x] Run the repository's pre-integration verification gates.
+- [ ] Commit all safe work and fast-forward it onto updated `main`.
+- [ ] Merge every ready open PR with branch deletion and refresh `main` after each.
+- [ ] Verify the final `main`, push it, and confirm the Release workflow starts.
+- [ ] Delete merged local branches/worktrees and leave a clean checkout on `main`.
+
+Review: pending.
+
+## Windows delegated-worker process leak regression
+
+- [x] Preserve the observed process tree and terminate only the three completed worker-owned trees.
+- [x] Identify the exact lifecycle owner and installed-version boundary where worker completion stops reaping MCP children.
+- [x] Compare the broken path with the last known working implementation or current upstream fix.
+- [x] Identify the exact minimal red lifecycle check before changing anything.
+- [x] Execute and preserve that red check in a separate Codex checkout before implementation.
+- [x] Restore or expose `close_agent` at the collaboration-wrapper boundary; do not add a repo cleanup daemon or polling workaround.
+- [x] Confirm V2's current resident bound is independently root plus three workers; correct the false claim that `[agents].max_threads`/`max_depth` govern V2.
+- [x] Inspect the uncommitted SymForge daemon idle-shutdown defense in depth and verify its authenticated-heartbeat mechanism.
+- [x] Obtain independent review of the daemon idle-shutdown scope, default service semantics, shutdown behavior, and test coverage via `research/token-cost/claude-handoff-daemon-idle-review-a019.md` (`CHANGES_REQUIRED`).
+- [x] Restrict the 600-second default to detached auto-spawn, keep explicit `symforge daemon` persistent when unset, and document the operator contract.
+- [x] Add a paused-time behavioral test proving authenticated activity defers shutdown and the next idle sweep notifies; preserve its red/green receipt.
+- [x] Verify focused tests, fmt, all-target clippy, the full serial all-targets suite, and an isolated 60-second live-process smoke with runtime-file cleanup.
+- [x] Obtain independent follow-up review of the corrected daemon diff (`APPROVE_COMMIT`) and commit only the approved product scope.
+- [x] Verify a completed worker leaves zero worker-owned descendants while the active session and unrelated Claude/WSL/Docker processes survive.
+- [x] Record the fix, verification, and cleanup in this section's review.
+- [x] Record the read-only STAY-AND-FIX reconnaissance in `research/token-cost/codex-v2-close-agent-reconnaissance-2026-07-14.md`.
+- [x] Obtain independent review via `research/token-cost/claude-handoff-codex-v2-close-agent-research-a019.md` (`APPROVE_IMPLEMENTATION_PLAN`).
+- [x] Create the isolated pinned Codex branch and preserve the focused clean baseline.
+- [x] Preserve the V2 `close_agent` tool-plan red test before product code.
+- [x] Implement only the V2 bridge, registration, honest usage hint, and focused behavior/namespace coverage.
+- [x] Obtain the next independent code-review verdict before broader gates or installation.
+- [x] Run the broader `codex-core` package gate and classify every residual failure outside the patch scope.
+- [x] Reproduce the live API rejection of default `collaboration.close_agent` and prove the same candidate through the supported non-reserved `agents` namespace.
+- [x] Obtain independent review of the reserved-namespace diagnostic and deployment recommendation.
+- [x] Verify the final Windows sentinel MCP tree exits after V2 close while the root and unrelated sentinel survive.
+- [x] Obtain final smoke/install review, commit and deploy the pinned binary, then clean the disposable Cargo target/worktree.
+
+Review note: daemon idle shutdown can bound an orphaned detached daemon only
+after authenticated traffic stops. It cannot reap the duplicate live MCP proxy
+stacks observed in Codex because those proxies keep their stdin open and send
+authenticated heartbeats. Do not present it as the root-cause fix for that
+host-owned lifecycle leak.
+
+Evidence so far:
+
+- Three collaboration workers reported completion/interruption but left three timestamp-clustered MCP/runtime bundles attached to the active Codex process.
+- The bundles contained 15 direct SymForge/Node roots plus 3 descendants. Exact-tree termination removed all 18; the active root session's older five-helper bundle remained alive.
+- The same workflow did not historically leak, so this is being treated as a lifecycle regression. Manual post-run cleanup is containment evidence, not the fix.
+- Corrected root cause: V2 intentionally retains completed agents for reuse and LRU-unloads an idle terminal resident only when a later spawn needs capacity. The active V2 surface exposes `interrupt_agent` (which preserves the target) but no explicit close, so callers cannot release a finished resident immediately.
+- V1 already registers `close_agent`; V2 registers six other collaboration operations and omits it in stable `0.144.4` and current upstream `main`. The npm JavaScript is only a native-binary launcher, so neither a plugin update nor an MCP wrapper can add the missing internal `AgentControl` route.
+- Local `codex features list` resolves `multi_agent_v2=false`, but Codex selects stored/model-catalog `multi_agent_version` before the local feature fallback. This verified precedence explains the active V2 surface; the prior configuration-only kill-switch conclusion was incomplete.
+- PR #19753 added explicit MCP-manager/client shutdown and process-group regression coverage. Normal successful session closure should now drain a completed worker's MCP stack; open issue #25426 separately shows that `close_agent` can still hang if thread termination wedges.
+- Corrected containment: V2's effective limit comes from `features.multi_agent_v2.max_concurrent_threads_per_session` and currently yields root plus three residents. V2 bypasses the V1 depth check, so `[agents].max_depth=1` is not a recursive-fan-out guarantee.
+- The tech-researcher checkpoint itself retained a verified 22-process worker tree after completion. Exact-tree cleanup removed all 22 and left the primary Codex process alive. This proves containment discipline, not lifecycle repair; the completed task remains logically registered in the current V2 session.
+- Daemon defense-in-depth review: the first independent report returned `CHANGES_REQUIRED`; the corrected policy is auto-spawn-only by default. Red gate reproduced unset→`Some(600s)`; green focused gate passed 2/2. `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `git diff --check`, and `cargo test --all-targets -- --test-threads=1` all exited 0. The isolated real-binary smoke exited at 75 seconds and confirmed port/pid/token runtime files absent. Follow-up verdict: `APPROVE_COMMIT`; exact product scope committed as `ebe013333e6f4393846c3b0c85dd9d092b9da9fd` (`Cargo.toml`, `README.md`, `src/daemon.rs`).
+- Codex-core implementation checkpoint: isolated branch `fix/multi-agent-v2-close-agent` is pinned at stable `rust-v0.144.4` base `8c68d4c87dc54d38861f5114e920c3de2efa5876`. The pre-change namespace and closed-agent/list tests passed. The preserved red assertion failed exactly with `expected close_agent in collaboration namespace`; the behavior test was also red on the missing V2 handler. The minimal bridge now registers `close_agent`, resolves V2 task paths, calls the existing V2-aware `AgentControl::close_agent`, documents post-close unavailability, and reuses the existing collaboration event contract. Green evidence: 65/65 `multi_agent_v2` tests, focused default/custom namespace tests, and close/follow-up/list behavior. `git diff --check` and Rustfmt check exit 0. The tag build's generated `Cargo.lock` version churn was removed; no compiler/linker/test processes remain. Independent code review is requested via `research/token-cost/claude-handoff-codex-v2-close-agent-code-review-a019.md` before broader gates or installation.
+- Independent code review returned `APPROVE_CONTINUE`. A helper-complete `just test -p codex-core` then ran 2,594 tests: 2,582 passed, 11 failed, 1 timed out, and 46 skipped; no V2 close/spec-plan test failed. Residual failures were unrelated Windows symlink/elevation, an unrelated missing command-runner helper, network/mock timing, and known flaky hook/CLI cases, so the package gate remains honestly red rather than being called green.
+- Standalone candidate SHA-256 `86B876536D06A70C58A03CB5104FC4F8D33875E4DB0B79FE64C79A84D7CD2E00` exposed a deployment blocker before model execution: the live API returned HTTP 400 because `collaboration.close_agent` is not in the reserved `collaboration` namespace allowlist. The identical candidate with `features.multi_agent_v2.tool_namespace='agents'` was accepted. Its sentinel MCP population moved root-only PID 62076 to root+worker PIDs 62076/59356, then back to root-only exactly when `close_agent` completed with previous status `completed`; the post-close follow-up was rejected, the worker disappeared from the live registry, the root MCP survived until normal root exit, and the separately owned unrelated sentinel remained alive until explicit cleanup. The diagnostic run's model verdict stayed `FAIL` only because both 15-second test-server hold calls were client-cancelled; final smoke must use shorter holds and must not reinterpret that diagnostic as a full pass.
+- Independent namespace review returned `APPROVE_CONFIG_DEPLOY`: keep the seven-file patch unchanged, use the supported whole-surface `agents` namespace locally, and disclose the reserved-namespace backend dependency upstream.
+- Deterministic final smoke passed its approved process/tool-result oracle at a hard root-plus-one capacity: owned MCP census 1 -> 2 -> 1 -> 2 -> 1 -> 0; both worker closes returned `completed`; post-close follow-up was rejected; the replacement spawn live-proved slot release; root and an unrelated sentinel survived both worker closes; candidate exit was 0 with `sequence_complete: true`. Five client-cancelled five-second sync holds remain harness notes, not treatment failures. At that checkpoint, smoke homes and test MCP processes were absent while the candidate target/worktree remained only for final review, commit, installation, and immediate disk cleanup.
+- Final independent review returned `APPROVE_COMMIT_INSTALL_CLEANUP`. The exact reviewed seven-file Codex patch was committed as `288cdc6ec16c6d7c6bd0f6eceb09ac40a5cf7e0a` on `fix/multi-agent-v2-close-agent`, with pinned parent `8c68d4c87dc54d38861f5114e920c3de2efa5876`; the retained commit contains no lockfile, dependency, SymForge, or unrelated changes.
+- The hash-pinned `codex-cli 0.144.4` binary was installed atomically at `C:\Users\rakovnik\.npm-global\codex.exe`; its SHA-256 is `86B876536D06A70C58A03CB5104FC4F8D33875E4DB0B79FE64C79A84D7CD2E00`. Both npm shims remained byte-identical. The live config contains exactly one `[features.multi_agent_v2]` table with `tool_namespace = "agents"` and no `multi_agent_v2 = true` scalar.
+- Installed-product verification passed by absolute path and by a sanitized Win32 bare-name spawn. A live installed `agents.close_agent` call reached the V2 handler and returned `root is not a spawned agent`, proving registration and dispatch without the reserved-namespace HTTP 400. The policy-forbidden PowerShell `Get-Command` check was not bypassed; Git Bash continues to resolve the untouched extensionless npm shim.
+- Cleanup removed 48,707 Cargo-target files (27.8 GiB reported by Cargo), removed and pruned the linked worktree, and retained the bare repository plus commit. Final custody showed the worktree and target absent, bare repo and seven-path commit present, zero `test_stdio_server.exe` processes, and 17,539,604,480 bytes free on `E:`. The broader Windows package gate remains honestly red at 2,582 passed, 11 failed, 1 timed out, and 46 skipped, with no failure in V2 close/spec-plan scope.
+
+## Current campaign — token, speed, and tool trust
+
+- [x] Create and switch to `feat/token-speed-tool-trust` without disturbing existing changes.
+- [x] Complete the reconnaissance and fact-backed experimental design.
+- [x] Repair the Claude bridge with a red/green MCP smoke test and preserve its timeout.
+- [x] Obtain Claude Opus checkpoint-0 review.
+- [x] Incorporate checkpoint-0 corrections into the experimental design.
+- [x] Write and review the original Phase 0 benchmark manifest and exact task oracles.
+- [x] Build the read-only harness, run the first full-arm observation, and stop on the corrected compact wiring gate.
+- [x] Obtain Claude Opus approval for Amendment A before the compact-read annotation prerequisite.
+- [x] Implement and verify only the compact `symforge` annotation prerequisite with a pinned candidate binary.
+- [x] Diagnose the pre-treatment snapshot-readiness failure, obtain Opus approval for Amendment B, and prove the semantic materialization baseline.
+- [x] Obtain Claude Opus code review of the Amendment B harness diff before retrying measured run 01.
+- [x] Receive the independent second-terminal Opus report artifact for the post-run-01 checkpoint before enabling runs 02–20.
+- [x] Run and blind-grade the 20-run full-versus-compact variance shakedown.
+- [x] Ask Claude Opus to review the harness, traces, and statistical interpretation.
+- [x] Complete the read-only Checkpoint-3 diagnostic of all 17 compact failures before choosing a rescue design.
+- [ ] Size and run the host-stratified surface/discovery pilot.
+- [ ] Implement only the smallest improvement supported by the confirmatory evidence.
+- [ ] Run final verification, Claude Opus code review, and disk/worktree cleanup.
+
+## Plan
+
+- [x] Replace the per-call study with an end-to-end session benchmark after user correction.
+- [x] Fix identical feature prompts, repository state, model, and completion criteria for both arms.
+- [x] Run clean native-tools and SymForge sessions through final answer.
+- [x] Verify task-result equivalence before comparing token totals.
+- [x] Repeat or cross-check runs for variance and order effects.
+- [x] Use per-call/schema measurements only to explain the observed session totals.
+- [x] Write the final report and verify its claims against captured evidence.
+
+## Evidence Log
+
+- Evaluation started 2026-07-13.
+- Current SymForge index: 726 files and 21,830 symbols.
+- User correction: the only primary metric is total tokens for equivalent feature work in two clean sessions; individual call economics cannot answer that question.
+- Accounting will not treat the user's approximate 7k-per-call figure as fact; actual session totals must include exposed schemas, requests, responses, retries, reasoning, and final answer.
+- Delegated workers are intentionally skipped because project lessons record a verified Windows worker-process leak; an independent second measurement pass will provide the cross-check.
+- Benchmark host: Codex CLI 0.144.2, `gpt-5.6-sol`, high reasoning; AAP commit `b1423aab350d1b065a550c42bf5f2b98c7d2c069`.
+- Trial 1: native 2,085,089 tokens; SymForge-enabled 1,330,244; net 754,845 saved (36.2%).
+- Trial 2, reverse order: native 3,092,305 tokens; SymForge-enabled 2,564,159; net 528,146 saved (17.1%).
+- Combined: 1,282,991 tokens saved across two repetitions; mean 641,496 per feature run (24.8%).
+- Included arms produced equivalent two-file implementations and green focused tests; all disposable AAP worktrees were removed after measurement.
+- Event traces show only explicit `index_folder` MCP use followed by native events. A stricter arm made zero MCP calls and was excluded, so the result is enabled-and-indexed versus disabled host behavior, not pure explicit-tool causality.
+- Current real schema measurement: full 36 tools = 72,757 bytes; compact 3 = 4,581 bytes.
+- Claude Opus checkpoint 3 blocked progression after run 01: the original compact wiring check had false-passed a cancelled tool call, run metadata was incomplete, user Codex agents/skills contaminated traces, and incomplete evidence could not be rerun safely.
+- Harness red/green fixes now isolate `CODEX_HOME`, require completed MCP calls, capture timestamped events and complete token/readiness metadata, emit blind grader copies, and quarantine incomplete reruns. SelfTest passes; personal-config diagnostics are zero.
+- Run 01 is a valid oracle failure under the old full binary: one usage event, 721,303 canonical tokens, 20 completed SymForge calls; failed frozen S1 criteria 2, 4, and 5. It is invalidated from the restarted series because all arms must use one binary.
+- Corrected wiring proves a shipped compact trust defect: direct MCP succeeds and full annotated `health_compact` completes, but compact `status` and compact `symforge` are cancelled by Codex. Production `compact_surface_tools()` creates fresh default tools without the full router's annotations.
+- Amendment A preserves the failed baseline and permits only truthful read-only/closed-world annotations on compact `symforge`; `status(reset_calibration=true)` and `symforge_edit` must remain non-read-only. Zero-call measured runs remain scored under their assigned arm.
+- The pinned candidate is `8.14.1`, SHA-256 `6C4176E03299B768793ACB64012FDD95783476B6AE59662FC4AD7B8C310FFC3B`; focused/full tests, clippy, format, check, and release build passed. Its 13.06 GB disposable Cargo target and the repo-local test target were removed.
+- The first amended run-01 retry stopped before treatment on an invalid post-health byte-hash invariant. Two clean health-only cycles rewrote `index.bin` to different hashes while reporting snapshot verification `pending`; source inspection confirmed fresh-worktree mtimes, clean-shutdown serialization, and postcard `HashMap` order make cross-process bytes unstable.
+- Amendment B keeps exact golden bytes only at readiness input, polls to `snapshot_restore`/`completed`/zero mismatches, and compares fixed-tree, tracked-source, repo-outline, parse-count, and candidate fingerprints. Opus returned `CHANGES_REQUIRED` on the first draft, then `APPROVE_PLAN` after semantic equality and the residual verifier confound were made explicit.
+- Semantic baseline receipt: 851 tracked files; 726 indexed (720 parsed, 4 partial, 2 failed); 21,830 symbols; zero mismatches. Fresh materialization observed running→completed in 38.451 s; the exact-materialized-byte probe observed pending→completed in 1.307 s and preserved the semantic outline. A separate dry per-run readiness pass matched the baseline and removed its fixture/processes.
+- Claude Opus Amendment B code review verdict: `APPROVE`. It confirmed the measured Codex process starts from the materialized snapshot, semantic fields are the equality key, baseline writes are no-overwrite/after-probe, process/token/secret/rerun gates fail closed, and only the authorized product metadata changed. Non-blocking hardening notes were retained for later harness cleanup; none can create a false pass or cross-arm asymmetry.
+- Independent post-run-01 Opus audit verdict: `APPROVE_CONTINUE`; its independent raw-trace reparse reproduced 240,645 canonical tokens, 8 completed SymForge calls (first substantive call `search_symbols`), 2 native events, zero configuration/secret diagnostics, the pinned candidate/semantic fingerprints, clean teardown, and the frozen-oracle Fail on criteria 4 and 5.
+- The audit's MEDIUM finding is accepted but does not alter this descriptive shakedown: production compact `tools/list` dispatches through `compact_surface_tools`, while frozen S1 requires probe-only `compact_probe_tools`. The run-01 grade stands and the oracle plus annotation/source custody must be corrected before the confirmatory pilot, never mid-series.
+- Runs 02–20 captured sequentially with stop-on-first-failure; all 20 records are unique, have one usage event, exit 0, no timeout, semantic readiness `ready`, zero snapshot mismatches/configuration diagnostics/potential-secret lines/repository changes, and clean per-run teardown. Post-series state has one Git worktree and no fixture/candidate process/isolated home/Cargo target.
+- Blind grading is complete and single-shot: 20/20 frozen-oracle Fails, 0 exclusions. All S1 answers hit the production-vs-probe oracle defect; all S2 answers omit the oracle's incidental mutation-before-clone ordering statement. The frozen grades are preserved and cannot support successful-task token/speed comparisons.
+- Four-cell descriptive report: `research/token-cost/token-surface-shakedown-report-a019.md`. Compact S2 recorded 28 completed SymForge calls (18 success / 10 error) and 186 native read/search fallbacks versus full S2's 176/176 successful calls and 20 fallbacks; no winner or causal claim is made because every cell scored 0/5.
+- Independent post-run-20 handoff is ready at `research/token-cost/claude-opus-handoff-post-run-20-a019.md`; raw/golden/candidate evidence remains retained until that review.
+- Final verification found and fixed one post-series harness-test isolation defect: `SelfTest` had hardcoded run 20 as missing after run 20 legitimately existed. The artifact helper now accepts an optional root with the real evidence root unchanged as default; the test uses a unique nonexistent temporary root. `SelfTest` is green and measured records/grades are untouched.
+- Independent post-run-20 Opus audit verdict: `APPROVE_SHAKEDOWN_CLOSURE`. It blind-reproduced the 0/20 grades, reparsed custody and usage from all raw traces, reproduced every four-cell statistic, confirmed 17 compact failures versus zero full failures, and found no closure blocker. Confirmatory work remains gated on repaired oracles/citation pinning, annotation-source custody, and the call-level failure diagnostic.
+- Approved cleanup deleted both golden-state directories and the current A019 wiring quarantine after path, process, and worktree guards, freeing 34,539,032 bytes. All 20 raw traces, the older pre-restart invalidated evidence (including two historical wiring-probe bundles), compact in-repo evidence, and the pinned candidate remained through Checkpoint 3.
+- Primary Checkpoint-3 diagnostic: `research/token-cost/compact-failure-diagnostic-a019.md`. It classifies all 17 failed compact facade calls as 4 pre-dispatch enum decodes plus 13 dispatched primitive outcomes (10 `EmptyResult`, 3 `NotFound`, 0 primitive `InvalidRequest`) that the executor collapses to facade `InvalidRequest`; no product code changed.
+- Independent Checkpoint-3 report: `research/token-cost/claude-opus-report-checkpoint-3-a019.md`, verdict `APPROVE_DIAGNOSTIC`. It reproduced all 17 rows, every aggregate and hash, the source mechanism, and product/custody scope. Its two non-blocking notes are closed by specifying the exact CRLF trace-set hash recipe and distinguishing the deleted current A019 quarantine from the intentionally retained historical Amendment A wiring bundles.
+- The already approved annotation prerequisite is now an isolated product commit: `0260760ac19e10f2f158411bf94201aaeed601e5` (`fix(stel): annotate compact read facade honestly`). No research, task, or unrelated workspace files were staged with it; the measured A019 candidate was not rebuilt or substituted.
+- Post-Checkpoint-3 cleanup removed the exact pinned-candidate directory after resolving the path, confirming its sole 60,908,544-byte file, and finding zero exact-path process holders. Primary raw traces and the tiny historical Amendment A evidence remain retained; no Cargo target or disposable worktree was recreated.
+
+## Review
+
+- Complete: [end-to-end feature benchmark](../research/token-cost/end-to-end-feature-benchmark-2026-07-13.md)
+- Verdict: observed mean end-to-end net saving is 641,496 tokens per completed feature run (24.8%); positive in both paired trials.
+- Limitation: n=2 and treatment noncompliance prevent attributing the full delta causally to explicit SymForge retrieval/edit calls.
+
+---
+
 # SymForge v8 Architecture Review
 
 ## Plan

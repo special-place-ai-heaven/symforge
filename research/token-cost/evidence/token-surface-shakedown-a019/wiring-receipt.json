@@ -1,0 +1,68 @@
+{
+  "symforge_binary": "C:\\Users\\rakovnik\\.codex\\tools\\symforge-token-trust-8.14.1-a019\\symforge.exe",
+  "symforge_binary_sha256": "6C4176E03299B768793ACB64012FDD95783476B6AE59662FC4AD7B8C310FFC3B",
+  "arms": [
+    {
+      "arm": "A-full",
+      "surface": "full",
+      "tool_count": 36,
+      "tool_names": [
+        "analyze_file_impact",
+        "ask",
+        "batch_edit",
+        "batch_insert",
+        "batch_rename",
+        "checkpoint_now",
+        "context_inventory",
+        "conventions",
+        "delete_symbol",
+        "detect_impact",
+        "diff_symbols",
+        "edit_plan",
+        "edit_within_symbol",
+        "explore",
+        "find_dependents",
+        "find_references",
+        "get_file_content",
+        "get_file_context",
+        "get_repo_map",
+        "get_symbol",
+        "get_symbol_context",
+        "health",
+        "health_compact",
+        "index_folder",
+        "insert_symbol",
+        "inspect_match",
+        "investigation_suggest",
+        "replace_symbol_body",
+        "search_files",
+        "search_symbols",
+        "search_text",
+        "status",
+        "symforge_edit",
+        "symforge_retrieve",
+        "validate_file_syntax",
+        "what_changed"
+      ],
+      "compact_annotations": null,
+      "codex_completed_tool": "health_compact"
+    },
+    {
+      "arm": "C-compact",
+      "surface": "compact",
+      "tool_count": 3,
+      "tool_names": [
+        "symforge",
+        "symforge_edit",
+        "status"
+      ],
+      "compact_annotations": {
+        "symforge_read_only": true,
+        "symforge_open_world": false,
+        "symforge_edit_read_only": null,
+        "status_read_only": null
+      },
+      "codex_completed_tool": "symforge"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "created_at": "2026-07-13T12:53:18.3041787+00:00",
+  "fixture_commit": "a10ff102546241f1ffd49852ba4d3088c0bb8029",
+  "git_tree_oid": "30704cf80723d4c40a0ac6bb65faf8aeaef50ea6",
+  "source_manifest_sha256": "8CB1C3E40C4EB8C2B84FC3C46F61503A6E8B2E4BACC55C166EA795E8FFF660C7",
+  "source_file_count": 851,
+  "golden_input_sha256": "5941FB75336ADD7DC2D85B5D88E1061466B0C5B6F8FCE26C461757D4CB5654D5",
+  "first_materialized_snapshot_sha256": "7C39A5B2619E3160678F354E7910DCEC6BCD72A440D537A4C1ECC0C388BEAEA7",
+  "probe_input_snapshot_sha256": "7C39A5B2619E3160678F354E7910DCEC6BCD72A440D537A4C1ECC0C388BEAEA7",
+  "probe_output_snapshot_sha256": "28EB4B365C0E02F283805E57B37AF405C6944092B2C6BC065E245FD0F8223327",
+  "repo_outline_sha256": "006DEB8BC310E03332E796C5ED606295D72264539D471274A448C25E435D2ADD",
+  "repo_outline_bytes": 56891,
+  "index_files": 726,
+  "parsed_files": 720,
+  "partial_files": 4,
+  "failed_files": 2,
+  "symbols": 21830,
+  "snapshot_mismatches": 0,
+  "first_observed_verify_states": [
+    "running",
+    "completed"
+  ],
+  "probe_observed_verify_states": [
+    "pending",
+    "completed"
+  ],
+  "first_materialization_milliseconds": 38451,
+  "probe_verification_milliseconds": 1307,
+  "symforge_binary_sha256": "6C4176E03299B768793ACB64012FDD95783476B6AE59662FC4AD7B8C310FFC3B",
+  "symforge_version": "8.14.1",
+  "residual_speed_confound": "Measured startup still performs stat-all plus 10% spot verification; matched mtimes remove full reparse but not this symmetric product behavior."
+}
