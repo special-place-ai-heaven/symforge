@@ -26,6 +26,18 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.1...v8.15.0) (2026-07-14)
+
+
+### Features
+
+* **daemon:** idle self-shutdown for auto-spawned daemons ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd))
+
+
+### Bug Fixes
+
+* **stel:** annotate compact read facade honestly ([0260760](https://github.com/special-place-ai-heaven/symforge/commit/0260760ac19e10f2f158411bf94201aaeed601e5))
+
 ## [8.14.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.0...v8.14.1) (2026-07-12)
 
 
