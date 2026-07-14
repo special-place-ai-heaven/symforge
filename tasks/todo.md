@@ -5,12 +5,12 @@
 - [x] Inventory local changes, branches/worktrees, remote divergence, open PRs, checks, and the release workflow.
 - [x] Validate the complete commit scope and scan it for secrets or oversized artifacts.
 - [x] Run the repository's pre-integration verification gates.
-- [ ] Commit all safe work and fast-forward it onto updated `main`.
-- [ ] Merge every ready open PR with branch deletion and refresh `main` after each.
-- [ ] Verify the final `main`, push it, and confirm the Release workflow starts.
-- [ ] Delete merged local branches/worktrees and leave a clean checkout on `main`.
+- [x] Commit all safe work and fast-forward it onto updated `main`.
+- [x] Merge every ready open PR with branch deletion and refresh `main` after each.
+- [x] Verify the final `main`, push it, and confirm the Release workflow starts.
+- [x] Delete merged local branches/worktrees and leave a clean checkout on `main`.
 
-Review: pending.
+Review: Completed. Fast-forwarded the three reviewed campaign commits to `main`; merged dependency PRs #450-#453 and release PR #454 with branch deletion; and published v8.15.0. The fresh pre-merge matrix passed Python/npm, fmt/check/clippy, the full serial all-target suite, release tool oracles, and embed gates. On the combined dependency tree, `cargo check` and all-target Clippy passed and #453's authoritative Rust CI passed. A redundant local full-suite rerun reached MSVC `LNK1201` only after `target/` exhausted the disk; `cargo clean` then reclaimed 31.7 GiB.
 
 ## Windows delegated-worker process leak regression
 
