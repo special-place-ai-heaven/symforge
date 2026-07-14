@@ -35,12 +35,18 @@ fn surface_tool(
 
 /// Production `tools/list` for `SYMFORGE_SURFACE=compact` (A-019 compact-3).
 pub fn compact_surface_tools() -> Vec<Tool> {
+    let mut symforge = surface_tool(
+        CompactSurfaceTool::Symforge.as_str(),
+        "STEL read/explore facade — natural-language code intelligence with token economics.",
+        schema_object::<StelRequest>(),
+    );
+    let mut annotations = rmcp::model::ToolAnnotations::default();
+    annotations.read_only_hint = Some(true);
+    annotations.open_world_hint = Some(false);
+    symforge.annotations = Some(annotations);
+
     vec![
-        surface_tool(
-            CompactSurfaceTool::Symforge.as_str(),
-            "STEL read/explore facade — natural-language code intelligence with token economics.",
-            schema_object::<StelRequest>(),
-        ),
+        symforge,
         surface_tool(
             CompactSurfaceTool::SymforgeEdit.as_str(),
             "STEL structural edit facade — symbol-aware edits with economics gate.",
@@ -86,6 +92,30 @@ mod tests {
         assert_eq!(tools.len(), COMPACT_SURFACE_TOOL_COUNT);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(names.as_slice(), COMPACT_TOOL_NAMES);
+    }
+
+    #[test]
+    fn compact_surface_annotations_are_honest() {
+        let tools = compact_surface_tools();
+        let symforge = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "symforge")
+            .expect("compact symforge tool");
+        let annotations = symforge
+            .annotations
+            .as_ref()
+            .expect("compact symforge annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        for name in ["symforge_edit", "status"] {
+            let read_only_hint = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .and_then(|tool| tool.annotations.as_ref())
+                .and_then(|annotations| annotations.read_only_hint);
+            assert_ne!(read_only_hint, Some(true), "{name} must not be read-only");
+        }
     }
 
     #[test]
