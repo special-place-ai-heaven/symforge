@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0",
+  "protocol": "SFBENCH-1.0",
+  "frozen_at": "2026-07-12",
+  "core_assets": [
+    {
+      "path": "research/full-surface-benchmark/cases.json",
+      "sha256": "7bbf41fa3b6a827cd0aa50e37fde993447be7703645174005129aef2f2a8db58"
+    },
+    {
+      "path": "research/full-surface-benchmark/campaign.config.json",
+      "sha256": "85b60a9fafd763e03aa97563807d135b2995dcaf7da207fcc0723e8b3ae27662"
+    },
+    {
+      "path": "research/full-surface-benchmark/corpus.lock.json",
+      "sha256": "1376e2fb33963d142409cbdccc7fa75593f85ebfa8ae607a90a797dac588f316"
+    },
+    {
+      "path": "corpus-manifest.json",
+      "sha256": "a8d154c61f2ff228e9b254851e06cd7d236766d4bf191abbd094b7934f041158"
+    },
+    {
+      "path": "oracle.json",
+      "sha256": "eb1fd3d075a1a29626a25d4b65faa7124c83db9c0ed1109e2cb9dcc90b12fadd"
+    },
+    {
+      "path": "research/full-surface-benchmark/direct_case_runner.py",
+      "sha256": "90b92b450375fec071cc23ae4a522ebcfb73b2efe8574ea7a86a9ef37f3edd15"
+    },
+    {
+      "path": "research/full-surface-benchmark/mcp_harness.py",
+      "sha256": "1f2696eb0ef32636c52171606863a7a5beaf1003bb29477d7fc11aebf60fe2b4"
+    },
+    {
+      "path": "research/full-surface-benchmark/fixture_generator.py",
+      "sha256": "99275c0c7143b940f4acb35c4624f6e971f87e33763eefc32f45c23886340b8e"
+    },
+    {
+      "path": "research/full-surface-benchmark/parity-normalization.json",
+      "sha256": "f1a50e26c2fc89da5c4073c7e152678078bc956971d61bc509040920c4cd28b3"
+    },
+    {
+      "path": "research/full-surface-benchmark/baseline-patches.json",
+      "sha256": "c4116e246edac2aee8f32ce933e3a05bc169c3378da15ff4bfd3fac2cff9d935"
+    }
+  ],
+  "auxiliary_assets": [
+    {
+      "path": "research/full-surface-benchmark/claude_task_runner.py",
+      "sha256": "837489f3953de0fea54fb2135dcd3fd66ff7df30553bc605d20e1b56bd6cd675"
+    },
+    {
+      "path": "research/full-surface-benchmark/non_tool_surface_smoke.py",
+      "sha256": "44d5b4fcac134d466d2a2995fabeadcfa6e51b31fa94e7d7d23be8b3e99bce81"
+    },
+    {
+      "path": "research/full-surface-benchmark/setup_corpus.ps1",
+      "sha256": "849d25159d9e2c42ae0399eeef7ddd5400ce9da58828ef3b71303960d897924a"
+    },
+    {
+      "path": "research/full-surface-benchmark/adjudication.md",
+      "sha256": "79fe6948b1e050af78c0868a2e983a7016e9c006018aad48fe6c174726c4702d"
+    }
+  ],
+  "system_under_test": {
+    "path": "symforge.exe",
+    "version": "8.14.0",
+    "sha256": "294ad9fae560ac217b10d685aa06c2a8fbaa63794d6f70bb92c2f5f61f9947fe"
+  },
+  "notes": [
+    "Core assets are fail-closed inputs verified by direct_case_runner.py.",
+    "Auxiliary assets are frozen for audit reproducibility.",
+    "The fixture tree, Git worktree state, corpus commits, tokenizer vocabulary, and SUT identity are independently verified by the runner."
+  ]
+}

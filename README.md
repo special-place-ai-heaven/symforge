@@ -113,6 +113,10 @@ Some valid code trips upstream tree-sitter grammar limitations (for example, Typ
 
 Every edit tool accepts an optional `working_directory` pointing at a sibling git worktree. Supplying it is **explicit routing consent**: SymForge validates the worktree, maps the indexed path into it, writes there, and reports both the indexed path and the actual write path (`wrote_to`, `indexed_path`, `rerouted`). Parallel agent sessions can each edit their own worktree against one shared index.
 
+### Renames that stay sound on ambiguous names
+
+`batch_rename` never rewrites a same-named symbol it cannot prove belongs to the target. When the index holds two or more definitions of a name, bare and unqualified references are surfaced as uncertain instead of written; a qualified reference is only kept writable when its immediate qualifier matches the resolved target's `impl` owner and that owner name is unique among the ambiguous definitions. This recovers the truly-bound `Owner::method` call sites while leaving the unattributable ones for the caller to decide. The resolution is Tier-0 syntactic qualifier matching, not type inference — it is honest about what it can and cannot attribute, without needing an LSP.
+
 ### Safe mutations: idempotency, tee snapshots, write-back invariants
 
 Mutating tools accept an `idempotency_key`; a retry with the same key and same canonical request replays the stored result without writing twice, and the same key with a different request returns a deterministic conflict. Before every edit lands, a **tee snapshot** preserves the pre-write file under `.symforge/tee/`. After every write, the index is rebuilt from the **persisted on-disk bytes**, never the in-memory buffer — if the OS wrote something different, the index reflects reality.
@@ -337,6 +341,7 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 |---|---|
 | `health` | Check index health, watcher state, parse resilience, runtime identity, sidecar state, and capability state |
 | `health_compact` | Smaller health summary for prompt budgets |
+| `status` | Trust-envelope and index-health summary with honest economics; also resets STEL calibration when asked (`reset_calibration`) |
 | `get_repo_map` | Get a bounded repository map |
 | `explore` | Explore a broad concept across symbols, files, and patterns with noise filtering and ranking reasons |
 | `ask` | Ask a natural-language codebase question and see route confidence, rationale, and the selected invocation |
@@ -368,6 +373,7 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `search_symbols` | Find functions, structs, classes, methods, types, modules, and other symbols |
 | `search_text` | Search text with enclosing symbol context; supports literal terms, OR terms, regex, and AST structural search |
 | `search_files` | Find and rank paths, resolve ambiguous paths, and optionally use frecency or co-change ranking |
+| `symforge_retrieve` | Retrieve the full output stored when CCR compressed a large result, by the hash from a search or discovery footer |
 
 ### Trace Impact
 
@@ -378,6 +384,7 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `what_changed` | Show changed files since a ref, timestamp, or current uncommitted state |
 | `diff_symbols` | Compare symbols between git refs |
 | `analyze_file_impact` | Reindex a changed file and report affected dependents |
+| `detect_impact` | Diff a base branch/ref against HEAD and report the blast radius (files or symbols, bounded hop depth) seeded from the symbols that actually changed |
 | `validate_file_syntax` | Report parser diagnostics with line and column locations |
 
 ### Edit
@@ -391,7 +398,8 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `delete_symbol` | Delete a symbol and its attached docs |
 | `batch_edit` | Apply multiple symbol-scoped edits atomically |
 | `batch_insert` | Insert before or after multiple symbols |
-| `batch_rename` | Rename a symbol and update references project-wide |
+| `batch_rename` | Rename a symbol and update its references project-wide, failing closed on ambiguity: when the name has multiple definitions, only references bound to the resolved target's owner are written; unattributable same-name references are surfaced, not rewritten |
+| `symforge_edit` | Structural edit facade: replace a whole symbol's source by name, previewing by default and committing with `apply:true`; `if_match` guards against a concurrent edit |
 
 ### Indexing
 
@@ -401,7 +409,7 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `checkpoint_now` | Atomically write the current in-memory index to `.symforge/index.bin`, optionally verifying after write |
 
 > [!NOTE]
-> The deprecated daemon compatibility name `trace_symbol` remains available through v7.x with an explicit deprecation warning and is planned for removal in v8.0. Generated client allow-lists do not grant it by default. Use `get_symbol_context` or `find_references`.
+> The daemon compatibility name `trace_symbol` is **retired**. The daemon still routes it and returns an explicit deprecation warning, but generated client allow-lists do not grant it by default. Use `get_symbol_context` with `sections=[...]` or `find_references` instead.
 
 ## MCP Resources And Prompts
 

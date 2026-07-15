@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "resolved_at": "2026-07-12",
+  "clone_policy": {
+    "partial_clone": false,
+    "submodules": false,
+    "lfs_smudge": false,
+    "core_autocrlf": false,
+    "core_eol": "lf",
+    "ordinary_case_materialization": "independent_local_clone_no_hardlinks"
+  },
+  "repositories": [
+    {
+      "alias": "ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep.git",
+      "commit": "d5b85d44057ff729a89be9c6549958c45d95aa99",
+      "history_depth": 128,
+      "stratum": "normal",
+      "primary_language": "Rust",
+      "overlay_language": "Rust"
+    },
+    {
+      "alias": "flask",
+      "url": "https://github.com/pallets/flask.git",
+      "commit": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+      "history_depth": 128,
+      "stratum": "normal",
+      "primary_language": "Python",
+      "overlay_language": "Python"
+    },
+    {
+      "alias": "zod",
+      "url": "https://github.com/colinhacks/zod.git",
+      "commit": "912f0f51b0ced654d0069741e7160834dca742ee",
+      "history_depth": 128,
+      "stratum": "normal",
+      "primary_language": "TypeScript",
+      "overlay_language": "TypeScript"
+    },
+    {
+      "alias": "cobra",
+      "url": "https://github.com/spf13/cobra.git",
+      "commit": "adbc8813901bba65827259daa8e22ff94ec1f30e",
+      "history_depth": 32,
+      "stratum": "normal",
+      "primary_language": "Go",
+      "overlay_language": "Go"
+    },
+    {
+      "alias": "gson",
+      "url": "https://github.com/google/gson.git",
+      "commit": "c9f3fd55854a743b66f857ace3c7b268ea3e2ef7",
+      "history_depth": 32,
+      "stratum": "normal",
+      "primary_language": "Java",
+      "overlay_language": "Java"
+    },
+    {
+      "alias": "fmt",
+      "url": "https://github.com/fmtlib/fmt.git",
+      "commit": "7077b016cc19793e11f9b9aa3d909390acd3819b",
+      "history_depth": 32,
+      "stratum": "normal",
+      "primary_language": "C++",
+      "overlay_language": "C++"
+    },
+    {
+      "alias": "mojo",
+      "url": "https://github.com/mojolicious/mojo.git",
+      "commit": "6007271e9152aa0998129991030c3ed16eb407d0",
+      "history_depth": 32,
+      "stratum": "normal",
+      "primary_language": "Perl",
+      "overlay_language": "Perl"
+    },
+    {
+      "alias": "typescript",
+      "url": "https://github.com/microsoft/TypeScript.git",
+      "commit": "637d5746b70257028fb95aad32ddec6b26ab0a14",
+      "history_depth": 128,
+      "stratum": "stress",
+      "primary_language": "TypeScript",
+      "overlay_language": "TypeScript"
+    },
+    {
+      "alias": "p-map",
+      "url": "https://github.com/sindresorhus/p-map.git",
+      "commit": "3ada5f36632aca8df860c376856270b6d2ba2de8",
+      "history_depth": 32,
+      "stratum": "tiny",
+      "primary_language": "JavaScript",
+      "overlay_language": "JavaScript"
+    },
+    {
+      "alias": "json-schema-suite",
+      "url": "https://github.com/json-schema-org/JSON-Schema-Test-Suite.git",
+      "commit": "92acb61eb772a932c077d5ffa634ded719d2d738",
+      "history_depth": 32,
+      "stratum": "symbol-poor",
+      "primary_language": "JSON",
+      "overlay_language": null
+    }
+  ]
+}

@@ -1,0 +1,257 @@
+{
+  "patch_count": 16,
+  "patches": {
+    "SF-batch_edit-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "e7bb0c6d27f867eb0a3382ed0f21c6faa7449930e6614997253ee72045e6b1ff",
+        "sfbench_fixture/rust/src/protocol.rs": "82d27d23b846aa2b2f9f536e36b4e186296e68e1bef035c80ca6825eb568b149"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e",
+        "sfbench_fixture/rust/src/protocol.rs": "1a5a025915918e483143f71b276dfa78f3c3923961368ecf1cd2ded936891771"
+      },
+      "case_id": "SF-batch_edit-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -45,7 +45,7 @@\n }\n \n pub fn sfbench_mutable() -> (&'static str, &'static str, &'static str) {\n-    let first = \"SF_BENCH_EDIT_OLD_9F31\";\n+    let first = \"SF_BENCH_EDIT_NEW_9F31\";\n     let unicode_inside = \"\u017earek \u03bb\";\n     let second = \"SF_BENCH_EDIT_OLD_9F31\";\n     (first, unicode_inside, second)\n--- a/sfbench_fixture/rust/src/protocol.rs\n+++ b/sfbench_fixture/rust/src/protocol.rs\n@@ -1,3 +1,7 @@\n pub trait SfBenchProtocol {\n     fn run(&self) -> String;\n }\n+\n+pub fn sfbench_inserted() -> &'static str {\n+    \"inserted\"\n+}\n",
+      "patch_sha256": "84025fa53397f846dc9d1fc7720d98e1155781586bcf272b2bb6b810620cedbd",
+      "patch_utf8_bytes": 611,
+      "placeholder": "${fixture.oracle.mutations.Rust.batch_edit.patch}",
+      "recipe_step": 2
+    },
+    "SF-batch_edit-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "0e9ae23dc97a000f928e9a3c10a5993855239f42ed910a5c10ee2e7ae6e97107"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-batch_edit-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -43,7 +43,7 @@\n }\n \n export function sfbench_mutable(): [string, string, string] {\n-  const first = \"SF_BENCH_EDIT_OLD_9F31\";\n+  const first = \"SF_BENCH_EDIT_NEW_9F31\";\n   const unicodeInside = \"\u017earek \u03bb\";\n   const second = \"SF_BENCH_EDIT_OLD_9F31\";\n   return [first, unicodeInside, second];\n@@ -51,10 +51,6 @@\n \n export function sfbench_outside_literal(): string {\n   return \"SF_BENCH_EDIT_OLD_9F31\";\n-}\n-\n-export function sfbench_delete_me(): string {\n-  return \"delete\";\n }\n \n export namespace SfBenchOuter {\n",
+      "patch_sha256": "4452fcbf88219d73d881b58159ab842de89689cc28b02eac8f2338a1d36763eb",
+      "patch_utf8_bytes": 606,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.batch_edit.patch}",
+      "recipe_step": 2
+    },
+    "SF-batch_insert-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "f59268ae1b3661551501b9c88753d4bb8bbd0a9fd537469283427114fedb43f1",
+        "sfbench_fixture/rust/src/protocol.rs": "63e8a586ebef39bd2a1a466d25bcbf9e265d21123c8305d276167b3553c7dbd3"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e",
+        "sfbench_fixture/rust/src/protocol.rs": "1a5a025915918e483143f71b276dfa78f3c3923961368ecf1cd2ded936891771"
+      },
+      "case_id": "SF-batch_insert-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -21,6 +21,10 @@\n     fn run(&self) -> String {\n         sfbench_rename_me()\n     }\n+}\n+\n+pub fn sfbench_inserted() -> &'static str {\n+    \"inserted\"\n }\n \n pub fn sfbench_entry() -> String {\n--- a/sfbench_fixture/rust/src/protocol.rs\n+++ b/sfbench_fixture/rust/src/protocol.rs\n@@ -1,3 +1,7 @@\n+pub fn sfbench_inserted() -> &'static str {\n+    \"inserted\"\n+}\n+\n pub trait SfBenchProtocol {\n     fn run(&self) -> String;\n }\n",
+      "patch_sha256": "cee82d8236eac299a7ba9cf778a19c406b75df197f4192de305bc3531be80752",
+      "patch_utf8_bytes": 501,
+      "placeholder": "${fixture.oracle.mutations.Rust.batch_insert_before.patch}",
+      "recipe_step": 2
+    },
+    "SF-batch_insert-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "3ac90f755c72d868a1a8d8a671230086f00056af6b967ea1e9029c4141b9042c"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-batch_insert-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -26,8 +26,16 @@\n   return `${sfbench_mid()}:${worker.run()}`;\n }\n \n+export function sfbench_inserted(): string {\n+  return \"inserted\";\n+}\n+\n export function sfbench_unused(): string {\n   return \"unused\";\n+}\n+\n+export function sfbench_inserted(): string {\n+  return \"inserted\";\n }\n \n export function sfbench_rename_user_one(): string {\n",
+      "patch_sha256": "1bce7e96fd3d4dc89c87a18bf0123a194d292bc74f1f6c6c62ed2b884f590ce5",
+      "patch_utf8_bytes": 428,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.batch_insert_after.patch}",
+      "recipe_step": 2
+    },
+    "SF-batch_rename-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "3454c8a8a7f055b7c69030570402d1f742e915c49c69d6a5b616aa9d890a2944"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-batch_rename-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -11,7 +11,7 @@\n     sfbench_leaf()\n }\n \n-pub fn sfbench_rename_me() -> String {\n+pub fn sfbench_renamed() -> String {\n     \"rename\".to_owned()\n }\n \n@@ -19,7 +19,7 @@\n \n impl SfBenchProtocol for SfBenchWorker {\n     fn run(&self) -> String {\n-        sfbench_rename_me()\n+        sfbench_renamed()\n     }\n }\n \n@@ -33,15 +33,15 @@\n }\n \n pub fn sfbench_rename_user_one() -> String {\n-    sfbench_rename_me()\n+    sfbench_renamed()\n }\n \n pub fn sfbench_rename_user_two() -> String {\n-    sfbench_rename_me()\n+    sfbench_renamed()\n }\n \n pub fn sfbench_rename_user_three() -> String {\n-    sfbench_rename_me()\n+    sfbench_renamed()\n }\n \n pub fn sfbench_mutable() -> (&'static str, &'static str, &'static str) {\n",
+      "patch_sha256": "45c7278038fda5e466033ac144e2675a031878745f0ce4a15ac40fe8b302c8be",
+      "patch_utf8_bytes": 788,
+      "placeholder": "${fixture.oracle.mutations.Rust.rename_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-delete_symbol-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "964d6f536b0f80c0a8231f43cf29e4853044e26e4d595aa5e248016537c76a33"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-delete_symbol-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -55,10 +55,6 @@\n     \"SF_BENCH_EDIT_OLD_9F31\"\n }\n \n-pub fn sfbench_delete_me() -> &'static str {\n-    \"delete\"\n-}\n-\n pub mod sfbench_outer {\n     pub mod inner {\n         pub fn sfbench_nested() -> &'static str {\n",
+      "patch_sha256": "bbdf6a35f2fdcfdc06c6cef67cbd465bc0c6ab8e0e158ae5b39e93ae4fb4e6e9",
+      "patch_utf8_bytes": 294,
+      "placeholder": "${fixture.oracle.mutations.Rust.delete_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-delete_symbol-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "b15888c08e6ead482949204e606b8809fae5a7e51b2197bae89569af2bb82878"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-delete_symbol-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -53,10 +53,6 @@\n   return \"SF_BENCH_EDIT_OLD_9F31\";\n }\n \n-export function sfbench_delete_me(): string {\n-  return \"delete\";\n-}\n-\n export namespace SfBenchOuter {\n   export class Inner {\n     sfbench_nested(): string {\n",
+      "patch_sha256": "3a3bb6e39fc6a3b3c27711dbd4900e513d53b087d94714235c910c0c7962c557",
+      "patch_utf8_bytes": 311,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.delete_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-edit_within_symbol-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "e4682227ea279fdae8c3acba284b763f46c3316b96bd9fb7f60e7cca35448672"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-edit_within_symbol-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -45,9 +45,9 @@\n }\n \n pub fn sfbench_mutable() -> (&'static str, &'static str, &'static str) {\n-    let first = \"SF_BENCH_EDIT_OLD_9F31\";\n+    let first = \"SF_BENCH_EDIT_NEW_9F31\";\n     let unicode_inside = \"\u017earek \u03bb\";\n-    let second = \"SF_BENCH_EDIT_OLD_9F31\";\n+    let second = \"SF_BENCH_EDIT_NEW_9F31\";\n     (first, unicode_inside, second)\n }\n \n",
+      "patch_sha256": "6ba7609d0953309b4cde5b4e040e92e07c4d1d872bef6e0909f86803bd69a1ed",
+      "patch_utf8_bytes": 430,
+      "placeholder": "${fixture.oracle.mutations.Rust.edit_within.patch}",
+      "recipe_step": 2
+    },
+    "SF-edit_within_symbol-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "5eacb3b2f86cb2c17f967aec14d17270f0ecfb9687f42386ebdd8d9a7015d332"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-edit_within_symbol-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -43,9 +43,9 @@\n }\n \n export function sfbench_mutable(): [string, string, string] {\n-  const first = \"SF_BENCH_EDIT_OLD_9F31\";\n+  const first = \"SF_BENCH_EDIT_NEW_9F31\";\n   const unicodeInside = \"\u017earek \u03bb\";\n-  const second = \"SF_BENCH_EDIT_OLD_9F31\";\n+  const second = \"SF_BENCH_EDIT_NEW_9F31\";\n   return [first, unicodeInside, second];\n }\n \n",
+      "patch_sha256": "cf5f4429958af253927636e2a43c22f9f38e1486f31974f737c453c366428ba0",
+      "patch_utf8_bytes": 435,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.edit_within.patch}",
+      "recipe_step": 2
+    },
+    "SF-insert_symbol-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "f59268ae1b3661551501b9c88753d4bb8bbd0a9fd537469283427114fedb43f1"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-insert_symbol-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -21,6 +21,10 @@\n     fn run(&self) -> String {\n         sfbench_rename_me()\n     }\n+}\n+\n+pub fn sfbench_inserted() -> &'static str {\n+    \"inserted\"\n }\n \n pub fn sfbench_entry() -> String {\n",
+      "patch_sha256": "f57c27f285e08e7bb7a459f12aca615015f27ff054fb38993f066e0dbc6e7bd1",
+      "patch_utf8_bytes": 271,
+      "placeholder": "${fixture.oracle.mutations.Rust.insert_symbol.before_patch}",
+      "recipe_step": 2
+    },
+    "SF-insert_symbol-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "32e703873ad87e7b0b4501c2ece5b1a474b4611c9f9586fca60e7ff50080a89d"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-insert_symbol-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -24,6 +24,10 @@\n export function sfbench_entry(): string {\n   const worker = new SfBenchWorker();\n   return `${sfbench_mid()}:${worker.run()}`;\n+}\n+\n+export function sfbench_inserted(): string {\n+  return \"inserted\";\n }\n \n export function sfbench_unused(): string {\n",
+      "patch_sha256": "d60746ee7862e59d110a5071d8da9afb57b52a47a852618687897d89ffb95a36",
+      "patch_utf8_bytes": 359,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.insert_symbol.after_patch}",
+      "recipe_step": 2
+    },
+    "SF-replace_symbol_body-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "44d8269f12e936e6b3999f4fb62f35c9a13f702d9521a068d11c2329303df9cb"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-replace_symbol_body-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -4,7 +4,7 @@\n pub const SF_BENCH_UNICODE_BEFORE: &str = \"na\u00efve \u03bb\";\n \n pub fn sfbench_leaf() -> String {\n-    \"leaf\".to_owned()\n+    \"leaf-v2\".to_owned()\n }\n \n pub fn sfbench_mid() -> String {\n",
+      "patch_sha256": "44a0fd676849bc0af45e8efda57075a68e2039107bc9ecfecb84a8fa9aae8a18",
+      "patch_utf8_bytes": 275,
+      "placeholder": "${fixture.oracle.mutations.Rust.replace_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-replace_symbol_body-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "b3b76f6602750047943561a258b8d404112fec36fd9a6180f96d891577c07d42"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-replace_symbol_body-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -4,7 +4,7 @@\n export const SF_BENCH_UNICODE_BEFORE = \"na\u00efve \u03bb\";\n \n export function sfbench_leaf(): string {\n-  return \"leaf\";\n+  return \"leaf-v2\";\n }\n \n export function sfbench_mid(): string {\n",
+      "patch_sha256": "0d3bcf3747c251ba1b98e8c9e49f332366b2d1be76d2f564cab027c1ad5f20fe",
+      "patch_utf8_bytes": 288,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.replace_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-symforge_edit-001": {
+      "after_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "44d8269f12e936e6b3999f4fb62f35c9a13f702d9521a068d11c2329303df9cb"
+      },
+      "apply_during_baseline": true,
+      "before_sha256": {
+        "sfbench_fixture/rust/src/core.rs": "9df53742dfcb0876e5ca0a949d2fc79a3a3fac7ad7e244ea48400a53f121627e"
+      },
+      "case_id": "SF-symforge_edit-001",
+      "patch": "--- a/sfbench_fixture/rust/src/core.rs\n+++ b/sfbench_fixture/rust/src/core.rs\n@@ -4,7 +4,7 @@\n pub const SF_BENCH_UNICODE_BEFORE: &str = \"na\u00efve \u03bb\";\n \n pub fn sfbench_leaf() -> String {\n-    \"leaf\".to_owned()\n+    \"leaf-v2\".to_owned()\n }\n \n pub fn sfbench_mid() -> String {\n",
+      "patch_sha256": "44a0fd676849bc0af45e8efda57075a68e2039107bc9ecfecb84a8fa9aae8a18",
+      "patch_utf8_bytes": 275,
+      "placeholder": "${fixture.oracle.mutations.Rust.replace_symbol.patch}",
+      "recipe_step": 2
+    },
+    "SF-symforge_edit-003": {
+      "after_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "61f4f420880493b3dfd94241aa32ac96f18e84df753401831a602091257cfe51"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/typescript/src/core.ts": "8b688c92e5adebeb2fa3bd6cf5bfe59ecc5d963e2f0857578275daf008b33c9a"
+      },
+      "case_id": "SF-symforge_edit-003",
+      "patch": "--- a/sfbench_fixture/typescript/src/core.ts\n+++ b/sfbench_fixture/typescript/src/core.ts\n@@ -19,6 +19,10 @@\n   run(): string {\n     return sfbench_rename_me();\n   }\n+}\n+\n+export function sfbench_inserted(): string {\n+  return \"inserted\";\n }\n \n export function sfbench_entry(): string {\n@@ -43,9 +47,9 @@\n }\n \n export function sfbench_mutable(): [string, string, string] {\n-  const first = \"SF_BENCH_EDIT_OLD_9F31\";\n+  const first = \"SF_BENCH_EDIT_NEW_9F31\";\n   const unicodeInside = \"\u017earek \u03bb\";\n-  const second = \"SF_BENCH_EDIT_OLD_9F31\";\n+  const second = \"SF_BENCH_EDIT_NEW_9F31\";\n   return [first, unicodeInside, second];\n }\n \n",
+      "patch_sha256": "cbd76db473a504ab3161448293301770ef5f3f1718faa9e074badaa54b8bf656",
+      "patch_utf8_bytes": 632,
+      "placeholder": "${fixture.oracle.mutations.TypeScript.facade_control.patch}",
+      "recipe_step": 2
+    },
+    "SF-symforge_edit-004": {
+      "after_sha256": {
+        "sfbench_fixture/java/src/SfBenchCore.java": "fb9a6107f03339d0694c9e13ae1e4c3ee9f3c70392d324bcc0d8987af921075b"
+      },
+      "apply_during_baseline": false,
+      "before_sha256": {
+        "sfbench_fixture/java/src/SfBenchCore.java": "8336d957eb2b4166b586daffeaa7caa50c3ef2980f23b983ef78a6aaa8e9db6e"
+      },
+      "case_id": "SF-symforge_edit-004",
+      "patch": "--- a/sfbench_fixture/java/src/SfBenchCore.java\n+++ b/sfbench_fixture/java/src/SfBenchCore.java\n@@ -3,7 +3,7 @@\n     static final String SF_BENCH_UNICODE_BEFORE = \"na\u00efve \u03bb\";\n \n     static String sfbench_leaf() {\n-        return \"leaf\";\n+        return \"leaf-v2\";\n     }\n \n     static String sfbench_mid() {\n",
+      "patch_sha256": "ad5655fc5e1802c2c51514ba3b81151b5c54d65c5981f63ec2cb78286ec119d7",
+      "patch_utf8_bytes": 309,
+      "placeholder": "${fixture.oracle.mutations.Java.replace_symbol.patch}",
+      "recipe_step": 2
+    }
+  },
+  "protocol": "SFBENCH-1.0",
+  "schema_version": "SFBENCH-BASELINE-PATCHES-1",
+  "source_hashes": {
+    "cases": "7bbf41fa3b6a827cd0aa50e37fde993447be7703645174005129aef2f2a8db58",
+    "fixture_clean_tree": "0460fad2ce33aa359c9266546b4d0614a800361de3c4b16b592ee1eb07bb0b13",
+    "oracle": "eb1fd3d075a1a29626a25d4b65faa7124c83db9c0ed1109e2cb9dcc90b12fadd"
+  },
+  "visibility": "evaluator-only; never expose to paired LLM arms"
+}
