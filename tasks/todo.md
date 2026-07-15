@@ -909,18 +909,26 @@ downgrade after truncation.
 Merge approval → merge with the release-please guard → publish → restart
 harness sessions (installed daemons pick up the fixes) → `cargo clean`.
 
-## Changelog reconciliation (2026-07-15)
+## v8.15.0 changelog and release-note reconciliation (2026-07-15)
 
 - [x] Pull `main` with `--ff-only` before editing.
 - [x] Pin the release range to `v8.14.1..v8.15.0` from Git tags.
-- [x] Reconcile every non-release-metadata commit in that range into the `8.15.0` changelog entry.
-- [x] Verify changelog coverage, formatting, diff, and repository scope.
+- [x] Compare the published SymForge body with Terminal Commander's detailed
+  v0.1.80 release format.
+- [x] Replace the commit-coverage summary with a user-facing narrative covering
+  behavior, evidence, compatibility, verification, and published artifacts.
+- [x] Verify statistics, release-range coverage, links, wording, diff, and
+  version synchronization.
+- [x] Replace and independently re-read the published GitHub v8.15.0 body.
+- [x] Commit and push the corrected repository changelog to `main`.
 
 ### Review
 
-- Changelog coverage check: 8/8 release changes represented; the generated
-  `chore(main): release 8.15.0` metadata commit is intentionally excluded.
-- `git diff --check` passed and `execution/version_sync.py check` confirmed
-  version `8.15.0`.
-- PR #455 (`docs/full-surface-benchmark`) is separate unreleased work and was
-  not misattributed to the tagged `v8.15.0` release.
+- Fact audit: 6/6 checks passed across all 8 non-release-metadata commits,
+  computed diff statistics, both benchmark reports, and every required section.
+- `git diff --check` passed; version synchronization remains `8.15.0`.
+- The published release body matches the local `8.15.0` changelog section after
+  newline normalization: 6,979 bytes and SHA-256
+  `4a5a7d0bf02a62379406b2cdbb6233c1ee79761570a4e52a7275d3452404af08`.
+- Changelog commit `4eff05037154812a1fd5ad5d316290e8c16d426c` is on `main`;
+  local HEAD and `refs/heads/main` matched exactly after push.
