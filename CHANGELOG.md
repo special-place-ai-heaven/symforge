@@ -31,12 +31,34 @@ notes remain in the per-version entries below.
 
 ### Features
 
-* **daemon:** idle self-shutdown for auto-spawned daemons ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd))
+* **daemon:** auto-spawned daemons now shut down gracefully after 10 minutes without authenticated traffic, while an explicit `symforge daemon` stays persistent unless configured; `SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS` controls the interval (minimum 60 seconds, `0` disables it) ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd))
 
 
 ### Bug Fixes
 
-* **stel:** annotate compact read facade honestly ([0260760](https://github.com/special-place-ai-heaven/symforge/commit/0260760ac19e10f2f158411bf94201aaeed601e5))
+* **stel:** mark the compact `symforge` facade read-only and closed-world while keeping `symforge_edit` and `status` non-read-only, giving MCP clients accurate tool-trust metadata ([0260760](https://github.com/special-place-ai-heaven/symforge/commit/0260760ac19e10f2f158411bf94201aaeed601e5))
+
+
+### Documentation
+
+* **readme:** disclose the full surface's measured ~7k-token schema overhead, scope the 70–95% savings figures to tested mean ranges, document cases where overhead can lose, and point users to the compact surface and benchmark evidence ([0e6b5a8](https://github.com/special-place-ai-heaven/symforge/commit/0e6b5a8407b0266b9a00961074d5a74d5e5d4aa3))
+
+
+### Research and Verification
+
+* **token economics:** preserve the controlled compact-vs-full shakedown traces, grading records, diagnostics, and independent audit artifacts used to design the confirmatory benchmark ([a292133](https://github.com/special-place-ai-heaven/symforge/commit/a292133102fc6b52d7f5b2f31b163834a021623a))
+
+
+### Dependencies
+
+* **tree-sitter:** update from 0.26.10 to 0.26.11 ([4d8a8b4](https://github.com/special-place-ai-heaven/symforge/commit/4d8a8b41f22c2d14d282ac05b581c4efaa40fcc8))
+* **mcp/search:** update `rmcp` from 2.1.0 to 2.2.0, `ignore` from 0.4.27 to 0.4.28, and `regex` from 1.12.4 to 1.13.0 ([1380bae](https://github.com/special-place-ai-heaven/symforge/commit/1380bae17dd07bf091c9421df7318f3f423ba933))
+* **windows:** update the Windows bindings from 0.58.0 to 0.62.2 ([1d547e7](https://github.com/special-place-ai-heaven/symforge/commit/1d547e7681fcb76116704fcfc192a59e2ebabd94))
+
+
+### Repository Maintenance
+
+* ignore the session-local `grok-symforge-analysis-report.md` output ([a10ff10](https://github.com/special-place-ai-heaven/symforge/commit/a10ff102546241f1ffd49852ba4d3088c0bb8029))
 
 ## [8.14.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.0...v8.14.1) (2026-07-12)
 

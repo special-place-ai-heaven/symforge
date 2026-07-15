@@ -908,3 +908,19 @@ downgrade after truncation.
 
 Merge approval → merge with the release-please guard → publish → restart
 harness sessions (installed daemons pick up the fixes) → `cargo clean`.
+
+## Changelog reconciliation (2026-07-15)
+
+- [x] Pull `main` with `--ff-only` before editing.
+- [x] Pin the release range to `v8.14.1..v8.15.0` from Git tags.
+- [x] Reconcile every non-release-metadata commit in that range into the `8.15.0` changelog entry.
+- [x] Verify changelog coverage, formatting, diff, and repository scope.
+
+### Review
+
+- Changelog coverage check: 8/8 release changes represented; the generated
+  `chore(main): release 8.15.0` metadata commit is intentionally excluded.
+- `git diff --check` passed and `execution/version_sync.py check` confirmed
+  version `8.15.0`.
+- PR #455 (`docs/full-surface-benchmark`) is separate unreleased work and was
+  not misattributed to the tagged `v8.15.0` release.
