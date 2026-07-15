@@ -28,37 +28,116 @@ notes remain in the per-version entries below.
 
 ## [8.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.1...v8.15.0) (2026-07-14)
 
+Version 8.15.0 changes 74 files with 7,591 additions and 85 deletions. Most
+of that volume is retained benchmark and independent-audit evidence; the
+runtime change is deliberately small.
 
-### Features
+### Honest token economics and reproducible evidence
 
-* **daemon:** auto-spawned daemons now shut down gracefully after 10 minutes without authenticated traffic, while an explicit `symforge daemon` stays persistent unless configured; `SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS` controls the interval (minimum 60 seconds, `0` disables it) ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd))
+* The published [paired end-to-end feature benchmark](https://github.com/special-place-ai-heaven/symforge/blob/v8.15.0/research/token-cost/end-to-end-feature-benchmark-2026-07-13.md)
+  records 24.8% fewer total tokens with SymForge enabled and indexed across two
+  clean completed feature trials (641,496 fewer tokens per run on average).
+  The report explicitly bounds that result: it is enabled-and-indexed versus
+  disabled host evidence, not proof that every model, project, or explicit
+  SymForge workflow will save 24.8%.
+* The README now separates fixed surface cost from retrieval savings. The
+  measured `tools/list` payload is 72,757 bytes for the full 36-tool surface
+  and 4,581 bytes for compact-3; the documented ~7k-token full-surface overhead
+  is a host/session cost, not a per-call surcharge. The 70–95% retrieval
+  figures are identified as tested mean ranges, and trivial or prose-only work
+  is called out as a case where MCP overhead can lose. Users can opt into
+  compact-3 with `SYMFORGE_SURFACE=compact`
+  ([0e6b5a8](https://github.com/special-place-ai-heaven/symforge/commit/0e6b5a8407b0266b9a00961074d5a74d5e5d4aa3)).
+* A separate [20-run full-versus-compact shakedown](https://github.com/special-place-ai-heaven/symforge/blob/v8.15.0/research/token-cost/token-surface-shakedown-report-a019.md)
+  is published as reconnaissance, not a marketing win. Every run failed at
+  least one frozen oracle criterion, so the release makes no headline token or
+  speed comparison from that series. The evidence did isolate 17 compact call
+  failures, 12 immediate retries, and 232 native fallbacks, versus zero
+  full-surface call failures and 65 native fallbacks; initial tool selection
+  was relevant in all 20 runs.
+* The harness, semantic baseline, per-run grading records, compact failure
+  ledger, raw-trace custody receipts, and independent Opus audits are retained
+  so the next confirmatory pilot can repair the oracles and test separable
+  compact-surface changes instead of repeating an unauditable benchmark
+  ([a292133](https://github.com/special-place-ai-heaven/symforge/commit/a292133102fc6b52d7f5b2f31b163834a021623a)).
 
+### Accurate compact-surface trust metadata
 
-### Bug Fixes
+* The compact `symforge` read/explore facade now advertises
+  `readOnlyHint=true` and `openWorldHint=false`, allowing MCP hosts to recognize
+  that it reads the indexed repository without mutating the workspace or
+  reaching into an open external world
+  ([0260760](https://github.com/special-place-ai-heaven/symforge/commit/0260760ac19e10f2f158411bf94201aaeed601e5)).
+* `symforge_edit` and `status` deliberately remain non-read-only. A regression
+  test pins all three annotations so a future surface refactor cannot make the
+  edit or calibration-reset paths look safe to invoke as reads.
+* This is additive MCP metadata only: tool names, schemas, dispatch behavior,
+  and the full-36/compact-3 surface split are unchanged.
 
-* **stel:** mark the compact `symforge` facade read-only and closed-world while keeping `symforge_edit` and `status` non-read-only, giving MCP clients accurate tool-trust metadata ([0260760](https://github.com/special-place-ai-heaven/symforge/commit/0260760ac19e10f2f158411bf94201aaeed601e5))
+### Bounded lifecycle for auto-spawned daemons
 
+* Detached daemons started automatically by SymForge now request graceful
+  shutdown after 600 seconds without an authenticated request. Successful
+  authorization refreshes the activity timestamp; unauthenticated probes
+  cannot keep a zombie daemon alive
+  ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd)).
+* Idle shutdown follows the same path as SIGINT/SIGTERM: the reaper stops, the
+  server receives graceful shutdown, and runtime files are removed only when
+  their recorded port, process, and token still belong to that daemon.
+* An explicitly managed `symforge daemon` remains persistent when the setting
+  is absent. `SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS` overrides either mode;
+  nonzero values clamp to at least 60 seconds and `0` disables idle shutdown.
+* The behavioral test uses paused Tokio time and the real authenticated HTTP
+  route to prove that fresh authenticated activity defers shutdown and a stale
+  activity timestamp triggers it.
 
-### Documentation
+### Dependencies and repository maintenance
 
-* **readme:** disclose the full surface's measured ~7k-token schema overhead, scope the 70–95% savings figures to tested mean ranges, document cases where overhead can lose, and point users to the compact surface and benchmark evidence ([0e6b5a8](https://github.com/special-place-ai-heaven/symforge/commit/0e6b5a8407b0266b9a00961074d5a74d5e5d4aa3))
+* Updated tree-sitter from 0.26.10 to 0.26.11
+  ([4d8a8b4](https://github.com/special-place-ai-heaven/symforge/commit/4d8a8b41f22c2d14d282ac05b581c4efaa40fcc8)).
+* Updated `rmcp`/`rmcp-macros` from 2.1.0 to 2.2.0, `ignore` from 0.4.27
+  to 0.4.28, and `regex` from 1.12.4 to 1.13.0
+  ([1380bae](https://github.com/special-place-ai-heaven/symforge/commit/1380bae17dd07bf091c9421df7318f3f423ba933)).
+* Updated the Windows bindings from 0.58.0 to 0.62.2
+  ([1d547e7](https://github.com/special-place-ai-heaven/symforge/commit/1d547e7681fcb76116704fcfc192a59e2ebabd94)).
+* Enabled Tokio's `test-util` feature for deterministic daemon lifecycle
+  testing
+  ([ebe0133](https://github.com/special-place-ai-heaven/symforge/commit/ebe013333e6f4393846c3b0c85dd9d092b9da9fd)).
+* Ignored the session-local `grok-symforge-analysis-report.md` output
+  ([a10ff10](https://github.com/special-place-ai-heaven/symforge/commit/a10ff102546241f1ffd49852ba4d3088c0bb8029)).
 
+### Compatibility and operator notes
 
-### Research and Verification
+* No MCP tool, resource, or prompt was added, removed, or renamed in this
+  release. The default remains the full 36-tool surface; compact-3 remains an
+  explicit opt-in.
+* Auto-spawned clients returning after a 10-minute idle gap may pay one warm
+  snapshot reload. Operators who intentionally keep an auto-spawned daemon
+  resident can set `SYMFORGE_DAEMON_IDLE_SHUTDOWN_SECS=0`.
+* Foreground service managers do not inherit the 600-second default unless the
+  operator sets it. Existing explicit daemon service units therefore remain
+  persistent.
 
-* **token economics:** preserve the controlled compact-vs-full shakedown traces, grading records, diagnostics, and independent audit artifacts used to design the confirmatory benchmark ([a292133](https://github.com/special-place-ai-heaven/symforge/commit/a292133102fc6b52d7f5b2f31b163834a021623a))
+### Verification
 
+* Independent reviews approved the compact annotation, the daemon lifecycle
+  policy and behavioral test, the 20-run shakedown closure, and the call-level
+  compact failure diagnostic. The benchmark series remains explicitly
+  descriptive where its frozen oracles prevent a valid causal comparison.
+* The [v8.15.0 release workflow](https://github.com/special-place-ai-heaven/symforge/actions/runs/29344597888)
+  passed version synchronization, Cargo check, the Rust test suite, release
+  build, engine-only embed build and tests, npm tests, and both tool-correctness
+  fixtures.
+* Linux x64, Windows x64, macOS x64, and macOS arm64 native builds passed, as
+  did release-asset upload, npm publication, and crates.io publication.
 
-### Dependencies
+### Published artifacts
 
-* **tree-sitter:** update from 0.26.10 to 0.26.11 ([4d8a8b4](https://github.com/special-place-ai-heaven/symforge/commit/4d8a8b41f22c2d14d282ac05b581c4efaa40fcc8))
-* **mcp/search:** update `rmcp` from 2.1.0 to 2.2.0, `ignore` from 0.4.27 to 0.4.28, and `regex` from 1.12.4 to 1.13.0 ([1380bae](https://github.com/special-place-ai-heaven/symforge/commit/1380bae17dd07bf091c9421df7318f3f423ba933))
-* **windows:** update the Windows bindings from 0.58.0 to 0.62.2 ([1d547e7](https://github.com/special-place-ai-heaven/symforge/commit/1d547e7681fcb76116704fcfc192a59e2ebabd94))
-
-
-### Repository Maintenance
-
-* ignore the session-local `grok-symforge-analysis-report.md` output ([a10ff10](https://github.com/special-place-ai-heaven/symforge/commit/a10ff102546241f1ffd49852ba4d3088c0bb8029))
+* npm: `symforge`, `symforge-linux-x64`, `symforge-windows-x64`,
+  `symforge-macos-x64`, and `symforge-macos-arm64`.
+* crates.io: `symforge`.
+* GitHub: the universal npm tarball plus native binaries and package tarballs
+  for Linux x64, Windows x64, macOS x64, and macOS arm64.
 
 ## [8.14.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.0...v8.14.1) (2026-07-12)
 
