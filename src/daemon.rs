@@ -9691,6 +9691,109 @@ mod tests {
         wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
     }
 
+    #[tokio::test]
+    async fn test_symforge_edit_project_selector_writes_selected_daemon_project() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _surface_guard = EnvVarGuard::set_str("SYMFORGE_SURFACE", "compact");
+
+        let home = project_dir("symforge-edit-home");
+        let home_file = home.path().join("src").join("lib.rs");
+        std::fs::write(&home_file, "pub fn shared() -> u32 { 1 }\n").expect("write home");
+        let sibling = project_dir("symforge-edit-sibling");
+        let sibling_file = sibling.path().join("src").join("lib.rs");
+        std::fs::write(&sibling_file, "pub fn shared() -> u32 { 10 }\n").expect("write sibling");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: home.path().display().to_string(),
+                client_name: "edit-project-selector".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open request")
+            .error_for_status()
+            .expect("open status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open body");
+
+        let client = DaemonSessionClient::new_for_test(
+            base_url.clone(),
+            opened.project_id.clone(),
+            opened.session_id.clone(),
+            opened.project_name.clone(),
+        )
+        .with_project_root(home.path().to_path_buf());
+        let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
+
+        let indexed_home = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: home.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+            }))
+            .await;
+        assert!(
+            indexed_home.starts_with("Indexed "),
+            "home index must succeed, got: {indexed_home}"
+        );
+        let indexed_sibling = server
+            .index_folder(Parameters(IndexFolderInput {
+                path: sibling.path().display().to_string(),
+                idempotency_key: None,
+                add: Some(true),
+            }))
+            .await;
+        assert!(
+            indexed_sibling.starts_with("Indexed "),
+            "sibling additive open must succeed, got: {indexed_sibling}"
+        );
+
+        let sibling_root = canonical_project_root(sibling.path()).expect("canonical sibling");
+        let sibling_project = project_key(&sibling_root);
+        let result = server
+            .symforge_edit_facade_tool(Parameters(crate::stel::StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                project: Some(sibling_project),
+                symbol: Some("shared".to_string()),
+                body: Some("pub fn shared() -> u32 { 20 }".to_string()),
+                apply: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .expect("symforge_edit dispatch");
+        let body = serde_json::to_value(&result).expect("serialize result")["content"][0]["text"]
+            .as_str()
+            .expect("result text")
+            .to_string();
+        assert!(
+            !body.starts_with("Error"),
+            "project-routed edit must succeed, got:\n{body}"
+        );
+
+        let home_after = std::fs::read_to_string(&home_file).expect("read home");
+        assert!(
+            home_after.contains("{ 1 }") && !home_after.contains("{ 20 }"),
+            "home project must not be edited when sibling is selected, got:\n{home_after}\n\nbody:\n{body}"
+        );
+        let sibling_after = std::fs::read_to_string(&sibling_file).expect("read sibling");
+        assert!(
+            sibling_after.contains("{ 20 }"),
+            "selected sibling project must receive the edit, got:\n{sibling_after}\n\nbody:\n{body}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+    }
+
     /// F6 regression: a `symforge_edit` apply carrying `working_directory`
     /// must route the write into the sibling git worktree through the DAEMON
     /// dispatch path (front-end proxy → daemon `execute_tool_call` →
