@@ -1919,6 +1919,50 @@ catalog lineage) occurs only under the per-project mutation lock. `tasks.md` Gat
 items are checked. Gate L is the next open gate; the 24 pre-existing clippy errors are logged above
 for the Gate-M battery.
 
+### Gate L Progress (OPEN — in progress 2026-07-22)
+
+Gate L is the largest gate in the feature (worktrees + local refs, real git2 blob ingestion,
+dedup, multi-source query composition, per-lane concurrency fences). It is being built as
+verifiable RED→GREEN increments; the gate stays OPEN until every L-R/L-G/L-V item is green.
+
+Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `live_index/mod.rs`):
+
+- Increment 1 — `scout_local_ref` (L-G02 core), commit `fd9bdeb`. Bounded in-process DFS over a
+  local ref tree via libgit2 (no Git/LFS subprocess, L-R05). Enumerates blobs keyed by immutable
+  object ID; per-path classification/language re-derivation (L-R02/L-R14). Blob size comes from the
+  ODB header (`Odb::read_header`), so a blob over the per-blob budget is `CatalogOnly` and its bytes
+  are never read (L-R04). Entry budget degrades coverage instead of collecting unbounded (L-R07
+  shape). Missing ref → typed error.
+- Increment 2 — `materialize_ingest_blobs` + `RefBlobBytes` (L-G03 raw-bytes layer), commit
+  `60ebddf`. Reads each distinct ingest-decision object ID once (dedup); never materializes
+  catalog-only blobs.
+- Module suite: 7 unit tests green (`cargo test --lib live_index::local_ref_scout::tests`,
+  `-j1 --test-threads=1`); fmt clean; no new clippy warnings in the module.
+
+Remaining Gate L work (in dependency order), NOT yet started — this is the scope escalation to pause
+and confirm direction at, because it reaches into the core extraction/publication/query surfaces:
+
+1. L-G04: route the deduped blob bytes through the SHARED extraction/secret/bridge/authority
+   adapters (do NOT create a second prose parser or search index). Requires understanding how the
+   filesystem path currently feeds bytes into parse/secret so ref blobs reuse the same pipeline
+   keyed by classification/route/extractor version + secret policy version. Covers L-R10 parity.
+2. L-G01/L-G05/L-G07: populate the multi-source `PublishedSourceSet` (today only holds `current`).
+   Reconcile ref/worktree topology atomically under the per-`ProjectInstance` publication writer
+   lock; copy the source map under lock, replace only the affected lane's entry, swap once;
+   `registry_generation` bumps on membership/bundle change while a P1-only change leaves the current
+   worktree's publication/content/project generations unchanged (L-R12/L-R13). Reuse worktree
+   `ProjectInstance` ownership for checked-out sources (L-R08/L-R11).
+3. L-G06: source filters/labels/per-source review envelopes; advertise `worktrees`/`local_refs`/`all`
+   scopes only after their focused tests pass (today `search_knowledge` advertises + implements only
+   `current`; the other scopes deserialize and return typed unsupported). Compose current/worktrees/
+   local_refs/all + two-project selectors + `projects=["*"]` deterministically from one captured
+   source set per selected `ProjectInstance` (L-R09), with typed empty/degraded lanes and no false
+   Complete ref scope (L-R07).
+4. VERIFY L-V01..L-V04 + update this ledger and `tasks.md` Gate-L boxes.
+
+Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; the boxes there remain
+unchecked. Known debt unchanged: 24 pre-existing clippy errors branch-wide (Gate-M gate).
+
 ---
 
 ## Windows Headless Process Invariant (2026-07-16)
