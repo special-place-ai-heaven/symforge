@@ -10,6 +10,7 @@ pub mod graph;
 mod health_view;
 pub mod knowledge_authority;
 pub mod knowledge_bridge;
+pub mod local_ref_scout;
 pub mod persist;
 pub(crate) mod qualified_usages;
 pub mod query;
