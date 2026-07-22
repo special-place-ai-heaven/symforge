@@ -134,6 +134,10 @@ impl SymforgeCallInput {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelEditRequest {
     pub path: String,
+    /// Optional daemon-session project selector. Mirrors the structural edit
+    /// tools so the compact facade cannot silently fall back to the home repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     /// New source. For replace: the FULL item (signature + body), flush-left

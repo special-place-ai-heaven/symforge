@@ -3756,7 +3756,9 @@ fn is_cross_project_read_verb(tool_name: &str) -> bool {
 /// batch-level only — each call stays one single-project transaction, and the
 /// existing worktree/`working_directory` validation then runs against the
 /// SELECTED project's repository, so an unrelated root rejects before preview
-/// or apply.
+/// or apply. `symforge_edit` is included too: the compact facade plans one of
+/// those same structural tools, so resolving it at the facade boundary prevents
+/// a selected sibling project from falling back to the session home.
 pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -3783,6 +3785,7 @@ pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
             | "batch_edit"
             | "batch_insert"
             | "batch_rename"
+            | "symforge_edit"
     )
 }
 
@@ -4821,6 +4824,14 @@ mod tests {
             .default_headers(headers)
             .build()
             .expect("build authed reqwest client")
+    }
+
+    #[test]
+    fn symforge_edit_is_single_project_routed() {
+        assert!(
+            single_project_routed_tool("symforge_edit"),
+            "compact edit facade must honor project selectors before planning legacy edits"
+        );
     }
 
     #[tokio::test]

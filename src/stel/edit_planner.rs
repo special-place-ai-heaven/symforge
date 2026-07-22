@@ -193,6 +193,10 @@ pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValida
         args["working_directory"] = serde_json::json!(cwd);
     }
 
+    if let Some(project) = &request.project {
+        args["project"] = serde_json::json!(project);
+    }
+
     Ok(StelPlan {
         plan_id: edit_plan_id(request),
         intent: IntentBucket::Edit,
@@ -363,6 +367,34 @@ mod tests {
             assert_eq!(
                 plan.steps[0].args[key], "/repos/wt_one",
                 "working_directory must be forwarded into the {} plan args",
+                plan.steps[0].tool
+            );
+        }
+    }
+
+    #[test]
+    fn build_edit_plan_forwards_project_selector() {
+        // Multi-project daemon safety: the compact facade must carry the same
+        // selector as the structural edit tools or an edit can land in home.
+        for op in [
+            None,
+            Some(StelEditOp::InsertAfter),
+            Some(StelEditOp::EditWithin),
+        ] {
+            let plan = build_edit_plan(&StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                project: Some("sibling-repo".to_string()),
+                symbol: Some("helper".to_string()),
+                body: Some("fn helper() {}".to_string()),
+                old_text: Some("old".to_string()),
+                new_text: Some("new".to_string()),
+                op,
+                ..Default::default()
+            })
+            .expect("valid edit request");
+            assert_eq!(
+                plan.steps[0].args["project"], "sibling-repo",
+                "project must be forwarded into the {} plan args",
                 plan.steps[0].tool
             );
         }
