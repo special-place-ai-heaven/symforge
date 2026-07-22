@@ -134,16 +134,17 @@ impl SymforgeCallInput {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelEditRequest {
     pub path: String,
+    // Optional daemon-session project selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
-    /// New source. For replace: the FULL item (signature + body), flush-left
-    /// (re-columned to the symbol's indent, not doubled). For insert: the new
-    /// symbol's source. Omit/false `apply` previews instead of writing.
+    // New source for replace/insert. Omit/false `apply` previews.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<StelEditIntent>,
-    /// insert/edit_within use symbol as anchor/scope.
+    // insert/edit_within use symbol as anchor/scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<StelEditOp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,13 +153,13 @@ pub struct StelEditRequest {
     pub new_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_all: Option<bool>,
-    /// When true, commit a validated single-symbol edit. Default / omitted = preview dry_run only.
+    // true commits; default/false previews.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply: Option<bool>,
-    /// When set on apply, must match the current indexed symbol body bytes exactly.
+    // Optimistic-concurrency guard for apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_match: Option<String>,
-    /// Replay guard for committed apply (forwarded to legacy `replace_symbol_body`).
+    // Replay guard for committed apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     // Caller's working directory (absolute): routes the write into the matching
