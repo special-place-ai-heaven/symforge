@@ -6,10 +6,14 @@
 //! is catalog-only (L-R04): its object ID and size come from the ODB header,
 //! and its bytes are never read into memory, so a giant blob cannot force
 //! materialization. Identical bytes reachable at several paths share one object
-//! ID while each path re-derives its own classification/language (L-R02/L-R14);
-//! deduplication of the raw bytes themselves is a later stage (L-G03).
+//! ID while each path re-derives its own classification/language (L-R02/L-R14).
+//! `materialize_ingest_blobs` reads each distinct ingest-decision object ID once
+//! and never touches catalog-only blobs (L-G03 raw-bytes layer); routing those
+//! bytes through the shared extraction/secret/bridge adapters is a later stage
+//! (L-G04).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use git2::{ObjectType, Repository};
 
@@ -192,6 +196,48 @@ pub fn scout_local_ref(
         distinct_blob_object_ids: distinct.len(),
         total_distinct_blob_bytes,
     })
+}
+
+/// Raw bytes for the ingest-decision blobs of a catalog, deduplicated by
+/// immutable object ID. Catalog-only blobs are never read, and identical bytes
+/// reachable at several paths are stored once (L-G03 raw-bytes layer).
+#[derive(Clone, Debug, Default)]
+pub struct RefBlobBytes {
+    by_object_id: BTreeMap<String, Arc<[u8]>>,
+}
+
+impl RefBlobBytes {
+    /// Raw bytes for one object ID, if it was an ingest-decision blob.
+    pub fn get(&self, object_id: &str) -> Option<&Arc<[u8]>> {
+        self.by_object_id.get(object_id)
+    }
+
+    /// Count of distinct object IDs whose bytes were materialized.
+    pub fn distinct_len(&self) -> usize {
+        self.by_object_id.len()
+    }
+}
+
+/// Read the ingest-decision blob bytes of a catalog, once per distinct object
+/// ID. Catalog-only blobs are skipped: their bytes are never materialized.
+pub fn materialize_ingest_blobs(
+    repository: &Repository,
+    catalog: &LocalRefCatalog,
+) -> Result<RefBlobBytes, String> {
+    let mut by_object_id: BTreeMap<String, Arc<[u8]>> = BTreeMap::new();
+    for entry in &catalog.entries {
+        if entry.decision != RefBlobDecision::Ingest || by_object_id.contains_key(&entry.object_id)
+        {
+            continue;
+        }
+        let oid = git2::Oid::from_str(&entry.object_id)
+            .map_err(|_| format!("Error: blob object id '{}' is invalid.", entry.object_id))?;
+        let blob = repository
+            .find_blob(oid)
+            .map_err(|_| format!("Error: blob '{}' could not be read.", entry.object_id))?;
+        by_object_id.insert(entry.object_id.clone(), Arc::from(blob.content()));
+    }
+    Ok(RefBlobBytes { by_object_id })
 }
 
 #[cfg(test)]
@@ -408,5 +454,68 @@ mod tests {
         )
         .expect_err("missing ref must error");
         assert!(error.contains("could not be resolved"), "{error}");
+    }
+
+    #[test]
+    fn materializes_shared_object_id_once_and_bytes_match_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let shared = b"identical content\n";
+        commit_files(
+            root,
+            &[("notes.md", shared), ("data.txt", shared)],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let bytes = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+
+        assert_eq!(bytes.distinct_len(), 1, "identical bytes materialized once");
+        let object_id = &catalog.entries[0].object_id;
+        assert_eq!(
+            bytes.get(object_id).expect("shared blob bytes").as_ref(),
+            shared
+        );
+    }
+
+    #[test]
+    fn catalog_only_blob_bytes_are_not_materialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let big = vec![b'x'; 4096];
+        commit_files(
+            root,
+            &[("small.md", b"# small\n"), ("big.bin", &big)],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let budget = LocalRefScoutBudget {
+            max_entries: 1_000,
+            max_blob_materialize_bytes: 1024,
+        };
+        let catalog = scout_local_ref(&repository, "HEAD", &budget).expect("scout");
+        let bytes = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+
+        let big_id = &catalog
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "big.bin")
+            .expect("big entry")
+            .object_id;
+        let small_id = &catalog
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "small.md")
+            .expect("small entry")
+            .object_id;
+        assert!(
+            bytes.get(big_id).is_none(),
+            "catalog-only blob bytes must never be materialized"
+        );
+        assert!(bytes.get(small_id).is_some(), "ingest blob is materialized");
+        assert_eq!(bytes.distinct_len(), 1);
     }
 }
