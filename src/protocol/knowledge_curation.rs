@@ -52,6 +52,10 @@ pub(crate) struct KnowledgeCurationCoordinator {
     probe_failures: Mutex<BTreeSet<PathBuf>>,
     #[cfg(test)]
     failpoint: Mutex<Option<CurationWriteStage>>,
+    #[cfg(test)]
+    temp_corruption: Mutex<Option<Vec<u8>>>,
+    #[cfg(test)]
+    interposed_policy_bytes: Mutex<Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,24 +379,21 @@ impl KnowledgeCurationCoordinator {
             Ok(record) => record,
             Err(error) => return error,
         } {
-            if let Err(error) =
-                verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)
-            {
-                return error;
-            }
-            if record.request_hash != request_hash {
-                return "Error: idempotency_conflict; the key is already bound to a different canonical request."
-                    .to_string();
-            }
-            if record_is_terminal(&record.state) {
-                return self.handle_existing_record(
-                    repo_root,
-                    &curation_dir,
-                    &record_path,
-                    record,
-                    &plan,
-                    &request_hash,
-                );
+            // Pre-lock fast path is strictly read-only: any binding outcome
+            // that would quarantine the record or append catalog lineage is
+            // deferred to the locked path below.
+            if verify_binding(repo_root, &curation_dir, &record.binding, &plan, false).is_ok() {
+                if record.request_hash != request_hash {
+                    return "Error: idempotency_conflict; the key is already bound to a different canonical request."
+                        .to_string();
+                }
+                match &record.state {
+                    ReplayState::Succeeded { receipt } => return receipt.render(),
+                    ReplayState::Failed { output } | ReplayState::Indeterminate { output } => {
+                        return output.clone();
+                    }
+                    ReplayState::Reserved | ReplayState::PendingWrite { .. } => {}
+                }
             }
         }
 
@@ -413,6 +414,9 @@ impl KnowledgeCurationCoordinator {
         let output = (|| {
             let mut generation = index.published_source_set().current_generation();
             let mut plan = curation_plan_current(&generation)?;
+            if let Some(record) = read_replay_record(&record_path)? {
+                verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)?;
+            }
             self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &plan)?;
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
@@ -473,13 +477,29 @@ impl KnowledgeCurationCoordinator {
                 diff: prepared.diff.clone(),
             };
             record.state = ReplayState::PendingWrite {
-                pre_image: prepared.pre_image,
+                pre_image: prepared.pre_image.clone(),
                 post_image: prepared.post_image.clone(),
                 receipt: receipt.clone(),
             };
             write_replay_record(&record_path, &record)?;
             self.maybe_fail(CurationWriteStage::AfterPendingIntentSync)?;
-            self.write_policy(&repo_root.join(POLICY_FILE), &prepared.post_image)?;
+            #[cfg(test)]
+            if let Some(bytes) = self.interposed_policy_bytes.lock().take() {
+                fs::write(repo_root.join(POLICY_FILE), bytes)
+                    .map_err(|error| durable_state_error(&error))?;
+            }
+            let policy_path = repo_root.join(POLICY_FILE);
+            let live_image = read_policy_bytes(&policy_path)?;
+            if live_image != prepared.pre_image && live_image != prepared.post_image {
+                let output = "Error: indeterminate_conflict; policy bytes match neither the recorded pre-image nor post-image."
+                    .to_string();
+                record.state = ReplayState::Indeterminate {
+                    output: output.clone(),
+                };
+                write_replay_record(&record_path, &record)?;
+                return Ok(output);
+            }
+            self.write_policy(&policy_path, &prepared.post_image)?;
             record.state = ReplayState::Succeeded {
                 receipt: receipt.clone(),
             };
@@ -663,6 +683,17 @@ impl KnowledgeCurationCoordinator {
             .flush()
             .map_err(|error| durable_state_error(&error))?;
         self.maybe_fail(CurationWriteStage::AfterTempWrite)?;
+        #[cfg(test)]
+        if let Some(corrupt) = self.temp_corruption.lock().take() {
+            fs::write(temp.path(), corrupt).map_err(|error| durable_state_error(&error))?;
+        }
+        let written = fs::read(temp.path()).map_err(|error| durable_state_error(&error))?;
+        if crate::hash::digest_hex(&written) != crate::hash::digest_hex(bytes) {
+            return Err(
+                "Error: policy temp image failed digest verification; no policy mutation was acknowledged."
+                    .to_string(),
+            );
+        }
         temp.as_file()
             .sync_all()
             .map_err(|error| durable_state_error(&error))?;
@@ -694,6 +725,16 @@ impl KnowledgeCurationCoordinator {
     }
 
     #[cfg(test)]
+    fn corrupt_temp_for_tests(&self, bytes: Vec<u8>) {
+        self.temp_corruption.lock().replace(bytes);
+    }
+
+    #[cfg(test)]
+    fn interpose_policy_bytes_for_tests(&self, bytes: Vec<u8>) {
+        self.interposed_policy_bytes.lock().replace(bytes);
+    }
+
+    #[cfg(test)]
     fn fail_probe_for_tests(&self, directory: &Path) {
         let canonical = dunce::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
         self.probe_failures.lock().insert(canonical);
@@ -703,15 +744,6 @@ impl KnowledgeCurationCoordinator {
     fn probe_operations_for_tests(&self) -> Vec<PathBuf> {
         self.probe_operations.lock().clone()
     }
-}
-
-fn record_is_terminal(state: &ReplayState) -> bool {
-    matches!(
-        state,
-        ReplayState::Succeeded { .. }
-            | ReplayState::Failed { .. }
-            | ReplayState::Indeterminate { .. }
-    )
 }
 
 pub(crate) fn validate_input(input: &CurateKnowledgeInput) -> Result<(), String> {
@@ -1497,6 +1529,7 @@ fn verify_binding(
     curation_dir: &Path,
     binding: &CurationSourceBinding,
     plan: &CurationReviewPlan,
+    append_lineage: bool,
 ) -> Result<(), String> {
     if binding.repository_id != plan.source.repository_id
         || binding.source_id != plan.source.source_id
@@ -1548,6 +1581,7 @@ fn verify_binding(
                 *publication_generation,
                 &plan.manifest_digest,
                 plan.publication_generation,
+                append_lineage,
             )?;
         }
     }
@@ -1561,7 +1595,7 @@ fn verify_record_binding(
     record: &ReplayRecord,
     plan: &CurationReviewPlan,
 ) -> Result<(), String> {
-    if let Err(foreign) = verify_binding(repo_root, curation_dir, &record.binding, plan) {
+    if let Err(foreign) = verify_binding(repo_root, curation_dir, &record.binding, plan, true) {
         quarantine_record(curation_dir, record_path, record)?;
         return Err(foreign);
     }
@@ -1590,6 +1624,7 @@ fn verify_or_append_lineage(
     from_generation: u64,
     to_digest: &str,
     to_generation: u64,
+    append: bool,
 ) -> Result<(), String> {
     if from_digest == to_digest {
         return Ok(());
@@ -1612,6 +1647,9 @@ fn verify_or_append_lineage(
             && edge.to_generation == to_generation
     }) {
         return Ok(());
+    }
+    if !append {
+        return Err("Error: catalog lineage verification requires the mutation lock.".to_string());
     }
     if to_generation != from_generation.saturating_add(1) {
         return Err(
@@ -1767,6 +1805,12 @@ fn durable_replace_io(path: &Path, bytes: &[u8], prefix: &str) -> io::Result<()>
         .tempfile_in(parent)?;
     temp.write_all(bytes)?;
     temp.as_file_mut().flush()?;
+    let written = fs::read(temp.path())?;
+    if crate::hash::digest_hex(&written) != crate::hash::digest_hex(bytes) {
+        return Err(io::Error::other(
+            "durable temp image failed digest verification",
+        ));
+    }
     temp.as_file().sync_all()?;
 
     persist_temp_file(temp, path)?;
@@ -2210,11 +2254,8 @@ mod tests {
             .expect("clone placeholder");
         let clone_path = clone_placeholder.path().to_path_buf();
         clone_placeholder.close().expect("remove clone placeholder");
-        git2::Repository::clone(
-            root.to_str().expect("UTF-8 test root"),
-            &clone_path,
-        )
-        .expect("clone same history");
+        git2::Repository::clone(root.to_str().expect("UTF-8 test root"), &clone_path)
+            .expect("clone same history");
 
         let displaced = tempfile::Builder::new()
             .prefix("symforge-original-root-")
@@ -2584,5 +2625,83 @@ mod tests {
             !source_path.exists(),
             "successful replacement consumes the temp file"
         );
+    }
+
+    #[test]
+    fn corrupted_temp_policy_image_fails_digest_verification_before_replace() {
+        let fixture = CrashFixture::new("temp-digest-corruption");
+        let coordinator = KnowledgeCurationCoordinator::default();
+        coordinator.corrupt_temp_for_tests(b"version = 1\n# corrupted temp image\n".to_vec());
+        let output = fixture.execute(&coordinator);
+        assert!(output.contains("digest verification"), "{output}");
+        assert!(
+            !fixture.dir.path().join(POLICY_FILE).exists(),
+            "corrupted temp image must never replace the policy"
+        );
+
+        let recovered = fixture.execute(&coordinator);
+        assert!(recovered.contains("status=applied"), "{recovered}");
+        let policy_bytes =
+            fs::read(fixture.dir.path().join(POLICY_FILE)).expect("recovered policy bytes");
+        let policy = parse_knowledge_policy(&policy_bytes).expect("valid recovered policy");
+        assert_eq!(policy.entries.len(), 1);
+    }
+
+    #[test]
+    fn live_third_state_policy_before_write_is_fenced_not_overwritten() {
+        let fixture = CrashFixture::new("live-pre-image-fence");
+        let coordinator = KnowledgeCurationCoordinator::default();
+        let third_state = b"version = 1\n# independent live change\n";
+        coordinator.interpose_policy_bytes_for_tests(third_state.to_vec());
+        let output = fixture.execute(&coordinator);
+        assert!(output.contains("indeterminate_conflict"), "{output}");
+        assert_eq!(
+            fs::read(fixture.dir.path().join(POLICY_FILE)).expect("live third-state policy"),
+            third_state,
+            "live fence must not overwrite an independent policy change"
+        );
+        assert_eq!(
+            fixture.execute(&coordinator),
+            output,
+            "indeterminate outcome must replay terminally"
+        );
+    }
+
+    #[test]
+    fn foreign_record_quarantine_waits_for_the_mutation_lock() {
+        let mut fixture = CrashFixture::new("foreign-quarantine-under-lock");
+        let state = tempfile::tempdir().expect("external state root");
+        use_external_state(&mut fixture, state.path());
+        let coordinator = KnowledgeCurationCoordinator::default();
+        let applied = fixture.execute(&coordinator);
+        assert!(applied.contains("status=applied"), "{applied}");
+        let displaced = replace_repository_root(&fixture);
+
+        let curation_dir = state.path().join("project-state").join(CURATION_STATE_DIR);
+        let quarantine_dir = curation_dir.join(QUARANTINE_DIR);
+        let lock = open_and_lock(&curation_dir.join(LOCK_FILE)).expect("hold curation lock");
+
+        let replay = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| fixture.execute(&coordinator));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let premature = fs::read_dir(&quarantine_dir)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            assert_eq!(
+                premature, 0,
+                "attributable state was quarantined before the mutation lock was acquired"
+            );
+            unlock_file(&lock).expect("release curation lock");
+            handle.join().expect("replay thread")
+        });
+        assert!(replay.contains("foreign_source_conflict"), "{replay}");
+        assert!(
+            fs::read_dir(&quarantine_dir)
+                .expect("quarantine after lock release")
+                .next()
+                .is_some(),
+            "foreign record must still be quarantined once the lock is held"
+        );
+        fs::remove_dir_all(displaced).expect("remove displaced repository");
     }
 }

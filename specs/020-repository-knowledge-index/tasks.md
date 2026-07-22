@@ -557,89 +557,89 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 
 ### RED
 
-- [ ] K-R01 Preview writes/reserves nothing; apply accepts explicit action IDs and
+- [x] K-R01 Preview writes/reserves nothing; apply accepts explicit action IDs and
   exactly one current-worktree review hash plus fresh manifest/policy/target guards,
   and mutates only `.symforge-knowledge.toml`.
-- [ ] K-R02 Identical idempotency replay returns stored terminal success before now-
+- [x] K-R02 Identical idempotency replay returns stored terminal success before now-
   stale freshness guards; same key/different canonical request conflicts.
-- [ ] K-R03 Concurrent curators serialize under one per-project policy mutation lock
+- [x] K-R03 Concurrent curators serialize under one per-project policy mutation lock
   and revalidate policy/manifest/document/action guards immediately before write.
-- [ ] K-R04 Secret-positive input rejects before routing, echo, logging, idempotency
+- [x] K-R04 Secret-positive input rejects before routing, echo, logging, idempotency
   reservation, evidence construction, temp write, or receipt.
-- [ ] K-R05 Explicit-protected/read-only/user-local-without-durable-replay/memory-
+- [x] K-R05 Explicit-protected/read-only/user-local-without-durable-replay/memory-
   only/ref/implicit-worktree sources expose a reason-bearing unavailable capability
   before probe evaluation, with zero probe file operations beneath the source root.
-- [ ] K-R06 Crash after durable intent reservation recovers one pending request and
+- [x] K-R06 Crash after durable intent reservation recovers one pending request and
   never mutates the ledger without completed validation.
-- [ ] K-R07 Crash after validation but before temp-file sync leaves the previous
+- [x] K-R07 Crash after validation but before temp-file sync leaves the previous
   complete ledger and a deterministically recoverable request.
-- [ ] K-R08 Crash after temp-file `sync_all` but before atomic replace leaves either
+- [x] K-R08 Crash after temp-file `sync_all` but before atomic replace leaves either
   the old complete ledger or a recoverable validated temp, never partial policy.
-- [ ] K-R09 Crash after atomic replace/parent-directory durability but before
+- [x] K-R09 Crash after atomic replace/parent-directory durability but before
   completion recording detects the exact post-state and terminalizes the request
   without applying it twice.
-- [ ] K-R10 Crash after completion recording replays the stored result; startup
+- [x] K-R10 Crash after completion recording replays the stored result; startup
   recovery quarantines/blocks indeterminate state rather than guessing success.
-- [ ] K-R11 Successful apply triggers ordinary watcher/reconciliation publication;
+- [x] K-R11 Successful apply triggers ordinary watcher/reconciliation publication;
   the receipt reports applied/pending generation, an already captured reader keeps
   its old generation, and a later reader sees the new policy/voice atomically.
-- [ ] K-R12 Move/delete/schema-invalid action, stale review/policy/manifest/target,
+- [x] K-R12 Move/delete/schema-invalid action, stale review/policy/manifest/target,
   unknown action, or any mixed batch failure causes zero policy mutation.
-- [ ] K-R13 Same-path repository replacement between `pending_write` and recovery
+- [x] K-R13 Same-path repository replacement between `pending_write` and recovery
   returns typed foreign-source conflict, quarantines attributable intent, and writes
   zero ledger bytes.
-- [ ] K-R14 Same-key replay under a same-path replacement returns typed foreign-source
+- [x] K-R14 Same-key replay under a same-path replacement returns typed foreign-source
   conflict and never reports the old repository's result as applied.
-- [ ] K-R15 Unix parent-sync and Windows write-through replacement capability probes
+- [x] K-R15 Unix parent-sync and Windows write-through replacement capability probes
   gate apply; unsupported/failed probes return `AtomicDurabilityUnavailable` before
   reservation or ledger mutation.
-- [ ] K-R16 `durability_probe_writes_nothing_into_non_available_sources`: a whole-root
+- [x] K-R16 `durability_probe_writes_nothing_into_non_available_sources`: a whole-root
   filesystem spy over explicit-protected, read-only, ref, implicit-worktree, and
   memory-only first-apply attempts observes zero probe operations.
-- [ ] K-R17 `intent_journal_directory_durability_gates_apply`: when the ledger parent
+- [x] K-R17 `intent_journal_directory_durability_gates_apply`: when the ledger parent
   passes but the `ProjectStateDir` replay/intent-journal parent cannot meet the same
   durability contract, apply is typed unavailable before reservation.
-- [ ] K-R18 `curation_replay_after_intervening_commit_is_not_foreign`: after apply and
+- [x] K-R18 `curation_replay_after_intervening_commit_is_not_foreign`: after apply and
   one ordinary commit, same-key/same-hash replay returns stored success. Its non-Git
   variant edits one file and requires a retained catalog-lineage transition to replay
   stored success; a missing transition fails closed.
-- [ ] K-R19 `identical_replay_immediately_after_apply_matches_stored_binding`: the
+- [x] K-R19 `identical_replay_immediately_after_apply_matches_stored_binding`: the
   post-image policy digest cannot turn immediate terminal replay into a foreign-source
   conflict.
-- [ ] K-R20 `curation_recovery_after_intervening_commit_terminalizes_post_image`:
+- [x] K-R20 `curation_recovery_after_intervening_commit_terminalizes_post_image`:
   crash after replace, then ordinary commit or identical-byte branch switch; recovery
   accepts same-repository continuity and terminalizes the exact post-image.
 
 ### GREEN
 
-- [ ] K-G01 Add preview-first `curate_knowledge` with canonical request hashing and
+- [x] K-G01 Add preview-first `curate_knowledge` with canonical request hashing and
   explicit action/guard validation for one current project/source.
-- [ ] K-G02 Reuse resolved `ProjectStateDir` durable replay/mutation intent and one
+- [x] K-G02 Reuse resolved `ProjectStateDir` durable replay/mutation intent and one
   per-project lock; disable apply when replay or atomic durability is unavailable.
-- [ ] K-G03 Implement recoverable pre/post intent state, guarded temp write,
+- [x] K-G03 Implement recoverable pre/post intent state, guarded temp write,
   `sync_all`, atomic replace, and the parent durability required by a tested platform
   contract, plus deterministic startup recovery/finalization; disable apply wherever
   that complete durability contract cannot be met. Use Unix parent-directory sync or
   Windows `FlushFileBuffers` plus write-through same-directory replacement, gated by
   last-evaluated first-use probes in both the ledger and replay/intent-journal
   directories plus platform crash tests.
-- [ ] K-G04 Revalidate the on-disk ledger and all source guards under the lock, then
+- [x] K-G04 Revalidate the on-disk ledger and all source guards under the lock, then
   let the ordinary watcher publish the new immutable generation.
-- [ ] K-G05 Keep target documents immutable: no archive move, delete, or content edit;
+- [x] K-G05 Keep target documents immutable: no archive move, delete, or content edit;
   physical cleanup remains an evidence-only proposal requiring a later user action.
-- [ ] K-G06 Expose exact capability/replay/recovery reason codes in tool receipts and
+- [x] K-G06 Expose exact capability/replay/recovery reason codes in tool receipts and
   health without treating live-query readiness as persistence readiness.
-- [ ] K-G07 Bind durable replay and pending intent to verified `RepositoryId`/
+- [x] K-G07 Bind durable replay and pending intent to verified `RepositoryId`/
   `SourceId` plus Git anchor-tip or non-Git root/catalog continuity. Keep manifest/
   policy digests as separate first-execution freshness guards; reject failed source
   continuity before ledger inspection, mutation, or stored-success replay.
 
 ### VERIFY
 
-- [ ] K-V01 Curation/idempotency/concurrency/capability suites are green.
-- [ ] K-V02 Crash injection at reservation, validation, temp sync, atomic replace,
+- [x] K-V01 Curation/idempotency/concurrency/capability suites are green.
+- [x] K-V02 Crash injection at reservation, validation, temp sync, atomic replace,
   parent sync, and completion proves one complete ledger and one terminal receipt.
-- [ ] K-V03 No review/curation path moves, deletes, or edits a target document.
+- [x] K-V03 No review/curation path moves, deletes, or edits a target document.
 
 ## Gate L — Worktrees and local refs
 

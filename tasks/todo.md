@@ -1851,38 +1851,73 @@ surfaces. Gate K guarded logical curation is the next open gate.
 
 ### Gate K Plan
 
-- [ ] Preserve K-R01–K-R20 and K-G01–K-G07 as executable REDs before implementation: preview/apply equivalence;
+- [x] Preserve K-R01–K-R20 and K-G01–K-G07 as executable REDs before implementation: preview/apply equivalence;
   same-source replay/conflict; preview side-effect freedom; availability-before-probe; fresh review/manifest/policy/target
   guards; per-project serialization; crash recovery at every intent/write/result boundary; watcher/publication convergence;
   branch/commit/rewrite continuity; non-Git continuity; secret safety; and repository-byte exclusivity.
-- [ ] Define one canonical curation request and result surface. Requests name nonempty review action IDs, carry the complete
+- [x] Define one canonical curation request and result surface. Requests name nonempty review action IDs, carry the complete
   source-local review hash plus manifest/policy/target guards, default to preview, and require an idempotency key only for
   apply. Results expose the canonical ledger diff and typed replay/publication state without document mutation authority.
-- [ ] Reproduce selected actions from a fresh captured review and render one deterministic `.symforge-knowledge.toml` image;
+- [x] Reproduce selected actions from a fresh captured review and render one deterministic `.symforge-knowledge.toml` image;
   preview must run every logical guard and return the exact apply diff while creating no lock, probe, journal, temp, or policy
   artifact. Canonical serialization must round-trip through the frozen policy parser without widening the authority model.
-- [ ] Add a project-bound curation coordinator with explicit source-access and persistence capabilities. Apply must reject an
+- [x] Add a project-bound curation coordinator with explicit source-access and persistence capabilities. Apply must reject an
   ineligible binding before any durability probe, then probe only the policy-ledger parent and durable intent parent, acquire
   one per-project policy lock, and revalidate the complete review/manifest/policy/target envelope under that lock.
-- [ ] Implement durable same-source idempotency and recovery under the project-state directory: identity is repository/source
+- [x] Implement durable same-source idempotency and recovery under the project-state directory: identity is repository/source
   identity plus a resolvable stored Git tip (or durable non-Git root/catalog lineage), never mutable refs, current tip, policy,
   manifest, or target digests. Persist reserved/pending/result states with pre/post images and fail closed on foreign or
   unverifiable continuity, key/hash conflict, third-state policy bytes, or non-durable storage.
-- [ ] Commit only `.symforge-knowledge.toml` through create-new same-directory temp, complete write/verification, sync,
+- [x] Commit only `.symforge-knowledge.toml` through create-new same-directory temp, complete write/verification, sync,
   atomic replacement, parent durability (or a documented/tested Windows-safe equivalent), then durable result. Recovery must
   converge every injected crash point exactly once; ordinary watcher publication remains the sole live-index update path.
-- [ ] Register `curate_knowledge` across the full tool surface, schema/annotations, daemon routing, generated client
+- [x] Register `curate_knowledge` across the full tool surface, schema/annotations, daemon routing, generated client
   allow-lists, documentation, and exact surface counts while compact remains three. Run focused Gate-K suites, crash and
   concurrency batteries, real-repository no-document-mutation acceptance, format/check, and all touched regressions before
   closing the gate.
 
 ### Gate K Evidence Log
 
-- Pending RED/GREEN receipts.
+- 2026-07-22 direct durability/continuity audit closed the three open items with strict RED → GREEN:
+  - Temp digest verification: `corrupted_temp_policy_image_fails_digest_verification_before_replace`
+    first failed by persisting an injected corrupt temp image as `status=applied`; `write_policy` now
+    verifies the temp read-back with `crate::hash::digest_hex` after flush, before `sync_all`/replace.
+    The same verification was added to `durable_replace_io` (review finding: the PendingWrite recovery
+    path and every replay/lineage/quarantine write shared the unverified-temp exposure).
+  - Live pre-image fencing: `live_third_state_policy_before_write_is_fenced_not_overwritten` first
+    failed by overwriting an independent third-state policy written between the durable `PendingWrite`
+    record and the policy write; `apply` now re-reads under the mutation lock immediately before the
+    write, accepts exact pre-image, finalizes exact post-image, and durably terminalizes any third
+    state as `indeterminate_conflict`.
+  - Pre-lock replay fast path: `foreign_record_quarantine_waits_for_the_mutation_lock` first failed by
+    quarantining a foreign record while an external holder owned `policy.lock`; the pre-lock fast path
+    is now strictly read-only (`verify_binding` gained a no-append mode; quarantine and non-Git lineage
+    appends happen only under the in-process + file mutation lock). K-R02 preserved: clean-binding
+    same-key/same-hash terminal replay still returns the stored result without taking the lock.
+  - Review-sustained HIGH found and fixed during the audit: with the read-only fast path, a foreign
+    same-key `PendingWrite` record was quarantined by `recover_pending_records` and the flow then fell
+    through to a fresh reservation that applied into the replacement repository. The locked path now
+    verifies the current key's record binding before pending-record recovery, restoring fail-closed
+    foreign handling (regression caught by
+    `pending_intent_under_same_path_replacement_is_quarantined_without_writing`).
+- Closing receipts (all post-corrections, repo-pinned cargo, `-j1 --test-threads=1`): curation module
+  17/17; `curate_knowledge` 9/9; `conformance` 20/20; `surface_default` 5/5; `daemon_aliases` 2/2;
+  `init_integration` 27/27; `recovery` 4/4; `cargo fmt --all -- --check` clean;
+  `cargo check -j1 --all-targets` exit 0; full serial library suite 2,953 passed / 0 failed / 2 ignored.
+- Known open branch debt (NOT Gate-K scope, blocks the Gate-M clippy gate): `cargo clippy --all-targets
+  -- -D warnings` reports 24 pre-existing errors across `watcher`, `discovery`, `live_index`,
+  `knowledge`, `protocol` (none introduced by the Gate-K audit corrections).
 
 ### Gate K Review
 
-Pending implementation, adversarial verification, and Gate-K closure evidence.
+Gate K is complete. A scoped adversarial pass over K-R01–K-R20/K-G01–K-G07 sustained two findings —
+the recovery-path unverified temp image (fixed at the shared `durable_replace_io` root) and the
+foreign same-key PendingWrite fall-through to fresh apply (fixed by pre-recovery binding verification
+under the lock) — and both fixes are covered by tests. Preview writes nothing; apply is durable,
+idempotent, fenced against live third-state edits, and mutation of attributable state (quarantine,
+catalog lineage) occurs only under the per-project mutation lock. `tasks.md` Gate-K RED/GREEN/VERIFY
+items are checked. Gate L is the next open gate; the 24 pre-existing clippy errors are logged above
+for the Gate-M battery.
 
 ---
 
