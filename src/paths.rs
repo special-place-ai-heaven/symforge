@@ -1,6 +1,41 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::domain::{AccessErrorKind, ControlStateDir, ControlStatePlacement, ProjectStateDir};
+
+#[must_use]
+pub(crate) fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+#[must_use]
+pub(crate) fn state_directory_entry_type_is_unsafe(
+    is_directory: bool,
+    is_symlink: bool,
+    is_reparse_point: bool,
+) -> bool {
+    !is_directory || is_symlink || is_reparse_point
+}
+
+#[must_use]
+pub(crate) fn state_directory_metadata_is_unsafe(metadata: &std::fs::Metadata) -> bool {
+    state_directory_entry_type_is_unsafe(
+        metadata.is_dir(),
+        metadata.file_type().is_symlink(),
+        metadata_is_reparse_point(metadata),
+    )
+}
+
 pub const SYMFORGE_DIR_NAME: &str = ".symforge";
 
 /// Bare db filenames (no `.symforge/` prefix). These are the `name` argument to
@@ -13,6 +48,9 @@ pub const COUPLING_DB_NAME: &str = "coupling.db";
 pub const ANALYTICS_DB_NAME: &str = "analytics.db";
 pub const API_KEYS_DB_NAME: &str = "api-keys.db";
 pub const STEL_LEDGER_DB_NAME: &str = "stel-ledger.db";
+
+pub const IDEMPOTENCY_DIR_NAME: &str = "idempotency";
+pub const INDEX_SNAPSHOT_QUARANTINE_RELATIVE_PATH: &str = "quarantine/index-snapshots";
 
 pub const SYMFORGE_IDEMPOTENCY_DIR_PATH: &str = ".symforge/idempotency";
 pub const SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH: &str = ".symforge/idempotency/records";
@@ -57,25 +95,115 @@ pub fn resolve_symforge_dir(base: &Path) -> PathBuf {
     base.join(SYMFORGE_DIR_NAME)
 }
 
+/// Resolve the process-global control-state lane without consulting a source
+/// root or launch CWD.
+///
+/// A relative `SYMFORGE_HOME`, a missing home directory, or an inaccessible
+/// private directory yields process-local coordination. It never turns into a
+/// relative `.symforge` path.
+pub fn resolve_control_state_placement() -> ControlStatePlacement {
+    let candidate = std::env::var_os("SYMFORGE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(SYMFORGE_DIR_NAME)));
+    resolve_control_state_placement_with(candidate, prepare_control_state_dir)
+}
+
+/// Resolve the process-global control owner exactly once and share that same
+/// placement with every control-state reader and writer.
+#[must_use]
+pub fn process_control_state_placement() -> &'static ControlStatePlacement {
+    static PLACEMENT: std::sync::OnceLock<ControlStatePlacement> = std::sync::OnceLock::new();
+    PLACEMENT.get_or_init(resolve_control_state_placement)
+}
+
+pub(crate) fn resolve_control_state_placement_with<F>(
+    candidate: Option<PathBuf>,
+    mut prepare: F,
+) -> ControlStatePlacement
+where
+    F: FnMut(&Path) -> Result<(), AccessErrorKind>,
+{
+    let Some(directory) = candidate else {
+        return ControlStatePlacement::ProcessLocal {
+            safe_reason: AccessErrorKind::NotFound,
+        };
+    };
+
+    if !directory.is_absolute() {
+        return ControlStatePlacement::ProcessLocal {
+            safe_reason: AccessErrorKind::InvalidData,
+        };
+    }
+
+    match prepare(&directory) {
+        Ok(()) => ControlStatePlacement::UserLocal {
+            directory: ControlStateDir::new(directory),
+        },
+        Err(safe_reason) => ControlStatePlacement::ProcessLocal { safe_reason },
+    }
+}
+
+fn prepare_control_state_dir(directory: &Path) -> Result<(), AccessErrorKind> {
+    std::fs::create_dir_all(directory).map_err(|error| access_error_kind(&error))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| access_error_kind(&error))?;
+    }
+
+    Ok(())
+}
+
+fn access_error_kind(error: &io::Error) -> AccessErrorKind {
+    match error.kind() {
+        io::ErrorKind::NotFound => AccessErrorKind::NotFound,
+        io::ErrorKind::PermissionDenied => AccessErrorKind::PermissionDenied,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => AccessErrorKind::InvalidData,
+        io::ErrorKind::OutOfMemory => AccessErrorKind::ResourceExhausted,
+        _ => AccessErrorKind::Other,
+    }
+}
+
 /// User-level SymForge home for runtime files when no safe project root exists.
 ///
 /// Honors `SYMFORGE_HOME` when set (the directory itself, no extra nesting).
 /// Otherwise uses `~/.symforge`, matching the daemon's global state layout.
 pub fn global_symforge_home() -> io::Result<PathBuf> {
-    if let Some(explicit_home) = std::env::var_os("SYMFORGE_HOME") {
-        let dir = PathBuf::from(explicit_home);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("ensuring symforge global home at {}: {}", dir.display(), e),
-            )
-        })?;
-        return Ok(dir);
+    match process_control_state_placement() {
+        ControlStatePlacement::UserLocal { directory } => Ok(directory.as_path().to_path_buf()),
+        ControlStatePlacement::ProcessLocal { safe_reason } => Err(io::Error::new(
+            io_error_kind(*safe_reason),
+            format!("durable SymForge control state unavailable: {safe_reason:?}"),
+        )),
     }
+}
 
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    ensure_symforge_dir(&home)
+/// Resolve the user-local base for a newly constructed project instance.
+///
+/// This intentionally does not use [`process_control_state_placement`]: project
+/// placement is re-evaluated for each new instance so durability can recover
+/// after a transient failure without restarting the process.
+pub fn resolve_user_local_project_state_base() -> io::Result<PathBuf> {
+    match resolve_control_state_placement() {
+        ControlStatePlacement::UserLocal { directory } => Ok(directory.as_path().to_path_buf()),
+        ControlStatePlacement::ProcessLocal { safe_reason } => Err(io::Error::new(
+            io_error_kind(safe_reason),
+            format!("durable user-local project state unavailable: {safe_reason:?}"),
+        )),
+    }
+}
+
+fn io_error_kind(error: AccessErrorKind) -> io::ErrorKind {
+    match error {
+        AccessErrorKind::NotFound => io::ErrorKind::NotFound,
+        AccessErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
+        AccessErrorKind::InvalidData => io::ErrorKind::InvalidData,
+        AccessErrorKind::ResourceExhausted => io::ErrorKind::OutOfMemory,
+        AccessErrorKind::Other => io::ErrorKind::Other,
+    }
 }
 
 /// True when `path` must not host a project-local `.symforge` (sensitive /
@@ -188,6 +316,68 @@ pub fn symforge_db_path(root: &Path, name: &str) -> PathBuf {
 pub fn ensure_symforge_db_path(root: &Path, name: &str) -> io::Result<PathBuf> {
     ensure_symforge_dir(root)?;
     Ok(symforge_db_path(root, name))
+}
+
+/// Build a path owned by an already-resolved project-state directory.
+///
+/// Unlike [`symforge_db_path`], this helper cannot accept a repository source
+/// root and never adds another `.symforge` segment.
+#[must_use]
+pub fn project_state_path(state_dir: &ProjectStateDir, relative: &str) -> PathBuf {
+    debug_assert!(
+        !Path::new(relative).is_absolute(),
+        "project-state paths must be relative"
+    );
+    state_dir.as_path().join(relative)
+}
+
+/// Ensure the resolved project-state owner exists.
+pub fn ensure_project_state_dir(state_dir: &ProjectStateDir) -> io::Result<()> {
+    std::fs::create_dir_all(state_dir.as_path()).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "ensuring project state dir at {}: {error}",
+                state_dir.as_path().display()
+            ),
+        )
+    })
+}
+
+/// Ensure the resolved project-state owner, then return one bare database path.
+pub fn ensure_project_state_db_path(
+    state_dir: &ProjectStateDir,
+    name: &str,
+) -> io::Result<PathBuf> {
+    debug_assert!(
+        !name.contains('/') && !name.contains('\\'),
+        "project-state database name must be bare"
+    );
+    ensure_project_state_dir(state_dir)?;
+    Ok(project_state_path(state_dir, name))
+}
+
+/// Build a path owned by the process-global control-state directory.
+#[must_use]
+pub fn control_state_path(state_dir: &ControlStateDir, relative: &str) -> PathBuf {
+    debug_assert!(
+        !Path::new(relative).is_absolute(),
+        "control-state paths must be relative"
+    );
+    state_dir.as_path().join(relative)
+}
+
+/// Ensure the resolved process-global control-state owner exists.
+pub fn ensure_control_state_dir(state_dir: &ControlStateDir) -> io::Result<()> {
+    std::fs::create_dir_all(state_dir.as_path()).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "ensuring control state dir at {}: {error}",
+                state_dir.as_path().display()
+            ),
+        )
+    })
 }
 
 /// Resolve the canonical idempotency replay directory under `base`.
@@ -479,6 +669,142 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn every_state_consumer_requires_its_typed_owner() {
+        let project_owned = [
+            ("idempotency replay", include_str!("idempotency.rs")),
+            (
+                "coupling store",
+                include_str!("live_index/coupling/lifecycle.rs"),
+            ),
+            ("frecency store", include_str!("live_index/frecency.rs")),
+            ("STEL ledger", include_str!("stel_core/ledger_store.rs")),
+            ("analytics store", include_str!("analytics/store.rs")),
+            ("API-key store", include_str!("server/api_keys.rs")),
+            ("edit-safety TEE", include_str!("edit_safety/tee.rs")),
+        ];
+        let control_owned = [
+            ("edit-safety trust", include_str!("edit_safety/trust.rs")),
+            ("sidecar port file", include_str!("sidecar/port_file.rs")),
+            ("sidecar server", include_str!("sidecar/server.rs")),
+            ("daemon control", include_str!("daemon.rs")),
+            ("hook adoption", include_str!("cli/hook.rs")),
+            ("operator profile", include_str!("cli/operator_profile.rs")),
+            ("onboarding state", include_str!("cli/onboarding.rs")),
+            ("runtime startup", include_str!("server/serve.rs")),
+            ("version registry", include_str!("version_registry.rs")),
+            ("updater", include_str!("cli/update.rs")),
+        ];
+
+        let mut violations = Vec::new();
+        for (consumer, source) in project_owned {
+            if !source.contains("ProjectStateDir") {
+                violations.push(format!(
+                    "{consumer} does not require ProjectStateDir from its resolved project owner"
+                ));
+            }
+        }
+        for (consumer, source) in control_owned {
+            if !source.contains("ControlStateDir") {
+                violations.push(format!(
+                    "{consumer} does not require ControlStateDir from its resolved process owner"
+                ));
+            }
+        }
+
+        let forbidden = [
+            (
+                "sidecar port file",
+                include_str!("sidecar/port_file.rs"),
+                "select_runtime_data_base(",
+            ),
+            (
+                "sidecar server",
+                include_str!("sidecar/server.rs"),
+                "select_runtime_data_base(",
+            ),
+            (
+                "updater",
+                include_str!("cli/update.rs"),
+                "Path::new(\".symforge\")",
+            ),
+            (
+                "edit-safety TEE",
+                include_str!("edit_safety/tee.rs"),
+                "ensure_symforge_dir(&self.repo_root)",
+            ),
+        ];
+        for (consumer, source, legacy_path) in forbidden {
+            if source.contains(legacy_path) {
+                violations.push(format!(
+                    "{consumer} still reconstructs state through forbidden `{legacy_path}`"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "typed-owner inventory violations:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn control_state_never_falls_back_to_launch_cwd_or_relative_symforge() {
+        let mut prepare_calls = 0;
+        let relative =
+            resolve_control_state_placement_with(Some(PathBuf::from(SYMFORGE_DIR_NAME)), |_| {
+                prepare_calls += 1;
+                Ok(())
+            });
+        assert_eq!(
+            relative,
+            crate::domain::ControlStatePlacement::ProcessLocal {
+                safe_reason: crate::domain::AccessErrorKind::InvalidData,
+            }
+        );
+        assert_eq!(
+            prepare_calls, 0,
+            "relative control state must not be probed"
+        );
+
+        let unavailable = resolve_control_state_placement_with(None, |_| {
+            prepare_calls += 1;
+            Ok(())
+        });
+        assert_eq!(
+            unavailable,
+            crate::domain::ControlStatePlacement::ProcessLocal {
+                safe_reason: crate::domain::AccessErrorKind::NotFound,
+            }
+        );
+        assert_eq!(
+            prepare_calls, 0,
+            "missing user-local state must remain process-local, never inspect launch CWD"
+        );
+
+        let launch_cwd = TempDir::new().unwrap();
+        let denied_control_dir = launch_cwd.path().join("private-control-state");
+        let denied = resolve_control_state_placement_with(Some(denied_control_dir), |_| {
+            prepare_calls += 1;
+            Err(crate::domain::AccessErrorKind::PermissionDenied)
+        });
+        assert_eq!(
+            denied,
+            crate::domain::ControlStatePlacement::ProcessLocal {
+                safe_reason: crate::domain::AccessErrorKind::PermissionDenied,
+            }
+        );
+        assert_eq!(
+            prepare_calls, 1,
+            "the chosen user-local path is probed once"
+        );
+        assert!(
+            !launch_cwd.path().join(SYMFORGE_DIR_NAME).exists(),
+            "an unavailable user-local directory must not create a launch-CWD fallback"
+        );
+    }
 
     #[test]
     fn select_runtime_data_base_prefers_project_root_over_launch_cwd() {

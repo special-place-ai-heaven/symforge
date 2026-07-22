@@ -41,6 +41,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_symbol_context",
     "search_symbols",
     "search_text",
+    "search_knowledge",
+    "review_knowledge",
+    "curate_knowledge",
     "search_files",
     "find_references",
     "find_dependents",
@@ -493,6 +496,8 @@ fn estimate_parameter_on_read_tools() {
         "analyze_file_impact",
         "what_changed",
         "diff_symbols",
+        // NOTE: search_knowledge is intentionally NOT here. SpecKit 020 freezes
+        // its exact eight-field input and uses max_tokens for bounded output.
         // NOTE: validate_file_syntax is intentionally NOT here. Its output is a
         // small, deterministic diagnostic (Status/Diagnostic/Byte span), so an
         // `estimate` token-preview mode has no meaningful semantics — the field
@@ -548,6 +553,8 @@ fn all_tools_have_annotations() {
         "get_symbol_context",
         "search_symbols",
         "search_text",
+        "search_knowledge",
+        "review_knowledge",
         "search_files",
         "find_references",
         "find_dependents",
@@ -585,7 +592,7 @@ fn all_tools_have_annotations() {
     // (destructive) yet converges to the same result on re-run (idempotent).
     // Both MCP hints are independent and honestly true, so it gets its own
     // bucket rather than being mislabeled non-destructive.
-    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["index_folder"];
+    const DESTRUCTIVE_IDEMPOTENT_STATE: &[&str] = &["index_folder", "curate_knowledge"];
 
     let tools = SymForgeServer::tool_definitions();
 
@@ -665,6 +672,47 @@ fn all_tools_have_annotations() {
         EXPECTED_TOOLS.len(),
         "classification lists must cover all expected tools"
     );
+}
+
+#[test]
+fn curate_knowledge_schema_is_guarded_and_closed() {
+    let tools = SymForgeServer::tool_definitions();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "curate_knowledge")
+        .expect("curate_knowledge must be registered");
+    let schema = serde_json::to_string(tool.input_schema.as_ref()).expect("curation schema JSON");
+    let required_fields = tool
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("curation schema must declare required fields");
+    assert!(
+        required_fields
+            .iter()
+            .any(|field| field.as_str() == Some("project")),
+        "curation must require one explicit current-project selector: {schema}"
+    );
+
+    for required in [
+        "actions",
+        "project",
+        "if_source_review_hash",
+        "if_manifest_digest",
+        "if_policy_digest",
+        "idempotency_key",
+        "apply",
+        "upsert",
+        "remove",
+    ] {
+        assert!(schema.contains(required), "missing {required} in {schema}");
+    }
+    for forbidden in ["\"move\"", "\"delete\""] {
+        assert!(
+            !schema.contains(forbidden),
+            "closed curation mutation schema advertised {forbidden}: {schema}"
+        );
+    }
 }
 
 #[test]

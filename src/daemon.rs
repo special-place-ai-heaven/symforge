@@ -19,6 +19,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::domain::{
+    CapabilityStatus, ControlStateDir, FreshnessStatus, ProjectCapabilities, RootBinding,
+    RootCandidateSource, RootRequestMode, RootResolution, SourceAccessMode, StatePlacement,
+    UnboundReason,
+};
 use crate::live_index::store::LiveIndex;
 use crate::live_index::view::{BaseKey, CommitId, IndexBase, Targets, WorkingSet};
 use crate::live_index::{self, SharedIndex};
@@ -30,10 +35,11 @@ use crate::protocol::edit::{
 };
 use crate::protocol::read_tools::SymforgeRetrieveInput;
 use crate::protocol::tools::{
-    AnalyzeFileImpactInput, CheckpointNowInput, DetectImpactInput, DiffSymbolsInput, EditPlanInput,
-    ExploreInput, FindDependentsInput, FindReferencesInput, GetFileContentInput,
-    GetFileContextInput, GetRepoMapInput, GetSymbolContextInput, GetSymbolInput, HealthInput,
-    IndexFolderInput, InspectMatchInput, InvestigationInput, SearchFilesInput, SearchSymbolsInput,
+    AnalyzeFileImpactInput, CheckpointNowInput, CurateKnowledgeInput, DetectImpactInput,
+    DiffSymbolsInput, EditPlanInput, ExploreInput, FindDependentsInput, FindReferencesInput,
+    GetFileContentInput, GetFileContextInput, GetRepoMapInput, GetSymbolContextInput,
+    GetSymbolInput, HealthInput, IndexFolderInput, InspectMatchInput, InvestigationInput,
+    ReviewKnowledgeInput, SearchFilesInput, SearchKnowledgeInput, SearchSymbolsInput,
     SearchTextInput, SmartQueryInput, TraceSymbolInput, ValidateFileSyntaxInput, WhatChangedInput,
     search_symbols_options_from_input, search_text_options_from_input,
 };
@@ -161,6 +167,10 @@ pub struct DaemonSessionClient {
     /// whole working set and verify deterministic IDs before serving.
     opened_roots: std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>,
     auth_token: Option<String>,
+    /// The process-coordination namespace that owns this daemon connection.
+    /// Reconnect must reuse this exact typed owner rather than re-resolving
+    /// mutable environment state.
+    control_state_dir: ControlStateDir,
     /// Stored so reconnection can re-open a session at the same project root.
     project_root: Option<PathBuf>,
 }
@@ -193,6 +203,10 @@ pub struct DaemonState {
     /// fail-closed — there is no "no token ⇒ allow" path. Making this a `String`
     /// (not `Option`) encodes the fail-closed invariant in the type system.
     auth_token: String,
+    /// Process-global coordination namespace used by daemon discovery and
+    /// cross-project idempotency. None preserves the explicit fail-closed
+    /// behavior when no durable control state is available.
+    control_state_dir: Option<ControlStateDir>,
     /// Concurrency governor — limits parallel tool calls and enforces timeouts.
     governor: crate::sidecar::governor::RequestGovernor,
     /// Epoch millis of the last AUTHENTICATED request — the idle-shutdown signal.
@@ -218,6 +232,10 @@ struct ProjectInstance {
     project_id: String,
     canonical_root: PathBuf,
     project_name: String,
+    source_access_mode: SourceAccessMode,
+    state_placement: StatePlacement,
+    persistence_health: Arc<RwLock<CapabilityStatus>>,
+    curation_coordinator: Arc<crate::protocol::knowledge_curation::KnowledgeCurationCoordinator>,
     index: SharedIndex,
     watcher_info: Arc<Mutex<WatcherInfo>>,
     watcher_task: Option<tokio::task::JoinHandle<()>>,
@@ -311,7 +329,12 @@ fn daemon_auth_token_from_env() -> Option<String> {
 /// therefore has no `SYMFORGE_DAEMON_AUTH_TOKEN` in its env — still learns the
 /// running daemon's token and authenticates.
 fn daemon_auth_token_from_file() -> Option<String> {
-    let dir = daemon_dir().ok()?;
+    let control_state_dir = process_control_state_dir().ok()?;
+    daemon_auth_token_from_file_at(control_state_dir)
+}
+
+fn daemon_auth_token_from_file_at(control_state_dir: &ControlStateDir) -> Option<String> {
+    let dir = daemon_dir_for(control_state_dir).ok()?;
     let contents = std::fs::read_to_string(dir.join(daemon_token_file_name())).ok()?;
     let trimmed = contents.trim().to_string();
     if trimmed.is_empty() {
@@ -332,6 +355,10 @@ fn daemon_auth_token_from_file() -> Option<String> {
 /// daemon this means the request will be rejected, which is the safe outcome.
 pub(crate) fn resolve_daemon_auth_token() -> Option<String> {
     daemon_auth_token_from_env().or_else(daemon_auth_token_from_file)
+}
+
+fn resolve_daemon_auth_token_at(control_state_dir: &ControlStateDir) -> Option<String> {
+    daemon_auth_token_from_env().or_else(|| daemon_auth_token_from_file_at(control_state_dir))
 }
 
 /// Generate an unpredictable 64-hex-character daemon auth token.
@@ -393,8 +420,8 @@ fn establish_daemon_auth_token() -> String {
 /// Persist the daemon auth token to its OS-tagged file with owner-only
 /// permissions on Unix. The token is written before the daemon starts serving
 /// so a client that observes the port file can also read a valid token.
-fn write_daemon_token_file(token: &str) -> io::Result<()> {
-    let path = daemon_dir()?.join(daemon_token_file_name());
+fn write_daemon_token_file_at(control_state_dir: &ControlStateDir, token: &str) -> io::Result<()> {
+    let path = daemon_dir_for(control_state_dir)?.join(daemon_token_file_name());
 
     // On Unix, create the file with 0o600 from the start so the secret is never
     // briefly world-readable between create and chmod.
@@ -624,7 +651,15 @@ pub struct ProjectHealth {
     pub file_count: usize,
     pub symbol_count: usize,
     pub index_state: String,
+    #[serde(default = "default_project_freshness")]
+    pub freshness: FreshnessStatus,
+    pub durability: CapabilityStatus,
+    pub capabilities: ProjectCapabilities,
     pub opened_at_unix_secs: u64,
+}
+
+fn default_project_freshness() -> FreshnessStatus {
+    FreshnessStatus::Current
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -660,6 +695,10 @@ struct SessionRuntime {
     /// is written. The active project's id for the targeting contract is
     /// `project_id` above (the default target when neither param is supplied).
     working_set: Arc<RwLock<WorkingSet>>,
+    /// Session-scoped project publications used by `search_knowledge`.
+    /// Capturing from this map, rather than the daemon-global project table,
+    /// makes `projects=["*"]` expand only to projects open in this session.
+    project_indexes: HashMap<String, SharedIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,6 +725,20 @@ impl DaemonState {
 
     /// Construct daemon state bound to a specific, already-established token.
     fn with_token(auth_token: String) -> Self {
+        let control_state_dir = paths::process_control_state_placement()
+            .directory()
+            .cloned();
+        Self::with_token_and_control_state(auth_token, control_state_dir)
+    }
+
+    fn with_token_at(auth_token: String, control_state_dir: ControlStateDir) -> Self {
+        Self::with_token_and_control_state(auth_token, Some(control_state_dir))
+    }
+
+    fn with_token_and_control_state(
+        auth_token: String,
+        control_state_dir: Option<ControlStateDir>,
+    ) -> Self {
         Self {
             next_session_id: AtomicU64::new(1),
             bases: RwLock::new(HashMap::new()),
@@ -694,6 +747,7 @@ impl DaemonState {
             sessions: RwLock::new(HashMap::new()),
             identity: current_daemon_identity(),
             auth_token,
+            control_state_dir,
             governor: crate::sidecar::governor::RequestGovernor::new(),
             last_activity_at: AtomicU64::new(now_epoch_millis()),
             idle_shutdown: tokio::sync::Notify::new(),
@@ -924,6 +978,32 @@ impl DaemonState {
         project_id: &str,
         canonical_root: &Path,
     ) -> anyhow::Result<Arc<ProjectSlot>> {
+        self.ensure_project_slot_for_session_with(session_id, project_id, || {
+            ProjectInstance::load(canonical_root)
+        })
+    }
+
+    fn ensure_project_slot_for_binding(
+        &self,
+        session_id: &str,
+        binding: &RootBinding,
+    ) -> anyhow::Result<Arc<ProjectSlot>> {
+        self.ensure_project_slot_for_session_with(session_id, &binding.root_id.0, || {
+            let state_placement = crate::discovery::resolve_state_placement(binding);
+            ProjectInstance::load_bound(binding, state_placement)
+        })
+    }
+
+    fn ensure_project_slot_for_session_with<F>(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        load_project: F,
+    ) -> anyhow::Result<Arc<ProjectSlot>>
+    where
+        F: FnOnce() -> anyhow::Result<ProjectInstance>,
+    {
+        let mut load_project = Some(load_project);
         loop {
             let existing = self.projects.read().get(project_id).cloned();
             if let Some(slot) = existing {
@@ -943,7 +1023,10 @@ impl DaemonState {
                 continue;
             }
 
-            let candidate = Arc::new(ProjectSlot::new(ProjectInstance::load(canonical_root)?));
+            let candidate = Arc::new(ProjectSlot::new(load_project
+                .take()
+                .expect("cold project loader is consumed only on the returning branch")(
+            )?));
             let mut projects = self.projects.write();
             let slot = Arc::clone(projects.entry(project_id.to_string()).or_insert(candidate));
             slot.metadata
@@ -1011,29 +1094,38 @@ impl DaemonState {
         &self,
         request: OpenProjectRequest,
     ) -> anyhow::Result<OpenProjectResponse> {
-        // Trust boundary, raw-input first (field report 2026-07-06): refuse a
-        // sensitive system path BEFORE canonicalization, whose failure on a
-        // protected tree would mask the refusal behind a raw OS access error.
-        if crate::paths::is_sensitive_path(Path::new(&request.project_root)) {
-            anyhow::bail!(
-                "Refused to open session for sensitive system path: {}. Use a project directory instead.",
-                request.project_root
-            );
-        }
-        let canonical_root = canonical_project_root(Path::new(&request.project_root))?;
-        // Trust boundary: `open_project_session` performs a full `LiveIndex::load`
-        // with no guard of its own, so a session-open on a sensitive system or
-        // credential-bearing root would read system/credential files. Apply the
-        // same unified guard used by `index_folder_for_session`, immediately
-        // after canonicalization and before any load, refusing cleanly (no panic).
-        if crate::paths::is_sensitive_path(&canonical_root) {
-            anyhow::bail!(
-                "Refused to open session for sensitive system path: {}. Use a project directory instead.",
-                canonical_root.display()
-            );
-        }
-        let project_id = project_key(&canonical_root);
-        self.register_session_for_existing_project(&project_id, &request, &canonical_root)
+        // Session-open/reconnect metadata is automatic authority: it may bind a
+        // normal client-declared root, but it can never inherit an earlier
+        // session's direct protected override. Use the same raw+canonical typed
+        // classifier as `index_folder` before looking up or loading a shared slot.
+        let binding = match crate::discovery::resolve_root_candidate(
+            Path::new(&request.project_root),
+            RootCandidateSource::McpClientRoot,
+            RootRequestMode::Automatic,
+        ) {
+            RootResolution::Bound(binding) => binding,
+            RootResolution::Unbound {
+                reason: UnboundReason::Refused(reason),
+                ..
+            } => {
+                anyhow::bail!(
+                    "Refused to open session for sensitive system path: {}. Use a project directory instead. ({})",
+                    request.project_root,
+                    reason.code()
+                );
+            }
+            RootResolution::Unbound { .. } => {
+                anyhow::bail!(
+                    "Refused to open session for project root: {}. Use a project directory instead.",
+                    request.project_root
+                );
+            }
+        };
+        self.register_session_for_existing_project(
+            &binding.root_id.0,
+            &request,
+            &binding.canonical_root,
+        )
     }
 
     pub fn heartbeat(&self, session_id: &str) -> HeartbeatResponse {
@@ -1234,6 +1326,49 @@ impl DaemonState {
         let slot = self.projects.read().get(project_id).cloned()?;
         let project = slot.metadata.read();
         let published = project.index.published_state();
+        let durability = *project.persistence_health.read();
+        let durable_mutation = match durability {
+            CapabilityStatus::Available => CapabilityStatus::Available,
+            CapabilityStatus::Unavailable { .. } => CapabilityStatus::Unavailable {
+                reason:
+                    crate::domain::CapabilityUnavailableReason::DurableMutationReplayUnavailable,
+            },
+        };
+        let protected = project.source_access_mode == SourceAccessMode::ExplicitProtected;
+        let source_mutation = if protected {
+            CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::ExplicitProtectedSource,
+            }
+        } else {
+            durable_mutation
+        };
+        let repository_init = if protected {
+            CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::ExplicitProtectedSource,
+            }
+        } else {
+            CapabilityStatus::Available
+        };
+        let team_artifact_export = if protected {
+            CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::ExplicitProtectedSource,
+            }
+        } else if matches!(
+            &project.state_placement,
+            StatePlacement::ProjectLocal { .. }
+        ) {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::NonProjectLocalPlacement,
+            }
+        };
+        let repository_curation = project.curation_coordinator.capability_status(
+            &project.index,
+            Some(&project.canonical_root),
+            Some(&project.state_placement),
+            durability,
+        );
 
         Some(ProjectHealth {
             project_id: project.project_id.clone(),
@@ -1243,6 +1378,16 @@ impl DaemonState {
             file_count: published.file_count,
             symbol_count: published.symbol_count,
             index_state: published.status_label().to_string(),
+            freshness: project.index.freshness_status().as_ref().clone(),
+            durability,
+            capabilities: ProjectCapabilities {
+                persistent_snapshots: durability,
+                checkpoint: durability,
+                structural_edits: source_mutation,
+                repository_init,
+                repository_curation,
+                team_artifact_export,
+            },
             opened_at_unix_secs: unix_seconds(project.opened_at),
         })
     }
@@ -1276,35 +1421,33 @@ impl DaemonState {
         session_id: &str,
         input: IndexFolderInput,
     ) -> anyhow::Result<String> {
-        // Trust boundary, raw-input first (field report 2026-07-06): refuse a
-        // sensitive system path BEFORE canonicalization, whose failure on a
-        // protected tree ("failed to canonicalize project root ...: Access is
-        // denied") would otherwise mask the refusal behind a raw OS error.
-        if crate::paths::is_sensitive_path(Path::new(&input.path)) {
-            return Ok(format!(
-                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
-                input.path
-            ));
-        }
-        let target_root = canonical_project_root(Path::new(&input.path))?;
-        // Fail-closed daemon auth is now in force: the daemon ALWAYS establishes
-        // a token at startup and `authorize_daemon_request` rejects any caller
-        // that does not present it, so this route (like every authenticated
-        // route) is unreachable by an unauthenticated local process.
-        //
-        // Trust boundary: refuse sensitive system paths before any reload/IO.
-        // The local `tools::index_folder` already guards this; the daemon path
-        // canonicalizes via `canonical_project_root` (which yields the `\\?\`
-        // extended-length form on Windows) and must apply the same hardened,
-        // prefix-aware guard so a daemon-routed call cannot index system files
-        // or drive a reload into a denial-of-service.
-        if crate::paths::is_sensitive_path(&target_root) {
-            return Ok(format!(
-                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
-                target_root.display()
-            ));
-        }
-        let target_project_id = project_key(&target_root);
+        let allow_protected_root = input.allow_protected_root == Some(true);
+        let binding = match crate::discovery::resolve_root_candidate(
+            Path::new(&input.path),
+            RootCandidateSource::ExplicitIndexFolder,
+            RootRequestMode::ExplicitIndexFolder {
+                allow_protected_root,
+            },
+        ) {
+            RootResolution::Bound(binding) => binding,
+            RootResolution::Unbound {
+                reason: UnboundReason::Refused(reason),
+                ..
+            } => {
+                return Ok(format!(
+                    "{}: Refused to index sensitive system path: {}. Use a project directory instead.",
+                    reason.code(),
+                    input.path
+                ));
+            }
+            RootResolution::Unbound { .. } => {
+                return Ok(format!(
+                    "root_unbound: Refused to index project root: {}.",
+                    input.path
+                ));
+            }
+        };
+        let target_root = &binding.canonical_root;
 
         // Immutable home: `index_folder` NEVER retargets the session. The
         // omitted-`add` default and the compatibility spelling `add=true` share
@@ -1313,42 +1456,40 @@ impl DaemonState {
         // project. The `add` spelling is deliberately NOT part of the canonical
         // idempotency request, so both spellings replay each other.
         //
-        // The durable replay ledger lives in the HOME project's `.symforge`
-        // store: home is immutable for the session's lifetime, so one stable
-        // store observes every open the session performs, which is what makes
-        // same-key/different-target conflicts detectable BEFORE the conflicting
-        // project is loaded.
-        let home_root = {
-            let home_project_id = self
-                .sessions
-                .read()
-                .get(session_id)
-                .map(|session| session.active_project_id.clone())
-                .ok_or_else(|| anyhow::anyhow!("unknown session '{session_id}'"))?;
-            let slot = self.projects.read().get(&home_project_id).cloned();
-            slot.map(|slot| slot.metadata.read().canonical_root.clone())
-        };
+        // Cross-project replay is process coordination, not state owned by the
+        // session's home repository. The one resolved ControlStateDir therefore
+        // observes every open before any target ProjectInstance is constructed.
         let reset_requested = crate::protocol::tools::index_folder_reset_requested();
-        let idempotency = match input.idempotency_key.as_deref() {
+        let (idempotency, replay_response) = match input.idempotency_key.as_deref() {
             Some(raw_key) => {
-                let store_root = home_root.as_deref().unwrap_or(&target_root);
+                let Some(control_state) = self.control_state_dir.as_ref() else {
+                    return Ok(
+                        "Idempotency unavailable: durable process control state is unavailable."
+                            .to_string(),
+                    );
+                };
                 match crate::idempotency::begin_index_folder_replay(
-                    store_root,
-                    None,
-                    &target_root,
+                    control_state,
+                    target_root,
                     raw_key,
                     reset_requested,
+                    allow_protected_root,
                 ) {
-                    Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
-                    Ok(crate::idempotency::ReplayStart::Replay(response)) => return Ok(response),
+                    Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
+                        (Some(active), None)
+                    }
+                    Ok(crate::idempotency::ReplayStart::Replay(response)) => (None, Some(response)),
                     Err(error) => return Ok(crate::idempotency::format_tool_error(&error)),
                 }
             }
-            None => None,
+            None => (None, None),
         };
 
-        match self.open_project_for_session(session_id, &target_project_id, &target_root) {
+        match self.open_project_for_session(session_id, &binding) {
             Ok(mut output) => {
+                if let Some(response) = replay_response {
+                    return Ok(response);
+                }
                 if let Some(idempotency) = &idempotency
                     && let Err(error) = idempotency.complete(output.clone())
                 {
@@ -1359,6 +1500,11 @@ impl DaemonState {
                 Ok(output)
             }
             Err(error) => {
+                if let Some(response) = replay_response {
+                    return Ok(crate::idempotency::format_live_postcondition_unavailable(
+                        &response, &error,
+                    ));
+                }
                 if let Some(idempotency) = &idempotency {
                     let _ = idempotency.fail(format!("Index failed: {error}"));
                 }
@@ -1391,23 +1537,59 @@ impl DaemonState {
     fn open_project_for_session(
         &self,
         session_id: &str,
-        target_project_id: &str,
-        target_root: &Path,
+        binding: &RootBinding,
     ) -> anyhow::Result<String> {
-        let target_slot =
-            self.ensure_project_slot_for_session(session_id, target_project_id, target_root)?;
+        let target_project_id = &binding.root_id.0;
+        let target_root = &binding.canonical_root;
+        let target_slot = self.ensure_project_slot_for_binding(session_id, binding)?;
         target_slot.activate();
-        let (file_count, symbol_count) = target_slot.reload(target_root)?;
+        let (file_count, symbol_count) = target_slot.reload_for_binding(binding)?;
 
-        // Persist the published generation. `checkpoint_shared_index` writes via
-        // unique-temp + atomic rename, so a failure here cannot corrupt or drop
-        // the prior valid snapshot — report the degraded outcome honestly.
-        let index = Arc::clone(&target_slot.metadata.read().index);
-        let checkpoint =
-            match crate::live_index::persist::checkpoint_shared_index(&index, target_root) {
-                Ok(_) => "checkpoint=written".to_string(),
-                Err(error) => format!("checkpoint=degraded: {error}"),
-            };
+        let (index, source_access_mode, state_placement, persistence_health) = {
+            let project = target_slot.metadata.read();
+            (
+                Arc::clone(&project.index),
+                project.source_access_mode,
+                project.state_placement.clone(),
+                Arc::clone(&project.persistence_health),
+            )
+        };
+        let gitignore_hygiene = crate::gitignore_hygiene::reconcile_project_gitignore(
+            target_root,
+            if source_access_mode == SourceAccessMode::ExplicitProtected {
+                crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitProtected
+            } else {
+                crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitNormalBinding
+            },
+        );
+        let (checkpoint, state_location) = match &state_placement {
+            StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. } => (
+                match crate::live_index::persist::checkpoint_shared_index(
+                    &index,
+                    target_root,
+                    &state_placement,
+                ) {
+                    Ok(_) => {
+                        *persistence_health.write() = CapabilityStatus::Available;
+                        "checkpoint=written".to_string()
+                    }
+                    Err(error) => {
+                        *persistence_health.write() = CapabilityStatus::Unavailable {
+                            reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+                        };
+                        format!("checkpoint=degraded: {error}")
+                    }
+                },
+                if matches!(&state_placement, StatePlacement::ProjectLocal { .. }) {
+                    "project-local"
+                } else {
+                    "user-local"
+                },
+            ),
+            StatePlacement::MemoryOnly { .. } => {
+                ("checkpoint=skipped(memory-only)".to_string(), "memory-only")
+            }
+        };
 
         if !self.add_project_to_session(session_id, target_project_id) {
             return Err(anyhow::anyhow!(
@@ -1423,7 +1605,8 @@ impl DaemonState {
             )
         };
         Ok(format!(
-            "Indexed {file_count} files, {symbol_count} symbols (added to working set).\nproject_id={target_project_id} project_name={project_name} root={root_text} {checkpoint}"
+            "Indexed {file_count} files, {symbol_count} symbols (added to working set).\nproject_id={target_project_id} project_name={project_name} root={root_text} source_access={source_access_mode:?} state={state_location} {checkpoint}\n{}",
+            gitignore_hygiene.receipt()
         ))
     }
 
@@ -1676,6 +1859,11 @@ impl DaemonState {
             )
         })?;
         let project_meta = slot.metadata.read();
+        let project_indexes = session
+            .servers
+            .iter()
+            .map(|(id, server)| (id.clone(), Arc::clone(&server.index)))
+            .collect();
         Ok(SessionRuntime {
             canonical_root: project_meta.canonical_root.clone(),
             project_id: target_id.clone(),
@@ -1685,6 +1873,7 @@ impl DaemonState {
             symbol_cache: Arc::clone(&project_meta.symbol_cache),
             server,
             working_set: Arc::clone(&session.working_set),
+            project_indexes,
         })
     }
 
@@ -1795,6 +1984,7 @@ impl DaemonSessionClient {
         session_id: String,
         project_name: String,
         auth_token: Option<String>,
+        control_state_dir: ControlStateDir,
     ) -> Self {
         // CRITICAL: reqwest::Client::new() has NO timeout by default.
         // Under concurrent load, if the daemon is slow, HTTP requests hang
@@ -1817,6 +2007,7 @@ impl DaemonSessionClient {
             session_id,
             project_name,
             auth_token,
+            control_state_dir,
             project_root: None,
             opened_roots: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
@@ -1848,15 +2039,37 @@ impl DaemonSessionClient {
         session_id: String,
         project_name: String,
     ) -> Self {
+        let control_state_dir = process_control_state_dir()
+            .expect("test daemon control state must be resolvable")
+            .clone();
+        Self::new_for_test_at(
+            base_url,
+            project_id,
+            session_id,
+            project_name,
+            control_state_dir,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_at(
+        base_url: String,
+        project_id: String,
+        session_id: String,
+        project_name: String,
+        control_state_dir: ControlStateDir,
+    ) -> Self {
         // The daemon is fail-closed; a proxy client must carry the token. Resolve
         // it the same way production does (env pin, then the persisted token
         // file) so test proxies authenticate against a spawned daemon.
+        let auth_token = resolve_daemon_auth_token_at(&control_state_dir);
         Self::new_with_auth_token(
             base_url,
             project_id,
             session_id,
             project_name,
-            resolve_daemon_auth_token(),
+            auth_token,
+            control_state_dir,
         )
     }
 
@@ -1880,6 +2093,10 @@ impl DaemonSessionClient {
         self.project_root.as_deref()
     }
 
+    pub(crate) fn control_state_dir(&self) -> &ControlStateDir {
+        &self.control_state_dir
+    }
+
     pub fn port(&self) -> Option<u16> {
         self.base_url
             .rsplit(':')
@@ -1901,8 +2118,13 @@ impl DaemonSessionClient {
             "attempting daemon reconnection for project {}",
             self.project_name
         );
-        let new_client =
-            connect_or_spawn_session(project_root, "mcp-stdio", Some(std::process::id())).await?;
+        let new_client = connect_or_spawn_session_at(
+            project_root,
+            "mcp-stdio",
+            Some(std::process::id()),
+            &self.control_state_dir,
+        )
+        .await?;
         let new_client = new_client.with_project_root(project_root.to_path_buf());
 
         // Task 8: home is immutable across reconnects — the fresh session
@@ -2046,7 +2268,17 @@ pub async fn connect_or_spawn_session(
     client_name: &str,
     pid: Option<u32>,
 ) -> anyhow::Result<DaemonSessionClient> {
-    let port = ensure_daemon_running().await?;
+    let control_state_dir = process_control_state_dir()?;
+    connect_or_spawn_session_at(project_root, client_name, pid, control_state_dir).await
+}
+
+async fn connect_or_spawn_session_at(
+    project_root: &Path,
+    client_name: &str,
+    pid: Option<u32>,
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<DaemonSessionClient> {
+    let port = ensure_daemon_running_at(control_state_dir).await?;
     let base_url = format!("http://127.0.0.1:{port}");
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -2056,7 +2288,7 @@ pub async fn connect_or_spawn_session(
     // Resolve the token AFTER `ensure_daemon_running` so a freshly spawned
     // daemon's persisted token file is already present (it is written before the
     // port file). Env pin takes precedence; otherwise we read the token file.
-    let auth_token = resolve_daemon_auth_token();
+    let auth_token = resolve_daemon_auth_token_at(control_state_dir);
     let open_request = http_client
         .post(format!("{base_url}/v1/sessions/open"))
         .json(&OpenProjectRequest {
@@ -2080,13 +2312,14 @@ pub async fn connect_or_spawn_session(
         opened.session_id,
         opened.project_name,
         auth_token,
+        control_state_dir.clone(),
     )
     .with_project_root(project_root.to_path_buf()))
 }
 
-async fn ensure_daemon_running() -> anyhow::Result<u16> {
+async fn ensure_daemon_running_at(control_state_dir: &ControlStateDir) -> anyhow::Result<u16> {
     let identity = current_daemon_identity();
-    if let Some(port) = daemon_port_if_compatible(&identity).await? {
+    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
         tracing::debug!("daemon already running on port {port}");
         return Ok(port);
     }
@@ -2101,13 +2334,13 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         );
     }
 
-    if let Some(lock) = try_acquire_start_lock()? {
-        if let Some(port) = daemon_port_if_compatible(&identity).await? {
+    if let Some(lock) = try_acquire_start_lock_at(control_state_dir)? {
+        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
             tracing::debug!("daemon became ready while acquiring lock, port {port}");
             return Ok(port);
         }
         tracing::info!("acquired start lock, spawning new daemon");
-        stop_incompatible_recorded_daemon(&identity).await?;
+        stop_incompatible_recorded_daemon_at(control_state_dir, &identity).await?;
         spawn_daemon_process()?;
         // Task 9: release the lock as soon as the child is spawned — the
         // child's `guarded_daemon_start` acquires the SAME lock before
@@ -2115,10 +2348,10 @@ async fn ensure_daemon_running() -> anyhow::Result<u16> {
         // deadlock parent (waiting for the child's port file) against child
         // (waiting for the lock).
         drop(lock);
-        wait_for_daemon_ready(&identity).await
+        wait_for_daemon_ready_at(control_state_dir, &identity).await
     } else {
         tracing::info!("start lock held by another process, waiting for daemon");
-        wait_for_daemon_ready(&identity).await
+        wait_for_daemon_ready_at(control_state_dir, &identity).await
     }
 }
 
@@ -2138,13 +2371,26 @@ pub enum GuardedStart {
 /// `symforge daemon` racing an auto-spawn (or another foreground start) can
 /// never overwrite a live daemon's runtime record.
 pub async fn guarded_daemon_start(bind_host: &str) -> anyhow::Result<GuardedStart> {
+    let control_state_dir = process_control_state_dir()?;
+    guarded_daemon_start_at(bind_host, control_state_dir).await
+}
+
+/// Start or reuse a daemon under an explicitly resolved control-state owner.
+///
+/// This is the typed-owner form used by embedders and isolated integration
+/// harnesses. Process entry points should normally call [`guarded_daemon_start`].
+#[doc(hidden)]
+pub async fn guarded_daemon_start_at(
+    bind_host: &str,
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<GuardedStart> {
     let identity = current_daemon_identity();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     let _lock = loop {
-        if let Some(port) = daemon_port_if_compatible(&identity).await? {
+        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
             return Ok(GuardedStart::AlreadyRunning { port });
         }
-        if let Some(lock) = try_acquire_start_lock()? {
+        if let Some(lock) = try_acquire_start_lock_at(control_state_dir)? {
             break lock;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2156,16 +2402,19 @@ pub async fn guarded_daemon_start(bind_host: &str) -> anyhow::Result<GuardedStar
     };
     // Re-check under the lock: a racer may have bound between our probe and
     // the acquisition.
-    if let Some(port) = daemon_port_if_compatible(&identity).await? {
+    if let Some(port) = daemon_port_if_compatible_at(control_state_dir, &identity).await? {
         return Ok(GuardedStart::AlreadyRunning { port });
     }
-    stop_incompatible_recorded_daemon(&identity).await?;
-    let handle = spawn_daemon(bind_host).await?;
+    stop_incompatible_recorded_daemon_at(control_state_dir, &identity).await?;
+    let handle = spawn_daemon_at(bind_host, control_state_dir).await?;
     Ok(GuardedStart::Started(handle))
 }
 
-async fn daemon_port_if_compatible(identity: &DaemonIdentity) -> anyhow::Result<Option<u16>> {
-    let port = match read_daemon_port_file() {
+async fn daemon_port_if_compatible_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> anyhow::Result<Option<u16>> {
+    let port = match read_daemon_port_file_at(control_state_dir) {
         Ok(port) => port,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -2192,10 +2441,13 @@ async fn daemon_port_if_compatible(identity: &DaemonIdentity) -> anyhow::Result<
     }
 }
 
-async fn wait_for_daemon_ready(identity: &DaemonIdentity) -> anyhow::Result<u16> {
+async fn wait_for_daemon_ready_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> anyhow::Result<u16> {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if let Some(port) = daemon_port_if_compatible(identity).await? {
+        if let Some(port) = daemon_port_if_compatible_at(control_state_dir, identity).await? {
             return Ok(port);
         }
 
@@ -2229,20 +2481,23 @@ async fn daemon_health_ok(port: u16) -> bool {
     daemon_health(port).await.is_some()
 }
 
-async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
-    let port = match read_daemon_port_file() {
+async fn stop_incompatible_recorded_daemon_at(
+    control_state_dir: &ControlStateDir,
+    identity: &DaemonIdentity,
+) -> anyhow::Result<()> {
+    let port = match read_daemon_port_file_at(control_state_dir) {
         Ok(port) => port,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
             tracing::warn!("removing corrupt symforge daemon port file: {error}");
-            cleanup_daemon_runtime_files();
+            cleanup_daemon_runtime_files_at(control_state_dir);
             return Ok(());
         }
         Err(error) => return Err(error).context("reading daemon port file"),
     };
 
     let Some(health) = daemon_health(port).await else {
-        cleanup_daemon_runtime_files();
+        cleanup_daemon_runtime_files_at(control_state_dir);
         return Ok(());
     };
 
@@ -2250,7 +2505,7 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
         return Ok(());
     }
 
-    if let Ok(pid) = read_daemon_pid_file() {
+    if let Ok(pid) = read_daemon_pid_file_at(control_state_dir) {
         if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
                 tracing::warn!(
@@ -2286,7 +2541,7 @@ async fn stop_incompatible_recorded_daemon(identity: &DaemonIdentity) -> anyhow:
         }
     }
 
-    cleanup_daemon_runtime_files();
+    cleanup_daemon_runtime_files_at(control_state_dir);
     Ok(())
 }
 
@@ -2315,14 +2570,21 @@ pub(crate) enum DaemonStopOutcome {
 /// is never terminated.
 #[allow(unsafe_code)] // SAFETY: SIGKILL targets a pid that already passed the ownership safety gate; a dead/invalid pid only errors, no memory is touched.
 pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonStopOutcome> {
-    let port = match read_daemon_port_file() {
+    let control_state_dir = process_control_state_dir()?;
+    stop_running_daemon_for_update_at(control_state_dir).await
+}
+
+async fn stop_running_daemon_for_update_at(
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<DaemonStopOutcome> {
+    let port = match read_daemon_port_file_at(control_state_dir) {
         Ok(port) => port,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(DaemonStopOutcome::NotRunning);
         }
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
             tracing::warn!("removing corrupt symforge daemon port file during update: {error}");
-            cleanup_daemon_runtime_files();
+            cleanup_daemon_runtime_files_at(control_state_dir);
             return Ok(DaemonStopOutcome::NotRunning);
         }
         Err(error) => return Err(error).context("reading daemon port file"),
@@ -2330,12 +2592,12 @@ pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonSto
 
     let Some(health) = daemon_health(port).await else {
         // Recorded but unreachable — clear the stale files and report not-running.
-        cleanup_daemon_runtime_files();
+        cleanup_daemon_runtime_files_at(control_state_dir);
         return Ok(DaemonStopOutcome::NotRunning);
     };
 
     let identity = current_daemon_identity();
-    match read_daemon_pid_file() {
+    match read_daemon_pid_file_at(control_state_dir) {
         Ok(pid) if should_terminate_recorded_daemon(&health, &identity, pid) => {
             if let Err(error) = terminate_process(pid) {
                 tracing::warn!(
@@ -2374,7 +2636,7 @@ pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonSto
                 );
                 Ok(DaemonStopOutcome::StopTimedOut { pid })
             } else {
-                cleanup_daemon_runtime_files();
+                cleanup_daemon_runtime_files_at(control_state_dir);
                 Ok(DaemonStopOutcome::Stopped { pid })
             }
         }
@@ -2384,7 +2646,7 @@ pub(crate) async fn stop_running_daemon_for_update() -> anyhow::Result<DaemonSto
         Ok(_) => Ok(DaemonStopOutcome::SkippedSafety),
         // No readable pid file: nothing to stop; clear any stale leftovers.
         Err(_) => {
-            cleanup_daemon_runtime_files();
+            cleanup_daemon_runtime_files_at(control_state_dir);
             Ok(DaemonStopOutcome::NotRunning)
         }
     }
@@ -2424,8 +2686,10 @@ async fn wait_for_daemon_unhealthy(port: u16) {
     }
 }
 
-fn try_acquire_start_lock() -> anyhow::Result<Option<DaemonStartLock>> {
-    let path = daemon_dir()?.join(daemon_start_lock_file_name());
+fn try_acquire_start_lock_at(
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<Option<DaemonStartLock>> {
+    let path = daemon_dir_for(control_state_dir)?.join(daemon_start_lock_file_name());
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2648,20 +2912,57 @@ fn stable_path_identity(path: &str) -> String {
 
 impl ProjectInstance {
     fn load(canonical_root: &Path) -> anyhow::Result<Self> {
+        let binding = RootBinding {
+            source: RootCandidateSource::InitCwd,
+            canonical_root: canonical_root.to_path_buf(),
+            root_id: crate::discovery::project_id_for_canonical_root(canonical_root),
+            access_mode: SourceAccessMode::NormalProject,
+        };
+        let state_placement = crate::discovery::resolve_state_placement(&binding);
+        Self::load_bound(&binding, state_placement)
+    }
+
+    fn load_bound(binding: &RootBinding, state_placement: StatePlacement) -> anyhow::Result<Self> {
+        let canonical_root = &binding.canonical_root;
         let project_name = canonical_root
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("project")
             .to_string();
 
-        let index = bootstrap_project_index(canonical_root)?;
+        let index = bootstrap_project_index(canonical_root, &state_placement)?;
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
         let token_stats = TokenStats::new();
+        let persistence_status = if matches!(
+            &state_placement,
+            StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. }
+        ) {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        };
+        let persistence_health = Arc::new(RwLock::new(persistence_status));
+        let curation_coordinator =
+            Arc::new(crate::protocol::knowledge_curation::KnowledgeCurationCoordinator::default());
+        if let Err(error) = curation_coordinator.recover_on_project_load(
+            &index,
+            canonical_root,
+            Some(&state_placement),
+            persistence_status,
+        ) {
+            tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
+        }
 
         Ok(Self {
-            project_id: project_key(canonical_root),
+            project_id: binding.root_id.0.clone(),
             canonical_root: canonical_root.to_path_buf(),
             project_name,
+            source_access_mode: binding.access_mode,
+            state_placement,
+            persistence_health,
+            curation_coordinator,
             index,
             watcher_info,
             watcher_task: None,
@@ -2753,27 +3054,55 @@ impl ProjectSlot {
     }
 
     fn server_for_session(&self) -> SymForgeServer {
-        let (index, project_name, watcher_info, canonical_root, token_stats) = {
+        let (
+            index,
+            project_name,
+            watcher_info,
+            canonical_root,
+            state_placement,
+            persistence_health,
+            curation_coordinator,
+            token_stats,
+        ) = {
             let project = self.metadata.read();
             (
                 Arc::clone(&project.index),
                 project.project_name.clone(),
                 Arc::clone(&project.watcher_info),
                 project.canonical_root.clone(),
+                project.state_placement.clone(),
+                Arc::clone(&project.persistence_health),
+                Arc::clone(&project.curation_coordinator),
                 Arc::clone(&project.token_stats),
             )
         };
-        SymForgeServer::new(
+        let mut server = SymForgeServer::new_with_state_placement(
             index,
             project_name,
             watcher_info,
             Some(canonical_root),
+            Some(state_placement),
             Some(token_stats),
-        )
+        );
+        server.persistence_health = persistence_health;
+        server.curation_coordinator = curation_coordinator;
+        server
     }
 
-    fn reload(&self, canonical_root: &Path) -> anyhow::Result<(usize, usize)> {
-        self.reload_with(canonical_root, |index, root| index.reload(root))
+    fn reload_for_binding(&self, binding: &RootBinding) -> anyhow::Result<(usize, usize)> {
+        let (project_state_dir, source_exclusions) = {
+            let project = self.metadata.read();
+            (
+                project.state_placement.directory().cloned(),
+                crate::discovery::SourceExclusions::for_state_placement(
+                    &binding.canonical_root,
+                    &project.state_placement,
+                ),
+            )
+        };
+        self.reload_with(&binding.canonical_root, move |index, root| {
+            index.reload_for_binding_with_exclusions(root, project_state_dir, source_exclusions)
+        })
     }
 
     fn reload_with<F>(
@@ -2842,22 +3171,33 @@ impl ProjectSlot {
 ///
 /// Cold path: no snapshot/artifact present (or it was quarantined) — fall back
 /// to a full discovery+parse [`live_index::LiveIndex::load`].
-fn bootstrap_project_index(canonical_root: &Path) -> anyhow::Result<SharedIndex> {
-    if let Some(snapshot) = live_index::persist::load_snapshot(canonical_root) {
+fn bootstrap_project_index(
+    canonical_root: &Path,
+    state_placement: &StatePlacement,
+) -> anyhow::Result<SharedIndex> {
+    let source_exclusions =
+        crate::discovery::SourceExclusions::for_state_placement(canonical_root, state_placement);
+    if let Some(snapshot) = live_index::persist::load_snapshot(canonical_root, state_placement) {
         let file_count = snapshot.files.len();
         let snapshot_mtimes: HashMap<String, u64> = snapshot
             .files
             .iter()
             .map(|(path, file)| (path.clone(), file.mtime_secs))
             .collect();
-        let live = live_index::persist::snapshot_to_live_index(snapshot, canonical_root);
+        let (live, code_signals) =
+            live_index::persist::snapshot_to_live_index_with_code_signals(snapshot, canonical_root);
         tracing::info!(
             files = file_count,
             load_source = ?live.load_source(),
             root = %canonical_root.display(),
             "daemon bootstrap restored index from .symforge snapshot/team artifact"
         );
-        let shared: SharedIndex = live_index::SharedIndexHandle::shared(live);
+        let shared: SharedIndex =
+            live_index::SharedIndexHandle::shared_with_source_exclusions_and_code_signals(
+                live,
+                source_exclusions.clone(),
+                code_signals,
+            );
 
         // Reconcile the restored snapshot against current disk state (offline
         // edits, or a teammate-cloned artifact vs their own working tree). Only
@@ -2877,12 +3217,46 @@ fn bootstrap_project_index(canonical_root: &Path) -> anyhow::Result<SharedIndex>
         return Ok(shared);
     }
 
-    live_index::LiveIndex::load(canonical_root).with_context(|| {
-        format!(
-            "failed to load project index for {}",
-            canonical_root.display()
-        )
-    })
+    let cold_result = if matches!(state_placement, StatePlacement::ProjectLocal { .. }) {
+        live_index::LiveIndex::load_for_state_placement(canonical_root, state_placement)
+            .with_context(|| {
+                format!(
+                    "failed to load project index for {}",
+                    canonical_root.display()
+                )
+            })
+    } else {
+        let index = LiveIndex::empty();
+        match index.reload_for_binding_with_exclusions(
+            canonical_root,
+            state_placement.directory().cloned(),
+            source_exclusions,
+        ) {
+            Ok(()) => Ok(index),
+            Err(error) => Err(error),
+        }
+    };
+
+    match cold_result {
+        Ok(index) => Ok(index),
+        Err(error) => {
+            let Some(capacity) = error.downcast_ref::<crate::discovery::ScoutCapacityError>()
+            else {
+                return Err(error);
+            };
+            let index = LiveIndex::empty();
+            index.set_freshness_status(crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: 0,
+                reason_codes: vec![capacity.reason()],
+            });
+            tracing::warn!(
+                root = %canonical_root.display(),
+                reason = ?capacity.reason(),
+                "cold project observation refused by catalog capacity; keeping project non-ready"
+            );
+            Ok(index)
+        }
+    }
 }
 
 fn start_project_watcher(
@@ -2985,8 +3359,21 @@ pub fn build_router(state: SharedDaemonState) -> Router {
 }
 
 pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
+    let control_state_dir = process_control_state_dir()?;
+    spawn_daemon_at(bind_host, control_state_dir).await
+}
+
+/// Spawn a daemon under an explicitly resolved control-state owner.
+///
+/// This is the typed-owner form used by embedders and isolated integration
+/// harnesses. Process entry points should normally call [`spawn_daemon`].
+#[doc(hidden)]
+pub async fn spawn_daemon_at(
+    bind_host: &str,
+    control_state_dir: &ControlStateDir,
+) -> anyhow::Result<DaemonHandle> {
     let resolved_host = resolve_daemon_bind_host(bind_host)?;
-    cleanup_daemon_runtime_files();
+    cleanup_daemon_runtime_files_at(control_state_dir);
 
     let listener = TcpListener::bind(daemon_socket_bind_address(&resolved_host)).await?;
     let port = listener.local_addr()?.port();
@@ -2996,15 +3383,19 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
     // writing the token first guarantees a client that observes the port can
     // always read a valid token (no open-then-tokenless window).
     let auth_token = establish_daemon_auth_token();
-    write_daemon_token_file(&auth_token)?;
-    write_daemon_port_file(port)?;
-    write_daemon_pid_file(std::process::id())?;
+    write_daemon_token_file_at(control_state_dir, &auth_token)?;
+    write_daemon_port_file_at(control_state_dir, port)?;
+    write_daemon_pid_file_at(control_state_dir, std::process::id())?;
 
-    let state = Arc::new(DaemonState::with_token(auth_token));
+    let state = Arc::new(DaemonState::with_token_at(
+        auth_token,
+        control_state_dir.clone(),
+    ));
     let app = build_router(Arc::clone(&state));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let owned_token = state.auth_token_for_cleanup();
+    let cleanup_control_state_dir = control_state_dir.clone();
     let server_task = tokio::spawn(async move {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
@@ -3018,7 +3409,12 @@ pub async fn spawn_daemon(bind_host: &str) -> anyhow::Result<DaemonHandle> {
         }
 
         // Owner-checked: never delete a successor daemon's fresh runtime files.
-        cleanup_daemon_runtime_files_if_owner(port, std::process::id(), &owned_token);
+        cleanup_daemon_runtime_files_if_owner_at(
+            &cleanup_control_state_dir,
+            port,
+            std::process::id(),
+            &owned_token,
+        );
     });
 
     // Task 9: one daemon-owned bounded reaper. The interval is derived from
@@ -3204,7 +3600,7 @@ async fn call_tool_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
     AxumPath((session_id, tool_name)): AxumPath<(String, String)>,
-    Json(params): Json<serde_json::Value>,
+    Json(mut params): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::response::IntoResponse;
     authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
@@ -3225,6 +3621,76 @@ async fn call_tool_handler(
             .map_err(|gov_err| bad_request(gov_err.into()))?
             .map_err(bad_request)
             .map(|text| text.into_response());
+    }
+
+    // Knowledge security ordering: reject a sensitive/invalid knowledge request
+    // before project routing, working-set refresh, cache/CCR access, or any
+    // repository observation. The protocol front-end performs the same guard,
+    // but the daemon HTTP route is independently callable and must fail closed.
+    if tool_name == "curate_knowledge" {
+        let input = decode_params::<CurateKnowledgeInput>(params.clone()).map_err(bad_request)?;
+        if let Err(message) = crate::protocol::knowledge_curation::validate_input(&input) {
+            return Ok(message.into_response());
+        }
+    }
+    if matches!(tool_name.as_str(), "search_knowledge" | "review_knowledge") {
+        let (project, projects) = if tool_name == "search_knowledge" {
+            let input =
+                decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
+            if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
+                return Ok(message.into_response());
+            }
+            (input.project, input.projects)
+        } else {
+            let input =
+                decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
+            if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
+                return Ok(message.into_response());
+            }
+            (input.project, input.projects)
+        };
+
+        // `search_knowledge` owns both scalar and set-valued targeting, so it
+        // bypasses the single-project route below. Canonicalize every explicit
+        // id/name selector through the same session-scoped resolver used by the
+        // rest of the daemon before the cross-project dispatcher captures its
+        // immutable source set. Wildcard expansion remains session-local.
+        let resolve_selector = |selector: &str| {
+            state
+                .runtime_for_target(&session_id, Some(selector))
+                .map(|runtime| runtime.project_id)
+        };
+        if let Some(selector) = project.as_deref() {
+            let project_id = match resolve_selector(selector) {
+                Ok(project_id) => project_id,
+                Err(message) if message.starts_with("unknown session") => {
+                    return Err((StatusCode::NOT_FOUND, message));
+                }
+                Err(message) => return Ok(message.into_response()),
+            };
+            if let Some(object) = params.as_object_mut() {
+                object.insert("project".to_string(), serde_json::Value::String(project_id));
+            }
+        } else if let Some(selectors) = projects.as_deref()
+            && !(selectors.len() == 1 && selectors[0] == "*")
+        {
+            let mut project_ids = Vec::with_capacity(selectors.len());
+            for selector in selectors {
+                let project_id = match resolve_selector(selector) {
+                    Ok(project_id) => project_id,
+                    Err(message) if message.starts_with("unknown session") => {
+                        return Err((StatusCode::NOT_FOUND, message));
+                    }
+                    Err(message) => return Ok(message.into_response()),
+                };
+                if !project_ids.contains(&project_id) {
+                    project_ids.push(project_id);
+                }
+            }
+            if let Some(object) = params.as_object_mut() {
+                object.insert("projects".to_string(), serde_json::json!(project_ids));
+            }
+        }
     }
 
     // Task 7: `status(detail="projects")` renders the SESSION's open-project
@@ -3254,12 +3720,12 @@ async fn call_tool_handler(
 
     // Task 4 (outstanding-work hardening): explicit single-project routing.
     // For the routed read/guidance verbs, peek the optional `project` selector,
-    // resolve the target runtime through the ONE shared resolver, strip the
-    // routing-only field, and dispatch the existing per-project implementation
-    // unchanged. Omission selects the immutable home. The three cross-project
+    // resolve the target runtime through the ONE shared resolver, canonicalize
+    // or strip the routing field, and dispatch the existing per-project
+    // implementation. Curation retains the canonical explicit selector because
+    // implicit-worktree mutation must fail closed. Omission selects the immutable home. The three cross-project
     // discovery verbs (search_symbols/search_text/find_references) keep their
     // own `project`/`projects` handling inside `execute_tool_call`.
-    let mut params = params;
     let runtime = if single_project_routed_tool(&tool_name) {
         #[derive(serde::Deserialize)]
         struct ProjectPeek {
@@ -3289,7 +3755,14 @@ async fn call_tool_handler(
                 if peek.project.is_some()
                     && let Some(object) = params.as_object_mut()
                 {
-                    object.remove("project");
+                    if tool_name == "curate_knowledge" {
+                        object.insert(
+                            "project".to_string(),
+                            serde_json::Value::String(runtime.project_id.clone()),
+                        );
+                    } else {
+                        object.remove("project");
+                    }
                 }
                 runtime
             }
@@ -3362,8 +3835,12 @@ async fn call_tool_handler(
                 // the byte-identical single-active path), so single-project reads
                 // never compare/re-intern and stay frecency-neutral (SC-4). Errors
                 // and invalid targeting are surfaced by `execute_tool_call` itself.
-                if let Some(targets) =
-                    resolve_cross_project_targets(&tool_name_owned, &params, &runtime.project_id)
+                if tool_name_owned != "search_knowledge"
+                    && let Some(targets) = resolve_cross_project_targets(
+                        &tool_name_owned,
+                        &params,
+                        &runtime.project_id,
+                    )
                 {
                     state_for_refresh.refresh_working_set_bases(&runtime.working_set, &targets);
                 }
@@ -3380,7 +3857,7 @@ async fn call_tool_handler(
         Ok(Ok(mut result)) => {
             // Task 7: full-surface `health`/`health_compact` gain the session's
             // open-project inventory once MORE than one project is open — the
-            // 36-tool surface can then list and select projects without the
+            // full 39-tool surface can then list and select projects without the
             // compact `status` tool. Single-project sessions stay byte-identical.
             if matches!(tool_name_for_panic.as_str(), "health" | "health_compact")
                 && let Some(inventory) =
@@ -3734,14 +4211,19 @@ fn targets_selects(targets: &Targets, project_id: &str) -> bool {
     }
 }
 
-/// The three cross-project READ verbs. Edits, analyze_file_impact, orient, and
+/// Cross-project READ verbs. Edits, analyze_file_impact, orient, and
 /// meta verbs are NEVER cross-project (they stay single-project on the active
 /// project) — kept in one place so the read route (`execute_tool_call`) and the
 /// freshness-refresh gate (`call_tool_handler`) agree by construction.
 fn is_cross_project_read_verb(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "search_symbols" | "search_text" | "find_references" | "search_files"
+        "search_symbols"
+            | "search_text"
+            | "search_knowledge"
+            | "review_knowledge"
+            | "find_references"
+            | "search_files"
     )
 }
 
@@ -3783,6 +4265,7 @@ pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
             | "batch_edit"
             | "batch_insert"
             | "batch_rename"
+            | "curate_knowledge"
     )
 }
 
@@ -4159,6 +4642,171 @@ fn execute_cross_project_read(
     }
 }
 
+/// Search repository knowledge over one immutable generation captured from
+/// every selected session project before any extraction or formatting begins.
+/// Project IDs and sections are canonically ordered, and CCR budgeting is
+/// applied once to the combined response so a multi-project call has one
+/// reversible result envelope.
+fn execute_cross_project_knowledge(
+    mut input: SearchKnowledgeInput,
+    targets: Targets,
+    project_indexes: &HashMap<String, SharedIndex>,
+    ccr_server: &SymForgeServer,
+) -> anyhow::Result<String> {
+    let mut selected_ids: Vec<String> = match targets {
+        Targets::One(id) => vec![id],
+        Targets::Subset(ids) => ids,
+        Targets::All => project_indexes.keys().cloned().collect(),
+    };
+    selected_ids.sort();
+    selected_ids.dedup();
+
+    let missing: Vec<String> = selected_ids
+        .iter()
+        .filter(|id| !project_indexes.contains_key(*id))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "project not open: {}. Open it in this session first with \
+             index_folder(path=..., add=true), then retarget.",
+            missing
+                .iter()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Targeting is daemon/session metadata, not a per-project search input.
+    input.project = None;
+    input.projects = None;
+    let max_tokens = input.max_tokens;
+
+    // Capture every source root first. No watcher publication after this point
+    // can split the response between generations.
+    let captured: Vec<_> = selected_ids
+        .iter()
+        .map(|id| {
+            let generation = project_indexes
+                .get(id)
+                .expect("selected projects were validated")
+                .published_source_set()
+                .current_generation();
+            (id.clone(), generation)
+        })
+        .collect();
+
+    let multi = captured.len() > 1;
+    let mut sections = Vec::with_capacity(captured.len());
+    for (project_id, generation) in captured {
+        let result = crate::protocol::knowledge_search::search_current(&generation, &input);
+        if multi {
+            sections.push(format!("── project: {project_id} ──\n{result}"));
+        } else {
+            sections.push(result);
+        }
+    }
+    let body = sections.join("\n\n");
+    Ok(ccr_server.apply_ccr_budget("search_knowledge", body, max_tokens))
+}
+
+/// Review repository knowledge over one immutable generation captured from
+/// every selected project. Per-source complete-plan hashes are computed before
+/// any rendering budget and the top-level hash covers the canonical source set.
+fn execute_cross_project_review(
+    mut input: ReviewKnowledgeInput,
+    targets: Targets,
+    project_indexes: &HashMap<String, SharedIndex>,
+    ccr_server: &SymForgeServer,
+) -> anyhow::Result<String> {
+    let mut selected_ids: Vec<String> = match targets {
+        Targets::One(id) => vec![id],
+        Targets::Subset(ids) => ids,
+        Targets::All => project_indexes.keys().cloned().collect(),
+    };
+    selected_ids.sort();
+    selected_ids.dedup();
+
+    let missing: Vec<String> = selected_ids
+        .iter()
+        .filter(|id| !project_indexes.contains_key(*id))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "project not open: {}. Open it in this session first with \
+             index_folder(path=..., add=true), then retarget.",
+            missing
+                .iter()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    input.project = None;
+    input.projects = None;
+    let max_tokens = input.max_tokens;
+    let captured: Vec<_> = selected_ids
+        .iter()
+        .map(|id| {
+            let generation = project_indexes
+                .get(id)
+                .expect("selected projects were validated")
+                .published_source_set()
+                .current_generation();
+            (id.clone(), generation)
+        })
+        .collect();
+
+    let mut plans = Vec::with_capacity(captured.len());
+    for (project_id, generation) in captured {
+        let output = crate::protocol::knowledge_review::review_current(&generation, &input)
+            .map_err(anyhow::Error::msg)?;
+        plans.push((project_id, output));
+    }
+    let top_result_hash = if plans.len() == 1 {
+        plans[0].1.result_hash.clone()
+    } else {
+        crate::protocol::knowledge_review::combined_result_hash(
+            &plans
+                .iter()
+                .map(|(_, output)| (output.source_key.clone(), output.review_hash.clone()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let multi = plans.len() > 1;
+    let sections = plans
+        .iter()
+        .map(|(project_id, output)| {
+            if multi {
+                format!("── project: {project_id} ──\n{}", output.source_section)
+            } else {
+                output.source_section.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let budget_sections = plans
+        .iter()
+        .map(|(project_id, output)| {
+            if multi {
+                format!(
+                    "── project: {project_id} ──\n{}",
+                    output.budget_source_section
+                )
+            } else {
+                output.budget_source_section.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let body = format!("top_result_hash={top_result_hash}\n{sections}");
+    let budget_body = format!("top_result_hash={top_result_hash}\n{budget_sections}");
+    Ok(ccr_server.apply_ccr_budget_with_summary("review_knowledge", body, budget_body, max_tokens))
+}
+
 /// Format cross-project file hits, grouped by project (`── project: <id> ──`
 /// headers when `multi`). Each project's hits arrive already rank-ordered from
 /// the per-project file search.
@@ -4415,6 +5063,24 @@ async fn execute_tool_call(
         )
         .map_err(|message| anyhow::anyhow!("{message}"))?;
         if !targets_is_single_active(&targets, &runtime.project_id) {
+            if tool_name == "search_knowledge" {
+                let input = decode_params::<SearchKnowledgeInput>(params)?;
+                return execute_cross_project_knowledge(
+                    input,
+                    targets,
+                    &runtime.project_indexes,
+                    &runtime.server,
+                );
+            }
+            if tool_name == "review_knowledge" {
+                let input = decode_params::<ReviewKnowledgeInput>(params)?;
+                return execute_cross_project_review(
+                    input,
+                    targets,
+                    &runtime.project_indexes,
+                    &runtime.server,
+                );
+            }
             let working_set = runtime.working_set.read();
             return execute_cross_project_read(tool_name, params, targets, &working_set);
         }
@@ -4449,6 +5115,15 @@ async fn execute_tool_call(
             .await),
         "search_text" => Ok(server
             .search_text(Parameters(decode_params::<SearchTextInput>(params)?))
+            .await),
+        "search_knowledge" => Ok(server
+            .search_knowledge(Parameters(decode_params::<SearchKnowledgeInput>(params)?))
+            .await),
+        "review_knowledge" => Ok(server
+            .review_knowledge(Parameters(decode_params::<ReviewKnowledgeInput>(params)?))
+            .await),
+        "curate_knowledge" => Ok(server
+            .curate_knowledge(Parameters(decode_params::<CurateKnowledgeInput>(params)?))
             .await),
         "trace_symbol" => {
             let tp: TraceSymbolInput = decode_params(params)?;
@@ -4615,28 +5290,33 @@ fn canonical_project_root(root: &Path) -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn project_key(root: &Path) -> String {
-    let normalized = normalized_path_string(root);
-    let stable_path = if cfg!(windows) {
-        normalized.to_lowercase()
-    } else {
-        normalized
-    };
-    format!(
-        "project-{}",
-        crate::hash::digest_hex(stable_path.as_bytes())
-    )
+    crate::discovery::project_id_for_canonical_root(root).0
 }
 
 fn normalized_path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-pub(crate) fn daemon_dir() -> io::Result<PathBuf> {
-    paths::global_symforge_home()
+fn process_control_state_dir() -> io::Result<&'static ControlStateDir> {
+    paths::process_control_state_placement()
+        .directory()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "process control state is unavailable",
+            )
+        })
 }
 
-fn write_daemon_port_file(port: u16) -> io::Result<()> {
-    let path = daemon_dir()?.join(daemon_port_file_name());
+fn daemon_dir_for(control_state_dir: &ControlStateDir) -> io::Result<PathBuf> {
+    paths::ensure_control_state_dir(control_state_dir)?;
+    let dir = paths::control_state_path(control_state_dir, "daemon");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn write_daemon_port_file_at(control_state_dir: &ControlStateDir, port: u16) -> io::Result<()> {
+    let path = daemon_dir_for(control_state_dir)?.join(daemon_port_file_name());
     std::fs::write(&path, port.to_string()).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -4645,8 +5325,8 @@ fn write_daemon_port_file(port: u16) -> io::Result<()> {
     })
 }
 
-fn write_daemon_pid_file(pid: u32) -> io::Result<()> {
-    let path = daemon_dir()?.join(daemon_pid_file_name());
+fn write_daemon_pid_file_at(control_state_dir: &ControlStateDir, pid: u32) -> io::Result<()> {
+    let path = daemon_dir_for(control_state_dir)?.join(daemon_pid_file_name());
     std::fs::write(&path, pid.to_string()).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -4655,9 +5335,9 @@ fn write_daemon_pid_file(pid: u32) -> io::Result<()> {
     })
 }
 
-fn read_daemon_pid_file() -> io::Result<u32> {
+fn read_daemon_pid_file_at(control_state_dir: &ControlStateDir) -> io::Result<u32> {
     let contents = read_daemon_runtime(
-        &daemon_dir()?,
+        &daemon_dir_for(control_state_dir)?,
         &daemon_pid_file_name(),
         LEGACY_DAEMON_PID_FILE,
     )?;
@@ -4668,8 +5348,12 @@ fn read_daemon_pid_file() -> io::Result<u32> {
 }
 
 pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
+    read_daemon_port_file_at(process_control_state_dir()?)
+}
+
+fn read_daemon_port_file_at(control_state_dir: &ControlStateDir) -> io::Result<u16> {
     let contents = read_daemon_runtime(
-        &daemon_dir()?,
+        &daemon_dir_for(control_state_dir)?,
         &daemon_port_file_name(),
         LEGACY_DAEMON_PORT_FILE,
     )?;
@@ -4680,9 +5364,9 @@ pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
 }
 
 #[cfg(test)]
-fn cleanup_daemon_files() {
-    cleanup_daemon_runtime_files();
-    if let Ok(dir) = daemon_dir() {
+fn cleanup_daemon_files_at(control_state_dir: &ControlStateDir) {
+    cleanup_daemon_runtime_files_at(control_state_dir);
+    if let Ok(dir) = daemon_dir_for(control_state_dir) {
         let _ = std::fs::remove_file(dir.join(daemon_start_lock_file_name()));
         let _ = std::fs::remove_file(dir.join(LEGACY_DAEMON_START_LOCK_FILE));
     }
@@ -4695,8 +5379,13 @@ fn cleanup_daemon_files() {
 /// leaving clients tokenless (401) or daemon-less — the 2026-07-11 fork-bomb
 /// incident's inner trigger. Startup cleanup stays unconditional (there is no
 /// live owner to protect before the new files are written).
-fn cleanup_daemon_runtime_files_if_owner(port: u16, pid: u32, token: &str) {
-    if let Ok(dir) = daemon_dir() {
+fn cleanup_daemon_runtime_files_if_owner_at(
+    control_state_dir: &ControlStateDir,
+    port: u16,
+    pid: u32,
+    token: &str,
+) {
+    if let Ok(dir) = daemon_dir_for(control_state_dir) {
         let owns = |path: &std::path::Path, expected: &str| {
             std::fs::read_to_string(path)
                 .map(|contents| contents.trim() == expected)
@@ -4721,8 +5410,8 @@ fn cleanup_daemon_runtime_files_if_owner(port: u16, pid: u32, token: &str) {
     }
 }
 
-fn cleanup_daemon_runtime_files() {
-    if let Ok(dir) = daemon_dir() {
+fn cleanup_daemon_runtime_files_at(control_state_dir: &ControlStateDir) {
+    if let Ok(dir) = daemon_dir_for(control_state_dir) {
         let _ = std::fs::remove_file(dir.join(daemon_port_file_name()));
         let _ = std::fs::remove_file(dir.join(daemon_pid_file_name()));
         // Remove the auth-token file too so a stale token from a previous daemon
@@ -4801,6 +5490,25 @@ mod tests {
         dir
     }
 
+    fn test_control_state(home: &Path) -> ControlStateDir {
+        ControlStateDir::new(home.to_path_buf())
+    }
+
+    fn test_daemon_path(home: &Path, file_name: impl AsRef<Path>) -> PathBuf {
+        daemon_dir_for(&test_control_state(home))
+            .expect("create test daemon control-state directory")
+            .join(file_name)
+    }
+
+    async fn spawn_test_daemon(bind_host: &str, home: &Path) -> anyhow::Result<DaemonHandle> {
+        let control_state_dir = test_control_state(home);
+        spawn_daemon_at(bind_host, &control_state_dir).await
+    }
+
+    fn test_daemon_state(home: &Path) -> DaemonState {
+        DaemonState::with_token_at(establish_daemon_auth_token(), test_control_state(home))
+    }
+
     async fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().await
     }
@@ -4861,7 +5569,9 @@ mod tests {
         let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
         let _idle = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "60");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let state = Arc::clone(&handle.state);
         tokio::task::yield_now().await;
 
@@ -4915,7 +5625,18 @@ mod tests {
         let fresh = live_index::LiveIndex::load(tmp.path()).expect("cold load");
         {
             let guard = fresh.read();
-            live_index::persist::export_artifact(&guard, tmp.path()).expect("export artifact");
+            let root = dunce::canonicalize(tmp.path()).expect("canonical root");
+            let placement = crate::domain::StatePlacement::ProjectLocal {
+                directory: crate::domain::ProjectStateDir::new(root.join(".symforge")),
+            };
+            live_index::persist::export_artifact(
+                &guard,
+                &root,
+                crate::domain::SourceAccessMode::NormalProject,
+                &placement,
+                &crate::domain::CapabilityStatus::Available,
+            )
+            .expect("export artifact");
         }
         assert!(
             !tmp.path().join(".symforge").join("index.bin").exists(),
@@ -4938,6 +5659,21 @@ mod tests {
         assert!(
             guard.get_file("main.rs").is_some(),
             "the artifact-restored index must serve the indexed files"
+        );
+    }
+
+    #[test]
+    fn daemon_sessions_share_one_project_curation_coordinator() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let slot = ProjectSlot::new(ProjectInstance::load(tmp.path()).expect("project load"));
+
+        let left = slot.server_for_session();
+        let right = slot.server_for_session();
+
+        assert!(
+            Arc::ptr_eq(&left.curation_coordinator, &right.curation_coordinator),
+            "all daemon sessions for one project must serialize through one curation coordinator"
         );
     }
 
@@ -5589,6 +6325,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: Some(true),
+                    allow_protected_root: None,
                 },
             )
             .expect("additive open B");
@@ -5681,6 +6418,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: Some(true),
+                    allow_protected_root: None,
                 },
             )
             .expect("additive open B");
@@ -5737,6 +6475,7 @@ mod tests {
                         path: root.display().to_string(),
                         idempotency_key: None,
                         add: None,
+                        allow_protected_root: None,
                     },
                 )
                 .expect("open same-name project");
@@ -5806,6 +6545,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: None,
+                    allow_protected_root: None,
                 },
             )
             .expect("open B");
@@ -5844,6 +6584,50 @@ mod tests {
         assert!(
             entry.overlay.is_valid_against(&entry.base),
             "re-seeded overlay fenced to its base"
+        );
+    }
+
+    #[test]
+    fn daemon_index_folder_reconciles_existing_root_gitignore() {
+        let home = project_dir("symforge-hygiene-home");
+        let target = project_dir("symforge-hygiene-target");
+        std::fs::create_dir(target.path().join(".git")).expect("create git metadata marker");
+        std::fs::write(target.path().join(".gitignore"), b"target/\r\n")
+            .expect("write root gitignore");
+        std::fs::write(
+            target.path().join("src").join("lib.rs"),
+            "fn indexed() {}\n",
+        )
+        .expect("write target source");
+        let state = DaemonState::new();
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home.path().display().to_string(),
+                client_name: "gitignore-hygiene".to_string(),
+                pid: None,
+            })
+            .expect("open home");
+
+        let receipt = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: target.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                    allow_protected_root: None,
+                },
+            )
+            .expect("open target");
+
+        assert!(
+            receipt.contains("gitignore_hygiene=effective changed=true"),
+            "daemon indexing must report the hygiene mutation: {receipt}"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join(".gitignore")).expect("read reconciled gitignore"),
+            b"target/\r\n/.symforge/\r\n",
+            "daemon indexing must preserve existing bytes and newline style"
         );
     }
 
@@ -5957,6 +6741,7 @@ mod tests {
                             path: retarget_path.clone(),
                             idempotency_key: None,
                             add: Some(i % 2 == 1),
+                            allow_protected_root: None,
                         },
                     );
 
@@ -5987,8 +6772,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_index_folder_for_session_refuses_sensitive_root() {
+    #[tokio::test]
+    async fn test_index_folder_for_session_refuses_sensitive_root() {
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
         // Regression: the daemon path historically never called the sensitive
         // -path guard, so a daemon-routed `index_folder` on a system root could
         // index system files and drive a reload into a denial-of-service.
@@ -6002,25 +6790,29 @@ mod tests {
             })
             .expect("session");
 
-        // A sensitive system root that exists and canonicalizes on this host.
-        #[cfg(windows)]
-        let sensitive = r"C:\Windows";
-        #[cfg(unix)]
-        let sensitive = "/etc";
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let sensitive = fixture.path().join("System32");
+        std::fs::create_dir(&sensitive).expect("create modeled protected root");
+        std::fs::write(
+            sensitive.join("lib.rs"),
+            "pub fn protected_daemon_symbol() {}\n",
+        )
+        .expect("write protected source");
 
         let result = state
             .index_folder_for_session(
                 &opened.session_id,
                 IndexFolderInput {
-                    path: sensitive.to_string(),
+                    path: sensitive.display().to_string(),
                     idempotency_key: None,
                     add: None,
+                    allow_protected_root: None,
                 },
             )
             .expect("refusal must be a clean Ok response, never an Err or panic");
         assert!(
-            result.contains("Refused to index sensitive system path"),
-            "daemon path must refuse sensitive root `{sensitive}`, got: {result}"
+            result.contains("protected_root_requires_explicit_override"),
+            "daemon path must refuse the modeled protected root, got: {result}"
         );
 
         // The session must remain bound to the original project (no reassign).
@@ -6029,6 +6821,786 @@ mod tests {
             projects.len(),
             1,
             "refusal must not create a project for the sensitive root"
+        );
+
+        let indexed = state
+            .index_folder_for_session(
+                &opened.session_id,
+                IndexFolderInput {
+                    path: sensitive.display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("direct protected authority should produce a clean result");
+        assert!(
+            indexed.contains("Indexed 1 files"),
+            "daemon override should index the exact protected root: {indexed}"
+        );
+        assert!(!sensitive.join(".symforge").exists());
+        let canonical = sensitive.canonicalize().unwrap();
+        assert!(
+            state_home
+                .path()
+                .join("projects")
+                .join(project_key(&canonical))
+                .is_dir(),
+            "explicit protected daemon state should be user-local"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_membership_is_per_session_and_requires_each_direct_override() {
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let home_a = project_dir("symforge-protected-session-a");
+        let home_b = project_dir("symforge-protected-session-b");
+        let state = DaemonState::new();
+        let session_a = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_a.path().display().to_string(),
+                client_name: "protected-a".to_string(),
+                pid: None,
+            })
+            .expect("open session A");
+        let session_b = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_b.path().display().to_string(),
+                client_name: "protected-b".to_string(),
+                pid: None,
+            })
+            .expect("open session B");
+
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let protected = fixture.path().join("System32");
+        std::fs::create_dir(&protected).expect("create modeled protected root");
+        std::fs::write(
+            protected.join("lib.rs"),
+            "pub fn protected_session_symbol() {}\n",
+        )
+        .expect("write protected source");
+        let protected_id = project_key(&protected.canonicalize().unwrap());
+
+        let opened_a = state
+            .index_folder_for_session(
+                &session_a.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session A direct protected open");
+        assert!(opened_a.contains("Indexed 1 files"), "{opened_a}");
+
+        let protected_name = {
+            let projects = state.projects.read();
+            let slot = projects.get(&protected_id).expect("shared protected slot");
+            slot.metadata.read().project_name.clone()
+        };
+        {
+            let sessions = state.sessions.read();
+            assert!(
+                sessions
+                    .get(&session_a.session_id)
+                    .unwrap()
+                    .working_set
+                    .read()
+                    .get(&protected_id)
+                    .is_some(),
+                "the directly authorized session must gain membership"
+            );
+            assert!(
+                sessions
+                    .get(&session_b.session_id)
+                    .unwrap()
+                    .working_set
+                    .read()
+                    .get(&protected_id)
+                    .is_none(),
+                "another session must not inherit protected membership"
+            );
+        }
+        assert!(
+            !state.set_active_project(&session_b.session_id, &protected_id),
+            "a global project id must not grant session membership"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session_b.session_id, Some(&protected_id))
+                .is_err(),
+            "a protected project id must not address another session's membership"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session_b.session_id, Some(&protected_name))
+                .is_err(),
+            "a protected project alias must not address another session's membership"
+        );
+
+        let refused_b = state
+            .index_folder_for_session(
+                &session_b.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: None,
+                },
+            )
+            .expect("missing override is a typed refusal");
+        assert!(
+            refused_b.contains("protected_root_requires_explicit_override"),
+            "{refused_b}"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session_b.session_id, Some(&protected_id))
+                .is_err(),
+            "a refused request must not attach protected membership"
+        );
+
+        let opened_b = state
+            .index_folder_for_session(
+                &session_b.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session B direct protected open");
+        assert!(opened_b.contains("Indexed 1 files"), "{opened_b}");
+        assert!(
+            state
+                .runtime_for_target(&session_b.session_id, Some(&protected_id))
+                .is_ok(),
+            "session B gains membership only after its own direct override"
+        );
+        let projects = state.projects.read();
+        let protected_slot = projects.get(&protected_id).expect("one protected slot");
+        let protected_meta = protected_slot.metadata.read();
+        assert_eq!(protected_meta.session_ids.len(), 2);
+        assert!(protected_meta.session_ids.contains(&session_a.session_id));
+        assert!(protected_meta.session_ids.contains(&session_b.session_id));
+    }
+
+    #[tokio::test]
+    async fn protected_membership_is_not_inherited_by_reconnect_alias_or_restart() {
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let home = project_dir("symforge-protected-restart-home");
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let protected = fixture.path().join("System32");
+        std::fs::create_dir(&protected).expect("create modeled protected root");
+        std::fs::write(
+            protected.join("lib.rs"),
+            "pub fn protected_restart_symbol() {}\n",
+        )
+        .expect("write protected source");
+        let protected_id = project_key(&protected.canonicalize().unwrap());
+        let protected_state = state_home.path().join("projects").join(&protected_id);
+
+        let state = DaemonState::new();
+        let authorized = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home.path().display().to_string(),
+                client_name: "protected-authorized".to_string(),
+                pid: None,
+            })
+            .expect("open authorized session home");
+        let opened = state
+            .index_folder_for_session(
+                &authorized.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("direct protected open");
+        assert!(opened.contains("Indexed 1 files"), "{opened}");
+        assert!(protected_state.join("index.bin").is_file());
+
+        let reconnect = state.open_project_session(OpenProjectRequest {
+            project_root: protected.display().to_string(),
+            client_name: "protected-reconnect".to_string(),
+            pid: None,
+        });
+        assert!(
+            reconnect.is_err(),
+            "reconnect metadata must not inherit direct protected authority"
+        );
+        {
+            let projects = state.projects.read();
+            let slot = projects.get(&protected_id).expect("live protected slot");
+            let metadata = slot.metadata.read();
+            assert_eq!(metadata.session_ids.len(), 1);
+            assert!(metadata.session_ids.contains(&authorized.session_id));
+        }
+
+        assert!(state.close_session(&authorized.session_id).is_some());
+        assert!(
+            state.list_projects().is_empty(),
+            "closing the last session must remove the live protected slot"
+        );
+        drop(state);
+        assert!(
+            protected_state.join("index.bin").is_file(),
+            "persisted protected state remains available but dormant"
+        );
+
+        let restarted = DaemonState::new();
+        let fresh = restarted
+            .open_project_session(OpenProjectRequest {
+                project_root: home.path().display().to_string(),
+                client_name: "protected-after-restart".to_string(),
+                pid: None,
+            })
+            .expect("open normal session after restart");
+        assert!(
+            restarted
+                .list_projects()
+                .iter()
+                .all(|project| project.project_id != protected_id),
+            "persisted protected state must not auto-attach after restart"
+        );
+        assert!(
+            !restarted.set_active_project(&fresh.session_id, &protected_id),
+            "a persisted project id must not grant membership after restart"
+        );
+        assert!(
+            restarted
+                .runtime_for_target(&fresh.session_id, Some("System32"))
+                .is_err(),
+            "a persisted protected display alias must remain dormant after restart"
+        );
+        assert!(
+            restarted
+                .open_project_session(OpenProjectRequest {
+                    project_root: protected.display().to_string(),
+                    client_name: "protected-reconnect-after-restart".to_string(),
+                    pid: None,
+                })
+                .is_err(),
+            "reconnect after restart must still refuse protected membership"
+        );
+
+        let refused = restarted
+            .index_folder_for_session(
+                &fresh.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: None,
+                },
+            )
+            .expect("missing override is a typed refusal");
+        assert!(
+            refused.contains("protected_root_requires_explicit_override"),
+            "{refused}"
+        );
+        assert!(
+            restarted
+                .list_projects()
+                .iter()
+                .all(|project| project.project_id != protected_id),
+            "refusal must leave persisted protected state dormant"
+        );
+
+        let reopened = restarted
+            .index_folder_for_session(
+                &fresh.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("fresh direct override after restart");
+        assert!(reopened.contains("Indexed 1 files"), "{reopened}");
+        assert!(
+            restarted
+                .runtime_for_target(&fresh.session_id, Some(&protected_id))
+                .is_ok(),
+            "fresh direct override must reactivate the dormant protected state"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_folder_replay_reestablishes_live_binding_or_returns_live_postcondition_unavailable()
+     {
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private replay state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let home = project_dir("symforge-replay-home");
+        let target = project_dir("symforge-replay-target");
+        let other = project_dir("symforge-replay-other");
+        std::fs::write(target.path().join("src").join("one.rs"), "fn one() {}\n")
+            .expect("write first target source");
+        std::fs::write(other.path().join("src").join("other.rs"), "fn other() {}\n")
+            .expect("write other target source");
+        let target_id = project_key(&canonical_project_root(target.path()).unwrap());
+        let other_id = project_key(&canonical_project_root(other.path()).unwrap());
+        let state = test_daemon_state(state_home.path());
+        let session = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home.path().display().to_string(),
+                client_name: "replay".to_string(),
+                pid: None,
+            })
+            .expect("open replay home");
+        let key = "b-r27-replay";
+
+        let first_receipt = {
+            let _limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", Path::new("100"));
+            state
+                .index_folder_for_session(
+                    &session.session_id,
+                    IndexFolderInput {
+                        path: target.path().display().to_string(),
+                        idempotency_key: Some(key.to_string()),
+                        add: Some(true),
+                        allow_protected_root: None,
+                    },
+                )
+                .expect("first replay execution")
+        };
+        assert!(first_receipt.contains("Indexed 1 files"), "{first_receipt}");
+        assert!(state.remove_project_from_session(&session.session_id, &target_id));
+        std::fs::write(target.path().join("src").join("two.rs"), "fn two() {}\n")
+            .expect("write second target source");
+
+        let unavailable = {
+            let _limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", Path::new("1"));
+            state
+                .index_folder_for_session(
+                    &session.session_id,
+                    IndexFolderInput {
+                        path: target.path().display().to_string(),
+                        idempotency_key: Some(key.to_string()),
+                        add: Some(true),
+                        allow_protected_root: None,
+                    },
+                )
+                .expect("replay failure is a successful typed tool result")
+        };
+        assert!(unavailable.contains("applied=false"), "{unavailable}");
+        assert!(
+            unavailable.contains("outcome=live_postcondition_unavailable"),
+            "{unavailable}"
+        );
+        assert!(
+            unavailable.contains(&first_receipt),
+            "typed failure must preserve the immutable historical receipt: {unavailable}"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session.session_id, Some(&target_id))
+                .is_err(),
+            "failed replay must not claim or attach a live binding"
+        );
+
+        let restored = {
+            let _limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", Path::new("100"));
+            state
+                .index_folder_for_session(
+                    &session.session_id,
+                    IndexFolderInput {
+                        path: target.path().display().to_string(),
+                        idempotency_key: Some(key.to_string()),
+                        add: Some(true),
+                        allow_protected_root: None,
+                    },
+                )
+                .expect("replay restores live postcondition")
+        };
+        assert_eq!(
+            restored, first_receipt,
+            "stored receipt must remain immutable"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session.session_id, Some(&target_id))
+                .is_ok(),
+            "stored success may return only after live membership is restored"
+        );
+        assert!(state.remove_project_from_session(&session.session_id, &target_id));
+
+        let override_conflict = state
+            .index_folder_for_session(
+                &session.session_id,
+                IndexFolderInput {
+                    path: target.path().display().to_string(),
+                    idempotency_key: Some(key.to_string()),
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("override change is a deterministic tool-level conflict");
+        assert!(
+            override_conflict.contains("Idempotency conflict"),
+            "{override_conflict}"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session.session_id, Some(&target_id))
+                .is_err(),
+            "override conflict must happen before live attachment"
+        );
+
+        let path_conflict = state
+            .index_folder_for_session(
+                &session.session_id,
+                IndexFolderInput {
+                    path: other.path().display().to_string(),
+                    idempotency_key: Some(key.to_string()),
+                    add: Some(true),
+                    allow_protected_root: None,
+                },
+            )
+            .expect("path change is a deterministic tool-level conflict");
+        assert!(
+            path_conflict.contains("Idempotency conflict"),
+            "{path_conflict}"
+        );
+        assert!(
+            state
+                .runtime_for_target(&session.session_id, Some(&other_id))
+                .is_err(),
+            "path conflict must happen before loading or attaching the other project"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_bind_state_write_failure_degrades_durability_not_live_readiness() {
+        let _guard = env_lock().await;
+        let project = project_dir("symforge-post-bind-state-failure");
+        std::fs::write(
+            project.path().join("src").join("main.rs"),
+            "fn main() { println!(\"still live\"); }\n",
+        )
+        .expect("write queryable source");
+        let state = DaemonState::new();
+        let session = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "durability-oracle".to_string(),
+                pid: None,
+            })
+            .expect("bind and publish project before failing state writes");
+        let slot = state
+            .projects
+            .read()
+            .get(&session.project_id)
+            .cloned()
+            .expect("bound project slot");
+        let (canonical_root, placement, publication_before, watcher_info) = {
+            let project = slot.metadata.read();
+            (
+                project.canonical_root.clone(),
+                project.state_placement.clone(),
+                project.index.published_generation(),
+                Arc::clone(&project.watcher_info),
+            )
+        };
+        let state_dir = match &placement {
+            StatePlacement::ProjectLocal { directory }
+            | StatePlacement::UserLocal { directory, .. } => directory.as_path().to_path_buf(),
+            StatePlacement::MemoryOnly { failures } => {
+                panic!("fixture requires durable placement, got memory-only: {failures:?}")
+            }
+        };
+        let before = state
+            .project_health(&session.project_id)
+            .expect("health before state failure");
+        assert_eq!(before.index_state, "Ready");
+        assert_eq!(
+            before.durability,
+            crate::domain::CapabilityStatus::Available
+        );
+        assert_eq!(
+            before.capabilities.checkpoint,
+            crate::domain::CapabilityStatus::Available
+        );
+
+        std::fs::remove_dir_all(&state_dir).expect("remove writable state directory");
+        std::fs::write(&state_dir, b"state owner became unwritable")
+            .expect("replace state directory with a blocking file");
+        let checkpoint = execute_tool_call(
+            state
+                .session_runtime(&session.session_id)
+                .expect("session runtime before checkpoint"),
+            "checkpoint_now",
+            serde_json::json!({ "verify_after_write": true }),
+        )
+        .await
+        .expect("checkpoint failure remains a typed tool response");
+        assert!(
+            checkpoint.contains("Checkpoint failed"),
+            "state write must fail in the fixture: {checkpoint}"
+        );
+
+        let after = state
+            .project_health(&session.project_id)
+            .expect("health after state failure");
+        assert_eq!(after.project_id, before.project_id);
+        assert_eq!(after.canonical_root, before.canonical_root);
+        assert_eq!(after.index_state, "Ready");
+        assert_eq!(
+            after.durability,
+            crate::domain::CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        );
+        assert_eq!(
+            after.capabilities.checkpoint,
+            crate::domain::CapabilityStatus::Unavailable {
+                reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        );
+        assert_eq!(
+            after.capabilities.repository_curation,
+            crate::domain::CapabilityStatus::Unavailable {
+                reason:
+                    crate::domain::CapabilityUnavailableReason::DurableMutationReplayUnavailable,
+            }
+        );
+
+        {
+            let project = slot.metadata.read();
+            assert_eq!(project.canonical_root, canonical_root);
+            assert_eq!(project.state_placement, placement);
+            let publication_after = project.index.published_generation();
+            assert!(
+                publication_after.publication_generation
+                    >= publication_before.publication_generation,
+                "derived-only background publication may advance but never rewind"
+            );
+            assert_eq!(
+                publication_after.content_generation, publication_before.content_generation,
+                "failed durability must not mutate live content identity"
+            );
+            assert_eq!(
+                publication_after.project_generation,
+                publication_before.project_generation
+            );
+            assert_eq!(publication_after.source, publication_before.source);
+            assert_eq!(
+                publication_after.source_version,
+                publication_before.source_version
+            );
+            assert_eq!(
+                publication_after
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| &manifest.digest),
+                publication_before
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| &manifest.digest)
+            );
+            assert!(Arc::ptr_eq(&project.watcher_info, &watcher_info));
+        }
+        let query = execute_tool_call(
+            state
+                .session_runtime(&session.session_id)
+                .expect("session runtime after checkpoint failure"),
+            "get_file_content",
+            serde_json::json!({ "path": "src/main.rs" }),
+        )
+        .await
+        .expect("live query after state failure");
+        assert!(
+            query.contains("still live"),
+            "live query regressed: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_preserves_resolved_placement_until_new_project_instance() {
+        let _guard = env_lock().await;
+        let project = project_dir("symforge-placement-lifetime");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn placement_lifetime() {}\n",
+        )
+        .expect("write source");
+        let project_state = project.path().join(".symforge");
+        std::fs::write(&project_state, b"block project-local state")
+            .expect("install project-local blocker");
+
+        let home = TempDir::new().expect("isolated user-local state");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", home.path());
+        let state = DaemonState::with_token_and_control_state(
+            "placement-lifetime-token".to_string(),
+            Some(ControlStateDir::new(home.path().to_path_buf())),
+        );
+        let first = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "placement-lifetime-first".to_string(),
+                pid: None,
+            })
+            .expect("open with user-local fallback");
+        let first_slot = state
+            .projects
+            .read()
+            .get(&first.project_id)
+            .cloned()
+            .expect("first project slot");
+        let (canonical_root, first_placement) = {
+            let project = first_slot.metadata.read();
+            (
+                project.canonical_root.clone(),
+                project.state_placement.clone(),
+            )
+        };
+        let first_state_dir = match &first_placement {
+            StatePlacement::UserLocal { directory, .. } => directory.as_path().to_path_buf(),
+            other => panic!("blocked project-local state must fall back, got {other:?}"),
+        };
+        assert!(first_state_dir.starts_with(home.path()));
+
+        std::fs::remove_file(&project_state).expect("make project-local state available");
+        let output = state
+            .index_folder_for_session(
+                &first.session_id,
+                IndexFolderInput {
+                    path: project.path().display().to_string(),
+                    idempotency_key: None,
+                    add: None,
+                    allow_protected_root: None,
+                },
+            )
+            .expect("reindex same live project");
+        assert!(
+            output.starts_with("Indexed "),
+            "unexpected receipt: {output}"
+        );
+        let same_slot = state
+            .projects
+            .read()
+            .get(&first.project_id)
+            .cloned()
+            .expect("same live project slot");
+        assert!(Arc::ptr_eq(&first_slot, &same_slot));
+        assert_eq!(
+            same_slot.metadata.read().state_placement,
+            first_placement,
+            "same live ProjectInstance must keep its resolved owner"
+        );
+        assert!(
+            !project_state.exists(),
+            "same live ProjectInstance must not re-run placement or probe/create a new owner"
+        );
+
+        drop(same_slot);
+        drop(first_slot);
+        let closed = state
+            .close_session(&first.session_id)
+            .expect("close first project instance");
+        assert!(closed.project_removed);
+
+        let second = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "placement-lifetime-second".to_string(),
+                pid: None,
+            })
+            .expect("construct fresh project instance");
+        let second_slot = state
+            .projects
+            .read()
+            .get(&second.project_id)
+            .cloned()
+            .expect("fresh project slot");
+        match &second_slot.metadata.read().state_placement {
+            StatePlacement::ProjectLocal { directory } => {
+                assert_eq!(directory.as_path(), canonical_root.join(".symforge"));
+                assert_ne!(directory.as_path(), first_state_dir);
+            }
+            other => panic!("fresh instance must recover project-local durability, got {other:?}"),
+        }
+        assert!(project_state.is_dir());
+        assert!(
+            state
+                .close_session(&second.session_id)
+                .expect("close fresh project instance")
+                .project_removed
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_capacity_refusal_stays_nonready_with_typed_freshness() {
+        let _guard = env_lock().await;
+        let _entry_limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", Path::new("1"));
+        let project = project_dir("symforge-capacity-refusal");
+        std::fs::write(
+            project.path().join("src").join("lib.rs"),
+            "pub fn one() {}\n",
+        )
+        .expect("write first source");
+        std::fs::write(project.path().join("README.md"), "# second catalog entry\n")
+            .expect("write second source");
+
+        let control = TempDir::new().expect("isolated daemon control state");
+        let state = DaemonState::with_token_and_control_state(
+            "capacity-refusal-token".to_string(),
+            Some(ControlStateDir::new(control.path().to_path_buf())),
+        );
+        let opened = state
+            .open_project_session(OpenProjectRequest {
+                project_root: project.path().display().to_string(),
+                client_name: "capacity-refusal-client".to_string(),
+                pid: None,
+            })
+            .expect("typed capacity refusal must keep the daemon responsive");
+        let slot = state
+            .projects
+            .read()
+            .get(&opened.project_id)
+            .cloned()
+            .expect("non-ready project slot remains registered");
+        let project = slot.metadata.read();
+
+        assert!(!project.index.read().is_ready());
+        assert!(
+            project.index.scout_plan().is_none(),
+            "no partial plan may publish"
+        );
+        assert!(matches!(
+            project.index.freshness_status().as_ref(),
+            crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: 0,
+                reason_codes,
+            } if reason_codes == &[crate::domain::FreshnessReason::CatalogEntryCapacityExceeded]
+        ));
+        drop(project);
+
+        let health = state
+            .project_health(&opened.project_id)
+            .expect("registered non-ready project health");
+        assert!(matches!(
+            health.freshness,
+            crate::domain::FreshnessStatus::Degraded {
+                last_valid_content_generation: 0,
+                ref reason_codes,
+            } if reason_codes == &[crate::domain::FreshnessReason::CatalogEntryCapacityExceeded]
+        ));
+        assert!(
+            state
+                .close_session(&opened.session_id)
+                .expect("close capacity-refusal session")
+                .project_removed
         );
     }
 
@@ -6098,6 +7670,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: Some(true),
+                    allow_protected_root: None,
                 },
             )
             .expect("additive open B");
@@ -6550,7 +8123,9 @@ mod tests {
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
         let project = project_dir("symforge-daemon-http");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -6667,14 +8242,22 @@ mod tests {
         assert!(!final_health.executable_path.is_empty());
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PID_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PID_FILE,
+        ))
+        .await;
         assert!(
-            !daemon_home.path().join(LEGACY_DAEMON_PORT_FILE).exists(),
+            !test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE).exists(),
             "daemon port file should be removed on shutdown"
         );
         assert!(
-            !daemon_home.path().join(LEGACY_DAEMON_PID_FILE).exists(),
+            !test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE).exists(),
             "daemon pid file should be removed on shutdown"
         );
     }
@@ -6690,7 +8273,9 @@ mod tests {
         let _auth_guard = EnvVarGuard::set_str(DAEMON_AUTH_TOKEN_ENV, token);
         let project = project_dir("symforge-daemon-auth");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         // This test drives auth explicitly (missing / wrong / correct token), so
         // it uses a bare client and attaches `.bearer_auth` per request rather
         // than the always-authed `authed_client` helper.
@@ -6849,7 +8434,11 @@ mod tests {
             .expect("authorized close status");
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Feature 012 US1 — cross-project query, end-to-end on the DAEMON path.
@@ -6889,7 +8478,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -6924,6 +8515,7 @@ mod tests {
                 path: project_a.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -6945,6 +8537,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: Some(true),
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -7193,7 +8786,387 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_project_knowledge_captures_selected_session_projects_only() {
+        let _env_lock = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+
+        let project_a = project_dir("symforge-knowledge-a");
+        let project_b = project_dir("symforge-knowledge-b");
+        let project_c = project_dir("symforge-knowledge-c");
+        for (project, source_name, source, document) in [
+            (
+                &project_a,
+                "a.rs",
+                "pub fn alpha_anchor() {}\n",
+                "# Alpha knowledge\nQuartz boundary alpha. See [alpha](../src/a.rs).\n",
+            ),
+            (
+                &project_b,
+                "b.rs",
+                "pub fn beta_anchor() {}\n",
+                "# Beta knowledge\nQuartz boundary beta. See [beta](../src/b.rs).\n",
+            ),
+            (
+                &project_c,
+                "c.rs",
+                "pub fn gamma_anchor() {}\n",
+                "# Gamma knowledge\nQuartz boundary gamma. See [gamma](../src/c.rs).\n",
+            ),
+        ] {
+            std::fs::create_dir_all(project.path().join("docs")).expect("docs dir");
+            std::fs::write(project.path().join("src").join(source_name), source)
+                .expect("source fixture");
+            std::fs::write(project.path().join("docs").join("knowledge.md"), document)
+                .expect("knowledge fixture");
+        }
+
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
+        let base_url = format!("http://127.0.0.1:{}", handle.port);
+        let http = authed_client(&handle);
+
+        let opened = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_a.path().display().to_string(),
+                client_name: "knowledge-xproj".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open A")
+            .error_for_status()
+            .expect("open A status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open A body");
+        let project_a_id = opened.project_id.clone();
+        let project_b_id =
+            project_key(&canonical_project_root(project_b.path()).expect("canonical B"));
+        let project_a_alias = project_a
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("A project-name alias")
+            .to_string();
+        let project_b_alias = project_b
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("B project-name alias")
+            .to_string();
+
+        for (path, add) in [(project_a.path(), None), (project_b.path(), Some(true))] {
+            let response = http
+                .post(format!(
+                    "{base_url}/v1/sessions/{}/tools/index_folder",
+                    opened.session_id
+                ))
+                .json(&IndexFolderInput {
+                    path: path.display().to_string(),
+                    idempotency_key: None,
+                    add,
+                    allow_protected_root: None,
+                })
+                .send()
+                .await
+                .expect("index request")
+                .error_for_status()
+                .expect("index status")
+                .text()
+                .await
+                .expect("index body");
+            assert!(
+                response.contains("Indexed") || response.contains("added to working set"),
+                "index response: {response}"
+            );
+        }
+
+        // Open C globally, but in another session. The first session's wildcard
+        // must remain scoped to its own A+B working set.
+        let _other_session = http
+            .post(format!("{base_url}/v1/sessions/open"))
+            .json(&OpenProjectRequest {
+                project_root: project_c.path().display().to_string(),
+                client_name: "knowledge-other-session".to_string(),
+                pid: Some(std::process::id()),
+            })
+            .send()
+            .await
+            .expect("open C")
+            .error_for_status()
+            .expect("open C status")
+            .json::<OpenProjectResponse>()
+            .await
+            .expect("open C body");
+
+        let wildcard = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "projects": ["*"]
+            }))
+            .send()
+            .await
+            .expect("wildcard request")
+            .error_for_status()
+            .expect("wildcard status")
+            .text()
+            .await
+            .expect("wildcard body");
+        assert!(
+            wildcard.contains("Quartz boundary alpha"),
+            "A hit: {wildcard}"
+        );
+        assert!(
+            wildcard.contains("Quartz boundary beta"),
+            "B hit: {wildcard}"
+        );
+        assert!(
+            !wildcard.contains("Quartz boundary gamma"),
+            "session wildcard leaked C: {wildcard}"
+        );
+
+        let explicit_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "project": project_b_id
+            }))
+            .send()
+            .await
+            .expect("B request")
+            .error_for_status()
+            .expect("B status")
+            .text()
+            .await
+            .expect("B body");
+        assert!(
+            explicit_b.contains("Quartz boundary beta"),
+            "B hit: {explicit_b}"
+        );
+        assert!(
+            !explicit_b.contains("Quartz boundary alpha") && !explicit_b.contains("src/a.rs"),
+            "explicit B leaked A hit/bridge: {explicit_b}"
+        );
+
+        let alias_b = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "project": project_b_alias.clone()
+            }))
+            .send()
+            .await
+            .expect("B alias request")
+            .error_for_status()
+            .expect("B alias status")
+            .text()
+            .await
+            .expect("B alias body");
+        assert!(
+            alias_b.contains("Quartz boundary beta"),
+            "unique project-name aliases must resolve: {alias_b}"
+        );
+        assert!(
+            !alias_b.contains("Quartz boundary alpha") && !alias_b.contains("src/a.rs"),
+            "project-name alias leaked A hit/bridge: {alias_b}"
+        );
+
+        let reversed_subset = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "projects": [project_b_alias.clone(), project_a_alias.clone()]
+            }))
+            .send()
+            .await
+            .expect("subset request")
+            .error_for_status()
+            .expect("subset status")
+            .text()
+            .await
+            .expect("subset body");
+        let mut sorted_ids = [project_a_id.clone(), project_b_id.clone()];
+        sorted_ids.sort();
+        let first = reversed_subset
+            .find(&format!("project: {}", sorted_ids[0]))
+            .expect("first deterministic project header");
+        let second = reversed_subset
+            .find(&format!("project: {}", sorted_ids[1]))
+            .expect("second deterministic project header");
+        assert!(
+            first < second,
+            "project envelopes must be canonical: {reversed_subset}"
+        );
+
+        let review_subset = |selectors: Vec<String>| {
+            let http = http.clone();
+            let url = format!(
+                "{base_url}/v1/sessions/{}/tools/review_knowledge",
+                opened.session_id
+            );
+            async move {
+                http.post(url)
+                    .json(&serde_json::json!({
+                        "mode": "remediation",
+                        "projects": selectors,
+                        "limit": 1
+                    }))
+                    .send()
+                    .await
+                    .expect("review subset request")
+                    .error_for_status()
+                    .expect("review subset status")
+                    .text()
+                    .await
+                    .expect("review subset body")
+            }
+        };
+        let reversed_review =
+            review_subset(vec![project_b_alias.clone(), project_a_alias.clone()]).await;
+        let forward_review =
+            review_subset(vec![project_a_alias.clone(), project_b_alias.clone()]).await;
+        assert_eq!(
+            reversed_review, forward_review,
+            "selector order must not affect the captured per-source plans or hashes"
+        );
+        assert_eq!(
+            reversed_review.matches("top_result_hash=").count(),
+            1,
+            "one top-level result hash: {reversed_review}"
+        );
+        assert_eq!(
+            reversed_review.matches("review_hash=").count(),
+            2,
+            "one isolated plan hash per selected source: {reversed_review}"
+        );
+        let review_first = reversed_review
+            .find(&format!("project: {}", sorted_ids[0]))
+            .expect("first review project header");
+        let review_second = reversed_review
+            .find(&format!("project: {}", sorted_ids[1]))
+            .expect("second review project header");
+        assert!(
+            review_first < review_second,
+            "review project envelopes must be canonical: {reversed_review}"
+        );
+
+        let conflict = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "project": project_a_id,
+                "projects": ["*"]
+            }))
+            .send()
+            .await
+            .expect("conflict request")
+            .error_for_status()
+            .expect("conflict status")
+            .text()
+            .await
+            .expect("conflict body");
+        assert!(
+            conflict.contains("mutually exclusive"),
+            "selector conflict: {conflict}"
+        );
+
+        let unknown = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/search_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "query": "quartz boundary",
+                "project": "project-not-open"
+            }))
+            .send()
+            .await
+            .expect("unknown request")
+            .error_for_status()
+            .expect("unknown status")
+            .text()
+            .await
+            .expect("unknown body");
+        assert!(unknown.contains("not open"), "unknown selector: {unknown}");
+
+        let review_conflict = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/review_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "mode": "summary",
+                "project": project_a_id,
+                "projects": ["*"]
+            }))
+            .send()
+            .await
+            .expect("review conflict request")
+            .error_for_status()
+            .expect("review conflict status")
+            .text()
+            .await
+            .expect("review conflict body");
+        assert!(
+            review_conflict.contains("mutually exclusive"),
+            "review selector conflict: {review_conflict}"
+        );
+
+        let review_unknown = http
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/review_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "mode": "summary",
+                "project": "project-not-open"
+            }))
+            .send()
+            .await
+            .expect("review unknown request")
+            .error_for_status()
+            .expect("review unknown status")
+            .text()
+            .await
+            .expect("review unknown body");
+        assert!(
+            review_unknown.contains("not open"),
+            "unknown review selector: {review_unknown}"
+        );
+
+        let _ = handle.shutdown_tx.send(());
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// B2/D12 regression: a cross-project read REFLECTS a project's watcher-
@@ -7229,7 +9202,9 @@ mod tests {
         std::fs::write(&b_source, "pub fn xproj_marker_beta() -> u32 { 2 }\n")
             .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -7260,6 +9235,7 @@ mod tests {
             path: project_a.path().display().to_string(),
             idempotency_key: None,
             add: None,
+            allow_protected_root: None,
         })
         .send()
         .await
@@ -7274,6 +9250,7 @@ mod tests {
             path: project_b.path().display().to_string(),
             idempotency_key: None,
             add: Some(true),
+            allow_protected_root: None,
         })
         .send()
         .await
@@ -7446,7 +9423,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Read the interned `base_generation` for `key`, if present. Test helper for
@@ -7708,12 +9689,15 @@ mod tests {
         // Critical: no env token. Previously this meant "auth disabled".
         let _auth_guard = EnvVarGuard::unset(DAEMON_AUTH_TOKEN_ENV);
         let project = project_dir("symforge-daemon-failclosed");
+        let control_state_dir = test_control_state(daemon_home.path());
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_daemon_at("127.0.0.1", &control_state_dir)
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
         // 1. A token file is always present after start.
-        let token_path = daemon_home.path().join(daemon_token_file_name());
+        let token_path = test_daemon_path(daemon_home.path(), daemon_token_file_name());
         assert!(
             token_path.exists(),
             "daemon must persist an auth token file even without an env pin"
@@ -7786,13 +9770,17 @@ mod tests {
         // 4. `resolve_daemon_auth_token` (the client/hook resolution path) reads
         //    the same token from the file when no env pin is set.
         assert_eq!(
-            resolve_daemon_auth_token().as_deref(),
+            resolve_daemon_auth_token_at(&control_state_dir).as_deref(),
             Some(file_token.as_str()),
             "client token resolution must read the persisted token file"
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -7804,7 +9792,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -7901,6 +9891,46 @@ mod tests {
             "search_files resolve mode should return the indexed file, got: {resolved_path_body}"
         );
 
+        let curation_preview = client
+            .post(format!(
+                "{base_url}/v1/sessions/{}/tools/curate_knowledge",
+                opened.session_id
+            ))
+            .json(&serde_json::json!({
+                "project": opened.project_id.clone(),
+                "actions": [{
+                    "action_id": "action-daemon-route-oracle",
+                    "mutation": {
+                        "operation": "upsert",
+                        "entry": {
+                            "entry_id": "entry-daemon-route-oracle",
+                            "target": {
+                                "path": "src/main.rs",
+                                "content_hash": "0".repeat(64)
+                            },
+                            "lifecycle": "unknown",
+                            "evidence": [],
+                            "justification_code": "daemon-route-oracle"
+                        }
+                    }
+                }],
+                "if_source_review_hash": "0".repeat(64),
+                "if_manifest_digest": "0".repeat(64),
+                "if_policy_digest": "0".repeat(64)
+            }))
+            .send()
+            .await
+            .expect("curate_knowledge preview request")
+            .error_for_status()
+            .expect("curate_knowledge preview status")
+            .text()
+            .await
+            .expect("curate_knowledge preview body");
+        assert!(
+            curation_preview.contains("stale_review_hash"),
+            "daemon must dispatch curate_knowledge to the project runtime: {curation_preview}"
+        );
+
         let reused = client
             .post(format!("{base_url}/v1/sessions/open"))
             .json(&OpenProjectRequest {
@@ -7955,7 +9985,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// SF-007 regression: `checkpoint_now` must forward to the daemon in
@@ -7971,7 +10005,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8026,14 +10062,26 @@ mod tests {
         // The snapshot was written to the daemon's authoritative project root
         // (the canonical root the session is bound to) and must deserialize.
         let canonical_root = PathBuf::from(&opened.canonical_root);
+        let RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
+            &canonical_root,
+            RootCandidateSource::LaunchCwd,
+            RootRequestMode::Automatic,
+        ) else {
+            panic!("opened daemon root must remain bound");
+        };
+        let state_placement = crate::discovery::resolve_state_placement(&binding);
         assert!(
-            crate::live_index::persist::load_snapshot(&canonical_root).is_some(),
+            crate::live_index::persist::load_snapshot(&canonical_root, &state_placement).is_some(),
             "checkpoint should write a loadable snapshot under {}/.symforge/index.bin",
             canonical_root.display()
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -8045,15 +10093,16 @@ mod tests {
         let health = DaemonState::new().health();
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE),
             port.to_string(),
         )
         .expect("write daemon port");
 
         let identity = current_daemon_identity();
-        let selected = daemon_port_if_compatible(&identity)
-            .await
-            .expect("compatible health lookup");
+        let selected =
+            daemon_port_if_compatible_at(&test_control_state(daemon_home.path()), &identity)
+                .await
+                .expect("compatible health lookup");
 
         assert_eq!(selected, Some(port));
 
@@ -8076,15 +10125,16 @@ mod tests {
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE),
             port.to_string(),
         )
         .expect("write daemon port");
 
         let identity = current_daemon_identity();
-        let selected = daemon_port_if_compatible(&identity)
-            .await
-            .expect("mismatch health lookup");
+        let selected =
+            daemon_port_if_compatible_at(&test_control_state(daemon_home.path()), &identity)
+                .await
+                .expect("mismatch health lookup");
 
         assert_eq!(selected, None);
 
@@ -8144,19 +10194,22 @@ mod tests {
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE),
             port.to_string(),
         )
         .expect("write daemon port");
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PID_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE),
             child_pid.to_string(),
         )
         .expect("write daemon pid");
 
-        stop_incompatible_recorded_daemon(&current_daemon_identity())
-            .await
-            .expect("stop incompatible daemon");
+        stop_incompatible_recorded_daemon_at(
+            &test_control_state(daemon_home.path()),
+            &current_daemon_identity(),
+        )
+        .await
+        .expect("stop incompatible daemon");
 
         assert!(
             child.try_wait().expect("poll child").is_none(),
@@ -8184,17 +10237,20 @@ mod tests {
         };
         let (port, shutdown_tx) = spawn_fake_health_server(health).await;
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE),
             port.to_string(),
         )
         .expect("write daemon port");
 
-        stop_incompatible_recorded_daemon(&current_daemon_identity())
-            .await
-            .expect("stop incompatible daemon");
+        stop_incompatible_recorded_daemon_at(
+            &test_control_state(daemon_home.path()),
+            &current_daemon_identity(),
+        )
+        .await
+        .expect("stop incompatible daemon");
 
         assert!(
-            !daemon_home.path().join(LEGACY_DAEMON_PORT_FILE).exists(),
+            !test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE).exists(),
             "incompatible daemon port file should be cleared"
         );
 
@@ -8210,7 +10266,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8252,7 +10310,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -8264,7 +10326,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8318,7 +10382,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -8330,7 +10398,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8373,7 +10443,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -8385,7 +10459,9 @@ mod tests {
         std::fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
             .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8441,7 +10517,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -8462,7 +10542,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8491,6 +10573,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -8563,7 +10646,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Task 4 parity table (daemon route): explicit `project` selects the open
@@ -8587,7 +10674,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8618,6 +10707,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -8706,7 +10796,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Task 4 leftover: set-valued `search_files` fans out across targeted
@@ -8732,7 +10826,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -8763,6 +10859,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -8839,7 +10936,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// INCIDENT GUARD (2026-07-11): a test build must NEVER auto-spawn a
@@ -8860,7 +10961,7 @@ mod tests {
         let _env_lock = env_lock().await;
         let empty_home = TempDir::new().expect("empty home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", empty_home.path());
-        let error = ensure_daemon_running()
+        let error = ensure_daemon_running_at(&test_control_state(empty_home.path()))
             .await
             .expect_err("no daemon + no spawn must error");
         assert!(
@@ -8891,7 +10992,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let first = spawn_daemon("127.0.0.1").await.expect("spawn first daemon");
+        let first = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn first daemon");
         let base_url = format!("http://127.0.0.1:{}", first.port);
         let http = authed_client(&first);
         let opened = http
@@ -8910,11 +11013,12 @@ mod tests {
             .await
             .expect("open body");
 
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(project_a.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -8925,6 +11029,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(opened_b.starts_with("Indexed "), "open B: {opened_b}");
@@ -8937,8 +11042,12 @@ mod tests {
         // writes its own files (the untagged legacy name never exists, so
         // waiting on it is a no-op that races the cleanup).
         let _ = first.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(daemon_port_file_name())).await;
-        let second = spawn_daemon("127.0.0.1")
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            daemon_port_file_name(),
+        ))
+        .await;
+        let second = spawn_test_daemon("127.0.0.1", daemon_home.path())
             .await
             .expect("spawn second daemon");
 
@@ -8966,7 +11075,11 @@ mod tests {
         );
 
         let _ = second.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Task 7: every routed daemon tool response carries a machine-readable
@@ -8991,7 +11104,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -9022,6 +11137,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -9078,7 +11194,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Task 9: the reaper re-checks the SAME last-seen observation under the
@@ -9193,7 +11313,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -9244,6 +11366,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -9306,7 +11429,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Task 5: structural edits route by explicit project. An explicit B edit
@@ -9327,7 +11454,9 @@ mod tests {
         std::fs::write(&file_a, "pub fn shared_name() -> u32 { 1 }\n").expect("write source a");
         std::fs::write(&file_b, "pub fn shared_name() -> u32 { 1 }\n").expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -9358,6 +11487,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -9450,7 +11580,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// T016 / TR-01 / FR-006 / FR-007 (SC-002): in the default daemon-proxy
@@ -9497,7 +11631,9 @@ mod tests {
         )
         .expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -9519,11 +11655,12 @@ mod tests {
 
         // The exact front-end an MCP client gets: empty self.index, proxying to
         // the warm daemon.
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(project.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -9534,6 +11671,7 @@ mod tests {
                 path: project.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -9591,7 +11729,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -9605,7 +11747,9 @@ mod tests {
         let file_path = project.path().join("src").join("lib.rs");
         std::fs::write(&file_path, "pub fn proxy_edit() -> u32 { 1 }\n").expect("write source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -9625,11 +11769,12 @@ mod tests {
             .await
             .expect("open body");
 
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(project.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -9639,6 +11784,7 @@ mod tests {
                 path: project.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -9677,7 +11823,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// F6 regression: a `symforge_edit` apply carrying `working_directory`
@@ -9734,7 +11884,9 @@ mod tests {
         ]);
         let worktree_file = worktree_root.join("src").join("lib.rs");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -9754,11 +11906,12 @@ mod tests {
             .await
             .expect("open body");
 
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(main_root.clone());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -9768,6 +11921,7 @@ mod tests {
                 path: main_root.display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -9848,7 +12002,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// F6 root-cause guard: drive `edit_within_symbol` DIRECTLY against the
@@ -9904,7 +12062,9 @@ mod tests {
         ]);
         let worktree_file = worktree_root.join("src").join("lib.rs");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -10005,7 +12165,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     /// Regression: a daemon-proxy `index_folder` switch must invalidate any
@@ -10033,7 +12197,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -10056,11 +12222,12 @@ mod tests {
 
         // Build a daemon-proxy SymForgeServer for that session — the exact shape
         // `run_remote_mcp_server_async` constructs for a real MCP client.
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(project_a.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -10097,6 +12264,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -10123,7 +12291,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -10150,11 +12322,13 @@ mod tests {
                 std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral probe port");
             listener.local_addr().expect("probe port local addr").port()
         };
-        let client = DaemonSessionClient::new_for_test(
+        let daemon_home = TempDir::new().expect("isolated daemon control state");
+        let client = DaemonSessionClient::new_for_test_at(
             format!("http://127.0.0.1:{dead_port}"),
             project_key(&home_root),
             "unreachable-session".to_string(),
             "home-a".to_string(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(home_root.clone());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -10175,6 +12349,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -10217,7 +12392,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let http = authed_client(&handle);
 
@@ -10238,11 +12415,12 @@ mod tests {
             .await
             .expect("open body");
 
-        let client = DaemonSessionClient::new_for_test(
+        let client = DaemonSessionClient::new_for_test_at(
             base_url.clone(),
             opened.project_id.clone(),
             opened.session_id.clone(),
             opened.project_name.clone(),
+            test_control_state(daemon_home.path()),
         )
         .with_project_root(project_a.path().to_path_buf());
         let server = crate::protocol::SymForgeServer::new_daemon_proxy(client);
@@ -10263,6 +12441,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -10312,7 +12491,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -10333,7 +12516,9 @@ mod tests {
         )
         .expect("write source b");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -10363,6 +12548,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -10389,6 +12575,7 @@ mod tests {
                 path: project_b.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -10409,6 +12596,7 @@ mod tests {
                 path: project_a.path().display().to_string(),
                 idempotency_key: Some("daemon-replay-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             })
             .send()
             .await
@@ -10428,11 +12616,16 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     #[test]
     fn test_index_folder_additive_replays_and_conflicts() {
+        let control_state_home = TempDir::new().expect("isolated idempotency control state");
         let project_a = project_dir("symforge-idempotency-home-a");
         let project_b = project_dir("symforge-idempotency-open-b");
         let project_c = project_dir("symforge-idempotency-conflict-c");
@@ -10440,7 +12633,7 @@ mod tests {
             .expect("write source b");
         std::fs::write(project_c.path().join("src").join("c.rs"), "fn c() {}\n")
             .expect("write source c");
-        let state = DaemonState::new();
+        let state = test_daemon_state(control_state_home.path());
         let opened = state
             .open_project_session(OpenProjectRequest {
                 project_root: project_a.path().display().to_string(),
@@ -10456,6 +12649,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: Some("shared-open-key".to_string()),
                     add: None,
+                    allow_protected_root: None,
                 },
             )
             .expect("default open B");
@@ -10477,6 +12671,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: Some("shared-open-key".to_string()),
                     add: Some(true),
+                    allow_protected_root: None,
                 },
             )
             .expect("compatibility add=true replay B");
@@ -10492,6 +12687,7 @@ mod tests {
                     path: project_c.path().display().to_string(),
                     idempotency_key: Some("shared-open-key".to_string()),
                     add: Some(true),
+                    allow_protected_root: None,
                 },
             )
             .expect("conflicting open C");
@@ -10532,6 +12728,7 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: None,
+                    allow_protected_root: None,
                 },
             )
             .expect("open B");
@@ -10550,7 +12747,16 @@ mod tests {
 
         drop(state);
         let canonical_b = canonical_project_root(project_b.path()).expect("canonical B");
-        let restored = bootstrap_project_index(&canonical_b).expect("restore B from snapshot");
+        let RootResolution::Bound(binding_b) = crate::discovery::resolve_root_candidate(
+            &canonical_b,
+            RootCandidateSource::LaunchCwd,
+            RootRequestMode::Automatic,
+        ) else {
+            panic!("B must remain a valid automatic project root");
+        };
+        let placement_b = crate::discovery::resolve_state_placement(&binding_b);
+        let restored =
+            bootstrap_project_index(&canonical_b, &placement_b).expect("restore B from snapshot");
         let guard = restored.read();
         assert_eq!(
             guard.load_source(),
@@ -10560,11 +12766,13 @@ mod tests {
         assert!(guard.get_file("src/restored.rs").is_some());
     }
 
-    /// Snapshot persistence failure must NOT fail the open: the in-memory
-    /// generation stays published and attached, and the receipt reports the
-    /// degraded checkpoint outcome honestly instead of claiming `written`.
-    #[test]
-    fn test_index_folder_open_reports_degraded_checkpoint_on_snapshot_failure() {
+    /// An unavailable project-local state directory must move the whole project
+    /// instance to user-local state instead of retrying writes under the source.
+    #[tokio::test]
+    async fn test_index_folder_open_falls_back_to_user_local_when_project_state_unavailable() {
+        let _env_lock = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
         let project_a = project_dir("symforge-degraded-home-a");
         let project_b = project_dir("symforge-degraded-open-b");
         std::fs::write(project_b.path().join("src").join("b.rs"), "fn b() {}\n")
@@ -10577,7 +12785,7 @@ mod tests {
         let opened = state
             .open_project_session(OpenProjectRequest {
                 project_root: project_a.path().display().to_string(),
-                client_name: "degraded-checkpoint".to_string(),
+                client_name: "state-fallback".to_string(),
                 pid: None,
             })
             .expect("open home A");
@@ -10589,20 +12797,21 @@ mod tests {
                     path: project_b.path().display().to_string(),
                     idempotency_key: None,
                     add: None,
+                    allow_protected_root: None,
                 },
             )
-            .expect("open B must succeed despite checkpoint failure");
+            .expect("open B must succeed through user-local fallback");
         assert!(
             receipt.starts_with("Indexed "),
             "open itself must succeed: {receipt}"
         );
         assert!(
-            receipt.contains("checkpoint=degraded"),
-            "snapshot failure must surface a degraded checkpoint outcome: {receipt}"
+            receipt.contains("state=user-local"),
+            "project-local failure must select user-local state: {receipt}"
         );
         assert!(
-            !receipt.contains("checkpoint=written"),
-            "degraded checkpoint must not claim a durable write: {receipt}"
+            receipt.contains("checkpoint=written"),
+            "user-local placement must checkpoint through its resolved state directory: {receipt}"
         );
 
         // The in-memory open stayed published: B is attached to the working set
@@ -10614,9 +12823,27 @@ mod tests {
         assert_eq!(session.active_project_id, opened.project_id, "home stays A");
         assert!(
             session.working_set.read().get(&project_b_id).is_some(),
-            "B must be attached despite the degraded checkpoint"
+            "B must be attached despite project-local state being unavailable"
         );
-        // No snapshot artifact was fabricated behind the failure.
+        assert!(
+            state_home
+                .path()
+                .join("projects")
+                .join(&project_b_id)
+                .is_dir(),
+            "fallback state must be prepared under the private user-local project directory"
+        );
+        assert!(
+            state_home
+                .path()
+                .join("projects")
+                .join(&project_b_id)
+                .join("index.bin")
+                .is_file(),
+            "user-local checkpoint must be written under the resolved project state directory"
+        );
+        // The source blocker remains untouched: fallback never tries to repair
+        // or replace source-root state behind the user's back.
         assert!(
             project_b.path().join(".symforge").is_file(),
             "the blocking file must remain in place (no destructive recovery)"
@@ -10633,7 +12860,9 @@ mod tests {
         let source_path = project.path().join("src").join("lib.rs");
         std::fs::write(&source_path, "pub fn old_name() {}\n").expect("write initial source");
 
-        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let handle = spawn_test_daemon("127.0.0.1", daemon_home.path())
+            .await
+            .expect("spawn daemon");
         let client = authed_client(&handle);
         let base_url = format!("http://127.0.0.1:{}", handle.port);
 
@@ -10680,7 +12909,11 @@ mod tests {
         );
 
         let _ = handle.shutdown_tx.send(());
-        wait_for_path_absent(&daemon_home.path().join(LEGACY_DAEMON_PORT_FILE)).await;
+        wait_for_path_absent(&test_daemon_path(
+            daemon_home.path(),
+            LEGACY_DAEMON_PORT_FILE,
+        ))
+        .await;
     }
 
     // -----------------------------------------------------------------
@@ -10917,7 +13150,7 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let lock_path = daemon_home.path().join(daemon_start_lock_file_name());
+        let lock_path = test_daemon_path(daemon_home.path(), daemon_start_lock_file_name());
 
         // Create a lock file and backdate it to 60 seconds ago.
         let file = std::fs::File::create(&lock_path).expect("create lock");
@@ -10927,7 +13160,8 @@ mod tests {
         drop(file);
 
         // try_acquire_start_lock should detect the stale lock and succeed.
-        let result = try_acquire_start_lock().expect("should not error");
+        let result = try_acquire_start_lock_at(&test_control_state(daemon_home.path()))
+            .expect("should not error");
         assert!(
             result.is_some(),
             "stale lock (>30s old) should be removed and lock acquired"
@@ -10943,13 +13177,14 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let lock_path = daemon_home.path().join(daemon_start_lock_file_name());
+        let lock_path = test_daemon_path(daemon_home.path(), daemon_start_lock_file_name());
 
         // Create a fresh lock file (just now — well within 30s threshold).
         std::fs::write(&lock_path, "").expect("create lock");
 
         // try_acquire_start_lock should see the fresh lock and return None.
-        let result = try_acquire_start_lock().expect("should not error");
+        let result = try_acquire_start_lock_at(&test_control_state(daemon_home.path()))
+            .expect("should not error");
         assert!(
             result.is_none(),
             "fresh lock (<30s old) should block acquisition"
@@ -10967,15 +13202,15 @@ mod tests {
         // and that it doesn't panic — actual file removal is best-effort.
         let dir = TempDir::new().expect("temp dir");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", dir.path());
-        let port_file = dir.path().join(LEGACY_DAEMON_PORT_FILE);
-        let pid_file = dir.path().join(LEGACY_DAEMON_PID_FILE);
-        let lock_file = dir.path().join(LEGACY_DAEMON_START_LOCK_FILE);
+        let port_file = test_daemon_path(dir.path(), LEGACY_DAEMON_PORT_FILE);
+        let pid_file = test_daemon_path(dir.path(), LEGACY_DAEMON_PID_FILE);
+        let lock_file = test_daemon_path(dir.path(), LEGACY_DAEMON_START_LOCK_FILE);
 
         std::fs::write(&port_file, "12345").expect("write port");
         std::fs::write(&pid_file, "99999").expect("write pid");
         std::fs::write(&lock_file, "").expect("write lock");
 
-        cleanup_daemon_files();
+        cleanup_daemon_files_at(&test_control_state(dir.path()));
 
         assert!(!port_file.exists(), "cleanup removes port file");
         assert!(!pid_file.exists(), "cleanup removes pid file");
@@ -10988,15 +13223,15 @@ mod tests {
         let daemon_home = TempDir::new().expect("daemon home");
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
-        let port_file = daemon_home.path().join(LEGACY_DAEMON_PORT_FILE);
-        let pid_file = daemon_home.path().join(LEGACY_DAEMON_PID_FILE);
-        let lock_file = daemon_home.path().join(LEGACY_DAEMON_START_LOCK_FILE);
+        let port_file = test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE);
+        let pid_file = test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PID_FILE);
+        let lock_file = test_daemon_path(daemon_home.path(), LEGACY_DAEMON_START_LOCK_FILE);
 
         std::fs::write(&port_file, "12345").expect("write port");
         std::fs::write(&pid_file, "99999").expect("write pid");
         std::fs::write(&lock_file, "").expect("write lock");
 
-        cleanup_daemon_runtime_files();
+        cleanup_daemon_runtime_files_at(&test_control_state(daemon_home.path()));
 
         assert!(!port_file.exists(), "runtime cleanup removes port file");
         assert!(!pid_file.exists(), "runtime cleanup removes pid file");
@@ -11013,15 +13248,16 @@ mod tests {
         let _env_guard = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
 
         std::fs::write(
-            daemon_home.path().join(LEGACY_DAEMON_PORT_FILE),
+            test_daemon_path(daemon_home.path(), LEGACY_DAEMON_PORT_FILE),
             "not-a-port",
         )
         .expect("write corrupt port");
 
         let identity = current_daemon_identity();
-        let selected = daemon_port_if_compatible(&identity)
-            .await
-            .expect("corrupt port should be ignored, not fatal");
+        let selected =
+            daemon_port_if_compatible_at(&test_control_state(daemon_home.path()), &identity)
+                .await
+                .expect("corrupt port should be ignored, not fatal");
 
         assert_eq!(selected, None);
     }

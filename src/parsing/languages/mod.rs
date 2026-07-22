@@ -115,6 +115,7 @@ pub fn extract_symbols(node: &Node, source: &str, language: &LanguageId) -> Vec<
         | LanguageId::Toml
         | LanguageId::Yaml
         | LanguageId::Markdown
+        | LanguageId::Text
         | LanguageId::Env => unreachable!("config types are handled before parse_source"),
         LanguageId::Html => html::extract_symbols(node, source),
         LanguageId::Css => css::extract_symbols(node, source),

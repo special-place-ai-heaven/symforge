@@ -8,6 +8,8 @@ pub mod git_temporal;
 // now a real `detect_impact` production dependency (no longer cbm-spike-gated).
 pub mod graph;
 mod health_view;
+pub mod knowledge_authority;
+pub mod knowledge_bridge;
 pub mod persist;
 pub(crate) mod qualified_usages;
 pub mod query;
@@ -29,7 +31,9 @@ pub use query::{
     WhatChangedTimestampView,
 };
 pub use store::{
-    CircuitBreakerState, IndexLoadSource, IndexState, IndexedFile, LiveIndex, ParseStatus,
-    PublishedIndexState, PublishedIndexStatus, ReferenceLocation, SharedIndex, SharedIndexHandle,
+    AuthorityPublicationFence, CircuitBreakerState, CodeSignalsSnapshot,
+    GitTemporalPublicationFence, IndexLoadSource, IndexState, IndexedFile, LiveIndex, ParseStatus,
+    PreparedKnowledgeAuthority, PublicationFence, PublishedGeneration, PublishedIndexState,
+    PublishedIndexStatus, PublishedSourceSet, ReferenceLocation, SharedIndex, SharedIndexHandle,
     SnapshotVerifyState,
 };

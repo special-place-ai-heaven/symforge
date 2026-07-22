@@ -1,6 +1,6 @@
 //! `OperatorSetupProfile` — operator-local setup convenience state (009, D5).
 //!
-//! Persisted to `<project>/.symforge/operator-setup.json`, mirroring the
+//! Persisted to the process-global control-state `operator-setup.json`, mirroring the
 //! `OnboardingState` load/save pattern (`cli::onboarding`). Drives reuse-if-running
 //! and idempotent re-run (FR-012/013). This is operator convenience state, not an
 //! index (Constitution I unaffected).
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::harness::HarnessId;
 use crate::cli::setup::InstallationType;
+use crate::domain::ControlStateDir;
 
 /// On-disk filename for the operator setup profile inside the SymForge data dir.
 pub const OPERATOR_SETUP_PROFILE_FILE: &str = "operator-setup.json";
@@ -37,7 +38,7 @@ pub enum AuthPosture {
 
 /// Persisted operator setup convenience state (E1).
 ///
-/// Serialized to `<project>/.symforge/operator-setup.json`. `harnesses` is stored
+/// Serialized to the process-global control-state `operator-setup.json`. `harnesses` is stored
 /// as the stable [`HarnessId::slug`] strings (e.g. `"claude"`, `"cursor"`) so the
 /// on-disk shape is human-readable and stable across `HarnessId` reordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,27 +74,28 @@ impl OperatorSetupProfile {
         }
     }
 
-    /// Resolve the profile path under `<base>/.symforge/`.
-    pub fn path(base: &Path) -> PathBuf {
-        crate::paths::resolve_symforge_dir(base).join(OPERATOR_SETUP_PROFILE_FILE)
+    /// Resolve the process-global operator profile path.
+    pub fn path(control_state_dir: &ControlStateDir) -> PathBuf {
+        crate::paths::control_state_path(control_state_dir, OPERATOR_SETUP_PROFILE_FILE)
     }
 
     /// Load the profile for project `base`. A missing **or** malformed file yields
     /// `None` (a fresh run) — setup is best-effort and must never fail the caller
     /// on a corrupt/old profile (D5, contract: operator-profile.md).
-    pub fn load(base: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(Self::path(base)).ok()?;
+    pub fn load(control_state_dir: &ControlStateDir) -> Option<Self> {
+        let text = std::fs::read_to_string(Self::path(control_state_dir)).ok()?;
         serde_json::from_str(&text).ok()
     }
 
     /// Persist this profile for project `base` atomically (temp file in the same
     /// dir + rename), mirroring `harness_apply::atomic_write`. The `.symforge`
     /// directory is created if needed.
-    pub fn save(&self, base: &Path) -> std::io::Result<()> {
-        let path = Self::path(base);
-        let dir = crate::paths::ensure_symforge_dir(base)?;
+    pub fn save(&self, control_state_dir: &ControlStateDir) -> std::io::Result<()> {
+        let path = Self::path(control_state_dir);
+        crate::paths::ensure_control_state_dir(control_state_dir)?;
+        let dir = control_state_dir.as_path();
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        atomic_write_in(&dir, &path, json.as_bytes())
+        atomic_write_in(dir, &path, json.as_bytes())
     }
 }
 
@@ -115,6 +117,10 @@ fn atomic_write_in(dir: &Path, path: &Path, content: &[u8]) -> std::io::Result<(
 mod tests {
     use super::*;
 
+    fn control_state(root: &Path) -> ControlStateDir {
+        ControlStateDir::new(root.join("control"))
+    }
+
     fn sample() -> OperatorSetupProfile {
         OperatorSetupProfile::new(
             InstallationType::Both,
@@ -128,17 +134,18 @@ mod tests {
     #[test]
     fn load_missing_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        // No .symforge/operator-setup.json under a fresh temp project.
-        assert_eq!(OperatorSetupProfile::load(dir.path()), None);
+        let control = control_state(dir.path());
+        assert_eq!(OperatorSetupProfile::load(&control), None);
     }
 
     #[test]
     fn save_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
+        let control = control_state(dir.path());
         let profile = sample();
-        profile.save(dir.path()).expect("save profile");
+        profile.save(&control).expect("save profile");
 
-        let loaded = OperatorSetupProfile::load(dir.path()).expect("load saved profile");
+        let loaded = OperatorSetupProfile::load(&control).expect("load saved profile");
         assert_eq!(loaded, profile);
         // Harnesses persist as stable slugs.
         assert_eq!(loaded.harnesses, vec!["claude", "cursor"]);
@@ -148,19 +155,21 @@ mod tests {
     #[test]
     fn malformed_file_returns_none() {
         let dir = tempfile::tempdir().unwrap();
+        let control = control_state(dir.path());
         // Write garbage into the profile path; load must degrade to None, not error.
-        crate::paths::ensure_symforge_dir(dir.path()).unwrap();
+        crate::paths::ensure_control_state_dir(&control).unwrap();
         std::fs::write(
-            OperatorSetupProfile::path(dir.path()),
+            OperatorSetupProfile::path(&control),
             b"{ this is not valid json",
         )
         .unwrap();
-        assert_eq!(OperatorSetupProfile::load(dir.path()), None);
+        assert_eq!(OperatorSetupProfile::load(&control), None);
     }
 
     #[test]
     fn network_keyed_posture_persists_without_key_bytes() {
         let dir = tempfile::tempdir().unwrap();
+        let control = control_state(dir.path());
         let profile = OperatorSetupProfile::new(
             InstallationType::Server,
             9000,
@@ -168,11 +177,11 @@ mod tests {
             &[HarnessId::Codex],
             1,
         );
-        profile.save(dir.path()).expect("save");
-        let text = std::fs::read_to_string(OperatorSetupProfile::path(dir.path())).unwrap();
+        profile.save(&control).expect("save");
+        let text = std::fs::read_to_string(OperatorSetupProfile::path(&control)).unwrap();
         // The posture is recorded; no key material is present in the file.
         assert!(text.contains("network-keyed"));
-        let loaded = OperatorSetupProfile::load(dir.path()).expect("load");
+        let loaded = OperatorSetupProfile::load(&control).expect("load");
         assert_eq!(loaded.auth_posture, AuthPosture::NetworkKeyed);
     }
 }

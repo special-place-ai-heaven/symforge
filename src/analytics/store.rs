@@ -8,6 +8,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::capability::CapabilityEvidence;
+use crate::domain::index::ProjectStateDir;
+use crate::paths::{ANALYTICS_DB_NAME, ensure_project_state_db_path, project_state_path};
 use crate::protocol::result_status::OutcomeClass;
 
 use super::schema::{CURRENT_SCHEMA_VERSION, META_SCHEMA_VERSION, SCHEMA_V1};
@@ -31,21 +33,21 @@ pub enum AnalyticsMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyticsConfig {
     pub mode: AnalyticsMode,
-    pub db_path: PathBuf,
+    pub project_state_dir: ProjectStateDir,
 }
 
 impl AnalyticsConfig {
-    pub fn disabled(db_path: impl Into<PathBuf>) -> Self {
+    pub fn disabled(project_state_dir: ProjectStateDir) -> Self {
         Self {
             mode: AnalyticsMode::Disabled,
-            db_path: db_path.into(),
+            project_state_dir,
         }
     }
 
-    pub fn enabled(db_path: impl Into<PathBuf>) -> Self {
+    pub fn enabled(project_state_dir: ProjectStateDir) -> Self {
         Self {
             mode: AnalyticsMode::Enabled,
-            db_path: db_path.into(),
+            project_state_dir,
         }
     }
 }
@@ -226,10 +228,13 @@ pub enum AnalyticsStore {
 
 impl AnalyticsStore {
     pub fn open(config: AnalyticsConfig) -> Result<Self> {
+        let db_path = project_state_path(&config.project_state_dir, ANALYTICS_DB_NAME);
         match config.mode {
-            AnalyticsMode::Disabled => Ok(Self::disabled(config.db_path)),
+            AnalyticsMode::Disabled => Ok(Self::disabled(db_path)),
             AnalyticsMode::Enabled => {
-                Ok(Self::Enabled(SqliteAnalyticsStore::open(&config.db_path)?))
+                let db_path =
+                    ensure_project_state_db_path(&config.project_state_dir, ANALYTICS_DB_NAME)?;
+                Ok(Self::Enabled(SqliteAnalyticsStore::open(&db_path)?))
             }
         }
     }
@@ -568,6 +573,13 @@ fn bounded_scope(scope: &AnalyticsScope) -> AnalyticsScope {
 }
 
 fn contains_sensitive_marker(raw: &str) -> bool {
+    if !matches!(
+        crate::knowledge::scan_secret_bytes("analytics", raw.as_bytes()),
+        crate::knowledge::SecretScan::Clean
+    ) {
+        return true;
+    }
+
     let lower = raw.to_ascii_lowercase();
     [
         "authorization",
@@ -674,8 +686,11 @@ mod tests {
     #[test]
     fn disabled_store_reports_status_and_keeps_filesystem_footprint_free() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = crate::paths::symforge_db_path(tmp.path(), crate::paths::ANALYTICS_DB_NAME);
-        let store = AnalyticsStore::open(AnalyticsConfig::disabled(&db_path)).expect("disabled");
+        let project_state = ProjectStateDir::new(tmp.path().join(crate::paths::SYMFORGE_DIR_NAME));
+        let db_path =
+            crate::paths::project_state_path(&project_state, crate::paths::ANALYTICS_DB_NAME);
+        let store =
+            AnalyticsStore::open(AnalyticsConfig::disabled(project_state)).expect("disabled");
 
         assert!(store.status().expect("status").is_disabled());
         assert!(
@@ -793,5 +808,46 @@ mod tests {
         assert_eq!(record.estimated_tokens, Some(i64::MAX as u64));
         assert_eq!(record.duration_ms, i64::MAX as u64);
         assert_eq!(record.outcome_class, "internal_failure");
+    }
+
+    #[test]
+    fn runtime_canary_is_absent_from_analytics_storage() {
+        let store = SqliteAnalyticsStore::open_in_memory().expect("analytics store");
+        let canary = ["runtime", "-", "canary", "-", "analytics"].concat();
+        let marked = format!("{}={}", ["to", "ken"].concat(), canary);
+        let observation = AnalyticsObservation::new(
+            "search_knowledge",
+            AnalyticsSurface::Other(marked.clone()),
+            AnalyticsScope::Other(marked.clone()),
+            0,
+            Some(0),
+            Duration::ZERO,
+            false,
+            OutcomeClass::InvalidRequest,
+        )
+        .with_capability_state(vec![
+            CapabilityEvidence::new(
+                CapabilityName::RankingDiagnostics,
+                CapabilityStatus::DisabledByPolicy,
+            )
+            .with_detail(marked),
+        ]);
+
+        store.record(&observation).expect("record");
+        let record = store
+            .recent_records(1)
+            .expect("records")
+            .pop()
+            .expect("one record");
+        let stored = format!(
+            "{} {} {} {}",
+            record.tool_name, record.surface, record.configured_scope, record.capability_state_json
+        );
+        assert!(
+            !stored
+                .as_bytes()
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
     }
 }

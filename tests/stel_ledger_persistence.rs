@@ -29,6 +29,7 @@
 
 use rusqlite::Connection;
 
+use symforge::domain::ProjectStateDir;
 use symforge::paths::{STEL_LEDGER_DB_NAME, symforge_db_path};
 use symforge::stel::ledger_store::{
     CURRENT_ESTIMATOR_VERSION, LEDGER_RETENTION_MAX, LedgerStoreStatus, PRE_013_ESTIMATOR_SENTINEL,
@@ -39,6 +40,10 @@ use symforge::stel::types::{AdmissionDecision, IntentBucket, RouteConfidence, St
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+fn project_state(root: &std::path::Path) -> ProjectStateDir {
+    ProjectStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
+}
 
 fn sample_event(plan_id: &str) -> StelLedgerEvent {
     StelLedgerEvent {
@@ -514,7 +519,7 @@ fn corrupt_db_degrades_to_disabled_not_a_panic() {
 
     // The dir-entry open must NOT panic and must yield Disabled (quarantined),
     // distinct from "no store wired" (Unavailable = Option::None at the boundary).
-    let store = StelLedgerStore::open(dir, "sess-corrupt");
+    let store = StelLedgerStore::open(&project_state(dir), "sess-corrupt");
     assert!(
         matches!(store, StelLedgerStore::Disabled),
         "a corrupt/non-DB file must degrade to Disabled, not serve"
@@ -712,7 +717,8 @@ fn cross_session_accumulation_is_cumulative_across_restarts() {
     let mut last_seen_total = 0_u64;
 
     for (session_idx, count) in per_session.iter().enumerate() {
-        let store = StelLedgerStore::open(root, format!("stdio-sess-{session_idx}"));
+        let store =
+            StelLedgerStore::open(&project_state(root), format!("stdio-sess-{session_idx}"));
         // On reopen, the prior sessions' events must already be counted — the
         // store is restored, NOT reset to zero.
         let on_open = store
@@ -748,7 +754,7 @@ fn cross_session_accumulation_is_cumulative_across_restarts() {
 
     // Final independent reopen confirms the durable cumulative count survived
     // every restart (SC-003: >= 3 restarts, cumulative, non-reset).
-    let final_store = StelLedgerStore::open(root, "stdio-sess-final");
+    let final_store = StelLedgerStore::open(&project_state(root), "stdio-sess-final");
     assert_eq!(
         final_store.summary().expect("final summary").total_events,
         expected_total,
@@ -770,7 +776,7 @@ fn forced_open_failure_degrades_to_disabled_distinguishably_never_panics() {
     // The dir-entry open must NOT panic and must yield a distinguishable
     // `Disabled` (the stdio/embed in-memory degrade, FR-003) — never a silent
     // zero-count that masquerades as durable accumulation.
-    let store = StelLedgerStore::open(dir, "stdio-degrade");
+    let store = StelLedgerStore::open(&project_state(dir), "stdio-degrade");
     assert!(
         matches!(store, StelLedgerStore::Disabled),
         "an unopenable db must degrade to Disabled, not serve"
@@ -804,7 +810,7 @@ fn one_db_spans_sessions_transport_parity() {
 
     // Session A (e.g. the serve surface) records two events, then exits.
     {
-        let store_a = StelLedgerStore::open(dir, "serve-1234");
+        let store_a = StelLedgerStore::open(&project_state(dir), "serve-1234");
         store_a.record(&sample_event("a-0"));
         store_a.record(&sample_event("a-1"));
         assert_eq!(store_a.summary().unwrap().total_events, 2);
@@ -813,7 +819,7 @@ fn one_db_spans_sessions_transport_parity() {
     // Session B (e.g. the stdio surface) under a DIFFERENT session_id opens the
     // SAME dir and must see A's events — there is ONE durable db, one
     // session-spanning count. stdio and serve back onto the same store.
-    let store_b = StelLedgerStore::open(dir, "stdio-5678");
+    let store_b = StelLedgerStore::open(&project_state(dir), "stdio-5678");
     assert_eq!(
         store_b.summary().unwrap().total_events,
         2,
@@ -898,8 +904,8 @@ fn single_process_two_openers_coexist_without_contention_or_lost_writes() {
     // Opener A is the stdio durable store; opener B is a second handle on the
     // SAME db file within the SAME process (the worst case the sidecar topology
     // could ever approximate). Both are live simultaneously.
-    let store_a = StelLedgerStore::open(dir, "stdio-A");
-    let store_b = StelLedgerStore::open(dir, "second-opener-B");
+    let store_a = StelLedgerStore::open(&project_state(dir), "stdio-A");
+    let store_b = StelLedgerStore::open(&project_state(dir), "second-opener-B");
     assert!(
         matches!(store_a, StelLedgerStore::Sqlite(_)),
         "opener A must open cleanly (WAL)"
@@ -927,7 +933,7 @@ fn single_process_two_openers_coexist_without_contention_or_lost_writes() {
     // (no lost write across the two-opener interleave).
     drop(store_a);
     drop(store_b);
-    let reopened = StelLedgerStore::open(dir, "verify");
+    let reopened = StelLedgerStore::open(&project_state(dir), "verify");
     assert_eq!(
         reopened.summary().expect("reopen summary").total_events,
         20,
@@ -953,7 +959,7 @@ fn open_under_project_root_lands_db_at_single_symforge_prefix_not_doubled() {
 
     // Open via the PRODUCTION calling convention: pass the project ROOT (exactly
     // what serve.rs / main.rs pass). The store must open cleanly and record.
-    let store = StelLedgerStore::open(root, "prod-convention");
+    let store = StelLedgerStore::open(&project_state(root), "prod-convention");
     assert!(
         matches!(store, StelLedgerStore::Sqlite(_)),
         "opening under the project root must succeed (parent .symforge created on demand)"

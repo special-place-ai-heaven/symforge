@@ -615,6 +615,26 @@ fn test_run_init_codex_only_updates_codex_files() {
 }
 
 #[test]
+fn project_aware_init_reconciles_existing_root_gitignore() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).expect("create git metadata marker");
+    std::fs::write(cwd.path().join(".gitignore"), b"target/\n").expect("write root gitignore");
+    let binary_path = std::path::PathBuf::from(FAKE_BINARY);
+
+    run_init_with_context(InitClient::Codex, home.path(), cwd.path(), &binary_path)
+        .expect("project-aware init must succeed");
+    run_init_with_context(InitClient::Codex, home.path(), cwd.path(), &binary_path)
+        .expect("repeated project-aware init must succeed");
+
+    assert_eq!(
+        std::fs::read(cwd.path().join(".gitignore")).expect("read reconciled gitignore"),
+        b"target/\n/.symforge/\n",
+        "init must reconcile once, preserve newline style, and remain idempotent"
+    );
+}
+
+#[test]
 fn test_run_init_claude_only_updates_claude_files() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();

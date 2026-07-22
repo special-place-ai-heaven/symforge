@@ -1,22 +1,30 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use rayon::prelude::*;
 use tracing::{error, info, warn};
 
+use super::knowledge_authority::{
+    AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
+};
+use super::knowledge_bridge::{BridgeLimits, KnowledgeBridge, build_knowledge_bridge};
 use super::query::RepoOutlineView;
 use crate::domain::ParseDiagnostic;
-use crate::domain::index::{AdmissionTier, SkippedFile};
+use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
 use crate::domain::{
-    FileClassification, FileOutcome, FileProcessingResult, LanguageId, ReferenceRecord,
-    SymbolRecord, find_enclosing_symbol,
+    CatalogEntry, CoverageStatus, FileClassification, FileDisposition, FileOutcome,
+    FileProcessingResult, FreshnessReason, FreshnessStatus, HardSkipReason, HistoryCoverage,
+    HistoryLimit, LanguageId, ManifestResourceUsage, MetadataOnlyReason, ProjectStateDir,
+    ReferenceRecord, RepositoryManifest, ScoutDecision, SourceId, SourceIdentity,
+    SourceResponseEnvelope, SourceVersion, StatePlacement, SymbolRecord, WorkingTreeState,
+    find_enclosing_symbol,
 };
 use crate::{discovery, parsing};
 
@@ -110,37 +118,16 @@ const MAX_INFLIGHT_BYTES_ENV: &str = "SYMFORGE_MAX_INFLIGHT_BYTES";
 /// recognized-source files that would otherwise be read fully in parallel.
 const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Files at or below this size are read with unbounded Rayon parallelism: they
-/// are too small to threaten peak memory, and forcing them through the budget
-/// would add pointless contention. Only files strictly above this threshold
-/// acquire permits against the in-flight budget before being read fully.
-///
-/// This is intentionally set BELOW [`crate::domain::index::METADATA_ONLY_BYTES`]
-/// (1 MiB), which is the effective per-file ceiling for the parse path: files
-/// larger than that are classified `MetadataOnly` and never read here. Choosing
-/// 256 KiB means the governor actually engages on the largest *parsed* files
-/// (those between 256 KiB and 1 MiB) — the ones whose concurrent reads dominate
-/// peak — while the bulk of tiny source files stay fully parallel. If the
-/// metadata ceiling is ever raised to admit larger source files, this budget
-/// keeps peak resident bytes bounded by the budget rather than by thread count.
-const INFLIGHT_GOVERNOR_THRESHOLD_BYTES: u64 = 256 * 1024;
-
-/// Bounds the PEAK concurrent in-memory bytes consumed by full-file reads
-/// during admission, without changing WHICH files are admitted.
+/// Bounds the peak concurrent in-memory bytes consumed by full-file reads.
 ///
 /// The cumulative byte cap in discovery limits total tree size, but says
 /// nothing about how much is resident *at once*. The admission gate reads every
 /// `Normal`-tier file fully into a `Vec<u8>` in parallel via Rayon. Today the
 /// per-file read ceiling on that path is `METADATA_ONLY_BYTES` (1 MiB) — larger
 /// files are classified `MetadataOnly` and skipped without a read — so peak is
-/// already `num_threads * up-to-1-MiB`. This governor makes peak independent of
-/// `num_threads` AND robust to any future raise of that ceiling: a worker about
-/// to read a file above the threshold acquires permits equal to its size
-/// (clamped to the total budget, so a single
-/// file larger than the whole budget still proceeds — alone) and releases them
-/// once the bytes are no longer held. Large files therefore read with bounded
-/// concurrency while small files stay fully parallel. Coverage is unchanged:
-/// every file still gets read and classified exactly as before.
+/// already `num_threads * up-to-1-MiB`. Every admitted read reserves its declared
+/// size before access and holds that permit through parse and staged hand-off.
+/// Callers reject a file larger than the total budget before allocation.
 struct InflightByteBudget {
     total: u64,
     state: std::sync::Mutex<u64>,
@@ -218,6 +205,263 @@ impl Drop for InflightPermit {
         // Wake all waiters: a large release may unblock several small waiters.
         self.budget.available.notify_all();
     }
+}
+
+/// Independent resident-byte accounting for content that has crossed from the
+/// transient read/parse pipeline into the staged index. A successful hand-off
+/// reserves staged capacity first and only then releases the transient permit,
+/// so the bytes are continuously accounted without retaining permits for the
+/// entire cold-load generation.
+struct StagedContentAccounting {
+    ceiling: u64,
+    used: AtomicU64,
+}
+
+impl StagedContentAccounting {
+    fn new(ceiling: u64) -> Self {
+        Self {
+            ceiling,
+            used: AtomicU64::new(0),
+        }
+    }
+
+    fn handoff(&self, bytes: u64, permit: Option<InflightPermit>) -> bool {
+        let reserved = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.ceiling)
+            })
+            .is_ok();
+        drop(permit);
+        reserved
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StableReadLimits {
+    per_file_bytes: u64,
+    inflight_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StableReadPass {
+    bytes: Option<Vec<u8>>,
+    length: u64,
+    hash: [u8; 32],
+    handle_before: crate::domain::FileStamp,
+    handle_after: crate::domain::FileStamp,
+    path_after: crate::domain::FileStamp,
+}
+
+trait StableReadAccess {
+    fn first_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass>;
+    fn second_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass>;
+}
+
+struct FilesystemStableReadAccess;
+
+fn file_stamp_from_metadata(metadata: &std::fs::Metadata) -> crate::domain::FileStamp {
+    crate::domain::FileStamp {
+        size: metadata.len(),
+        created_hint: metadata.created().ok(),
+        modified_hint: metadata.modified().ok(),
+        platform_id: None,
+    }
+}
+
+impl FilesystemStableReadAccess {
+    fn read_pass(
+        path: &Path,
+        max_bytes: usize,
+        retain_bytes: bool,
+    ) -> std::io::Result<StableReadPass> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path)?;
+        let handle_before = file_stamp_from_metadata(&file.metadata()?);
+        if usize::try_from(handle_before.size).map_or(true, |size| size > max_bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stable read exceeded its pre-authorized bound",
+            ));
+        }
+
+        let mut bytes = retain_bytes.then(Vec::new);
+        if let Some(bytes) = bytes.as_mut() {
+            bytes
+                .try_reserve_exact(handle_before.size as usize)
+                .map_err(|_| std::io::Error::other("stable read reservation failed"))?;
+        }
+        let mut hasher = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("stable read length overflow"))?;
+            if length > max_bytes as u64 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stable read exceeded its pre-authorized bound",
+                ));
+            }
+            hasher.update(&buffer[..read]);
+            if let Some(bytes) = bytes.as_mut() {
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+        }
+
+        let handle_after = file_stamp_from_metadata(&file.metadata()?);
+        let path_after = file_stamp_from_metadata(&std::fs::metadata(path)?);
+        Ok(StableReadPass {
+            bytes,
+            length,
+            hash: hasher.finalize().into(),
+            handle_before,
+            handle_after,
+            path_after,
+        })
+    }
+}
+
+impl StableReadAccess for FilesystemStableReadAccess {
+    fn first_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass> {
+        Self::read_pass(path, max_bytes, true)
+    }
+
+    fn second_pass(&self, path: &Path, max_bytes: usize) -> std::io::Result<StableReadPass> {
+        Self::read_pass(path, max_bytes, false)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StableReadOutcome {
+    Accepted {
+        bytes: Vec<u8>,
+        hash: [u8; 32],
+    },
+    HardSkip {
+        reason: HardSkipReason,
+    },
+    Unreadable {
+        stage: crate::domain::AccessStage,
+        kind: crate::domain::AccessErrorKind,
+    },
+    UnstableDuringRead,
+}
+
+fn stable_read_with_access(
+    path: &Path,
+    scout_stamp: &crate::domain::FileStamp,
+    limits: StableReadLimits,
+    access: &impl StableReadAccess,
+) -> StableReadOutcome {
+    let Ok(max_bytes) = usize::try_from(scout_stamp.size) else {
+        return StableReadOutcome::HardSkip {
+            reason: HardSkipReason::PerFileCeiling,
+        };
+    };
+    if scout_stamp.size > limits.per_file_bytes || scout_stamp.size > limits.inflight_bytes {
+        return StableReadOutcome::HardSkip {
+            reason: HardSkipReason::PerFileCeiling,
+        };
+    }
+
+    let first = match access.first_pass(path, max_bytes) {
+        Ok(first) => first,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return StableReadOutcome::UnstableDuringRead;
+        }
+        Err(error) => {
+            return StableReadOutcome::Unreadable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: discovery::access_error_kind(error.kind()),
+            };
+        }
+    };
+    if &first.handle_before != scout_stamp
+        || &first.handle_after != scout_stamp
+        || &first.path_after != scout_stamp
+    {
+        return StableReadOutcome::UnstableDuringRead;
+    }
+    let Some(bytes) = first.bytes else {
+        return StableReadOutcome::UnstableDuringRead;
+    };
+    if first.length != scout_stamp.size
+        || usize::try_from(first.length).ok() != Some(bytes.len())
+        || first.hash != crate::hash::digest(&bytes)
+    {
+        return StableReadOutcome::UnstableDuringRead;
+    }
+
+    let second = match access.second_pass(path, max_bytes) {
+        Ok(second) => second,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return StableReadOutcome::UnstableDuringRead;
+        }
+        Err(error) => {
+            return StableReadOutcome::Unreadable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: discovery::access_error_kind(error.kind()),
+            };
+        }
+    };
+    if &second.handle_before != scout_stamp
+        || &second.handle_after != scout_stamp
+        || &second.path_after != scout_stamp
+        || second.length != first.length
+        || second.hash != first.hash
+    {
+        return StableReadOutcome::UnstableDuringRead;
+    }
+
+    StableReadOutcome::Accepted {
+        bytes,
+        hash: first.hash,
+    }
+}
+
+fn stable_read_with_retries(
+    path: &Path,
+    scout_stamp: &crate::domain::FileStamp,
+    limits: StableReadLimits,
+    access: &impl StableReadAccess,
+) -> StableReadOutcome {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let outcome = stable_read_with_access(path, scout_stamp, limits, access);
+        if !matches!(outcome, StableReadOutcome::UnstableDuringRead) {
+            return outcome;
+        }
+    }
+    StableReadOutcome::UnstableDuringRead
+}
+
+pub(crate) fn stable_read_file(
+    path: &Path,
+    scout_stamp: &crate::domain::FileStamp,
+) -> StableReadOutcome {
+    stable_read_with_retries(
+        path,
+        scout_stamp,
+        StableReadLimits {
+            per_file_bytes: crate::domain::index::HARD_SKIP_BYTES,
+            inflight_bytes: InflightByteBudget::from_env().total,
+        },
+        &FilesystemStableReadAccess,
+    )
 }
 
 /// Per-file parse status stored in the index.
@@ -594,6 +838,221 @@ pub struct PublishedIndexState {
     pub indexed_root: Option<PathBuf>,
 }
 
+/// One immutable externally observable repository generation.
+///
+/// Gate E grows this core bundle with source identity, canonical manifest, and
+/// code-signal metadata. Live content, health, and outline already share this
+/// single publication root so readers cannot observe mixed swaps.
+pub struct CodeSignalsSnapshot {
+    pub state: super::git_temporal::GitTemporalState,
+    pub temporal: Arc<super::git_temporal::GitTemporalIndex>,
+    pub computed_for_content_generation: u64,
+    pub computed_for_source_version: SourceVersion,
+    pub coverage: Arc<HistoryCoverage>,
+}
+
+pub struct PublishedGeneration {
+    pub publication_generation: u64,
+    pub content_generation: u64,
+    pub project_generation: u64,
+    pub source: Option<Arc<SourceIdentity>>,
+    pub source_version: Option<Arc<SourceVersion>>,
+    pub freshness: Arc<FreshnessStatus>,
+    pub manifest: Option<Arc<RepositoryManifest>>,
+    pub code_signals: Arc<CodeSignalsSnapshot>,
+    pub bridge: Arc<KnowledgeBridge>,
+    pub authority: Arc<KnowledgeAuthorityView>,
+    pub live: Arc<LiveIndex>,
+    pub health: Arc<PublishedIndexState>,
+    pub outline: Arc<RepoOutlineView>,
+}
+
+impl PublishedGeneration {
+    pub fn source_response_envelope(&self) -> Option<SourceResponseEnvelope> {
+        let manifest = self.manifest.as_ref()?;
+        Some(SourceResponseEnvelope {
+            source: self.source.as_ref()?.as_ref().clone(),
+            source_version: self.source_version.as_ref()?.as_ref().clone(),
+            publication_generation: self.publication_generation,
+            content_generation: self.content_generation,
+            freshness: self.freshness.as_ref().clone(),
+            manifest_digest: manifest.digest.clone(),
+            coverage: manifest.coverage,
+        })
+    }
+}
+
+pub struct PublishedSourceSet {
+    pub registry_generation: u64,
+    pub current_source_id: SourceId,
+    pub sources: BTreeMap<SourceId, Arc<PublishedGeneration>>,
+}
+
+impl PublishedSourceSet {
+    pub fn current_generation(&self) -> Arc<PublishedGeneration> {
+        Arc::clone(
+            self.sources
+                .get(&self.current_source_id)
+                .expect("published source set must contain its current source"),
+        )
+    }
+}
+
+fn unbound_source_id() -> SourceId {
+    SourceId::new("symforge:unbound-source")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationFence {
+    pub publication_generation: u64,
+    pub content_generation: u64,
+    pub project_generation: u64,
+}
+
+pub struct PreparedKnowledgeBridge {
+    fence: PublicationFence,
+    bridge: Arc<KnowledgeBridge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityPublicationFence {
+    pub publication: PublicationFence,
+    pub source: Option<SourceIdentity>,
+    pub source_version: Option<SourceVersion>,
+}
+
+/// Exact repository state a background git-temporal computation is allowed to
+/// describe. Publication-only refreshes do not invalidate the work, while any
+/// content, source identity, or source-version movement does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitTemporalPublicationFence {
+    pub project_generation: u64,
+    pub content_generation: u64,
+    pub source: Option<SourceIdentity>,
+    pub source_version: Option<SourceVersion>,
+}
+
+pub struct PreparedKnowledgeAuthority {
+    fence: AuthorityPublicationFence,
+    authority: Arc<KnowledgeAuthorityView>,
+}
+
+fn capture_published_manifest(
+    live: &LiveIndex,
+    scout_plan: Option<&discovery::ScoutPlan>,
+) -> Option<Arc<RepositoryManifest>> {
+    let root = live.indexed_root.as_deref()?;
+    let canonical_root = dunce::canonicalize(root).ok()?;
+    let project_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
+    let captured = match super::persist::capture_repository_source(&canonical_root, &project_id) {
+        Ok(captured) => captured,
+        Err(error) => {
+            warn!(%error, "failed to capture published source identity");
+            return None;
+        }
+    };
+    let coverage = scout_plan.map_or_else(
+        || {
+            if manifest_requires_degraded_coverage(live) {
+                CoverageStatus::Degraded
+            } else {
+                CoverageStatus::Complete
+            }
+        },
+        |plan| plan.coverage,
+    );
+    let issues = scout_plan
+        .map(|plan| plan.issues.clone())
+        .unwrap_or_default();
+    let usage = scout_plan
+        .map(|plan| plan.usage)
+        .unwrap_or_else(|| ManifestResourceUsage {
+            catalog_entries: live.manifest_entries.len() as u64,
+            catalog_metadata_bytes: serde_json::to_vec(&live.manifest_entries)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or_default(),
+            admitted_content_bytes: live.files.values().map(|file| file.byte_len).sum(),
+        });
+    match RepositoryManifest::new(
+        1,
+        1,
+        crate::knowledge::SECRET_POLICY_VERSION,
+        captured.source,
+        captured.source_version,
+        coverage,
+        live.manifest_entries.clone(),
+        issues,
+        usage,
+    ) {
+        Ok(manifest) => Some(Arc::new(manifest)),
+        Err(error) => {
+            warn!(%error, "failed to build canonical published manifest");
+            None
+        }
+    }
+}
+
+fn capture_history_coverage(
+    live: &LiveIndex,
+    temporal_state: &super::git_temporal::GitTemporalState,
+) -> Arc<HistoryCoverage> {
+    let Some(root) = live.indexed_root.as_deref() else {
+        return Arc::new(HistoryCoverage {
+            complete_to_root: false,
+            limitations: vec![HistoryLimit::Unavailable],
+        });
+    };
+    let mut coverage = super::persist::capture_history_coverage(root);
+    let mut add_limit = |limit| {
+        if !coverage.limitations.contains(&limit) {
+            coverage.limitations.push(limit);
+        }
+    };
+    match temporal_state {
+        super::git_temporal::GitTemporalState::Ready => {
+            // The shipped temporal index intentionally analyzes a bounded
+            // commit/time window and does not follow renames across paths.
+            add_limit(HistoryLimit::WindowLimited);
+            add_limit(HistoryLimit::RenameFollowLimited);
+        }
+        super::git_temporal::GitTemporalState::Pending
+        | super::git_temporal::GitTemporalState::Computing
+        | super::git_temporal::GitTemporalState::Unavailable(_) => {
+            add_limit(HistoryLimit::Unavailable);
+        }
+    }
+    coverage.complete_to_root = false;
+    Arc::new(coverage)
+}
+
+fn build_published_authority(
+    live: &LiveIndex,
+    source: Option<&SourceIdentity>,
+    source_version: Option<&SourceVersion>,
+    content_generation: u64,
+    bridge: &KnowledgeBridge,
+    code_signals: &CodeSignalsSnapshot,
+    manifest: Option<&RepositoryManifest>,
+) -> Arc<KnowledgeAuthorityView> {
+    let (Some(source), Some(source_version)) = (source, source_version) else {
+        return Arc::new(KnowledgeAuthorityView::default());
+    };
+    let temporal =
+        AuthorityTemporalIndex::from_components(live, Some(source_version), code_signals);
+    Arc::new(build_knowledge_authority(
+        live,
+        source,
+        source_version,
+        content_generation,
+        bridge,
+        &temporal,
+        manifest.map_or(crate::knowledge::SECRET_POLICY_VERSION, |manifest| {
+            manifest.secret_policy_version
+        }),
+        &AuthorityLimits::default(),
+    ))
+}
+
 /// The in-memory index: file contents and parsed symbols for all discovered files.
 #[derive(Clone)]
 pub struct LiveIndex {
@@ -623,8 +1082,13 @@ pub struct LiveIndex {
     /// Compiled gitignore patterns loaded at index time. Used by NoisePolicy
     /// to classify files as vendor/generated/ignored noise.
     pub(crate) gitignore: Option<ignore::gitignore::Gitignore>,
-    /// Files that were not fully indexed (Tier 2 metadata-only or Tier 3 hard-skipped).
-    pub(crate) skipped_files: Vec<SkippedFile>,
+    /// Canonical catalog/disposition state for the current live generation.
+    ///
+    /// This is the runtime `RepositoryManifest.entries` lane. Gate E wraps it in
+    /// the fully versioned manifest/publication bundle; until then it already is
+    /// the sole disposition authority. Legacy `SkippedFile` responses are
+    /// projected from these entries and are never stored independently.
+    pub(crate) manifest_entries: Vec<CatalogEntry>,
     /// Per-workspace co-change store, present when policy warms it or when
     /// lazy policy finds an existing store at startup.
     pub(crate) coupling_store: Option<Arc<super::coupling::CouplingStore>>,
@@ -671,6 +1135,19 @@ pub struct PreUpdateSymbol {
 /// for contention-free reads (previously `RwLock<Arc<T>>`).
 pub struct SharedIndexHandle {
     live: ArcSwap<LiveIndex>,
+    published_source_set: ArcSwap<PublishedSourceSet>,
+    /// Typed owner for every durable per-project side store associated with
+    /// the currently published project generation.
+    project_state_dir: ArcSwapOption<ProjectStateDir>,
+    /// Resolved state/control subtrees that are outside the active source
+    /// generation even when their names are not universally reserved.
+    source_exclusions: ArcSwap<discovery::SourceExclusions>,
+    /// Immutable metadata-first catalog that authorized the current execution
+    /// generation. `None` only for an empty/snapshot compatibility bootstrap.
+    scout_plan: ArcSwapOption<discovery::ScoutPlan>,
+    /// Typed freshness is kept beside the live/scout generation until Gate E
+    /// folds both into the final single publication bundle.
+    freshness_status: ArcSwap<FreshnessStatus>,
     /// Serializes writers — only one mutation in flight at a time.
     write_mutex: Mutex<()>,
     published_state: ArcSwap<PublishedIndexState>,
@@ -687,6 +1164,9 @@ pub struct SharedIndexHandle {
     /// per-file churn, ownership, and co-change data. Populated asynchronously
     /// after index load/reload completes.
     git_temporal: ArcSwap<super::git_temporal::GitTemporalIndex>,
+    /// One running git-temporal computation plus one replaceable latest
+    /// request. This bounds background work during watcher bursts.
+    pub(super) git_temporal_jobs: Mutex<super::git_temporal::GitTemporalJobQueue>,
     /// Pre-update file snapshots: saved automatically by `update_file` before
     /// the index entry is replaced. Consumed (take) by `analyze_file_impact` to
     /// compute accurate diffs even when the watcher re-indexes before the hook fires.
@@ -707,10 +1187,109 @@ pub struct SharedIndexWriteGuard<'a> {
 
 impl SharedIndexHandle {
     pub fn new(index: LiveIndex) -> Self {
+        Self::new_with_scout_plan(index, None)
+    }
+
+    fn new_with_scout_plan(
+        index: LiveIndex,
+        scout_plan: Option<Arc<discovery::ScoutPlan>>,
+    ) -> Self {
+        Self::new_with_scout_plan_and_code_signals(index, scout_plan, None)
+    }
+
+    fn new_with_scout_plan_and_code_signals(
+        index: LiveIndex,
+        scout_plan: Option<Arc<discovery::ScoutPlan>>,
+        code_signals: Option<CodeSignalsSnapshot>,
+    ) -> Self {
+        let manifest = capture_published_manifest(&index, scout_plan.as_deref());
+        let source = manifest
+            .as_ref()
+            .map(|manifest| Arc::new(manifest.source.clone()));
+        let source_version = manifest
+            .as_ref()
+            .map(|manifest| Arc::new(manifest.source_version.clone()));
+        let code_signals = Arc::new(code_signals.unwrap_or_else(|| {
+            let temporal = Arc::new(super::git_temporal::GitTemporalIndex::pending());
+            let coverage = capture_history_coverage(&index, &temporal.state);
+            CodeSignalsSnapshot {
+                state: temporal.state.clone(),
+                temporal,
+                computed_for_content_generation: 0,
+                computed_for_source_version: source_version.as_deref().cloned().unwrap_or(
+                    SourceVersion {
+                        branch: None,
+                        commit: None,
+                        working_tree: WorkingTreeState::Unknown,
+                    },
+                ),
+                coverage,
+            }
+        }));
+        let temporal = Arc::clone(&code_signals.temporal);
+        let freshness_status = if index.is_empty
+            || !matches!(index.snapshot_verify_state, SnapshotVerifyState::NotNeeded)
+        {
+            FreshnessStatus::Verifying
+        } else {
+            FreshnessStatus::Current
+        };
         let published_state = Arc::new(PublishedIndexState::capture(0, &index));
         let published_repo_outline = Arc::new(index.capture_repo_outline_view());
+        let bridge = source
+            .as_deref()
+            .map(|source| {
+                Arc::new(build_knowledge_bridge(
+                    &index,
+                    source,
+                    0,
+                    &BridgeLimits::default(),
+                ))
+            })
+            .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
+        let authority = build_published_authority(
+            &index,
+            source.as_deref(),
+            source_version.as_deref(),
+            0,
+            &bridge,
+            &code_signals,
+            manifest.as_deref(),
+        );
+        let live = Arc::new(index);
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: 0,
+            content_generation: 0,
+            project_generation: 0,
+            source: source.clone(),
+            source_version,
+            freshness: Arc::new(freshness_status.clone()),
+            manifest,
+            code_signals,
+            bridge,
+            authority,
+            live: Arc::clone(&live),
+            health: Arc::clone(&published_state),
+            outline: Arc::clone(&published_repo_outline),
+        });
+        let current_source_id = source
+            .as_ref()
+            .map(|source| source.source_id.clone())
+            .unwrap_or_else(unbound_source_id);
+        let mut sources = BTreeMap::new();
+        sources.insert(current_source_id.clone(), published_generation);
+        let published_source_set = Arc::new(PublishedSourceSet {
+            registry_generation: 0,
+            current_source_id,
+            sources,
+        });
         Self {
-            live: ArcSwap::new(Arc::new(index)),
+            live: ArcSwap::new(live),
+            published_source_set: ArcSwap::new(published_source_set),
+            project_state_dir: ArcSwapOption::empty(),
+            source_exclusions: ArcSwap::new(Arc::new(discovery::SourceExclusions::default())),
+            scout_plan: ArcSwapOption::new(scout_plan),
+            freshness_status: ArcSwap::new(Arc::new(freshness_status)),
             write_mutex: Mutex::new(()),
             published_state: ArcSwap::new(published_state),
             published_repo_outline: ArcSwap::new(published_repo_outline),
@@ -718,7 +1297,8 @@ impl SharedIndexHandle {
             project_generation: AtomicU64::new(0),
             last_reset_project_generation: AtomicU64::new(0),
             rejected_stale_mutations: AtomicU64::new(0),
-            git_temporal: ArcSwap::new(Arc::new(super::git_temporal::GitTemporalIndex::pending())),
+            git_temporal: ArcSwap::new(temporal),
+            git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
         }
     }
@@ -727,13 +1307,463 @@ impl SharedIndexHandle {
         Arc::new(Self::new(index))
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_with_code_signals(
+        index: LiveIndex,
+        code_signals: CodeSignalsSnapshot,
+    ) -> Arc<Self> {
+        Arc::new(Self::new_with_scout_plan_and_code_signals(
+            index,
+            None,
+            Some(code_signals),
+        ))
+    }
+
+    pub(crate) fn shared_with_source_exclusions_and_code_signals(
+        index: LiveIndex,
+        source_exclusions: discovery::SourceExclusions,
+        code_signals: CodeSignalsSnapshot,
+    ) -> Arc<Self> {
+        let handle = Self::new_with_scout_plan_and_code_signals(index, None, Some(code_signals));
+        handle.source_exclusions.store(Arc::new(source_exclusions));
+        Arc::new(handle)
+    }
+
+    fn shared_with_scout_plan(
+        index: LiveIndex,
+        scout_plan: discovery::ScoutPlan,
+        source_exclusions: discovery::SourceExclusions,
+    ) -> Arc<Self> {
+        let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
+        let handle = Self::new_with_scout_plan(index, Some(Arc::new(scout_plan)));
+        handle.source_exclusions.store(Arc::new(source_exclusions));
+        if is_degraded {
+            handle
+                .freshness_status
+                .store(Arc::new(FreshnessStatus::Degraded {
+                    last_valid_content_generation: 0,
+                    reason_codes: vec![FreshnessReason::ReconciliationPending],
+                }));
+        }
+        Arc::new(handle)
+    }
+
+    pub fn shared_for_state_placement(
+        index: LiveIndex,
+        root: &Path,
+        state_placement: &StatePlacement,
+    ) -> Arc<Self> {
+        let handle = Self::new(index);
+        handle
+            .source_exclusions
+            .store(Arc::new(discovery::SourceExclusions::for_state_placement(
+                root,
+                state_placement,
+            )));
+        handle
+            .project_state_dir
+            .store(state_placement.directory().cloned().map(Arc::new));
+        Arc::new(handle)
+    }
+
+    pub fn shared_for_state_placement_with_code_signals(
+        index: LiveIndex,
+        root: &Path,
+        state_placement: &StatePlacement,
+        code_signals: CodeSignalsSnapshot,
+    ) -> Arc<Self> {
+        let handle = Self::new_with_scout_plan_and_code_signals(index, None, Some(code_signals));
+        handle
+            .source_exclusions
+            .store(Arc::new(discovery::SourceExclusions::for_state_placement(
+                root,
+                state_placement,
+            )));
+        handle
+            .project_state_dir
+            .store(state_placement.directory().cloned().map(Arc::new));
+        Arc::new(handle)
+    }
+
+    #[must_use]
+    pub fn project_state_dir(&self) -> Option<Arc<ProjectStateDir>> {
+        self.project_state_dir.load_full()
+    }
+
+    #[must_use]
+    pub fn scout_plan(&self) -> Option<Arc<discovery::ScoutPlan>> {
+        self.scout_plan.load_full()
+    }
+
+    #[must_use]
+    pub(crate) fn source_exclusions(&self) -> Arc<discovery::SourceExclusions> {
+        self.source_exclusions.load_full()
+    }
+
+    fn scout_plan_with_entry_locked(
+        &self,
+        entry: crate::domain::ScoutedEntry,
+        live: &LiveIndex,
+    ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        let Some(current) = self.scout_plan.load_full() else {
+            return Ok(None);
+        };
+        let mut plan = (*current).clone();
+        let entry_changed = match plan
+            .entries
+            .iter()
+            .position(|existing| existing.path == entry.path)
+        {
+            Some(position) if plan.entries[position] == entry => false,
+            Some(position) => {
+                plan.entries[position] = entry;
+                true
+            }
+            None => {
+                plan.entries.push(entry);
+                true
+            }
+        };
+        discovery::refresh_scout_plan(&mut plan)?;
+        if manifest_requires_degraded_coverage(live) {
+            plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        if !entry_changed && plan.coverage == current.coverage {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(plan)))
+    }
+
+    fn scout_plan_without_path_locked(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<Arc<discovery::ScoutPlan>>> {
+        let Some(current) = self.scout_plan.load_full() else {
+            return Ok(None);
+        };
+        let mut plan = (*current).clone();
+        let entry_count = plan.entries.len();
+        plan.entries
+            .retain(|entry| entry.path.normalized_utf8.as_deref() != Some(path));
+        if plan.entries.len() == entry_count {
+            return Ok(None);
+        }
+        discovery::refresh_scout_plan(&mut plan)?;
+        Ok(Some(Arc::new(plan)))
+    }
+
+    pub(crate) fn publish_reconciled_scout_plan_at_generation(
+        &self,
+        baseline: Option<&discovery::ScoutPlan>,
+        mut scout_plan: discovery::ScoutPlan,
+        expected_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                expected_gen,
+                current_gen,
+                "rejecting stale scout-plan publication"
+            );
+            return false;
+        }
+
+        if let Some(current) = self.scout_plan.load_full() {
+            let baseline_entries: HashMap<crate::domain::CatalogPath, crate::domain::ScoutedEntry> =
+                baseline
+                    .map(|plan| {
+                        plan.entries
+                            .iter()
+                            .cloned()
+                            .map(|entry| (entry.path.clone(), entry))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let current_entries: HashMap<crate::domain::CatalogPath, crate::domain::ScoutedEntry> =
+                current
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| (entry.path.clone(), entry))
+                    .collect();
+            let mut fresh_entries: HashMap<
+                crate::domain::CatalogPath,
+                crate::domain::ScoutedEntry,
+            > = scout_plan
+                .entries
+                .drain(..)
+                .map(|entry| (entry.path.clone(), entry))
+                .collect();
+            let changed_paths: HashSet<crate::domain::CatalogPath> = baseline_entries
+                .keys()
+                .chain(current_entries.keys())
+                .cloned()
+                .collect();
+
+            for path in changed_paths {
+                if current_entries.get(&path) == baseline_entries.get(&path) {
+                    continue;
+                }
+                match current_entries.get(&path) {
+                    Some(entry) => {
+                        fresh_entries.insert(path, entry.clone());
+                    }
+                    None => {
+                        fresh_entries.remove(&path);
+                    }
+                }
+            }
+            scout_plan.entries = fresh_entries.into_values().collect();
+        }
+        if let Err(error) = discovery::refresh_scout_plan(&mut scout_plan) {
+            tracing::error!(%error, "failed to refresh reconciled scout-plan accounting");
+            return false;
+        }
+        if manifest_requires_degraded_coverage(&self.live.load_full()) {
+            scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        self.scout_plan.store(Some(Arc::new(scout_plan)));
+        true
+    }
+
+    pub(crate) fn terminal_dispositions(
+        &self,
+    ) -> Arc<Vec<(String, crate::domain::FileDisposition)>> {
+        Arc::new(
+            self.live
+                .load_full()
+                .manifest_entries
+                .iter()
+                .map(|entry| {
+                    (
+                        scouted_catalog_path(&entry.path).to_string(),
+                        entry.disposition.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn freshness_status(&self) -> Arc<FreshnessStatus> {
+        Arc::clone(&self.published_generation().freshness)
+    }
+
+    pub(crate) fn set_freshness_status(&self, status: FreshnessStatus) {
+        let _wg = self.write_mutex.lock();
+        self.freshness_status.store(Arc::new(status));
+        let live = (*self.live.load_full()).clone();
+        self.swap_and_publish_retaining_content(live);
+    }
+
     /// Lock-free read: returns a guard that derefs to `&LiveIndex`.
     ///
     /// The returned guard holds a snapshot of the index at the time of the call.
     /// Concurrent writes do not affect the snapshot — they swap in a new `Arc`
     /// that subsequent `read()` calls will see.
-    pub fn read(&self) -> arc_swap::Guard<Arc<LiveIndex>> {
-        self.live.load()
+    pub fn read(&self) -> Arc<LiveIndex> {
+        Arc::clone(&self.published_generation().live)
+    }
+
+    pub fn published_generation(&self) -> Arc<PublishedGeneration> {
+        self.published_source_set.load_full().current_generation()
+    }
+
+    pub fn published_source_set(&self) -> Arc<PublishedSourceSet> {
+        self.published_source_set.load_full()
+    }
+
+    pub fn publication_fence(&self) -> PublicationFence {
+        let published = self.published_generation();
+        PublicationFence {
+            publication_generation: published.publication_generation,
+            content_generation: published.content_generation,
+            project_generation: published.project_generation,
+        }
+    }
+
+    pub fn matches_publication_fence(&self, expected: PublicationFence) -> bool {
+        self.publication_fence() == expected
+    }
+
+    pub fn prepare_bridge_rebuild(&self) -> PreparedKnowledgeBridge {
+        let published = self.published_generation();
+        let fence = PublicationFence {
+            publication_generation: published.publication_generation,
+            content_generation: published.content_generation,
+            project_generation: published.project_generation,
+        };
+        let bridge = published
+            .source
+            .as_deref()
+            .map(|source| {
+                Arc::new(build_knowledge_bridge(
+                    &published.live,
+                    source,
+                    published.content_generation,
+                    &BridgeLimits::default(),
+                ))
+            })
+            .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
+        PreparedKnowledgeBridge { fence, bridge }
+    }
+
+    pub fn publish_prepared_bridge(&self, prepared: PreparedKnowledgeBridge) -> bool {
+        let _write_guard = self.write_mutex.lock();
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        let current_fence = PublicationFence {
+            publication_generation: previous.publication_generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+        };
+        if current_fence != prepared.fence {
+            self.rejected_stale_mutations.fetch_add(1, Ordering::AcqRel);
+            return false;
+        }
+
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let authority = build_published_authority(
+            &previous.live,
+            previous.source.as_deref(),
+            previous.source_version.as_deref(),
+            previous.content_generation,
+            &prepared.bridge,
+            &previous.code_signals,
+            previous.manifest.as_deref(),
+        );
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+            source: previous.source.clone(),
+            source_version: previous.source_version.clone(),
+            freshness: Arc::clone(&previous.freshness),
+            manifest: previous.manifest.clone(),
+            code_signals: Arc::clone(&previous.code_signals),
+            bridge: prepared.bridge,
+            authority,
+            live: Arc::clone(&previous.live),
+            health: Arc::clone(&previous.health),
+            outline: Arc::clone(&previous.outline),
+        });
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            previous_source_set.current_source_id.clone(),
+            published_generation,
+        );
+        self.published_source_set
+            .store(Arc::new(PublishedSourceSet {
+                registry_generation: previous_source_set.registry_generation.saturating_add(1),
+                current_source_id: previous_source_set.current_source_id.clone(),
+                sources,
+            }));
+        true
+    }
+
+    pub fn prepare_authority_rebuild(&self) -> PreparedKnowledgeAuthority {
+        let published = self.published_generation();
+        let fence = AuthorityPublicationFence {
+            publication: PublicationFence {
+                publication_generation: published.publication_generation,
+                content_generation: published.content_generation,
+                project_generation: published.project_generation,
+            },
+            source: published.source.as_deref().cloned(),
+            source_version: published.source_version.as_deref().cloned(),
+        };
+        let authority = build_published_authority(
+            &published.live,
+            published.source.as_deref(),
+            published.source_version.as_deref(),
+            published.content_generation,
+            &published.bridge,
+            &published.code_signals,
+            published.manifest.as_deref(),
+        );
+        PreparedKnowledgeAuthority { fence, authority }
+    }
+
+    pub fn publish_prepared_authority(&self, prepared: PreparedKnowledgeAuthority) -> bool {
+        let _write_guard = self.write_mutex.lock();
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        let current_fence = AuthorityPublicationFence {
+            publication: PublicationFence {
+                publication_generation: previous.publication_generation,
+                content_generation: previous.content_generation,
+                project_generation: previous.project_generation,
+            },
+            source: previous.source.as_deref().cloned(),
+            source_version: previous.source_version.as_deref().cloned(),
+        };
+        if current_fence != prepared.fence {
+            self.rejected_stale_mutations.fetch_add(1, Ordering::AcqRel);
+            return false;
+        }
+
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation: previous.content_generation,
+            project_generation: previous.project_generation,
+            source: previous.source.clone(),
+            source_version: previous.source_version.clone(),
+            freshness: Arc::clone(&previous.freshness),
+            manifest: previous.manifest.clone(),
+            code_signals: Arc::clone(&previous.code_signals),
+            bridge: Arc::clone(&previous.bridge),
+            authority: prepared.authority,
+            live: Arc::clone(&previous.live),
+            health: Arc::clone(&previous.health),
+            outline: Arc::clone(&previous.outline),
+        });
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            previous_source_set.current_source_id.clone(),
+            published_generation,
+        );
+        self.published_source_set
+            .store(Arc::new(PublishedSourceSet {
+                registry_generation: previous_source_set.registry_generation.saturating_add(1),
+                current_source_id: previous_source_set.current_source_id.clone(),
+                sources,
+            }));
+        true
+    }
+
+    pub fn refresh_source_metadata(&self) -> bool {
+        let _write_guard = self.write_mutex.lock();
+        let previous = self.published_generation();
+        let live = self.live.load_full();
+        let scout_plan = self.scout_plan.load_full();
+        let candidate = capture_published_manifest(&live, scout_plan.as_deref());
+        let candidate_source = candidate.as_ref().map(|manifest| &manifest.source);
+        let candidate_version = candidate.as_ref().map(|manifest| &manifest.source_version);
+        if candidate_source == previous.source.as_deref()
+            && candidate_version == previous.source_version.as_deref()
+        {
+            return false;
+        }
+        self.swap_and_publish_retaining_content((*live).clone());
+        true
+    }
+
+    /// Capture the exact content/source version a git-temporal result will
+    /// describe. Refresh first so bytes-identical commits and branch movement
+    /// are fenced even when the filesystem watcher has no content event.
+    pub fn git_temporal_publication_fence(&self) -> GitTemporalPublicationFence {
+        self.refresh_source_metadata();
+        let published = self.published_generation();
+        GitTemporalPublicationFence {
+            project_generation: published.project_generation,
+            content_generation: published.content_generation,
+            source: published.source.as_deref().cloned(),
+            source_version: published.source_version.as_deref().cloned(),
+        }
     }
 
     /// Acquire exclusive write access. The returned guard holds an owned clone
@@ -752,12 +1782,12 @@ impl SharedIndexHandle {
 
     /// Lock-free read of the published state snapshot.
     pub fn published_state(&self) -> Arc<PublishedIndexState> {
-        self.published_state.load_full()
+        Arc::clone(&self.published_generation().health)
     }
 
     /// Lock-free read of the published repo outline.
     pub fn published_repo_outline(&self) -> Arc<RepoOutlineView> {
-        self.published_repo_outline.load_full()
+        Arc::clone(&self.published_generation().outline)
     }
 
     pub fn current_project_generation(&self) -> u64 {
@@ -789,18 +1819,76 @@ impl SharedIndexHandle {
     }
 
     pub fn reload(&self, root: &Path) -> anyhow::Result<()> {
+        self.reload_for_binding(root, None)
+    }
+
+    /// Reload while explicitly controlling whether source-local project state
+    /// is eligible for this binding.
+    pub(crate) fn reload_for_binding(
+        &self,
+        root: &Path,
+        project_state_dir: Option<ProjectStateDir>,
+    ) -> anyhow::Result<()> {
+        self.reload_for_binding_with_exclusions(
+            root,
+            project_state_dir,
+            discovery::SourceExclusions::default(),
+        )
+    }
+
+    pub fn reload_for_state_placement(
+        &self,
+        root: &Path,
+        state_placement: &StatePlacement,
+    ) -> anyhow::Result<()> {
+        self.reload_for_binding_with_exclusions(
+            root,
+            state_placement.directory().cloned(),
+            discovery::SourceExclusions::for_state_placement(root, state_placement),
+        )
+    }
+
+    pub(crate) fn reload_for_binding_with_exclusions(
+        &self,
+        root: &Path,
+        project_state_dir: Option<ProjectStateDir>,
+        source_exclusions: discovery::SourceExclusions,
+    ) -> anyhow::Result<()> {
         // Build new index data OUTSIDE the write lock (file I/O + parsing).
         // Only the final swap acquires the mutex, reducing block time from
         // seconds (full I/O) to milliseconds (in-memory index rebuild).
-        let data = LiveIndex::build_reload_data(root)?;
+        let data = LiveIndex::build_reload_data_for_binding_with_exclusions(
+            root,
+            project_state_dir.as_ref(),
+            &source_exclusions,
+        )?;
+        let scout_plan = Arc::clone(&data.scout_plan);
+        let is_degraded = matches!(scout_plan.coverage, crate::domain::CoverageStatus::Degraded);
+        let live = LiveIndex::from_reload_data(data);
         let _wg = self.write_mutex.lock();
-        let mut live = (*self.live.load_full()).clone();
-        live.apply_reload_data(data);
-        self.swap_and_publish(live);
+        self.source_exclusions.store(Arc::new(source_exclusions));
+        self.scout_plan.store(Some(scout_plan));
+        self.freshness_status.store(Arc::new(if is_degraded {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation: self.published_state.load().generation,
+                reason_codes: vec![FreshnessReason::ReconciliationPending],
+            }
+        } else {
+            FreshnessStatus::Current
+        }));
+        self.project_state_dir
+            .store(project_state_dir.map(Arc::new));
         self.project_generation.fetch_add(1, Ordering::AcqRel);
+        self.swap_and_publish(live);
         self.last_reset_project_generation
             .store(0, Ordering::Release);
         Ok(())
+    }
+
+    pub(crate) fn is_source_excluded(&self, relative_path: &Path) -> bool {
+        self.source_exclusions
+            .load()
+            .excludes_relative(relative_path)
     }
 
     /// Drop all indexed state and publish a fresh empty index.
@@ -817,8 +1905,13 @@ impl SharedIndexHandle {
     /// repo root instead of serving the previous project.
     pub fn reset_to_empty(&self) {
         let _wg = self.write_mutex.lock();
-        self.swap_and_publish(LiveIndex::empty_live_index());
+        self.source_exclusions
+            .store(Arc::new(discovery::SourceExclusions::default()));
+        self.scout_plan.store(None);
+        self.freshness_status
+            .store(Arc::new(FreshnessStatus::Verifying));
         self.project_generation.fetch_add(1, Ordering::AcqRel);
+        self.swap_and_publish(LiveIndex::empty_live_index());
         self.last_reset_project_generation
             .store(0, Ordering::Release);
         self.pre_update_snapshots.lock().clear();
@@ -938,6 +2031,108 @@ impl SharedIndexHandle {
         true
     }
 
+    /// Publish one admitted file across the content, derived-index, catalog,
+    /// and terminal-disposition lanes under one generation fence.
+    pub(crate) fn publish_indexed_file_at_generation(
+        &self,
+        path: &str,
+        file: IndexedFile,
+        scouted: crate::domain::ScoutedEntry,
+        targets: crate::domain::IndexTargets,
+        expected_gen: u64,
+        expected_publication_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale indexed-file publication"
+            );
+            return false;
+        }
+        let current_publication_gen = self.published_state.load().generation;
+        if current_publication_gen != expected_publication_gen {
+            tracing::trace!(
+                path,
+                expected_publication_gen,
+                current_publication_gen,
+                "rejecting indexed-file publication prepared from a stale source bundle"
+            );
+            return false;
+        }
+
+        let current = self.live.load_full();
+        if let Some(existing) = current.get_file(path) {
+            self.pre_update_snapshots.lock().insert(
+                path.to_string(),
+                PreUpdateSnapshot {
+                    content: existing.content.clone(),
+                    symbols: existing
+                        .symbols
+                        .iter()
+                        .map(|symbol| PreUpdateSymbol {
+                            name: symbol.name.clone(),
+                            kind: symbol.kind.to_string(),
+                            line_range: symbol.line_range,
+                            byte_range: symbol.byte_range,
+                        })
+                        .collect(),
+                },
+            );
+        }
+
+        let parse_status = match &file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+        };
+        let disposition = FileDisposition::Indexed {
+            targets,
+            parse_status,
+        };
+        let manifest_entry =
+            catalog_entry_from_scout(&scouted, disposition, Some(file.content_hash.clone()));
+        let mut live = (*current).clone();
+        let path_owned = path.to_string();
+        let path_for_log = path_owned.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            live.update_file(path_owned, file);
+            live.upsert_manifest_entry(manifest_entry);
+        }));
+        if let Err(panic_info) = result {
+            let msg = panic_info
+                .downcast_ref::<String>()
+                .map(|message| message.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown");
+            tracing::error!(
+                "indexed-file publication panicked for '{}': {} — original index preserved",
+                path_for_log,
+                msg
+            );
+            return false;
+        }
+
+        let updated_scout_plan = match self.scout_plan_with_entry_locked(scouted, &live) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::error!(path, %error, "failed to refresh indexed-file scout plan");
+                return false;
+            }
+        };
+
+        if let Some(plan) = updated_scout_plan {
+            self.scout_plan.store(Some(plan));
+        }
+        self.swap_and_publish(live);
+        true
+    }
+
     /// Update only the stored mtime for a file without re-parsing.
     ///
     /// Used by the watcher when a file's content hash matches but its mtime has
@@ -954,8 +2149,7 @@ impl SharedIndexHandle {
             let mut updated = (**live.files.get(path).unwrap()).clone();
             updated.mtime_secs = new_mtime;
             live.files.insert(path.to_string(), Arc::new(updated));
-            self.live.store(Arc::new(live));
-            // mtime-only change doesn't affect published state
+            self.swap_and_publish_retaining_content(live);
         }
     }
 
@@ -982,9 +2176,91 @@ impl SharedIndexHandle {
             let mut updated = (**live.files.get(path).unwrap()).clone();
             updated.mtime_secs = new_mtime;
             live.files.insert(path.to_string(), Arc::new(updated));
-            self.live.store(Arc::new(live));
-            // mtime-only change doesn't affect published state
+            self.swap_and_publish_retaining_content(live);
         }
+        true
+    }
+
+    pub(crate) fn publish_hash_skip_at_generation(
+        &self,
+        path: &str,
+        new_mtime: u64,
+        scouted: crate::domain::ScoutedEntry,
+        targets: crate::domain::IndexTargets,
+        expected_gen: u64,
+        expected_publication_gen: u64,
+    ) -> bool {
+        let _wg = self.write_mutex.lock();
+        let current_gen = self.project_generation.load(Ordering::Acquire);
+        if current_gen != expected_gen {
+            self.rejected_stale_mutations
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                path,
+                expected_gen,
+                current_gen,
+                "rejecting stale hash-skip publication"
+            );
+            return false;
+        }
+        let current_publication_gen = self.published_state.load().generation;
+        if current_publication_gen != expected_publication_gen {
+            tracing::trace!(
+                path,
+                expected_publication_gen,
+                current_publication_gen,
+                "rejecting hash-skip prepared from a stale source bundle"
+            );
+            return false;
+        }
+
+        let current = self.live.load_full();
+        let mut live = (*current).clone();
+        let mut live_changed = false;
+        let Some(file) = current.files.get(path) else {
+            return false;
+        };
+        if file.mtime_secs != new_mtime && new_mtime != 0 {
+            let mut updated = (**file).clone();
+            updated.mtime_secs = new_mtime;
+            live.files.insert(path.to_string(), Arc::new(updated));
+            live_changed = true;
+        }
+        let parse_status = match &file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+        };
+        let indexed_disposition = FileDisposition::Indexed {
+            targets,
+            parse_status,
+        };
+        let manifest_entry = catalog_entry_from_scout(
+            &scouted,
+            indexed_disposition,
+            Some(file.content_hash.clone()),
+        );
+        let manifest_changed = !current
+            .manifest_entries
+            .iter()
+            .any(|entry| entry == &manifest_entry);
+        if manifest_changed {
+            live.upsert_manifest_entry(manifest_entry);
+        }
+        let updated_scout_plan = match self.scout_plan_with_entry_locked(scouted, &live) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::error!(path, %error, "failed to refresh hash-skip scout plan");
+                return false;
+            }
+        };
+        if !live_changed && updated_scout_plan.is_none() && !manifest_changed {
+            return true;
+        }
+        if let Some(plan) = updated_scout_plan {
+            self.scout_plan.store(Some(plan));
+        }
+        self.swap_and_publish(live);
         true
     }
 
@@ -1037,6 +2313,29 @@ impl SharedIndexHandle {
     }
 
     pub fn remove_file_at_generation(&self, path: &str, expected_gen: u64) -> bool {
+        self.remove_file_with_fences(path, expected_gen, None, None)
+    }
+
+    pub fn remove_file_at_publication_fence(&self, path: &str, expected: PublicationFence) -> bool {
+        self.remove_file_with_fences(path, expected.project_generation, None, Some(expected))
+    }
+
+    pub(crate) fn remove_file_if_scout_entry_at_generation(
+        &self,
+        path: &str,
+        expected_entry: &crate::domain::ScoutedEntry,
+        expected_gen: u64,
+    ) -> bool {
+        self.remove_file_with_fences(path, expected_gen, Some(expected_entry), None)
+    }
+
+    fn remove_file_with_fences(
+        &self,
+        path: &str,
+        expected_gen: u64,
+        expected_scout_entry: Option<&crate::domain::ScoutedEntry>,
+        expected_publication: Option<PublicationFence>,
+    ) -> bool {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
         if current_gen != expected_gen {
@@ -1050,46 +2349,78 @@ impl SharedIndexHandle {
             );
             return false;
         }
+        if let Some(expected_publication) = expected_publication {
+            let current_publication = self.publication_fence();
+            if current_publication != expected_publication {
+                tracing::trace!(
+                    path,
+                    ?expected_publication,
+                    ?current_publication,
+                    "rejecting stale file removal publication"
+                );
+                return false;
+            }
+        }
+        if let Some(expected_scout_entry) = expected_scout_entry {
+            let current_plan = self.scout_plan.load_full();
+            let current_entry = current_plan.as_ref().and_then(|plan| {
+                plan.entries
+                    .iter()
+                    .find(|entry| entry.path == expected_scout_entry.path)
+            });
+            if current_entry != Some(expected_scout_entry) {
+                tracing::trace!(
+                    path,
+                    "rejecting file removal because its scouted base changed"
+                );
+                return false;
+            }
+        }
 
         let mut live = (*self.live.load_full()).clone();
         let path_owned = path.to_string();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             live.remove_file(path);
+            live.remove_manifest_entry(path);
         }));
-        match result {
-            Ok(()) => self.swap_and_publish(live),
-            Err(panic_info) => {
-                let msg = panic_info
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown");
-                tracing::error!(
-                    "index remove panicked for '{}': {} — original index preserved",
-                    path_owned,
-                    msg
-                );
-            }
+        if let Err(panic_info) = result {
+            let msg = panic_info
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown");
+            tracing::error!(
+                "index remove panicked for '{}': {} — original index preserved",
+                path_owned,
+                msg
+            );
+            return false;
         }
+
+        let updated_scout_plan = match self.scout_plan_without_path_locked(path) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::error!(path, %error, "failed to refresh scout plan after removal");
+                return false;
+            }
+        };
+
+        if let Some(plan) = updated_scout_plan {
+            self.scout_plan.store(Some(plan));
+        }
+        self.swap_and_publish(live);
         true
     }
 
-    /// Generation-checked demotion of a single file to Tier 2/3.
-    ///
-    /// Atomically removes the path from the fully-indexed `files` map (if it was
-    /// Tier 1 before) and upserts its `SkippedFile` record. Used by the
-    /// single-file (re)index choke point to enforce admission tiering: a file
-    /// that classifies as metadata-only/hard-skip must never be parsed into the
-    /// index by the watcher event path or the freshen-on-read path.
-    ///
-    /// Returns `false` (without mutating) when `expected_gen` no longer matches
-    /// the live project generation, matching the stale-mutation fence used by
-    /// `update_file_at_generation` / `remove_file_at_generation`.
-    pub fn demote_to_skipped_at_generation(
+    /// Publish one metadata-terminal observation under the same generation
+    /// fence and writer boundary as the compatibility live-index projection.
+    pub(crate) fn publish_terminal_disposition_at_generation(
         &self,
         path: &str,
-        sf: SkippedFile,
+        scouted: crate::domain::ScoutedEntry,
+        disposition: crate::domain::FileDisposition,
         expected_gen: u64,
+        expected_publication_gen: u64,
     ) -> bool {
         let _wg = self.write_mutex.lock();
         let current_gen = self.project_generation.load(Ordering::Acquire);
@@ -1100,98 +2431,269 @@ impl SharedIndexHandle {
                 path,
                 expected_gen,
                 current_gen,
-                "rejecting stale file demotion"
+                "rejecting stale terminal disposition"
             );
             return false;
         }
-
-        let mut live = (*self.live.load_full()).clone();
-        let path_owned = path.to_string();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            live.demote_to_skipped(&path_owned, sf);
-        }));
-        match result {
-            Ok(()) => self.swap_and_publish(live),
-            Err(panic_info) => {
-                // Clone-mutate-swap means the original index is untouched on
-                // panic — no repair needed, just log and discard the clone.
-                let msg = panic_info
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown");
-                tracing::error!(
-                    "index demotion panicked for '{}': {} — original index preserved",
-                    path,
-                    msg
-                );
-            }
-        }
-        true
-    }
-
-    /// Generation-checked removal of any Tier-2/3 skip record for `path`.
-    ///
-    /// Called on the single-file reindex path when a file is admitted as Tier 1
-    /// again, so a previously-skipped path stops being counted in the Tier-2/3
-    /// totals. Only swaps a new index in when a record was actually removed, so
-    /// the common (no stale skip record) case is allocation-free after the
-    /// clone check. Returns `false` when the generation fence rejects the call.
-    pub fn clear_skipped_at_generation(&self, path: &str, expected_gen: u64) -> bool {
-        let _wg = self.write_mutex.lock();
-        let current_gen = self.project_generation.load(Ordering::Acquire);
-        if current_gen != expected_gen {
-            self.rejected_stale_mutations
-                .fetch_add(1, Ordering::Relaxed);
+        let current_publication_gen = self.published_state.load().generation;
+        if current_publication_gen != expected_publication_gen {
             tracing::trace!(
                 path,
-                expected_gen,
-                current_gen,
-                "rejecting stale skip-record clear"
+                expected_publication_gen,
+                current_publication_gen,
+                "rejecting terminal disposition prepared from a stale source bundle"
+            );
+            return false;
+        }
+        let manifest_entry = catalog_entry_from_scout(&scouted, disposition.clone(), None);
+        let mut live = (*self.live.load_full()).clone();
+        let retains_last_valid_content = matches!(
+            &disposition,
+            crate::domain::FileDisposition::Unreadable { .. }
+                | crate::domain::FileDisposition::UnstableDuringRead
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !retains_last_valid_content {
+                live.remove_file(path);
+            }
+            live.upsert_manifest_entry(manifest_entry);
+        }));
+        if let Err(panic_info) = result {
+            let msg = panic_info
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown");
+            tracing::error!(
+                "terminal disposition mutation panicked for '{}': {} — original index preserved",
+                path,
+                msg
             );
             return false;
         }
 
-        // Fast path: only clone + swap when a skip record actually exists.
-        let current = self.live.load_full();
-        if !current.skipped_files.iter().any(|sf| sf.path == path) {
-            return true;
+        let updated_scout_plan = match self.scout_plan_with_entry_locked(scouted, &live) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::error!(path, %error, "failed to refresh terminal scout plan");
+                return false;
+            }
+        };
+
+        if let Some(plan) = updated_scout_plan {
+            self.scout_plan.store(Some(plan));
         }
-        let mut live = (*current).clone();
-        live.clear_skipped(path);
-        self.swap_and_publish(live);
+        if retains_last_valid_content {
+            let last_valid_content_generation = self.published_generation().content_generation;
+            self.freshness_status
+                .store(Arc::new(FreshnessStatus::Degraded {
+                    last_valid_content_generation,
+                    reason_codes: vec![FreshnessReason::ObservationFailed],
+                }));
+            self.swap_and_publish_retaining_content(live);
+        } else {
+            self.swap_and_publish(live);
+        }
         true
     }
 
     pub fn mark_snapshot_verify_running(&self) {
+        let expected = self.publication_fence();
+        let _ = self.mark_snapshot_verify_running_at_fence(expected);
+    }
+
+    pub fn mark_snapshot_verify_running_at_generation(&self, expected_gen: u64) -> bool {
+        let expected = self.publication_fence();
+        if expected.project_generation != expected_gen {
+            self.note_rejected_stale_mutation();
+            return false;
+        }
+        self.mark_snapshot_verify_running_at_fence(expected)
+            .is_some()
+    }
+
+    pub fn mark_snapshot_verify_running_at_fence(
+        &self,
+        expected: PublicationFence,
+    ) -> Option<PublicationFence> {
         let _wg = self.write_mutex.lock();
+        if self.publication_fence() != expected {
+            self.note_rejected_stale_mutation();
+            return None;
+        }
         let mut live = (*self.live.load_full()).clone();
         live.mark_snapshot_verify_running();
-        self.swap_and_publish(live);
+        self.freshness_status
+            .store(Arc::new(FreshnessStatus::Verifying));
+        self.swap_and_publish_retaining_content(live);
+        Some(self.publication_fence())
     }
 
     pub fn mark_snapshot_verify_completed(&self, mismatched_paths: Vec<String>) {
+        let expected = self.publication_fence();
+        let _ = self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths);
+    }
+
+    pub fn mark_snapshot_verify_completed_at_generation(
+        &self,
+        expected_gen: u64,
+        mismatched_paths: Vec<String>,
+    ) -> bool {
+        let expected = self.publication_fence();
+        if expected.project_generation != expected_gen {
+            self.note_rejected_stale_mutation();
+            return false;
+        }
+        self.mark_snapshot_verify_completed_at_fence(expected, mismatched_paths)
+    }
+
+    pub fn mark_snapshot_verify_completed_at_fence(
+        &self,
+        expected: PublicationFence,
+        mismatched_paths: Vec<String>,
+    ) -> bool {
         let _wg = self.write_mutex.lock();
+        if self.publication_fence() != expected {
+            self.note_rejected_stale_mutation();
+            return false;
+        }
         let mut live = (*self.live.load_full()).clone();
+        let freshness = if mismatched_paths.is_empty() {
+            FreshnessStatus::Current
+        } else {
+            FreshnessStatus::Degraded {
+                last_valid_content_generation: expected.content_generation,
+                reason_codes: vec![FreshnessReason::SnapshotVerificationFailed],
+            }
+        };
         live.mark_snapshot_verify_completed(mismatched_paths);
-        self.swap_and_publish(live);
+        self.freshness_status.store(Arc::new(freshness));
+        self.swap_and_publish_retaining_content(live);
+        true
     }
 
     /// Swap a new `LiveIndex` into the `ArcSwap` and publish derived state.
     ///
     /// Must be called while holding `write_mutex`.
     fn swap_and_publish(&self, live: LiveIndex) {
+        self.swap_and_publish_with_content_change_and_hook(live, true, || {});
+    }
+
+    fn swap_and_publish_retaining_content(&self, live: LiveIndex) {
+        self.swap_and_publish_with_content_change_and_hook(live, false, || {});
+    }
+
+    #[cfg(test)]
+    fn swap_and_publish_with_hook<F>(&self, live: LiveIndex, after_live_swap: F)
+    where
+        F: FnOnce(),
+    {
+        self.swap_and_publish_with_content_change_and_hook(live, true, after_live_swap);
+    }
+
+    fn swap_and_publish_with_content_change_and_hook<F>(
+        &self,
+        live: LiveIndex,
+        content_changed: bool,
+        after_live_swap: F,
+    ) where
+        F: FnOnce(),
+    {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let published_state = Arc::new(PublishedIndexState::capture(generation, &live));
         let published_repo_outline = Arc::new(live.capture_repo_outline_view());
-        self.live.store(Arc::new(live));
+        let previous_source_set = self.published_source_set.load_full();
+        let previous = previous_source_set.current_generation();
+        let content_generation = if content_changed {
+            previous.content_generation.saturating_add(1)
+        } else {
+            previous.content_generation
+        };
+        let freshness = self.freshness_status.load_full();
+        let scout_plan = self.scout_plan.load_full();
+        let manifest = capture_published_manifest(&live, scout_plan.as_deref());
+        let temporal = self.git_temporal.load_full();
+        let history_coverage = capture_history_coverage(&live, &temporal.state);
+        let source = manifest
+            .as_ref()
+            .map(|manifest| Arc::new(manifest.source.clone()));
+        let source_version = manifest
+            .as_ref()
+            .map(|manifest| Arc::new(manifest.source_version.clone()));
+        let code_signals = if Arc::ptr_eq(&temporal, &previous.code_signals.temporal) {
+            Arc::clone(&previous.code_signals)
+        } else {
+            Arc::new(CodeSignalsSnapshot {
+                state: temporal.state.clone(),
+                temporal,
+                computed_for_content_generation: content_generation,
+                computed_for_source_version: source_version.as_deref().cloned().unwrap_or(
+                    SourceVersion {
+                        branch: None,
+                        commit: None,
+                        working_tree: WorkingTreeState::Unknown,
+                    },
+                ),
+                coverage: history_coverage,
+            })
+        };
+        let bridge = source
+            .as_deref()
+            .map(|source| {
+                Arc::new(build_knowledge_bridge(
+                    &live,
+                    source,
+                    content_generation,
+                    &BridgeLimits::default(),
+                ))
+            })
+            .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
+        let authority = build_published_authority(
+            &live,
+            source.as_deref(),
+            source_version.as_deref(),
+            content_generation,
+            &bridge,
+            &code_signals,
+            manifest.as_deref(),
+        );
+        let live = Arc::new(live);
+        let published_generation = Arc::new(PublishedGeneration {
+            publication_generation: generation,
+            content_generation,
+            project_generation: self.project_generation.load(Ordering::Acquire),
+            source: source.clone(),
+            source_version,
+            freshness,
+            manifest,
+            code_signals,
+            bridge,
+            authority,
+            live: Arc::clone(&live),
+            health: Arc::clone(&published_state),
+            outline: Arc::clone(&published_repo_outline),
+        });
+        let current_source_id = source
+            .as_ref()
+            .map(|source| source.source_id.clone())
+            .unwrap_or_else(unbound_source_id);
+        let mut sources = BTreeMap::new();
+        sources.insert(current_source_id.clone(), published_generation);
+        let published_source_set = Arc::new(PublishedSourceSet {
+            registry_generation: previous_source_set.registry_generation.saturating_add(1),
+            current_source_id,
+            sources,
+        });
+        self.live.store(live);
+        after_live_swap();
         self.published_state.store(published_state);
         self.published_repo_outline.store(published_repo_outline);
+        self.published_source_set.store(published_source_set);
     }
 
     /// Lock-free read of the git temporal index.
     pub fn git_temporal(&self) -> Arc<super::git_temporal::GitTemporalIndex> {
-        self.git_temporal.load_full()
+        Arc::clone(&self.published_generation().code_signals.temporal)
     }
 
     /// Take (consume) the pre-update snapshot for a file, if any.
@@ -1211,35 +2713,60 @@ impl SharedIndexHandle {
 
     /// Atomically replace the git temporal index with a new version.
     pub fn update_git_temporal(&self, index: super::git_temporal::GitTemporalIndex) {
+        let _wg = self.write_mutex.lock();
         self.git_temporal.store(Arc::new(index));
+        let live = (*self.live.load_full()).clone();
+        self.swap_and_publish_retaining_content(live);
     }
 
-    pub fn update_git_temporal_at_generation(
+    pub fn update_git_temporal_at_fence(
         &self,
         index: super::git_temporal::GitTemporalIndex,
-        expected_gen: u64,
+        fence: &GitTemporalPublicationFence,
     ) -> bool {
         let _wg = self.write_mutex.lock();
+        let live = self.live.load_full();
+        let scout_plan = self.scout_plan.load_full();
+        let candidate = capture_published_manifest(&live, scout_plan.as_deref());
+        let candidate_source = candidate.as_ref().map(|manifest| &manifest.source);
+        let candidate_version = candidate.as_ref().map(|manifest| &manifest.source_version);
+        let published = self.published_generation();
         let current_gen = self.project_generation.load(Ordering::Acquire);
-        if current_gen != expected_gen {
+        let matches = current_gen == fence.project_generation
+            && published.content_generation == fence.content_generation
+            && candidate_source == fence.source.as_ref()
+            && candidate_version == fence.source_version.as_ref();
+        if !matches {
             self.rejected_stale_mutations
                 .fetch_add(1, Ordering::Relaxed);
+            if candidate.is_some()
+                && (candidate_source != published.source.as_deref()
+                    || candidate_version != published.source_version.as_deref())
+            {
+                self.swap_and_publish_retaining_content((*live).clone());
+            }
             tracing::trace!(
-                expected_gen,
+                expected_project_generation = fence.project_generation,
                 current_gen,
+                expected_content_generation = fence.content_generation,
+                current_content_generation = published.content_generation,
                 "rejecting stale git temporal publication"
             );
             return false;
         }
 
         self.git_temporal.store(Arc::new(index));
+        self.swap_and_publish_retaining_content((*live).clone());
         true
     }
 
     /// Set the empty-index reason on the live LiveIndex. Used by the startup
     /// LocalEmpty branch so `health` can surface why the index is empty.
     pub fn set_local_empty_reason(&self, reason: Option<String>) {
-        self.live.load().set_local_empty_reason(reason);
+        let _wg = self.write_mutex.lock();
+        let mut live = (*self.live.load_full()).clone();
+        live.local_empty_reason = Arc::new(parking_lot::RwLock::new(reason));
+        self.swap_and_publish_retaining_content(live);
     }
 }
 
@@ -1421,11 +2948,12 @@ impl DerivedIndices {
 /// it cannot fail — it's pure assignment.
 pub(crate) struct ReloadData {
     pub files: HashMap<String, Arc<IndexedFile>>,
+    pub scout_plan: Arc<discovery::ScoutPlan>,
+    pub manifest_entries: Vec<CatalogEntry>,
     pub cb_state: CircuitBreakerState,
     pub load_duration: Duration,
     pub gitignore: Option<ignore::gitignore::Gitignore>,
     pub derived: DerivedIndices,
-    pub skipped_files: Vec<SkippedFile>,
     pub coupling_store: Option<Arc<super::coupling::CouplingStore>>,
     /// Normalized root this reload was built from. Carried through so
     /// `apply_reload_data` can record it on the live index (root-mismatch
@@ -1468,29 +2996,193 @@ pub(crate) fn build_path_indices_from_files(
     (by_basename, by_dir_component)
 }
 
-/// An admitted file plus everything needed to parse it. Defined as a named
-/// struct (rather than a wide tuple) to keep the `to_parse` collection type
-/// simple and self-documenting. Shared by the `load` and reload pipelines via
-/// [`admit_and_parse_entries`].
-struct ParseCandidate {
-    relative_path: String,
-    language: crate::domain::LanguageId,
-    classification: crate::domain::FileClassification,
-    bytes: Vec<u8>,
-    mtime_secs: u64,
-    /// Original on-disk size, used in the parse stage to re-acquire an in-flight
-    /// permit for large files (bounding concurrent parse memory). Permits are NOT
-    /// carried across the read→parse stage boundary: doing so would deadlock the
-    /// admission `par_iter`, whose permits would only free in the later parse
-    /// stage. Each stage acquires and releases within its own closure instead.
-    file_size: u64,
+/// Outcome of running admission and parsing for one discovered file.
+enum AdmissionOutcome {
+    Parsed(String, IndexedFile, crate::domain::IndexTargets),
+    Terminal {
+        path: String,
+        disposition: crate::domain::FileDisposition,
+    },
 }
 
-/// Outcome of running the admission gate against one discovered file: either it
-/// is admitted for parsing or it is recorded as skipped (Tier 2/3).
-enum AdmissionOutcome {
-    Parse(ParseCandidate),
-    Skip(SkippedFile),
+pub(super) fn scouted_catalog_path(path: &crate::domain::CatalogPath) -> &str {
+    path.normalized_utf8
+        .as_deref()
+        .unwrap_or(path.public_id.as_str())
+}
+
+fn scouted_entry_path(entry: &crate::domain::ScoutedEntry) -> &str {
+    scouted_catalog_path(&entry.path)
+}
+
+fn manifest_requires_degraded_coverage(live: &LiveIndex) -> bool {
+    live.manifest_entries.iter().any(|entry| {
+        matches!(
+            entry.disposition,
+            FileDisposition::Unreadable { .. }
+                | FileDisposition::UnstableDuringRead
+                | FileDisposition::AbortedCircuitBreaker
+        )
+    })
+}
+
+fn catalog_entry_from_scout(
+    scouted: &crate::domain::ScoutedEntry,
+    disposition: FileDisposition,
+    content_hash: Option<String>,
+) -> CatalogEntry {
+    CatalogEntry {
+        path: scouted.path.clone(),
+        size: scouted.stamp.size,
+        language: scouted.language.clone(),
+        classification: scouted.classification,
+        disposition,
+        content_hash,
+    }
+}
+
+fn manifest_entries_from_scout(
+    scout_plan: &discovery::ScoutPlan,
+    terminal_dispositions: Vec<(String, FileDisposition)>,
+    files: &HashMap<String, Arc<IndexedFile>>,
+) -> anyhow::Result<Vec<CatalogEntry>> {
+    let mut dispositions: HashMap<String, FileDisposition> =
+        terminal_dispositions.into_iter().collect();
+    let mut entries = Vec::with_capacity(scout_plan.entries.len());
+
+    for scouted in &scout_plan.entries {
+        let path = scouted_entry_path(scouted);
+        let disposition = dispositions.remove(path).ok_or_else(|| {
+            anyhow::anyhow!("manifest disposition missing for scouted path {path}")
+        })?;
+        let content_hash = match &disposition {
+            FileDisposition::Indexed { .. } => Some(
+                files
+                    .get(path)
+                    .ok_or_else(|| anyhow::anyhow!("indexed manifest path missing content {path}"))?
+                    .content_hash
+                    .clone(),
+            ),
+            _ => None,
+        };
+        entries.push(catalog_entry_from_scout(scouted, disposition, content_hash));
+    }
+
+    if !dispositions.is_empty() {
+        let mut unexpected: Vec<_> = dispositions.into_keys().collect();
+        unexpected.sort();
+        anyhow::bail!(
+            "manifest dispositions without scout entries: {}",
+            unexpected.join(", ")
+        );
+    }
+    entries.sort_by_cached_key(|entry| {
+        let path = entry
+            .path
+            .normalized_utf8
+            .as_deref()
+            .unwrap_or(entry.path.public_id.as_str());
+        (path.to_lowercase(), path.to_string())
+    });
+    Ok(entries)
+}
+
+pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<AdmissionDecision> {
+    let (tier, reason) = match &entry.disposition {
+        FileDisposition::Indexed { .. } => return None,
+        FileDisposition::MetadataOnly { reason } => (
+            AdmissionTier::MetadataOnly,
+            match reason {
+                MetadataOnlyReason::Lockfile => SkipReason::DependencyLockfile,
+                MetadataOnlyReason::Binary => SkipReason::BinaryContent,
+                MetadataOnlyReason::OversizedData => SkipReason::SizeThreshold,
+                MetadataOnlyReason::GeneratedOrVendor => {
+                    let path = scouted_catalog_path(&entry.path);
+                    let admission =
+                        discovery::classify_admission(Path::new(path), entry.size, None);
+                    if admission.reason == Some(SkipReason::DenylistedExtension) {
+                        SkipReason::DenylistedExtension
+                    } else if entry.classification.is_generated
+                        || entry.classification.is_vendor
+                        || Path::new(path).parent().is_some_and(|parent| {
+                            parent.components().any(|component| {
+                                discovery::is_generated_output_dir_name(
+                                    &component.as_os_str().to_string_lossy(),
+                                )
+                            })
+                        })
+                    {
+                        SkipReason::GeneratedOutput
+                    } else {
+                        // The canonical manifest deliberately collapses legacy
+                        // generated/vendor/untracked admission reasons. A path
+                        // with none of the generated/vendor signals can only be
+                        // the opt-in untracked demotion.
+                        SkipReason::Untracked
+                    }
+                }
+                MetadataOnlyReason::SensitivePath { .. }
+                | MetadataOnlyReason::SensitiveContent { .. }
+                | MetadataOnlyReason::LfsPointer { .. }
+                | MetadataOnlyReason::PlatformPathCollision
+                | MetadataOnlyReason::UnsupportedPathEncoding
+                | MetadataOnlyReason::PathMetadataTooLarge
+                | MetadataOnlyReason::UnsupportedTextEncoding => SkipReason::UnsupportedLanguage,
+            },
+        ),
+        FileDisposition::HardSkip { reason } => (
+            AdmissionTier::HardSkip,
+            match reason {
+                HardSkipReason::PerFileCeiling => SkipReason::SizeCeiling,
+                HardSkipReason::ArtifactType => SkipReason::DenylistedExtension,
+            },
+        ),
+        FileDisposition::Unreadable { .. }
+        | FileDisposition::UnstableDuringRead
+        | FileDisposition::AbortedCircuitBreaker => {
+            (AdmissionTier::MetadataOnly, SkipReason::UnsupportedLanguage)
+        }
+    };
+    Some(AdmissionDecision::skip(tier, reason))
+}
+
+fn disposition_from_admission(decision: AdmissionDecision) -> crate::domain::FileDisposition {
+    match decision.tier {
+        AdmissionTier::HardSkip => crate::domain::FileDisposition::HardSkip {
+            reason: if matches!(decision.reason, Some(SkipReason::SizeCeiling)) {
+                HardSkipReason::PerFileCeiling
+            } else {
+                HardSkipReason::ArtifactType
+            },
+        },
+        AdmissionTier::MetadataOnly => crate::domain::FileDisposition::MetadataOnly {
+            reason: match decision.reason {
+                Some(SkipReason::DependencyLockfile) => MetadataOnlyReason::Lockfile,
+                Some(SkipReason::BinaryContent) => MetadataOnlyReason::Binary,
+                Some(SkipReason::SizeThreshold) => MetadataOnlyReason::OversizedData,
+                Some(SkipReason::DenylistedExtension)
+                | Some(SkipReason::GeneratedOutput)
+                | Some(SkipReason::Untracked) => MetadataOnlyReason::GeneratedOrVendor,
+                Some(SkipReason::UnsupportedLanguage) | Some(SkipReason::SizeCeiling) | None => {
+                    MetadataOnlyReason::UnsupportedTextEncoding
+                }
+            },
+        },
+        AdmissionTier::Normal => crate::domain::FileDisposition::MetadataOnly {
+            reason: MetadataOnlyReason::UnsupportedTextEncoding,
+        },
+    }
+}
+
+fn terminal_admission_outcome(
+    entry: &discovery::DiscoveredEntry,
+    _decision: AdmissionDecision,
+    disposition: crate::domain::FileDisposition,
+) -> AdmissionOutcome {
+    AdmissionOutcome::Terminal {
+        path: entry.relative_path.clone(),
+        disposition,
+    }
 }
 
 /// Parsed file map plus the skip records and circuit-breaker state produced by a
@@ -1499,16 +3191,202 @@ enum AdmissionOutcome {
 /// the result.
 pub(crate) struct AdmitParseResult {
     pub files: HashMap<String, Arc<IndexedFile>>,
-    pub skipped_files: Vec<SkippedFile>,
+    pub terminal_dispositions: Vec<(String, crate::domain::FileDisposition)>,
+    pub coverage: crate::domain::CoverageStatus,
     pub cb_state: CircuitBreakerState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CircuitBreakerScope {
+    source: PathBuf,
+    lane: crate::domain::IndexTargets,
+    stage: String,
+}
+
+impl CircuitBreakerScope {
+    fn new(source: PathBuf, lane: crate::domain::IndexTargets, stage: impl Into<String>) -> Self {
+        Self {
+            source,
+            lane,
+            stage: stage.into(),
+        }
+    }
+}
+
+struct ParseFoldResult {
+    files: HashMap<String, Arc<IndexedFile>>,
+    dispositions: Vec<(String, crate::domain::FileDisposition)>,
+    coverage: crate::domain::CoverageStatus,
+    cb_state: CircuitBreakerState,
+}
+
+fn fold_parse_results_for_scope(
+    mut parse_results: Vec<(String, IndexedFile)>,
+    cb_state: CircuitBreakerState,
+    scope: CircuitBreakerScope,
+) -> ParseFoldResult {
+    parse_results.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut files = HashMap::with_capacity(parse_results.len());
+    let mut dispositions = Vec::with_capacity(parse_results.len());
+    let mut remaining = parse_results.into_iter();
+    let mut cb_tripped = false;
+
+    while let Some((path, indexed_file)) = remaining.next() {
+        let parse_status = match &indexed_file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { error } => {
+                cb_state.record_failure(&path, error);
+                crate::domain::index::ParseStatus::Failed
+            }
+        };
+        if !matches!(indexed_file.parse_status, ParseStatus::Failed { .. }) {
+            cb_state.record_success();
+        }
+
+        dispositions.push((
+            path.clone(),
+            crate::domain::FileDisposition::Indexed {
+                targets: scope.lane,
+                parse_status,
+            },
+        ));
+        files.insert(path, Arc::new(indexed_file));
+
+        if cb_state.should_abort() {
+            error!("{}", cb_state.summary());
+            cb_tripped = true;
+            dispositions
+                .extend(remaining.map(|(path, _)| {
+                    (path, crate::domain::FileDisposition::AbortedCircuitBreaker)
+                }));
+            break;
+        }
+    }
+
+    if cb_tripped {
+        cb_state.tripped.store(true, Ordering::Relaxed);
+    }
+
+    ParseFoldResult {
+        files,
+        dispositions,
+        coverage: if cb_tripped {
+            crate::domain::CoverageStatus::Degraded
+        } else {
+            crate::domain::CoverageStatus::Complete
+        },
+        cb_state,
+    }
+}
+
+#[derive(Clone)]
+struct PlannedIngest {
+    stamp: crate::domain::FileStamp,
+    targets: crate::domain::IndexTargets,
+}
+
+struct LegacyExecutionProjection {
+    entries: Vec<discovery::DiscoveredEntry>,
+    ingest_plans: HashMap<String, PlannedIngest>,
+    terminal_dispositions: Vec<(String, crate::domain::FileDisposition)>,
+}
+
+/// Project an authoritative metadata-first scout into the legacy execution
+/// pipeline while retaining exactly one outcome slot for every scout entry.
+/// Entries executable by the current code parser carry their immutable stamp
+/// and targets into stable-read execution; every other scout decision is
+/// represented immediately as a terminal manifest disposition.
+fn project_scout_for_legacy_execution(plan: &discovery::ScoutPlan) -> LegacyExecutionProjection {
+    let mut executable = Vec::new();
+    let mut ingest_plans = HashMap::new();
+    let mut terminal_dispositions = Vec::new();
+
+    for entry in &plan.entries {
+        let path = entry
+            .path
+            .normalized_utf8
+            .clone()
+            .unwrap_or_else(|| entry.path.public_id.clone());
+        match &entry.decision {
+            ScoutDecision::Ingest { targets } => {
+                let Some(relative_path) = entry.path.normalized_utf8.clone() else {
+                    terminal_dispositions.push((
+                        path,
+                        crate::domain::FileDisposition::MetadataOnly {
+                            reason: MetadataOnlyReason::UnsupportedPathEncoding,
+                        },
+                    ));
+                    continue;
+                };
+                let Some(absolute_path) = entry.absolute_path.clone() else {
+                    terminal_dispositions.push((
+                        path,
+                        crate::domain::FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::Metadata,
+                            kind: crate::domain::AccessErrorKind::Other,
+                        },
+                    ));
+                    continue;
+                };
+                ingest_plans.insert(
+                    relative_path.clone(),
+                    PlannedIngest {
+                        stamp: entry.stamp.clone(),
+                        targets: *targets,
+                    },
+                );
+                executable.push(discovery::DiscoveredEntry {
+                    relative_os_path: PathBuf::from(&relative_path),
+                    relative_path,
+                    absolute_path,
+                    file_size: entry.stamp.size,
+                    language: entry.language.clone(),
+                    classification: entry.classification,
+                });
+            }
+            ScoutDecision::MetadataOnly { reason } => {
+                terminal_dispositions.push((
+                    path,
+                    crate::domain::FileDisposition::MetadataOnly {
+                        reason: reason.clone(),
+                    },
+                ));
+            }
+            ScoutDecision::HardSkip { reason } => {
+                terminal_dispositions.push((
+                    path,
+                    crate::domain::FileDisposition::HardSkip { reason: *reason },
+                ));
+            }
+            ScoutDecision::Unavailable { stage, kind } => {
+                terminal_dispositions.push((
+                    path,
+                    crate::domain::FileDisposition::Unreadable {
+                        stage: *stage,
+                        kind: *kind,
+                    },
+                ));
+            }
+        }
+    }
+
+    terminal_dispositions.sort_by(|left, right| left.0.cmp(&right.0));
+    LegacyExecutionProjection {
+        entries: executable,
+        ingest_plans,
+        terminal_dispositions,
+    }
 }
 
 /// Run the shared admission gate and parser over a set of discovered entries.
 ///
 /// This is the SINGLE pipeline used by both [`LiveIndex::load`] (initial load)
 /// and [`LiveIndex::build_reload_data`] (full reindex / `index_folder`), so both
-/// paths classify every discovered file into Tier 1/2/3, record Tier-2/3 files in
-/// `skipped_files`, and respect the in-flight byte governor identically.
+/// paths classify every discovered file into Tier 1/2/3, retain one canonical
+/// manifest disposition per path, and respect the in-flight byte governor
+/// identically.
 ///
 /// Pipeline shape (same as the original `load`):
 ///   * Phase 1 — size + basename classification (no I/O beyond the walk).
@@ -1529,246 +3407,166 @@ pub(crate) struct AdmitParseResult {
 /// under UNTRACKED generated-output dirs (see
 /// `discovery::untracked_generated_output_demotions`) are demoted to Tier 2
 /// without reading their content. An empty set demotes nothing.
-pub(crate) fn admit_and_parse_entries(
+fn admit_and_parse_entries(
     entries: &[crate::discovery::DiscoveredEntry],
+    ingest_plans: &HashMap<String, PlannedIngest>,
     exclude_untracked_set: &Option<std::collections::HashSet<String>>,
     generated_output_demotions: &std::collections::HashSet<String>,
+    source_scope: PathBuf,
 ) -> AdmitParseResult {
-    use crate::discovery::{classify_admission, unsupported_language_decision};
-    // `AdmissionTier` and `SkippedFile` are already imported at module scope.
+    use crate::discovery::classify_admission;
 
-    // Peak-memory governor: bounds the bytes resident across all concurrent
-    // full-file reads/parses so a tree of many large recognized-source files
-    // (each under the per-file hard-skip, cumulatively under the cap) cannot
-    // drive peak RSS to `num_threads * file_size`. Coverage is unchanged — every
-    // file is still read and classified; only concurrency of the large reads is
-    // bounded. `read_under_budget` returns the same bytes a bare `std::fs::read`
-    // would, just admission-throttled for big files.
+    // Transient bytes and staged resident bytes are governed independently.
+    // The immutable scout plan fixes both the per-entry stamp and the maximum
+    // staged content charge before any worker allocates.
     let inflight_budget = Arc::new(InflightByteBudget::from_env());
-    // Read a file, acquiring an in-flight permit FIRST for files above the
-    // governor threshold. The returned permit (if any) must be held for as long
-    // as the returned bytes are alive, so peak resident bytes across all workers
-    // stay within the budget. Returns `(bytes, permit)`.
-    let read_under_budget =
-        |path: &Path, size: u64| -> std::io::Result<(Vec<u8>, Option<InflightPermit>)> {
-            if size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES {
-                // Acquire BEFORE reading so the large allocation never races ahead
-                // of the budget.
-                let permit = inflight_budget.acquire(size);
-                let bytes = std::fs::read(path)?;
-                Ok((bytes, Some(permit)))
-            } else {
-                let bytes = std::fs::read(path)?;
-                Ok((bytes, None))
-            }
-        };
+    let staged_ceiling = ingest_plans.values().fold(0_u64, |total, planned| {
+        total.saturating_add(planned.stamp.size)
+    });
+    let staged_accounting = Arc::new(StagedContentAccounting::new(staged_ceiling));
 
     let outcomes: Vec<AdmissionOutcome> = indexing_thread_pool().install(|| {
         entries
             .par_iter()
-            .filter_map(|entry| {
-                // Phase 1: size + extension check (no I/O beyond what the walk gave us).
-                let decision_pre = classify_admission(
-                    &entry.absolute_path,
-                    entry.file_size,
-                    None, // no content yet
-                );
-
-                match decision_pre.tier {
-                    AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
-                        // No need to read content — already decided.
-                        let sf = SkippedFile {
-                            path: entry.relative_path.clone(),
-                            size: entry.file_size,
-                            extension: entry
-                                .absolute_path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .map(|s| s.to_string()),
-                            decision: decision_pre,
-                        };
-                        return Some(AdmissionOutcome::Skip(sf));
-                    }
-                    AdmissionTier::Normal => {}
-                }
-
-                // F5: untracked generated-output demotion. Decided at discovery
-                // time (dir-level git evidence); checked here BEFORE any file
-                // read so a 900-file JSON cache dump costs zero I/O. Empty set
-                // (the default for git-less trees and under the
-                // `SYMFORGE_INDEX_GENERATED_OUTPUT` opt-in) demotes nothing.
-                if generated_output_demotions.contains(&entry.relative_path) {
-                    let sf = SkippedFile {
-                        path: entry.relative_path.clone(),
-                        size: entry.file_size,
-                        extension: entry
-                            .absolute_path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map(|s| s.to_string()),
-                        decision: crate::domain::index::AdmissionDecision::skip(
+            .map(|entry| {
+                let Some(planned) = ingest_plans.get(&entry.relative_path) else {
+                    return terminal_admission_outcome(
+                        entry,
+                        AdmissionDecision::skip(
                             AdmissionTier::MetadataOnly,
-                            crate::domain::index::SkipReason::GeneratedOutput,
+                            SkipReason::UnsupportedLanguage,
                         ),
-                    };
-                    return Some(AdmissionOutcome::Skip(sf));
+                        crate::domain::FileDisposition::Unreadable {
+                            stage: crate::domain::AccessStage::Metadata,
+                            kind: crate::domain::AccessErrorKind::Other,
+                        },
+                    );
+                };
+                // Re-run metadata-only policy before any permit/allocation. The
+                // immutable scout remains authoritative; this is a defense-in-
+                // depth parity check for policy changes between stages.
+                let decision_pre = classify_admission(&entry.absolute_path, entry.file_size, None);
+                if !matches!(decision_pre.tier, AdmissionTier::Normal) {
+                    let disposition = disposition_from_admission(decision_pre);
+                    return terminal_admission_outcome(entry, decision_pre, disposition);
                 }
 
-                // Phase 2: we tentatively have Tier-1. If the file has no recognized
-                // language, we cannot parse it — skip it as metadata-only.
-                let language = match &entry.language {
-                    Some(lang) => lang.clone(),
-                    None => {
-                        // Unknown extension, not on denylist, under size limit.
-                        // Read content to do binary sniff, then store as skipped.
-                        // `_permit` stays alive until the end of this block so the
-                        // read bytes are accounted against the in-flight budget.
-                        let (bytes, _permit) =
-                            match read_under_budget(&entry.absolute_path, entry.file_size) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                                    return None;
-                                }
-                            };
-                        let decision_post = unsupported_language_decision(classify_admission(
-                            &entry.absolute_path,
-                            entry.file_size,
-                            Some(&bytes),
-                        ));
-                        let sf = SkippedFile {
-                            path: entry.relative_path.clone(),
-                            size: entry.file_size,
-                            extension: entry
-                                .absolute_path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .map(|s| s.to_string()),
-                            decision: decision_post,
-                        };
-                        return Some(AdmissionOutcome::Skip(sf));
+                // Generated and untracked demotions are metadata decisions and
+                // therefore happen before stable-read I/O.
+                if generated_output_demotions.contains(&entry.relative_path) {
+                    let decision = AdmissionDecision::skip(
+                        AdmissionTier::MetadataOnly,
+                        SkipReason::GeneratedOutput,
+                    );
+                    let disposition = disposition_from_admission(decision);
+                    return terminal_admission_outcome(entry, decision, disposition);
+                }
+                if let Some(tracked) = exclude_untracked_set.as_ref()
+                    && !tracked.contains(&entry.relative_path)
+                {
+                    let decision =
+                        AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::Untracked);
+                    let disposition = disposition_from_admission(decision);
+                    return terminal_admission_outcome(entry, decision, disposition);
+                }
+
+                // A request larger than the total in-flight budget is terminal
+                // before permit acquisition or allocation (FR-005/C-R07).
+                if planned.stamp.size > inflight_budget.total {
+                    let decision =
+                        AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling);
+                    return terminal_admission_outcome(
+                        entry,
+                        decision,
+                        crate::domain::FileDisposition::HardSkip {
+                            reason: HardSkipReason::PerFileCeiling,
+                        },
+                    );
+                }
+
+                let permit = Some(inflight_budget.acquire(planned.stamp.size));
+                let stable = stable_read_with_retries(
+                    &entry.absolute_path,
+                    &planned.stamp,
+                    StableReadLimits {
+                        per_file_bytes: crate::domain::index::HARD_SKIP_BYTES,
+                        inflight_bytes: inflight_budget.total,
+                    },
+                    &FilesystemStableReadAccess,
+                );
+                let (bytes, accepted_hash) = match stable {
+                    StableReadOutcome::Accepted { bytes, hash } => (bytes, hash),
+                    StableReadOutcome::HardSkip { reason } => {
+                        let decision = AdmissionDecision::skip(
+                            AdmissionTier::HardSkip,
+                            SkipReason::SizeCeiling,
+                        );
+                        return terminal_admission_outcome(
+                            entry,
+                            decision,
+                            crate::domain::FileDisposition::HardSkip { reason },
+                        );
+                    }
+                    StableReadOutcome::Unreadable { stage, kind } => {
+                        return terminal_admission_outcome(
+                            entry,
+                            AdmissionDecision::skip(
+                                AdmissionTier::MetadataOnly,
+                                SkipReason::UnsupportedLanguage,
+                            ),
+                            crate::domain::FileDisposition::Unreadable { stage, kind },
+                        );
+                    }
+                    StableReadOutcome::UnstableDuringRead => {
+                        return terminal_admission_outcome(
+                            entry,
+                            AdmissionDecision::skip(
+                                AdmissionTier::MetadataOnly,
+                                SkipReason::UnsupportedLanguage,
+                            ),
+                            crate::domain::FileDisposition::UnstableDuringRead,
+                        );
                     }
                 };
 
-                // Phase 3: read content and do binary sniff before passing to parser.
-                // `_permit` bounds the concurrent READ footprint and is released at
-                // the end of this closure — it deliberately does NOT cross into the
-                // parse stage (that would deadlock this `par_iter`). The parse stage
-                // re-acquires its own permit from `file_size`.
-                let (bytes, _permit) =
-                    match read_under_budget(&entry.absolute_path, entry.file_size) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!("failed to read {:?}: {}", entry.absolute_path, e);
-                            return None;
-                        }
-                    };
-                let mtime_secs = std::fs::metadata(&entry.absolute_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
                 let decision_post =
                     classify_admission(&entry.absolute_path, entry.file_size, Some(&bytes));
-
-                match decision_post.tier {
-                    AdmissionTier::HardSkip | AdmissionTier::MetadataOnly => {
-                        // Binary sniff reclassified this file — do NOT parse.
-                        // Drop the bytes now; `_permit` releases at closure end.
-                        drop(bytes);
-                        let sf = SkippedFile {
-                            path: entry.relative_path.clone(),
-                            size: entry.file_size,
-                            extension: entry
-                                .absolute_path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .map(|s| s.to_string()),
-                            decision: decision_post,
-                        };
-                        Some(AdmissionOutcome::Skip(sf))
-                    }
-                    AdmissionTier::Normal => {
-                        // SF-009 opt-in demotion: if the exclude-untracked policy is
-                        // active and this recognized-extension file is NOT git-tracked,
-                        // demote it to Tier-2 instead of parsing it. Default (`None`)
-                        // skips this entirely.
-                        if let Some(tracked) = exclude_untracked_set.as_ref()
-                            && !tracked.contains(&entry.relative_path)
-                        {
-                            drop(bytes);
-                            let sf = SkippedFile {
-                                path: entry.relative_path.clone(),
-                                size: entry.file_size,
-                                extension: entry
-                                    .absolute_path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.to_string()),
-                                decision: crate::domain::index::AdmissionDecision::skip(
-                                    AdmissionTier::MetadataOnly,
-                                    crate::domain::index::SkipReason::Untracked,
-                                ),
-                            };
-                            return Some(AdmissionOutcome::Skip(sf));
-                        }
-                        Some(AdmissionOutcome::Parse(ParseCandidate {
-                            relative_path: entry.relative_path.clone(),
-                            language,
-                            classification: entry.classification,
-                            bytes,
-                            mtime_secs,
-                            file_size: entry.file_size,
-                        }))
-                    }
+                if !matches!(decision_post.tier, AdmissionTier::Normal) {
+                    let disposition = disposition_from_admission(decision_post);
+                    return terminal_admission_outcome(entry, decision_post, disposition);
                 }
-            })
-            .collect()
-    });
 
-    // Split outcomes into parse candidates and skipped files. Each candidate
-    // carries its on-disk `file_size` so the parse stage can re-acquire an
-    // in-flight permit for large files.
-    let mut skipped_files: Vec<SkippedFile> = Vec::new();
-    let mut to_parse: Vec<ParseCandidate> = Vec::new();
+                // Stable bytes cross one content-policy boundary before parsing,
+                // hashing, or publication. A metadata-only result consumes the
+                // owned buffer here, so positive or indeterminate detector bytes
+                // cannot reach any resident, snapshot, search, or analytics lane.
+                if let crate::knowledge::StableContentAdmission::MetadataOnly(reason) =
+                    crate::knowledge::classify_stable_content(
+                        &entry.relative_path,
+                        planned.targets,
+                        &bytes,
+                    )
+                {
+                    return terminal_admission_outcome(
+                        entry,
+                        AdmissionDecision::skip(
+                            AdmissionTier::MetadataOnly,
+                            SkipReason::UnsupportedLanguage,
+                        ),
+                        crate::domain::FileDisposition::MetadataOnly { reason },
+                    );
+                }
+                let language = entry.language.clone().unwrap_or(LanguageId::Text);
 
-    for outcome in outcomes {
-        match outcome {
-            AdmissionOutcome::Skip(sf) => skipped_files.push(sf),
-            AdmissionOutcome::Parse(candidate) => to_parse.push(candidate),
-        }
-    }
-
-    info!(
-        "admission gate: {} to parse, {} skipped",
-        to_parse.len(),
-        skipped_files.len()
-    );
-
-    // Parse all admitted files in parallel via Rayon. Large files re-acquire an
-    // in-flight permit (scoped to THIS closure, so it can never deadlock the
-    // stage) for the duration of the parse, bounding the concurrent parse memory
-    // the same way the read stage bounds the concurrent read memory. Small files
-    // parse with full parallelism.
-    let mut parse_results: Vec<(String, IndexedFile)> = indexing_thread_pool().install(|| {
-        to_parse
-            .into_par_iter()
-            .map(|candidate| {
-                let ParseCandidate {
-                    relative_path,
-                    language,
-                    classification,
-                    bytes,
-                    mtime_secs,
-                    file_size,
-                } = candidate;
-                // Permit held for read+parse residency of this large file; released
-                // when this closure returns. `_permit` is None for small files
-                // (unbounded parallelism).
-                let _permit = (file_size > INFLIGHT_GOVERNOR_THRESHOLD_BYTES)
-                    .then(|| inflight_budget.acquire(file_size));
+                let mtime_secs = planned
+                    .stamp
+                    .modified_hint
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let relative_path = entry.relative_path.clone();
+                let classification =
+                    FileClassification::for_indexed_path(&relative_path, planned.targets);
                 let result = parsing::process_file_with_classification(
                     &relative_path,
                     &bytes,
@@ -1776,49 +3574,117 @@ pub(crate) fn admit_and_parse_entries(
                     classification,
                 );
                 let indexed = IndexedFile::from_parse_result(result, bytes).with_mtime(mtime_secs);
-                (relative_path, indexed)
+                debug_assert_eq!(crate::hash::digest(&indexed.content), accepted_hash);
+                let resident_bytes = u64::try_from(indexed.content.len()).unwrap_or(u64::MAX);
+                if !staged_accounting.handoff(resident_bytes, permit) {
+                    let decision =
+                        AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling);
+                    return terminal_admission_outcome(
+                        entry,
+                        decision,
+                        crate::domain::FileDisposition::HardSkip {
+                            reason: HardSkipReason::PerFileCeiling,
+                        },
+                    );
+                }
+                AdmissionOutcome::Parsed(relative_path, indexed, planned.targets)
             })
             .collect()
     });
 
-    // Sort by path for deterministic circuit-breaker evaluation order.
-    parse_results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut code_results: Vec<(String, IndexedFile)> = Vec::new();
+    let mut knowledge_results: Vec<(String, IndexedFile)> = Vec::new();
+    let mut combined_results: Vec<(String, IndexedFile)> = Vec::new();
+    let mut terminal_dispositions = Vec::new();
+    let mut execution_degraded = false;
 
-    // Build the file map sequentially, running circuit breaker checks.
-    let cb_state = CircuitBreakerState::from_env();
-    let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::with_capacity(parse_results.len());
-
-    let mut cb_tripped = false;
-    for (path, indexed_file) in parse_results {
-        match &indexed_file.parse_status {
-            ParseStatus::Failed { error } => {
-                cb_state.record_failure(&path, error);
-            }
-            _ => {
-                cb_state.record_success();
+    for outcome in outcomes {
+        match outcome {
+            AdmissionOutcome::Parsed(path, indexed, targets) => match targets {
+                crate::domain::IndexTargets::Code => code_results.push((path, indexed)),
+                crate::domain::IndexTargets::Knowledge => {
+                    knowledge_results.push((path, indexed));
+                }
+                crate::domain::IndexTargets::CodeAndKnowledge => {
+                    combined_results.push((path, indexed));
+                }
+            },
+            AdmissionOutcome::Terminal { path, disposition } => {
+                execution_degraded |= matches!(
+                    disposition,
+                    crate::domain::FileDisposition::Unreadable { .. }
+                        | crate::domain::FileDisposition::UnstableDuringRead
+                );
+                terminal_dispositions.push((path, disposition));
             }
         }
+    }
 
-        if cb_state.should_abort() {
-            let summary = cb_state.summary();
-            error!("{}", summary);
-            cb_tripped = true;
-            // Still insert the file before breaking.
-            files.insert(path, Arc::new(indexed_file));
-            break;
+    let staged_count = code_results.len() + knowledge_results.len() + combined_results.len();
+    info!(
+        "admission + parse: {} staged, {} terminal",
+        staged_count,
+        terminal_dispositions.len()
+    );
+
+    let mut files = HashMap::with_capacity(staged_count);
+    let mut breaker_coverage = crate::domain::CoverageStatus::Complete;
+    let mut cb_state = None;
+
+    for (lane, parse_results) in [
+        (crate::domain::IndexTargets::Code, code_results),
+        (crate::domain::IndexTargets::Knowledge, knowledge_results),
+        (
+            crate::domain::IndexTargets::CodeAndKnowledge,
+            combined_results,
+        ),
+    ] {
+        if parse_results.is_empty() {
+            continue;
+        }
+        let ParseFoldResult {
+            files: lane_files,
+            dispositions,
+            coverage,
+            cb_state: lane_cb_state,
+        } = fold_parse_results_for_scope(
+            parse_results,
+            CircuitBreakerState::from_env(),
+            CircuitBreakerScope::new(source_scope.clone(), lane, "parse"),
+        );
+        files.extend(lane_files);
+        terminal_dispositions.extend(dispositions);
+        if matches!(coverage, crate::domain::CoverageStatus::Degraded) {
+            breaker_coverage = crate::domain::CoverageStatus::Degraded;
         }
 
-        files.insert(path, Arc::new(indexed_file));
+        // The legacy LiveIndex health field can represent only one breaker.
+        // Preserve the first tripped scope deterministically; manifest coverage
+        // retains the complete multi-lane result for reconciliation.
+        if cb_state
+            .as_ref()
+            .is_none_or(|current: &CircuitBreakerState| {
+                !current.is_tripped() && lane_cb_state.is_tripped()
+            })
+        {
+            cb_state = Some(lane_cb_state);
+        }
     }
 
-    if cb_tripped {
-        cb_state.tripped.store(true, Ordering::Relaxed);
-    }
+    terminal_dispositions.sort_by(|left, right| left.0.cmp(&right.0));
+    let coverage = if execution_degraded
+        || matches!(breaker_coverage, crate::domain::CoverageStatus::Degraded)
+    {
+        crate::domain::CoverageStatus::Degraded
+    } else {
+        crate::domain::CoverageStatus::Complete
+    };
 
     AdmitParseResult {
         files,
-        skipped_files,
-        cb_state,
+        terminal_dispositions,
+        coverage,
+        cb_state: cb_state.unwrap_or_else(CircuitBreakerState::from_env),
     }
 }
 
@@ -1829,16 +3695,42 @@ impl LiveIndex {
     /// This function is **synchronous** — it must complete before the async tokio runtime
     /// needs the index. Rayon handles internal parallelism.
     pub fn load(root: &Path) -> anyhow::Result<SharedIndex> {
+        Self::load_with_project_state(root, None, discovery::SourceExclusions::default())
+    }
+
+    pub fn load_for_state_placement(
+        root: &Path,
+        state_placement: &StatePlacement,
+    ) -> anyhow::Result<SharedIndex> {
+        let shared = Self::load_with_project_state(
+            root,
+            state_placement.directory(),
+            discovery::SourceExclusions::for_state_placement(root, state_placement),
+        )?;
+        shared
+            .project_state_dir
+            .store(state_placement.directory().cloned().map(Arc::new));
+        Ok(shared)
+    }
+
+    fn load_with_project_state(
+        root: &Path,
+        project_state_dir: Option<&ProjectStateDir>,
+        source_exclusions: discovery::SourceExclusions,
+    ) -> anyhow::Result<SharedIndex> {
         let start = Instant::now();
 
         info!("LiveIndex::load starting at {:?}", root);
 
-        // 1. Discover ALL files (not just known-language ones) so the admission gate
-        //    can classify every file, including those with denylisted or unknown extensions.
-        let all_entries = discovery::discover_all_files(root)?;
+        // 1. Build the authoritative metadata-first catalog. Every later content
+        //    action is projected from this immutable plan; load never performs a
+        //    second independent filesystem walk.
+        let mut scout_plan = discovery::scout_repository_with_exclusions(root, &source_exclusions)?;
+        let projection = project_scout_for_legacy_execution(&scout_plan);
         info!(
-            "discovered {} total files (pre-admission)",
-            all_entries.len()
+            "scouted {} catalog entries ({} executable by the legacy index)",
+            scout_plan.entries.len(),
+            projection.entries.len(),
         );
 
         // SF-009 opt-in: when `SYMFORGE_EXCLUDE_UNTRACKED` is enabled, compute
@@ -1855,36 +3747,52 @@ impl LiveIndex {
         // out/cache/*-out/… with no tracked file beneath) to Tier-2. Empty for
         // non-git trees and under `SYMFORGE_INDEX_GENERATED_OUTPUT=1`.
         let generated_output_demotions =
-            discovery::untracked_generated_output_demotions(root, &all_entries);
+            discovery::untracked_generated_output_demotions(root, &projection.entries);
+        let LegacyExecutionProjection {
+            entries: all_entries,
+            ingest_plans,
+            terminal_dispositions: mut scout_terminal_dispositions,
+        } = projection;
 
         // 2. Run the shared admission + parse pipeline. This classifies every
-        //    discovered file into Tier 1/2/3, records Tier-2/3 files in
-        //    `skipped_files`, reads admitted files under the in-flight byte
+        //    discovered file into a terminal manifest disposition, reads admitted files under the in-flight byte
         //    governor, parses them in parallel, and applies the circuit breaker.
         //    The exact same pipeline backs `build_reload_data` (the reload /
         //    `index_folder` path), so both surfaces report identical tiering.
         let AdmitParseResult {
             files,
-            skipped_files,
+            mut terminal_dispositions,
+            coverage,
             cb_state,
         } = admit_and_parse_entries(
             &all_entries,
+            &ingest_plans,
             &exclude_untracked_set,
             &generated_output_demotions,
+            normalize_root(root),
         );
+        if matches!(coverage, crate::domain::CoverageStatus::Degraded) {
+            scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        terminal_dispositions.append(&mut scout_terminal_dispositions);
+        terminal_dispositions.sort_by(|left, right| left.0.cmp(&right.0));
+        debug_assert_eq!(terminal_dispositions.len(), scout_plan.entries.len());
+        let manifest_entries =
+            manifest_entries_from_scout(&scout_plan, terminal_dispositions, &files)?;
 
         let load_duration = start.elapsed();
         info!(
-            "LiveIndex loaded: {} files, {} symbols, {} skipped, {:?}",
+            "LiveIndex loaded: {} files, {} symbols, {} manifest entries, {:?}",
             files.len(),
             files.values().map(|f| f.symbols.len()).sum::<usize>(),
-            skipped_files.len(),
+            manifest_entries.len(),
             load_duration
         );
 
         let trigram_index = super::trigram::TrigramIndex::build_from_files(&files);
         let gitignore = discovery::load_gitignore(root);
-        let coupling_store = super::coupling::init_coupling_store(root);
+        let coupling_store = project_state_dir
+            .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir));
 
         let mut index = LiveIndex {
             files,
@@ -1900,7 +3808,7 @@ impl LiveIndex {
             files_by_dir_component: HashMap::new(),
             trigram_index,
             gitignore,
-            skipped_files,
+            manifest_entries,
             coupling_store,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             // Record the normalized root this fresh index was built from so a
@@ -1917,7 +3825,11 @@ impl LiveIndex {
         // no frecency footprint.
         crate::live_index::frecency::ensure_bump_hook_registered();
 
-        Ok(SharedIndexHandle::shared(index))
+        Ok(SharedIndexHandle::shared_with_scout_plan(
+            index,
+            scout_plan,
+            source_exclusions,
+        ))
     }
 
     /// Build a bare, empty `LiveIndex` value (no files loaded).
@@ -1940,7 +3852,7 @@ impl LiveIndex {
             files_by_dir_component: HashMap::new(),
             trigram_index: super::trigram::TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             // An empty bootstrap index has no root: any non-empty target root
@@ -1973,89 +3885,70 @@ impl LiveIndex {
         self.coupling_store.as_deref()
     }
 
-    pub fn add_skipped_file(&mut self, sf: SkippedFile) {
-        self.skipped_files.push(sf);
+    fn upsert_manifest_entry(&mut self, entry: CatalogEntry) {
+        let path = scouted_catalog_path(&entry.path).to_string();
+        self.manifest_entries
+            .retain(|existing| scouted_catalog_path(&existing.path) != path);
+        self.manifest_entries.push(entry);
+        self.manifest_entries.sort_by_cached_key(|entry| {
+            let path = entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .unwrap_or(entry.path.public_id.as_str());
+            (path.to_lowercase(), path.to_string())
+        });
     }
 
-    /// Demote a single file to Tier 2/3 (metadata-only or hard-skip).
-    ///
-    /// Used by the single-file (re)index choke point when admission classifies a
-    /// file as non-Tier-1. Performs the full transition atomically on this
-    /// `LiveIndex` clone:
-    /// 1. If the path is currently a fully-indexed Tier-1 file, remove it from
-    ///    `files` (and its derived indices). This handles a Tier 1 -> Tier 2
-    ///    transition, e.g. a source file that grew past the 1MB threshold.
-    /// 2. Upsert the `SkippedFile` record, replacing any stale record for the
-    ///    same path so `skipped_files` never accumulates duplicates or a stale
-    ///    tier/reason for one path.
-    ///
-    /// Mirrors the dedup invariant the bulk `load` path establishes (one record
-    /// per skipped path).
-    pub fn demote_to_skipped(&mut self, path: &str, sf: SkippedFile) {
-        // Drop the file from the fully-indexed store if it was Tier 1 before.
-        // `remove_file` is a no-op when the path is absent.
-        self.remove_file(path);
-        // Replace any existing skip record for this path, then insert the fresh
-        // one. Keeps exactly one record per path with the current tier/reason.
-        self.skipped_files.retain(|existing| existing.path != path);
-        self.skipped_files.push(sf);
-        self.is_empty = self.files.is_empty();
-        self.loaded_at_system = SystemTime::now();
+    fn remove_manifest_entry(&mut self, path: &str) -> bool {
+        let before = self.manifest_entries.len();
+        self.manifest_entries
+            .retain(|entry| scouted_catalog_path(&entry.path) != path);
+        self.manifest_entries.len() != before
     }
 
-    /// Remove any Tier-2/3 skip record for `path`.
-    ///
-    /// Called when a previously-skipped file is admitted as Tier 1 again
-    /// (e.g. an oversized file shrank back under the threshold), so the file is
-    /// no longer double-counted as both indexed and skipped. No-op when no skip
-    /// record exists. Returns `true` when a record was removed.
-    pub fn clear_skipped(&mut self, path: &str) -> bool {
-        let before = self.skipped_files.len();
-        self.skipped_files.retain(|existing| existing.path != path);
-        self.skipped_files.len() != before
-    }
-
-    pub fn skipped_files(&self) -> &[SkippedFile] {
-        &self.skipped_files
+    /// Project the legacy Tier-2/3 response from canonical manifest entries.
+    /// No compatibility state is retained after this call returns.
+    pub fn compatibility_skipped_files(&self) -> Vec<SkippedFile> {
+        self.manifest_entries
+            .iter()
+            .filter_map(|entry| {
+                let decision = compatibility_admission_decision(entry)?;
+                let path = scouted_catalog_path(&entry.path).to_string();
+                let extension = Path::new(&path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(ToOwned::to_owned);
+                Some(SkippedFile {
+                    path,
+                    size: entry.size,
+                    extension,
+                    decision,
+                })
+            })
+            .collect()
     }
 
     /// Returns (tier1_count, tier2_count, tier3_count).
-    /// Tier 1 = number of indexed files (self.files.len()).
-    /// Tier 2/3 = from skipped_files.
+    /// All tiers are projected from canonical manifest dispositions. The
+    /// file-map fallback exists only for legacy synthetic indices that have no
+    /// manifest entries at all.
     pub fn tier_counts(&self) -> (usize, usize, usize) {
-        let tier1 = self.files.len();
+        let mut tier1 = 0;
         let mut tier2 = 0;
         let mut tier3 = 0;
-        for sf in &self.skipped_files {
-            match sf.tier() {
-                AdmissionTier::MetadataOnly => tier2 += 1,
-                AdmissionTier::HardSkip => tier3 += 1,
-                AdmissionTier::Normal => {
-                    // INVARIANT VIOLATION: a skipped file must never carry a
-                    // Tier-1/Normal decision — a Normal file is parsed and lives
-                    // in `self.files`, not `skipped_files`. Before SF-004/SF-012
-                    // the unsupported-language branch minted exactly such records
-                    // and they vanished here, taking the file out of every tier
-                    // count (so "discovered" undercounted and "Tier 3: 0" read as
-                    // complete accounting). The admission gate now demotes those
-                    // to Tier-2/UnsupportedLanguage, so reaching this arm means a
-                    // new code path regressed the invariant. Surface it loudly
-                    // (and count it as Tier-2 so the file is at least not lost)
-                    // instead of silently dropping the record.
-                    warn!(
-                        "tier_counts invariant violation: skipped file {:?} has \
-                         Tier-1/Normal decision (reason {:?}); counting as Tier-2",
-                        sf.path,
-                        sf.reason()
-                    );
-                    debug_assert!(
-                        false,
-                        "skipped file {:?} must not carry a Normal admission tier",
-                        sf.path
-                    );
-                    tier2 += 1;
-                }
+        for entry in &self.manifest_entries {
+            match entry.disposition {
+                FileDisposition::Indexed { .. } => tier1 += 1,
+                FileDisposition::HardSkip { .. } => tier3 += 1,
+                FileDisposition::MetadataOnly { .. }
+                | FileDisposition::Unreadable { .. }
+                | FileDisposition::UnstableDuringRead
+                | FileDisposition::AbortedCircuitBreaker => tier2 += 1,
             }
+        }
+        if self.manifest_entries.is_empty() {
+            tier1 = self.files.len();
         }
         (tier1, tier2, tier3)
     }
@@ -2065,6 +3958,25 @@ impl LiveIndex {
     /// lock via `apply_reload_data` — reducing lock hold time from seconds to
     /// milliseconds.
     pub(crate) fn build_reload_data(root: &Path) -> anyhow::Result<ReloadData> {
+        Self::build_reload_data_for_binding(root, None)
+    }
+
+    pub(crate) fn build_reload_data_for_binding(
+        root: &Path,
+        project_state_dir: Option<&ProjectStateDir>,
+    ) -> anyhow::Result<ReloadData> {
+        Self::build_reload_data_for_binding_with_exclusions(
+            root,
+            project_state_dir,
+            &discovery::SourceExclusions::default(),
+        )
+    }
+
+    pub(crate) fn build_reload_data_for_binding_with_exclusions(
+        root: &Path,
+        project_state_dir: Option<&ProjectStateDir>,
+        source_exclusions: &discovery::SourceExclusions,
+    ) -> anyhow::Result<ReloadData> {
         let start = Instant::now();
 
         info!("LiveIndex::build_reload_data starting at {:?}", root);
@@ -2076,54 +3988,66 @@ impl LiveIndex {
             );
         }
 
-        // 1. Discover ALL files (not just known-language ones), exactly as
-        //    `LiveIndex::load` does, so the admission gate can classify every
-        //    file — including denylisted/binary/oversized ones — and record them
-        //    as Tier-2/3 skips instead of invisibly dropping them. This also
-        //    enables the cumulative-byte discovery ceiling that `discover_files`
-        //    does not enforce. (Previously reload used `discover_files`, which
-        //    hard-filters on extension and therefore never saw Tier-2/3 files,
-        //    leaving health tier counts structurally N/0/0 after any reload.)
-        let all_entries = discovery::discover_all_files(root)?;
+        // 1. Build the same authoritative metadata-first catalog used by cold
+        //    load. Reload performs no independent compatibility walk.
+        let mut scout_plan = discovery::scout_repository_with_exclusions(root, source_exclusions)?;
+        let projection = project_scout_for_legacy_execution(&scout_plan);
         info!(
-            "discovered {} total files (pre-admission)",
-            all_entries.len()
+            "scouted {} catalog entries ({} executable by the legacy index)",
+            scout_plan.entries.len(),
+            projection.entries.len(),
         );
 
         // SF-009 opt-in: compute the git-tracked set so untracked
         // recognized-extension files can be demoted out of Tier-1 below.
         // `None` (default + fail-open for non-git trees) means "keep
         // everything", so admission defaults are unchanged. With the unified
-        // pipeline a demoted file is now recorded as a Tier-2 skip (it was
-        // silently dropped before), so the `untracked_indexed` health count and
-        // the `skipped_files` registry agree across both discovery paths.
+        // pipeline a demoted file now retains a Tier-2 manifest disposition (it
+        // was silently dropped before), so compatibility health projections
+        // agree across both discovery paths.
         let exclude_untracked_set = discovery::tracked_path_set_for_exclusion(root);
 
         // F5: same untracked generated-output demotion as `load`, so initial
         // load and reload report identical tiering.
         let generated_output_demotions =
-            discovery::untracked_generated_output_demotions(root, &all_entries);
+            discovery::untracked_generated_output_demotions(root, &projection.entries);
+        let LegacyExecutionProjection {
+            entries: all_entries,
+            ingest_plans,
+            terminal_dispositions: mut scout_terminal_dispositions,
+        } = projection;
 
         // 2. Run the shared admission + parse pipeline (identical to the one
         //    `LiveIndex::load` uses). This reads admitted files under the
         //    in-flight byte governor, parses in parallel, applies the circuit
-        //    breaker, and records every Tier-2/3 file in `skipped_files`.
+        //    breaker, and records one terminal disposition per catalog entry.
         let AdmitParseResult {
             files: new_files,
-            skipped_files,
+            mut terminal_dispositions,
+            coverage,
             cb_state: new_cb,
         } = admit_and_parse_entries(
             &all_entries,
+            &ingest_plans,
             &exclude_untracked_set,
             &generated_output_demotions,
+            normalize_root(root),
         );
+        if matches!(coverage, crate::domain::CoverageStatus::Degraded) {
+            scout_plan.coverage = crate::domain::CoverageStatus::Degraded;
+        }
+        terminal_dispositions.append(&mut scout_terminal_dispositions);
+        terminal_dispositions.sort_by(|left, right| left.0.cmp(&right.0));
+        debug_assert_eq!(terminal_dispositions.len(), scout_plan.entries.len());
+        let manifest_entries =
+            manifest_entries_from_scout(&scout_plan, terminal_dispositions, &new_files)?;
 
         let load_duration = start.elapsed();
         info!(
-            "LiveIndex::build_reload_data done: {} files, {} symbols, {} skipped, {:?}",
+            "LiveIndex::build_reload_data done: {} files, {} symbols, {} manifest entries, {:?}",
             new_files.len(),
             new_files.values().map(|f| f.symbols.len()).sum::<usize>(),
-            skipped_files.len(),
+            manifest_entries.len(),
             load_duration
         );
 
@@ -2132,16 +4056,14 @@ impl LiveIndex {
 
         Ok(ReloadData {
             files: new_files,
+            scout_plan: Arc::new(scout_plan),
+            manifest_entries,
             cb_state: new_cb,
             load_duration,
             gitignore: discovery::load_gitignore(root),
             derived,
-            // Reload now records Tier-2/3 files just like `LiveIndex::load`, so
-            // health tier counts are correct after a reload / `index_folder`.
-            // `apply_reload_data` REPLACES `self.skipped_files` (not append), so
-            // stale skips from a prior generation never accumulate.
-            skipped_files,
-            coupling_store: super::coupling::init_coupling_store(root),
+            coupling_store: project_state_dir
+                .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir)),
             // Record the normalized root so the reloaded index advertises which
             // project it now serves (root-mismatch invalidation).
             indexed_root: normalize_root(root),
@@ -2158,6 +4080,7 @@ impl LiveIndex {
         self.load_duration = data.load_duration;
         self.cb_state = data.cb_state;
         self.is_empty = false;
+        self.local_empty_reason.write().take();
         self.load_source = IndexLoadSource::FreshLoad;
         self.snapshot_verify_state = SnapshotVerifyState::NotNeeded;
         self.trigram_index = data.derived.trigram_index;
@@ -2165,9 +4088,15 @@ impl LiveIndex {
         self.files_by_basename = data.derived.files_by_basename;
         self.files_by_dir_component = data.derived.files_by_dir_component;
         self.gitignore = data.gitignore;
-        self.skipped_files = data.skipped_files;
+        self.manifest_entries = data.manifest_entries;
         self.coupling_store = data.coupling_store;
         self.indexed_root = Some(data.indexed_root);
+    }
+
+    fn from_reload_data(data: ReloadData) -> Self {
+        let mut live = Self::empty_live_index();
+        live.apply_reload_data(data);
+        live
     }
 
     /// Replaces all files, resets circuit breaker, and updates timestamps.
@@ -2186,7 +4115,9 @@ impl LiveIndex {
     /// Insert or replace a single file in the index without a full reload.
     ///
     /// Updates `loaded_at_system` to reflect the mutation time.
-    /// If the file already exists, its entry is replaced atomically.
+    /// If the file already exists, its content and canonical manifest entry are
+    /// replaced atomically. Existing target routing is preserved; callers that
+    /// need to change routing must use the explicit admission publication path.
     pub fn update_file(&mut self, path: String, file: IndexedFile) {
         // Capture old reference names BEFORE replacing the file, so we can
         // clean up stale reverse index entries after the insert.
@@ -2197,12 +4128,56 @@ impl LiveIndex {
             .unwrap_or_default();
         let had_existing = !old_ref_names.is_empty() || self.files.contains_key(&path);
 
+        let (catalog_path, targets) = self
+            .manifest_entries
+            .iter()
+            .find(|entry| scouted_catalog_path(&entry.path) == path)
+            .map(|entry| {
+                let targets = match entry.disposition {
+                    FileDisposition::Indexed { targets, .. } => targets,
+                    _ if file.language.is_code_language() => crate::domain::IndexTargets::Code,
+                    _ => crate::domain::IndexTargets::Knowledge,
+                };
+                (entry.path.clone(), targets)
+            })
+            .unwrap_or_else(|| {
+                let targets = if file.language.is_code_language() {
+                    crate::domain::IndexTargets::Code
+                } else {
+                    crate::domain::IndexTargets::Knowledge
+                };
+                (
+                    crate::domain::CatalogPath {
+                        public_id: path.clone(),
+                        normalized_utf8: Some(path.clone()),
+                    },
+                    targets,
+                )
+            });
+        let parse_status = match &file.parse_status {
+            ParseStatus::Parsed => crate::domain::index::ParseStatus::Parsed,
+            ParseStatus::PartialParse { .. } => crate::domain::index::ParseStatus::PartialParse,
+            ParseStatus::Failed { .. } => crate::domain::index::ParseStatus::Failed,
+        };
+        let manifest_entry = CatalogEntry {
+            path: catalog_path,
+            size: file.byte_len,
+            language: Some(file.language.clone()),
+            classification: file.classification.clone(),
+            disposition: FileDisposition::Indexed {
+                targets,
+                parse_status,
+            },
+            content_hash: Some(file.content_hash.clone()),
+        };
+
         // SAFETY: Insert the new file into the primary store FIRST.
         // This ensures the file is always present in `self.files` even if
         // auxiliary index updates panic (e.g., from concurrent access or
         // gitignore assertion failures). Auxiliary indices may become
         // temporarily stale, but the file won't vanish from the index.
         self.files.insert(path.clone(), Arc::new(file));
+        self.upsert_manifest_entry(manifest_entry);
 
         // Clean up old auxiliary indices using captured state.
         if had_existing {
@@ -2261,13 +4236,17 @@ impl LiveIndex {
 
     /// Remove a single file from the index by its relative path.
     ///
-    /// If the path is not present, this is a no-op (no timestamp update).
-    /// If the path is found and removed, `loaded_at_system` is updated.
+    /// Indexed bytes and the canonical manifest entry are cleared together. If
+    /// neither lane contains the path, this is a no-op (no timestamp update).
     pub fn remove_file(&mut self, path: &str) {
         self.remove_reverse_index_for_path(path);
-        if self.files.remove(path).is_some() {
+        let removed_file = self.files.remove(path).is_some();
+        let removed_manifest = self.remove_manifest_entry(path);
+        if removed_file {
             self.trigram_index.remove_file(path);
             self.remove_path_indices_for_path(path);
+        }
+        if removed_file || removed_manifest {
             self.loaded_at_system = SystemTime::now();
         }
     }
@@ -2475,6 +4454,10 @@ mod tests {
         }
     }
 
+    fn runtime_canary() -> String {
+        ["runtime", "-", "canary", "-", "segment"].concat()
+    }
+
     fn dummy_symbol() -> SymbolRecord {
         let byte_range = (0, 10);
         SymbolRecord {
@@ -2678,8 +4661,8 @@ mod tests {
 
             // It MUST appear in skipped_files with the lockfile skip reason.
             let lockfile_skip = index
-                .skipped_files()
-                .iter()
+                .compatibility_skipped_files()
+                .into_iter()
                 .find(|sf| sf.path.replace('\\', "/") == "package-lock.json")
                 .expect("lockfile must be recorded in skipped_files on reload");
             assert_eq!(
@@ -2725,8 +4708,8 @@ mod tests {
             );
 
             let big_skip = index
-                .skipped_files()
-                .iter()
+                .compatibility_skipped_files()
+                .into_iter()
                 .find(|sf| sf.path.replace('\\', "/") == "data/big.json")
                 .expect("oversized file must be recorded in skipped_files on reload");
             assert_eq!(big_skip.tier(), AdmissionTier::MetadataOnly);
@@ -2775,8 +4758,13 @@ mod tests {
         git2::Repository::init(tmp.path()).unwrap();
         write_file(tmp.path(), "src/lib.rs", "pub fn alpha() {}");
 
-        let shared = LiveIndex::load(tmp.path()).unwrap();
-        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(tmp.path());
+        let project_state =
+            crate::domain::ProjectStateDir::new(tmp.path().join(crate::paths::SYMFORGE_DIR_NAME));
+        let placement = crate::domain::StatePlacement::ProjectLocal {
+            directory: project_state.clone(),
+        };
+        let shared = LiveIndex::load_for_state_placement(tmp.path(), &placement).unwrap();
+        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(&project_state);
         assert!(shared.read().coupling_store().is_none());
         assert!(
             !db_path.exists(),
@@ -2792,7 +4780,12 @@ mod tests {
         git2::Repository::init(tmp.path()).unwrap();
         write_file(tmp.path(), "src/lib.rs", "pub fn alpha() {}");
 
-        let shared = LiveIndex::load(tmp.path()).unwrap();
+        let project_state =
+            crate::domain::ProjectStateDir::new(tmp.path().join(crate::paths::SYMFORGE_DIR_NAME));
+        let placement = crate::domain::StatePlacement::ProjectLocal {
+            directory: project_state,
+        };
+        let shared = LiveIndex::load_for_state_placement(tmp.path(), &placement).unwrap();
         let index = shared.read();
         let store = index
             .coupling_store()
@@ -2873,6 +4866,334 @@ mod tests {
     }
 
     #[test]
+    fn stable_read_refuses_over_ceiling_before_allocation() {
+        struct PanicStableReadAccess;
+
+        impl StableReadAccess for PanicStableReadAccess {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                panic!("over-ceiling input must be rejected before allocation/read")
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                panic!("over-ceiling input must be rejected before allocation/read")
+            }
+        }
+
+        let scout_stamp = crate::domain::FileStamp {
+            size: 2_048,
+            created_hint: None,
+            modified_hint: None,
+            platform_id: None,
+        };
+        let outcome = stable_read_with_access(
+            Path::new("oversized.rs"),
+            &scout_stamp,
+            StableReadLimits {
+                per_file_bytes: 1_024,
+                inflight_bytes: 4_096,
+            },
+            &PanicStableReadAccess,
+        );
+
+        assert!(matches!(
+            outcome,
+            StableReadOutcome::HardSkip {
+                reason: HardSkipReason::PerFileCeiling
+            }
+        ));
+    }
+
+    #[test]
+    fn read_larger_than_inflight_budget_is_terminal_hard_skip() {
+        struct PanicOverInflightAccess;
+
+        impl StableReadAccess for PanicOverInflightAccess {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                panic!("over-inflight input must be rejected before allocation/read")
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                panic!("over-inflight input must be rejected before allocation/read")
+            }
+        }
+
+        let stamp = crate::domain::FileStamp {
+            size: 2_048,
+            created_hint: None,
+            modified_hint: None,
+            platform_id: None,
+        };
+        let outcome = stable_read_with_access(
+            Path::new("over-inflight.rs"),
+            &stamp,
+            StableReadLimits {
+                per_file_bytes: 4_096,
+                inflight_bytes: 1_024,
+            },
+            &PanicOverInflightAccess,
+        );
+
+        assert!(matches!(
+            outcome,
+            StableReadOutcome::HardSkip {
+                reason: HardSkipReason::PerFileCeiling
+            }
+        ));
+    }
+
+    #[test]
+    fn stable_read_rejects_changed_manifest_stamp() {
+        use std::cell::Cell;
+
+        struct ChangedStampAccess<'a> {
+            first_calls: &'a Cell<usize>,
+            second_calls: &'a Cell<usize>,
+            first: StableReadPass,
+        }
+
+        impl StableReadAccess for ChangedStampAccess<'_> {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                self.first_calls.set(self.first_calls.get() + 1);
+                Ok(self.first.clone())
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                self.second_calls.set(self.second_calls.get() + 1);
+                panic!("changed first-pass stamp must reject before the second read")
+            }
+        }
+
+        let scout_stamp = crate::domain::FileStamp {
+            size: 4,
+            created_hint: None,
+            modified_hint: Some(std::time::UNIX_EPOCH),
+            platform_id: None,
+        };
+        let changed_stamp = crate::domain::FileStamp {
+            modified_hint: Some(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            ..scout_stamp.clone()
+        };
+        let first_calls = Cell::new(0);
+        let second_calls = Cell::new(0);
+        let access = ChangedStampAccess {
+            first_calls: &first_calls,
+            second_calls: &second_calls,
+            first: StableReadPass {
+                bytes: Some(b"same".to_vec()),
+                length: 4,
+                hash: crate::hash::digest(b"same"),
+                handle_before: changed_stamp.clone(),
+                handle_after: changed_stamp.clone(),
+                path_after: changed_stamp,
+            },
+        };
+
+        let outcome = stable_read_with_access(
+            Path::new("changed.rs"),
+            &scout_stamp,
+            StableReadLimits {
+                per_file_bytes: 1_024,
+                inflight_bytes: 1_024,
+            },
+            &access,
+        );
+
+        assert!(matches!(outcome, StableReadOutcome::UnstableDuringRead));
+        assert_eq!(first_calls.get(), 1);
+        assert_eq!(
+            second_calls.get(),
+            0,
+            "changed scout/open-handle state must short-circuit the second pass"
+        );
+    }
+
+    #[test]
+    fn read_failure_retains_unreadable_disposition() {
+        use std::cell::Cell;
+
+        struct FailingReadAccess<'a> {
+            first_calls: &'a Cell<usize>,
+            second_calls: &'a Cell<usize>,
+        }
+
+        impl StableReadAccess for FailingReadAccess<'_> {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                self.first_calls.set(self.first_calls.get() + 1);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected read refusal",
+                ))
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                self.second_calls.set(self.second_calls.get() + 1);
+                panic!("failed first read must not attempt a second pass")
+            }
+        }
+
+        let stamp = crate::domain::FileStamp {
+            size: 4,
+            created_hint: None,
+            modified_hint: None,
+            platform_id: None,
+        };
+        let first_calls = Cell::new(0);
+        let second_calls = Cell::new(0);
+        let access = FailingReadAccess {
+            first_calls: &first_calls,
+            second_calls: &second_calls,
+        };
+
+        let outcome = stable_read_with_access(
+            Path::new("locked.rs"),
+            &stamp,
+            StableReadLimits {
+                per_file_bytes: 1_024,
+                inflight_bytes: 1_024,
+            },
+            &access,
+        );
+
+        assert!(matches!(
+            outcome,
+            StableReadOutcome::Unreadable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            }
+        ));
+        assert_eq!(first_calls.get(), 1);
+        assert_eq!(second_calls.get(), 0);
+    }
+
+    #[test]
+    fn stable_read_double_pass_rejects_same_stamp_torn_write() {
+        struct ScriptedStableReadAccess {
+            first: StableReadPass,
+            second: StableReadPass,
+        }
+
+        impl StableReadAccess for ScriptedStableReadAccess {
+            fn first_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                Ok(self.first.clone())
+            }
+
+            fn second_pass(
+                &self,
+                _path: &Path,
+                _max_bytes: usize,
+            ) -> std::io::Result<StableReadPass> {
+                Ok(self.second.clone())
+            }
+        }
+
+        let stamp = crate::domain::FileStamp {
+            size: 4,
+            created_hint: None,
+            modified_hint: Some(std::time::UNIX_EPOCH),
+            platform_id: None,
+        };
+        let pass = |bytes: Option<Vec<u8>>, payload: &[u8]| StableReadPass {
+            bytes,
+            length: 4,
+            hash: crate::hash::digest(payload),
+            handle_before: stamp.clone(),
+            handle_after: stamp.clone(),
+            path_after: stamp.clone(),
+        };
+        let limits = StableReadLimits {
+            per_file_bytes: 1_024,
+            inflight_bytes: 1_024,
+        };
+
+        let accepted = stable_read_with_access(
+            Path::new("stable.rs"),
+            &stamp,
+            limits,
+            &ScriptedStableReadAccess {
+                first: pass(Some(b"same".to_vec()), b"same"),
+                second: pass(None, b"same"),
+            },
+        );
+        assert!(matches!(
+            accepted,
+            StableReadOutcome::Accepted { ref bytes, hash }
+                if bytes == b"same" && hash == crate::hash::digest(b"same")
+        ));
+
+        let torn = stable_read_with_access(
+            Path::new("torn.rs"),
+            &stamp,
+            limits,
+            &ScriptedStableReadAccess {
+                first: pass(Some(b"same".to_vec()), b"same"),
+                second: pass(None, b"torn"),
+            },
+        );
+        assert!(matches!(torn, StableReadOutcome::UnstableDuringRead));
+    }
+
+    #[test]
+    fn filesystem_stable_read_accepts_unchanged_bytes_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.rs");
+        let expected = b"fn exact() {\r\n    println!(\"byte exact\");\r\n}\r\n";
+        std::fs::write(&path, expected).unwrap();
+        let stamp = file_stamp_from_metadata(&std::fs::metadata(&path).unwrap());
+
+        let outcome = stable_read_with_retries(
+            &path,
+            &stamp,
+            StableReadLimits {
+                per_file_bytes: crate::domain::index::HARD_SKIP_BYTES,
+                inflight_bytes: crate::domain::index::HARD_SKIP_BYTES,
+            },
+            &FilesystemStableReadAccess,
+        );
+
+        assert!(matches!(
+            outcome,
+            StableReadOutcome::Accepted { bytes, hash }
+                if bytes == expected && hash == crate::hash::digest(expected)
+        ));
+    }
+
+    #[test]
     fn inflight_budget_releases_on_permit_drop() {
         let budget = Arc::new(InflightByteBudget::new(1000));
         assert_eq!(budget.available_bytes(), 1000);
@@ -2888,6 +5209,26 @@ mod tests {
 
         drop(permit_b);
         assert_eq!(budget.available_bytes(), 1000);
+    }
+
+    #[test]
+    fn inflight_permit_releases_at_staged_handoff_without_deadlock() {
+        let inflight = Arc::new(InflightByteBudget::new(4));
+        let staged = StagedContentAccounting::new(8);
+
+        let first = inflight.acquire(4);
+        assert_eq!(inflight.available_bytes(), 0);
+        assert!(staged.handoff(4, Some(first)));
+        assert_eq!(staged.used_bytes(), 4);
+        assert_eq!(inflight.available_bytes(), 4);
+
+        // This immediate second acquisition would deadlock if the first permit
+        // remained attached to bytes already owned by the staged index.
+        let second = inflight.acquire(4);
+        assert_eq!(inflight.available_bytes(), 0);
+        assert!(staged.handoff(4, Some(second)));
+        assert_eq!(staged.used_bytes(), 8);
+        assert_eq!(inflight.available_bytes(), 4);
     }
 
     #[test]
@@ -2956,22 +5297,14 @@ mod tests {
         let _env = InflightEnvGuard::set(Some(&(512 * 1024).to_string()));
 
         let tmp = TempDir::new().unwrap();
-        // Build valid Rust files comfortably above the 256 KiB governor threshold
-        // but below the 1 MiB MetadataOnly ceiling, so they are Normal-tier and
-        // read fully through the governed path. Use a fixed function count and
-        // assert the resulting size lands in the intended window.
+        // Build valid Rust files below the per-file in-flight ceiling so each can
+        // complete even though their combined size exceeds the total budget.
         const FNS_PER_FILE: u32 = 24_000;
         let mut body = String::with_capacity(400 * 1024);
         for i in 0..FNS_PER_FILE {
             use std::fmt::Write;
             writeln!(body, "fn f_{i:07}() {{}}").unwrap();
         }
-        assert!(
-            body.len() as u64 > INFLIGHT_GOVERNOR_THRESHOLD_BYTES,
-            "fixture ({} bytes) must exceed the governor threshold ({}) to exercise the bound",
-            body.len(),
-            INFLIGHT_GOVERNOR_THRESHOLD_BYTES
-        );
         assert!(
             (body.len() as u64) < crate::domain::index::METADATA_ONLY_BYTES,
             "fixture ({} bytes) must stay Normal-tier (under the {} metadata ceiling)",
@@ -3087,6 +5420,31 @@ mod tests {
     }
 
     #[test]
+    fn published_generation_is_atomic_under_concurrent_reloads() {
+        let shared = LiveIndex::empty();
+        let mut replacement = (*shared.live.load_full()).clone();
+        replacement.add_file(
+            "src/new_generation.rs".to_string(),
+            make_indexed_file_for_mutation("src/new_generation.rs"),
+        );
+
+        let _writer = shared.write_mutex.lock();
+        shared.swap_and_publish_with_hook(replacement, || {
+            let live_file_count = shared.read().file_count();
+            let health_file_count = shared.published_state().file_count;
+            let outline_file_count = shared.published_repo_outline().total_files;
+            assert_eq!(
+                live_file_count, health_file_count,
+                "live content and health must come from one captured generation"
+            );
+            assert_eq!(
+                health_file_count, outline_file_count,
+                "health and outline must come from one captured generation"
+            );
+        });
+    }
+
+    #[test]
     fn test_reset_to_empty_invalidates_populated_index_and_bumps_generation() {
         // Populate a handle with a file (simulating a stale OLD-project local index).
         let shared = LiveIndex::empty();
@@ -3097,6 +5455,14 @@ mod tests {
         let before = shared.published_state();
         assert_eq!(before.file_count, 1, "precondition: index has stale file");
         let project_gen_before = shared.current_project_generation();
+        shared.write().manifest_entries = vec![make_manifest_entry(
+            "src/old_project.rs",
+            1,
+            FileDisposition::Indexed {
+                targets: crate::domain::IndexTargets::Code,
+                parse_status: crate::domain::index::ParseStatus::Parsed,
+            },
+        )];
 
         // Reset (the operation index_folder's daemon branch now performs on switch).
         shared.reset_to_empty();
@@ -3128,6 +5494,15 @@ mod tests {
             shared.current_project_generation() > project_gen_before,
             "reset_to_empty must bump project generation to fence stale watcher mutations"
         );
+        assert_eq!(
+            shared.published_generation().project_generation,
+            shared.current_project_generation(),
+            "the replacement project's generation must be captured inside the same publication root"
+        );
+        assert!(
+            shared.terminal_dispositions().is_empty(),
+            "reset_to_empty must drop terminal dispositions from the previous project"
+        );
     }
 
     #[test]
@@ -3147,12 +5522,45 @@ mod tests {
             shared.current_project_generation() > gen_a,
             "reload must advance project generation before stale mutations are checked"
         );
+        assert_eq!(
+            shared.published_generation().project_generation,
+            shared.current_project_generation(),
+            "reload must publish the new project generation inside the replacement root"
+        );
         assert!(!shared.remove_file_at_generation("src/a.rs", gen_a));
         assert_eq!(shared.current_rejected_stale_mutations(), 1);
 
         let indexed = make_indexed_file_for_mutation("src/stale.rs");
         assert!(!shared.update_file_at_generation("src/stale.rs", indexed, gen_a));
         assert_eq!(shared.current_rejected_stale_mutations(), 2);
+    }
+
+    #[test]
+    fn reload_builds_a_direct_replacement_without_mutating_previous_generation() {
+        let shared = LiveIndex::empty();
+        shared.set_local_empty_reason(Some("prior-generation-reason".to_string()));
+        let previous = shared.published_generation();
+        assert_eq!(
+            previous.live.local_empty_reason().as_deref(),
+            Some("prior-generation-reason")
+        );
+        let replacement = TempDir::new().unwrap();
+        write_file(
+            replacement.path(),
+            "src/replacement.rs",
+            "pub fn replacement() {}\n",
+        );
+
+        shared.reload(replacement.path()).unwrap();
+
+        let current = shared.published_generation();
+        assert_eq!(current.live.local_empty_reason(), None);
+        assert_eq!(
+            previous.live.local_empty_reason().as_deref(),
+            Some("prior-generation-reason"),
+            "reload must not clear an Arc-owned field inside the previously published root"
+        );
+        assert!(!Arc::ptr_eq(&previous.live, &current.live));
     }
 
     #[test]
@@ -3186,6 +5594,87 @@ mod tests {
     }
 
     #[test]
+    fn mtime_only_update_is_visible_in_published_root_without_advancing_content_generation() {
+        let shared = LiveIndex::empty();
+        shared.add_file(
+            "src/touched.rs".to_string(),
+            make_indexed_file_for_mutation("src/touched.rs"),
+        );
+        let before = shared.published_generation();
+        let before_mtime = before
+            .live
+            .get_file("src/touched.rs")
+            .expect("fixture file")
+            .mtime_secs;
+        let next_mtime = before_mtime.saturating_add(42);
+
+        shared.touch_mtime("src/touched.rs", next_mtime);
+
+        let after = shared.published_generation();
+        assert_eq!(
+            after
+                .live
+                .get_file("src/touched.rs")
+                .expect("published fixture file")
+                .mtime_secs,
+            next_mtime,
+            "mtime-only updates must be visible through the immutable publication root"
+        );
+        assert!(after.publication_generation > before.publication_generation);
+        assert_eq!(after.content_generation, before.content_generation);
+    }
+
+    #[test]
+    fn local_empty_reason_is_published_in_the_same_immutable_root() {
+        let shared = LiveIndex::empty();
+        let before = shared.published_generation();
+
+        shared.set_local_empty_reason(Some("workspace is not bound".to_string()));
+
+        let after = shared.published_generation();
+        assert_eq!(
+            after.health.local_empty_reason.as_deref(),
+            Some("workspace is not bound")
+        );
+        assert_eq!(
+            after.live.local_empty_reason().as_deref(),
+            Some("workspace is not bound")
+        );
+        assert!(after.publication_generation > before.publication_generation);
+        assert_eq!(after.content_generation, before.content_generation);
+        assert_eq!(before.live.local_empty_reason(), None);
+    }
+
+    #[test]
+    fn published_source_set_is_the_single_atomic_root_for_current_source() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/lib.rs", "pub fn source_set() {}\n");
+        let shared = LiveIndex::load(tmp.path()).unwrap();
+        let before = shared.published_source_set();
+        let before_current = before.current_generation();
+        assert_eq!(before.sources.len(), 1);
+        assert_eq!(
+            before_current
+                .manifest
+                .as_ref()
+                .expect("bound manifest")
+                .source
+                .source_id,
+            before.current_source_id
+        );
+
+        shared.update_file(
+            "src/next.rs".to_string(),
+            make_indexed_file_for_mutation("src/next.rs"),
+        );
+
+        let after = shared.published_source_set();
+        assert!(after.registry_generation > before.registry_generation);
+        assert!(Arc::ptr_eq(&before_current, &before.current_generation()));
+        assert!(!Arc::ptr_eq(&before_current, &after.current_generation()));
+    }
+
+    #[test]
     fn test_shared_index_handle_published_state_tracks_verify_transitions() {
         let mut live = make_empty_live_index();
         live.is_empty = false;
@@ -3201,7 +5690,7 @@ mod tests {
         shared.mark_snapshot_verify_running();
         let running = shared.published_state();
         assert_eq!(running.generation, 1);
-        assert_eq!(running.status, PublishedIndexStatus::Ready);
+        assert_eq!(running.status, PublishedIndexStatus::Loading);
         assert_eq!(running.degraded_summary, None);
         assert_eq!(running.snapshot_verify_state, SnapshotVerifyState::Running);
         assert_eq!(running.file_count, initial.file_count);
@@ -3315,12 +5804,17 @@ mod tests {
     }
 
     #[test]
-    fn test_live_index_reload_loads_files_and_becomes_ready() {
+    fn unbound_bootstrap_rebinds_writable_project_without_restart() {
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn alpha() {}");
         write_file(tmp.path(), "b.rs", "fn beta() {}");
 
         let shared = LiveIndex::empty();
+        {
+            let index = shared.read();
+            index.set_local_empty_reason(Some("workspace is not bound".to_owned()));
+            assert!(index.local_empty_reason().is_some());
+        }
         {
             let mut index = shared.write();
             index.reload(tmp.path()).expect("reload should succeed");
@@ -3330,6 +5824,7 @@ mod tests {
         assert!(index.is_ready(), "after reload should be ready");
         assert_eq!(index.index_state(), IndexState::Ready);
         assert_eq!(index.load_source(), IndexLoadSource::FreshLoad);
+        assert_eq!(index.local_empty_reason(), None);
         assert_eq!(
             index.snapshot_verify_state(),
             SnapshotVerifyState::NotNeeded
@@ -3345,6 +5840,84 @@ mod tests {
             result.is_err(),
             "reload on invalid root should return error"
         );
+    }
+
+    #[test]
+    fn failed_reload_preserves_previous_generation() {
+        let tmp = TempDir::new().unwrap();
+        let shared = LiveIndex::empty();
+        shared.add_file(
+            "src/retained.rs".to_string(),
+            make_indexed_file_for_mutation("src/retained.rs"),
+        );
+        let before = shared.published_generation();
+
+        let result = shared.reload(&tmp.path().join("missing-repository"));
+
+        assert!(result.is_err(), "invalid reload input must fail");
+        let after = shared.published_generation();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "failed replacement construction must retain the exact published generation"
+        );
+    }
+
+    #[test]
+    fn failed_observation_publishes_degraded_last_valid_wrapper() {
+        let path = "src/retained.rs";
+        let shared = LiveIndex::empty();
+        shared.add_file(path.to_string(), make_indexed_file_for_mutation(path));
+        let before = shared.published_generation();
+        let before_file = Arc::clone(before.live.files.get(path).unwrap());
+        let scouted = crate::domain::ScoutedEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            absolute_path: None,
+            stamp: crate::domain::FileStamp {
+                size: before_file.byte_len,
+                created_hint: None,
+                modified_hint: None,
+                platform_id: None,
+            },
+            language: Some(LanguageId::Rust),
+            classification: before_file.classification,
+            decision: crate::domain::ScoutDecision::Unavailable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+        };
+
+        assert!(shared.publish_terminal_disposition_at_generation(
+            path,
+            scouted,
+            FileDisposition::Unreadable {
+                stage: crate::domain::AccessStage::FullRead,
+                kind: crate::domain::AccessErrorKind::PermissionDenied,
+            },
+            shared.current_project_generation(),
+            before.publication_generation,
+        ));
+
+        let after = shared.published_generation();
+        assert!(after.publication_generation > before.publication_generation);
+        assert_eq!(
+            after.content_generation, before.content_generation,
+            "failed observation must not mint a new content generation"
+        );
+        assert!(Arc::ptr_eq(
+            &before_file,
+            after.live.files.get(path).unwrap()
+        ));
+        assert!(matches!(
+            &*shared.freshness_status(),
+            FreshnessStatus::Degraded {
+                last_valid_content_generation,
+                reason_codes,
+            } if *last_valid_content_generation == before.content_generation
+                && reason_codes == &[FreshnessReason::ObservationFailed]
+        ));
     }
 
     #[test]
@@ -3423,10 +5996,30 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
+        }
+    }
+
+    fn make_manifest_entry(path: &str, size: u64, disposition: FileDisposition) -> CatalogEntry {
+        CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size,
+            language: None,
+            classification: FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition,
+            content_hash: None,
         }
     }
 
@@ -3591,6 +6184,7 @@ mod tests {
         let file = make_indexed_file_for_mutation("src/to_delete.rs");
         index.update_file("src/to_delete.rs".to_string(), file);
         assert_eq!(index.file_count(), 1);
+        assert_eq!(index.tier_counts(), (1, 0, 0));
 
         index.remove_file("src/to_delete.rs");
         assert!(
@@ -3598,6 +6192,11 @@ mod tests {
             "file should be removed"
         );
         assert_eq!(index.file_count(), 0);
+        assert_eq!(
+            index.tier_counts(),
+            (0, 0, 0),
+            "removal must clear the canonical manifest entry with the indexed bytes"
+        );
         assert!(!index.files_by_basename.contains_key("to_delete.rs"));
         assert!(!index.files_by_dir_component.contains_key("src"));
     }
@@ -4034,6 +6633,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn circuit_breaker_tail_retains_aborted_dispositions() {
+        let parse_results = (0..10)
+            .map(|index| {
+                let path = format!("a/f{index:02}.rs");
+                let outcome = if index < 5 {
+                    FileOutcome::Processed
+                } else {
+                    FileOutcome::Failed {
+                        error: "parse failed".to_string(),
+                    }
+                };
+                let mut result = make_result(outcome, vec![]);
+                result.relative_path = path.clone();
+                let indexed = IndexedFile::from_parse_result(result, b"fixture".to_vec());
+                (path, indexed)
+            })
+            .collect();
+
+        let folded = fold_parse_results_for_scope(
+            parse_results,
+            CircuitBreakerState::new(0.20),
+            CircuitBreakerScope::new(
+                PathBuf::from("source-a"),
+                crate::domain::IndexTargets::Code,
+                "parse",
+            ),
+        );
+        let aborted_paths: Vec<_> = folded
+            .dispositions
+            .iter()
+            .filter_map(|(path, disposition)| {
+                matches!(
+                    disposition,
+                    crate::domain::FileDisposition::AbortedCircuitBreaker
+                )
+                .then_some(path.as_str())
+            })
+            .collect();
+
+        assert_eq!(folded.dispositions.len(), 10);
+        assert_eq!(aborted_paths, ["a/f07.rs", "a/f08.rs", "a/f09.rs"]);
+        assert!(folded.files.contains_key("a/f06.rs"));
+        assert!(!folded.files.contains_key("a/f07.rs"));
+    }
+
+    #[test]
+    fn circuit_breaker_trip_is_scoped_and_degraded() {
+        let results = |fail_after: Option<usize>| {
+            (0..10)
+                .map(|index| {
+                    let path = format!("a/f{index:02}.rs");
+                    let outcome = if fail_after.is_some_and(|start| index >= start) {
+                        FileOutcome::Failed {
+                            error: "parse failed".to_string(),
+                        }
+                    } else {
+                        FileOutcome::Processed
+                    };
+                    let mut result = make_result(outcome, vec![]);
+                    result.relative_path = path.clone();
+                    (
+                        path,
+                        IndexedFile::from_parse_result(result, b"fixture".to_vec()),
+                    )
+                })
+                .collect()
+        };
+        let tripped_scope = CircuitBreakerScope::new(
+            PathBuf::from("source-a"),
+            crate::domain::IndexTargets::Code,
+            "parse",
+        );
+        let unaffected_scopes = [
+            CircuitBreakerScope::new(
+                PathBuf::from("source-a"),
+                crate::domain::IndexTargets::Knowledge,
+                "parse",
+            ),
+            CircuitBreakerScope::new(
+                PathBuf::from("source-a"),
+                crate::domain::IndexTargets::Code,
+                "stable-read",
+            ),
+            CircuitBreakerScope::new(
+                PathBuf::from("source-b"),
+                crate::domain::IndexTargets::Code,
+                "parse",
+            ),
+        ];
+
+        let tripped = fold_parse_results_for_scope(
+            results(Some(5)),
+            CircuitBreakerState::new(0.20),
+            tripped_scope.clone(),
+        );
+        assert_eq!(tripped.coverage, crate::domain::CoverageStatus::Degraded);
+        assert_eq!(
+            tripped
+                .dispositions
+                .iter()
+                .filter(|(_, disposition)| matches!(
+                    disposition,
+                    crate::domain::FileDisposition::AbortedCircuitBreaker
+                ))
+                .count(),
+            3
+        );
+        for scope in unaffected_scopes {
+            let unaffected =
+                fold_parse_results_for_scope(results(None), CircuitBreakerState::new(0.20), scope);
+            assert_eq!(unaffected.coverage, crate::domain::CoverageStatus::Complete);
+            assert_eq!(unaffected.files.len(), 10);
+            assert!(
+                unaffected
+                    .dispositions
+                    .iter()
+                    .all(|(_, disposition)| !matches!(
+                        disposition,
+                        crate::domain::FileDisposition::AbortedCircuitBreaker
+                    ))
+            );
+        }
+    }
+
     /// SF-009: surfacing of indexed-but-untracked files, and the opt-in
     /// exclude-untracked admission policy. The mechanism in the original bug report
     /// (text scratch files inflating symbol counts) is REFUTED — these tests both
@@ -4116,11 +6840,11 @@ mod tests {
         }
 
         /// Documents that the report's stated mechanism does NOT reproduce:
-        /// a dotfile scratch file is filtered by the `ignore` crate's default
-        /// `hidden:true` BEFORE admission, and an unknown-extension text file is
-        /// Tier-2 metadata-only with zero symbols.
+        /// repository-owned dotfiles are deliberately discovered. Safe UTF-8
+        /// text is generic knowledge and therefore resident, but still produces
+        /// zero code symbols.
         #[test]
-        fn report_bug_does_not_reproduce_dotfile_filtered_unknown_ext_tier2() {
+        fn report_bug_does_not_reproduce_generic_text_has_zero_code_symbols() {
             let tmp = TempDir::new().unwrap();
             init_repo(tmp.path());
             write_file(tmp.path(), "src/main.rs", "fn main() {}");
@@ -4132,28 +6856,45 @@ mod tests {
             let entries = discovery::discover_all_files(tmp.path()).unwrap();
             let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
 
-            // The dotfile is filtered by the `ignore` crate before admission.
+            // Repository-owned hidden knowledge is discoverable; hidden-path
+            // filtering is reserved for VCS/runtime internals.
             assert!(
-                !paths.contains(&".probe.txt"),
-                "dotfile must be filtered before admission (report bug does not reproduce): {paths:?}"
+                paths.contains(&".probe.txt"),
+                "repository-owned dotfile should reach admission: {paths:?}"
             );
-            // The unknown-extension text file is discovered but has no language.
+            // Both text files use the authoritative generic-text language.
             let notes = entries
                 .iter()
                 .find(|e| e.relative_path == "notes.txt")
                 .expect("notes.txt should be discovered");
-            assert!(
-                notes.language.is_none(),
-                "unknown-extension .txt maps to no language (Tier-2 metadata-only, 0 symbols)"
-            );
+            assert_eq!(notes.language, Some(LanguageId::Text));
+            let probe = entries
+                .iter()
+                .find(|e| e.relative_path == ".probe.txt")
+                .expect(".probe.txt should be discovered");
+            assert_eq!(probe.language, Some(LanguageId::Text));
 
-            // And once loaded, the .txt contributes 0 symbols and is not Tier-1.
+            // Both files are resident knowledge, but neither contributes symbols.
             let shared = LiveIndex::load(tmp.path()).unwrap();
             let index = shared.read();
-            assert!(
-                !index.files.contains_key("notes.txt"),
-                "unknown-extension text file must not be a Tier-1 indexed file"
-            );
+            for path in ["notes.txt", ".probe.txt"] {
+                let file = index
+                    .get_file(path)
+                    .unwrap_or_else(|| panic!("generic knowledge file missing: {path}"));
+                assert_eq!(file.language, LanguageId::Text);
+                assert!(file.symbols.is_empty());
+                assert!(matches!(
+                    index
+                        .manifest_entries
+                        .iter()
+                        .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+                        .map(|entry| &entry.disposition),
+                    Some(FileDisposition::Indexed {
+                        targets: crate::domain::IndexTargets::Knowledge,
+                        ..
+                    })
+                ));
+            }
         }
 
         /// A non-dotfile untracked recognized-extension source file is surfaced as
@@ -4287,7 +7028,7 @@ mod tests {
                 // Demoted to Tier-2: recorded as a skipped file with the Untracked reason.
                 assert!(
                     index
-                        .skipped_files()
+                        .compatibility_skipped_files()
                         .iter()
                         .any(|sf| sf.path == "scratch.rs"
                             && sf.reason() == Some(crate::domain::index::SkipReason::Untracked)),
@@ -4302,26 +7043,25 @@ mod tests {
 
     #[test]
     fn test_tier_counts() {
-        use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
-
         let mut index = make_empty_live_index();
         assert_eq!(index.tier_counts(), (0, 0, 0));
 
-        index.add_skipped_file(SkippedFile {
-            path: "model.bin".into(),
-            size: 1000,
-            extension: Some("bin".into()),
-            decision: AdmissionDecision::skip(
-                AdmissionTier::MetadataOnly,
-                SkipReason::DenylistedExtension,
+        index.manifest_entries.extend([
+            make_manifest_entry(
+                "model.bin",
+                1000,
+                FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::GeneratedOrVendor,
+                },
             ),
-        });
-        index.add_skipped_file(SkippedFile {
-            path: "huge.dat".into(),
-            size: 200_000_000,
-            extension: Some("dat".into()),
-            decision: AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
-        });
+            make_manifest_entry(
+                "huge.dat",
+                200_000_000,
+                FileDisposition::HardSkip {
+                    reason: HardSkipReason::PerFileCeiling,
+                },
+            ),
+        ]);
 
         assert_eq!(index.tier_counts(), (0, 1, 1));
     }
@@ -4333,13 +7073,9 @@ mod tests {
     /// This is the corpus case (redis `.tcl`/`.sh`, phoenix `.eex`, extensionless
     /// `LICENSE`/`Makefile`).
     #[test]
-    fn load_admits_unsupported_language_files_as_tier2() {
-        use crate::domain::index::{AdmissionTier, SkipReason};
-
+    fn load_routes_unknown_utf8_files_as_generic_knowledge() {
         let tmp = TempDir::new().unwrap();
-        // Visible Tier-1 source.
         write_file(tmp.path(), "src/main.rs", "fn main() {}");
-        // Unsupported-language files that EXIST on disk and are small/non-binary.
         write_file(
             tmp.path(),
             "tests/unit/foo.tcl",
@@ -4351,55 +7087,322 @@ mod tests {
         let shared = LiveIndex::load(tmp.path()).unwrap();
         let index = shared.read();
 
-        // The supported file is Tier-1; the three unsupported-language files are
-        // Tier-2 (not lost). Tier-3 stays 0.
         let (tier1, tier2, tier3) = index.tier_counts();
-        assert_eq!(tier1, 1, "only src/main.rs is parsed Tier-1");
         assert_eq!(
-            tier2, 3,
-            "the 3 unsupported-language files must land in Tier-2"
+            tier1, 4,
+            "safe UTF-8 files must be resident Tier-1 evidence"
         );
+        assert_eq!(tier2, 0);
         assert_eq!(tier3, 0);
 
-        // Every unsupported-language skip record carries the honest reason and is
-        // NEVER stored with a contradictory Tier-1/Normal decision.
-        for sf in index.skipped_files() {
-            assert_eq!(
-                sf.tier(),
-                AdmissionTier::MetadataOnly,
-                "skipped file {:?} must be Tier-2, never Normal",
-                sf.path
-            );
-            assert_eq!(
-                sf.reason(),
-                Some(SkipReason::UnsupportedLanguage),
-                "skipped file {:?} must report unsupported-language",
-                sf.path
-            );
+        for path in ["tests/unit/foo.tcl", "scripts/setup.sh", "LICENSE"] {
+            let file = index
+                .get_file(path)
+                .unwrap_or_else(|| panic!("generic knowledge file missing: {path}"));
+            assert_eq!(file.language, LanguageId::Text);
+            assert!(file.classification.is_text());
+            assert!(file.symbols.is_empty());
+            assert!(matches!(
+                index
+                    .manifest_entries
+                    .iter()
+                    .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+                    .map(|entry| &entry.disposition),
+                Some(crate::domain::FileDisposition::Indexed {
+                    targets: crate::domain::IndexTargets::Knowledge,
+                    ..
+                })
+            ));
         }
+    }
 
-        // SF-012 auditability: the demoted files are surfaced as metadata-only
-        // paths (so search_files / repo-map can find them), not invisible.
-        let surfaced: Vec<&str> = index
-            .metadata_only_skipped_paths()
-            .map(|(path, _)| path)
+    #[test]
+    fn unknown_utf8_file_becomes_generic_knowledge() {
+        let tmp = TempDir::new().unwrap();
+        let exact = b"first fact\r\nsecond fact without final newline";
+        let path = tmp.path().join("notes").join("facts.unknown-format");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, exact).unwrap();
+
+        let shared = LiveIndex::load(tmp.path()).expect("generic UTF-8 load must succeed");
+        let index = shared.read();
+        let file = index
+            .get_file("notes/facts.unknown-format")
+            .expect("safe unknown UTF-8 must become resident knowledge");
+
+        assert_eq!(file.language, LanguageId::Text);
+        assert!(file.classification.is_text());
+        assert_eq!(file.content.as_slice(), exact);
+        assert!(file.symbols.is_empty());
+
+        let disposition = index
+            .manifest_entries
+            .iter()
+            .find(|entry| {
+                entry.path.normalized_utf8.as_deref() == Some("notes/facts.unknown-format")
+            })
+            .map(|entry| &entry.disposition)
+            .expect("generic knowledge must retain a manifest disposition");
+        assert!(matches!(
+            disposition,
+            FileDisposition::Indexed {
+                targets: crate::domain::IndexTargets::Knowledge,
+                parse_status: crate::domain::index::ParseStatus::Parsed
+            }
+        ));
+    }
+
+    #[test]
+    fn sensitive_files_remain_catalog_only_with_zero_value_leakage() {
+        let tmp = TempDir::new().unwrap();
+        let canary = runtime_canary();
+        write_file(tmp.path(), ".env", &format!("password={canary}\n"));
+        write_file(tmp.path(), "notes/guide.txt", &format!("token={canary}\n"));
+
+        let shared = LiveIndex::load(tmp.path()).expect("sensitive fixture must load safely");
+        let index = shared.read();
+        assert!(index.get_file(".env").is_none());
+        assert!(index.get_file("notes/guide.txt").is_none());
+
+        let env = index
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some(".env"))
+            .expect("sensitive path must remain cataloged");
+        assert!(matches!(
+            env.disposition,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::SensitivePath { .. }
+            }
+        ));
+        assert!(env.content_hash.is_none());
+
+        let content = index
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("notes/guide.txt"))
+            .expect("detector-positive content must remain cataloged");
+        assert!(matches!(
+            content.disposition,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::SensitiveContent { .. }
+            }
+        ));
+        assert!(content.content_hash.is_none());
+
+        let serialized = serde_json::to_vec(&index.manifest_entries).unwrap();
+        assert!(
+            !serialized
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+    }
+
+    #[test]
+    fn safe_template_path_still_runs_content_detector() {
+        let tmp = TempDir::new().unwrap();
+        let canary = runtime_canary();
+        write_file(tmp.path(), ".env.example", &format!("password={canary}\n"));
+
+        let shared = LiveIndex::load(tmp.path()).expect("safe template fixture must load");
+        let index = shared.read();
+        let entry = index
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some(".env.example"))
+            .expect("template must remain cataloged");
+        assert!(matches!(
+            entry.disposition,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::SensitiveContent { .. }
+            }
+        ));
+        assert!(entry.content_hash.is_none());
+        assert!(index.get_file(".env.example").is_none());
+    }
+
+    #[test]
+    fn lfs_pointer_is_catalog_only_and_never_knowledge_searchable() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "docs/asset.txt",
+            "version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 42\n",
+        );
+
+        let shared = LiveIndex::load(tmp.path()).expect("LFS pointer fixture must load");
+        let index = shared.read();
+        let entry = index
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("docs/asset.txt"))
+            .expect("pointer must remain cataloged");
+        assert!(matches!(
+            entry.disposition,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::LfsPointer { .. }
+            }
+        ));
+        assert!(entry.content_hash.is_none());
+        assert!(index.get_file("docs/asset.txt").is_none());
+    }
+
+    #[test]
+    fn non_utf8_text_is_catalog_only_without_lossy_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let mut bytes = vec![b'a'; crate::domain::index::BINARY_SNIFF_BYTES];
+        bytes.extend_from_slice(&[0xff, 0xfe, b'!']);
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let shared = LiveIndex::load(tmp.path()).expect("invalid text must fail closed");
+        let index = shared.read();
+        let entry = index
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some("notes.txt"))
+            .expect("invalid text must remain cataloged");
+        assert!(matches!(
+            entry.disposition,
+            FileDisposition::MetadataOnly {
+                reason: MetadataOnlyReason::UnsupportedTextEncoding
+            }
+        ));
+        assert!(entry.content_hash.is_none());
+        assert!(index.get_file("notes.txt").is_none());
+    }
+
+    #[test]
+    fn load_and_reload_publish_authoritative_scout_plan() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/main.rs", "fn main() {}\n");
+        write_file(tmp.path(), "notes.txt", "repository knowledge\n");
+
+        let shared = LiveIndex::load(tmp.path()).unwrap();
+        let initial = shared
+            .scout_plan()
+            .expect("fresh load must retain its authoritative scout plan");
+        assert_eq!(initial.entries.len(), 2);
+        assert_eq!(
+            shared
+                .terminal_dispositions()
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.txt", "src/main.rs"]
+        );
+        assert!(initial.entries.iter().any(|entry| {
+            entry.path.normalized_utf8.as_deref() == Some("src/main.rs")
+                && matches!(
+                    entry.decision,
+                    crate::domain::ScoutDecision::Ingest {
+                        targets: crate::domain::IndexTargets::Code
+                    }
+                )
+        }));
+        assert!(initial.entries.iter().any(|entry| {
+            entry.path.normalized_utf8.as_deref() == Some("notes.txt")
+                && matches!(
+                    entry.decision,
+                    crate::domain::ScoutDecision::Ingest {
+                        targets: crate::domain::IndexTargets::Knowledge
+                    }
+                )
+        }));
+
+        write_file(tmp.path(), "README.md", "# Added later\n");
+        shared.reload(tmp.path()).unwrap();
+        let reloaded = shared
+            .scout_plan()
+            .expect("reload must atomically replace the authoritative scout plan");
+        assert_eq!(reloaded.entries.len(), 3);
+        assert_eq!(
+            shared
+                .terminal_dispositions()
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.txt", "README.md", "src/main.rs"]
+        );
+        assert!(
+            reloaded
+                .entries
+                .iter()
+                .any(|entry| entry.path.normalized_utf8.as_deref() == Some("README.md"))
+        );
+    }
+
+    #[test]
+    fn legacy_execution_projection_retains_one_outcome_per_scout_entry() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "src/main.rs", "fn main() {}\n");
+        write_file(tmp.path(), "notes.txt", "repository knowledge\n");
+        write_file(tmp.path(), "Cargo.lock", "version = 4\n");
+
+        let scout = discovery::scout_repository(tmp.path()).unwrap();
+        let projection = project_scout_for_legacy_execution(&scout);
+        let accounted = projection.entries.len() + projection.terminal_dispositions.len();
+        let mut paths: Vec<_> = projection
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .chain(
+                projection
+                    .terminal_dispositions
+                    .iter()
+                    .map(|(path, _)| path.as_str()),
+            )
             .collect();
-        assert!(surfaced.contains(&"tests/unit/foo.tcl"), "{surfaced:?}");
-        assert!(surfaced.contains(&"scripts/setup.sh"), "{surfaced:?}");
-        assert!(surfaced.contains(&"LICENSE"), "{surfaced:?}");
+        paths.sort_unstable();
+        paths.dedup();
+
+        assert_eq!(accounted, scout.entries.len());
+        assert_eq!(paths.len(), scout.entries.len());
+    }
+
+    #[test]
+    fn compatibility_skips_are_projected_from_manifest_entries() {
+        let mut index = make_empty_live_index();
+        index.manifest_entries = vec![crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "Cargo.lock".to_string(),
+                normalized_utf8: Some("Cargo.lock".to_string()),
+            },
+            size: 128,
+            language: Some(crate::domain::LanguageId::Toml),
+            classification: crate::domain::FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: true,
+            },
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::Lockfile,
+            },
+            content_hash: None,
+        }];
+
+        let projected = index.compatibility_skipped_files();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].path, "Cargo.lock");
+        assert_eq!(projected[0].size, 128);
+        assert_eq!(
+            projected[0].decision.reason,
+            Some(SkipReason::DependencyLockfile)
+        );
+        assert_eq!(index.tier_counts(), (0, 1, 0));
     }
 
     /// SF-025 / SF-012: the health/admission counters must RECONCILE on any
     /// index instant. Two invariants, asserted on a synthetic index built from
     /// the public accessors:
-    ///   1. tier1 + tier2 + tier3 == files.len() + skipped_files.len()
+    ///   1. tier1 + tier2 + tier3 == manifest entries
     ///      (every record lands in exactly one tier — no silent drops).
     ///   2. parsed + partial + failed == file_count
     ///      (every indexed file is in exactly one parse state).
     #[test]
     fn tier_and_parse_counters_reconcile_on_synthetic_index() {
-        use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
-
         let mut index = make_empty_live_index();
 
         // Three Tier-1 files in distinct parse states.
@@ -4419,36 +7422,50 @@ mod tests {
         };
         index.update_file("src/failed.rs".into(), failed);
 
-        // A spread of Tier-2/3 skip records, including the new
-        // unsupported-language reason.
-        index.add_skipped_file(SkippedFile {
-            path: "vendor.lock".into(),
-            size: 100,
-            extension: Some("lock".into()),
-            decision: AdmissionDecision::skip(
-                AdmissionTier::MetadataOnly,
-                SkipReason::DependencyLockfile,
+        let manifest_entry = |path: &str, size: u64, disposition: FileDisposition| CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size,
+            language: None,
+            classification: FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition,
+            content_hash: None,
+        };
+        index.manifest_entries.extend([
+            manifest_entry(
+                "vendor.lock",
+                100,
+                FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::Lockfile,
+                },
             ),
-        });
-        index.add_skipped_file(SkippedFile {
-            path: "tests/foo.tcl".into(),
-            size: 50,
-            extension: Some("tcl".into()),
-            decision: AdmissionDecision::skip(
-                AdmissionTier::MetadataOnly,
-                SkipReason::UnsupportedLanguage,
+            manifest_entry(
+                "tests/foo.tcl",
+                50,
+                FileDisposition::MetadataOnly {
+                    reason: MetadataOnlyReason::UnsupportedTextEncoding,
+                },
             ),
-        });
-        index.add_skipped_file(SkippedFile {
-            path: "huge.bin".into(),
-            size: 200_000_000,
-            extension: Some("bin".into()),
-            decision: AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
-        });
+            manifest_entry(
+                "huge.bin",
+                200_000_000,
+                FileDisposition::HardSkip {
+                    reason: HardSkipReason::PerFileCeiling,
+                },
+            ),
+        ]);
 
         // Invariant 1: tier sum == total records (indexed + skipped).
         let (tier1, tier2, tier3) = index.tier_counts();
-        let discovered = index.file_count() + index.skipped_files().len();
+        let discovered = index.file_count() + index.compatibility_skipped_files().len();
         assert_eq!(
             tier1 + tier2 + tier3,
             discovered,

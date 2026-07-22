@@ -367,10 +367,21 @@ pub fn run_admin<B: crate::cli::browser::BrowserOpener + ?Sized>(
     ctx: &crate::cli::setup::SetupContext,
     browser: &B,
 ) -> anyhow::Result<AdminOutcome> {
+    let placement = crate::paths::process_control_state_placement();
+    run_admin_with_control_state(args, ctx, browser, placement.directory())
+}
+
+#[doc(hidden)]
+pub fn run_admin_with_control_state<B: crate::cli::browser::BrowserOpener + ?Sized>(
+    args: &AdminCliArgs,
+    ctx: &crate::cli::setup::SetupContext,
+    browser: &B,
+    control_state_dir: Option<&crate::domain::ControlStateDir>,
+) -> anyhow::Result<AdminOutcome> {
     use crate::cli::operator_profile::OperatorSetupProfile;
 
-    let project_base = ctx.project_base();
-    let existing_profile = OperatorSetupProfile::load(&project_base);
+    let _ = ctx;
+    let existing_profile = control_state_dir.and_then(OperatorSetupProfile::load);
 
     // Step 1+2: reuse an already-running server on the remembered port (FR-015).
     let mut reused_server = false;
@@ -394,7 +405,7 @@ pub fn run_admin<B: crate::cli::browser::BrowserOpener + ?Sized>(
             let preferred = preferred_start_addr(existing_profile.as_ref());
             let started =
                 start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)?;
-            persist_started_port(&project_base, existing_profile.as_ref(), &started);
+            persist_started_port(control_state_dir, existing_profile.as_ref(), &started);
             started
         }
     };
@@ -442,7 +453,7 @@ fn preferred_start_addr(
 /// non-fatal — the server is already up and reported — so it is logged as a
 /// warning, never an error that masks a running dashboard.
 fn persist_started_port(
-    project_base: &std::path::Path,
+    control_state_dir: Option<&crate::domain::ControlStateDir>,
     existing_profile: Option<&crate::cli::operator_profile::OperatorSetupProfile>,
     started: &ServerSessionDescriptor,
 ) {
@@ -469,7 +480,11 @@ fn persist_started_port(
         },
     };
 
-    if let Err(error) = profile.save(project_base) {
+    let Some(control_state_dir) = control_state_dir else {
+        tracing::warn!("admin: process control state unavailable; started port not persisted");
+        return;
+    };
+    if let Err(error) = profile.save(control_state_dir) {
         tracing::warn!(%error, "admin: could not persist the started operator-server port");
     }
 }
@@ -545,6 +560,10 @@ mod tests {
         }
     }
 
+    fn control_over(home: &std::path::Path) -> crate::domain::ControlStateDir {
+        crate::domain::ControlStateDir::new(home.join("control"))
+    }
+
     #[test]
     fn run_admin_reuses_running_server_on_profile_port() {
         // A real server is running; the profile points at its port.
@@ -556,6 +575,7 @@ mod tests {
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
+        let control = control_over(home.path());
         OperatorSetupProfile::new(
             InstallationType::Server,
             running_port,
@@ -563,13 +583,18 @@ mod tests {
             &[],
             1,
         )
-        .save(project.path())
+        .save(&control)
         .expect("persist profile");
 
         let ctx = ctx_over(home.path(), project.path());
         let browser = NoopBrowserOpener::default();
-        let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
-            .expect("admin should reuse the running server");
+        let outcome = run_admin_with_control_state(
+            &AdminCliArgs { no_open: false },
+            &ctx,
+            &browser,
+            Some(&control),
+        )
+        .expect("admin should reuse the running server");
 
         assert!(
             outcome.reused_server,
@@ -592,12 +617,18 @@ mod tests {
     fn run_admin_starts_and_persists_when_none_running() {
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
-        assert!(OperatorSetupProfile::load(project.path()).is_none());
+        let control = control_over(home.path());
+        assert!(OperatorSetupProfile::load(&control).is_none());
 
         let ctx = ctx_over(home.path(), project.path());
         let browser = NoopBrowserOpener::default();
-        let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
-            .expect("admin should start a server when none runs");
+        let outcome = run_admin_with_control_state(
+            &AdminCliArgs { no_open: false },
+            &ctx,
+            &browser,
+            Some(&control),
+        )
+        .expect("admin should start a server when none runs");
 
         assert!(!outcome.reused_server, "no server ran; must start one");
         assert!(outcome.session.reachable);
@@ -608,7 +639,7 @@ mod tests {
         assert_eq!(browser.opened_urls().len(), 1);
 
         // The bound port is persisted so the next run reuses it (FR-012/015).
-        let profile = OperatorSetupProfile::load(project.path()).expect("port persisted");
+        let profile = OperatorSetupProfile::load(&control).expect("port persisted");
         assert_eq!(profile.port, outcome.session.bound_addr.port());
     }
 
@@ -621,6 +652,7 @@ mod tests {
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
+        let control = control_over(home.path());
         OperatorSetupProfile::new(
             InstallationType::Server,
             running.bound_addr.port(),
@@ -628,13 +660,18 @@ mod tests {
             &[],
             1,
         )
-        .save(project.path())
+        .save(&control)
         .expect("persist profile");
 
         let ctx = ctx_over(home.path(), project.path());
         let browser = NoopBrowserOpener::default();
-        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
-            .expect("admin --no-open should report without opening");
+        let outcome = run_admin_with_control_state(
+            &AdminCliArgs { no_open: true },
+            &ctx,
+            &browser,
+            Some(&control),
+        )
+        .expect("admin --no-open should report without opening");
 
         assert!(
             browser.opened_urls().is_empty(),
@@ -655,11 +692,17 @@ mod tests {
         // the serve thread died with the process and the printed URL was refused.
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
+        let control = control_over(home.path());
         let ctx = ctx_over(home.path(), project.path());
         let browser = NoopBrowserOpener::default();
 
-        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
-            .expect("admin should start a server when none runs");
+        let outcome = run_admin_with_control_state(
+            &AdminCliArgs { no_open: true },
+            &ctx,
+            &browser,
+            Some(&control),
+        )
+        .expect("admin should start a server when none runs");
         assert!(!outcome.reused_server, "no server ran; must start one");
 
         let waited = std::cell::Cell::new(false);
@@ -709,6 +752,7 @@ mod tests {
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
+        let control = control_over(home.path());
         OperatorSetupProfile::new(
             InstallationType::Server,
             running.bound_addr.port(),
@@ -716,13 +760,18 @@ mod tests {
             &[],
             1,
         )
-        .save(project.path())
+        .save(&control)
         .expect("persist profile");
 
         let ctx = ctx_over(home.path(), project.path());
         let browser = NoopBrowserOpener::default();
-        let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
-            .expect("admin should reuse the running server");
+        let outcome = run_admin_with_control_state(
+            &AdminCliArgs { no_open: true },
+            &ctx,
+            &browser,
+            Some(&control),
+        )
+        .expect("admin should reuse the running server");
         assert!(outcome.reused_server, "must reuse the running server");
 
         let waited = std::cell::Cell::new(false);

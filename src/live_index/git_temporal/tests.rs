@@ -1,4 +1,36 @@
 use super::*;
+use crate::domain::{SourceVersion, WorkingTreeState};
+
+fn temporal_request(commit: &str) -> GitTemporalComputationRequest {
+    GitTemporalComputationRequest {
+        fence: GitTemporalPublicationFence {
+            project_generation: 7,
+            content_generation: 11,
+            source: None,
+            source_version: Some(SourceVersion {
+                branch: Some("main".to_string()),
+                commit: Some(commit.to_string()),
+                working_tree: WorkingTreeState::Clean,
+            }),
+        },
+        repo_root: PathBuf::from("repo"),
+    }
+}
+
+#[test]
+fn temporal_queue_keeps_one_running_and_coalesces_one_latest_request() {
+    let mut queue = GitTemporalJobQueue::default();
+    let first = temporal_request("a");
+    let superseded = temporal_request("b");
+    let latest = temporal_request("c");
+
+    assert_eq!(queue.enqueue(first.clone()), Some(first.clone()));
+    assert_eq!(queue.enqueue(first.clone()), None);
+    assert_eq!(queue.enqueue(superseded), None);
+    assert_eq!(queue.enqueue(latest.clone()), None);
+    assert_eq!(queue.finish(&first), Some(latest.clone()));
+    assert_eq!(queue.finish(&latest), None);
+}
 
 // ── Rendering helpers ───────────────────────────────────────────────
 

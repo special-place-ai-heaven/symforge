@@ -122,7 +122,7 @@ Current v8.14.0 recovery contract:
 The shipped v8.14.0 MCP surface includes tools, resources, and prompts. Do not
 design for tools only.
 
-The **default** `tools/list` surface is the full **36-tool** surface below
+The **default** `tools/list` surface is the full **39-tool** surface below
 (including `health_compact`). The compact-3 surface — `symforge`,
 `symforge_edit`, `status` — is a documented opt-in escape hatch via
 `SYMFORGE_SURFACE=compact`:
@@ -132,13 +132,13 @@ The **default** `tools/list` surface is the full **36-tool** surface below
   `diff_symbols`, `validate_file_syntax`
 - Read and search: `get_repo_map`, `get_file_context`, `get_file_content`,
   `get_symbol`, `get_symbol_context`, `inspect_match`, `search_symbols`,
-  `search_text`, `search_files`, `find_references`, `find_dependents`,
-  `symforge_retrieve`
+  `search_text`, `search_files`, `search_knowledge`, `review_knowledge`,
+  `find_references`, `find_dependents`, `symforge_retrieve`
 - Guidance: `explore`, `ask`, `conventions`, `edit_plan`,
   `context_inventory`, `investigation_suggest`
 - Structural edits: `replace_symbol_body`, `edit_within_symbol`,
   `insert_symbol`, `delete_symbol`, `batch_edit`, `batch_insert`,
-  `batch_rename`, `symforge_edit`
+  `batch_rename`, `symforge_edit`, `curate_knowledge`
 
 Ranking signal invariants:
 - `search_symbols`, `search_text`, `search_files`, `explore`, `ask`, and
@@ -270,5 +270,5 @@ Do not default to broad raw file reads for source-code inspection when SymForge 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/011-ccr-output-compression/plan.md
+at specs/020-repository-knowledge-index/plan.md
 <!-- SPECKIT END -->

@@ -48,8 +48,10 @@ fn wait_for_status(
 #[test]
 fn enabled_recorder_writes_bounded_metadata_in_background() {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join(".symforge").join("analytics.db");
-    let store = AnalyticsStore::open(AnalyticsConfig::enabled(&db_path)).unwrap();
+    let project_state = symforge::domain::ProjectStateDir::new(tmp.path().join(".symforge"));
+    let db_path =
+        symforge::paths::project_state_path(&project_state, symforge::paths::ANALYTICS_DB_NAME);
+    let store = AnalyticsStore::open(AnalyticsConfig::enabled(project_state)).unwrap();
     let recorder = AnalyticsRecorder::start(store, AnalyticsScope::Session, 8);
 
     let long_tool_name = "read_tool_".repeat(64);

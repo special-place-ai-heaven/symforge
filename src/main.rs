@@ -79,6 +79,7 @@ fn startup_plan(
 fn spawn_periodic_checkpoint(
     index: live_index::SharedIndex,
     root: std::path::PathBuf,
+    state_placement: symforge::domain::StatePlacement,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -86,8 +87,13 @@ fn spawn_periodic_checkpoint(
             tokio::time::sleep(interval).await;
             let checkpoint_index = Arc::clone(&index);
             let checkpoint_root = root.clone();
+            let checkpoint_placement = state_placement.clone();
             match tokio::task::spawn_blocking(move || {
-                persist::checkpoint_shared_index(&checkpoint_index, &checkpoint_root)
+                persist::checkpoint_shared_index(
+                    &checkpoint_index,
+                    &checkpoint_root,
+                    &checkpoint_placement,
+                )
             })
             .await
             {
@@ -253,11 +259,15 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
 }
 
 async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> anyhow::Result<()> {
-    if let Some(port) = session.port() {
+    let control_state_dir = symforge::paths::process_control_state_placement()
+        .directory()
+        .cloned();
+    if let (Some(port), Some(state_dir)) = (session.port(), control_state_dir.as_ref()) {
         // Task 8: one atomic per-adapter descriptor instead of the fixed
         // port/pid/session files — a second adapter on the same root can no
         // longer be overwritten or deleted by this one.
         sidecar::port_file::write_session_descriptor(
+            state_dir,
             port,
             Some(session.session_id()),
             session.project_root(),
@@ -272,7 +282,26 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
         }
     });
 
-    let mut server = protocol::SymForgeServer::new_daemon_proxy(session.clone());
+    let state_placement = session.project_root().and_then(|root| {
+        match discovery::resolve_root_candidate(
+            root,
+            symforge::domain::RootCandidateSource::LaunchCwd,
+            symforge::domain::RootRequestMode::Automatic,
+        ) {
+            symforge::domain::RootResolution::Bound(binding) => {
+                Some(discovery::resolve_state_placement(&binding))
+            }
+            symforge::domain::RootResolution::Unbound { .. } => None,
+        }
+    });
+    let project_state_dir = state_placement
+        .as_ref()
+        .and_then(|placement| placement.directory())
+        .cloned();
+    let mut server = protocol::SymForgeServer::new_daemon_proxy_with_state_placement(
+        session.clone(),
+        state_placement,
+    );
 
     // Feature 013 US1 (T021): the DEFAULT operator stdio is daemon-backed, and
     // the `symforge` compact tool — the ONLY tool that records STEL economics
@@ -284,11 +313,9 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     // capture + durable write-through stays on the proxy. So durable accumulation
     // in the daemon-default deployment requires attaching the durable store
     // HERE, on the proxy — mirroring the local-stdio attach (T020) and serve.rs.
-    // Open under the project ROOT: `StelLedgerStore::open` joins the
-    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
-    // dir on demand (passing the already-`.symforge` data dir here would double
-    // the prefix). A dir/open failure degrades to `Disabled` INSIDE `open`
-    // (logged, in-memory, FR-003). This deliberately does NOT touch the
+    // The proxy and its durable ledger share one already-resolved typed project
+    // state owner. A dir/open failure degrades to `Disabled` inside `open`
+    // (logged, in-memory, FR-003). This deliberately does not touch the
     // privileged daemon worker.
     //
     // Observability (D2-ROOT): `status` IS proxied to the daemon worker, which
@@ -300,9 +327,9 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     // real accumulation + calibration verdict, not the worker's blind
     // `0`/`none`/`unavailable`/`deferred`. If the proxy ALSO has no store /
     // empty ledger, the lines stay truthfully `0`/`none`/`unavailable`/`deferred`.
-    if let Some(root) = session.project_root() {
+    if let Some(state_dir) = project_state_dir.as_ref() {
         let store = symforge::stel::ledger_store::StelLedgerStore::open(
-            root,
+            state_dir,
             format!("stdio-daemon-{}", std::process::id()),
         );
         server = server.with_stel_ledger_store(Arc::new(store));
@@ -326,7 +353,9 @@ async fn run_remote_mcp_server_async(session: daemon::DaemonSessionClient) -> an
     let _ = session.close().await;
     // Task 8: remove ONLY this adapter's descriptor; sibling adapters on the
     // same root keep theirs.
-    sidecar::port_file::cleanup_own_descriptor(session.project_root());
+    if let Some(state_dir) = control_state_dir.as_ref() {
+        sidecar::port_file::cleanup_own_descriptor(state_dir);
+    }
     tracing::info!("daemon-backed MCP server shut down cleanly");
     Ok(())
 }
@@ -335,11 +364,23 @@ async fn run_local_mcp_server_async(
     should_auto_index: bool,
     resolved_root: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let (index, project_name, watcher_root) = if let Some(root) = resolved_root {
+    let (index, project_name, watcher_root, state_placement) = if let Some(root) = resolved_root {
         tracing::info!(root = %root.display(), "auto-indexing from project root");
 
+        let binding = match discovery::resolve_root_candidate(
+            &root,
+            symforge::domain::RootCandidateSource::LaunchCwd,
+            symforge::domain::RootRequestMode::Automatic,
+        ) {
+            symforge::domain::RootResolution::Bound(binding) => binding,
+            resolution => anyhow::bail!(
+                "resolved local project root no longer satisfies the canonical source guard: {resolution:?}"
+            ),
+        };
+        let state_placement = discovery::resolve_state_placement(&binding);
+
         // Try loading from persisted snapshot first (fast path: no re-parsing).
-        let index = if let Some(snapshot) = persist::load_snapshot(&root) {
+        let index = if let Some(snapshot) = persist::load_snapshot(&root, &state_placement) {
             let file_count = snapshot.files.len();
             // Extract mtime map before consuming snapshot
             let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
@@ -348,14 +389,21 @@ async fn run_local_mcp_server_async(
                 .map(|(k, v)| (k.clone(), v.mtime_secs))
                 .collect();
 
-            let live = persist::snapshot_to_live_index(snapshot, &root);
+            let (live, code_signals) =
+                persist::snapshot_to_live_index_with_code_signals(snapshot, &root);
             tracing::info!(
                 files = file_count,
                 load_source = ?live.load_source(),
                 snapshot_verify_state = ?live.snapshot_verify_state(),
                 "loaded serialized index from .symforge/index.bin"
             );
-            let shared: live_index::SharedIndex = live_index::SharedIndexHandle::shared(live);
+            let shared: live_index::SharedIndex =
+                live_index::SharedIndexHandle::shared_for_state_placement_with_code_signals(
+                    live,
+                    &root,
+                    &state_placement,
+                    code_signals,
+                );
 
             // Spawn background verification to reconcile against current disk state.
             let bg_index = shared.clone();
@@ -371,9 +419,10 @@ async fn run_local_mcp_server_async(
             let shared = live_index::LiveIndex::empty();
             let bg_index = shared.clone();
             let bg_root = root.clone();
+            let bg_state_placement = state_placement.clone();
             tokio::task::spawn_blocking(move || {
                 tracing::info!("cold-start indexing in background");
-                if let Err(e) = bg_index.reload(&bg_root) {
+                if let Err(e) = bg_index.reload_for_state_placement(&bg_root, &bg_state_placement) {
                     tracing::error!(%e, "background cold-start indexing failed");
                 } else {
                     tracing::info!("background cold-start indexing complete");
@@ -414,12 +463,12 @@ async fn run_local_mcp_server_async(
             .unwrap_or("project")
             .to_string();
 
-        (index, name, Some(root))
+        (index, name, Some(root), Some(state_placement))
     } else {
         tracing::info!("{}", local_empty_reason(should_auto_index));
         let live = live_index::LiveIndex::empty();
         live.set_local_empty_reason(Some(local_empty_reason(should_auto_index).to_string()));
-        (live, "project".to_string(), None)
+        (live, "project".to_string(), None, None)
     };
 
     // Spawn file watcher after initial load (only when auto-index is enabled).
@@ -445,23 +494,39 @@ async fn run_local_mcp_server_async(
         );
     }
 
-    let periodic_checkpoint = watcher_root.as_ref().and_then(|root| {
-        persist::checkpoint_interval_from_env().map(|interval| {
-            tracing::info!(
-                interval_secs = interval.as_secs(),
-                env = persist::CHECKPOINT_INTERVAL_ENV,
-                "periodic checkpointing enabled"
-            );
-            spawn_periodic_checkpoint(Arc::clone(&index), root.clone(), interval)
-        })
-    });
+    let periodic_checkpoint = watcher_root
+        .as_ref()
+        .zip(state_placement.as_ref())
+        .and_then(|(root, placement)| {
+            persist::checkpoint_interval_from_env().map(|interval| {
+                tracing::info!(
+                    interval_secs = interval.as_secs(),
+                    env = persist::CHECKPOINT_INTERVAL_ENV,
+                    "periodic checkpointing enabled"
+                );
+                spawn_periodic_checkpoint(
+                    Arc::clone(&index),
+                    root.clone(),
+                    placement.clone(),
+                    interval,
+                )
+            })
+        });
 
     // Spawn HTTP sidecar after watcher, before MCP serve.
     // The sidecar shares the same Arc<LiveIndex> so mutations are immediately visible.
     let bind_host =
         std::env::var("SYMFORGE_SIDECAR_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let sidecar_handle =
-        sidecar::spawn_sidecar(Arc::clone(&index), &bind_host, watcher_root.clone()).await?;
+    let control_state_dir = symforge::paths::process_control_state_placement()
+        .directory()
+        .cloned();
+    let sidecar_handle = sidecar::spawn_sidecar(
+        Arc::clone(&index),
+        &bind_host,
+        watcher_root.clone(),
+        control_state_dir,
+    )
+    .await?;
     tracing::info!(port = sidecar_handle.port, "HTTP sidecar started");
 
     // Share the sidecar's TokenStats Arc with the MCP server so the health tool
@@ -470,29 +535,30 @@ async fn run_local_mcp_server_async(
     let token_stats = Some(Arc::clone(&sidecar_handle.token_stats));
 
     // Create MCP server and serve on stdio transport.
-    let mut server = protocol::SymForgeServer::new(
+    let mut server = protocol::SymForgeServer::new_with_state_placement(
         Arc::clone(&index),
         project_name,
         watcher_info,
         watcher_root.clone(),
+        state_placement.clone(),
         token_stats,
     );
 
     // Feature 013 US1 (T020): attach the durable STEL economics ledger on the
     // LOCAL stdio path so predicted-vs-actual events accumulate ACROSS restarts
     // (FR-001/SC-003), not just in serve mode. Mirrors `serve::build_serve_runtime`:
-    // open under the project ROOT — `StelLedgerStore::open` joins the
-    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
-    // dir on demand (the same convention as analytics/coupling/frecency; passing
-    // the already-`.symforge` data dir here would double the prefix). A dir/open
-    // failure degrades to `Disabled` INSIDE `open` (logged, in-memory, FR-003),
+    // open through the resolved typed project state owner. A dir/open failure
+    // degrades to `Disabled` inside `open` (logged, in-memory, FR-003),
     // so stdio never fails to start over a ledger problem. The `symforge` compact
     // tool's `finalize_symforge_with_ledger` write-through then persists each
     // economics row to this store, bringing stdio to parity with serve
     // (Principle VII) for the durable backing.
-    if let Some(root) = watcher_root.as_ref() {
+    if let Some(state_dir) = state_placement
+        .as_ref()
+        .and_then(|placement| placement.directory())
+    {
         let store = symforge::stel::ledger_store::StelLedgerStore::open(
-            root,
+            state_dir,
             format!("stdio-{}", std::process::id()),
         );
         server = server.with_stel_ledger_store(Arc::new(store));
@@ -517,8 +583,8 @@ async fn run_local_mcp_server_async(
 
     // Serialize index to disk on clean shutdown.
     // Only serialize when auto-index is enabled (i.e., we have a real project root).
-    if let Some(ref root) = watcher_root {
-        match persist::serialize_shared_index(&index, root) {
+    if let (Some(root), Some(placement)) = (watcher_root.as_ref(), state_placement.as_ref()) {
+        match persist::serialize_shared_index(&index, root, placement) {
             Ok(()) => tracing::info!("index serialized to .symforge/index.bin"),
             Err(e) => tracing::warn!("failed to serialize index on shutdown: {e}"),
         }

@@ -631,11 +631,16 @@ fn project_config_hash_is_stable_across_creation_order() {
 }
 
 #[test]
-fn default_store_path_uses_user_local_symforge_trust_json() {
-    let path = default_trust_store_path().expect("data_local_dir should exist on test host");
+fn default_store_path_uses_process_control_state_owner() {
+    let control_state = symforge::paths::process_control_state_placement()
+        .directory()
+        .expect("durable process control state should exist on test host");
+    let path = default_trust_store_path().expect("trust store path should resolve");
 
-    assert_eq!(path.file_name().unwrap(), "trust.json");
-    assert_eq!(path.parent().unwrap().file_name().unwrap(), "symforge");
+    assert_eq!(
+        path,
+        symforge::paths::control_state_path(control_state, "edit-safety/trust.json")
+    );
 }
 
 #[cfg(windows)]

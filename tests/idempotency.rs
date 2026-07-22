@@ -1,6 +1,7 @@
 use std::fs;
 
 use serde_json::json;
+use symforge::domain::ProjectStateDir;
 use symforge::idempotency::{
     FileReplayStore, IdempotencyError, IdempotencyKey, ReplayDecision, ReplayStatus, RequestHash,
 };
@@ -8,6 +9,10 @@ use symforge::paths::{
     SYMFORGE_IDEMPOTENCY_QUARANTINE_DIR_PATH, SYMFORGE_IDEMPOTENCY_RECORDS_DIR_PATH,
 };
 use tempfile::TempDir;
+
+fn project_state(root: &std::path::Path) -> ProjectStateDir {
+    ProjectStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
+}
 
 fn expect_first_execution(decision: ReplayDecision) -> symforge::idempotency::ReplayRecord {
     match decision {
@@ -46,7 +51,7 @@ fn idempotency_canonical_request_hash_ignores_json_object_key_order() {
 #[test]
 fn idempotency_first_execution_reserves_record_without_storing_raw_key_or_request_body() {
     let tmp = TempDir::new().unwrap();
-    let store = FileReplayStore::open(tmp.path()).unwrap();
+    let store = FileReplayStore::open(&project_state(tmp.path())).unwrap();
     let key = IdempotencyKey::new("SECRET_IDEMPOTENCY_KEY").unwrap();
     let request = json!({
         "path": "SECRET_REQUEST_PATH",
@@ -70,7 +75,7 @@ fn idempotency_first_execution_reserves_record_without_storing_raw_key_or_reques
 #[test]
 fn idempotency_same_key_same_hash_replays_stored_status() {
     let tmp = TempDir::new().unwrap();
-    let store = FileReplayStore::open(tmp.path()).unwrap();
+    let store = FileReplayStore::open(&project_state(tmp.path())).unwrap();
     let key = IdempotencyKey::new("replay-key").unwrap();
     let hash = RequestHash::for_tool_request("index_folder", &json!({"path": "src"})).unwrap();
 
@@ -95,7 +100,7 @@ fn idempotency_same_key_same_hash_replays_stored_status() {
 #[test]
 fn idempotency_same_key_different_hash_returns_deterministic_conflict() {
     let tmp = TempDir::new().unwrap();
-    let store = FileReplayStore::open(tmp.path()).unwrap();
+    let store = FileReplayStore::open(&project_state(tmp.path())).unwrap();
     let key = IdempotencyKey::new("conflict-key").unwrap();
     let first_hash =
         RequestHash::for_tool_request("index_folder", &json!({"path": "src"})).unwrap();
@@ -119,7 +124,7 @@ fn idempotency_same_key_different_hash_returns_deterministic_conflict() {
 #[test]
 fn idempotency_corrupt_replay_record_is_quarantined_and_not_served_as_success() {
     let tmp = TempDir::new().unwrap();
-    let store = FileReplayStore::open(tmp.path()).unwrap();
+    let store = FileReplayStore::open(&project_state(tmp.path())).unwrap();
     let key = IdempotencyKey::new("corrupt-key").unwrap();
     let hash = RequestHash::for_tool_request("index_folder", &json!({"path": "src"})).unwrap();
 

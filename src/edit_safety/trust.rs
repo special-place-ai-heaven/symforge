@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::domain::ControlStateDir;
+
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -332,7 +334,13 @@ impl Default for TrustStore {
 }
 
 pub fn default_trust_store_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|dir| dir.join("symforge").join("trust.json"))
+    crate::paths::process_control_state_placement()
+        .directory()
+        .map(trust_store_path)
+}
+
+fn trust_store_path(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, "edit-safety/trust.json")
 }
 
 fn canonical_project_key(project_root: &Path) -> io::Result<String> {

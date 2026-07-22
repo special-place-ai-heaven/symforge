@@ -27,6 +27,9 @@ use tempfile::TempDir;
 fn make_server(files: &[(&str, &str)]) -> (TempDir, SymForgeServer) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
+    if files.iter().any(|(rel, _)| *rel == ".gitignore") {
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+    }
     for (rel, content) in files {
         let path = root.join(rel);
         if let Some(parent) = path.parent() {
@@ -74,7 +77,7 @@ async fn impact_refuses_oversized_code_file() {
         server
             .index()
             .read()
-            .skipped_files()
+            .compatibility_skipped_files()
             .iter()
             .any(|f| f.path == "src/big.rs"),
         "the refusal must record the demotion in the skip registry"
@@ -121,5 +124,51 @@ async fn impact_refuses_oversized_data_file_at_1mb_threshold() {
     assert!(
         result.contains("Not indexed") && result.contains("Tier 2"),
         "1.5MB data file must get an honest Tier-2 refusal; got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn impact_normalizes_existing_path_before_catalog_lookup() {
+    let (_dir, server) = make_server(&[("src/lib.rs", "pub fn keep() {}\n")]);
+
+    let result = server
+        .dispatch_tool_for_tests("analyze_file_impact", json!({ "path": "./src/lib.rs" }))
+        .await;
+    assert!(
+        result.contains("Impact:") || result.contains("Symbols:"),
+        "normalized existing path must remain analyzable; got: {result}"
+    );
+
+    let index = server.index().read();
+    assert!(index.get_file("src/lib.rs").is_some());
+    assert!(
+        index.get_file("./src/lib.rs").is_none(),
+        "impact must not mint a second catalog identity for a spelling variant"
+    );
+}
+
+#[tokio::test]
+async fn impact_cannot_admit_gitignored_supported_source() {
+    let (_dir, server) = make_server(&[
+        (".gitignore", "ignored.rs\n"),
+        ("ignored.rs", "pub fn must_stay_ignored() {}\n"),
+        ("src/lib.rs", "pub fn keep() {}\n"),
+    ]);
+    assert!(server.index().read().get_file("ignored.rs").is_none());
+
+    let result = server
+        .dispatch_tool_for_tests(
+            "analyze_file_impact",
+            json!({ "path": "ignored.rs", "new_file": true }),
+        )
+        .await;
+
+    assert!(
+        result.contains("Not indexed"),
+        "scope exclusion must produce a typed non-indexed result; got: {result}"
+    );
+    assert!(
+        server.index().read().get_file("ignored.rs").is_none(),
+        "impact must share the watcher/cold-walk gitignore gate"
     );
 }

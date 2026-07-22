@@ -25,6 +25,7 @@ pub enum LanguageId {
     Toml,
     Yaml,
     Markdown,
+    Text,
     Env,
     Html,
     Css,
@@ -33,7 +34,7 @@ pub enum LanguageId {
 
 impl LanguageId {
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext {
+        match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
             "js" | "jsx" => Some(Self::JavaScript),
@@ -53,13 +54,54 @@ impl LanguageId {
             "json" => Some(Self::Json),
             "toml" => Some(Self::Toml),
             "yaml" | "yml" => Some(Self::Yaml),
-            "md" => Some(Self::Markdown),
+            "md" | "mdx" => Some(Self::Markdown),
+            "txt" | "text" | "rst" | "adoc" | "asciidoc" | "org" | "ini" | "conf"
+            | "properties" | "xml" | "json5" => Some(Self::Text),
             "env" => Some(Self::Env),
             "html" => Some(Self::Html),
             "css" => Some(Self::Css),
             "scss" => Some(Self::Scss),
             _ => None,
         }
+    }
+
+    /// Detect an indexed language from the complete repository-relative path.
+    ///
+    /// Extensionless narrative entry points and dotfile configuration cannot be
+    /// classified from [`Self::from_extension`] alone. Keeping that closed path
+    /// matrix here gives cold discovery, watcher updates, reconciliation, and
+    /// direct impact analysis one deterministic answer.
+    pub fn from_path(relative_path: &str) -> Option<Self> {
+        let basename = relative_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(relative_path)
+            .to_ascii_lowercase();
+
+        if basename == ".env" || basename.starts_with(".env.") {
+            return Some(Self::Env);
+        }
+        if matches!(
+            basename.as_str(),
+            "readme"
+                | "changelog"
+                | "license"
+                | "notice"
+                | "agents"
+                | "claude"
+                | "contributing"
+                | "security"
+                | "governance"
+                | ".gitignore"
+                | ".gitattributes"
+                | ".editorconfig"
+        ) {
+            return Some(Self::Text);
+        }
+
+        basename
+            .rsplit_once('.')
+            .and_then(|(_, extension)| Self::from_extension(extension))
     }
 
     /// True for programming languages (symbol-bearing code) as opposed to
@@ -73,6 +115,7 @@ impl LanguageId {
                 | Self::Toml
                 | Self::Yaml
                 | Self::Markdown
+                | Self::Text
                 | Self::Env
                 | Self::Html
                 | Self::Css
@@ -137,7 +180,20 @@ impl LanguageId {
             Self::Json => &["json"],
             Self::Toml => &["toml"],
             Self::Yaml => &["yaml", "yml"],
-            Self::Markdown => &["md"],
+            Self::Markdown => &["md", "mdx"],
+            Self::Text => &[
+                "txt",
+                "text",
+                "rst",
+                "adoc",
+                "asciidoc",
+                "org",
+                "ini",
+                "conf",
+                "properties",
+                "xml",
+                "json5",
+            ],
             Self::Env => &["env"],
             Self::Html => &["html"],
             Self::Css => &["css"],
@@ -165,6 +221,7 @@ impl LanguageId {
             | Self::Toml
             | Self::Yaml
             | Self::Markdown
+            | Self::Text
             | Self::Env
             | Self::Html
             | Self::Css
@@ -196,6 +253,7 @@ impl fmt::Display for LanguageId {
             Self::Toml => "TOML",
             Self::Yaml => "YAML",
             Self::Markdown => "Markdown",
+            Self::Text => "Text",
             Self::Env => "Env",
             Self::Html => "HTML",
             Self::Css => "CSS",
@@ -323,6 +381,20 @@ impl FileClassification {
         }
     }
 
+    /// Classify one admitted path while keeping ingest routing in
+    /// [`IndexTargets`]. Knowledge-only prose is descriptive text; overlapping
+    /// configuration remains code-shaped and is marked as configuration.
+    pub fn for_indexed_path(relative_path: &str, targets: IndexTargets) -> Self {
+        let mut classification = Self::for_code_path(relative_path);
+        classification.class = if matches!(targets, IndexTargets::Knowledge) {
+            FileClass::Text
+        } else {
+            FileClass::Code
+        };
+        classification.is_config = matches!(targets, IndexTargets::CodeAndKnowledge);
+        classification
+    }
+
     pub const fn is_code(&self) -> bool {
         matches!(self.class, FileClass::Code)
     }
@@ -333,6 +405,716 @@ impl FileClassification {
 
     pub const fn is_binary(&self) -> bool {
         matches!(self.class, FileClass::Binary)
+    }
+}
+
+/// Stable identity for one canonical source root.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(pub String);
+
+/// Stable identity shared by all sources from one logical repository.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct RepositoryId(String);
+
+impl RepositoryId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Stable identity for one worktree or immutable repository source.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SourceId(String);
+
+impl SourceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SourceLocation {
+    WorkingTree { worktree_id: String },
+    GitRef { name: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum WorkingTreeState {
+    Clean,
+    Dirty,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SourceVersion {
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub working_tree: WorkingTreeState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SourceIdentity {
+    pub repository_id: RepositoryId,
+    pub source_id: SourceId,
+    pub location: SourceLocation,
+}
+
+/// Captured repository state used to prove that persisted derived state still
+/// belongs to the same source and source version.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RepositoryFingerprint {
+    Git {
+        object_format: String,
+        selected_ref_or_head: String,
+        tip_object_id: String,
+        reachable_history_fingerprint: String,
+    },
+    NonGit {
+        catalog_identity_digest: String,
+    },
+}
+
+/// Strong snapshot binding. `ProjectId` selects storage; the remaining fields
+/// prove repository/source identity and the exact derived state captured there.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotSourceIdentity {
+    pub project_id: ProjectId,
+    pub repository_id: RepositoryId,
+    pub source_id: SourceId,
+    pub source_version: SourceVersion,
+    pub repository_fingerprint: RepositoryFingerprint,
+    pub manifest_digest: String,
+    pub indexed_content_digest: String,
+}
+
+/// Per-source provenance attached to every externally formatted repository
+/// result. It is projected from one captured published generation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceResponseEnvelope {
+    pub source: SourceIdentity,
+    pub source_version: SourceVersion,
+    pub publication_generation: u64,
+    pub content_generation: u64,
+    pub freshness: FreshnessStatus,
+    pub manifest_digest: String,
+    pub coverage: CoverageStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RootCandidateSource {
+    WorkspaceEnvironment,
+    McpClientRoot,
+    GitAncestor,
+    LaunchCwd,
+    ExplicitIndexFolder,
+    InitCwd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RootRequestMode {
+    Automatic,
+    Init,
+    ExplicitIndexFolder { allow_protected_root: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RootClass {
+    Normal,
+    Protected,
+    NeverIndexable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RootRefusalReason {
+    FilesystemOrDriveRoot,
+    HomeOrProfileRoot,
+    OsOrSensitiveTree,
+    BroadContainer,
+    SymlinkAliasToForbiddenRoot,
+    MissingOrNotDirectory,
+    CanonicalizationFailed,
+    DeviceOrSpecialNamespace,
+    ProtectedRootRequiresExplicitOverride,
+}
+
+impl RootRefusalReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FilesystemOrDriveRoot => "filesystem_or_drive_root",
+            Self::HomeOrProfileRoot => "home_or_profile_root",
+            Self::OsOrSensitiveTree => "os_or_sensitive_tree",
+            Self::BroadContainer => "broad_container",
+            Self::SymlinkAliasToForbiddenRoot => "symlink_alias_to_forbidden_root",
+            Self::MissingOrNotDirectory => "missing_or_not_directory",
+            Self::CanonicalizationFailed => "canonicalization_failed",
+            Self::DeviceOrSpecialNamespace => "device_or_special_namespace",
+            Self::ProtectedRootRequiresExplicitOverride => {
+                "protected_root_requires_explicit_override"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnboundReason {
+    NoCandidateDeclared,
+    Refused(RootRefusalReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SourceAccessMode {
+    NormalProject,
+    ExplicitProtected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RootBinding {
+    pub source: RootCandidateSource,
+    pub canonical_root: std::path::PathBuf,
+    pub root_id: ProjectId,
+    pub access_mode: SourceAccessMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RootResolution {
+    Bound(RootBinding),
+    Unbound {
+        rejected_source: Option<RootCandidateSource>,
+        reason: UnboundReason,
+        safe_path_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ProjectStateDir(std::path::PathBuf);
+
+impl ProjectStateDir {
+    #[must_use]
+    pub fn new(path: std::path::PathBuf) -> Self {
+        assert!(
+            path.is_absolute(),
+            "project state directory must be absolute"
+        );
+        Self(path)
+    }
+
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Private process-global coordination state, resolved independently from any
+/// repository binding.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ControlStateDir(std::path::PathBuf);
+
+impl ControlStateDir {
+    #[must_use]
+    pub fn new(path: std::path::PathBuf) -> Self {
+        assert!(
+            path.is_absolute(),
+            "control state directory must be absolute"
+        );
+        Self(path)
+    }
+
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Placement for process-global transport, daemon, and replay coordination.
+///
+/// This lane is deliberately incapable of naming a repository or launch-CWD
+/// directory when durable user-local state is unavailable.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ControlStatePlacement {
+    UserLocal { directory: ControlStateDir },
+    ProcessLocal { safe_reason: AccessErrorKind },
+}
+
+impl ControlStatePlacement {
+    #[must_use]
+    pub fn directory(&self) -> Option<&ControlStateDir> {
+        match self {
+            Self::UserLocal { directory } => Some(directory),
+            Self::ProcessLocal { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CapabilityUnavailableReason {
+    ExplicitProtectedSource,
+    SourceReadOnly,
+    PersistentStateUnavailable,
+    DurableMutationReplayUnavailable,
+    NonProjectLocalPlacement,
+    AtomicDurabilityUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CapabilityStatus {
+    Available,
+    Unavailable { reason: CapabilityUnavailableReason },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectCapabilities {
+    pub persistent_snapshots: CapabilityStatus,
+    pub checkpoint: CapabilityStatus,
+    pub structural_edits: CapabilityStatus,
+    pub repository_init: CapabilityStatus,
+    pub repository_curation: CapabilityStatus,
+    pub team_artifact_export: CapabilityStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StatePlacement {
+    ProjectLocal {
+        directory: ProjectStateDir,
+    },
+    UserLocal {
+        directory: ProjectStateDir,
+        root_id: ProjectId,
+        reason: UserLocalPlacementReason,
+    },
+    MemoryOnly {
+        failures: Vec<StateFailure>,
+    },
+}
+
+impl StatePlacement {
+    #[must_use]
+    pub fn directory(&self) -> Option<&ProjectStateDir> {
+        match self {
+            Self::ProjectLocal { directory } | Self::UserLocal { directory, .. } => Some(directory),
+            Self::MemoryOnly { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UserLocalPlacementReason {
+    ExplicitProtected,
+    ProjectLocalUnavailable { safe_reason: AccessErrorKind },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum StateLocationKind {
+    ProjectLocal,
+    UserLocal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StateFailure {
+    pub location: StateLocationKind,
+    pub safe_reason: AccessErrorKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GitignoreHygiene {
+    Effective,
+    MissingRule,
+    NoRootGitignore,
+    Unverifiable { safe_reason: AccessErrorKind },
+    NotApplicableExplicitProtected,
+}
+
+/// Lossless public identity for one repository-relative catalog path.
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct CatalogPath {
+    pub public_id: String,
+    pub normalized_utf8: Option<String>,
+}
+
+/// Non-empty indexing target selected by the metadata-first scout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum IndexTargets {
+    Code,
+    Knowledge,
+    CodeAndKnowledge,
+}
+
+impl IndexTargets {
+    /// Determine the non-empty ingest lane set for one safe textual path.
+    pub fn for_path(relative_path: &str, language: Option<&LanguageId>) -> Self {
+        match language {
+            Some(LanguageId::Markdown) => Self::Knowledge,
+            Some(LanguageId::Json | LanguageId::Toml | LanguageId::Yaml | LanguageId::Env) => {
+                Self::CodeAndKnowledge
+            }
+            Some(LanguageId::Text) if is_dual_target_text_path(relative_path) => {
+                Self::CodeAndKnowledge
+            }
+            Some(LanguageId::Text) | None => Self::Knowledge,
+            Some(_) => Self::Code,
+        }
+    }
+
+    pub const fn includes_code(self) -> bool {
+        matches!(self, Self::Code | Self::CodeAndKnowledge)
+    }
+
+    pub const fn includes_knowledge(self) -> bool {
+        matches!(self, Self::Knowledge | Self::CodeAndKnowledge)
+    }
+}
+
+fn is_dual_target_text_path(relative_path: &str) -> bool {
+    let basename = relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path)
+        .to_ascii_lowercase();
+    let extension = basename.rsplit_once('.').map(|(_, ext)| ext);
+    matches!(
+        extension,
+        Some("ini" | "conf" | "properties" | "xml" | "json5")
+    ) || matches!(
+        basename.as_str(),
+        ".gitignore" | ".gitattributes" | ".editorconfig" | "dockerfile"
+    )
+}
+
+/// Private host file identity used only as a race/change hint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlatformFileId(Vec<u8>);
+
+/// Metadata captured before any file payload is read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub size: u64,
+    pub created_hint: Option<std::time::SystemTime>,
+    pub modified_hint: Option<std::time::SystemTime>,
+    pub platform_id: Option<PlatformFileId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MetadataOnlyReason {
+    Lockfile,
+    Binary,
+    OversizedData,
+    GeneratedOrVendor,
+    SensitivePath {
+        rule_id: String,
+    },
+    SensitiveContent {
+        rule_ids: Vec<String>,
+        finding_count: u32,
+    },
+    LfsPointer {
+        declared_oid: Option<String>,
+        declared_size: Option<u64>,
+    },
+    PlatformPathCollision,
+    UnsupportedPathEncoding,
+    PathMetadataTooLarge,
+    UnsupportedTextEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum HardSkipReason {
+    ArtifactType,
+    PerFileCeiling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AccessStage {
+    Metadata,
+    Probe,
+    FullRead,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AccessErrorKind {
+    NotFound,
+    PermissionDenied,
+    InvalidData,
+    ResourceExhausted,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ScoutDecision {
+    Ingest {
+        targets: IndexTargets,
+    },
+    MetadataOnly {
+        reason: MetadataOnlyReason,
+    },
+    HardSkip {
+        reason: HardSkipReason,
+    },
+    Unavailable {
+        stage: AccessStage,
+        kind: AccessErrorKind,
+    },
+}
+
+/// One successfully metadata-observed path in the immutable scout plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoutedEntry {
+    pub path: CatalogPath,
+    pub absolute_path: Option<std::path::PathBuf>,
+    pub stamp: FileStamp,
+    pub language: Option<LanguageId>,
+    pub classification: FileClassification,
+    pub decision: ScoutDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CoverageStatus {
+    Complete,
+    Degraded,
+}
+
+/// Whether the published repository view reflects the latest accepted observation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FreshnessStatus {
+    Current,
+    Verifying,
+    Degraded {
+        last_valid_content_generation: u64,
+        reason_codes: Vec<FreshnessReason>,
+    },
+}
+
+/// Stable reason codes for a non-current repository view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FreshnessReason {
+    ObservationFailed,
+    WatcherUnavailable,
+    ReconciliationPending,
+    SnapshotVerificationFailed,
+    DerivedPublicationPending,
+    CatalogEntryCapacityExceeded,
+    CatalogMetadataCapacityExceeded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum HistoryLimit {
+    Shallow,
+    WindowLimited,
+    RenameFollowLimited,
+    DivergentHistory,
+    WorkingTreeOnly,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryCoverage {
+    pub complete_to_root: bool,
+    pub limitations: Vec<HistoryLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ScoutIssueKind {
+    DirectoryEntryUnreadable { kind: AccessErrorKind },
+    ScopeEscape,
+    UnsupportedSpecialFile,
+    PathIdentityCollision,
+    TraversalCircuitBreaker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScoutIssue {
+    pub path_id: Option<String>,
+    pub safe_path: Option<String>,
+    pub kind: ScoutIssueKind,
+    pub safe_message: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManifestResourceUsage {
+    pub catalog_entries: u64,
+    pub catalog_metadata_bytes: u64,
+    pub admitted_content_bytes: u64,
+}
+
+/// Canonical, bounded aggregate status stored in a repository manifest.
+///
+/// Free-text parser and extractor diagnostics remain operational state and are
+/// intentionally absent from this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ParseStatus {
+    Parsed,
+    PartialParse,
+    Failed,
+}
+
+impl ParseStatus {
+    /// Collapse the existing operational outcome while discarding diagnostic text.
+    pub fn from_operational_outcome(outcome: &FileOutcome) -> Self {
+        match outcome {
+            FileOutcome::Processed => Self::Parsed,
+            FileOutcome::PartialParse { .. } => Self::PartialParse,
+            FileOutcome::Failed { .. } => Self::Failed,
+        }
+    }
+
+    /// Aggregate only the processors selected by `targets`.
+    ///
+    /// A knowledge-only entry therefore derives its status solely from the
+    /// knowledge extractor; an incidental or synthetic code status is ignored.
+    pub fn aggregate_for_targets(
+        targets: IndexTargets,
+        code: Option<Self>,
+        knowledge: Option<Self>,
+    ) -> Self {
+        let selected = match targets {
+            IndexTargets::Code => return code.unwrap_or(Self::Failed),
+            IndexTargets::Knowledge => return knowledge.unwrap_or(Self::Failed),
+            IndexTargets::CodeAndKnowledge => [
+                code.unwrap_or(Self::Failed),
+                knowledge.unwrap_or(Self::Failed),
+            ],
+        };
+
+        if selected.iter().all(|status| *status == Self::Parsed) {
+            Self::Parsed
+        } else if selected.iter().all(|status| *status == Self::Failed) {
+            Self::Failed
+        } else {
+            Self::PartialParse
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FileDisposition {
+    Indexed {
+        targets: IndexTargets,
+        parse_status: ParseStatus,
+    },
+    MetadataOnly {
+        reason: MetadataOnlyReason,
+    },
+    HardSkip {
+        reason: HardSkipReason,
+    },
+    Unreadable {
+        stage: AccessStage,
+        kind: AccessErrorKind,
+    },
+    UnstableDuringRead,
+    AbortedCircuitBreaker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CatalogEntry {
+    pub path: CatalogPath,
+    pub size: u64,
+    pub language: Option<LanguageId>,
+    pub classification: FileClassification,
+    pub disposition: FileDisposition,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepositoryManifest {
+    pub schema_version: u32,
+    pub policy_version: u32,
+    pub secret_policy_version: u32,
+    pub source: SourceIdentity,
+    pub source_version: SourceVersion,
+    pub coverage: CoverageStatus,
+    pub entries: Vec<CatalogEntry>,
+    pub issues: Vec<ScoutIssue>,
+    pub usage: ManifestResourceUsage,
+    pub digest: String,
+}
+
+impl RepositoryManifest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        schema_version: u32,
+        policy_version: u32,
+        secret_policy_version: u32,
+        source: SourceIdentity,
+        source_version: SourceVersion,
+        coverage: CoverageStatus,
+        mut entries: Vec<CatalogEntry>,
+        mut issues: Vec<ScoutIssue>,
+        usage: ManifestResourceUsage,
+    ) -> Result<Self, serde_json::Error> {
+        entries.sort_by_cached_key(|entry| match entry.path.normalized_utf8.as_deref() {
+            Some(path) => (0_u8, path.to_lowercase(), path.to_string()),
+            None => (1_u8, entry.path.public_id.clone(), String::new()),
+        });
+        issues.sort_by_cached_key(|issue| match issue.safe_path.as_deref() {
+            Some(path) => (0_u8, path.to_lowercase(), path.to_string()),
+            None => (
+                1_u8,
+                issue.path_id.clone().unwrap_or_default(),
+                String::new(),
+            ),
+        });
+
+        let digest = Self::compute_digest(
+            schema_version,
+            policy_version,
+            secret_policy_version,
+            &source,
+            &entries,
+        )?;
+
+        Ok(Self {
+            schema_version,
+            policy_version,
+            secret_policy_version,
+            source,
+            source_version,
+            coverage,
+            entries,
+            issues,
+            usage,
+            digest,
+        })
+    }
+
+    fn compute_digest(
+        schema_version: u32,
+        policy_version: u32,
+        secret_policy_version: u32,
+        source: &SourceIdentity,
+        entries: &[CatalogEntry],
+    ) -> Result<String, serde_json::Error> {
+        #[derive(serde::Serialize)]
+        struct CanonicalManifestDigest<'a> {
+            schema_version: u32,
+            policy_version: u32,
+            secret_policy_version: u32,
+            source: &'a SourceIdentity,
+            entries: &'a [CatalogEntry],
+        }
+
+        let canonical = serde_json::to_vec(&CanonicalManifestDigest {
+            schema_version,
+            policy_version,
+            secret_policy_version,
+            source,
+            entries,
+        })?;
+        Ok(crate::hash::digest_hex(&canonical))
     }
 }
 
@@ -403,6 +1185,26 @@ pub struct SymbolRecord {
     pub doc_byte_range: Option<(u32, u32)>,
     #[serde(default)]
     pub item_byte_range: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KnowledgeUnitKind {
+    MarkdownSection,
+    TextLine,
+}
+
+/// Ephemeral knowledge projection over canonical indexed bytes and symbol spans.
+/// LiveIndex persists neither this value nor a second copy of source content.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeUnit {
+    pub source: SourceIdentity,
+    pub path: String,
+    pub content_hash: String,
+    pub kind: KnowledgeUnitKind,
+    pub heading_path: Vec<String>,
+    pub byte_range: std::ops::Range<u32>,
+    pub line_range: std::ops::Range<u32>,
+    pub parent: Option<u32>,
 }
 
 impl SymbolRecord {
@@ -1048,6 +1850,55 @@ mod tests {
     }
 
     #[test]
+    fn text_format_matrix_routes_mdx_rst_asciidoc_org_extensionless_and_safe_configs() {
+        let knowledge_only = [
+            ("guide.mdx", LanguageId::Markdown),
+            ("guide.rst", LanguageId::Text),
+            ("guide.adoc", LanguageId::Text),
+            ("guide.asciidoc", LanguageId::Text),
+            ("guide.org", LanguageId::Text),
+            ("README", LanguageId::Text),
+            ("docs/NOTICE", LanguageId::Text),
+        ];
+
+        for (path, expected_language) in knowledge_only {
+            let language = LanguageId::from_path(path).expect("text format must be recognized");
+            assert_eq!(language, expected_language);
+            assert_eq!(
+                IndexTargets::for_path(path, Some(&language)),
+                IndexTargets::Knowledge
+            );
+            assert!(FileClassification::for_indexed_path(path, IndexTargets::Knowledge).is_text());
+        }
+
+        for (path, expected_language) in [
+            ("openapi.yaml", LanguageId::Yaml),
+            ("schema.json", LanguageId::Json),
+            ("config.toml", LanguageId::Toml),
+            (".env.example", LanguageId::Env),
+            ("config/settings.ini", LanguageId::Text),
+            (".gitignore", LanguageId::Text),
+        ] {
+            let language = LanguageId::from_path(path).expect("safe config must be recognized");
+            assert_eq!(language, expected_language);
+            assert_eq!(
+                IndexTargets::for_path(path, Some(&language)),
+                IndexTargets::CodeAndKnowledge
+            );
+            let classification =
+                FileClassification::for_indexed_path(path, IndexTargets::CodeAndKnowledge);
+            assert!(classification.is_code());
+            assert!(classification.is_config);
+        }
+
+        let rust = LanguageId::from_path("src/lib.rs").expect("Rust must stay recognized");
+        assert_eq!(
+            IndexTargets::for_path("src/lib.rs", Some(&rust)),
+            IndexTargets::Code
+        );
+    }
+
+    #[test]
     fn test_find_enclosing_symbol_innermost_for_nested() {
         // outer: line 0..10, inner: line 3..6
         let symbols = vec![
@@ -1251,5 +2102,91 @@ mod tests {
             warning.contains("0, 1, 2, 3, 4, ..."),
             "more NULs than sampled => ellipsis: {warning}"
         );
+    }
+
+    #[test]
+    fn parse_status_is_bounded_and_digest_stable() {
+        let old_diagnostic = FileOutcome::PartialParse {
+            warning: "unexpected token near heading".to_string(),
+        };
+        let reworded_diagnostic = FileOutcome::PartialParse {
+            warning: "heading contains recoverable syntax".to_string(),
+        };
+
+        let old_knowledge_status = ParseStatus::from_operational_outcome(&old_diagnostic);
+        let reworded_knowledge_status = ParseStatus::from_operational_outcome(&reworded_diagnostic);
+        assert_eq!(old_knowledge_status, ParseStatus::PartialParse);
+        assert_eq!(old_knowledge_status, reworded_knowledge_status);
+
+        let entry = |knowledge_status| CatalogEntry {
+            path: CatalogPath {
+                public_id: "path:README.md".to_string(),
+                normalized_utf8: Some("README.md".to_string()),
+            },
+            size: 42,
+            language: Some(LanguageId::Markdown),
+            classification: FileClassification::for_code_path("README.md"),
+            disposition: FileDisposition::Indexed {
+                targets: IndexTargets::Knowledge,
+                parse_status: ParseStatus::aggregate_for_targets(
+                    IndexTargets::Knowledge,
+                    Some(ParseStatus::Failed),
+                    Some(knowledge_status),
+                ),
+            },
+            content_hash: Some("stable-content-hash".to_string()),
+        };
+
+        let source = SourceIdentity {
+            repository_id: RepositoryId::new("repository-fixture"),
+            source_id: SourceId::new("source-fixture"),
+            location: SourceLocation::WorkingTree {
+                worktree_id: "worktree-fixture".to_string(),
+            },
+        };
+        let source_version = SourceVersion {
+            branch: Some("main".to_string()),
+            commit: Some("0123456789abcdef".to_string()),
+            working_tree: WorkingTreeState::Clean,
+        };
+        let usage = ManifestResourceUsage {
+            catalog_entries: 1,
+            catalog_metadata_bytes: 256,
+            admitted_content_bytes: 42,
+        };
+
+        let old_manifest = RepositoryManifest::new(
+            1,
+            1,
+            1,
+            source.clone(),
+            source_version.clone(),
+            CoverageStatus::Complete,
+            vec![entry(old_knowledge_status)],
+            Vec::new(),
+            usage,
+        )
+        .unwrap();
+        let reworded_manifest = RepositoryManifest::new(
+            1,
+            1,
+            1,
+            source,
+            source_version,
+            CoverageStatus::Complete,
+            vec![entry(reworded_knowledge_status)],
+            Vec::new(),
+            usage,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            old_manifest.entries[0].disposition,
+            FileDisposition::Indexed {
+                targets: IndexTargets::Knowledge,
+                parse_status: ParseStatus::PartialParse,
+            }
+        ));
+        assert_eq!(old_manifest.digest, reworded_manifest.digest);
     }
 }

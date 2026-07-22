@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ControlStateDir;
+
 /// On-disk filename for onboarding state inside the SymForge data dir.
 pub const ONBOARDING_STATE_FILE: &str = "onboarding.json";
 
@@ -76,9 +78,9 @@ impl OnboardingSink for StderrSink {
     }
 }
 
-/// Resolve the onboarding-state path under the SymForge data dir for `base`.
-pub fn state_path(base: &Path) -> PathBuf {
-    crate::paths::resolve_symforge_dir(base).join(ONBOARDING_STATE_FILE)
+/// Resolve the process-global onboarding-state path.
+pub fn state_path(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, ONBOARDING_STATE_FILE)
 }
 
 /// Show the onboarding banner once per version. Loads state from `state_path`,

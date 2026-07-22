@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use symforge::domain::{ProjectStateDir, StatePlacement};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::{AnchorKey, CouplingRow, CouplingStore};
 use tempfile::TempDir;
@@ -86,7 +87,10 @@ fn env_unset_startup_does_not_create_missing_coupling_store() {
     let tmp = init_git_repo_with_workspace();
     let db_path = symforge::paths::symforge_db_path(tmp.path(), symforge::paths::COUPLING_DB_NAME);
 
-    let shared = LiveIndex::load(tmp.path()).unwrap();
+    let placement = StatePlacement::ProjectLocal {
+        directory: ProjectStateDir::new(db_path.parent().unwrap().to_path_buf()),
+    };
+    let shared = LiveIndex::load_for_state_placement(tmp.path(), &placement).unwrap();
 
     assert!(shared.read().coupling_store().is_none());
     assert!(
@@ -115,7 +119,10 @@ fn env_unset_startup_opens_existing_ready_coupling_store_without_warm_build() {
         .unwrap();
     drop(store);
 
-    let shared = LiveIndex::load(tmp.path()).unwrap();
+    let placement = StatePlacement::ProjectLocal {
+        directory: ProjectStateDir::new(db_path.parent().unwrap().to_path_buf()),
+    };
+    let shared = LiveIndex::load_for_state_placement(tmp.path(), &placement).unwrap();
 
     assert!(
         shared.read().coupling_store().is_some(),

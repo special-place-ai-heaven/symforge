@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 
-use crate::domain::{FileClass, FileClassification, LanguageId, SymbolKind};
+use crate::domain::{FileClass, FileClassification, IndexTargets, LanguageId, SymbolKind};
 use crate::live_index::LiveIndex;
 use crate::live_index::query::{SearchFilesHit, SearchFilesTier};
 
@@ -85,6 +85,40 @@ impl SearchScope {
             Self::Binary => matches!(classification.class, FileClass::Binary),
         }
     }
+
+    /// Apply the manifest's invariant-bearing targets when present. The
+    /// classification fallback preserves isolated/unit-test indices that predate
+    /// canonical manifests, while every normal published index is target-led.
+    pub const fn allows_targets(
+        self,
+        classification: &FileClassification,
+        targets: Option<IndexTargets>,
+    ) -> bool {
+        match (self, targets) {
+            (Self::All, _) => true,
+            (Self::Code, Some(targets)) => targets.includes_code(),
+            (Self::Text, Some(targets)) => targets.includes_knowledge(),
+            (Self::Binary, _) => matches!(classification.class, FileClass::Binary),
+            (_, None) => self.allows(classification),
+        }
+    }
+}
+
+fn indexed_targets_by_path(index: &LiveIndex) -> HashMap<&str, IndexTargets> {
+    index
+        .manifest_entries
+        .iter()
+        .filter_map(|entry| {
+            let crate::domain::FileDisposition::Indexed { targets, .. } = &entry.disposition else {
+                return None;
+            };
+            entry
+                .path
+                .normalized_utf8
+                .as_deref()
+                .map(|path| (path, *targets))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,6 +873,7 @@ pub fn search_symbols_with_options(
     let browse = query.trim().is_empty()
         && (kind_filter.is_some() || !matches!(options.path_scope, PathScope::Any));
     let mut matches: Vec<ScoredSymbolMatch> = Vec::new();
+    let targets_by_path = indexed_targets_by_path(index);
 
     let mut paths: Vec<&String> = index.all_files().map(|(path, _)| path).collect();
     paths.sort();
@@ -848,7 +883,10 @@ pub fn search_symbols_with_options(
             .get_file(path)
             .expect("path from all_files must exist");
         if !options.path_scope.matches(path)
-            || !options.search_scope.allows(&file.classification)
+            || !options.search_scope.allows_targets(
+                &file.classification,
+                targets_by_path.get(path.as_str()).copied(),
+            )
             || !options.noise_policy.allows(&file.classification)
             || (!options.include_personal_tooling
                 && crate::live_index::query::is_personal_tooling_path(path))
@@ -1001,6 +1039,7 @@ pub fn search_text_with_options(
     options: &TextSearchOptions,
 ) -> Result<TextSearchResult, TextSearchError> {
     let compiled_globs = compile_text_glob_filters(options)?;
+    let targets_by_path = indexed_targets_by_path(index);
     let case_sensitive = options.case_sensitive.unwrap_or(regex);
     let normalized_terms: Vec<String> = match terms {
         Some(raw_terms) if !raw_terms.is_empty() => raw_terms
@@ -1044,7 +1083,8 @@ pub fn search_text_with_options(
         let mut candidate_paths = Vec::new();
         let mut suppressed_candidate_paths = Vec::new();
         for (path, file) in index.all_files() {
-            if !file_matches_text_base_scope(path, file, options, &compiled_globs) {
+            if !file_matches_text_base_scope(path, file, options, &compiled_globs, &targets_by_path)
+            {
                 continue;
             }
             if file_hidden_by_search_policy(path, file, options) {
@@ -1085,7 +1125,13 @@ pub fn search_text_with_options(
             let Some(file) = index.get_file(&path) else {
                 continue;
             };
-            if !file_matches_text_base_scope(&path, file, options, &compiled_globs) {
+            if !file_matches_text_base_scope(
+                &path,
+                file,
+                options,
+                &compiled_globs,
+                &targets_by_path,
+            ) {
                 continue;
             }
             if file_hidden_by_search_policy(&path, file, options) {
@@ -1233,10 +1279,13 @@ fn file_matches_text_base_scope(
     file: &crate::live_index::IndexedFile,
     options: &TextSearchOptions,
     glob_filters: &CompiledTextGlobFilters,
+    targets_by_path: &HashMap<&str, IndexTargets>,
 ) -> bool {
     options.path_scope.matches(path)
         && glob_filters.matches(path)
-        && options.search_scope.allows(&file.classification)
+        && options
+            .search_scope
+            .allows_targets(&file.classification, targets_by_path.get(path).copied())
         && options
             .language_filter
             .as_ref()
@@ -1258,8 +1307,9 @@ fn file_matches_text_options(
     file: &crate::live_index::IndexedFile,
     options: &TextSearchOptions,
     glob_filters: &CompiledTextGlobFilters,
+    targets_by_path: &HashMap<&str, IndexTargets>,
 ) -> bool {
-    file_matches_text_base_scope(path, file, options, glob_filters)
+    file_matches_text_base_scope(path, file, options, glob_filters, targets_by_path)
         && !file_hidden_by_search_policy(path, file, options)
 }
 
@@ -1321,6 +1371,7 @@ fn search_structural_with_compiler(
     >,
 ) -> Result<TextSearchResult, TextSearchError> {
     let compiled_globs = compile_text_glob_filters(options)?;
+    let targets_by_path = indexed_targets_by_path(index);
 
     let mut files: Vec<TextFileMatches> = Vec::new();
     let mut total_matches = 0usize;
@@ -1345,7 +1396,9 @@ fn search_structural_with_compiler(
     // Collect candidate files filtered by options.
     let mut candidates: Vec<(String, crate::domain::index::LanguageId)> = index
         .all_files()
-        .filter(|(path, file)| file_matches_text_options(path, file, options, &compiled_globs))
+        .filter(|(path, file)| {
+            file_matches_text_options(path, file, options, &compiled_globs, &targets_by_path)
+        })
         .map(|(path, file)| (path.clone(), file.language.clone()))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2056,13 +2109,117 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index,
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
         };
         index.rebuild_path_indices();
         index
+    }
+
+    fn load_target_partition_fixture() -> crate::live_index::SharedIndex {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            b"// lane-marker\nfn code() {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("README.md"), b"# Guide\n\nlane-marker\n").unwrap();
+        std::fs::write(
+            tmp.path().join("settings.toml"),
+            b"description = \"lane-marker\"\n",
+        )
+        .unwrap();
+        crate::live_index::LiveIndex::load(tmp.path())
+            .expect("fixture must load before temp root drops")
+    }
+
+    #[test]
+    fn knowledge_scope_finds_text_without_leaking_into_code_scope() {
+        let shared = load_target_partition_fixture();
+        let index = shared.read();
+
+        let code = search_text_with_options(
+            &index,
+            Some("lane-marker"),
+            None,
+            false,
+            &TextSearchOptions {
+                search_scope: SearchScope::Code,
+                noise_policy: NoisePolicy {
+                    include_tests: true,
+                    include_generated: true,
+                    include_vendor: true,
+                    ..NoisePolicy::default()
+                },
+                ..TextSearchOptions::default()
+            },
+        )
+        .expect("code search must succeed");
+        let knowledge = search_text_with_options(
+            &index,
+            Some("lane-marker"),
+            None,
+            false,
+            &TextSearchOptions {
+                search_scope: SearchScope::Text,
+                noise_policy: NoisePolicy {
+                    include_tests: true,
+                    include_generated: true,
+                    include_vendor: true,
+                    ..NoisePolicy::default()
+                },
+                ..TextSearchOptions::default()
+            },
+        )
+        .expect("knowledge search must succeed");
+
+        let code_paths = code
+            .files
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>();
+        let knowledge_paths = knowledge
+            .files
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(code_paths.contains(&"src/lib.rs"));
+        assert!(!code_paths.contains(&"README.md"));
+        assert!(knowledge_paths.contains(&"README.md"));
+        assert!(!knowledge_paths.contains(&"src/lib.rs"));
+    }
+
+    #[test]
+    fn config_targeted_to_both_scopes_is_findable_in_both() {
+        let shared = load_target_partition_fixture();
+        let index = shared.read();
+
+        for scope in [SearchScope::Code, SearchScope::Text] {
+            let result = search_text_with_options(
+                &index,
+                Some("lane-marker"),
+                None,
+                false,
+                &TextSearchOptions {
+                    search_scope: scope,
+                    noise_policy: NoisePolicy {
+                        include_tests: true,
+                        include_generated: true,
+                        include_vendor: true,
+                        ..NoisePolicy::default()
+                    },
+                    ..TextSearchOptions::default()
+                },
+            )
+            .expect("overlapping scope search must succeed");
+            assert!(
+                result.files.iter().any(|hit| hit.path == "settings.toml"),
+                "dual-target config must survive both target scopes"
+            );
+        }
     }
 
     #[test]

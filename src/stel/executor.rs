@@ -173,6 +173,17 @@ pub fn apply_compact_serve_caps(plan: &StelPlan, decision: &StelDecision) -> Ste
         let Some(args) = step.args.as_object_mut() else {
             continue;
         };
+        if supports_max_tokens_cap(&step.tool)
+            && let Some(requested) = decision.effective_max_tokens
+        {
+            let requested = u64::from(requested);
+            let effective = args
+                .get("max_tokens")
+                .and_then(|value| value.as_u64())
+                .map(|existing| existing.min(requested))
+                .unwrap_or(requested);
+            args.insert("max_tokens".to_string(), serde_json::json!(effective));
+        }
         match step.tool.as_str() {
             "explore" => {
                 let cap = u64::from(COMPACT_SERVE_EXPLORE_MAX_TOKENS);
@@ -208,6 +219,7 @@ fn supports_max_tokens_cap(tool: &str) -> bool {
             | "get_symbol_context"
             | "search_symbols"
             | "search_text"
+            | "search_knowledge"
             | "find_references"
             | "find_dependents"
             | "get_repo_map"

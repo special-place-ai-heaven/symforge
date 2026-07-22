@@ -89,6 +89,7 @@ impl SgLang {
             | LanguageId::Toml
             | LanguageId::Yaml
             | LanguageId::Markdown
+            | LanguageId::Text
             | LanguageId::Env => return None,
         };
         Some(Self { ts_lang, expando })

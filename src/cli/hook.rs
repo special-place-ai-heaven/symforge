@@ -14,38 +14,23 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::HookSubcommand;
+use crate::domain::ControlStateDir;
 
 // hook-adoption.log is written AND read only inside this hook binary (single OS per
 // process), so it stays un-tagged. The sidecar port/session files are cross-process
 // (written by the sidecar/proxy, read here) and MUST be OS-tagged in lockstep with the
 // writer — both sides derive the tag from `crate::paths::os_tagged_runtime_file_name`,
 // so a given OS's hook and sidecar always agree. See `sidecar_port_file_rel` below.
-const ADOPTION_LOG_FILE: &str = ".symforge/hook-adoption.log";
+const ADOPTION_LOG_FILE: &str = "hook-adoption.log";
 
-/// Legacy (pre-OS-tag) cross-process paths, read-only fallback for one release.
-const LEGACY_PORT_FILE: &str = ".symforge/sidecar.port";
-const LEGACY_SESSION_FILE: &str = ".symforge/sidecar.session";
-
-/// CWD-relative path to the OS-tagged sidecar port file, e.g. `.symforge/sidecar.windows.port`.
-fn sidecar_port_file_rel() -> PathBuf {
-    Path::new(crate::paths::SYMFORGE_DIR_NAME)
-        .join(crate::paths::os_tagged_runtime_file_name("sidecar", "port"))
+fn process_control_state_dir() -> Option<ControlStateDir> {
+    crate::paths::process_control_state_placement()
+        .directory()
+        .cloned()
 }
 
-/// CWD-relative path to the OS-tagged sidecar session file.
-fn sidecar_session_file_rel() -> PathBuf {
-    Path::new(crate::paths::SYMFORGE_DIR_NAME).join(crate::paths::os_tagged_runtime_file_name(
-        "sidecar", "session",
-    ))
-}
-
-/// Read a CWD-relative runtime file, preferring the OS-tagged path then the legacy path.
-fn read_runtime_rel(tagged: &Path, legacy: &str) -> std::io::Result<String> {
-    match std::fs::read_to_string(tagged) {
-        Ok(contents) => Ok(contents),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::read_to_string(legacy),
-        Err(e) => Err(e),
-    }
+fn sidecar_descriptor_path(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, "sidecar/sessions")
 }
 /// Hard HTTP timeout — leaves margin within HOOK-03's 100 ms total budget.
 const HTTP_TIMEOUT: Duration = Duration::from_millis(50);
@@ -248,15 +233,26 @@ pub fn run_hook(subcommand: Option<&HookSubcommand>) -> anyhow::Result<()> {
 /// `run_hook` with the stdin payload supplied by the caller instead of read
 /// from the process's stdin.
 ///
-/// This is the seam in-process callers (integration tests) must use: reading
-/// the real stdin from inside a test binary blocks until the harness's stdin
-/// reaches EOF, which never happens when the launching environment holds the
-/// pipe open.
 pub fn run_hook_with_input(
     input: HookInput,
     subcommand: Option<&HookSubcommand>,
 ) -> anyhow::Result<()> {
+    run_hook_with_input_at(input, subcommand, process_control_state_dir())
+}
+
+/// Run a hook against an explicitly resolved control-state owner.
+///
+/// This is the seam in-process callers and integration harnesses use when
+/// reading the real stdin would block or process-global placement would make
+/// isolated state ownership impossible.
+#[doc(hidden)]
+pub fn run_hook_with_input_at(
+    input: HookInput,
+    subcommand: Option<&HookSubcommand>,
+    control_state_dir: Option<ControlStateDir>,
+) -> anyhow::Result<()> {
     let verbose = is_hook_verbose();
+    let repo_root = std::env::current_dir().unwrap_or_default();
 
     // PreTool is a special case: no sidecar call needed, just output a
     // tool-preference suggestion based on the tool_name from stdin.
@@ -268,7 +264,9 @@ pub fn run_hook_with_input(
     // there is no active sidecar, meaning the agent may not realize SymForge
     // is available.
     if matches!(subcommand, Some(HookSubcommand::PreTool)) {
-        let sidecar_active = read_port_file().is_ok();
+        let sidecar_active = control_state_dir
+            .as_ref()
+            .is_some_and(|state_dir| read_sidecar_endpoint(state_dir, &repo_root).is_ok());
         if !sidecar_active {
             let suggestion = pre_tool_suggestion(&input);
             if !suggestion.is_empty() {
@@ -291,7 +289,19 @@ pub fn run_hook_with_input(
         .map(event_name_for)
         .unwrap_or("PostToolUse");
     let workflow = workflow_for_subcommand(resolved.as_ref(), &input);
-    let session_id = read_session_file().ok();
+    let sidecar_endpoint = control_state_dir
+        .as_ref()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "process control state unavailable",
+            )
+        })
+        .and_then(|state_dir| read_sidecar_endpoint(state_dir, &repo_root));
+    let session_id = sidecar_endpoint
+        .as_ref()
+        .ok()
+        .and_then(|(_, session_id)| session_id.clone());
 
     // Conservatively fail open for workflows we do not want to semanticize.
     // This keeps docs/config/non-source reads and unknown tool events from
@@ -305,16 +315,18 @@ pub fn run_hook_with_input(
     }
 
     // Step 1 — read port file; if missing, try daemon fallback before fail-open.
-    let (port, effective_session_id, used_daemon_fallback) = match read_port_file() {
-        Ok(p) => {
+    let (port, effective_session_id, used_daemon_fallback) = match sidecar_endpoint {
+        Ok((p, descriptor_session_id)) => {
             if verbose {
                 eprintln!("[symforge-hook] read port file: port={p}");
             }
-            (p, session_id.clone(), false)
+            (p, descriptor_session_id, false)
         }
         Err(e) => {
-            let repo_root = std::env::current_dir().unwrap_or_default();
-            let port_file_path = repo_root.join(sidecar_port_file_rel());
+            let port_file_path = control_state_dir
+                .as_ref()
+                .map(sidecar_descriptor_path)
+                .unwrap_or_default();
             if verbose {
                 eprintln!(
                     "[symforge-hook] port file not readable: {e} (searched {})",
@@ -345,7 +357,7 @@ pub fn run_hook_with_input(
                     }
                     // --- Gap 1: Enhanced diagnostics ---
                     emit_no_sidecar_diagnostic(&repo_root, &port_file_path);
-                    maybe_emit_sidecar_hint(&repo_root);
+                    maybe_emit_sidecar_hint(control_state_dir.as_ref());
                     if verbose {
                         eprintln!("[symforge-hook] outcome=NoSidecar reason=sidecar_port_missing");
                     }
@@ -413,8 +425,10 @@ pub fn run_hook_with_input(
             // (`used_daemon_fallback`): the daemon is the thing that just
             // failed, so a second round-trip would be pointless — and this
             // guard guarantees at most one daemon attempt, never a loop.
-            let repo_root = std::env::current_dir().unwrap_or_default();
-            let port_file_path = repo_root.join(sidecar_port_file_rel());
+            let port_file_path = control_state_dir
+                .as_ref()
+                .map(sidecar_descriptor_path)
+                .unwrap_or_default();
 
             // Honest liveness diagnostics (item b): probe the actual sidecar
             // state so a dead sidecar is never a silent bypass. The probe does
@@ -424,11 +438,18 @@ pub fn run_hook_with_input(
             // daemon fallback records `DaemonFallback` (sidecar dead/degraded,
             // served via daemon), and a total miss records `sidecar_port_stale`.
             if verbose {
-                let sidecar_dir = repo_root.join(crate::sidecar::port_file::DIR_NAME);
-                let liveness =
-                    crate::sidecar::port_file::read_sidecar_status_at(&sidecar_dir, "127.0.0.1")
+                let liveness = control_state_dir
+                    .as_ref()
+                    .map(|state_dir| {
+                        crate::sidecar::port_file::read_sidecar_status(
+                            state_dir,
+                            "127.0.0.1",
+                            Some(&repo_root),
+                        )
                         .liveness
-                        .as_str();
+                        .as_str()
+                    })
+                    .unwrap_or("unavailable");
                 eprintln!(
                     "[symforge-hook] HTTP request failed — sidecar liveness={liveness}, \
                      attempting daemon fallback before fail-open"
@@ -476,7 +497,7 @@ pub fn run_hook_with_input(
                              outcome=NoSidecar reason=sidecar_port_stale"
                         );
                     }
-                    maybe_emit_sidecar_hint(&repo_root);
+                    maybe_emit_sidecar_hint(control_state_dir.as_ref());
                     record_hook_outcome_with_detail(
                         workflow,
                         HookOutcome::NoSidecar,
@@ -914,18 +935,15 @@ fn extract_file_path(input: &HookInput, cwd: &str) -> String {
     }
 }
 
-/// Read the OS-tagged `.symforge/sidecar.<os>.port` (legacy fallback) from the CWD.
-fn read_port_file() -> std::io::Result<u16> {
-    let contents = read_runtime_rel(&sidecar_port_file_rel(), LEGACY_PORT_FILE)?;
-    contents
-        .trim()
-        .parse::<u16>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-fn read_session_file() -> std::io::Result<String> {
-    let contents = read_runtime_rel(&sidecar_session_file_rel(), LEGACY_SESSION_FILE)?;
-    Ok(contents.trim().to_string())
+fn read_sidecar_endpoint(
+    control_state_dir: &ControlStateDir,
+    project_root: &Path,
+) -> std::io::Result<(u16, Option<String>)> {
+    crate::sidecar::port_file::read_sidecar_endpoint(
+        control_state_dir,
+        "127.0.0.1",
+        Some(project_root),
+    )
 }
 
 fn proxy_path(base_path: &str, session_id: Option<&str>) -> String {
@@ -960,11 +978,23 @@ fn parse_tracked_workflow(raw: &str) -> Option<HookWorkflow> {
 }
 
 fn record_hook_outcome(workflow: HookWorkflow, outcome: HookOutcome, session_id: Option<&str>) {
+    let Some(control_state_dir) = process_control_state_dir() else {
+        return;
+    };
+    record_hook_outcome_at(&control_state_dir, workflow, outcome, session_id);
+}
+
+fn record_hook_outcome_at(
+    control_state_dir: &ControlStateDir,
+    workflow: HookWorkflow,
+    outcome: HookOutcome,
+    session_id: Option<&str>,
+) {
     let Some(workflow_name) = tracked_workflow_name(workflow) else {
         return;
     };
     let _ = append_hook_adoption_event(
-        Path::new(ADOPTION_LOG_FILE),
+        &adoption_log_path(control_state_dir),
         session_id,
         workflow_name,
         outcome.label(),
@@ -1181,7 +1211,7 @@ fn is_hook_verbose() -> bool {
 }
 
 /// Marker file path for the one-time sidecar hint (HOOK-03).
-const HOOK_HINT_MARKER: &str = ".symforge/hook-hint-shown";
+const HOOK_HINT_MARKER: &str = "hook-hint-shown";
 
 /// Freshness window for the sidecar hint marker file (30 minutes).
 const HOOK_HINT_FRESHNESS: Duration = Duration::from_secs(30 * 60);
@@ -1200,8 +1230,11 @@ const SIDECAR_HINT_COMMAND: &str = "symforge init";
 /// `SYMFORGE_HOOK_VERBOSE` — it is specifically a user-facing one-time hint.
 ///
 /// All I/O failures are silently ignored to preserve fail-open behavior.
-fn maybe_emit_sidecar_hint(repo_root: &Path) {
-    let marker_path = repo_root.join(HOOK_HINT_MARKER);
+fn maybe_emit_sidecar_hint(control_state_dir: Option<&ControlStateDir>) {
+    let Some(control_state_dir) = control_state_dir else {
+        return;
+    };
+    let marker_path = crate::paths::control_state_path(control_state_dir, HOOK_HINT_MARKER);
 
     // Check if the marker file is fresh (modified within the last 30 minutes).
     if let Ok(metadata) = std::fs::metadata(&marker_path)
@@ -1247,8 +1280,7 @@ fn emit_no_sidecar_diagnostic(repo_root: &Path, port_file_path: &Path) {
     };
 
     eprintln!(
-        "[symforge-hook] sidecar not running. No {} found in {}.",
-        sidecar_port_file_rel().display(),
+        "[symforge-hook] sidecar not running. No matching control-state descriptor for {}.",
         repo_root.display()
     );
     eprintln!("[symforge-hook]   Searched: {}", port_file_path.display());
@@ -1269,8 +1301,11 @@ fn record_hook_outcome_with_detail(
     let Some(workflow_name) = tracked_workflow_name(workflow) else {
         return;
     };
+    let Some(control_state_dir) = process_control_state_dir() else {
+        return;
+    };
     let _ = append_hook_adoption_event_with_detail(
-        Path::new(ADOPTION_LOG_FILE),
+        &adoption_log_path(&control_state_dir),
         session_id,
         workflow_name,
         outcome.label(),
@@ -1331,27 +1366,18 @@ fn append_hook_adoption_event(
     writeln!(file, "{session}\t{workflow_name}\t{outcome_label}")
 }
 
-fn adoption_log_path(repo_root: Option<&Path>) -> PathBuf {
-    repo_root
-        .unwrap_or_else(|| Path::new("."))
-        .join(ADOPTION_LOG_FILE)
+fn adoption_log_path(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, ADOPTION_LOG_FILE)
 }
 
-fn session_file_path(repo_root: Option<&Path>) -> PathBuf {
-    repo_root
-        .unwrap_or_else(|| Path::new("."))
-        .join(sidecar_session_file_rel())
-}
-
-fn read_session_id_for_repo(repo_root: Option<&Path>) -> Option<String> {
-    let base = repo_root.unwrap_or_else(|| Path::new("."));
-    read_runtime_rel(
-        &session_file_path(repo_root),
-        &base.join(LEGACY_SESSION_FILE).to_string_lossy(),
-    )
-    .ok()
-    .map(|text| text.trim().to_string())
-    .filter(|value| !value.is_empty())
+fn read_session_id_for_repo_at(
+    control_state_dir: &ControlStateDir,
+    repo_root: Option<&Path>,
+) -> Option<String> {
+    crate::sidecar::port_file::read_sidecar_endpoint(control_state_dir, "127.0.0.1", repo_root)
+        .ok()?
+        .1
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn load_hook_adoption_snapshot_from_path(
@@ -1400,8 +1426,18 @@ fn load_hook_adoption_snapshot_from_path(
 }
 
 pub(crate) fn load_hook_adoption_snapshot(repo_root: Option<&Path>) -> HookAdoptionSnapshot {
-    let session = read_session_id_for_repo(repo_root);
-    load_hook_adoption_snapshot_from_path(&adoption_log_path(repo_root), session.as_deref())
+    let Some(control_state_dir) = process_control_state_dir() else {
+        return HookAdoptionSnapshot::default();
+    };
+    load_hook_adoption_snapshot_at(&control_state_dir, repo_root)
+}
+
+fn load_hook_adoption_snapshot_at(
+    control_state_dir: &ControlStateDir,
+    repo_root: Option<&Path>,
+) -> HookAdoptionSnapshot {
+    let session = read_session_id_for_repo_at(control_state_dir, repo_root);
+    load_hook_adoption_snapshot_from_path(&adoption_log_path(control_state_dir), session.as_deref())
         .unwrap_or_default()
 }
 
@@ -2100,19 +2136,23 @@ mod tests {
     #[test]
     fn test_load_hook_adoption_snapshot_filters_to_current_session() {
         let tmp = TempDir::new().unwrap();
-        let symforge_dir = tmp.path().join(".symforge");
-        std::fs::create_dir_all(&symforge_dir).unwrap();
-        let log_path = symforge_dir.join("hook-adoption.log");
-        let session_path = symforge_dir.join("sidecar.session");
+        let control_state = ControlStateDir::new(tmp.path().join(".symforge"));
+        let log_path = adoption_log_path(&control_state);
 
         append_hook_adoption_event(&log_path, Some("session-a"), "source-read", "routed").unwrap();
         append_hook_adoption_event(&log_path, Some("session-a"), "repo-start", "no-sidecar")
             .unwrap();
         append_hook_adoption_event(&log_path, Some("session-b"), "source-search", "routed")
             .unwrap();
-        std::fs::write(&session_path, "session-a\n").unwrap();
+        crate::sidecar::port_file::write_session_descriptor(
+            &control_state,
+            41_321,
+            Some("session-a"),
+            Some(tmp.path()),
+        )
+        .unwrap();
 
-        let snapshot = load_hook_adoption_snapshot(Some(tmp.path()));
+        let snapshot = load_hook_adoption_snapshot_at(&control_state, Some(tmp.path()));
         assert_eq!(snapshot.source_read.routed, 1);
         assert_eq!(snapshot.source_search.routed, 0);
         assert_eq!(snapshot.repo_start.no_sidecar, 1);
@@ -2159,31 +2199,23 @@ mod tests {
     // at its dispatch sites. That wire-up is guarded by code review — see
     // src/cli/hook.rs::run_hook lines 307/350/378.
 
-    /// Serializes cwd mutation inside this test binary. Tests run with
-    /// --test-threads=1 (per CLAUDE.md), so this lock only guards against
-    /// future intra-binary concurrency regressions.
-    static HOOK_CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
     #[test]
     fn test_health_hook_adoption_metric_pins_published_contract() {
         let tmp = TempDir::new().unwrap();
-        let symforge_dir = tmp.path().join(".symforge");
-        std::fs::create_dir_all(&symforge_dir).unwrap();
-        let log_path = symforge_dir.join("hook-adoption.log");
-        let session_path = symforge_dir.join("sidecar.session");
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        let log_path = adoption_log_path(&control);
 
         // Two tracked workflows, both routed — mirrors the "2/2 (100%)"
         // contract shown in CONTEXT.md §Project rules.
         append_hook_adoption_event(&log_path, Some("sess-live"), "repo-start", "routed").unwrap();
         append_hook_adoption_event(&log_path, Some("sess-live"), "prompt-context", "routed")
             .unwrap();
-        std::fs::write(&session_path, "sess-live\n").unwrap();
-
         // adoption_log_path and load_hook_adoption_snapshot must agree on
         // where the log lives — pin that too.
-        assert_eq!(adoption_log_path(Some(tmp.path())), log_path);
+        assert_eq!(adoption_log_path(&control), log_path);
 
-        let snapshot = load_hook_adoption_snapshot(Some(tmp.path()));
+        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-live"))
+            .expect("load adoption snapshot");
         assert_eq!(snapshot.total_routed(), 2);
         assert_eq!(snapshot.total_attempts(), 2);
         assert_eq!(snapshot.total_fail_open(), 0);
@@ -2221,18 +2253,15 @@ mod tests {
         // "a regression where hooks silently stop firing would drop this to
         // 0/2 or 1/2 and nothing automated would notice".
         let tmp = TempDir::new().unwrap();
-        let symforge_dir = tmp.path().join(".symforge");
-        std::fs::create_dir_all(&symforge_dir).unwrap();
-        let log_path = symforge_dir.join("hook-adoption.log");
-        let session_path = symforge_dir.join("sidecar.session");
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        let log_path = adoption_log_path(&control);
 
         append_hook_adoption_event(&log_path, Some("sess-down"), "source-read", "no-sidecar")
             .unwrap();
         append_hook_adoption_event(&log_path, Some("sess-down"), "prompt-context", "no-sidecar")
             .unwrap();
-        std::fs::write(&session_path, "sess-down\n").unwrap();
-
-        let snapshot = load_hook_adoption_snapshot(Some(tmp.path()));
+        let snapshot = load_hook_adoption_snapshot_from_path(&log_path, Some("sess-down"))
+            .expect("load adoption snapshot");
         let rendered = crate::protocol::format::format_hook_adoption(&snapshot);
 
         assert!(
@@ -2255,38 +2284,26 @@ mod tests {
         // ADOPTION_LOG_FILE path constant. A rename of either — or a
         // rewrite of record_hook_outcome that stops calling
         // append_hook_adoption_event — trips this test.
-        let _guard = HOOK_CWD_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let original = std::env::current_dir().expect("cwd readable");
-        std::env::set_current_dir(tmp.path()).expect("cwd settable to tempdir");
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        record_hook_outcome_at(
+            &control,
+            HookWorkflow::SourceRead,
+            HookOutcome::Routed,
+            Some("sess-wireup"),
+        );
 
-        // Use a catch_unwind-style restore so a failing assertion doesn't
-        // strand cwd in the tempdir for subsequent tests.
-        let result = std::panic::catch_unwind(|| {
-            record_hook_outcome(
-                HookWorkflow::SourceRead,
-                HookOutcome::Routed,
-                Some("sess-wireup"),
-            );
-
-            let log_path = tmp.path().join(ADOPTION_LOG_FILE);
-            assert!(
-                log_path.exists(),
-                "record_hook_outcome must create {ADOPTION_LOG_FILE} under cwd; \
-                 missing at {}",
-                log_path.display()
-            );
-            let contents = std::fs::read_to_string(&log_path).expect("log readable");
-            assert!(
-                contents.contains("sess-wireup\tsource-read\trouted"),
-                "log must contain the tab-separated routed event; got: {contents:?}"
-            );
-        });
-
-        std::env::set_current_dir(&original).expect("cwd restorable");
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        let log_path = adoption_log_path(&control);
+        assert!(
+            log_path.exists(),
+            "record_hook_outcome must create {ADOPTION_LOG_FILE} in control state; missing at {}",
+            log_path.display()
+        );
+        let contents = std::fs::read_to_string(&log_path).expect("log readable");
+        assert!(
+            contents.contains("sess-wireup\tsource-read\trouted"),
+            "log must contain the tab-separated routed event; got: {contents:?}"
+        );
     }
 
     // ---- HOOK-02: is_hook_verbose ----
@@ -2413,16 +2430,18 @@ mod tests {
     #[test]
     fn sidecar_hint_creates_marker_file() {
         let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join(HOOK_HINT_MARKER);
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        let marker = crate::paths::control_state_path(&control, HOOK_HINT_MARKER);
         assert!(!marker.exists());
-        maybe_emit_sidecar_hint(tmp.path());
+        maybe_emit_sidecar_hint(Some(&control));
         assert!(marker.exists(), "marker file should be created");
     }
 
     #[test]
     fn sidecar_hint_skips_when_marker_fresh() {
         let tmp = TempDir::new().unwrap();
-        let marker = tmp.path().join(HOOK_HINT_MARKER);
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        let marker = crate::paths::control_state_path(&control, HOOK_HINT_MARKER);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "").unwrap();
         // Marker was just created — should be fresh.
@@ -2430,7 +2449,7 @@ mod tests {
         // the marker file's mtime is NOT updated (proving the function returned early).
         let mtime_before = std::fs::metadata(&marker).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        maybe_emit_sidecar_hint(tmp.path());
+        maybe_emit_sidecar_hint(Some(&control));
         let mtime_after = std::fs::metadata(&marker).unwrap().modified().unwrap();
         assert_eq!(
             mtime_before, mtime_after,

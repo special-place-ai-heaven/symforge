@@ -21,7 +21,7 @@
 
 SymForge is a local-first [MCP](https://modelcontextprotocol.io) server for AI coding agents. It gives an agent a fast, symbol-aware view of a repository so it can ask precise questions instead of reading whole files, running broad grep commands, or editing code with blind text replacement.
 
-It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and by default exposes the full **36-tool MCP surface**; the **compact 3-tool surface** (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`. Either way it ships resources and prompts for repo orientation, code reading, search, reference tracing, impact analysis, and structural edits.
+It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and by default exposes the full **39-tool MCP surface**; the **compact 3-tool surface** (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`. Either way it ships resources and prompts for repo orientation, code and repository-knowledge reading, search, review, guarded curation, reference tracing, impact analysis, and structural edits.
 
 > [!IMPORTANT]
 > SymForge is for **code intelligence and code editing**.
@@ -67,7 +67,7 @@ SymForge answers the same questions from an in-memory, symbol-level index:
 
 Every response carries a machine-readable **trust envelope** so the agent knows exactly how much to believe it — and every truncation is disclosed with the real cost, never silently applied.
 
-**Token economics (measured, honest)**: The full 36-tool surface carries ~7k tokens of schema/description overhead. The 70–95% savings figures (e.g. for `get_file_context`) are mean ranges from actual test runs on code, not theoretical best-case. When used for code with the right tools (outlines first, compact modes, targeted symbols), net context usage is lower than naive full-file reads + greps because large irrelevant source is avoided. Trivial or prose-only work can lose on the overhead. See `grok-symforge-analysis-report.md` and the wiki benchmarks for the data. For lower overhead use `SYMFORGE_SURFACE=compact`.
+**Token economics (measured, honest)**: The pre-knowledge 36-tool v8.15.0 surface measured ~7k tokens of schema/description overhead; the current full surface has 39 tools and must be measured as its own payload. The 70–95% savings figures (e.g. for `get_file_context`) are mean ranges from actual test runs on code, not theoretical best-case. When used for code with the right tools (outlines first, compact modes, targeted symbols), net context usage is lower than naive full-file reads + greps because large irrelevant source is avoided. Trivial or prose-only work can lose on the overhead. See `grok-symforge-analysis-report.md` and the wiki benchmarks for the data. For lower overhead use `SYMFORGE_SURFACE=compact`.
 
 Measured numbers also live in the wiki: [Benchmarks and Token Savings](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings).
 
@@ -145,7 +145,7 @@ flowchart LR
     Local --> Snapshot[".symforge/index.bin<br/>(checkpointed, verified, quarantined)"]
     Snapshot --> Local
 
-    Local --> Tools["full 36-tool default surface<br/>(compact-3 opt-in)<br/>resources + prompts<br/>trust envelopes"]
+    Local --> Tools["full 39-tool default surface<br/>(compact-3 opt-in)<br/>resources + prompts<br/>trust envelopes"]
     Tools --> Client
 
     Tools --> Edits["structural edit engine"]
@@ -329,7 +329,7 @@ symforge update
 
 ## MCP Tools
 
-By default SymForge exposes the full **36-tool** surface below through MCP `tools/list`, advertising every tool individually. The **compact 3-tool surface** — `symforge` (read/search/navigate), `symforge_edit` (structural edits), and `status` (index health + honest economics) — is a documented opt-in escape hatch: set `SYMFORGE_SURFACE=compact` to collapse to it for token-sensitive setups. The tools are grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
+By default SymForge exposes the full **39-tool** surface below through MCP `tools/list`, advertising every tool individually. The **compact 3-tool surface** — `symforge` (read/search/navigate), `symforge_edit` (structural edits), and `status` (index health + honest economics) — is a documented opt-in escape hatch: set `SYMFORGE_SURFACE=compact` to collapse to it for token-sensitive setups. The tools are grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
 
 ### Orient
 
@@ -368,6 +368,9 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `search_symbols` | Find functions, structs, classes, methods, types, modules, and other symbols |
 | `search_text` | Search text with enclosing symbol context; supports literal terms, OR terms, regex, and AST structural search |
 | `search_files` | Find and rank paths, resolve ambiguous paths, and optionally use frecency or co-change ranking |
+| `search_knowledge` | Search repository-owned Markdown knowledge with typed provenance, lifecycle, voice, and evidence anchors |
+| `review_knowledge` | Build bounded, read-only knowledge-quality dossiers for one project or an explicit project set |
+| `curate_knowledge` | Preview or apply explicit, guarded, idempotent policy-ledger changes without editing repository documents |
 
 ### Trace Impact
 

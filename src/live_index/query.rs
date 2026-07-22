@@ -608,7 +608,7 @@ pub(crate) fn is_personal_tooling_path(path: &str) -> bool {
         || lower.starts_with(".claude/get-shit-done/")
 }
 
-pub(super) fn normalize_path_query(raw: &str) -> String {
+pub(crate) fn normalize_path_query(raw: &str) -> String {
     let mut normalized = raw.trim().replace('\\', "/");
     while normalized.starts_with("./") {
         normalized = normalized[2..].to_string();
@@ -912,7 +912,7 @@ pub enum SearchFilesTier {
     Basename,
     LoosePath,
     /// Tier-2 admission-demoted file (lockfile, oversized, denylisted, etc.).
-    /// Stored in `LiveIndex::skipped_files()` as metadata only — never parsed.
+    /// Projected from canonical manifest entries as metadata only — never parsed.
     /// Findable by path so it is not a silent black hole, but ranked strictly
     /// below every Tier-1 hit via the rank floor in
     /// `capture_search_files_view_with_noise`.
@@ -1241,13 +1241,14 @@ impl LiveIndex {
     /// reason label is the `SkipReason` display string (e.g. "lockfile",
     /// "artifact", size threshold) used by the formatter's `[metadata-only: …]` suffix.
     pub fn metadata_only_skipped_paths(&self) -> impl Iterator<Item = (&str, String)> {
-        self.skipped_files().iter().filter_map(|sf| {
-            if sf.tier() == crate::domain::index::AdmissionTier::MetadataOnly {
-                let reason = sf
-                    .reason()
+        self.manifest_entries.iter().filter_map(|entry| {
+            let decision = super::store::compatibility_admission_decision(entry)?;
+            if decision.tier == crate::domain::index::AdmissionTier::MetadataOnly {
+                let reason = decision
+                    .reason
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "metadata only".to_string());
-                Some((sf.path.as_str(), reason))
+                Some((super::store::scouted_catalog_path(&entry.path), reason))
             } else {
                 None
             }
@@ -3121,7 +3122,7 @@ mod tests {
         SearchFilesCouplingNeighbors, SearchFilesHit, SearchFilesResolveView, SearchFilesTier,
         SearchFilesView,
     };
-    use crate::domain::index::{AdmissionDecision, AdmissionTier, SkipReason, SkippedFile};
+    use crate::domain::index::{AdmissionTier, SkipReason};
     use crate::domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord};
     use crate::live_index::store::{
         CircuitBreakerState, IndexState, IndexedFile, LiveIndex, ParseStatus,
@@ -3212,7 +3213,7 @@ mod tests {
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index,
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -3430,15 +3431,11 @@ mod tests {
     #[test]
     fn test_capture_admission_tier_lookup_view_returns_tier2_skipped_metadata() {
         let mut index = make_index(vec![], false);
-        index.add_skipped_file(SkippedFile {
-            path: "models/v1.safetensors".to_string(),
-            size: 4096,
-            extension: Some("safetensors".to_string()),
-            decision: AdmissionDecision::skip(
-                AdmissionTier::MetadataOnly,
-                SkipReason::DenylistedExtension,
-            ),
-        });
+        add_metadata_only_skip(
+            &mut index,
+            "models/v1.safetensors",
+            SkipReason::DenylistedExtension,
+        );
 
         assert_eq!(
             index.capture_admission_tier_lookup_view("models\\v1.safetensors"),
@@ -3456,12 +3453,14 @@ mod tests {
     #[test]
     fn test_capture_admission_tier_lookup_view_returns_tier3_reason() {
         let mut index = make_index(vec![], false);
-        index.add_skipped_file(SkippedFile {
-            path: "artifacts/huge.bin".to_string(),
-            size: 150 * 1024 * 1024,
-            extension: Some("bin".to_string()),
-            decision: AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling),
-        });
+        add_manifest_disposition(
+            &mut index,
+            "artifacts/huge.bin",
+            150 * 1024 * 1024,
+            crate::domain::FileDisposition::HardSkip {
+                reason: crate::domain::HardSkipReason::PerFileCeiling,
+            },
+        );
 
         assert_eq!(
             index.capture_admission_tier_lookup_view("./artifacts\\huge.bin"),
@@ -3724,16 +3723,51 @@ mod tests {
         );
     }
 
-    fn add_metadata_only_skip(index: &mut LiveIndex, path: &str, reason: SkipReason) {
-        index.add_skipped_file(SkippedFile {
-            path: path.to_string(),
-            size: 4096,
-            extension: std::path::Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_string),
-            decision: AdmissionDecision::skip(AdmissionTier::MetadataOnly, reason),
+    fn add_manifest_disposition(
+        index: &mut LiveIndex,
+        path: &str,
+        size: u64,
+        disposition: crate::domain::FileDisposition,
+    ) {
+        index.manifest_entries.push(crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size,
+            language: None,
+            classification: crate::domain::FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition,
+            content_hash: None,
         });
+    }
+
+    fn add_metadata_only_skip(index: &mut LiveIndex, path: &str, reason: SkipReason) {
+        let reason = match reason {
+            SkipReason::DependencyLockfile => crate::domain::MetadataOnlyReason::Lockfile,
+            SkipReason::BinaryContent => crate::domain::MetadataOnlyReason::Binary,
+            SkipReason::SizeThreshold | SkipReason::SizeCeiling => {
+                crate::domain::MetadataOnlyReason::OversizedData
+            }
+            SkipReason::DenylistedExtension
+            | SkipReason::Untracked
+            | SkipReason::GeneratedOutput => crate::domain::MetadataOnlyReason::GeneratedOrVendor,
+            SkipReason::UnsupportedLanguage => {
+                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
+            }
+        };
+        add_manifest_disposition(
+            index,
+            path,
+            4096,
+            crate::domain::FileDisposition::MetadataOnly { reason },
+        );
     }
 
     // Fix 1(a): a query matching only a Tier-2 lockfile returns it labeled
@@ -5480,7 +5514,7 @@ impl Actor for MyActor {
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -5519,7 +5553,7 @@ impl Actor for MyActor {
             files_by_dir_component: std::collections::HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,

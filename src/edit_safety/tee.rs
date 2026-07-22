@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::paths;
+use crate::domain::ProjectStateDir;
+use crate::paths::{ensure_project_state_dir, project_state_path};
 
 /// Maximum number of edit snapshots retained in `.symforge/tee/`. Newer
 /// snapshots beyond this count are pruned at write time. Override with
@@ -130,14 +131,16 @@ impl TeeSnapshot {
 #[derive(Debug, Clone)]
 pub struct Tee {
     repo_root: PathBuf,
+    project_state_dir: ProjectStateDir,
     retention: TeeRetention,
     max_file_bytes: u64,
 }
 
 impl Tee {
-    pub fn for_repo(repo_root: impl AsRef<Path>) -> Self {
+    pub fn for_repo(repo_root: impl AsRef<Path>, project_state_dir: &ProjectStateDir) -> Self {
         Self {
             repo_root: repo_root.as_ref().to_path_buf(),
+            project_state_dir: project_state_dir.clone(),
             retention: TeeRetention::from_env(),
             max_file_bytes: TEE_MAX_FILE_BYTES as u64,
         }
@@ -145,16 +148,17 @@ impl Tee {
 
     /// Construct a `Tee` with explicit retention limits, bypassing env
     /// resolution. Primarily for tests that exercise pruning behavior.
-    pub fn with_retention(repo_root: impl AsRef<Path>, retention: TeeRetention) -> Self {
+    pub fn with_retention(
+        repo_root: impl AsRef<Path>,
+        project_state_dir: &ProjectStateDir,
+        retention: TeeRetention,
+    ) -> Self {
         Self {
             repo_root: repo_root.as_ref().to_path_buf(),
+            project_state_dir: project_state_dir.clone(),
             retention,
             max_file_bytes: TEE_MAX_FILE_BYTES as u64,
         }
-    }
-
-    pub fn for_target(target: impl AsRef<Path>) -> Self {
-        Self::for_repo(discover_repo_root(target.as_ref()))
     }
 
     pub fn snapshot(&self, original_path: impl AsRef<Path>) -> io::Result<TeeSnapshot> {
@@ -188,8 +192,8 @@ impl Tee {
             });
         }
 
-        let tee_dir = paths::ensure_symforge_dir(&self.repo_root)
-            .map(|dir| dir.join("tee"))
+        let tee_dir = ensure_project_state_dir(&self.project_state_dir)
+            .map(|()| project_state_path(&self.project_state_dir, "tee"))
             .and_then(|dir| {
                 fs::create_dir_all(&dir)?;
                 Ok(dir)
@@ -229,22 +233,6 @@ impl Tee {
             repo_root: self.repo_root.clone(),
         }))
     }
-}
-
-fn discover_repo_root(target: &Path) -> PathBuf {
-    let start = if target.is_dir() {
-        target
-    } else {
-        target.parent().unwrap_or(target)
-    };
-
-    for ancestor in start.ancestors() {
-        if ancestor.join(".git").exists() || ancestor.join(paths::SYMFORGE_DIR_NAME).exists() {
-            return ancestor.to_path_buf();
-        }
-    }
-
-    start.to_path_buf()
 }
 
 fn snapshot_file_name(original_path: &Path) -> String {

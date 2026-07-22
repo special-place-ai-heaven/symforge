@@ -8,6 +8,10 @@ pub(crate) mod edit_tools;
 pub mod explore;
 pub mod format;
 pub mod investigation;
+pub(crate) mod knowledge_curation;
+pub(crate) mod knowledge_model;
+pub(crate) mod knowledge_review;
+pub(crate) mod knowledge_search;
 pub mod prompts;
 pub(crate) mod read_tools;
 pub mod resources;
@@ -19,7 +23,7 @@ pub mod smart_query;
 pub mod surface_probe;
 pub mod tools;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -36,6 +40,9 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
 
+use crate::domain::{
+    CapabilityStatus, CapabilityUnavailableReason, ControlStateDir, ProjectStateDir, StatePlacement,
+};
 use crate::live_index::SharedIndex;
 use crate::protocol::result_status::OutcomeClass;
 use crate::sidecar::TokenStats;
@@ -165,6 +172,25 @@ pub struct SymForgeServer {
     /// state so local stdio tools can keep using the latest project root after
     /// `index_folder` rebinds the server to a new workspace.
     pub(crate) repo_root: Arc<RwLock<Option<PathBuf>>>,
+    /// Persistence placement selected for the currently bound project.
+    ///
+    /// Kept beside `repo_root` so checkpoint/reset paths consume the same typed
+    /// placement selected during binding instead of reconstructing
+    /// `<source>/.symforge`. A mixed root/placement observation during a
+    /// concurrent rebind is fail-closed by the persistence root-ID check.
+    pub(crate) state_placement: Arc<RwLock<Option<StatePlacement>>>,
+    /// Process-global coordination namespace selected once for daemon/sidecar
+    /// discovery. It is independent from the bound project's persistence
+    /// placement and must never be reconstructed from the source root.
+    pub(crate) control_state_dir: Option<ControlStateDir>,
+    /// Runtime durability of the selected project-state owner. Placement is
+    /// stable for the binding lifetime; a later write failure changes only this
+    /// health signal and the capabilities derived from it.
+    pub(crate) persistence_health: Arc<RwLock<CapabilityStatus>>,
+    /// One ledger-mutation coordinator shared by every session bound to the
+    /// same project runtime. It owns preview/apply serialization, durability
+    /// probe caching, durable replay, and crash recovery for Gate K.
+    pub(crate) curation_coordinator: Arc<knowledge_curation::KnowledgeCurationCoordinator>,
     /// Shared token stats from the HTTP sidecar. Present when the sidecar is running.
     /// The health tool reads this to display token savings accumulated during the session.
     pub(crate) token_stats: Option<Arc<TokenStats>>,
@@ -209,18 +235,21 @@ pub struct SymForgeServer {
     pub(crate) ledger_writes: Arc<LedgerWriteTracker>,
 }
 
-fn default_analytics_db_path(repo_root: Option<&Path>) -> PathBuf {
-    repo_root
-        .map(|root| crate::paths::symforge_db_path(root, crate::paths::ANALYTICS_DB_NAME))
-        // No project root: fall back to a relative `.symforge/analytics.db`,
-        // byte-identical to the prior `PathBuf::from(SYMFORGE_ANALYTICS_DB_PATH)`.
-        .unwrap_or_else(|| {
-            Path::new(crate::paths::SYMFORGE_DIR_NAME).join(crate::paths::ANALYTICS_DB_NAME)
+fn default_analytics_db_path(project_state_dir: Option<&ProjectStateDir>) -> PathBuf {
+    project_state_dir
+        .map(|state_dir| {
+            crate::paths::project_state_path(state_dir, crate::paths::ANALYTICS_DB_NAME)
         })
+        // Disabled analytics performs no I/O. With no durable project-state
+        // owner, retain an empty diagnostic path instead of inventing a
+        // CWD-relative fallback.
+        .unwrap_or_default()
 }
 
-fn disabled_analytics_recorder(repo_root: Option<&Path>) -> crate::analytics::AnalyticsRecorder {
-    crate::analytics::AnalyticsRecorder::disabled(default_analytics_db_path(repo_root))
+fn disabled_analytics_recorder(
+    project_state_dir: Option<&ProjectStateDir>,
+) -> crate::analytics::AnalyticsRecorder {
+    crate::analytics::AnalyticsRecorder::disabled(default_analytics_db_path(project_state_dir))
 }
 
 fn estimate_tokens(response_bytes: u64) -> u64 {
@@ -243,8 +272,70 @@ impl SymForgeServer {
         repo_root: Option<PathBuf>,
         token_stats: Option<Arc<TokenStats>>,
     ) -> Self {
+        let (repo_root, state_placement) = match repo_root.as_deref() {
+            Some(root) => match crate::discovery::resolve_root_candidate(
+                root,
+                crate::domain::RootCandidateSource::LaunchCwd,
+                crate::domain::RootRequestMode::Automatic,
+            ) {
+                crate::domain::RootResolution::Bound(binding) => {
+                    let placement = crate::discovery::resolve_state_placement(&binding);
+                    (Some(binding.canonical_root), Some(placement))
+                }
+                crate::domain::RootResolution::Unbound { .. } => (None, None),
+            },
+            None => (None, None),
+        };
+        Self::new_with_state_placement(
+            index,
+            project_name,
+            watcher_info,
+            repo_root,
+            state_placement,
+            token_stats,
+        )
+    }
+
+    /// Create a server with an already-resolved project state placement.
+    ///
+    /// Production bind paths use this constructor so root authorization and
+    /// state placement run once and every persistence consumer receives the
+    /// same typed result. [`Self::new`] remains the compatibility constructor
+    /// for callers that only have an automatically authorized normal root.
+    pub fn new_with_state_placement(
+        index: SharedIndex,
+        project_name: String,
+        watcher_info: Arc<Mutex<WatcherInfo>>,
+        repo_root: Option<PathBuf>,
+        state_placement: Option<StatePlacement>,
+        token_stats: Option<Arc<TokenStats>>,
+    ) -> Self {
         crate::worktree::register_if_feature_enabled();
-        let analytics_recorder = disabled_analytics_recorder(repo_root.as_deref());
+        let analytics_recorder = disabled_analytics_recorder(
+            state_placement.as_ref().and_then(StatePlacement::directory),
+        );
+        let persistence_health = if matches!(
+            state_placement.as_ref(),
+            Some(StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. })
+        ) {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        };
+        let curation_coordinator =
+            Arc::new(knowledge_curation::KnowledgeCurationCoordinator::default());
+        if let Some(root) = repo_root.as_deref()
+            && let Err(error) = curation_coordinator.recover_on_project_load(
+                &index,
+                root,
+                state_placement.as_ref(),
+                persistence_health,
+            )
+        {
+            tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
+        }
         Self {
             index,
             tool_router: Self::tool_router(),
@@ -253,6 +344,12 @@ impl SymForgeServer {
             watcher_info,
             watcher_handle: Arc::new(Mutex::new(None)),
             repo_root: Arc::new(RwLock::new(repo_root)),
+            state_placement: Arc::new(RwLock::new(state_placement)),
+            control_state_dir: crate::paths::process_control_state_placement()
+                .directory()
+                .cloned(),
+            persistence_health: Arc::new(RwLock::new(persistence_health)),
+            curation_coordinator,
             token_stats,
             daemon_client: None,
             daemon_degraded: Arc::new(AtomicBool::new(false)),
@@ -269,12 +366,48 @@ impl SymForgeServer {
     }
 
     pub fn new_daemon_proxy(daemon_client: crate::daemon::DaemonSessionClient) -> Self {
+        let repo_root = daemon_client.project_root().map(|p| p.to_path_buf());
+        let state_placement = repo_root.as_deref().and_then(|root| {
+            match crate::discovery::resolve_root_candidate(
+                root,
+                crate::domain::RootCandidateSource::LaunchCwd,
+                crate::domain::RootRequestMode::Automatic,
+            ) {
+                crate::domain::RootResolution::Bound(binding) => {
+                    Some(crate::discovery::resolve_state_placement(&binding))
+                }
+                crate::domain::RootResolution::Unbound { .. } => None,
+            }
+        });
+        Self::new_daemon_proxy_with_state_placement(daemon_client, state_placement)
+    }
+
+    /// Create a daemon proxy with a placement already resolved by the adapter.
+    ///
+    /// This keeps every adapter-side persistence consumer on the same typed
+    /// owner instead of resolving state independently from the source root.
+    pub fn new_daemon_proxy_with_state_placement(
+        daemon_client: crate::daemon::DaemonSessionClient,
+        state_placement: Option<StatePlacement>,
+    ) -> Self {
         use crate::watcher::WatcherInfo;
 
         crate::worktree::register_if_feature_enabled();
         let project_name = daemon_client.project_name().to_string();
         let repo_root = daemon_client.project_root().map(|p| p.to_path_buf());
-        let analytics_recorder = disabled_analytics_recorder(repo_root.as_deref());
+        let analytics_recorder = disabled_analytics_recorder(
+            state_placement.as_ref().and_then(StatePlacement::directory),
+        );
+        let persistence_health = if matches!(
+            state_placement.as_ref(),
+            Some(StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. })
+        ) {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        };
         Self {
             index: crate::live_index::LiveIndex::empty(),
             tool_router: Self::tool_router(),
@@ -283,6 +416,12 @@ impl SymForgeServer {
             watcher_info: Arc::new(Mutex::new(WatcherInfo::default())),
             watcher_handle: Arc::new(Mutex::new(None)),
             repo_root: Arc::new(RwLock::new(repo_root)),
+            state_placement: Arc::new(RwLock::new(state_placement)),
+            control_state_dir: Some(daemon_client.control_state_dir().clone()),
+            persistence_health: Arc::new(RwLock::new(persistence_health)),
+            curation_coordinator: Arc::new(
+                knowledge_curation::KnowledgeCurationCoordinator::default(),
+            ),
             token_stats: None,
             daemon_client: Some(Arc::new(tokio::sync::RwLock::new(daemon_client))),
             daemon_degraded: Arc::new(AtomicBool::new(false)),
@@ -619,6 +758,31 @@ impl SymForgeServer {
         self.repo_root.read().clone()
     }
 
+    pub(crate) fn capture_state_placement(&self) -> Option<StatePlacement> {
+        self.state_placement.read().clone()
+    }
+
+    pub(crate) fn capture_control_state_dir(&self) -> Option<ControlStateDir> {
+        self.control_state_dir.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_control_state_dir_for_test(
+        mut self,
+        control_state_dir: ControlStateDir,
+    ) -> Self {
+        self.control_state_dir = Some(control_state_dir);
+        self
+    }
+
+    pub(crate) fn capture_project_state_dir(&self) -> Option<ProjectStateDir> {
+        self.state_placement
+            .read()
+            .as_ref()
+            .and_then(StatePlacement::directory)
+            .cloned()
+    }
+
     /// Record a frecency bump for the given paths against the bound workspace.
     ///
     /// No-op when no repo root is bound (the feature has nothing to anchor
@@ -627,7 +791,8 @@ impl SymForgeServer {
     /// persistent, or disabled collection policy.
     pub(crate) fn bump_frecency(&self, paths: &[PathBuf]) {
         if let Some(root) = self.capture_repo_root() {
-            crate::live_index::frecency::bump(&root, paths);
+            let project_state = self.capture_project_state_dir();
+            crate::live_index::frecency::bump(&root, project_state.as_ref(), paths);
         }
     }
 
@@ -639,8 +804,28 @@ impl SymForgeServer {
     pub(crate) fn set_repo_root(&self, repo_root: Option<PathBuf>) {
         *self.repo_root.write() = repo_root.clone();
         if self.analytics_recorder.read().status().disabled {
-            *self.analytics_recorder.write() = disabled_analytics_recorder(repo_root.as_deref());
+            let state_dir = self.capture_project_state_dir();
+            *self.analytics_recorder.write() = disabled_analytics_recorder(state_dir.as_ref());
         }
+    }
+
+    pub(crate) fn set_bound_project_state(
+        &self,
+        repo_root: Option<PathBuf>,
+        state_placement: Option<StatePlacement>,
+    ) {
+        *self.persistence_health.write() = if matches!(
+            state_placement.as_ref(),
+            Some(StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. })
+        ) {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::Unavailable {
+                reason: CapabilityUnavailableReason::PersistentStateUnavailable,
+            }
+        };
+        *self.state_placement.write() = state_placement;
+        self.set_repo_root(repo_root);
     }
 
     /// Bump the worktree-awareness misuse counter when an edit handler
@@ -701,6 +886,28 @@ impl SymForgeServer {
             return ccr::enforce_token_budget_with_ccr(&mut store, tool_name, result, budget);
         }
         format::enforce_token_budget(result, budget)
+    }
+
+    /// Apply a token budget using a caller-provided, block-safe summary before
+    /// CCR stores the complete output. This is used by structured multi-line
+    /// results whose generic line cut could otherwise expose half a record.
+    pub(crate) fn apply_ccr_budget_with_summary(
+        &self,
+        tool_name: &str,
+        result: String,
+        summary: String,
+        max_tokens: Option<u64>,
+    ) -> String {
+        let budget = ccr::resolve_tool_max_tokens(tool_name, max_tokens);
+        let Some(tokens) = budget.filter(|tokens| *tokens > 0) else {
+            return result;
+        };
+        if ccr::profile_for_tool(tool_name).is_some_and(|profile| profile.ccr_eligible) {
+            let summary = format::enforce_token_budget(summary, Some(tokens));
+            let mut store = self.ccr_store.lock();
+            return ccr::apply_ccr_overflow(&mut store, tool_name, summary, result, tokens);
+        }
+        format::enforce_token_budget(result, Some(tokens))
     }
 
     pub(crate) fn format_read_cache_hit(
@@ -1102,6 +1309,7 @@ impl SymForgeServer {
             path: resolved.display().to_string(),
             idempotency_key: None,
             add: None,
+            allow_protected_root: None,
         };
         let result = self
             .index_folder(rmcp::handler::server::wrapper::Parameters(input))
@@ -1143,6 +1351,9 @@ impl SymForgeServer {
             "batch_insert" => call!(batch_insert, edit::BatchInsertInput),
             "search_files" => call!(search_files, tools::SearchFilesInput),
             "search_text" => call!(search_text, tools::SearchTextInput),
+            "search_knowledge" => call!(search_knowledge, tools::SearchKnowledgeInput),
+            "review_knowledge" => call!(review_knowledge, tools::ReviewKnowledgeInput),
+            "curate_knowledge" => call!(curate_knowledge, tools::CurateKnowledgeInput),
             "search_symbols" => call!(search_symbols, tools::SearchSymbolsInput),
             "get_file_context" => call!(get_file_context, tools::GetFileContextInput),
             "get_file_content" => call!(get_file_content, tools::GetFileContentInput),
@@ -1155,6 +1366,7 @@ impl SymForgeServer {
             "index_folder" => call!(index_folder, tools::IndexFolderInput),
             "detect_impact" => call!(detect_impact, tools::DetectImpactInput),
             "explore" => call!(explore, tools::ExploreInput),
+            "ask" => call!(ask, tools::SmartQueryInput),
             "get_repo_map" => call!(get_repo_map, tools::GetRepoMapInput),
             "context_inventory" => self.context_inventory().await,
             "symforge_retrieve" => call!(symforge_retrieve, read_tools::SymforgeRetrieveInput),

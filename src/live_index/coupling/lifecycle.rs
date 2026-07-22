@@ -16,6 +16,7 @@ use tracing::{debug, trace};
 
 use super::{CouplingStore, WalkerConfig, apply_head_delta, cold_build};
 use crate::capability::CouplingPreparePolicy;
+use crate::domain::ProjectStateDir;
 use crate::live_index::store::SharedIndex;
 
 pub const COUPLING_FLAG_ENV: &str = "SYMFORGE_COUPLING";
@@ -46,14 +47,14 @@ fn is_git_repo(root: &Path) -> bool {
     git2::Repository::discover(root).is_ok()
 }
 
-pub fn coupling_db_path(project_root: &Path) -> PathBuf {
-    crate::paths::symforge_db_path(project_root, crate::paths::COUPLING_DB_NAME)
+pub fn coupling_db_path(project_state: &ProjectStateDir) -> PathBuf {
+    crate::paths::project_state_path(project_state, crate::paths::COUPLING_DB_NAME)
 }
 
 pub fn open_existing_coupling_store(
-    project_root: &Path,
+    project_state: &ProjectStateDir,
 ) -> Result<Option<Arc<CouplingStore>>, String> {
-    let db_path = coupling_db_path(project_root);
+    let db_path = coupling_db_path(project_state);
     if !db_path.is_file() {
         return Ok(None);
     }
@@ -69,7 +70,10 @@ pub enum LazyPrepareOutcome {
     AlreadyRunning,
 }
 
-pub fn start_lazy_prepare(project_root: &Path) -> Result<LazyPrepareOutcome, String> {
+pub fn start_lazy_prepare(
+    project_root: &Path,
+    project_state: &ProjectStateDir,
+) -> Result<LazyPrepareOutcome, String> {
     if !is_git_repo(project_root) {
         return Err("not a git repository".to_string());
     }
@@ -80,11 +84,12 @@ pub fn start_lazy_prepare(project_root: &Path) -> Result<LazyPrepareOutcome, Str
     };
 
     let repo_root = project_root.to_path_buf();
+    let project_state = project_state.clone();
     let spawn_result = std::thread::Builder::new()
         .name("coupling-lazy-prepare".into())
         .spawn(move || {
             let _release = release;
-            let db_path = coupling_db_path(&repo_root);
+            let db_path = coupling_db_path(&project_state);
             debug!("coupling lazy prepare: starting");
             match run_init(&db_path, &repo_root) {
                 Ok(()) => debug!("coupling lazy prepare: ok"),
@@ -134,7 +139,10 @@ fn try_acquire(guard: Arc<AtomicBool>) -> Option<GuardRelease> {
 /// Warm-on-start spawns a named background thread that runs `run_init`. The
 /// per-workspace guard is acquired before spawning and released by RAII in
 /// the spawned thread.
-pub fn init_coupling_store(project_root: &Path) -> Option<Arc<CouplingStore>> {
+pub fn init_coupling_store(
+    project_root: &Path,
+    project_state: &ProjectStateDir,
+) -> Option<Arc<CouplingStore>> {
     let policy = coupling_prepare_policy_from_env();
 
     if matches!(policy, CouplingPreparePolicy::Disabled) || !is_git_repo(project_root) {
@@ -142,7 +150,7 @@ pub fn init_coupling_store(project_root: &Path) -> Option<Arc<CouplingStore>> {
     }
 
     if matches!(policy, CouplingPreparePolicy::LazyOnRequest) {
-        return match open_existing_coupling_store(project_root) {
+        return match open_existing_coupling_store(project_state) {
             Ok(store) => store,
             Err(e) => {
                 debug!("coupling init: existing store open failed: {e}");
@@ -151,7 +159,7 @@ pub fn init_coupling_store(project_root: &Path) -> Option<Arc<CouplingStore>> {
         };
     }
 
-    let db_path = coupling_db_path(project_root);
+    let db_path = coupling_db_path(project_state);
     let store = match CouplingStore::open(&db_path) {
         Ok(store) => Arc::new(store),
         Err(e) => {
@@ -209,8 +217,11 @@ pub fn refresh_on_reconcile_tick(project_root: &Path, expected_gen: u64, shared:
     if matches!(policy, CouplingPreparePolicy::Disabled) {
         return;
     }
+    let Some(project_state) = shared.project_state_dir() else {
+        return;
+    };
     if matches!(policy, CouplingPreparePolicy::LazyOnRequest)
-        && !coupling_db_path(project_root).is_file()
+        && !coupling_db_path(&project_state).is_file()
     {
         return;
     }
@@ -223,7 +234,7 @@ pub fn refresh_on_reconcile_tick(project_root: &Path, expected_gen: u64, shared:
         return;
     };
 
-    let db_path = coupling_db_path(project_root);
+    let db_path = coupling_db_path(&project_state);
     debug!("coupling tick: starting");
     match run_init(&db_path, project_root) {
         Ok(()) => debug!("coupling tick: ok"),
@@ -293,6 +304,21 @@ mod tests {
         unsafe { std::env::remove_var(COUPLING_FLAG_ENV) };
     }
 
+    fn project_state(root: &Path) -> ProjectStateDir {
+        ProjectStateDir::new(root.join(crate::paths::SYMFORGE_DIR_NAME))
+    }
+
+    fn shared_with_project_state(root: &Path, state: &ProjectStateDir) -> SharedIndex {
+        let placement = crate::domain::StatePlacement::ProjectLocal {
+            directory: state.clone(),
+        };
+        crate::live_index::SharedIndexHandle::shared_for_state_placement(
+            crate::live_index::LiveIndex::empty_live_index(),
+            root,
+            &placement,
+        )
+    }
+
     fn init_repo_with_root_commit(root: &Path) -> String {
         let repo = git2::Repository::init(root).expect("init repo");
         let sig = git2::Signature::now("t", "t@x").expect("sig");
@@ -333,10 +359,11 @@ mod tests {
         clear_flag();
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
+        let state = project_state(tmp.path());
 
-        init_coupling_store(tmp.path());
+        init_coupling_store(tmp.path(), &state);
 
-        let db_path = coupling_db_path(tmp.path());
+        let db_path = coupling_db_path(&state);
         assert!(
             !db_path.exists(),
             "no db should be created with SYMFORGE_COUPLING unset"
@@ -348,11 +375,12 @@ mod tests {
         let _lock = COUPLING_ENV_LOCK.lock().unwrap();
         set_flag_on();
         let tmp = TempDir::new().unwrap();
+        let state = project_state(tmp.path());
         // No git init — just a bare directory.
 
-        init_coupling_store(tmp.path());
+        init_coupling_store(tmp.path(), &state);
 
-        let db_path = coupling_db_path(tmp.path());
+        let db_path = coupling_db_path(&state);
         assert!(
             !db_path.exists(),
             "no db should be created on non-git project"
@@ -366,12 +394,13 @@ mod tests {
         clear_flag();
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
-        let shared = crate::live_index::LiveIndex::empty();
+        let state = project_state(tmp.path());
+        let shared = shared_with_project_state(tmp.path(), &state);
         let expected_gen = shared.current_project_generation();
 
         refresh_on_reconcile_tick(tmp.path(), expected_gen, &shared);
 
-        let db_path = coupling_db_path(tmp.path());
+        let db_path = coupling_db_path(&state);
         assert!(!db_path.exists(), "no db touch on tick with flag unset");
     }
 
@@ -381,13 +410,14 @@ mod tests {
         clear_flag();
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
+        let state = project_state(tmp.path());
         let guard = guard_for(tmp.path());
         let _held = try_acquire(guard).expect("test should acquire guard");
 
-        let outcome = start_lazy_prepare(tmp.path()).expect("lazy prepare request");
+        let outcome = start_lazy_prepare(tmp.path(), &state).expect("lazy prepare request");
 
         assert_eq!(outcome, LazyPrepareOutcome::AlreadyRunning);
-        let db_path = coupling_db_path(tmp.path());
+        let db_path = coupling_db_path(&state);
         assert!(
             !db_path.exists(),
             "contested lazy prepare must not start a duplicate builder"
@@ -401,8 +431,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head = add_commit(tmp.path(), "pair", &[("a.txt", "a"), ("b.txt", "b")]);
+        let state = project_state(tmp.path());
 
-        let db_path = coupling_db_path(tmp.path());
+        let db_path = coupling_db_path(&state);
         run_init(&db_path, tmp.path()).expect("run_init ok");
 
         let store = CouplingStore::open(&db_path).expect("open");
@@ -422,7 +453,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         add_commit(tmp.path(), "pair", &[("a.txt", "a"), ("b.txt", "b")]);
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         run_init(&db_path, tmp.path()).expect("first");
         let (cbat_before, lrt_before) = {
@@ -449,7 +481,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         run_init(&db_path, tmp.path()).expect("cold");
         let cbat_before = CouplingStore::open(&db_path)
@@ -478,7 +511,8 @@ mod tests {
     fn run_init_handles_empty_repo_no_head() {
         let tmp = TempDir::new().unwrap();
         git2::Repository::init(tmp.path()).expect("init bare repo");
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         run_init(&db_path, tmp.path()).expect("run_init ok on no-HEAD repo");
 
@@ -503,7 +537,8 @@ mod tests {
         let symforge_path = tmp.path().join(crate::paths::SYMFORGE_DIR_NAME);
         std::fs::write(&symforge_path, b"blocker").expect("write blocker file");
 
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
         let result = run_init(&db_path, tmp.path());
         assert!(
             result.is_err(),
@@ -520,14 +555,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         add_commit(tmp.path(), "seed", &[("a.txt", "a"), ("b.txt", "b")]);
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         run_init(&db_path, tmp.path()).expect("seed store");
         let lrt_before = CouplingStore::open(&db_path)
             .unwrap()
             .last_reference_ts()
             .unwrap();
-        let shared = crate::live_index::LiveIndex::empty();
+        let shared = shared_with_project_state(tmp.path(), &state);
         let expected_gen = shared.current_project_generation();
 
         refresh_on_reconcile_tick(tmp.path(), expected_gen, &shared);
@@ -550,12 +586,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         run_init(&db_path, tmp.path()).expect("seed");
         let head_b = add_commit(tmp.path(), "b", &[("z.txt", "z"), ("w.txt", "w")]);
         assert_ne!(head_a, head_b);
-        let shared = crate::live_index::LiveIndex::empty();
+        let shared = shared_with_project_state(tmp.path(), &state);
         let expected_gen = shared.current_project_generation();
 
         refresh_on_reconcile_tick(tmp.path(), expected_gen, &shared);
@@ -578,7 +615,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo_with_root_commit(tmp.path());
         let head_a = add_commit(tmp.path(), "a", &[("x.txt", "x"), ("y.txt", "y")]);
-        let db_path = coupling_db_path(tmp.path());
+        let state = project_state(tmp.path());
+        let db_path = coupling_db_path(&state);
 
         // Seed at A.
         run_init(&db_path, tmp.path()).expect("seed");
@@ -590,7 +628,7 @@ mod tests {
         // Take the workspace guard.
         let guard = guard_for(tmp.path());
         let _hold = try_acquire(guard).expect("test must win the guard");
-        let shared = crate::live_index::LiveIndex::empty();
+        let shared = shared_with_project_state(tmp.path(), &state);
         let expected_gen = shared.current_project_generation();
 
         refresh_on_reconcile_tick(tmp.path(), expected_gen, &shared);

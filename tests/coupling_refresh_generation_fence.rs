@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use symforge::domain::{ProjectStateDir, StatePlacement};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::coupling::refresh_on_reconcile_tick;
 use tempfile::tempdir;
@@ -68,20 +69,26 @@ fn init_repo_with_root_commit(root: &Path) {
 #[test]
 fn stale_refresh_aborts_pre_flight() {
     let _lock = COUPLING_ENV_LOCK.lock().unwrap();
-    let _env = EnvGuard::set("SYMFORGE_COUPLING", "1");
 
     let root_a = tempdir().unwrap();
     init_repo_with_root_commit(root_a.path());
     let root_b = tempdir().unwrap();
     init_repo_with_root_commit(root_b.path());
 
-    let shared = LiveIndex::empty();
+    let project_state = ProjectStateDir::new(root_a.path().join(".symforge"));
+    let placement = StatePlacement::ProjectLocal {
+        directory: project_state.clone(),
+    };
+    let disabled = EnvGuard::set("SYMFORGE_COUPLING", "0");
+    let shared = LiveIndex::load_for_state_placement(root_a.path(), &placement).unwrap();
+    drop(disabled);
+    let _env = EnvGuard::set("SYMFORGE_COUPLING", "1");
     let gen_a = shared.current_project_generation();
     let rejected_before = shared.current_rejected_stale_mutations();
     shared.reload(root_b.path()).unwrap();
 
     let db_path =
-        symforge::paths::symforge_db_path(root_a.path(), symforge::paths::COUPLING_DB_NAME);
+        symforge::paths::project_state_path(&project_state, symforge::paths::COUPLING_DB_NAME);
     assert!(
         !db_path.exists(),
         "test setup must start without a coupling db"
@@ -103,15 +110,22 @@ fn stale_refresh_aborts_pre_flight() {
 #[test]
 fn current_refresh_proceeds_normally() {
     let _lock = COUPLING_ENV_LOCK.lock().unwrap();
-    let _env = EnvGuard::set("SYMFORGE_COUPLING", "1");
 
     let root = tempdir().unwrap();
     init_repo_with_root_commit(root.path());
 
-    let shared = LiveIndex::empty();
+    let project_state = ProjectStateDir::new(root.path().join(".symforge"));
+    let placement = StatePlacement::ProjectLocal {
+        directory: project_state.clone(),
+    };
+    let disabled = EnvGuard::set("SYMFORGE_COUPLING", "0");
+    let shared = LiveIndex::load_for_state_placement(root.path(), &placement).unwrap();
+    drop(disabled);
+    let _env = EnvGuard::set("SYMFORGE_COUPLING", "1");
     let expected_gen = shared.current_project_generation();
     let rejected_before = shared.current_rejected_stale_mutations();
-    let db_path = symforge::paths::symforge_db_path(root.path(), symforge::paths::COUPLING_DB_NAME);
+    let db_path =
+        symforge::paths::project_state_path(&project_state, symforge::paths::COUPLING_DB_NAME);
     assert!(
         !db_path.exists(),
         "test setup must start without a coupling db"

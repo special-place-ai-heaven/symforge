@@ -87,6 +87,7 @@ async fn repeated_index_folder_preserves_file_count() {
             path: project_a.path().display().to_string(),
             idempotency_key: None,
             add: None,
+            allow_protected_root: None,
         }))
         .await;
     assert!(
@@ -99,6 +100,7 @@ async fn repeated_index_folder_preserves_file_count() {
             path: project_b.path().display().to_string(),
             idempotency_key: None,
             add: None,
+            allow_protected_root: None,
         }))
         .await;
     assert!(

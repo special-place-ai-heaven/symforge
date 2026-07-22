@@ -348,6 +348,9 @@ async fn sidecar_impact_prefix_comment_matches_mcp_handler() {
         Arc::clone(&shared),
         "127.0.0.1",
         Some(dir.path().to_path_buf()),
+        Some(symforge::domain::ControlStateDir::new(
+            dir.path().join("control-state"),
+        )),
     )
     .await
     .expect("spawn sidecar");

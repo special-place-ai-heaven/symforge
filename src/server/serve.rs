@@ -19,6 +19,9 @@ use parking_lot::Mutex;
 use super::api_keys::ApiKeyStore;
 use super::auth::{AuthConfig, AuthLayerState, OriginLayerState};
 use super::{ServerRuntime, admin, mcp_http};
+use crate::domain::{
+    ControlStateDir, RootCandidateSource, RootRequestMode, RootResolution, StatePlacement,
+};
 use crate::live_index::{LiveIndex, SharedIndex};
 use crate::protocol::SymForgeServer;
 use crate::sidecar::governor::RequestGovernor;
@@ -279,14 +282,30 @@ pub enum ServeError {
 /// safe root is found, serves over an empty index — `tools/list` still responds,
 /// and the operator can `index_folder` after attaching. Returns the index and
 /// the resolved root (for the STEL ledger store location and the project name).
-fn load_serve_index() -> Result<(SharedIndex, Option<std::path::PathBuf>), ServeError> {
+fn load_serve_index() -> Result<
+    (
+        SharedIndex,
+        Option<std::path::PathBuf>,
+        Option<StatePlacement>,
+    ),
+    ServeError,
+> {
     match crate::discovery::find_project_root() {
         Some(root) => {
-            let index =
-                LiveIndex::load(&root).map_err(|source| ServeError::IndexLoad { source })?;
-            Ok((index, Some(root)))
+            let RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
+                &root,
+                RootCandidateSource::LaunchCwd,
+                RootRequestMode::Automatic,
+            ) else {
+                return Ok((LiveIndex::empty(), None, None));
+            };
+            let state_placement = crate::discovery::resolve_state_placement(&binding);
+            let root = binding.canonical_root;
+            let index = LiveIndex::load_for_state_placement(&root, &state_placement)
+                .map_err(|source| ServeError::IndexLoad { source })?;
+            Ok((index, Some(root), Some(state_placement)))
         }
-        None => Ok((LiveIndex::empty(), None)),
+        None => Ok((LiveIndex::empty(), None, None)),
     }
 }
 
@@ -308,6 +327,7 @@ fn load_serve_index() -> Result<(SharedIndex, Option<std::path::PathBuf>), Serve
 fn build_serve_runtime(
     index: SharedIndex,
     repo_root: Option<std::path::PathBuf>,
+    state_placement: Option<StatePlacement>,
     auth: AuthConfig,
 ) -> ServerRuntime {
     let project_name = repo_root
@@ -317,29 +337,35 @@ fn build_serve_runtime(
         .unwrap_or("project")
         .to_string();
 
-    // US3: open the durable economics ledger under the project data dir FIRST,
+    // US3: open the durable economics ledger under the resolved project state
+    // owner FIRST,
     // so the opened handle can be shared with both the dispatcher and the
     // runtime. A failure here degrades to Disabled inside `StelLedgerStore::open`,
     // so the server still starts (FR-011).
-    // Open under the project ROOT: `StelLedgerStore::open` joins the
-    // `.symforge/`-prefixed db const itself and creates the `.symforge` parent
-    // dir on demand (matching analytics/coupling/frecency). Passing the already-
-    // `.symforge` data dir here would double the prefix
-    // (`root/.symforge/.symforge/...`). A dir/open failure degrades to `Disabled`
-    // INSIDE `open` (logged, never panics), so the server still starts (FR-011).
-    let ledger_store: Option<Arc<StelLedgerStore>> = repo_root.as_ref().map(|root| {
+    // A dir/open failure degrades to `Disabled` inside `open` (logged, never
+    // panics), so the server still starts (FR-011).
+    let project_state_dir = state_placement
+        .as_ref()
+        .and_then(|placement| placement.directory());
+    let ledger_store: Option<Arc<StelLedgerStore>> = project_state_dir.map(|state_dir| {
         Arc::new(StelLedgerStore::open(
-            root,
+            state_dir,
             format!("serve-{}", std::process::id()),
         ))
     });
 
+    // 006 G-039: the hashed product API-key store shares the exact same typed
+    // project state owner. It cannot reconstruct placement from the source root.
+    let key_store: Option<Arc<ApiKeyStore>> =
+        project_state_dir.map(|state_dir| Arc::new(ApiKeyStore::open(state_dir)));
+
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
-    let mut protocol = SymForgeServer::new(
+    let mut protocol = SymForgeServer::new_with_state_placement(
         Arc::clone(&index),
         project_name,
         watcher_info,
         repo_root.clone(),
+        state_placement,
         None,
     );
     // Share the SAME store allocation with the dispatcher so durable
@@ -359,19 +385,6 @@ fn build_serve_runtime(
     // variant shares its `Arc<Mutex<Connection>>`), so `status`'s `summary()`
     // observes exactly the rows the dispatcher wrote — surviving restart.
     let runtime_store = ledger_store.map(|store| (*store).clone());
-
-    // 006 G-039: open the hashed product API-key store under the project ROOT.
-    // `ApiKeyStore::open` routes the path through `paths::symforge_db_path`, the
-    // single `.symforge` prefix owner, landing the db at `root/.symforge/api-keys.db`
-    // and creating the parent `.symforge` dir on demand. Pass the ROOT (NOT the
-    // `.symforge` data dir): passing the data dir here was the D7 double-prefix bug
-    // (`root/.symforge/.symforge/api-keys.db`, shipped in 8.5.0). On any failure it
-    // degrades to `Disabled` INSIDE `open` (bootstrap --api-key still works).
-    // Shared by Arc into both the auth layer (minted keys authenticate at /mcp)
-    // and the admin /api/v1/keys handlers.
-    let key_store: Option<Arc<ApiKeyStore>> = repo_root
-        .as_ref()
-        .map(|root| Arc::new(ApiKeyStore::open(root)));
 
     let mut runtime = ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store);
     if let Some(store) = key_store {
@@ -413,11 +426,12 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
 
     // Load the shared index, then bind. Load before bind so an index failure does
     // not leave a half-open listener.
-    let (index, repo_root) = load_serve_index()?;
-    // Keep a copy for the onboarding state path (the original is moved into the
-    // runtime builder below).
-    let onboarding_root = repo_root.clone();
-    let runtime = build_serve_runtime(index, repo_root, auth.clone());
+    let (index, repo_root, state_placement) = load_serve_index()?;
+    let control_state_dir: Option<ControlStateDir> =
+        crate::paths::process_control_state_placement()
+            .directory()
+            .cloned();
+    let runtime = build_serve_runtime(index, repo_root, state_placement, auth.clone());
 
     // US1 (FR-001/002/003): an explicit operator-chosen `--listen` is honored
     // exactly — an occupied port fails loudly (no substitution). The default
@@ -473,8 +487,8 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // When a sibling AAP checkout is detected (008 US3 / FR-006), the banner also
     // surfaces the operator `/admin` panel URL and the AAP embed path dependency
     // (the AAP-native integration route). Detection is read-only.
-    if let Some(root) = onboarding_root.as_ref() {
-        let state_path = crate::cli::onboarding::state_path(root);
+    if let Some(control_state_dir) = control_state_dir.as_ref() {
+        let state_path = crate::cli::onboarding::state_path(control_state_dir);
         let mut sink = crate::cli::onboarding::StderrSink;
         let detection = crate::server::aap::AapDetection::resolve();
         let aap_banner = detection.detected.then(|| {

@@ -9,13 +9,15 @@
 //! compatible daemon, stop an incompatible record, and only then bind in the
 //! current process — all under the lock.
 
-use symforge::daemon::{GuardedStart, guarded_daemon_start, spawn_daemon};
+use symforge::daemon::{GuardedStart, guarded_daemon_start_at, spawn_daemon_at};
+use symforge::domain::ControlStateDir;
 use tempfile::TempDir;
 
-fn read_port_file(home: &std::path::Path) -> u16 {
-    let os = std::env::consts::OS;
-    let contents = std::fs::read_to_string(home.join(format!("daemon.{os}.port")))
-        .expect("daemon port file should exist");
+fn read_port_file(control_state: &ControlStateDir) -> u16 {
+    let path = symforge::paths::control_state_path(control_state, "daemon").join(
+        symforge::paths::os_tagged_runtime_file_name("daemon", "port"),
+    );
+    let contents = std::fs::read_to_string(path).expect("daemon port file should exist");
     contents.trim().parse().expect("port file should be a u16")
 }
 
@@ -26,18 +28,20 @@ fn read_port_file(home: &std::path::Path) -> u16 {
 #[tokio::test]
 async fn test_guarded_start_refuses_to_replace_live_daemon() {
     let daemon_home = TempDir::new().expect("daemon home temp dir");
+    let control_state = ControlStateDir::new(daemon_home.path().to_path_buf());
     // SAFETY: integration test binary runs with --test-threads=1; no
     // concurrent env access.
     unsafe {
-        std::env::set_var("SYMFORGE_HOME", daemon_home.path());
         std::env::set_var("SYMFORGE_DAEMON_AUTH_TOKEN", "daemon-singleton-test-token");
     }
 
-    let first = spawn_daemon("127.0.0.1").await.expect("first daemon");
-    let recorded_port = read_port_file(daemon_home.path());
+    let first = spawn_daemon_at("127.0.0.1", &control_state)
+        .await
+        .expect("first daemon");
+    let recorded_port = read_port_file(&control_state);
     assert_eq!(recorded_port, first.port, "record belongs to first daemon");
 
-    match guarded_daemon_start("127.0.0.1")
+    match guarded_daemon_start_at("127.0.0.1", &control_state)
         .await
         .expect("guarded start should not error")
     {
@@ -50,7 +54,7 @@ async fn test_guarded_start_refuses_to_replace_live_daemon() {
     }
 
     assert_eq!(
-        read_port_file(daemon_home.path()),
+        read_port_file(&control_state),
         first.port,
         "live daemon's runtime record must never be overwritten"
     );
@@ -62,16 +66,16 @@ async fn test_guarded_start_refuses_to_replace_live_daemon() {
 #[tokio::test]
 async fn test_concurrent_guarded_starts_yield_one_daemon() {
     let daemon_home = TempDir::new().expect("daemon home temp dir");
+    let control_state = ControlStateDir::new(daemon_home.path().to_path_buf());
     // SAFETY: integration test binary runs with --test-threads=1; no
     // concurrent env access.
     unsafe {
-        std::env::set_var("SYMFORGE_HOME", daemon_home.path());
         std::env::set_var("SYMFORGE_DAEMON_AUTH_TOKEN", "daemon-singleton-test-token");
     }
 
     let (a, b) = tokio::join!(
-        guarded_daemon_start("127.0.0.1"),
-        guarded_daemon_start("127.0.0.1"),
+        guarded_daemon_start_at("127.0.0.1", &control_state),
+        guarded_daemon_start_at("127.0.0.1", &control_state),
     );
     let outcomes = [a.expect("racer a"), b.expect("racer b")];
 
@@ -101,7 +105,7 @@ async fn test_concurrent_guarded_starts_yield_one_daemon() {
         "loser must report the winner's port"
     );
     assert_eq!(
-        read_port_file(daemon_home.path()),
+        read_port_file(&control_state),
         started[0],
         "the single runtime record must belong to the winner"
     );

@@ -932,3 +932,977 @@ harness sessions (installed daemons pick up the fixes) → `cargo clean`.
   `4a5a7d0bf02a62379406b2cdbb6233c1ee79761570a4e52a7275d3452404af08`.
 - Changelog commit `4eff05037154812a1fd5ad5d316290e8c16d426c` is on `main`;
   local HEAD and `refs/heads/main` matched exactly after push.
+
+## Repository Knowledge Index (2026-07-16)
+
+### Plan
+
+- [x] Define the product boundary: repository knowledge retrieval is separate
+  from code intelligence and must not create prose symbols/references.
+- [x] Inspect current file admission, Markdown section extraction, search, watcher,
+  and persistence seams.
+- [x] Research established document-element parsing and embedded lexical-search
+  designs; treat embeddings as optional, not foundational.
+- [x] Present the smallest complete v1 design and obtain user approval.
+- [x] Write the approved implementation spec with data contracts, tool UX,
+  ranking rules, persistence, watcher behavior, and acceptance tests.
+- [x] Resolve the final four SpecKit blockers: invariant target enum, complete source-
+  version propagation, Gate-E/G/H publication layering, and compact search evidence.
+- [x] Rerun local link, ID, traceability, contradiction, and checklist checks.
+- [x] Capture the clean Gate-A baseline for discovery, persistence, search, watcher,
+  surface, and admission before production changes.
+- [x] Complete fresh Architect/Skeptic/Minimalist review and resolve every accepted
+  HIGH/MEDIUM finding before freezing the SpecKit.
+  - [x] Preserve and independently verify the exact external Fable report.
+  - [x] Adjudicate all 24 HIGH/MEDIUM findings against current artifacts/source and
+    apply every accepted correction plus the 12 LOW cleanups.
+  - [x] Obtain the focused three-lens re-review; preserve its five unrefuted MEDIUMs
+    and five LOW findings at
+    `specs/020-repository-knowledge-index/fable-focused-rereview-2026-07-17.md`.
+  - [x] Correct the five focused MEDIUMs, apply the coherent LOW cleanup, and add all
+    nine named red-test obligations without changing production code.
+  - [x] Rerun mechanical ID/gate/link/focused-assertion and diff checks.
+  - [x] Obtain the permitted scoped delta verification with no unrefuted HIGH/MEDIUM
+    finding.
+- [ ] Implement test-first in bounded slices and run focused plus full gates.
+  - [x] Gates A-C: frozen baseline, metadata-first scout, and stable bounded execution.
+  - [x] Gate D reopened after scoped adversarial review; preserve the verified writer/fence work
+    while closing only the sustained reconciliation, coverage-authority, and impact-seam gaps.
+    - [x] Retain metadata-failure entries and gate removals on Complete coverage.
+    - [x] Keep coverage Degraded from manifest transients/aborts until stable replacement.
+    - [x] Re-observe circuit-breaker aborts and remove dead duplicate repair state.
+    - [x] Normalize and route impact updates through the shared single-file admission seam.
+    - [x] Treat failed rescouts as Degraded and add the four missing behavioral oracles.
+    - [x] Re-run focused/stress suites and capture a fresh authoritative serial receipt.
+  - [ ] Gates E-M: continue only in frozen order after each prior gate is green.
+- [ ] Before final review/commit/push, close the AAP-reproduced SymForge tool-contract report in
+  priority order with behavioral REDs, focused GREENs, impact review, and regression coverage:
+  - [ ] SF-AAP-001: literal existing repo-relative paths (`.md`, `.ts`, `.d.ts`, `.test.ts`, `.json`,
+    `.ps1`, dotted basenames, and symbol-free files) always beat symbol/generated heuristics in
+    `edit_plan`; return a typed file limitation when needed and never recommend another path.
+  - [ ] SF-AAP-003: parallel `get_file_content` range calls complete, queue within a bounded time, or
+    return a typed busy/unsupported result with request/cancellation diagnostics; never hang.
+  - [ ] SF-AAP-002: `analyze_file_impact` reports stable `exists=true` plus generation/Tier-2 evidence
+    and a typed unsupported-analysis result for newly reconciled non-parser files, never false absence.
+  Do not claim SpecKit 020's Markdown/read work alone fixes any of these independent contracts.
+- [ ] Verify token-efficient retrieval on real architecture/spec/plan documents
+  and document the results.
+
+### Evidence Log
+
+- Current Markdown extraction already computes section byte/line spans, but stores
+  them as code-facing `SymbolRecord` values and recognizes only ATX headings.
+- Mature ingestion systems partition documents into typed structural elements
+  before any optional chunking; Rust parsers expose Markdown AST source positions.
+- A dedicated in-memory knowledge index can reuse SymForge discovery, watcher,
+  snapshot, and byte/line provenance infrastructure while keeping its retrieval
+  model and MCP tools separate from code intelligence.
+- User approved a metadata-first pre-run scout and accepted bounded cold-start
+  latency in exchange for explicit scope, safe admission, and current coverage.
+- The implementation plan is `docs/plans/2026-07-16-repository-knowledge-index.md`.
+  It reuses the existing `FileClass::Text`, `SearchScope::Text`, trigram search,
+  exact line rendering, and Markdown section spans instead of adding embeddings
+  or another database.
+- Adversarial review found five prerequisite consistency defects: discovery
+  counts hard-skipped artifact bytes before admission; watcher reads before
+  admission; read/circuit-breaker failures can disappear from accounting;
+  snapshot verification bypasses the shared policy; and publication exposes
+  independently swapped state that can be observed across generations.
+- Work is isolated on branch `feat/repository-knowledge-index`.
+- Fresh-session blocker closure replaced the boolean target pair with the closed
+  `Code`/`Knowledge`/`CodeAndKnowledge` enum; propagated closed working-tree state
+  through manifest/snapshot/publication/per-source envelopes; made Gate E core-only
+  with Gate G/H bundle extensions; and reduced search hits to compact display plus
+  stable IDs/bounded previews while retaining full review dossiers.
+- Local verification: 16 Markdown files had zero broken local links; 75 requirement/
+  success IDs and 277 task IDs had zero duplicates; Gates A-M each existed exactly
+  once; 25 blocker/contradiction assertions and 11 changed-requirement traceability
+  mappings passed; `git diff --check` exited 0 (only existing line-ending warnings).
+- Local Architect/Skeptic/Minimalist review tightened link IDs to exclude changing
+  resolution state and made compact ID/preview vectors canonically bounded with
+  explicit coverage. At that point, fresh independent external review remained the
+  freeze blocker.
+- External Fable review is preserved verbatim at
+  `specs/020-repository-knowledge-index/fable-adversarial-review-2026-07-17.md`;
+  scratchpad/report byte identity was independently verified. Its verdict was PASS
+  WITH CHANGES: 2 HIGH, 22 MEDIUM, and 12 LOW findings.
+- All HIGH/MEDIUM findings were sustained and corrected. Finding 16 dissolved by
+  deleting the dead verification-baseline machinery. Finding 21's source description
+  was narrowed: the current cache check precedes target freshening and can suppress
+  the required current reread; it does not directly replay cached file bytes.
+- Corrections now cover foreign-source curation replay, serialized multi-source
+  publication, verifier/temporal fencing and convergence, typed state ownership,
+  degraded repair, platform durability, bounded canonical types, stable IDs, compact
+  CCR retrieval, generation-aware deep reads, classification-aware object reuse, and
+  fail-closed suppression under derived-budget exhaustion.
+- Post-correction verification: 75 requirement/success definitions and 306 task
+  definitions are unique; Gates A-M each exist exactly once; local Markdown links are
+  intact; 73 focused contradiction/trace assertions pass; retired baseline/dead enum
+  terms are absent from canonical artifacts; and `git diff --check` exits 0 apart
+  from existing line-ending warnings on unrelated tracked files.
+- Focused freeze-gate packet:
+  `specs/020-repository-knowledge-index/fable-focused-rereview-request-2026-07-17.md`.
+- The focused re-review is preserved at
+  `specs/020-repository-knowledge-index/fable-focused-rereview-2026-07-17.md`; it found
+  no HIGH and authorized one scoped delta pass after five sentence-scale MEDIUM fixes.
+- All five MEDIUM corrections, five coherent LOW cleanups, and nine named red-test
+  obligations now land across the canonical artifacts. Production code remains
+  intentionally untouched.
+- Delta-correction verification: 75 requirement/success definitions and 314 task IDs
+  are unique; Gates A-M and all nine named red tests each exist exactly once; 12
+  focused assertions pass; local Markdown links have zero broken targets; and
+  `git diff --check` exits 0 apart from existing line-ending warnings.
+- Final freeze-gate packet:
+  `specs/020-repository-knowledge-index/fable-scoped-delta-verification-request-2026-07-17.md`.
+- The resulting report is preserved at
+  `specs/020-repository-knowledge-index/fable-scoped-delta-verification-2026-07-17.md`:
+  PASS, all five MEDIUM corrections sustained, no regression, and READY TO FREEZE.
+- Its one non-blocking LOW is closed by defining non-Git root identity through the
+  existing bounded `PlatformFileId` mechanism and recording required catalog-digest
+  transitions in the durable `ProjectStateDir` replay store; K-R18 carries the variant.
+- Gate A is complete and the SpecKit is frozen. Production implementation starts at
+  Gate B under strict RED/GREEN/VERIFY ordering.
+- Gate-A pre-change baseline is green (223 passed, 0 failed, 1 intentionally ignored):
+  `cargo test --lib discovery::tests:: -- --test-threads=1` passed 74; the cold build
+  took 598.276s and the tests 2.86s. `cargo test --lib live_index::persist::tests:: --
+  --test-threads=1` passed 43 in 14.96s. `cargo test --lib
+  live_index::search::tests:: -- --test-threads=1` passed 62 in 0.29s. One serialized
+  Cargo run across `admission_acceptance`, `impact_admission`, `surface_default`,
+  `surface_honesty`, `watcher_index_folder_leak`, `watcher_integration`,
+  `watcher_layer3_restat`, and `watcher_reload_cancellation` passed 44 with the one
+  scheduled/manual watcher perf smoke ignored; command exit 0 in 102.885s.
+- Gate B B-R01 completed strict RED/GREEN: a sparse 100 MiB `HardSkip` initially
+  failed under a 1 KiB admitted-byte ceiling because discovery charged its declared
+  size; metadata admission now precedes accounting and only `Normal` files consume
+  that budget. The named test passes, all eight bounded-discovery tests pass, all 75
+  discovery tests pass, and `cargo fmt --all -- --check` exits 0.
+- Gate B B-R02 completed compile-RED, behavioral-RED, then GREEN: the new scout
+  initially ignored its injected metadata source and published the candidate; it now
+  omits double-failure paths, records a fixed safe `DirectoryEntryUnreadable` issue
+  with owned `AccessErrorKind`, and degrades coverage without fabricating size zero.
+- Gate B B-R03 passed immediately for the intended reason once the closed scout
+  decision/types existed: unchanged state produces the same ordered entry projection,
+  all code/knowledge/catalog-only candidates remain represented exactly once, and
+  resource entry count matches. No redundant production sort was added.
+- First Gate-B batch regressions are green: the two metadata-first scout tests pass,
+  39 domain-index tests pass, all 77 discovery tests pass, and Rustfmt check exits 0.
+- Gate B B-R04 completed compile-RED, behavioral-RED, then GREEN: an injected probe
+  initially observed no calls; metadata-terminal model/sparse artifacts now bypass
+  probe I/O while the sole undecided candidate receives exactly one bounded
+  `BINARY_SNIFF_BYTES` read through `Read::take`.
+- Gate B B-R05 completed compile-RED, behavioral-RED, then GREEN: injected `a.rs`/
+  `A.rs` peers initially preserved arrival order. Entries and issues now share a
+  cached total-order key (case-folded safe path, exact UTF-8 bytes, stable public ID),
+  and one peer's metadata failure leaves the other intact with distinct identity.
+- Gate B B-R06 passed for the intended existing refusal behavior: exceeding the
+  entry ceiling, including via a catalog-only candidate, returns no partial
+  `ScoutPlan` and names the configured file-count limit.
+- Second Gate-B batch regressions are green: four metadata-first scout tests, nine
+  bounded-discovery tests, all 80 discovery tests, and Rustfmt check pass.
+- Gate B B-R07 completed compile-RED, behavioral-RED, then GREEN: native non-UTF-8
+  paths no longer flow through lossy display text. They retain distinct platform-byte
+  identities, remain catalog-only with `UnsupportedPathEncoding`, and perform zero
+  probe reads even when their lossy renderings collide.
+- Gate B B-R08 completed behavioral-RED then GREEN: environment, MCP-client, and
+  launch-CWD candidates now all pass the same protected-root gate at the final binding
+  boundary; rejected candidates create no source-root `.symforge` state.
+- Gate B B-R09 completed behavioral-RED then GREEN: a successful reload on the same
+  `LiveIndex` instance now clears its bootstrap-only `local_empty_reason` while becoming
+  Ready with the freshly loaded files—no process restart required.
+- Third Gate-B batch regressions are green: all 82 discovery tests and all 10
+  reload-filtered library tests pass; `cargo fmt --all -- --check` exits 0.
+- Gate B B-R10 completed compile-RED, local behavioral-RED, daemon behavioral-RED,
+  then GREEN: only the exact direct `allow_protected_root=true` authority binds a
+  protected root. Refusal leaves the session/project set unchanged; authorized local
+  and daemon indexing reads the requested source while creating no source-root
+  `.symforge` state.
+- Gate B B-R11 completed compile-RED then GREEN: state placement is fixed on each
+  `ProjectInstance`; explicit protected roots skip every project-local state attempt,
+  prepare `SYMFORGE_HOME/projects/<ProjectId>`, and degrade to typed memory-only state
+  when that location is unavailable. Normal roots with blocked `.symforge` state now
+  follow the same user-local fallback instead of retrying a source checkpoint.
+- Fourth Gate-B batch regressions are green: both protected-root contract tests pass,
+  the daemon protected-root test passes, all 20 serial index-folder library tests pass,
+  and `cargo fmt --all -- --check` exits 0. User-local checkpoint persistence remains
+  explicitly skipped until its typed consumer routing lands in the later Gate-B slice;
+  no broader state-routing green gate is claimed yet.
+- Gate B B-R12 passed immediately for the intended reason: injected project-local
+  permission failure moves only `StatePlacement` to the user-local directory; the
+  canonical source, shared `ProjectId`, readable source bytes, and absent source-root
+  `.symforge` state remain unchanged.
+- Gate B B-R13 completed behavioral-RED then GREEN: alias/different-root behavior was
+  already correct, while the red oracle exposed the unversioned ID format. The shared
+  constructor now hashes a domain/version/platform tag plus lossless canonical native
+  identity, emits `project-v1-<digest>`, preserves unpaired Windows UTF-16 units, and is
+  used by discovery, daemon registry keys, state placement, and local runtime status.
+- Fifth Gate-B batch regressions are green: all 85 discovery tests and all 20 serial
+  index-folder library tests pass; `cargo fmt --all -- --check` exits 0.
+- Gate B B-R14 completed compile-RED, three surface-level behavioral REDs, then GREEN.
+  One shared repository-root operation now evaluates effective ordered root-ignore
+  semantics and appends only `/.symforge/` after successful explicit-normal indexing
+  or project-aware init. It preserves the BOM, every pre-existing byte, the first
+  newline style, and final-newline behavior; absent files remain absent, automatic and
+  explicit-protected authorities are read-only, and hash/type races fail safely.
+- The guarded hygiene matrix covers empty/BOM-only, LF/CRLF, final/no-final newline,
+  equivalent rooted rules, ordered negation, global/info-exclude-only evidence, a
+  deterministic concurrent-byte change, and symlink/reparse refusal. This Windows host
+  denied test symlink creation with OS error 1314, so the fixture also exercises the
+  reparse metadata predicate directly while proving the external target stays unchanged.
+- Sixth Gate-B batch regressions are green: all five hygiene adversarial tests, all 22
+  serial index-folder library tests, all 27 init integration tests, and
+  `cargo fmt --all -- --check` pass.
+- Gate B B-R15 completed behavioral-RED then GREEN: a root `.gitignore` negation
+  initially admitted `.symforge` and `.git` internals while blanket hidden filtering
+  discarded `.github`/`.codex` knowledge. The shared walk now admits repository-owned
+  hidden paths but prunes every `.git`/`.symforge` component before traversal,
+  independent of ignore rules and active state placement. Watcher/freshen reindexing
+  uses the same predicate before metadata/content I/O and evicts any stale record.
+- Seventh Gate-B batch regressions are green: all 86 discovery tests, all 41 watcher
+  tests, all 3 impact-admission integration tests, and Rustfmt pass. B-G07's hidden-
+  knowledge inclusion is now implemented, but it remains open until ignore-pruned
+  coverage is represented as required by that full task.
+- Gate B B-R16 completed behavioral-RED then GREEN: an over-cap retarget already kept
+  the prior root and exact published-state `Arc`, but it stopped and discarded the
+  active watcher before the replacement build could succeed. Watcher shutdown now
+  begins only after `reload_for_binding` publishes the replacement generation; failed
+  builds leave the original handle/token untouched, and the oracle proves it continues
+  indexing a post-failure file in the prior project.
+- Eighth Gate-B batch regressions are green: the B-R16 oracle, all 22 serial
+  index-folder library tests, all 3 watcher reload-cancellation tests, the repeated-
+  `index_folder` watcher-leak integration test, and Rustfmt pass. The leak fixture's two
+  stale `IndexFolderInput` initializers were updated for the required protected-root
+  authority field discovered by this broader gate.
+- Gate B B-R17 completed compile-RED then GREEN: a placement-derived
+  `SourceExclusions` policy now converts the selected project/user-local state directory
+  into a canonical repository-relative subtree when it lies beneath the source root.
+  The filtered repository walk drives scouting and bulk reload, while the same policy is
+  published beside the successful shared-index generation and checked by watcher and
+  freshen paths before metadata/content I/O. Failed reloads cannot replace the prior
+  policy, and stale watcher mutations remain generation-fenced.
+- Ninth Gate-B batch regressions are green: the exact B-R17 cross-surface oracle, all 86
+  discovery tests, all 42 watcher tests, all 10 reload-filtered library tests, the daemon
+  user-local fallback test, and `cargo fmt --all -- --check` pass. B-G14 remains open for
+  its later snapshot root-identity and verification clauses.
+- Gate B B-R18 completed compile-RED then GREEN: the canonical root resolver now rejects
+  Windows device/NT namespaces before filesystem probing, rejects Unix device/virtual
+  namespaces and special file kinds, and repeats the same check on the canonical target.
+  The production resolver and injected test seam share one decision function, so a
+  canonicalization error remains a typed refusal under `allow_protected_root=true` rather
+  than being promoted to a protected binding.
+- Tenth Gate-B batch regressions are green: the exact B-R18 oracle, all 87 discovery
+  tests, all 3 protected-root regressions, and `cargo fmt --all -- --check` pass.
+- Gate B B-R19 completed compile-RED, behavioral-RED, then GREEN. Snapshot schema v5
+  embeds the versioned `ProjectId`; load, overwrite, and reset validate it under the
+  selected state-directory lock. Foreign, corrupt, or version-skewed bytes are copied
+  exactly into the resolved quarantine directory and removed from the active slot only
+  after a hash-stable re-read. The collision oracle proves two sources forced onto one
+  user-local directory cannot load or overwrite each other's state.
+- The widened daemon oracle exposed a Windows identity split between verbatim
+  `Path::canonicalize` roots and `dunce::canonicalize` roots. The shared identity
+  function now simplifies the Windows canonical spelling before case/separator folding;
+  its dedicated regression and the user-local daemon checkpoint both pass.
+- Gate B B-R20 completed compile-RED then GREEN. Snapshot serialization, checkpoint,
+  verification load, reset, temp cleanup, and snapshot quarantine now require the
+  resolved `StatePlacement`/`ProjectStateDir`; none reconstructs `<source>/.symforge`.
+  Local and daemon servers retain the chosen placement across checkpoint calls and only
+  publish a replacement root/placement after a successful retarget. The exact lifecycle
+  oracle keeps a source-root `.symforge` blocker byte-for-byte untouched while every
+  persistence artifact lands in user-local state.
+- Eleventh Gate-B batch regressions are green: both exact B-R19/B-R20 oracles; all 88
+  discovery tests; all 45 persistence tests; all 4 protocol checkpoint tests; the daemon
+  user-local, restore, and checkpoint tests; 2 checkpoint, 3 snapshot, and 2 team-artifact
+  integration tests; `cargo fmt --all -- --check`; and `cargo check --all-targets` with
+  zero warnings/errors. B-G14 is complete: dynamic nested-state exclusion, root-ID
+  validation, and fail-safe mismatch handling are all verified.
+- Gate B B-R21 completed compile-RED then GREEN. Process-global coordination now has a
+  separate typed `ControlStatePlacement`: an absolute prepared user-local directory or a
+  pathless `ProcessLocal` reason. Its resolver has no source-root/launch-CWD input, rejects
+  relative `SYMFORGE_HOME` before probing, and converts missing or inaccessible durable
+  state into process-local coordination instead of reconstructing relative `.symforge`.
+- Twelfth Gate-B batch regressions are green: the exact B-R21 oracle (including relative,
+  missing, and permission-denied sequences), all 14 paths tests, all 14 sidecar descriptor
+  tests, all 88 discovery tests, and Rustfmt pass; the initial filtered all-target Cargo
+  run also compiled every target successfully.
+- Gate B B-R22 completed compile-RED, behavioral-RED, then GREEN. The shared exporter
+  initially accepted an explicit-protected binding and wrote the artifact, metadata, and
+  `.gitattributes`; it now refuses protected, non-project-local, mismatched-state, and
+  unavailable mutation capability before any export write. Normal project-local export
+  uses the existing `git2` index/ignore APIs and reports exactly `already_tracked`,
+  `untracked_visible`, `ignored_force_add_required`, or `git_visibility_unavailable`;
+  `checkpoint_now` includes that exact state in its receipt. B-G17 is complete.
+- The widened B-R22 regressions are green: the exact four-state/refusal oracle; all 11
+  artifact-filtered library tests; all 5 checkpoint tests; both public team-artifact
+  integrations; both session-cache constructor regressions; and `cargo check --all-targets`
+  with no warnings. The widening also fixed the compatibility constructor to retain the
+  canonical bound root rather than pairing a raw caller path with canonical state placement.
+- Gate B B-R23 completed behavioral-RED then GREEN. On this Windows host, directory-link
+  creation is unavailable (error 1314), so the oracle substitutes an unsafe non-directory
+  state entry while independently exercising the reparse predicate. Before the fix, the
+  resolver delegated that entry to preparation and reported `Other`; on link-capable hosts
+  the same path would follow the link and write its marker outside the project. The shared
+  state-directory seam now rejects symlinks, Windows reparse points, and non-directories as
+  `InvalidData` both before and after preparation, then selects typed user-local state without
+  touching the unsafe target. `.gitignore` hygiene now reuses the same reparse detector.
+- Thirteenth Gate-B batch regressions are green: the exact B-R23 oracle, all 89 discovery
+  tests, all 5 `.gitignore` hygiene tests, all 14 paths tests, `cargo fmt --all -- --check`,
+  and `cargo check --all-targets` with no warnings or errors.
+- Gate B B-R24 completed behavioral-RED then GREEN. The scout previously hard-coded
+  `catalog_metadata_bytes=0` and ignored the dedicated limit. It now counts the exact
+  compact canonical encoding of logical public entry/issue metadata (including array
+  framing) while excluding payload bytes, absolute paths, and private timestamp/platform
+  hints. The ceiling has its own environment override/default and aborts the candidate
+  before a `ScoutPlan` can escape; it creates no budget `ScoutIssue` or partial manifest.
+- Fourteenth Gate-B batch regressions are green: the exact B-R24 below/exact-boundary
+  oracle, all 10 bounded-discovery tests, all 90 discovery tests, the watcher scout
+  consumer, `cargo fmt --all -- --check`, and `cargo check --all-targets` with no warnings
+  or errors. The sparse metadata-terminal fixture also proves payload size consumes zero
+  admitted and catalog-metadata bytes beyond its bounded logical descriptor.
+- Gate B B-R25 was GREEN as a characterization on introduction: the existing per-session
+  working set already prevents another session from addressing a shared protected slot by
+  global project ID, display alias, active-project selection, or `projects=["*"]`. The
+  second session joins that one slot only after its own exact direct override.
+- Gate B B-R26 completed behavioral-RED then GREEN. The older `open_project_session`
+  path-only guard accepted the modeled protected root after session A had loaded it, so
+  reconnect metadata could join the live slot without an override. Session open now uses
+  the same typed raw+canonical resolver as other binding paths with automatic client-root
+  authority, before any slot lookup or load. Persisted protected state remains dormant
+  across close/restart; project ID, display alias, session-open metadata, and an omitted
+  override cannot reactivate it. A fresh direct override can. B-G19 is complete.
+- Fifteenth Gate-B batch regressions are green: both exact B-R25/B-R26 oracles, both
+  sensitive-root regressions, normal same-root slot reuse, all 86 daemon tests,
+  `cargo fmt --all -- --check`, and `cargo check --all-targets` with no warnings/errors.
+- Gate B B-R27 completed behavioral-RED then GREEN. Same-key replay previously returned
+  the stored `Indexed` receipt immediately while the requesting session had no live target
+  membership. Daemon and local/embed paths now rebuild and publish the requested binding
+  before returning the immutable historical receipt. A forced rebuild failure returns
+  `applied=false outcome=live_postcondition_unavailable`, embeds the unchanged historical
+  receipt, leaves no false membership, and does not rewrite the replay record; a later
+  viable replay restores membership and returns the original receipt exactly.
+- The canonical `index_folder` request hash now includes the exact canonical path, reset
+  intent, and `allow_protected_root`; `add` remains the documented compatibility spelling.
+  Changed path or override conflicts before any load/attachment. The shared unavailable
+  formatter keeps daemon and local responses identical. B-G15 and B-G20 are complete.
+- Sixteenth Gate-B batch regressions are green: the exact daemon B-R27 failure/recovery/
+  conflict oracle, all 3 local protocol replay tests (including live two-file rebuild), all
+  5 idempotency integrations, all 87 daemon tests, `cargo fmt --all -- --check`, and
+  `cargo check --all-targets` with no warnings/errors. `src/protocol/tools.rs` remains a
+  Tier-2 metadata-only file, so focused tests plus all-target compilation provide its proof.
+- Gate B B-R28 completed compile-RED, behavioral-RED, then GREEN. The type-level oracle
+  first failed because project health had no durability/capability fields; after adding the
+  frozen `ProjectCapabilities` shape, the runnable oracle exposed the real defect by
+  observing `Available` after a forced checkpoint failure. Each daemon `ProjectInstance`
+  now owns one shared runtime durability signal, and every cached session server updates
+  that same signal after checkpoint success/failure without changing the selected placement.
+  Health derives reason-bearing snapshot/checkpoint and durable-mutation capabilities from
+  the signal while keeping the published index state as the independent readiness report.
+- Seventeenth Gate-B batch regressions are green: the exact B-R28 state-owner-blocker oracle
+  proves unchanged project identity, canonical root, placement, generation, watcher owner,
+  `Ready` state, and live file query while durability becomes
+  `PersistentStateUnavailable` and curation becomes `DurableMutationReplayUnavailable`;
+  all 5 checkpoint tests, all 88 daemon tests, `cargo fmt --all -- --check`, and
+  `cargo check --all-targets` pass with no warnings/errors. The changed checkpoint branch in
+  Tier-2 `src/protocol/tools.rs` was additionally inspected through a bounded raw window.
+- Gate B B-R29 completed compile/behavioral RED then GREEN across the exhaustive typed-owner
+  inventory. Project artifacts remain behind `ProjectStateDir`; daemon discovery/control,
+  sidecar/session status, hook adoption, cross-project replay, version/update state, and local
+  `index_folder` idempotency now consume the owning server/client `ControlStateDir` instead of
+  re-resolving launch-CWD or process-global paths at call time. Reconnect keeps the same owner.
+- The first serial library run exposed 11 stale/global-state failures; exact root fixes closed
+  health/sidecar namespaces, updater cleanup, coupling placement, Windows path identity, and
+  reset-fixture ownership. A widened rerun exposed two remaining local idempotency consumers;
+  routing them through the server-owned control namespace produced the final serial result:
+  2,804 passed, 0 failed, 2 intentionally ignored in 259.60s.
+- B-R29's static typed-owner oracle passes. Three public integration batches covering
+  admission/publication/watchers; checkpoint/idempotency/artifact/init/onboarding/API-key/
+  capability state; and edit-safety/hook/sidecar behavior all exit 0 serially. Their widening
+  updated stale trust/hook fixtures to assert the typed control owner and real session/daemon
+  descriptor namespaces. `cargo fmt --all -- --check` and `cargo check --all-targets` exit 0.
+  B-G16 and B-G21 are complete; B-R30 is the next open red-test obligation.
+- Gate B B-R30 completed behavioral-RED then GREEN. The live slot already retained its
+  `StatePlacement` value, but same-project `index_folder` still called the resolver before the
+  slot lookup and created a newly available source `.symforge` owner. Placement resolution now
+  lives exclusively inside the cold `ProjectInstance` loader closure. The oracle proves a
+  user-local fallback survives same-instance reindex with zero project-local probe/write, then
+  close/reopen in the same daemon constructs a fresh instance and recovers project-local state.
+- B-R30 widening is green: the exact lifecycle oracle, all 89 daemon tests, the B-R29 typed-owner
+  oracle, Rustfmt, and `cargo check --all-targets` pass. B-R31 is the next open obligation.
+- Gate B B-R31 completed compile-RED, behavioral-RED, then GREEN. The frozen
+  `FreshnessStatus`/`FreshnessReason` domain types now exist, and catalog-capacity refusal is a
+  typed `ScoutCapacityError` outside `ScoutPlan`: entry exhaustion yields
+  `CatalogEntryCapacityExceeded`, metadata exhaustion yields
+  `CatalogMetadataCapacityExceeded`, and admitted-content exhaustion remains an independent
+  non-catalog error. Every refusal returns before a partial plan/manifest or budget `ScoutIssue`
+  can exist.
+- B-R31 widening is green: the exact oracle passes; all 11 bounded-discovery tests, all 91
+  discovery tests, and all 39 domain tests pass serially; Rustfmt and `cargo check --all-targets`
+  exit 0. B-R32 is the next open red-test obligation.
+- Gate B B-R32 completed compile-RED then GREEN. `RepositoryManifest` now carries the frozen
+  serializable source/catalog/disposition model and hashes only canonical bounded identity.
+  `ParseStatus::{Parsed, PartialParse, Failed}` strips all operational diagnostic text before
+  manifest construction. Target aggregation selects only requested processors, so a
+  Knowledge-only entry ignores a synthetic failed code status and derives `PartialParse` from
+  its knowledge extractor. Rewording the operational warning leaves the manifest digest exact.
+  This also completes B-G01's core domain-type obligation.
+- B-R32 widening is green: the exact digest/target oracle and all 40 domain tests pass serially;
+  Rustfmt and `cargo check --all-targets` exit 0. All Gate-B RED obligations are now closed; the
+  remaining work is production scout/manifest integration and focused verification.
+- Gate B GREEN is complete. Metadata-first scouting is authoritative for cold load and reload;
+  admission precedes content accounting; walker/metadata failures, path collisions, unsafe or
+  oversized spellings, hidden-knowledge coverage, and independent catalog capacities all retain
+  typed total outcomes. Cold catalog-capacity refusal stays responsive and publishes typed
+  non-ready freshness without a partial manifest.
+- The fail-fast integration sweep exposed and closed legacy projection and typed-owner regressions
+  in admission receipts, call-time co-change/frecency fixtures, coupling refresh, daemon runtime
+  paths, startup sidecar discovery, hook routing, and worktree TEE placement. The production fix
+  retained the cold-load `ProjectStateDir` on the shared handle; all other corrections made test
+  readers/writers carry the same explicit owner and canonical path helpers.
+- Gate B VERIFY is authoritative: `cargo test --all-targets -- --test-threads=1` exited 0 in
+  824.895s across the complete library and integration surface. `cargo check --all-targets`,
+  `cargo fmt --all -- --check`, and `git diff --check` also exit 0; the latter reports only the
+  repository's existing LF-to-CRLF notices. SymForge impact review is current for domain,
+  discovery, store, daemon/hook seams, and all touched integration fixtures.
+- Gate B is complete. Gate C stable bounded reads and total execution is the next open gate.
+- Gate C C-R01 completed compile-RED then GREEN. `stable_read_with_access` rejects a scout
+  size above the per-file ceiling as `HardSkip(PerFileCeiling)` before invoking either access
+  pass; the panic access spy proves zero allocation/read attempts. The named test passes 1/1.
+- Gate C C-R02 completed behavioral-RED then GREEN. A first-pass handle/path stamp that differs
+  from the scout stamp now returns `UnstableDuringRead` immediately; the spy proves exactly one
+  first-pass call and zero second-pass I/O. Both stable-read oracles pass 2/2.
+- Gate C C-R03 completed compile-RED then GREEN. A first-pass I/O failure is retained as the typed
+  `Unreadable { stage: FullRead, kind }` outcome using the discovery layer's canonical error-kind
+  classifier; the named oracle passes 1/1 and no failure is silently filtered from accounting.
+- Gate C C-R04 completed compile-RED then GREEN. The deterministic production fold now retains
+  every post-trip parse result as `AbortedCircuitBreaker` while keeping the triggering entry in
+  the indexed set. The fixture proves 10/10 terminal dispositions, the exact three-entry tail,
+  and zero accidental tail insertion; the named oracle passes 1/1.
+- Gate C C-R05 completed compile-RED then GREEN. Admission now performs read, classification,
+  parse, and staged hand-off in one worker closure: staged capacity is reserved before the
+  transient permit releases, so resident bytes remain continuously accounted without holding a
+  corpus-wide permit set. The named oracle passes 1/1; all six in-flight and nine circuit-breaker
+  regressions pass serially, including the tight-budget multi-file fixture.
+- Gate C C-R06 completed compile-RED then GREEN. Stable reads now require matching first/second
+  lengths and hashes plus unchanged scout/handle/path stamps; the first pass must also carry bytes
+  whose measured length and hash agree with its evidence. A same-stamp changed payload is rejected
+  as `UnstableDuringRead`, while the matching control returns owned accepted bytes; all three
+  stable-read oracles pass serially.
+- Gate C C-R07 completed behavioral-RED then GREEN. A scout-admitted read whose declared size is
+  within the per-file ceiling but larger than the total in-flight budget now returns the exact
+  terminal `HardSkip(PerFileCeiling)` before either read pass; the panic access spy proves zero
+  allocation/read attempts and the named oracle passes 1/1.
+- Gate C C-R08 completed compile-RED then GREEN. Breakers now carry an exact source/lane/stage
+  scope; a trip degrades only that scope, retains only its unprocessed tail as aborted, and queues
+  a bounded five-attempt reconciliation repair behind `ReconciliationPending` freshness. The
+  oracle independently varies source, lane, and stage and proves all unaffected scopes remain
+  Complete with 10/10 indexed entries and no repair. The named oracle passes 1/1, all ten circuit-
+  breaker tests pass serially, and the cold-load/reload scout publication regression remains green.
+- Gate C GREEN is complete. Both scout entrypoints use the single bounded probe helper; execution
+  uses one double-pass stable-read helper, preserves permits through parse/staged hand-off, folds
+  code/knowledge lanes deterministically, and retains one sorted terminal disposition per scout
+  entry across cold load and reload. Project reset now clears those dispositions and queued scoped
+  repairs; the lifecycle oracle was observed RED (0/1) before the two-line reset fix and GREEN (1/1)
+  afterward.
+- Gate C focused verification is green serially: 73/73 `live_index::store::tests`, 4/4 stable-read,
+  7/7 in-flight accounting, 10/10 circuit-breaker, 1/1 unreadable retention, 2/2 CRLF persistence/
+  watcher, and the non-ASCII/UTF-8/source-span regressions. C-V03 is an operational bound receipt,
+  not an RSS claim: permit exhaustion blocks until capacity frees, six fitting large files complete
+  under a 512 KiB total budget, and an individual request above the total budget hard-skips before
+  either read pass.
+- Gate C VERIFY is authoritative after the reset fix: `cargo test -j 1 --all-targets --
+  --test-threads=1` exited 0 in 810.927s. `cargo check -j 1 --all-targets` exited 0 in 58.99s,
+  `cargo fmt --all -- --check` exited 0, and `git diff --check` exited 0 with only the repository's
+  existing LF-to-CRLF notices. A prior unrestricted-parallel all-target compile exhausted compiler
+  memory; verification was deliberately serialized with `-j 1`, and both a 949.409s pre-fix full
+  baseline and the final post-fix full run exited cleanly.
+- Gate C is complete. Gate D watcher and reconciliation convergence is the next open gate.
+- Gate D D-R01 completed behavioral-RED then GREEN. A sparse `weights.gguf` created after cold
+  load was initially dropped by extension filtering (0/1). Watcher/freshen paths now treat language
+  inference only as a target hint, route the path through the cold-load single-path scout, and
+  publish `HardSkip(PerFileCeiling)` under the project-generation writer fence before any whole-file
+  read. The named oracle passes 1/1 and the complete watcher unit module passes 43/43 serially.
+- Gate D D-R02 completed behavioral-RED then GREEN. The strengthened catalog-only-to-code fixture
+  observed two publication generations for one watcher update because indexed content and stale
+  catalog cleanup were committed separately. `publish_indexed_file_at_generation` now applies the
+  content/derived update, catalog cleanup, and indexed terminal disposition under one project-
+  generation fence and calls the publication boundary once. The named oracle passes 1/1 and the
+  complete watcher unit module passes 44/44 serially.
+- Gate D D-R03 completed behavioral-RED then GREEN. Tier-1-only reconciliation returned zero for
+  two missed creates. Reconciliation now builds a fresh metadata scout with the active source
+  exclusions, processes paths absent from the prior scout plan, and publishes the refreshed plan
+  under the project-generation fence. The oracle proves a new Markdown file is indexed, a new
+  plain-text file retains a terminal outcome pending Gate F, and both remain authoritative Knowledge
+  targets. The named oracle passes 1/1 and the watcher unit module passes 45/45 serially.
+- Gate D D-R04 completed behavioral-RED then GREEN. The initial fresh rescout still ignored changed
+  and deleted catalog-only entries and returned zero repairs. Reconciliation now diffs complete
+  scouted entries, re-observes every changed disposition/stamp, removes paths missing from the fresh
+  manifest, and retains the old Tier-1 sweep only as a bounded fallback when rescout itself fails.
+  Generation-fenced removal now clears indexed content, derived indices, the legacy catalog
+  projection, and terminal disposition in one publication. The named oracle passes 1/1 and the
+  watcher unit module passes 46/46 serially.
+- Gate D D-R05 completed behavioral-RED then GREEN. A watcher registered after a missed create/delete
+  reached Active but performed no reconciliation within the bounded startup window. Every successful
+  watcher registration now runs an immediate full-manifest reconciliation before consuming queued
+  incremental hints; periodic and overflow paths share the same cause-aware accounting helper. The
+  named fresh-instance/overflow oracle passes 1/1, watcher units pass 47/47, and the directly affected
+  `watcher_layer3_restat` and `watcher_reload_cancellation` integrations each pass 3/3 serially.
+- Gate D D-R06 completed behavioral-RED then GREEN. Cross-project generation fences already preserved
+  content, derived indices, catalog state, the scout plan, terminal dispositions, freshness, and the
+  publication generation, but the cause-accounting wrapper still stamped `last_reconcile_at` for the
+  active project after the foreign batch was rejected. Accounting now requires an initially matching
+  effective generation and an unchanged generation after the sweep. The named all-lane oracle passes
+  1/1 and the watcher unit module passes 48/48 serially.
+- Gate D D-R07 completed deterministic behavioral-RED then GREEN. Reconciliation paused after its
+  off-lock scout, a watcher published an 82-byte replacement, and the old implementation then
+  overwrote the manifest with the stale 24-byte entry. Incremental publications now update their
+  scouted entry under the writer boundary, off-lock file builds fence and retry against the captured
+  publication generation, removals compare the exact scouted base, and reconciliation rebases only
+  paths changed since its baseline before publishing canonical coverage/accounting. The RED failed
+  exactly at 24 vs 82 bytes; the named oracle passes 1/1 and all watcher units pass 49/49 serially.
+- Gate D D-R08 completed behavioral-RED then GREEN. Three manifest observations carried identical
+  entries while coverage progressed Degraded, Degraded, Complete; the old cause wrapper stopped
+  after the first observation. Reconciliation now retries Degraded coverage up to five attempts with
+  capped 50/100/200/400 ms backoff, rechecking cancellation and active project generation between
+  attempts, while equal Complete coverage remains a one-attempt no-op. The RED observed 1 attempt
+  instead of 3; the named convergence oracle passes 1/1 and all watcher units pass 50/50 serially.
+- Gate D D-R09 completed compile-RED, behavioral-RED, then GREEN. The watcher lacked a shared stable-
+  read seam; once exposed, injected full-read refusal proved the existing path returned an error while
+  leaving coverage Complete. Watcher reads now use the bulk pipeline's double-pass stable reader;
+  `Unreadable` and `UnstableDuringRead` publish Degraded coverage, transient terminal paths bypass
+  equal-entry manifest no-op, and a stable hash-skip restores the canonical Indexed disposition. Both
+  transient variants converge without any repository change. The two named oracles pass 1/1 each and
+  all watcher units pass 52/52 serially.
+- Gate D D-R10 passed immediately for the intended post-D-R08 reason. A first uncertainty window
+  exhausts exactly five Degraded attempts and remains explicitly Degraded; a later overflow opens a
+  fresh bounded window, observes Degraded then Complete, and records the overflow once. Retry state is
+  invocation-scoped rather than a permanent settled latch. The named oracle passes 1/1 and all watcher
+  units pass 53/53 serially.
+- Gate D GREEN is complete. Single-file observation now enters through shared scout/admission/stable-
+  read policy; indexed content, derived indices, scout state, manifest disposition, coverage, and
+  publication accounting commit under generation/publication fences. Reconciliation diffs the complete
+  manifest, rebases paths changed after its off-lock build, and retries or aborts stale work instead of
+  overwriting newer watcher publications.
+- D-G08 removed stored `skipped_files` state and direct skip mutations. `manifest_entries` is the sole
+  disposition authority; compatibility skip responses and tier lookup/counts are projections. Direct
+  `update_file`/`remove_file` mutations now publish and clear the corresponding canonical entry, and
+  upsert deduplicates by normalized repository path rather than host-specific catalog identity.
+- The final mutation-invariant verification caught and closed three additional real regressions: atomic
+  rename batches now coalesce by normalized path and process existing destinations before vanished temp
+  hints; transient unreadable/unstable observations retain last-valid bytes while the manifest remains
+  authoritatively Degraded; and structural-edit NUL fixtures pin disk mtime only when testing byte-exact
+  splice preservation, without changing the normal disk-refreshed authority contract.
+- Gate D focused verification is green serially: 74/74 store units, 53/53 watcher units, 146/146 query
+  units, 4/4 health-view units, 5/5 admission acceptance, 3/3 impact admission, 3/3 layer-3 restat, and
+  3/3 reload-cancellation. The OS watcher integration passed three consecutive runs (10 passed, 1
+  ignored each), including the formerly nondeterministic rename-replace case.
+- Gate D VERIFY is authoritative: `cargo fmt --all -- --check` exited 0; `cargo check -j 1 --tests`
+  exited 0 in 68.489s; and `cargo test -j 1 --all-targets -- --test-threads=1` exited 0 in 930.497s
+  (`job_019f84910ba37c53921fa1b3672a3e19`). The final tail includes watcher integration 10/10 with
+  one ignored, layer-3 restat 3/3, reload cancellation 3/3, worktree awareness 27/27, and xref 13/13.
+  `analyze_file_impact` refreshed every indexed touched file; the 1.2 MB `src/protocol/tools.rs` correctly
+  returned the existing typed Tier-2 metadata-only limitation, so exact reads plus compiled behavioral
+  tests are the evidence for that file.
+- Gate D is complete. Gate E snapshot fidelity and one-Arc publication is the next open gate; no Gate E
+  implementation began before the final Gate D all-target receipt.
+- The scoped Fable Gate-D review reopened the gate with four HIGH findings sharing two root causes.
+  The preserved report is `specs/020-repository-knowledge-index/fable-gate-d-review-2026-07-21.md`.
+  Metadata scout failures now retain an authoritative `Unavailable { Metadata }` entry, and reconcile
+  removals require Complete fresh coverage. Candidate/live manifest dispositions, not only the scout
+  plan, keep coverage Degraded through unreadable, unstable-read, and circuit-breaker states until a
+  stable replacement lands.
+- Circuit-breaker aborts now re-enter bounded reconciliation, failed rescouts preserve a Degraded retry
+  signal across the cause wrapper, and the unconsumed duplicate repair queue was removed. The focused
+  failure oracles cover retained missing entries, unchanged Complete no-publication, metadata-before-read
+  refusal, and real notify-error routing.
+- `analyze_file_impact` now normalizes one repository-relative path before lookup/upsert and routes new
+  or edited files through the watcher's shared metadata/admission/stable-read publication seam. The new
+  regressions prove `./src/lib.rs` cannot mint a duplicate identity and gitignored supported sources
+  cannot bypass admission.
+- Reopened Gate D focused verification is green: discovery metadata-first 7/7, watcher units 59/59,
+  store units 74/74, admission acceptance 5/5, impact admission 5/5, watcher integration 10/10 with one
+  ignored, layer-3 restat 3/3, and reload cancellation 3/3. The full library target passed 2,839 with
+  zero failures and two ignored in 221.49s.
+- The fresh authoritative `cargo test -j 1 --all-targets -- --test-threads=1` receipt exited 0 in
+  1,016.033s (`job_019f84f7119d7032b53cc03b8294fb32`): 3,555 passed, 0 failed, 10 ignored across 107
+  test-result summaries. `cargo fmt --all -- --check` and `git diff --check` both exited 0; the latter
+  reported only the repository's existing LF-to-CRLF notices.
+- The review's disputed Gate-E E-R01 oracle was re-stressed on the later Gate-H tree: the exact
+  snapshot round-trip test passed 25 consecutive fail-fast process-isolated runs
+  (`job_019f86a4732b7c72b44a00fa9ab01ea3`), then the complete persistence module passed five
+  consecutive serial runs (`job_019f86a7350e7490a23351d6531cb6e1`). Both loops exited 0, so the
+  pre-remediation one-off failure is not reproducible in the current tree.
+
+### Review
+
+The scoped Fable delta report returned PASS and READY TO FREEZE. All five MEDIUM
+corrections held, no regression or new blocker exists, and its one LOW definition gap
+is closed locally. Gate A is complete; implementation may proceed from Gate B while
+the full goal remains open through Gates B-M, final review, commit, and push.
+
+Gate D was reopened by the scoped Fable review and is re-closed after behavioral
+RED/GREEN fixes for every sustained finding and missing oracle. Focused suites, the
+2,839-test library target, formatting/diff checks, and the fresh 1,016.033-second
+all-target run are green with zero failures. No Gate D blocker remains; Gate E may
+resume under the frozen publication/snapshot contract.
+
+### Gate E Evidence Log
+
+- Gate E RED/GREEN is complete. The ten named oracles cover snapshot catalog fidelity,
+  shared admission, project and publication fences, atomic reader capture, failed reload
+  retention, degraded last-valid publication, verifying readiness, same-path replacement,
+  source-version coherence, and watcher/verifier races.
+- Snapshot schema v7 now persists one canonical manifest, stable repository/source identity,
+  exact source version and closed working-tree state, resident-content and Git-history
+  fingerprints, and code-signal provenance including computed content generation, source
+  version, and history coverage. Restore rebuilds resident indices and reconstructs the same
+  immutable code-signal snapshot instead of restamping generation zero.
+- One `ArcSwap<PublishedSourceSet>` is the externally observable root. Its current source maps
+  to one immutable core `PublishedGeneration` containing live content, health, outline,
+  freshness, manifest, source version, and code signals. Direct reloads build replacements,
+  while mtime-only and derived-only publications retain the content generation.
+- Strong lineage validation now gates load, overwrite, reset, and team-artifact import.
+  Same-path foreign repositories cannot inherit, delete, or overwrite prior state; mismatched
+  snapshots and artifacts leave their active path and are quarantined. Ordinary Git drift is
+  accepted for overwrite only while the stored anchor remains in the live object database.
+- Additional boundary REDs were preserved: foreign reset failed before the lineage gate
+  (`job_019f85717ea27d52bb0f78bb53ff6685`), code-signal provenance restored as generation zero
+  (`job_019f8571a5b87982a70a936557ed9464`), and foreign team artifacts were refused but left
+  active (`job_019f8576274f71908f4394dd225b1148`). Each exact oracle is now green.
+- Focused verification is green serially: persistence 58/58, store 81/81, and the complete
+  `live_index` namespace 568/568. The full library receipt
+  `job_019f857c51b97e10a44887eaa9789cba` passed 2,858 with zero failures and two ignored in
+  216.86 seconds.
+- The non-test boundary is green: `cargo check -j 1 --tests` exited 0 in 51.05 seconds
+  (`job_019f8583bd6f7582baaab814f61f3459`). Checkpoint 2/2, live-index integration 31/31 with
+  one ignored performance case, and team-artifact 2/2 passed under
+  `job_019f8584bba576e3871043a5b62eb81f`.
+- `cargo fmt --all -- --check` and `git diff --check` both exited 0. The diff check emitted only
+  the repository's existing Windows LF-to-CRLF advisories.
+
+### Gate E Review
+
+Gate E is complete. Every frozen RED, GREEN, and VERIFY item is closed with serial behavioral
+evidence, and no snapshot/publication blocker remains. Gate F knowledge-target extraction is
+the next open implementation gate.
+
+### Gate F Plan
+
+- [x] Preserve F-R01–F-R16 as behavioral REDs across routing, extraction, sensitive admission,
+  byte/format matrices, and cold/watch/reconcile/verifier parity.
+- [x] Make manifest `IndexTargets` authoritative for code/knowledge overlap while keeping all
+  existing code search, symbols, references, and frecency code-only.
+- [x] Add generic UTF-8 text extraction and project existing Markdown sections with exact
+  byte/line/content provenance; add no duplicate persisted unit store.
+- [x] Add versioned high-precision path/content detection and one whole-hit output guard shared
+  by direct, CCR, diagnostics, and analytics boundaries.
+- [x] Verify parser/search scope, existing code/config parsers, byte-exact fixtures, snapshots,
+  and runtime-canary containment before marking Gate F complete.
+
+### Gate F Evidence Log
+
+- Added authoritative overlapping `IndexTargets`, `LanguageId::Text`, generic strict-UTF-8/BOM
+  extraction, and on-demand Markdown section projection without a duplicate persisted content store.
+  Code discovery remains code-only; prose is knowledge-only; config/schema formats retain both lanes.
+- Added one versioned, compile-once byte detector and shared whole-hit guard. Sensitive paths are
+  terminal before content I/O, detector failures fail closed, LFS pointers and invalid UTF-8 remain
+  catalog-only, and only safe rule identifiers/counts reach metadata.
+- Cold load, watcher, reconciliation, background verification, snapshot recovery, and team-artifact
+  import now share the same admission policy and reject a mismatched detector-policy version.
+- Focused serial suites are green: knowledge 7/7 (`job_019f85cd229a77319cdcdb5440579bc6`),
+  Markdown 18/18 (`job_019f85cdaf4f74e295ab80149e2504ab`), metadata scout 9/9
+  (`job_019f85cdb7fb7c519ae0afc8f0bd8db3`), search 64/64
+  (`job_019f85cdc0ba76908938f9986f881159`), analytics 7/7
+  (`job_019f85cdfa057e62b6434c4a40de366b`), domain 41/41, config extractors 91/91,
+  and existing language parsers 153/153.
+- Boundary suites are green: store 86/86 (`job_019f85d25b3c7043a954c242d764f759`), persistence
+  61/61 (`job_019f85d2bde97e91bbd0d209edd1b775`), and watcher 61/61
+  (`job_019f85d3138b7be2a24a3458a12e48e1`). The full serial library gate passed 2,883 with
+  zero failures and two ignored (`job_019f85dd56e074b0ba844e4ed75727a9`).
+- External checks are green: live-index integration 31/31 with one ignored performance case
+  (`job_019f85e121f470b2a5ad3665cd097d9b`), checkpoint 2/2
+  (`job_019f85e2530273138bc94cab47411b01`), and team-artifact 2/2
+  (`job_019f85e2821171e1b1135070cc983e4e`). `cargo check -j 1 --tests`, formatting, and the
+  unchanged `Cargo.toml`/`Cargo.lock` dependency boundary all exit zero.
+- Runtime-generated canaries are absent from serialized snapshots and analytics, and detector-positive
+  hits are withheld whole from direct and CCR-visible fields. Failure oracles compare only safe
+  booleans/counts and never interpolate the canary.
+- The broad gate exposed one stale pre-F oracle: `.gitignore` is now intentionally indexed as generic
+  text. Its corrected assertion proves `.gitignore` remains visible while the rule still excludes
+  `ignored.rs`; the exact regression passes under `job_019f85dc9b407e4092ee383c2830014d`.
+
+### Gate F Review
+
+Gate F is complete. All 16 RED, nine GREEN, and four VERIFY items are closed with serial behavioral
+evidence. No parser dependency was added, no sensitive-value surface remains known, and all ingestion
+paths produce the same knowledge disposition. Gate G evidence-bridge core is the next open gate.
+
+### Gate G Plan
+
+- [x] Preserve G-R01–G-R08 as exact behavioral REDs for closed-world candidate extraction,
+  ambiguity/missing state, same-source identity, ownership provenance, budgets, and stale builds.
+- [x] Add compact bridge domain types with canonical ordering, stable source-local link IDs, bounded
+  samples/selectors/metadata, and index-based forward/reverse storage without copied document bodies.
+- [x] Extract candidates only from internal links, exact repository paths, code-spanned unique symbol
+  names, versioned structured values, and declared ownership selectors; reject bare prose, external
+  links, contributor history, and all unsafe/nonresident knowledge.
+- [x] Build against one captured source/content generation and extend `PublishedGeneration` with the
+  immutable bridge. Rebuild watcher/reconcile mutations before their single publication and reject
+  stale off-lock bridge results at the existing publication fence.
+- [x] Verify deterministic repeated builds, exact bidirectional repair on create/change/rename/remove,
+  independent truncation coverage, cross-source isolation, concurrent readers, code-scope isolation,
+  and frecency neutrality before marking Gate G complete.
+
+### Gate G Evidence Log
+
+- Added compact source-local anchors, exact/declared-set/ambiguous/missing resolutions, stable link IDs,
+  compact reverse indices, and canonical derived-coverage breaches. Bridge state stores no copied prose.
+- Closed-world extraction accepts internal repository links, exact path/code-span selectors, one versioned
+  structured-path rule, and CODEOWNERS selectors. Markdown and bare external URLs, bare symbol prose,
+  contributor text, sensitive/nonresident files, and cross-source anchors create no code edge.
+- `PublishedGeneration` now owns one immutable bridge beside live, manifest, outline, health, and temporal
+  state. Watcher and reconciliation tests prove forward/reverse repair shares the same publication; stale
+  off-lock builds fail their publication fence and pinned callers retain their captured generation.
+- Contract-audit REDs caught and corrected missing `.md` links routed into the code lane, per-link rather
+  than global sample ceilings, bare external URL suffixes, and zero-based evidence/code-anchor line ranges.
+- The first store run exposed eager materialization of every symbol in a code-only 144,000-symbol fixture.
+  Bridge construction now extracts selectors first and builds anchors only for referenced names; the exact
+  stress case completes in 12.10 seconds (`job_019f86152fc779b0be9d015cb2ab4154`).
+- Focused serial suites are green: bridge 12/12 (`job_019f8618a58c7ba19f7e4b601f303cb3`), watcher
+  62/62 (`job_019f8610a2e077d3b6d0f4357a422f0c`), store 86/86
+  (`job_019f8616c4117fc1ab54c59f0a796c35`), and persistence 61/61
+  (`job_019f861849d97752a7bfb30e2f1437fa`).
+- The complete serial library gate passed 2,896 with zero failures and two ignored in 267.19 seconds
+  (`job_019f8618d8277f63ba2efbbc1199abe4`). Concurrent reader stress observes one source/content generation,
+  repeated builds are equal and canonically ordered, and direct bridge construction invokes no frecency path.
+- Final hygiene passed: `cargo fmt --check` (`job_019f861e4ad07701a34d485495f0936b`),
+  `cargo check -j 1 --tests` (`job_019f861e6e0f7601843c5ba35f008ab4`), the 31-pass/one-ignored
+  live-index integration suite (`job_019f861fad25766086e5480201e0f9c2`), the 2/2 checkpoint suite
+  (`job_019f8620e4927560ba889fd1a082f28e`), and `git diff --check`
+  (`job_019f862129637d32bca47db939173eb8`). `Cargo.toml` and `Cargo.lock` remain unchanged.
+
+### Gate G Review
+
+Gate G is complete. All eight RED, six GREEN, and three VERIFY items are closed with behavioral evidence.
+The bridge is derived from resident safe bytes, rebuilt rather than persisted, atomically published, bounded,
+source-local, and deterministic. Gate H knowledge-authority foundations are the next open gate.
+
+### Gate H Plan
+
+- [x] Preserve H-R01–H-R15 as exact behavioral REDs covering independent authority axes, mixed units,
+  deterministic evidence precedence, temporal provenance, policy failure/staleness, budgets, and source-tip fences.
+- [x] Add one source-local authority derivation module with the frozen lifecycle/domain/evidence/voice model,
+  stable finding/provenance IDs, canonical coverage, and no copied document bodies.
+- [x] Parse exactly one versioned `.symforge-knowledge.toml` ledger; require exact safe paths, whole-file hashes,
+  and optional zero-based half-open unit ranges/hashes. Malformed, unsupported, conflicting, cyclic, or stale
+  entries remain findings and cannot suppress or authorize curation.
+- [x] Derive typed records from admitted knowledge units plus the captured bridge and bounded temporal evidence;
+  only supported current-implementation claims may be code-diverged, while intent/decision/governance divergence
+  remains an implementation gap and all timestamp-only evidence stays advisory.
+- [x] Extend `PublishedGeneration` with immutable authority state and one off-lock prepared publication seam fenced
+  by publication/content/project generations plus exact source version. Reject stale completions and retain one
+  coalesced latest target without advancing content identity for accepted derived-only publications.
+- [x] Verify cold/watcher/reconcile/verification parity, deterministic repeats, per-unit isolation, fail-open raw
+  retrieval, fail-closed suppression, independent budgets, temporal convergence, full focused suites, and broad
+  serial regression gates before closing Gate H.
+
+### Gate H Evidence Log
+
+- The authority type/rule/parser/build/publication TDD chain was observed red before implementation and then green:
+  type contract (`job_019f862949b17022860b1c5244230db6` -> `job_019f862b8f077571b11be7ce9a8072dd`),
+  evidence rules (`job_019f862d337f7c039c59b10a7ed9c006` -> `job_019f862f176f75119ef60c8d30699dd7`),
+  policy parser (`job_019f86307fc870729664a999324c159d` -> `job_019f8632292579529ec46182676e4f91`),
+  authority derivation (`job_019f86349ea37342a8ae104352ef6cd5` -> `job_019f863bf2ee70b2a224c5991ecafb36`),
+  and immutable publication (`job_019f863dbad67423a56c66cf9cba489b` -> `job_019f8640e3eb74f2a0a65e3ca98dbff1`).
+- `knowledge_authority.rs` now carries independent lifecycle/domain/evidence/voice axes, stable finding IDs,
+  exact display precedence, a closed versioned policy parser, exact whole-file/unit hash validation, cycle/native-conflict
+  refusal, unit isolation, explicit budgets, and fail-closed skipped-suppression IDs. The final focused authority suite is
+  14/14 (`job_019f8663eaa379c0819db1397f4aa32e`).
+- Git temporal publication now fences project generation, content generation, source identity, and exact source version.
+  One running request plus one replaceable latest marker bounds watcher bursts; stale completions self-schedule the latest
+  same-source target. Project/content/source-tip rejection plus bytes-identical-commit convergence and bounded coverage
+  are green 5/5 (`job_019f865f198c72638b8c0c2819959ab2`), and the temporal unit suite is green 41/41
+  (`job_019f8663cc9979a2b7f3738b54e3dba2`).
+- Cold load, direct watcher admission, reconciliation, and background verification compare identical authority semantics
+  after normalizing only their intentionally different receipt generations (`job_019f8653e96d7372a36dc405f67026d5`).
+  Watcher publication carries bridge/authority/source/version in one root; watcher is green 62/62
+  (`job_019f866228de796097176003dbcb5940`), store 86/86 (`job_019f866362717cf38e263390c189c536`),
+  and persistence 62/62 (`job_019f8663005a7893aad3462090c6196c`).
+- Snapshot restore rebuilds unpersisted authority with current authority-rule, policy, and secret-policy versions before
+  becoming Ready. Temporal coverage explicitly reports bounded-window, rename-follow, shallow/working-tree/unavailable,
+  dirty, divergent, and clock-skew limitations without upgrading clocks to proof.
+- The first complete serial run found one invalid legacy oracle after 2,911 passes: it required publication generation to
+  remain fixed while background derived-only work was allowed to publish. The oracle now fences content/project/source/
+  version/manifest identity instead, passed three consecutive focused runs, and the lesson is recorded in
+  `tasks/lessons.md`.
+- Final gates: formatting (`job_019f866fba7a79218772d582166a3df3`), `cargo check -j 1 --tests`
+  (`job_019f866407a57f539893ecb36100938d`), and the complete serial library suite: 2,912 passed, zero failed,
+  two ignored (`job_019f866fe21874e0b54aaee19da24fe9`). `Cargo.toml` and `Cargo.lock` remain unchanged.
+
+### Gate H Review
+
+Gate H is complete. All fifteen RED, nine GREEN, and three VERIFY contracts are covered by executable evidence. Authority
+is derived from the resident knowledge/bridge generation, rebuilt rather than persisted, atomically published with exact
+source/version provenance, bounded without hiding raw safe units, and incapable of silently treating intent, governance,
+operations, or history as current implementation. Gate I `search_knowledge` is the next open gate.
+
+### Gate I Plan
+
+- [x] Preserve I-R01–I-R16 as executable REDs before implementation: exact eight-field schema and annotations;
+  captured-generation hit/envelope provenance; the five no-match classes; typed readiness, selector, scope, CCR,
+  recovery, and budget failures; deterministic ranking; whole-hit security withholding; and frecency neutrality.
+- [x] Add the exact `SearchKnowledgeInput` and current-only advertised source scope, while keeping the full surface
+  increment to one tool and the compact surface exactly three tools.
+- [x] Reuse resident knowledge units, authority records, bridge previews, source envelopes, project selection, and CCR;
+  capture one immutable published source set per selected project before extraction and never reload during formatting.
+- [x] Implement deterministic query interpretation and ranking in the frozen order: exact phrase, heading/title,
+  distinct significant terms, source precedence, then canonical path/line ties. Keep authority filtering independent
+  from source precedence and keep knowledge intent from stealing code/symbol questions.
+- [x] Enforce the security pipeline before routing and after extraction: reject unsafe queries without echo/state,
+  construct only guarded `SafeHit` values, withhold unsafe candidates whole, and preserve guarded provenance through
+  token budgeting and CCR retrieval.
+- [x] Format exact source/version/publication/content generation, content identity, 1-based half-open lines,
+  authority display, stable finding/provenance IDs, bounded bridge previews, per-source and worst coverage/freshness,
+  filtered/withheld/overflow counts, and deterministic empty-result reasons from only the captured source bundles.
+- [x] Wire `ask` and the compact facade only after direct-tool mapping tests are green; preserve successful no-match
+  responses, facade CCR redemption, cross-project isolation/order, repeat-cache generation identity, and zero frecency.
+- [x] Run I-V01–I-V03 plus focused protocol/live-index/daemon suites and formatting/checks; defer the campaign-wide
+  complete serial all-target regression gate to the final Gate-M/release verification so it covers the finished tree.
+
+### Gate I Evidence Log
+
+- Exact schema/surface coverage is green: `schema_roundtrip` 27/27, conformance 19/19, and compact-surface
+  invariants 4/4. The full surface gained exactly `search_knowledge`; compact remains `symforge`, `symforge_edit`,
+  and `status`, with current as the only advertised Gate-I source scope.
+- Public search coverage is green: 11/11 integration tests with one explicit manual corpus test ignored in the normal
+  suite (`job_019f87108b7c7871a857e260c4db2dae`), plus 49/49 knowledge-focused library tests. The suite covers all five
+  no-match classes, validation/readiness/degraded states, deterministic ranking, exact BOM/CRLF/multibyte line ranges,
+  captured-generation coherence, stable authority IDs, source-envelope withholding, bridge previews, CCR policy and
+  stale retrieval, current-only scope, and generation-aware deep reads.
+- A bridge-preview RED exposed an exact-ID join between line-level bridge anchors and enclosing knowledge-unit anchors.
+  Search now joins only same-source/same-path/same-content anchors contained by the unit range; the exact regression and
+  full public suite are green.
+- Compact routing is green end to end: knowledge intent precedes find fusion, successful empty results remain successful,
+  max-token caps reach `search_knowledge`, and CCR footers redeem through the three-tool `symforge` facade without a
+  fourth tool. Direct and `ask` search remain frecency-neutral.
+- Daemon I-R11 is green for ID and unique-name `project`, ID/name `projects`, session-scoped wildcard expansion,
+  canonical envelope order, selector conflict/unknown errors, and zero third-session hit/bridge leakage
+  (`job_019f870442ee719090a03d6481e0bf45`). Selectors are canonicalized through the existing session resolver before
+  any immutable source-set capture.
+- Real-repository acceptance is reproducible through the ignored named corpus test. All eight frozen queries returned a
+  non-acceptance-fixture pointer in one `limit=3`, `max_tokens=2500` call, repeated byte-identically with captured source
+  version/freshness/coverage (`job_019f870f64e4708394c8c4bfabd6e7d1`). Returned-token estimates were
+  665/766/793/950/968/979/1065/1165 (median 959). The conservative direct-read-only baseline for the selected source
+  files was 1353/2151/2674/2674/3755/4293/9967/14775 (median 3214.5), so the measured reduction is 70.2% before adding
+  any broad-discovery cost; no direct read was needed.
+- Existing code discovery remained isolated: `search_symbols` 30/30, `search_text` 52/52, and `find_references` 46/46.
+  `cargo check -j 1 --tests` and final `cargo fmt --all -- --check` both exited 0.
+
+### Gate I Review
+
+Gate I is complete. `search_knowledge` is a bounded, read-only full-surface tool over one caller-captured immutable
+generation per selected project. It reuses the resident corpus, authority, bridge, project, safety, and CCR machinery;
+adds no embeddings or duplicate index; cannot serve mixed generations; preserves all successful empty-result classes;
+and leaves code discovery plus compact-3 behavior unchanged. Gate J repository-map and `review_knowledge` work is next.
+
+### Gate J Plan
+
+- [x] Preserve J-R01–J-R11 as executable REDs: bounded source-captured role/map output; knowledge-only/default/empty/
+  bundle context behavior and backlink caps; generation-aware context cache invalidation; exact source-local review modes,
+  IDs, evidence arrays, bridge records, temporal provenance, blockers, and proposals; complete-plan hashes; selector
+  isolation; frecency neutrality; capture coherence; contributor/missing-role honesty; budget exhaustion; and secret safety.
+- [x] Derive fixed v1 role cards only from declared spans, versioned exact heading rules, and path conventions, retaining
+  missing roles and coverage rather than generating or persisting a summary.
+- [x] Extend `get_repo_map`, orientation `ask`, `get_file_context`, and `get_symbol_context` from one captured generation;
+  preserve existing default/empty/bundle contracts, exact backlink cap five, code commitment behavior, and compact budgets.
+- [x] Add exact read-only `review_knowledge` schema, annotations, summary/document/remediation modes, canonical complete-plan
+  per-source/top-level hashes, bounded source-local dossiers, and daemon ID/name/list/wildcard routing without mutation.
+- [x] Add fixed prompt `symforge-knowledge-hygiene` with review/evidence/proposal/approval/preview ordering and no embedded
+  approval, mutation, or deletion authority.
+- [x] Run role/map/context/review/hash/publication/frecency/security/selector suites, one-call real-repository orientation and
+  deep review, repeatability/no-mutation checks, format/check, and focused regressions before closing Gate J.
+
+### Gate J Evidence Log
+
+- The full public surface is pinned at 38 tools and compact remains exactly three. `search_knowledge` and
+  `review_knowledge` are present in the registered surface, canonical conformance inventory, annotations, and every
+  generated full-surface client allow-list. The fail-first allow-list oracle and the complete 55-test init module are green.
+- Role cards expose fixed role IDs, exact unit/evidence anchors, content hashes, source/content generations, voice,
+  overflow, missing roles, hygiene, and uncertainty. Ambiguous backlinks retain typed candidate counts/samples and exact
+  bounded evidence rather than becoming guessed links.
+- File and symbol contexts capture one publication for code plus knowledge. Omitted, empty, knowledge-only, default,
+  bundle, repeat-cache, and tight-budget modes are covered; budget truncation now preserves an indivisible
+  source/count/coverage block and never emits a partial backlink.
+- `review_knowledge` provides summary/document/remediation modes, complete-plan per-source/top-level hashes, exact
+  source-local dossiers, eligibility/blocker evidence, and canonical multi-project routing. A later publication cannot
+  alter a review already captured from the prior generation.
+- Secret-positive search/review inputs reject before analytics or CCR state. Map/search/review/ask remain frecency-neutral,
+  and read-only review leaves both document bytes and repository policy absent/unchanged.
+- Real-repository Gate-J acceptance repeated orientation and remediation review byte-identically with exact role anchors,
+  source-version fields, hashes, paths, dossiers, uncertainty, and coverage (`job_019f87aa94c9719086bff4dbc0b25208`).
+- Verification is green: public knowledge integration 22 passed/2 manual corpus tests ignored
+  (`job_019f87bd66a7736388352d7e12fb433f`); frecency 23/23; schema 27/27; conformance 19/19;
+  init 55/55; surface profile 7/7; cross-project daemon review 1/1; focused mental-model/review/prompt/capture suites;
+  `cargo check -j 1 --all-targets`; and `cargo fmt --all -- --check`.
+
+### Gate J Review
+
+Gate J is complete. Repository orientation and read-only knowledge review are now bounded, source-local, generation-coherent,
+deterministic, secret-safe, and non-mutating. The implementation adds no generated/persisted summary and no duplicate
+index; it composes the resident Gate-H authority/bridge generation with existing topology, project routing, CCR, and prompt
+surfaces. Gate K guarded logical curation is the next open gate.
+
+### Gate K Plan
+
+- [ ] Preserve K-R01–K-R20 and K-G01–K-G07 as executable REDs before implementation: preview/apply equivalence;
+  same-source replay/conflict; preview side-effect freedom; availability-before-probe; fresh review/manifest/policy/target
+  guards; per-project serialization; crash recovery at every intent/write/result boundary; watcher/publication convergence;
+  branch/commit/rewrite continuity; non-Git continuity; secret safety; and repository-byte exclusivity.
+- [ ] Define one canonical curation request and result surface. Requests name nonempty review action IDs, carry the complete
+  source-local review hash plus manifest/policy/target guards, default to preview, and require an idempotency key only for
+  apply. Results expose the canonical ledger diff and typed replay/publication state without document mutation authority.
+- [ ] Reproduce selected actions from a fresh captured review and render one deterministic `.symforge-knowledge.toml` image;
+  preview must run every logical guard and return the exact apply diff while creating no lock, probe, journal, temp, or policy
+  artifact. Canonical serialization must round-trip through the frozen policy parser without widening the authority model.
+- [ ] Add a project-bound curation coordinator with explicit source-access and persistence capabilities. Apply must reject an
+  ineligible binding before any durability probe, then probe only the policy-ledger parent and durable intent parent, acquire
+  one per-project policy lock, and revalidate the complete review/manifest/policy/target envelope under that lock.
+- [ ] Implement durable same-source idempotency and recovery under the project-state directory: identity is repository/source
+  identity plus a resolvable stored Git tip (or durable non-Git root/catalog lineage), never mutable refs, current tip, policy,
+  manifest, or target digests. Persist reserved/pending/result states with pre/post images and fail closed on foreign or
+  unverifiable continuity, key/hash conflict, third-state policy bytes, or non-durable storage.
+- [ ] Commit only `.symforge-knowledge.toml` through create-new same-directory temp, complete write/verification, sync,
+  atomic replacement, parent durability (or a documented/tested Windows-safe equivalent), then durable result. Recovery must
+  converge every injected crash point exactly once; ordinary watcher publication remains the sole live-index update path.
+- [ ] Register `curate_knowledge` across the full tool surface, schema/annotations, daemon routing, generated client
+  allow-lists, documentation, and exact surface counts while compact remains three. Run focused Gate-K suites, crash and
+  concurrency batteries, real-repository no-document-mutation acceptance, format/check, and all touched regressions before
+  closing the gate.
+
+### Gate K Evidence Log
+
+- Pending RED/GREEN receipts.
+
+### Gate K Review
+
+Pending implementation, adversarial verification, and Gate-K closure evidence.
+
+---
+
+## Windows Headless Process Invariant (2026-07-16)
+
+### Plan
+
+- [ ] Reproduce and trace every SymForge child-process path used by Codex/subagents.
+- [ ] Add a failing Windows regression oracle that inventories spawn call sites and
+  proves the shared command policy prevents a visible console window.
+- [ ] Route every production spawn through the shared no-window constructor/policy.
+- [ ] Run focused Windows process tests, relevant daemon/sidecar/hook suites, and the
+  full verification gate appropriate to the touched code.
+- [ ] Verify no test/helper/worker descendants remain after completion.
+
+### Evidence Log
+
+- User report: SymForge-related terminal windows still appeared and stole focus when
+  Codex subagents used SymForge. Subagent activity was stopped before diagnosis.
+
+### Review
+
+Pending root-cause proof, RED/GREEN evidence, and process-tree verification.

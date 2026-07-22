@@ -50,7 +50,8 @@ pub(crate) use super::read_tools::{
 #[cfg(test)]
 pub(crate) use super::search_tools::normalize_search_text_glob;
 pub use super::search_tools::{
-    FindReferencesInput, SearchFilesInput, SearchSymbolsInput, SearchTextInput,
+    CurateKnowledgeInput, FindReferencesInput, ReviewKnowledgeInput, SearchFilesInput,
+    SearchKnowledgeInput, SearchSymbolsInput, SearchTextInput,
 };
 pub(crate) use super::search_tools::{
     fix_common_double_escapes, normalize_path_prefix, parse_language_filter,
@@ -273,6 +274,18 @@ fn classify_search_text_output(text: &str) -> OutcomeClass {
     }
 }
 
+fn classify_search_knowledge_output(text: &str) -> OutcomeClass {
+    if text.starts_with("Error:") {
+        OutcomeClass::InvalidRequest
+    } else if text.contains("\nNo match:") {
+        OutcomeClass::EmptyResult
+    } else if text.starts_with("Readiness:") {
+        OutcomeClass::InternalFailure
+    } else {
+        OutcomeClass::Found
+    }
+}
+
 fn classify_search_files_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
@@ -343,6 +356,7 @@ pub(crate) fn classify_compact_tool_output(tool: &str, text: &str) -> OutcomeCla
         "get_file_context" => classify_get_file_context_output(text),
         "search_symbols" => classify_search_symbols_output(text),
         "search_text" => classify_search_text_output(text),
+        "search_knowledge" => classify_search_knowledge_output(text),
         "search_files" => classify_search_files_output(text),
         "find_references" => classify_find_references_output(text),
         _ => {
@@ -376,8 +390,9 @@ use crate::protocol::edit;
 use crate::protocol::format;
 use crate::protocol::search_format;
 use crate::sidecar::handlers::{
-    ImpactParams, OutlineParams, SymbolContextParams, impact_tool_text, outline_tool_text,
-    repo_map_text, symbol_context_tool_text,
+    ImpactParams, OutlineParams, SymbolContextParams, impact_tool_text,
+    outline_tool_text_for_generation, repo_map_text_for_generation,
+    symbol_context_tool_text_for_generation,
 };
 use crate::sidecar::{SidecarState, TokenStats};
 use crate::watcher;
@@ -403,6 +418,10 @@ pub struct IndexFolderInput {
     /// (no daemon) an `add:true` call honestly refuses (Principle VII).
     #[serde(default, deserialize_with = "lenient_bool")]
     pub add: Option<bool>,
+    /// Direct, per-request authority to index the exact protected root in
+    /// read/index-only mode. Never inherited by automatic root discovery.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub allow_protected_root: Option<bool>,
 }
 
 /// Input for `checkpoint_now`.
@@ -1306,10 +1325,19 @@ fn cochange_fallback_detail(
 
 fn cochange_lazy_prepare_evidence(
     root: &Path,
+    project_state: Option<&crate::domain::ProjectStateDir>,
     reason: &str,
     fallback_detail: &str,
 ) -> CapabilityEvidence {
-    match crate::live_index::coupling::start_lazy_prepare(root) {
+    let Some(project_state) = project_state else {
+        return cochange_ranking_evidence(
+            CapabilityStatus::Unavailable,
+            CapabilityFreshness::Unknown,
+            CapabilityCost::Free,
+            format!("{reason}; no project-state owner is available; {fallback_detail}"),
+        );
+    };
+    match crate::live_index::coupling::start_lazy_prepare(root, project_state) {
         Ok(crate::live_index::coupling::LazyPrepareOutcome::Started) => cochange_ranking_evidence(
             CapabilityStatus::Preparing,
             CapabilityFreshness::Unknown,
@@ -1335,8 +1363,19 @@ fn cochange_lazy_prepare_evidence(
     }
 }
 
-fn cochange_stale_prepare_evidence(root: &Path) -> CapabilityEvidence {
-    match crate::live_index::coupling::start_lazy_prepare(root) {
+fn cochange_stale_prepare_evidence(
+    root: &Path,
+    project_state: Option<&crate::domain::ProjectStateDir>,
+) -> CapabilityEvidence {
+    let Some(project_state) = project_state else {
+        return cochange_ranking_evidence(
+            CapabilityStatus::Unavailable,
+            CapabilityFreshness::Stale,
+            CapabilityCost::Free,
+            "coupling store is stale but no project-state owner is available; path ranking returned",
+        );
+    };
+    match crate::live_index::coupling::start_lazy_prepare(root, project_state) {
         Ok(crate::live_index::coupling::LazyPrepareOutcome::Started) => cochange_ranking_evidence(
             CapabilityStatus::Stale,
             CapabilityFreshness::Stale,
@@ -1365,6 +1404,7 @@ fn cochange_stale_prepare_evidence(root: &Path) -> CapabilityEvidence {
 fn search_files_coupling_neighbors(
     index: &LiveIndex,
     repo_root: Option<&Path>,
+    project_state: Option<&crate::domain::ProjectStateDir>,
     anchor_path: &str,
 ) -> SearchFilesCoChangeResolution {
     let anchor_path = normalize_exact_path(anchor_path);
@@ -1397,14 +1437,15 @@ fn search_files_coupling_neighbors(
 
     let store = if let Some(store) = index.coupling_store() {
         Some(store.clone())
-    } else if let Some(root) = repo_root {
-        match crate::live_index::coupling::open_existing_coupling_store(root) {
+    } else if let (Some(root), Some(project_state)) = (repo_root, project_state) {
+        match crate::live_index::coupling::open_existing_coupling_store(project_state) {
             Ok(Some(store)) => Some((*store).clone()),
             Ok(None) => {
                 return SearchFilesCoChangeResolution {
                     neighbors: None,
                     evidence: cochange_lazy_prepare_evidence(
                         root,
+                        Some(project_state),
                         "no coupling store exists for this workspace",
                         "path ranking returned",
                     ),
@@ -1453,6 +1494,7 @@ fn search_files_coupling_neighbors(
                     neighbors: None,
                     evidence: cochange_lazy_prepare_evidence(
                         root,
+                        project_state,
                         "coupling store exists but has not completed a cold build",
                         "path ranking returned",
                     ),
@@ -1493,7 +1535,7 @@ fn search_files_coupling_neighbors(
         if stored_head != current_head {
             return SearchFilesCoChangeResolution {
                 neighbors: None,
-                evidence: cochange_stale_prepare_evidence(root),
+                evidence: cochange_stale_prepare_evidence(root, project_state),
             };
         }
     }
@@ -1788,11 +1830,16 @@ impl CapabilityStatusReport {
     }
 }
 
-fn frecency_health_status(repo_root: Option<&Path>) -> String {
-    let Some(repo_root) = repo_root else {
+fn frecency_health_status(
+    repo_root: Option<&Path>,
+    project_state: Option<&crate::domain::ProjectStateDir>,
+) -> String {
+    if repo_root.is_none() {
         return "unavailable/no-repository-root".to_string();
-    };
-    let has_persistent_history = crate::live_index::frecency::frecency_db_path(repo_root).is_file();
+    }
+    let has_persistent_history = project_state
+        .map(crate::live_index::frecency::frecency_db_path)
+        .is_some_and(|path| path.is_file());
     match crate::live_index::frecency::collection_policy_from_env() {
         FrecencyCollectionPolicy::Disabled => "disabled by policy".to_string(),
         FrecencyCollectionPolicy::Session => {
@@ -1803,6 +1850,9 @@ fn frecency_health_status(repo_root: Option<&Path>) -> String {
             }
         }
         FrecencyCollectionPolicy::Persistent => {
+            if project_state.is_none() {
+                return "unavailable/no-project-state-owner".to_string();
+            }
             if has_persistent_history {
                 "ready/persistent".to_string()
             } else {
@@ -1838,7 +1888,11 @@ fn cochange_store_health_status(
     }
 }
 
-fn cochange_health_status(index: &LiveIndex, repo_root: Option<&Path>) -> String {
+fn cochange_health_status(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    project_state: Option<&crate::domain::ProjectStateDir>,
+) -> String {
     let policy = crate::live_index::coupling::coupling_prepare_policy_from_env();
     if matches!(policy, CouplingPreparePolicy::Disabled) {
         return "disabled by policy".to_string();
@@ -1855,7 +1909,10 @@ fn cochange_health_status(index: &LiveIndex, repo_root: Option<&Path>) -> String
         return cochange_store_health_status(store, repo_root);
     }
 
-    match crate::live_index::coupling::open_existing_coupling_store(repo_root) {
+    let Some(project_state) = project_state else {
+        return "unavailable/no-project-state-owner".to_string();
+    };
+    match crate::live_index::coupling::open_existing_coupling_store(project_state) {
         Ok(Some(store)) => cochange_store_health_status(store.as_ref(), repo_root),
         Ok(None) => match policy {
             CouplingPreparePolicy::LazyOnRequest => {
@@ -1887,10 +1944,14 @@ fn ranking_diagnostics_health_status() -> String {
     }
 }
 
-fn capability_status_report(index: &LiveIndex, repo_root: Option<&Path>) -> CapabilityStatusReport {
+fn capability_status_report(
+    index: &LiveIndex,
+    repo_root: Option<&Path>,
+    project_state: Option<&crate::domain::ProjectStateDir>,
+) -> CapabilityStatusReport {
     CapabilityStatusReport {
-        frecency: frecency_health_status(repo_root),
-        co_change: cochange_health_status(index, repo_root),
+        frecency: frecency_health_status(repo_root, project_state),
+        co_change: cochange_health_status(index, repo_root, project_state),
         worktree_routing: worktree_routing_health_status(),
         ranking_diagnostics: ranking_diagnostics_health_status(),
     }
@@ -3357,11 +3418,15 @@ fn sidecar_state_for_server(server: &SymForgeServer) -> SidecarState {
 fn sidecar_status_for_server(server: &SymForgeServer) -> crate::sidecar::port_file::SidecarStatus {
     let bind_host =
         std::env::var("SYMFORGE_SIDECAR_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    if let Some(repo_root) = server.capture_repo_root() {
-        let symforge_dir = repo_root.join(crate::sidecar::port_file::DIR_NAME);
-        return crate::sidecar::port_file::read_sidecar_status_at(&symforge_dir, &bind_host);
-    }
-    crate::sidecar::port_file::read_sidecar_status(&bind_host)
+    let Some(control_state_dir) = server.capture_control_state_dir() else {
+        return crate::sidecar::port_file::SidecarStatus::no_sidecar();
+    };
+    let repo_root = server.capture_repo_root();
+    crate::sidecar::port_file::read_sidecar_status(
+        &control_state_dir,
+        &bind_host,
+        repo_root.as_deref(),
+    )
 }
 
 /// Best-effort PATH-shadow report for the binary serving this runtime.
@@ -3614,6 +3679,68 @@ fn render_symbol_context_header(
         }
         SymbolSelectorMatch::NotFound | SymbolSelectorMatch::Ambiguous(_) => None,
     }
+}
+
+fn capture_trace_symbol_view_for_generation(
+    published: &crate::live_index::PublishedGeneration,
+    params: &TraceSymbolInput,
+    sections: Option<&[String]>,
+) -> crate::live_index::TraceSymbolView {
+    let mut trace_view = published.live.capture_trace_symbol_view(
+        &params.path,
+        &params.name,
+        params.kind.as_deref(),
+        params.symbol_line,
+        sections,
+        include_tests_from_sections(params.sections.as_ref()),
+    );
+
+    if let crate::live_index::TraceSymbolView::Found(ref mut found) = trace_view {
+        let wants_git = sections
+            .map(|values| values.iter().any(|value| value.eq_ignore_ascii_case("git")))
+            .unwrap_or(true);
+
+        if wants_git {
+            let temporal = &published.code_signals.temporal;
+            if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready
+                && let Some(history) = temporal.files.get(&params.path)
+            {
+                use crate::live_index::git_temporal::{churn_bar, churn_label, relative_time};
+
+                found.git_activity = Some(crate::live_index::GitActivityView {
+                    churn_score: history.churn_score,
+                    churn_bar: churn_bar(history.churn_score),
+                    churn_label: churn_label(history.churn_score).to_string(),
+                    commit_count: history.commit_count,
+                    last_relative: relative_time(history.last_commit.days_ago),
+                    last_hash: history.last_commit.hash.clone(),
+                    last_message: history.last_commit.message_head.clone(),
+                    last_author: history.last_commit.author.clone(),
+                    last_timestamp: history.last_commit.timestamp.clone(),
+                    owners: history
+                        .contributors
+                        .iter()
+                        .map(|contributor| {
+                            format!("{} {:.0}%", contributor.author, contributor.percentage)
+                        })
+                        .collect(),
+                    co_changes: history
+                        .co_changes
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.path.clone(),
+                                entry.coupling_score,
+                                entry.shared_commits,
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+    }
+
+    trace_view
 }
 
 enum CapturedGetSymbolsEntry {
@@ -4149,11 +4276,9 @@ impl SymForgeServer {
             let guard = self.index.read();
             loading_guard!(guard);
         }
+        let published = self.index.published_generation();
         if params.0.estimate == Some(true) {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            let file_count = guard.file_count();
-            drop(guard);
+            let file_count = published.live.file_count();
             let detail = params.0.detail.as_deref().unwrap_or("compact");
             let est = match detail {
                 "full" => {
@@ -4173,9 +4298,7 @@ impl SymForgeServer {
         } else if let Some(max_tokens) = params.0.max_tokens {
             // Adaptive detail: auto-select "full" when the estimated output fits
             // within the token budget, otherwise fall back to "compact".
-            let guard = self.index.read();
-            let file_count = guard.file_count();
-            drop(guard);
+            let file_count = published.live.file_count();
             let max_files = params.0.max_files.unwrap_or(200) as usize;
             let full_estimate = max_files.min(file_count) * 30;
             if (full_estimate as u64) <= max_tokens {
@@ -4186,13 +4309,12 @@ impl SymForgeServer {
         } else {
             "compact"
         };
-        let output = match detail {
+        let mut output = match detail {
             "full" => {
-                let published = self.index.published_state();
-                if let Some(message) = loading_guard_message_from_published(&published) {
+                if let Some(message) = loading_guard_message_from_published(&published.health) {
                     return message;
                 }
-                let view = self.index.published_repo_outline();
+                let view = Arc::clone(&published.outline);
                 if let Some(ref path) = params.0.path {
                     // Filter outline to files under the given path prefix
                     let filtered_files: Vec<_> = view
@@ -4256,49 +4378,47 @@ impl SymForgeServer {
                 }
             }
             "tree" => {
-                let published = self.index.published_state();
-                if let Some(message) = loading_guard_message_from_published(&published) {
+                if let Some(message) = loading_guard_message_from_published(&published.health) {
                     return message;
                 }
                 let path = params.0.path.as_deref().unwrap_or("");
                 let depth = params.0.depth.unwrap_or(2).min(5);
-                let view = self.index.published_repo_outline();
-                let guard = self.index.read();
-                let skipped = guard.skipped_files().to_vec();
-                drop(guard);
+                let view = Arc::clone(&published.outline);
+                let skipped = published.live.compatibility_skipped_files();
                 format::file_tree_view_with_skipped(&view.files, &skipped, path, depth)
             }
-            _ => {
-                let guard = self.index.read();
-                loading_guard!(guard);
-                drop(guard);
-
-                let state = sidecar_state_for_server(self);
-                match repo_map_text(&state) {
-                    Ok(result) => {
-                        let doctrine = "\nDoctrine: the map orients; the tools prove. \
+            _ => match repo_map_text_for_generation(&published) {
+                Ok(result) => {
+                    let doctrine = "\nDoctrine: the map orients; the tools prove. \
                              Completeness: ranked and truncated by result cap - absence \
                              from the map is not absence from the repo; confirm with \
                              search_symbols / search_text before concluding something is missing.";
-                        format!("{result}{doctrine}")
-                    }
-                    Err(StatusCode::NOT_FOUND) => "Repository map unavailable.".to_string(),
-                    Err(StatusCode::INTERNAL_SERVER_ERROR) => {
-                        "Repository map failed: internal error.".to_string()
-                    }
-                    Err(other) => format!("Repository map failed: HTTP {}", other.as_u16()),
+                    format!("{result}{doctrine}")
                 }
-            }
+                Err(StatusCode::NOT_FOUND) => "Repository map unavailable.".to_string(),
+                Err(StatusCode::INTERNAL_SERVER_ERROR) => {
+                    "Repository map failed: internal error.".to_string()
+                }
+                Err(other) => format!("Repository map failed: HTTP {}", other.as_u16()),
+            },
         };
+        let knowledge_map =
+            crate::protocol::knowledge_model::render_repository_knowledge_map(&published);
+        output.push_str("\n\n");
+        output.push_str(&knowledge_map);
         self.session_context.record_summary_output(
             "get_repo_map",
             (output.len() / 4).min(u32::MAX as usize) as u32,
         );
-        if detail == "full" {
-            self.apply_ccr_budget("get_repo_map", output, params.0.max_tokens)
-        } else {
-            format::enforce_token_budget(output, params.0.max_tokens)
-        }
+        let budget_summary = format!(
+            "Repository orientation budget summary\noutput_coverage=degraded\n{knowledge_map}\n\nCode topology omitted from the bounded summary; retrieve the full map through the CCR handle."
+        );
+        self.apply_ccr_budget_with_summary(
+            "get_repo_map",
+            output,
+            budget_summary,
+            params.0.max_tokens,
+        )
     }
 
     /// Rich file summary: symbol outline, imports, consumers, references, and git activity.
@@ -4307,7 +4427,7 @@ impl SymForgeServer {
     /// Much smaller than reading the raw file.
     /// NOT for reading actual source code (use get_file_content or get_symbol).
     #[tool(
-        description = "Prefer this over raw file reads for code understanding — it usually saves 70-95% of tokens by returning the file's symbol outline and structure first. Rich file summary: symbol outline, imports, consumers, references, and git activity. Use sections=['outline'] for a fast first pass, or sections=['outline','imports'] to stay compact. Best tool for understanding a file before editing or before deciding whether you need exact raw text. NOT for reading actual source code (use get_file_content or get_symbol).",
+        description = "Prefer this over raw file reads for code understanding — it usually saves 70-95% of tokens by returning the file's symbol outline and structure first. Rich file summary: symbol outline, imports, consumers, references, git activity, and exact repository-knowledge backlinks. Use sections=['outline'] for a fast first pass, sections=['knowledge'] for the trust header plus knowledge backlinks only, or omit/pass [] for all sections. Best tool for understanding a file before editing or before deciding whether you need exact raw text. NOT for reading actual source code (use get_file_content or get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_file_context(&self, params: Parameters<GetFileContextInput>) -> String {
@@ -4318,9 +4438,21 @@ impl SymForgeServer {
             return refusal;
         }
         let force_refresh = params.0.force_refresh == Some(true);
+        freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(&params.0.path));
+        let published = self.index.published_generation();
+        if let Some(message) = loading_guard_message_from_published(&published.health) {
+            return message;
+        }
         let params_hash = crate::protocol::session::hash_file_context_params(
             params.0.max_tokens,
             params.0.sections.as_deref(),
+            &self.project_name,
+            published
+                .source
+                .as_deref()
+                .map(|source| source.source_id.as_str()),
+            published.publication_generation,
+            published.content_generation,
         );
         if let Some(meta) = self.session_context.try_file_context_cache_hit(
             &params.0.path,
@@ -4337,23 +4469,17 @@ impl SymForgeServer {
         // disk fallback shared with the symbol-level degradation path.
         {
             let repo_root = self.capture_repo_root();
-            let degraded = {
-                let guard = self.index.read();
-                loading_guard!(guard);
-                admission_tier_file_degradation_for_path(
-                    &guard,
-                    repo_root.as_deref(),
-                    &params.0.path,
-                )
-            };
+            let degraded = admission_tier_file_degradation_for_path(
+                published.live.as_ref(),
+                repo_root.as_deref(),
+                &params.0.path,
+            );
             if let Some(result) = degraded {
                 return result;
             }
         }
         if params.0.estimate == Some(true) {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            if let Some(file) = guard.capture_shared_file(&params.0.path) {
+            if let Some(file) = published.live.capture_shared_file(&params.0.path) {
                 let file_tokens = file.content.len() / 4;
                 let outline_tokens = file.content.len() / 50; // ~5-10% of raw
                 return format!(
@@ -4371,22 +4497,20 @@ impl SymForgeServer {
             }
         }
         const LARGE_FILE_CONTEXT_DEFAULT_TOKENS: u64 = 1000;
-        let (raw_chars, line_count, symbol_count, reference_count) = {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            let stats = guard
+        let (file_exists, raw_chars, line_count, symbol_count, reference_count) = {
+            published
+                .live
                 .capture_shared_file(&params.0.path)
                 .map(|f| {
                     (
+                        true,
                         f.content.len(),
                         format::indexed_file_line_count(&f.content),
                         f.symbols.len(),
                         f.references.len(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0));
-            drop(guard);
-            stats
+                .unwrap_or((false, 0, 0, 0, 0))
         };
         let is_small_file = format::is_small_indexed_file(raw_chars, line_count);
         let large_default_summary = !is_small_file
@@ -4395,26 +4519,69 @@ impl SymForgeServer {
 
         let state = sidecar_state_for_server(self);
         let include_tests = include_tests_from_sections(params.0.sections.as_ref());
+        let requested_sections = visible_sections(&params.0.sections);
+        let knowledge_requested = requested_sections.as_ref().map_or(true, |sections| {
+            sections.is_empty() || sections.iter().any(|section| section == "knowledge")
+        });
+        let knowledge_only = requested_sections
+            .as_ref()
+            .is_some_and(|sections| sections.len() == 1 && sections[0] == "knowledge");
+        let requested_code_sections = requested_sections.as_ref().map(|sections| {
+            sections
+                .iter()
+                .filter(|section| section.as_str() != "knowledge")
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         let sections = if is_small_file {
             Some(vec!["outline".to_string()])
         } else if large_default_summary {
             Some(vec!["outline".to_string(), "imports".to_string()])
         } else {
-            visible_sections(&params.0.sections)
+            requested_code_sections
         };
         let context_max_tokens = Some(format::resolve_read_max_tokens(
             params
                 .0
                 .max_tokens
+                .or_else(|| knowledge_requested.then_some(1000))
                 .or_else(|| large_default_summary.then_some(LARGE_FILE_CONTEXT_DEFAULT_TOKENS)),
             raw_chars,
         ));
+        let knowledge_section = knowledge_requested
+            .then(|| {
+                crate::protocol::knowledge_model::render_code_knowledge_context(
+                    &published,
+                    &crate::live_index::knowledge_bridge::CodeAnchorId::File {
+                        path: params.0.path.clone(),
+                    },
+                    true,
+                )
+            })
+            .flatten();
+        if knowledge_only {
+            if !file_exists {
+                return format::not_found_file(&params.0.path);
+            }
+            let output = crate::protocol::knowledge_model::render_budgeted_code_knowledge_only(
+                &published,
+                knowledge_section.as_deref(),
+                context_max_tokens,
+            );
+            let tokens = (output.len() / 4) as u32;
+            self.session_context
+                .record_file_context_fetch(&params.0.path, params_hash, tokens);
+            self.session_context
+                .record_listed_file(&params.0.path, tokens);
+            self.bump_frecency(&[PathBuf::from(&params.0.path)]);
+            return output;
+        }
         let outline = OutlineParams {
             path: params.0.path.clone(),
             max_tokens: context_max_tokens,
             sections: sections.clone(),
         };
-        match outline_tool_text(&state, &outline) {
+        match outline_tool_text_for_generation(&state, &published, &outline) {
             Ok(result) => {
                 let mut result =
                     format::collapse_large_test_modules(result, include_tests, sections.as_deref());
@@ -4429,12 +4596,19 @@ impl SymForgeServer {
                         format!("{note}\n\n{result}")
                     };
                 }
-                let body = result;
+                let mut body = result;
+                if let Some(knowledge) = &knowledge_section {
+                    body.push_str("\n\n");
+                    body.push_str(knowledge);
+                }
                 let footer = format::compact_savings_footer(body.len(), raw_chars);
-                let (mut output, truncated_after_assembly) = format::enforce_token_budget_flagged(
-                    format!("{body}{footer}"),
-                    context_max_tokens,
-                );
+                let (mut output, truncated_after_assembly) =
+                    crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
+                        &published,
+                        format!("{body}{footer}"),
+                        knowledge_section.as_deref(),
+                        context_max_tokens,
+                    );
                 if truncated_after_assembly {
                     // The sidecar stamped the trust envelope (possibly
                     // `Completeness: full`) BEFORE this post-assembly cut —
@@ -4484,11 +4658,11 @@ impl SymForgeServer {
     /// (2) bundle=true: symbol body + full definitions of all referenced custom types, resolved recursively — best
     /// for edit preparation (requires path). (3) sections=[...]: comprehensive trace analysis — definition, callers,
     /// callees, implementations, type dependencies, git activity. Valid sections: 'dependents', 'siblings',
-    /// 'implementations', 'git' (empty array = all). Set verbosity='signature' for ~80% smaller output.
+    /// 'implementations', 'git', 'knowledge' (empty array = all). Set verbosity='signature' for ~80% smaller output.
     /// NOT for just the symbol body (use get_symbol).
     #[tool(
         name = "get_symbol_context",
-        description = "Symbol usage analysis with three modes. (1) Default: definition + callers grouped by file + callees + type usages. (2) bundle=true: symbol body + full definitions of all referenced custom types, resolved recursively — best for edit preparation (requires path). (3) sections=[...]: comprehensive trace analysis — definition, callers, callees, implementations, type dependencies, git activity. Valid sections: 'dependents', 'siblings', 'implementations', 'git' (empty array = all). Set verbosity='signature' for ~80% smaller output. NOT for just the symbol body (use get_symbol).",
+        description = "Symbol usage analysis with three modes. (1) Default: definition + callers grouped by file + callees + type usages; exact knowledge backlinks are appended only when evidence exists. (2) bundle=true: symbol body + full definitions of all referenced custom types, resolved recursively; bundles never inject knowledge. (3) sections=[...]: comprehensive trace analysis or sections=['knowledge'] for the trust header plus knowledge backlinks only. Valid sections: 'dependents', 'siblings', 'implementations', 'git', 'knowledge' (empty array = all). Set verbosity='signature' for ~80% smaller output. NOT for just the symbol body (use get_symbol).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn get_symbol_context_tool(
@@ -4517,28 +4691,34 @@ impl SymForgeServer {
         if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
             return refusal;
         }
+        let refreshed = params
+            .0
+            .path
+            .as_deref()
+            .or(params.0.file.as_deref())
+            .is_some_and(|path| {
+                freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(path))
+            });
+        let published = self.index.published_generation();
+        if let Some(message) = loading_guard_message_from_published(&published.health) {
+            return message;
+        }
         if let Some(path) = params.0.path.as_deref().or(params.0.file.as_deref()) {
             let repo_root = self.capture_repo_root();
-            let degraded = {
-                let guard = self.index.read();
-                loading_guard!(guard);
-                admission_tier_degradation_for_path(
-                    &guard,
-                    repo_root.as_deref(),
-                    "get_symbol_context",
-                    path,
-                    &params.0.name,
-                )
-            };
+            let degraded = admission_tier_degradation_for_path(
+                published.live.as_ref(),
+                repo_root.as_deref(),
+                "get_symbol_context",
+                path,
+                &params.0.name,
+            );
             if let Some(result) = degraded {
                 return result;
             }
         }
         if params.0.estimate == Some(true) {
             let path = params.0.path.as_deref().unwrap_or("");
-            let guard = self.index.read();
-            loading_guard!(guard);
-            if let Some(file) = guard.capture_shared_file(path) {
+            if let Some(file) = published.live.capture_shared_file(path) {
                 let sym_tokens = file
                     .symbols
                     .iter()
@@ -4567,26 +4747,24 @@ impl SymForgeServer {
                 Some(p) => p.to_string(),
                 None => return "Error: bundle=true requires the 'path' parameter.".to_string(),
             };
-            let refreshed =
-                freshen_exact_path_for_targeted_retrieval(self, &search::PathScope::exact(&path));
             let (view, raw_chars, parse_state) = {
-                let guard = self.index.read();
-                loading_guard!(guard);
-                let raw = guard
+                let raw = published
+                    .live
                     .capture_shared_file(&path)
                     .map(|f| f.content.len())
                     .unwrap_or(0);
-                let parse_state = guard
+                let parse_state = published
+                    .live
                     .capture_shared_file(&path)
                     .map(|f| parse_state_for_file(f.as_ref()))
                     .unwrap_or("parsed");
-                let v = guard.capture_context_bundle_view(
+                let view = published.live.capture_context_bundle_view(
                     &path,
                     &params.0.name,
                     params.0.symbol_kind.as_deref(),
                     params.0.symbol_line,
                 );
-                (v, raw, parse_state)
+                (view, raw, parse_state)
             };
             let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
             let result = format::context_bundle_result_view_with_max_tokens(
@@ -4645,9 +4823,53 @@ impl SymForgeServer {
 
             // Convert sections: Some(empty vec) = all sections (like trace_symbol's None)
             let include_tests = include_tests_from_sections(params.0.sections.as_ref());
-            let sections_param = visible_sections(&params.0.sections)
-                .and_then(|s| if s.is_empty() { None } else { Some(s) });
+            let requested_sections = visible_sections(&params.0.sections).unwrap_or_default();
+            let knowledge_requested = requested_sections.is_empty()
+                || requested_sections
+                    .iter()
+                    .any(|section| section == "knowledge");
+            let knowledge_only = requested_sections.len() == 1
+                && requested_sections
+                    .first()
+                    .is_some_and(|section| section == "knowledge");
+            let sections_param = requested_sections
+                .iter()
+                .filter(|section| section.as_str() != "knowledge")
+                .cloned()
+                .collect::<Vec<_>>();
+            let sections_param = if sections_param.is_empty() {
+                None
+            } else {
+                Some(sections_param)
+            };
             let sections_param = encode_include_tests_marker(sections_param, include_tests);
+
+            let target = crate::protocol::knowledge_model::resolve_symbol_code_anchor(
+                &published,
+                &path,
+                &params.0.name,
+                params.0.symbol_kind.as_deref(),
+                params.0.symbol_line,
+            );
+            let knowledge = target.as_ref().and_then(|target| {
+                crate::protocol::knowledge_model::render_code_knowledge_context(
+                    &published, target, true,
+                )
+            });
+            if knowledge_only {
+                let output = crate::protocol::knowledge_model::render_budgeted_code_knowledge_only(
+                    &published,
+                    knowledge.as_deref(),
+                    params.0.max_tokens.or(Some(1000)),
+                );
+                self.session_context.record_symbol(
+                    &path,
+                    &params.0.name,
+                    (output.len() / 4) as u32,
+                );
+                self.bump_frecency(&[PathBuf::from(&path)]);
+                return output;
+            }
 
             let trace_input = TraceSymbolInput {
                 path: path.clone(),
@@ -4659,7 +4881,35 @@ impl SymForgeServer {
                 max_tokens: params.0.max_tokens,
                 estimate: None,
             };
-            let trace_result = self.trace_symbol(Parameters(trace_input)).await;
+            let trace_sections = visible_sections(&trace_input.sections);
+            let trace_view = capture_trace_symbol_view_for_generation(
+                &published,
+                &trace_input,
+                trace_sections.as_deref(),
+            );
+            let trace_verbosity = trace_input.verbosity.as_deref().unwrap_or("full");
+            let mut trace_result = format::trace_symbol_result_view(
+                &trace_view,
+                &trace_input.name,
+                trace_verbosity,
+                trace_input.max_tokens,
+            );
+            if knowledge_requested {
+                if let Some(knowledge) = &knowledge {
+                    trace_result.push_str("\n\n");
+                    trace_result.push_str(knowledge);
+                }
+            }
+            let (trace_result, _) =
+                crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
+                    &published,
+                    trace_result,
+                    knowledge.as_deref(),
+                    params
+                        .0
+                        .max_tokens
+                        .or_else(|| knowledge_requested.then_some(1000)),
+                );
             self.session_context.record_symbol(
                 &path,
                 &params.0.name,
@@ -4668,16 +4918,10 @@ impl SymForgeServer {
             // Frecency bump — commitment tool, trace-mode happy path.
             // Collection policy is resolved inside bump_frecency.
             self.bump_frecency(&[PathBuf::from(&path)]);
-            return format::enforce_token_budget(trace_result, params.0.max_tokens);
+            return trace_result;
         }
 
         // Default: symbol context mode
-        if let Some(result) = self.proxy_tool_call("get_symbol_context", &params.0).await {
-            return result;
-        }
-        if let Some(refusal) = self.foreign_project_refusal(params.0.project.as_deref()) {
-            return refusal;
-        }
         let file_path_hint = params.0.path.as_deref().or(params.0.file.as_deref());
         // Auto-resolve path from index when not provided
         let resolved_path: Option<String>;
@@ -4685,9 +4929,7 @@ impl SymForgeServer {
             resolved_path = None;
             file_path_hint
         } else {
-            let guard = self.index.read();
-            let candidates = symbol_candidate_paths(&guard, &params.0.name);
-            drop(guard);
+            let candidates = symbol_candidate_paths(published.live.as_ref(), &params.0.name);
             if candidates.len() == 1 {
                 resolved_path = Some(candidates.into_iter().next().unwrap());
                 resolved_path.as_deref()
@@ -4700,14 +4942,26 @@ impl SymForgeServer {
         };
         let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
         let max_tokens = params.0.max_tokens;
+        let knowledge_section = file_path_hint
+            .and_then(|path| {
+                crate::protocol::knowledge_model::resolve_symbol_code_anchor(
+                    &published,
+                    path,
+                    &params.0.name,
+                    params.0.symbol_kind.as_deref(),
+                    params.0.symbol_line,
+                )
+            })
+            .and_then(|target| {
+                crate::protocol::knowledge_model::render_code_knowledge_context(
+                    &published, &target, false,
+                )
+            });
 
         // Capture the symbol definition from the index so we can prepend it
         // (the sidecar only returns reference locations, not the definition itself).
         let (symbol_header, impl_block_tip, callees_text, raw_chars) = {
-            let guard = self.index.read();
-            loading_guard!(guard);
-
-            let file = file_path_hint.and_then(|p| guard.capture_shared_file(p));
+            let file = file_path_hint.and_then(|path| published.live.capture_shared_file(path));
             let raw = file.as_ref().map(|f| f.content.len()).unwrap_or(0);
 
             let header = file.and_then(|f| {
@@ -4723,7 +4977,7 @@ impl SymForgeServer {
 
             let (impl_block_tip, callees_text) = file_path_hint
                 .map(|path| {
-                    let view = guard.capture_context_bundle_view(
+                    let view = published.live.capture_context_bundle_view(
                         path,
                         &params.0.name,
                         params.0.symbol_kind.as_deref(),
@@ -4746,7 +5000,7 @@ impl SymForgeServer {
             symbol_kind: params.0.symbol_kind.clone(),
             symbol_line: params.0.symbol_line,
         };
-        match symbol_context_tool_text(&state, &symbol_context) {
+        match symbol_context_tool_text_for_generation(&state, &published, &symbol_context) {
             Ok(refs_text) => {
                 let mut output = String::new();
                 if let Some(header) = &symbol_header {
@@ -4760,6 +5014,10 @@ impl SymForgeServer {
                 }
                 if !impl_block_tip.is_empty() {
                     output.push_str(impl_block_tip.trim_start_matches('\n'));
+                }
+                if let Some(knowledge) = &knowledge_section {
+                    output.push_str("\n\n");
+                    output.push_str(knowledge);
                 }
                 let footer = format::compact_savings_footer(output.len(), raw_chars);
                 // Frecency bump — commitment tool, default-mode happy path.
@@ -4776,7 +5034,13 @@ impl SymForgeServer {
                 {
                     self.bump_frecency(&[bump_path]);
                 }
-                format::enforce_token_budget(format!("{output}{footer}"), max_tokens)
+                crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
+                    &published,
+                    format!("{output}{footer}"),
+                    knowledge_section.as_deref(),
+                    max_tokens,
+                )
+                .0
             }
             Err(_) => {
                 // Sidecar unavailable — fall back to the index definition so callers
@@ -4788,6 +5052,10 @@ impl SymForgeServer {
                     if !impl_block_tip.is_empty() {
                         body.push('\n');
                         body.push_str(impl_block_tip.trim_start_matches('\n'));
+                    }
+                    if let Some(knowledge) = &knowledge_section {
+                        body.push_str("\n\n");
+                        body.push_str(knowledge);
                     }
                     let footer = format::compact_savings_footer(body.len(), raw_chars);
                     self.record_read_savings(format::saved_tokens_vs_competent_manual(
@@ -4822,7 +5090,13 @@ impl SymForgeServer {
                     {
                         self.bump_frecency(&[bump_path]);
                     }
-                    format::enforce_token_budget(output, max_tokens)
+                    crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(
+                        &published,
+                        output,
+                        knowledge_section.as_deref(),
+                        max_tokens,
+                    )
+                    .0
                 } else {
                     format!("Symbol \"{}\" not found in index.", params.0.name)
                 }
@@ -5108,6 +5382,195 @@ impl SymForgeServer {
         statused_tool_result(output, outcome_class)
     }
 
+    /// Retrieves exact, bounded repository-knowledge evidence from one captured
+    /// immutable source generation. This Gate I surface intentionally supports
+    /// only the current source; other frozen source scopes arrive in Gate L.
+    #[tool(
+        name = "search_knowledge",
+        description = "Search exact repository knowledge evidence with captured source/version/generation provenance, deterministic authority filtering, bounded bridge previews, and explicit coverage. Gate I supports source_scope='current' only. Read-only and frecency-neutral.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn search_knowledge_tool(
+        &self,
+        params: Parameters<SearchKnowledgeInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if let Err(output) = super::knowledge_search::validate_input(&params.0) {
+            let outcome_class = classify_search_knowledge_output(&output);
+            return statused_tool_result(output, outcome_class);
+        }
+        let started = Instant::now();
+        let output = self.search_knowledge(params).await;
+        let outcome_class = classify_search_knowledge_output(&output);
+        self.record_tool_completion(
+            "search_knowledge",
+            &output,
+            started.elapsed(),
+            outcome_class,
+        );
+        statused_tool_result(output, outcome_class)
+    }
+
+    pub(crate) async fn search_knowledge(
+        &self,
+        params: Parameters<SearchKnowledgeInput>,
+    ) -> String {
+        // Includes the raw-query secret guard and must run before daemon
+        // routing, analytics, cache lookup, or CCR creation.
+        if let Err(error) = super::knowledge_search::validate_input(&params.0) {
+            return error;
+        }
+        if let Some(result) = self.proxy_tool_call("search_knowledge", &params.0).await {
+            return result;
+        }
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
+        }
+
+        let source_set = self.index.published_source_set();
+        let generation = source_set.current_generation();
+        let output = super::knowledge_search::search_current(&generation, &params.0);
+        self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
+    }
+
+    /// Audits repository-knowledge authority and hygiene from one immutable
+    /// publication. Complete-plan hashes are computed before output limits or CCR.
+    #[tool(
+        name = "review_knowledge",
+        description = "Review repository knowledge authority and hygiene in summary, exact-document, or remediation mode. Returns complete aggregate evidence arrays, bridge records, temporal provenance, eligibility blockers, stable per-source review hashes, and a top-level result hash. Gate J supports source_scope='current' only. Read-only and frecency-neutral.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn review_knowledge_tool(
+        &self,
+        params: Parameters<ReviewKnowledgeInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if let Err(output) = super::knowledge_review::validate_input(&params.0) {
+            let outcome_class = classify_search_knowledge_output(&output);
+            return statused_tool_result(output, outcome_class);
+        }
+        let started = Instant::now();
+        let output = self.review_knowledge(params).await;
+        let outcome_class = classify_search_knowledge_output(&output);
+        self.record_tool_completion(
+            "review_knowledge",
+            &output,
+            started.elapsed(),
+            outcome_class,
+        );
+        statused_tool_result(output, outcome_class)
+    }
+
+    pub(crate) async fn review_knowledge(
+        &self,
+        params: Parameters<ReviewKnowledgeInput>,
+    ) -> String {
+        // The no-echo input guard runs before proxy routing, analytics/cache
+        // access, generation capture, or CCR creation.
+        if let Err(error) = super::knowledge_review::validate_input(&params.0) {
+            return error;
+        }
+        if let Some(result) = self.proxy_tool_call("review_knowledge", &params.0).await {
+            return result;
+        }
+        if let Some(refusal) = self
+            .local_cross_project_refusal(params.0.project.as_deref(), params.0.projects.as_deref())
+        {
+            return refusal;
+        }
+
+        let generation = self.index.published_source_set().current_generation();
+        match super::knowledge_review::review_current(&generation, &params.0) {
+            Ok(output) => self.apply_ccr_budget_with_summary(
+                "review_knowledge",
+                output.rendered,
+                output.budget_rendered,
+                params.0.max_tokens,
+            ),
+            Err(error) => error,
+        }
+    }
+
+    /// Applies explicitly approved review actions to the root policy ledger.
+    /// Preview is the default and is strictly side-effect free.
+    #[tool(
+        name = "curate_knowledge",
+        description = "Preview or apply explicitly approved repository-knowledge policy mutations for exactly one current worktree. Requires fresh review, manifest, policy, and target guards; apply additionally requires durable idempotency and atomic file durability. This tool only writes `.symforge-knowledge.toml` and never edits, moves, or deletes repository documents.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn curate_knowledge_tool(
+        &self,
+        params: Parameters<CurateKnowledgeInput>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if let Err(output) = super::knowledge_curation::validate_input(&params.0) {
+            let outcome_class = classify_search_knowledge_output(&output);
+            return statused_tool_result(output, outcome_class);
+        }
+        let started = Instant::now();
+        let output = self.curate_knowledge(params).await;
+        let outcome_class = classify_search_knowledge_output(&output);
+        self.record_tool_completion(
+            "curate_knowledge",
+            &output,
+            started.elapsed(),
+            outcome_class,
+        );
+        statused_tool_result(output, outcome_class)
+    }
+
+    pub(crate) async fn curate_knowledge(
+        &self,
+        params: Parameters<CurateKnowledgeInput>,
+    ) -> String {
+        // No-echo validation precedes proxy routing, project observation,
+        // analytics, durable replay lookup, capability probing, or temp I/O.
+        if let Err(error) = super::knowledge_curation::validate_input(&params.0) {
+            return error;
+        }
+        if let Some(result) = self.proxy_tool_call("curate_knowledge", &params.0).await {
+            return result;
+        }
+        if let Some(refusal) = self.local_cross_project_refusal(params.0.project.as_deref(), None) {
+            return refusal;
+        }
+        let Some(repo_root) = self.repo_root.read().clone() else {
+            return "status=unavailable\nreason=persistent_state_unavailable".to_string();
+        };
+        let state_placement = self.state_placement.read().clone();
+        let persistence_health = *self.persistence_health.read();
+        let coordinator = Arc::clone(&self.curation_coordinator);
+        let index = Arc::clone(&self.index);
+        let input = params.0;
+        tokio::task::spawn_blocking(move || {
+            coordinator.execute(
+                &index,
+                &repo_root,
+                state_placement.as_ref(),
+                persistence_health,
+                &input,
+            )
+        })
+        .await
+        .unwrap_or_else(|_| {
+            "Error: curation_worker_failed; no policy mutation was acknowledged.".to_string()
+        })
+    }
+
     pub(crate) async fn search_text(&self, params: Parameters<SearchTextInput>) -> String {
         if let Some(result) = self.proxy_tool_call("search_text", &params.0).await {
             return result;
@@ -5344,6 +5807,7 @@ impl SymForgeServer {
     /// Internal: trace_symbol logic, called by get_symbol_context when sections are provided.
     /// The daemon compatibility alias routes through get_symbol_context so this
     /// canonical path owns trace-mode behavior.
+    #[cfg(test)]
     pub(crate) async fn trace_symbol(&self, params: Parameters<TraceSymbolInput>) -> String {
         if let Some(result) = self.proxy_tool_call("trace_symbol", &params.0).await {
             return result;
@@ -5361,57 +5825,12 @@ impl SymForgeServer {
             );
         }
 
-        let mut trace_view = {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            guard.capture_trace_symbol_view(
-                &params.0.path,
-                &params.0.name,
-                params.0.kind.as_deref(),
-                params.0.symbol_line,
-                sections.as_deref(),
-                include_tests_from_sections(params.0.sections.as_ref()),
-            )
-        };
-
-        // Fill in git activity if it was requested (or if all sections requested)
-        if let crate::live_index::TraceSymbolView::Found(ref mut found) = trace_view {
-            let wants_git = sections
-                .as_ref()
-                .map(|s| s.iter().any(|v| v.eq_ignore_ascii_case("git")))
-                .unwrap_or(true);
-
-            if wants_git {
-                let temporal = self.index.git_temporal();
-                if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready
-                    && let Some(history) = temporal.files.get(&params.0.path)
-                {
-                    use crate::live_index::git_temporal::{churn_bar, churn_label, relative_time};
-
-                    found.git_activity = Some(crate::live_index::GitActivityView {
-                        churn_score: history.churn_score,
-                        churn_bar: churn_bar(history.churn_score),
-                        churn_label: churn_label(history.churn_score).to_string(),
-                        commit_count: history.commit_count,
-                        last_relative: relative_time(history.last_commit.days_ago),
-                        last_hash: history.last_commit.hash.clone(),
-                        last_message: history.last_commit.message_head.clone(),
-                        last_author: history.last_commit.author.clone(),
-                        last_timestamp: history.last_commit.timestamp.clone(),
-                        owners: history
-                            .contributors
-                            .iter()
-                            .map(|c| format!("{} {:.0}%", c.author, c.percentage))
-                            .collect(),
-                        co_changes: history
-                            .co_changes
-                            .iter()
-                            .map(|e| (e.path.clone(), e.coupling_score, e.shared_commits))
-                            .collect(),
-                    });
-                }
-            }
+        let published = self.index.published_generation();
+        if let Some(message) = loading_guard_message_from_published(&published.health) {
+            return message;
         }
+        let trace_view =
+            capture_trace_symbol_view_for_generation(&published, &params.0, sections.as_deref());
 
         let verbosity = params.0.verbosity.as_deref().unwrap_or("full");
         let output = format::trace_symbol_result_view(
@@ -5777,6 +6196,9 @@ impl SymForgeServer {
         } else {
             None
         };
+        let cochange_project_state = rank_by_path_cochange
+            .then(|| self.capture_project_state_dir())
+            .flatten();
         let mut view = {
             let guard = self.index.read();
             loading_guard!(guard);
@@ -5785,6 +6207,7 @@ impl SymForgeServer {
                     Some(anchor_path) => Some(search_files_coupling_neighbors(
                         &guard,
                         cochange_repo_root.as_deref(),
+                        cochange_project_state.as_ref(),
                         anchor_path,
                     )),
                     None => Some(SearchFilesCoChangeResolution {
@@ -5899,6 +6322,7 @@ impl SymForgeServer {
                     }
                     SearchFilesView::Found { hits, .. } => {
                         if let Some(repo_root) = self.capture_repo_root() {
+                            let project_state = self.capture_project_state_dir();
                             let candidate_count = hits.len();
                             let hit_paths: Vec<std::path::PathBuf> = hits
                                 .iter()
@@ -5911,7 +6335,10 @@ impl SymForgeServer {
                                 .map(|duration| duration.as_secs() as i64)
                                 .unwrap_or(0);
                             match crate::live_index::frecency::ranking_scores_for_paths(
-                                &repo_root, &path_refs, now_ts,
+                                &repo_root,
+                                project_state.as_ref(),
+                                &path_refs,
+                                now_ts,
                             ) {
                                 Ok(Some(snapshot)) if !snapshot.scores.is_empty() => {
                                     let scored_count = snapshot.scores.len();
@@ -6115,7 +6542,11 @@ impl SymForgeServer {
         crate::daemon::single_project_routed_tool(tool)
             || matches!(
                 tool,
-                "search_symbols" | "search_text" | "find_references" | "search_files"
+                "search_symbols"
+                    | "search_text"
+                    | "search_knowledge"
+                    | "find_references"
+                    | "search_files"
             )
     }
 
@@ -6266,16 +6697,7 @@ impl SymForgeServer {
     }
 
     fn project_id_for_root(root: &Path) -> String {
-        let normalized = root.display().to_string().replace('\\', "/");
-        let stable_path = if cfg!(windows) {
-            normalized.to_lowercase()
-        } else {
-            normalized
-        };
-        format!(
-            "project-{}",
-            crate::hash::digest_hex(stable_path.as_bytes())
-        )
+        crate::discovery::project_id_for_canonical_root(root).0
     }
 
     fn runtime_status_for(
@@ -6394,11 +6816,24 @@ impl SymForgeServer {
 
         let capabilities = {
             let repo_root = self.capture_repo_root();
+            let project_state = self.capture_project_state_dir();
             let guard = self.index.read();
-            capability_status_report(&guard, repo_root.as_deref())
+            capability_status_report(&guard, repo_root.as_deref(), project_state.as_ref())
         };
         result.push('\n');
         result.push_str(&capabilities.full_text());
+        let curation_health = {
+            let repo_root = self.capture_repo_root();
+            let state_placement = self.capture_state_placement();
+            self.curation_coordinator.health_line(
+                &self.index,
+                repo_root.as_deref(),
+                state_placement.as_ref(),
+                *self.persistence_health.read(),
+            )
+        };
+        result.push('\n');
+        result.push_str(&curation_health);
 
         // Append worktree-awareness misuse counter (rolling last-hour window).
         result.push('\n');
@@ -6411,9 +6846,9 @@ impl SymForgeServer {
         // guard mirrors the one in `frecency::bump`; when the flag is unset,
         // the health output remains compact unless the feature is explicitly enabled.
         if std::env::var(crate::live_index::frecency::FRECENCY_FLAG_ENV).as_deref() == Ok("1")
-            && let Some(repo_root) = self.capture_repo_root()
+            && let Some(project_state) = self.capture_project_state_dir()
             && let Ok(store) = crate::live_index::frecency::FrecencyStore::open(
-                &crate::live_index::frecency::frecency_db_path(&repo_root),
+                &crate::live_index::frecency::frecency_db_path(&project_state),
             )
         {
             let now_ts = std::time::SystemTime::now()
@@ -6525,11 +6960,24 @@ impl SymForgeServer {
 
         let capabilities = {
             let repo_root = self.capture_repo_root();
+            let project_state = self.capture_project_state_dir();
             let guard = self.index.read();
-            capability_status_report(&guard, repo_root.as_deref())
+            capability_status_report(&guard, repo_root.as_deref(), project_state.as_ref())
         };
         result.push('\n');
         result.push_str(&capabilities.compact_text());
+        let curation_health = {
+            let repo_root = self.capture_repo_root();
+            let state_placement = self.capture_state_placement();
+            self.curation_coordinator.health_line(
+                &self.index,
+                repo_root.as_deref(),
+                state_placement.as_ref(),
+                *self.persistence_health.read(),
+            )
+        };
+        result.push('\n');
+        result.push_str(&curation_health);
 
         if let Some(drift) = crate::version_registry::drift_banner_default() {
             result.push('\n');
@@ -6646,15 +7094,55 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Checkpoint failed: no repository root configured.".to_string(),
         };
+        let state_placement = match self.capture_state_placement() {
+            Some(placement) => placement,
+            None => {
+                *self.persistence_health.write() = crate::domain::CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+                };
+                return "Checkpoint unavailable: persistence_unavailable; applied=false; no resolved project state placement."
+                    .to_string();
+            }
+        };
         let index = Arc::clone(&self.index);
         let checkpoint_root = repo_root.clone();
+        let checkpoint_state_placement = state_placement.clone();
         let verify_after_write = params.0.verify_after_write.unwrap_or(false);
         let export_artifact = params.0.export_artifact.unwrap_or(false);
+        let artifact_access_mode = match &checkpoint_state_placement {
+            crate::domain::StatePlacement::UserLocal {
+                reason: crate::domain::UserLocalPlacementReason::ExplicitProtected,
+                ..
+            } => crate::domain::SourceAccessMode::ExplicitProtected,
+            _ => crate::domain::SourceAccessMode::NormalProject,
+        };
+        let artifact_capability =
+            if artifact_access_mode == crate::domain::SourceAccessMode::ExplicitProtected {
+                crate::domain::CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::ExplicitProtectedSource,
+                }
+            } else if matches!(
+                &checkpoint_state_placement,
+                crate::domain::StatePlacement::ProjectLocal { .. }
+            ) {
+                crate::domain::CapabilityStatus::Available
+            } else {
+                crate::domain::CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::NonProjectLocalPlacement,
+                }
+            };
         match tokio::task::spawn_blocking(move || {
-            let report =
-                crate::live_index::persist::checkpoint_shared_index(&index, &checkpoint_root)?;
+            let report = crate::live_index::persist::checkpoint_shared_index(
+                &index,
+                &checkpoint_root,
+                &checkpoint_state_placement,
+            )?;
             if verify_after_write
-                && crate::live_index::persist::load_snapshot(&checkpoint_root).is_none()
+                && crate::live_index::persist::load_snapshot(
+                    &checkpoint_root,
+                    &checkpoint_state_placement,
+                )
+                .is_none()
             {
                 anyhow::bail!(
                     "checkpoint verification failed: snapshot did not deserialize after write"
@@ -6665,6 +7153,9 @@ impl SymForgeServer {
                 Some(crate::live_index::persist::export_artifact(
                     &guard,
                     &checkpoint_root,
+                    artifact_access_mode,
+                    &checkpoint_state_placement,
+                    &artifact_capability,
                 )?)
             } else {
                 None
@@ -6674,6 +7165,7 @@ impl SymForgeServer {
         .await
         {
             Ok(Ok((report, artifact_report))) => {
+                *self.persistence_health.write() = crate::domain::CapabilityStatus::Available;
                 let mut message = format!(
                     "Checkpoint complete: wrote {} bytes for {} file(s) to {}",
                     report.bytes,
@@ -6696,17 +7188,28 @@ impl SymForgeServer {
                 }
                 if let Some(artifact) = artifact_report {
                     message.push_str(&format!(
-                        "\nArtifact exported: {} ({} bytes compressed from {} for {} file(s))",
+                        "\nArtifact exported: {} ({} bytes compressed from {} for {} file(s)); git_visibility={}",
                         artifact.path.display(),
                         artifact.compressed_bytes,
                         artifact.raw_bytes,
-                        artifact.files
+                        artifact.files,
+                        artifact.git_visibility.as_str()
                     ));
                 }
                 message
             }
-            Ok(Err(error)) => format!("Checkpoint failed: {error}"),
-            Err(join_error) => format!("Checkpoint failed: checkpoint task panicked: {join_error}"),
+            Ok(Err(error)) => {
+                *self.persistence_health.write() = crate::domain::CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+                };
+                format!("Checkpoint failed: {error}")
+            }
+            Err(join_error) => {
+                *self.persistence_health.write() = crate::domain::CapabilityStatus::Unavailable {
+                    reason: crate::domain::CapabilityUnavailableReason::PersistentStateUnavailable,
+                };
+                format!("Checkpoint failed: checkpoint task panicked: {join_error}")
+            }
         }
     }
 
@@ -6754,6 +7257,13 @@ impl SymForgeServer {
             }
             let root_text = root.display().to_string();
             if selector == root_text || selector == root_text.replace('\\', "/") {
+                return true;
+            }
+            let selector_path = std::path::Path::new(selector);
+            if selector_path.is_absolute()
+                && crate::live_index::store::normalize_root(selector_path)
+                    == crate::live_index::store::normalize_root(root)
+            {
                 return true;
             }
         }
@@ -6905,35 +7415,45 @@ impl SymForgeServer {
                 to open multiple projects in one session."
                 .to_string();
         }
-        let root = PathBuf::from(&input.path);
-        // Trust boundary, raw-input first (field report 2026-07-06): a
-        // sensitive system path must be refused BEFORE exists()/canonicalize(),
-        // whose failures on protected trees surface raw OS access errors
-        // instead of the refusal. The post-canonicalize check below stays as
-        // the symlink belt.
-        if crate::paths::is_sensitive_path(&root) {
-            return format!(
-                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
-                root.display()
-            );
-        }
-        if !root.exists() {
-            return format!("Path does not exist: {}", input.path);
-        }
-        if !root.is_dir() {
-            return format!("Path is not a directory: {}", input.path);
-        }
-        // Trust boundary: canonicalize and reject sensitive system paths.
-        let root = match root.canonicalize() {
-            Ok(p) => p,
-            Err(e) => return format!("Cannot resolve path: {e}"),
+        let requested_root = PathBuf::from(&input.path);
+        let allow_protected_root = input.allow_protected_root == Some(true);
+        let binding = match crate::discovery::resolve_root_candidate(
+            &requested_root,
+            crate::domain::RootCandidateSource::ExplicitIndexFolder,
+            crate::domain::RootRequestMode::ExplicitIndexFolder {
+                allow_protected_root,
+            },
+        ) {
+            crate::domain::RootResolution::Bound(binding) => binding,
+            crate::domain::RootResolution::Unbound { reason, .. } => {
+                let crate::domain::UnboundReason::Refused(reason) = reason else {
+                    return "index_folder refused: no candidate declared".to_string();
+                };
+                return match reason {
+                    crate::domain::RootRefusalReason::MissingOrNotDirectory
+                        if !requested_root.exists() =>
+                    {
+                        format!("Path does not exist: {}", input.path)
+                    }
+                    crate::domain::RootRefusalReason::MissingOrNotDirectory => {
+                        format!("Path is not a directory: {}", input.path)
+                    }
+                    crate::domain::RootRefusalReason::CanonicalizationFailed => {
+                        "Cannot resolve path: canonicalization_failed".to_string()
+                    }
+                    _ => format!(
+                        "Refused to index sensitive system path: {}. Use a project directory or retry this exact direct request with allow_protected_root=true.",
+                        reason.code()
+                    ),
+                };
+            }
         };
-        if crate::paths::is_sensitive_path(&root) {
-            return format!(
-                "Refused to index sensitive system path: {}.                  Use a project directory instead.",
-                root.display()
-            );
-        }
+        let explicit_protected = matches!(
+            binding.access_mode,
+            crate::domain::SourceAccessMode::ExplicitProtected
+        );
+        let state_placement = crate::discovery::resolve_state_placement(&binding);
+        let root = binding.canonical_root;
         // Bounded discovery: a huge NON-sensitive tree (a deep monorepo, a
         // generated-file bomb, a user-pointed scratch dir) can no longer OOM or
         // panic the reload. `discovery::discover_all_files`/`discover_files`
@@ -6944,22 +7464,30 @@ impl SymForgeServer {
         // below propagates that error to the caller instead of crashing.
         let reset_requested = index_folder_reset_requested();
         let current_root = self.capture_repo_root();
-        let idempotency = match input.idempotency_key.as_deref() {
-            Some(raw_key) => match crate::idempotency::begin_index_folder_replay(
-                &root,
-                current_root.as_deref(),
-                &root,
-                raw_key,
-                reset_requested,
-            ) {
-                Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Some(active),
-                Ok(crate::idempotency::ReplayStart::Replay(response)) => return response,
-                Err(error) => return crate::idempotency::format_tool_error(&error),
-            },
-            None => None,
+        let (idempotency, replay_response) = match input.idempotency_key.as_deref() {
+            Some(raw_key) => {
+                let Some(control_state) = self.capture_control_state_dir() else {
+                    return "Idempotency unavailable: durable process control state is unavailable."
+                        .to_string();
+                };
+                match crate::idempotency::begin_index_folder_replay(
+                    &control_state,
+                    &root,
+                    raw_key,
+                    reset_requested,
+                    allow_protected_root,
+                ) {
+                    Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => {
+                        (Some(active), None)
+                    }
+                    Ok(crate::idempotency::ReplayStart::Replay(response)) => (None, Some(response)),
+                    Err(error) => return crate::idempotency::format_tool_error(&error),
+                }
+            }
+            None => (None, None),
         };
-        let reset_report = if reset_requested {
-            match crate::live_index::persist::reset_snapshot_state(&root) {
+        let reset_report = if reset_requested && replay_response.is_none() {
+            match crate::live_index::persist::reset_snapshot_state(&root, &state_placement) {
                 Ok(report) => Some(report),
                 Err(error) => {
                     let output = format!("Reset failed: {error}");
@@ -6972,30 +7500,47 @@ impl SymForgeServer {
         } else {
             None
         };
-        let previous_watcher = self.watcher_handle.lock().take();
-        if let Some(previous_watcher) = previous_watcher {
-            previous_watcher.stop_token.store(true, Ordering::Release);
-            let mut previous_task = previous_watcher.task;
-            if tokio::time::timeout(Duration::from_secs(2), &mut previous_task)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    "watcher: previous watcher did not stop within 2s before index reload"
-                );
-                previous_task.abort();
-            }
-        }
         let index = Arc::clone(&self.index);
         let reload_root = root.clone();
-        match tokio::task::spawn_blocking(move || index.reload(&reload_root)).await {
+        let reload_state_placement = state_placement.clone();
+        match tokio::task::spawn_blocking(move || {
+            index.reload_for_state_placement(&reload_root, &reload_state_placement)
+        })
+        .await
+        {
             Ok(Ok(())) => {
+                // The replacement generation is now published. Only at this
+                // commit point may watcher ownership move to the new root; a
+                // failed build above leaves the previous handle and stop token
+                // completely untouched.
+                let previous_watcher = self.watcher_handle.lock().take();
+                if let Some(previous_watcher) = previous_watcher {
+                    previous_watcher.stop_token.store(true, Ordering::Release);
+                    let mut previous_task = previous_watcher.task;
+                    if tokio::time::timeout(Duration::from_secs(2), &mut previous_task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "watcher: previous watcher did not stop during successful index handoff"
+                        );
+                        previous_task.abort();
+                    }
+                }
                 if reset_report.is_some() {
                     self.index.mark_index_folder_reset();
                 }
                 let published = self.index.published_state();
                 let file_count = published.file_count;
                 let symbol_count = published.symbol_count;
+                let gitignore_hygiene = crate::gitignore_hygiene::reconcile_project_gitignore(
+                    &root,
+                    if explicit_protected {
+                        crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitProtected
+                    } else {
+                        crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitNormalBinding
+                    },
+                );
 
                 // Root actually changed → session accounting recorded under the
                 // previous root (context_inventory) would double-count; start
@@ -7003,7 +7548,7 @@ impl SymForgeServer {
                 if current_root.as_deref() != Some(root.as_path()) {
                     self.session_context.reset();
                 }
-                self.set_repo_root(Some(root.clone()));
+                self.set_bound_project_state(Some(root.clone()), Some(state_placement.clone()));
 
                 // Restart the file watcher at the new root so freshness continues.
                 let watcher_handle = crate::watcher::restart_watcher(
@@ -7023,7 +7568,17 @@ impl SymForgeServer {
                     expected_gen,
                 );
 
+                if let Some(response) = replay_response {
+                    self.session_context.record_summary_output(
+                        "index_folder",
+                        (response.len() / 4).min(u32::MAX as usize) as u32,
+                    );
+                    return response;
+                }
+
                 let mut output = format!("Indexed {} files, {} symbols.", file_count, symbol_count);
+                output.push('\n');
+                output.push_str(&gitignore_hygiene.receipt());
                 // Warn-only: indexing a subfolder of a git repo binds paths to
                 // that subfolder, not the repo root. Narrow-scope indexing is
                 // supported, so we do NOT auto-retarget — just surface the
@@ -7069,6 +7624,11 @@ impl SymForgeServer {
                 output
             }
             Ok(Err(e)) => {
+                if let Some(response) = replay_response {
+                    return crate::idempotency::format_live_postcondition_unavailable(
+                        &response, &e,
+                    );
+                }
                 let output = format!("Index failed: {e}");
                 if let Some(idempotency) = &idempotency {
                     let _ = idempotency.fail(output.clone());
@@ -7076,6 +7636,11 @@ impl SymForgeServer {
                 output
             }
             Err(join_err) => {
+                if let Some(response) = replay_response {
+                    return crate::idempotency::format_live_postcondition_unavailable(
+                        &response, &join_err,
+                    );
+                }
                 let output = format!("Index failed: reload task panicked: {join_err}");
                 if let Some(idempotency) = &idempotency {
                     let _ = idempotency.fail(output.clone());
@@ -7850,22 +8415,39 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
+        let options = match file_content_options_from_input(&input) {
+            Ok(options) => options,
+            Err(message) => return message,
+        };
+        freshen_exact_path_for_targeted_retrieval(self, &options.path_scope);
+
+        // Capture freshness and the immutable publication before consulting the
+        // repeat-read cache. The same request against a later watcher publication
+        // must be a cache miss, and the bytes below must come from this exact
+        // captured generation rather than a second live-index read.
+        let generation = self.index.published_source_set().current_generation();
+        if let Some(message) = loading_guard_message_from_published(&generation.health) {
+            return message;
+        }
         let force_refresh = input.force_refresh == Some(true);
-        let params_hash = crate::protocol::session::hash_value(
-            &serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
-        );
+        let source_id = generation
+            .source
+            .as_ref()
+            .map(|source| source.source_id.as_str())
+            .unwrap_or("unavailable");
+        let params_hash = crate::protocol::session::hash_value(&serde_json::json!({
+            "input": &input,
+            "project_generation": generation.project_generation,
+            "source_id": source_id,
+            "publication_generation": generation.publication_generation,
+            "content_generation": generation.content_generation,
+        }));
         if let Some(meta) =
             self.session_context
                 .try_file_content_cache_hit(&input.path, params_hash, force_refresh)
         {
             return self.format_read_cache_hit(&meta, "session_repeat_read");
         }
-
-        let options = match file_content_options_from_input(&input) {
-            Ok(options) => options,
-            Err(message) => return message,
-        };
-        freshen_exact_path_for_targeted_retrieval(self, &options.path_scope);
         let mode_annotation = match (
             &options.content_context.mode_name,
             options.content_context.mode_explicit,
@@ -7873,11 +8455,9 @@ impl SymForgeServer {
             (Some(mode), true) => format!("── mode: {} (explicit) ──\n", mode),
             _ => String::new(),
         };
-        let file = {
-            let guard = self.index.read();
-            loading_guard!(guard);
-            guard.capture_shared_file_for_scope(&options.path_scope)
-        };
+        let file = generation
+            .live
+            .capture_shared_file_for_scope(&options.path_scope);
         match file {
             Some(file) => {
                 let raw_chars = file.as_ref().content.len();
@@ -8241,11 +8821,8 @@ impl SymForgeServer {
                 let tier2_disclosure = {
                     let repo_root = self.capture_repo_root();
                     let guard = self.index.read();
-                    tier2_reference_disclosure(
-                        guard.skipped_files(),
-                        repo_root.as_deref(),
-                        &input.name,
-                    )
+                    let skipped = guard.compatibility_skipped_files();
+                    tier2_reference_disclosure(&skipped, repo_root.as_deref(), &input.name)
                 };
                 let envelope = if !view.files.is_empty() {
                     let guard = self.index.read();
@@ -10008,13 +10585,23 @@ impl SymForgeServer {
                     .entry("project")
                     .or_insert_with(|| serde_json::Value::String(project.to_string()));
             }
-            let tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
+            let mut tool_body = self.dispatch_tool_for_tests(&step.tool, step_args).await;
+            if step.tool == "search_knowledge" {
+                tool_body = crate::protocol::ccr::rewrite_footer_for_symforge_facade(tool_body);
+            }
             step_results.push(ServedStepResult {
                 tool: step.tool.clone(),
                 body: tool_body.clone(),
             });
+            let step_outcome = serve_step_outcome(&step.tool, &tool_body);
+            if step.tool == "search_knowledge" && step_outcome == OutcomeClass::EmptyResult {
+                // Knowledge no-match classes are typed successful answers. Keep
+                // the EmptyResult metadata without feeding them into the
+                // dependent-chain reject path (M-06 / I-R09).
+                outcome_class = OutcomeClass::EmptyResult;
+                continue;
+            }
             if serve_step_failed(&step.tool, &tool_body) {
-                let step_outcome = serve_step_outcome(&step.tool, &tool_body);
                 let fatal = !is_fusion_union
                     || matches!(
                         step_outcome,
@@ -10238,9 +10825,7 @@ impl SymForgeServer {
             // through to the gates (preserving new-key optimistic concurrency);
             // a same-key/different-request hit surfaces the store's conflict
             // rather than silently replaying.
-            if let Some(key) = request.idempotency_key.as_deref()
-                && let Some(repo_root) = self.capture_repo_root()
-            {
+            if let Some(key) = request.idempotency_key.as_deref() {
                 // A planning failure here is re-surfaced by the authoritative
                 // `build_edit_plan` call below; don't duplicate the error path.
                 if let Ok(probe_plan) = build_edit_plan(request) {
@@ -10249,7 +10834,7 @@ impl SymForgeServer {
                         .first()
                         .expect("edit planner always emits at least one step");
                     match super::edit_tools::probe_symforge_edit_apply_replay(
-                        &repo_root,
+                        self,
                         &step.tool,
                         &step.args,
                         Some(key),
@@ -10797,9 +11382,19 @@ impl SymForgeServer {
         if hash.len() != 12 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return "CCR retrieve: invalid hash (expected 12 hex chars)".to_string();
         }
-        match self.ccr_store.lock().retrieve(&hash) {
-            Some(body) => body,
-            None => format!("CCR retrieve: unknown or expired hash '{hash}'"),
+        match self
+            .ccr_store
+            .lock()
+            .retrieve_checked(&hash, crate::knowledge::SECRET_POLICY_VERSION)
+        {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                "CCR retrieve: stale or expired handle; retry the originating search.".to_string()
+            }
+            Err(crate::protocol::ccr::CcrRetrieveError::SecretPolicyMismatch) => {
+                "CCR retrieve: secret-policy version mismatch; retry the originating search."
+                    .to_string()
+            }
         }
     }
 
@@ -10830,6 +11425,9 @@ impl SymForgeServer {
             return refusal;
         }
         let original_q = params.0.query.trim();
+        if crate::knowledge::guard_query(original_q).is_err() {
+            return "Error: sensitive query rejected by repository safety policy.".to_string();
+        }
         let q = smart_query::strip_leading_articles(original_q);
         if q.is_empty() {
             return "query requires a non-empty question.".to_string();
@@ -11009,6 +11607,31 @@ impl SymForgeServer {
                     projects: None,
                 };
                 self.search_text(Parameters(input)).await
+            }
+            smart_query::QueryIntent::SearchKnowledge { query } => {
+                let input = SearchKnowledgeInput {
+                    query: query.clone(),
+                    path_prefix: None,
+                    source_scope: Some(super::search_tools::KnowledgeSourceScope::Current),
+                    authority_scope: Some(super::search_tools::KnowledgeAuthorityScope::Default),
+                    project: None,
+                    projects: None,
+                    limit: None,
+                    max_tokens: params.0.max_tokens,
+                };
+                self.search_knowledge(Parameters(input)).await
+            }
+            smart_query::QueryIntent::RepositoryOrientation => {
+                self.get_repo_map(Parameters(GetRepoMapInput {
+                    project: None,
+                    detail: Some("compact".to_string()),
+                    path: None,
+                    depth: None,
+                    max_files: None,
+                    estimate: None,
+                    max_tokens: params.0.max_tokens,
+                }))
+                .await
             }
             smart_query::QueryIntent::FindDependents { target } => {
                 let input = FindDependentsInput {
@@ -11659,9 +12282,10 @@ mod tests {
             "proj".to_string(),
         );
         let repo = tempfile::tempdir().expect("temp repo");
-        let store = StelLedgerStore::open(repo.path(), "proxy-broken");
+        let project_state = project_state(repo.path());
+        let store = StelLedgerStore::open(&project_state, "proxy-broken");
         let db_path =
-            crate::paths::symforge_db_path(repo.path(), crate::paths::STEL_LEDGER_DB_NAME);
+            crate::paths::project_state_path(&project_state, crate::paths::STEL_LEDGER_DB_NAME);
         rusqlite::Connection::open(db_path)
             .expect("open ledger db directly")
             .execute_batch("DROP TABLE stel_ledger_events;")
@@ -12298,7 +12922,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index,
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -12321,24 +12945,52 @@ mod tests {
         size: u64,
         reason: crate::domain::index::SkipReason,
     ) -> LiveIndex {
-        use crate::domain::index::{AdmissionDecision, AdmissionTier, SkippedFile};
         let (anchor_key, anchor_file) = make_file(
             "src/anchor.rs",
             b"fn anchor() {}\n",
             vec![make_symbol("anchor", SymbolKind::Function, 0, 0)],
         );
         let mut index = make_live_index_ready(vec![(anchor_key, anchor_file)]);
-        let extension = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_string);
-        index.skipped_files = vec![SkippedFile {
-            path: path.to_string(),
-            size,
-            extension,
-            decision: AdmissionDecision::skip(AdmissionTier::MetadataOnly, reason),
-        }];
+        index.manifest_entries = vec![manifest_metadata_entry(path, size, reason)];
         index
+    }
+
+    fn manifest_metadata_entry(
+        path: &str,
+        size: u64,
+        reason: crate::domain::index::SkipReason,
+    ) -> crate::domain::CatalogEntry {
+        use crate::domain::index::SkipReason;
+        let reason = match reason {
+            SkipReason::DependencyLockfile => crate::domain::MetadataOnlyReason::Lockfile,
+            SkipReason::BinaryContent => crate::domain::MetadataOnlyReason::Binary,
+            SkipReason::SizeThreshold | SkipReason::SizeCeiling => {
+                crate::domain::MetadataOnlyReason::OversizedData
+            }
+            SkipReason::DenylistedExtension
+            | SkipReason::Untracked
+            | SkipReason::GeneratedOutput => crate::domain::MetadataOnlyReason::GeneratedOrVendor,
+            SkipReason::UnsupportedLanguage => {
+                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
+            }
+        };
+        crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size,
+            language: None,
+            classification: crate::domain::FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition: crate::domain::FileDisposition::MetadataOnly { reason },
+            content_hash: None,
+        }
     }
 
     fn make_live_index_ready_with_coupling_store(
@@ -12393,7 +13045,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index: TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -12424,7 +13076,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index: TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -12447,6 +13099,10 @@ mod tests {
 
     fn make_server(index: LiveIndex) -> SymForgeServer {
         make_server_with_root(index, None)
+    }
+
+    fn project_state(root: &std::path::Path) -> crate::domain::ProjectStateDir {
+        crate::domain::ProjectStateDir::new(root.join(crate::paths::SYMFORGE_DIR_NAME))
     }
 
     fn serialized_tool_result<R: IntoCallToolResult>(result: R) -> serde_json::Value {
@@ -12582,9 +13238,13 @@ mod tests {
         }
     }
 
-    fn write_sidecar_state(repo_root: &Path, port: Option<u16>, pid: Option<&str>) {
-        let dir = crate::paths::ensure_symforge_dir(repo_root)
-            .expect("test repo root should allow .symforge creation");
+    fn write_sidecar_state(
+        control_state_dir: &crate::domain::ControlStateDir,
+        port: Option<u16>,
+        pid: Option<&str>,
+    ) {
+        let dir = crate::sidecar::port_file::ensure_symforge_dir(control_state_dir)
+            .expect("test control state should allow sidecar namespace creation");
         if let Some(port) = port {
             fs::write(dir.join("sidecar.port"), port.to_string())
                 .expect("sidecar port file should be writable");
@@ -13336,7 +13996,16 @@ mod tests {
         );
         let server = SymForgeServer::new_daemon_proxy(daemon_client);
         let dir = tempfile::tempdir().expect("create temp repo root");
-        server.set_repo_root(Some(dir.path().to_path_buf()));
+        let binding = match crate::discovery::resolve_root_candidate(
+            dir.path(),
+            crate::domain::RootCandidateSource::LaunchCwd,
+            crate::domain::RootRequestMode::Automatic,
+        ) {
+            crate::domain::RootResolution::Bound(binding) => binding,
+            resolution => panic!("fixture root should bind: {resolution:?}"),
+        };
+        let placement = crate::discovery::resolve_state_placement(&binding);
+        server.set_bound_project_state(Some(binding.canonical_root), Some(placement));
 
         let output = server
             .checkpoint_now(Parameters(super::CheckpointNowInput {
@@ -13737,23 +14406,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_file_context_unsupported_language_on_disk_is_honest_not_found() {
-        // SF-004: a file that EXISTS on disk but maps to no supported grammar
-        // (e.g. `.sh`, `.tcl`, extensionless `LICENSE`) is NOT in the index's
-        // skipped_files (it was admission-excluded at the unsupported-language
-        // branch / a stale index never saw it). get_file_context must resolve it
-        // via the repo-root-bound disk fallback and report the honest Tier-2
-        // "not indexed: unsupported language" message — NEVER a false
+    async fn test_get_file_context_catalog_only_text_is_honest_not_found() {
+        // SF-004 + Feature 020: files without a semantic grammar (for example
+        // `.sh` and extensionless `LICENSE`) still belong to the resident file
+        // catalog as generic Text. get_file_context must report their truthful
+        // zero-symbol catalog context and knowledge evidence — NEVER a false
         // "File not found", which an agent would read as "the file is absent".
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("scripts")).unwrap();
         std::fs::write(repo.path().join("scripts/setup.sh"), "#!/bin/sh\necho hi\n").unwrap();
         std::fs::write(repo.path().join("LICENSE"), "MIT License\n").unwrap();
 
-        // Ready (non-empty) index whose `skipped_files` does NOT record the target
-        // paths: the files are on disk but absent from the index, so resolution
-        // MUST fall through to the repo-root-bound disk-fallback leg (this mirrors
-        // a stale/admission-excluded index — the SF-004 production scenario).
+        // The ready anchor index is rebound to the repository root on first use;
+        // Feature 020 discovery must admit the two generic-text files without
+        // inventing semantic symbols for them.
         let (anchor_key, anchor_file) = make_file(
             "src/anchor.rs",
             b"fn anchor() {}\n",
@@ -13781,16 +14447,12 @@ mod tests {
                  not-found; got: {result}"
             );
             assert!(
-                result.contains("Not indexed:") && result.contains("Tier 2 (metadata only)"),
-                "`{path}` must report honest Tier-2 metadata-only status; got: {result}"
+                result.contains("(0 symbols, Text)"),
+                "`{path}` must report honest zero-symbol Text catalog status; got: {result}"
             );
             assert!(
-                result.contains("reason: unsupported language"),
-                "`{path}` must name the unsupported-language reason; got: {result}"
-            );
-            assert!(
-                result.contains("get_file_content"),
-                "`{path}` must point at the raw-read escape hatch; got: {result}"
+                result.contains("Knowledge evidence:"),
+                "`{path}` must retain its repository-knowledge evidence; got: {result}"
             );
         }
 
@@ -14010,7 +14672,7 @@ mod tests {
         let original =
             b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
         assert!(original.contains(&0u8), "fixture must contain a NUL");
-        let (_dir, server, file_path) = setup_edit_test(original);
+        let (_dir, server, file_path) = setup_edit_test_with_fresh_mtime(original);
 
         let input = crate::protocol::edit::ReplaceSymbolBodyInput {
             project: None,
@@ -14050,7 +14712,7 @@ mod tests {
         // Same byte-exactness guarantee for edit_within_symbol.
         let original =
             b"fn target() {\n    let x = 1;\n}\n\nfn after() {\n    let _b = \"lead\0tail\";\n}\n";
-        let (_dir, server, file_path) = setup_edit_test(original);
+        let (_dir, server, file_path) = setup_edit_test_with_fresh_mtime(original);
 
         let result = server
             .edit_within_symbol(Parameters(crate::protocol::edit::EditWithinSymbolInput {
@@ -14816,7 +15478,7 @@ mod tests {
             "got: {result}"
         );
         assert!(
-            !crate::live_index::frecency::frecency_db_path(repo.path()).exists(),
+            !crate::live_index::frecency::frecency_db_path(&project_state(repo.path())).exists(),
             "ambiguous selector must not bump frecency for an arbitrary first candidate"
         );
     }
@@ -15046,6 +15708,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_protected_root_requires_override_and_never_touches_local_state() {
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let protected = fixture.path().join("System32");
+        fs::create_dir(&protected).expect("create modeled protected root");
+        fs::write(protected.join("lib.rs"), "pub fn protected_symbol() {}\n")
+            .expect("write protected-root source");
+
+        let server = make_server(make_live_index_empty());
+        let refused = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: protected.display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        assert!(
+            refused.contains("protected_root_requires_explicit_override"),
+            "direct protected roots must fail closed without the explicit override: {refused}"
+        );
+        assert!(!protected.join(".symforge").exists());
+
+        let indexed = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: protected.display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: Some(true),
+            }))
+            .await;
+        assert!(
+            indexed.contains("Indexed 1 files"),
+            "the exact direct protected root should index with explicit authority: {indexed}"
+        );
+        assert!(
+            !protected.join(".symforge").exists(),
+            "explicit-protected indexing must skip source-local state entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_normal_index_folder_reconciles_existing_root_gitignore() {
+        let repo = TempDir::new().expect("gitignore hygiene repo");
+        fs::create_dir(repo.path().join(".git")).expect("create git metadata marker");
+        fs::write(repo.path().join(".gitignore"), b"target/\r\n").expect("write root gitignore");
+        fs::write(repo.path().join("lib.rs"), "pub fn indexed_symbol() {}\n")
+            .expect("write source");
+
+        let server = make_server(make_live_index_empty());
+        let indexed = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: repo.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+
+        assert!(
+            indexed.contains("gitignore_hygiene=effective changed=true"),
+            "successful explicit normal indexing must report the hygiene mutation: {indexed}"
+        );
+        assert_eq!(
+            fs::read(repo.path().join(".gitignore")).expect("read reconciled gitignore"),
+            b"target/\r\n/.symforge/\r\n",
+            "index_folder must preserve existing bytes and the first newline style"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retarget_preserves_previous_generation_and_watcher() {
+        let active = TempDir::new().expect("active project");
+        fs::create_dir_all(active.path().join("src")).expect("create active source dir");
+        fs::write(
+            active.path().join("src/active.rs"),
+            "pub fn active_generation() {}\n",
+        )
+        .expect("write active source");
+
+        let rejected = TempDir::new().expect("failed retarget project");
+        fs::write(rejected.path().join("one.rs"), "fn one() {}\n").expect("write one");
+        fs::write(rejected.path().join("two.rs"), "fn two() {}\n").expect("write two");
+
+        let index = LiveIndex::load(active.path()).expect("load active project");
+        let watcher_info = Arc::new(parking_lot::Mutex::new(
+            crate::watcher::WatcherInfo::default(),
+        ));
+        let active_root = active.path().canonicalize().expect("canonical active root");
+        let server = SymForgeServer::new(
+            index,
+            "failed-retarget".to_string(),
+            Arc::clone(&watcher_info),
+            Some(active_root.clone()),
+            None,
+        );
+        let watcher = crate::watcher::restart_watcher(
+            active_root.clone(),
+            Arc::clone(&server.index),
+            Arc::clone(&server.watcher_info),
+            None,
+        );
+        let original_stop_token = Arc::clone(&watcher.stop_token);
+        server.watcher_handle.lock().replace(watcher);
+
+        for _ in 0..100 {
+            if server.watcher_info.lock().state == crate::watcher_state::WatcherState::Active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            server.watcher_info.lock().state,
+            crate::watcher_state::WatcherState::Active,
+            "fixture watcher must be active before exercising failed handoff"
+        );
+
+        let root_before = server.capture_repo_root();
+        let generation_before = server.index.current_project_generation();
+        let published_before = server.index.published_state();
+        let limit = EnvVarGuard::set("SYMFORGE_MAX_INDEX_FILES", "1");
+        let result = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: rejected.path().display().to_string(),
+                idempotency_key: None,
+                add: None,
+                allow_protected_root: None,
+            }))
+            .await;
+        drop(limit);
+
+        assert!(
+            result.contains("tree too large to index"),
+            "fixture must fail after binding but before publication: {result}"
+        );
+        assert_eq!(server.capture_repo_root(), root_before);
+        assert_eq!(
+            server.index.current_project_generation(),
+            generation_before,
+            "failed retarget must not advance the live project generation"
+        );
+        assert!(
+            Arc::ptr_eq(&published_before, &server.index.published_state()),
+            "failed retarget must preserve the exact published generation"
+        );
+        assert!(server.index.read().get_file("src/active.rs").is_some());
+
+        {
+            let watcher = server.watcher_handle.lock();
+            let watcher = watcher
+                .as_ref()
+                .expect("failed retarget must retain the previous watcher handle");
+            assert!(Arc::ptr_eq(&original_stop_token, &watcher.stop_token));
+            assert!(
+                !watcher
+                    .stop_token
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "failed retarget must not signal the previous watcher to stop"
+            );
+        }
+
+        fs::write(
+            active.path().join("src/after_failure.rs"),
+            "pub fn watcher_survived() {}\n",
+        )
+        .expect("write post-failure source");
+        for _ in 0..100 {
+            if server
+                .index
+                .read()
+                .get_file("src/after_failure.rs")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            server
+                .index
+                .read()
+                .get_file("src/after_failure.rs")
+                .is_some(),
+            "the retained watcher must keep the prior project fresh"
+        );
+
+        let watcher = server
+            .watcher_handle
+            .lock()
+            .take()
+            .expect("watcher cleanup handle");
+        watcher
+            .stop_token
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut task = watcher.task;
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn test_index_folder_rebinds_repo_root_for_local_impact_analysis() {
         let repo = TempDir::new().expect("temp repo");
         fs::create_dir_all(repo.path().join("scratch")).expect("scratch dir");
@@ -15058,6 +15923,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
 
@@ -15117,6 +15983,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -15166,6 +16033,7 @@ mod tests {
                 path: sub.display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
 
@@ -15192,6 +16060,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -15205,6 +16074,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -15263,7 +16133,15 @@ mod tests {
         fs::create_dir_all(&src_dir).expect("create src dir");
         fs::create_dir_all(&symforge_dir).expect("create .symforge dir");
         fs::write(src_dir.join("lib.rs"), "pub fn reset_fresh() {}\n").expect("write source");
-        fs::write(symforge_dir.join("index.bin"), b"stale snapshot").expect("write snapshot");
+        let snapshot_placement = crate::domain::StatePlacement::ProjectLocal {
+            directory: crate::domain::ProjectStateDir::new(symforge_dir.clone()),
+        };
+        crate::live_index::persist::serialize_index(
+            &make_live_index_empty(),
+            repo.path(),
+            &snapshot_placement,
+        )
+        .expect("write valid owned snapshot");
         fs::write(symforge_dir.join("index.bin.tmp"), b"stale tmp").expect("write tmp");
         fs::write(symforge_dir.join("frecency.db"), b"unrelated").expect("write sentinel");
 
@@ -15273,6 +16151,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: None,
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
 
@@ -15322,16 +16201,20 @@ mod tests {
     #[tokio::test]
     async fn test_index_folder_idempotency_replays_same_key_same_request_locally() {
         let repo = TempDir::new().expect("temp repo");
+        let control = TempDir::new().expect("temp control state");
         fs::create_dir_all(repo.path().join("src")).expect("create src dir");
         fs::write(repo.path().join("src/lib.rs"), "pub fn first() {}\n")
             .expect("write initial file");
 
-        let server = make_server(make_live_index_empty());
+        let server = make_server(make_live_index_empty()).with_control_state_dir_for_test(
+            crate::domain::ControlStateDir::new(control.path().join("control")),
+        );
         let first = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -15346,6 +16229,7 @@ mod tests {
                 path: repo.path().display().to_string(),
                 idempotency_key: Some("local-replay-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
 
@@ -15353,12 +16237,18 @@ mod tests {
             replay, first,
             "same idempotency key and same canonical request must replay stored output"
         );
+        assert_eq!(
+            server.index.published_state().file_count,
+            2,
+            "stored output may return only after the current live binding is rebuilt"
+        );
     }
 
     #[tokio::test]
     async fn test_index_folder_idempotency_rejects_same_key_different_request_locally() {
         let first_repo = TempDir::new().expect("first repo");
         let second_repo = TempDir::new().expect("second repo");
+        let control = TempDir::new().expect("temp control state");
         fs::create_dir_all(first_repo.path().join("src")).expect("create first src dir");
         fs::create_dir_all(second_repo.path().join("src")).expect("create second src dir");
         fs::write(first_repo.path().join("src/lib.rs"), "pub fn first() {}\n")
@@ -15369,12 +16259,15 @@ mod tests {
         )
         .expect("write second source");
 
-        let server = make_server(make_live_index_empty());
+        let server = make_server(make_live_index_empty()).with_control_state_dir_for_test(
+            crate::domain::ControlStateDir::new(control.path().join("control")),
+        );
         let first = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: first_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
         assert!(
@@ -15382,11 +16275,25 @@ mod tests {
             "first idempotent index_folder should index once, got: {first}"
         );
 
+        let override_conflict = server
+            .index_folder(Parameters(super::IndexFolderInput {
+                path: first_repo.path().display().to_string(),
+                idempotency_key: Some("local-conflict-key".to_string()),
+                add: None,
+                allow_protected_root: Some(true),
+            }))
+            .await;
+        assert!(
+            override_conflict.contains("Idempotency conflict"),
+            "same key with a changed protected-root override must conflict: {override_conflict}"
+        );
+
         let conflict = server
             .index_folder(Parameters(super::IndexFolderInput {
                 path: second_repo.path().display().to_string(),
                 idempotency_key: Some("local-conflict-key".to_string()),
                 add: None,
+                allow_protected_root: None,
             }))
             .await;
 
@@ -16046,6 +16953,7 @@ mod tests {
         let probe = || {
             crate::live_index::frecency::ranking_scores_for_paths(
                 root.path(),
+                Some(&project_state(root.path())),
                 &[Path::new("src/lib.rs")],
                 0,
             )
@@ -17420,7 +18328,8 @@ mod tests {
     async fn test_search_files_path_cochange_env_unset_missing_store_reports_preparing() {
         let _env = EnvVarGuard::remove("SYMFORGE_COUPLING");
         let repo = init_git_repo();
-        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
+        let db_path =
+            crate::live_index::coupling::lifecycle::coupling_db_path(&project_state(repo.path()));
         assert!(!db_path.exists(), "test starts without a coupling store");
         let server = make_server_with_root(
             make_live_index_ready(vec![
@@ -17464,7 +18373,8 @@ mod tests {
     async fn test_search_files_path_cochange_disabled_policy_reports_disabled() {
         let _env = EnvVarGuard::set("SYMFORGE_COUPLING", "disabled");
         let repo = init_git_repo();
-        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
+        let db_path =
+            crate::live_index::coupling::lifecycle::coupling_db_path(&project_state(repo.path()));
         let server = make_server_with_root(
             make_live_index_ready(vec![
                 make_file("src/auth/routes.rs", b"fn auth_routes() {}", vec![]),
@@ -17624,7 +18534,8 @@ mod tests {
     async fn test_search_files_path_cochange_corrupt_store_reports_unavailable() {
         let _env = EnvVarGuard::remove("SYMFORGE_COUPLING");
         let repo = init_git_repo();
-        let db_path = crate::live_index::coupling::lifecycle::coupling_db_path(repo.path());
+        let db_path =
+            crate::live_index::coupling::lifecycle::coupling_db_path(&project_state(repo.path()));
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         fs::write(&db_path, b"not sqlite").unwrap();
         let server = make_server_with_root(
@@ -18082,7 +18993,11 @@ mod tests {
             result.contains("Runtime: mode=local_process"),
             "health should identify local runtime mode: {result}"
         );
-        let root_text = temp.path().to_string_lossy().replace('\\', "/");
+        let root_text = server
+            .capture_repo_root()
+            .expect("test server should retain its canonical project root")
+            .to_string_lossy()
+            .replace('\\', "/");
         assert!(
             result.contains(&format!("project_root={root_text}")),
             "health should identify active project root: {result}"
@@ -18231,7 +19146,13 @@ mod tests {
             "checkpoint_now should create .symforge/index.bin"
         );
         assert!(
-            crate::live_index::persist::load_snapshot(temp.path()).is_some(),
+            crate::live_index::persist::load_snapshot(
+                temp.path(),
+                &server
+                    .capture_state_placement()
+                    .expect("fixture server should retain resolved state placement"),
+            )
+            .is_some(),
             "checkpoint_now should write a readable snapshot"
         );
     }
@@ -18265,6 +19186,10 @@ mod tests {
             "export_artifact=true should report the artifact export: {result}"
         );
         assert!(
+            result.contains("git_visibility=git_visibility_unavailable"),
+            "artifact receipt must disclose its exact Git visibility: {result}"
+        );
+        assert!(
             temp.path()
                 .join(".symforge")
                 .join(crate::live_index::persist::ARTIFACT_FILENAME)
@@ -18290,6 +19215,8 @@ mod tests {
             make_live_index_ready(vec![(key, file)]),
             Some(temp.path().to_path_buf()),
         );
+        fs::remove_dir_all(temp.path().join(".symforge"))
+            .expect("remove resolved project state directory");
         fs::write(temp.path().join(".symforge"), b"not a directory")
             .expect("block .symforge directory creation");
 
@@ -18310,19 +19237,21 @@ mod tests {
     #[tokio::test]
     async fn test_health_surfaces_alive_sidecar_pid_and_state() {
         let temp = TempDir::new().expect("tempdir should be created");
+        let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("test listener should bind to an ephemeral port");
         let port = listener
             .local_addr()
             .expect("test listener should have a local address")
             .port();
-        write_sidecar_state(temp.path(), Some(port), Some("4242"));
+        write_sidecar_state(&control_state_dir, Some(port), Some("4242"));
 
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server_with_root(
             make_live_index_ready(vec![(key, file)]),
             Some(temp.path().to_path_buf()),
-        );
+        )
+        .with_control_state_dir_for_test(control_state_dir);
 
         let result = server
             .health(Parameters(super::HealthInput::default()))
@@ -18336,11 +19265,13 @@ mod tests {
     #[tokio::test]
     async fn test_health_distinguishes_no_sidecar_state() {
         let temp = TempDir::new().expect("tempdir should be created");
+        let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server_with_root(
             make_live_index_ready(vec![(key, file)]),
             Some(temp.path().to_path_buf()),
-        );
+        )
+        .with_control_state_dir_for_test(control_state_dir);
 
         let result = server
             .health(Parameters(super::HealthInput::default()))
@@ -18470,14 +19401,16 @@ mod tests {
     #[tokio::test]
     async fn test_health_compact_surfaces_dead_sidecar_pid_and_state() {
         let temp = TempDir::new().expect("tempdir should be created");
+        let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
         let port = 0;
-        write_sidecar_state(temp.path(), Some(port), Some("4242"));
+        write_sidecar_state(&control_state_dir, Some(port), Some("4242"));
 
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
         let server = make_server_with_root(
             make_live_index_ready(vec![(key, file)]),
             Some(temp.path().to_path_buf()),
-        );
+        )
+        .with_control_state_dir_for_test(control_state_dir);
 
         let result = server.health_compact().await;
         assert!(
@@ -18489,8 +19422,9 @@ mod tests {
     #[tokio::test]
     async fn test_health_surfaces_unknown_sidecar_state_for_malformed_port_file() {
         let temp = TempDir::new().expect("tempdir should be created");
-        let dir = crate::paths::ensure_symforge_dir(temp.path())
-            .expect("test repo root should allow .symforge creation");
+        let control_state_dir = crate::domain::ControlStateDir::new(temp.path().join("control"));
+        let dir = crate::sidecar::port_file::ensure_symforge_dir(&control_state_dir)
+            .expect("test control state should allow sidecar namespace creation");
         fs::write(dir.join("sidecar.port"), "not-a-port")
             .expect("sidecar port file should be writable");
         fs::write(dir.join("sidecar.pid"), "4242").expect("sidecar pid file should be writable");
@@ -18499,7 +19433,8 @@ mod tests {
         let server = make_server_with_root(
             make_live_index_ready(vec![(key, file)]),
             Some(temp.path().to_path_buf()),
-        );
+        )
+        .with_control_state_dir_for_test(control_state_dir);
 
         let result = server
             .health(Parameters(super::HealthInput::default()))
@@ -20041,8 +20976,10 @@ mod tests {
             "src/lib.rs",
             "fn present() {\n    println!(\"old\");\n}\n",
         )]);
-        let db_path = crate::paths::symforge_db_path(_dir.path(), crate::paths::ANALYTICS_DB_NAME);
-        let store = AnalyticsStore::open(AnalyticsConfig::enabled(&db_path)).unwrap();
+        let project_state = project_state(_dir.path());
+        let db_path =
+            crate::paths::project_state_path(&project_state, crate::paths::ANALYTICS_DB_NAME);
+        let store = AnalyticsStore::open(AnalyticsConfig::enabled(project_state)).unwrap();
         server.set_analytics_recorder_for_tests(AnalyticsRecorder::start(
             store,
             AnalyticsScope::Session,
@@ -20121,6 +21058,95 @@ mod tests {
             }
             Ok(crate::analytics::AnalyticsWriteOutcome::Recorded { id: 1 })
         }
+    }
+
+    struct NoopAnalyticsWriter;
+
+    impl crate::analytics::AnalyticsWriter for NoopAnalyticsWriter {
+        fn write(
+            &mut self,
+            _observation: &crate::analytics::AnalyticsObservation,
+        ) -> anyhow::Result<crate::analytics::AnalyticsWriteOutcome> {
+            Ok(crate::analytics::AnalyticsWriteOutcome::Recorded { id: 1 })
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_review_input_creates_no_analytics_or_ccr_state() {
+        use crate::analytics::{AnalyticsRecorder, AnalyticsScope};
+        use crate::protocol::search_tools::{
+            KnowledgeSourceScope, ReviewKnowledgeInput, ReviewKnowledgeMode,
+        };
+
+        let server = make_server(make_live_index_empty());
+        server.set_analytics_recorder_for_tests(AnalyticsRecorder::start_with_writer_for_tests(
+            AnalyticsScope::Session,
+            4,
+            NoopAnalyticsWriter,
+        ));
+        let canary = ["runtime", "-", "analytics", "-", "canary"].concat();
+        let result = serialized_tool_result(
+            server
+                .review_knowledge_tool(Parameters(ReviewKnowledgeInput {
+                    mode: ReviewKnowledgeMode::Document,
+                    path: Some(format!("docs/token={canary}")),
+                    path_prefix: None,
+                    source_scope: Some(KnowledgeSourceScope::Current),
+                    project: None,
+                    projects: None,
+                    limit: None,
+                    max_tokens: Some(128),
+                }))
+                .await,
+        );
+        let text = tool_result_text(&result);
+
+        assert!(text.contains("sensitive path rejected"), "{text}");
+        assert!(!text.contains(&canary), "sensitive input must not echo");
+        assert!(!text.contains("review_hash=") && !text.contains("hash=\""));
+        assert_eq!(server.analytics_queue_status_for_tests().enqueued, 0);
+        let economics = server.compression_economics();
+        assert_eq!(economics.offloads, 0);
+        assert_eq!(economics.bytes_stored, 0);
+    }
+
+    #[tokio::test]
+    async fn sensitive_search_input_creates_no_analytics_or_ccr_state() {
+        use crate::analytics::{AnalyticsRecorder, AnalyticsScope};
+        use crate::protocol::search_tools::{
+            KnowledgeAuthorityScope, KnowledgeSourceScope, SearchKnowledgeInput,
+        };
+
+        let server = make_server(make_live_index_empty());
+        server.set_analytics_recorder_for_tests(AnalyticsRecorder::start_with_writer_for_tests(
+            AnalyticsScope::Session,
+            4,
+            NoopAnalyticsWriter,
+        ));
+        let canary = ["runtime", "-", "search", "-", "canary"].concat();
+        let query = format!("token={canary}");
+        let result = serialized_tool_result(
+            server
+                .search_knowledge_tool(Parameters(SearchKnowledgeInput {
+                    query,
+                    path_prefix: None,
+                    source_scope: Some(KnowledgeSourceScope::Current),
+                    authority_scope: Some(KnowledgeAuthorityScope::Default),
+                    project: None,
+                    projects: None,
+                    limit: None,
+                    max_tokens: Some(128),
+                }))
+                .await,
+        );
+        let text = tool_result_text(&result);
+
+        assert!(text.contains("sensitive query rejected"), "{text}");
+        assert!(!text.contains(&canary), "sensitive input must not echo");
+        assert_eq!(server.analytics_queue_status_for_tests().enqueued, 0);
+        let economics = server.compression_economics();
+        assert_eq!(economics.offloads, 0);
+        assert_eq!(economics.bytes_stored, 0);
     }
 
     #[tokio::test]
@@ -23151,6 +24177,7 @@ mod tests {
         let now = 0i64;
         let snapshot = crate::live_index::frecency::ranking_scores_for_paths(
             root.path(),
+            None,
             &[Path::new("src/watcher/reconcile.rs")],
             now,
         )
@@ -24253,15 +25280,11 @@ mod tests {
         let def = make_symbol("PortRegistry", SymbolKind::Struct, 1, 1);
         let (key, file) = make_file("src/lib.rs", b"struct PortRegistry;\n", vec![def]);
         let mut index = make_live_index_ready(vec![(key, file)]);
-        index.skipped_files = vec![crate::domain::index::SkippedFile {
-            path: "big.rs".to_string(),
-            size: big.len() as u64,
-            extension: Some("rs".to_string()),
-            decision: crate::domain::index::AdmissionDecision::skip(
-                crate::domain::index::AdmissionTier::MetadataOnly,
-                crate::domain::index::SkipReason::SizeThreshold,
-            ),
-        }];
+        index.manifest_entries = vec![manifest_metadata_entry(
+            "big.rs",
+            big.len() as u64,
+            crate::domain::index::SkipReason::SizeThreshold,
+        )];
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
         let result = server
             .find_references(Parameters(find_references_input("PortRegistry")))
@@ -24299,15 +25322,11 @@ mod tests {
             )],
         );
         let mut index = make_live_index_ready(vec![file]);
-        index.skipped_files = vec![crate::domain::index::SkippedFile {
-            path: "big.rs".to_string(),
-            size: big.len() as u64,
-            extension: Some("rs".to_string()),
-            decision: crate::domain::index::AdmissionDecision::skip(
-                crate::domain::index::AdmissionTier::MetadataOnly,
-                crate::domain::index::SkipReason::SizeThreshold,
-            ),
-        }];
+        index.manifest_entries = vec![manifest_metadata_entry(
+            "big.rs",
+            big.len() as u64,
+            crate::domain::index::SkipReason::SizeThreshold,
+        )];
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
         let result = server
             .find_references(Parameters(find_references_input("solitary_fn")))
@@ -25595,6 +26614,19 @@ mod tests {
 
     /// Helper: write a file to disk and build a server with it indexed.
     fn setup_edit_test(original: &[u8]) -> (TempDir, SymForgeServer, PathBuf) {
+        setup_edit_test_inner(original, false)
+    }
+
+    /// Keep the synthetic index mtime aligned with disk when a test needs to
+    /// exercise byte splicing without triggering a fresh admission decision.
+    fn setup_edit_test_with_fresh_mtime(original: &[u8]) -> (TempDir, SymForgeServer, PathBuf) {
+        setup_edit_test_inner(original, true)
+    }
+
+    fn setup_edit_test_inner(
+        original: &[u8],
+        record_disk_mtime: bool,
+    ) -> (TempDir, SymForgeServer, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let src_dir = dir.path().join("src");
@@ -25603,7 +26635,15 @@ mod tests {
         std::fs::write(&file_path, original).unwrap();
 
         let result = crate::parsing::process_file("src/lib.rs", original, LanguageId::Rust);
-        let indexed = IndexedFile::from_parse_result(result, original.to_vec());
+        let mut indexed = IndexedFile::from_parse_result(result, original.to_vec());
+        if record_disk_mtime {
+            indexed.mtime_secs = std::fs::metadata(&file_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+        }
         let index = make_live_index_ready(vec![("src/lib.rs".to_string(), indexed)]);
         let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
         (dir, server, file_path)
@@ -25712,13 +26752,18 @@ mod tests {
 
     #[test]
     fn prepare_batch_paths_for_edit_partial_succeeds_with_skipped_paths() {
-        let (dir, server) = setup_loaded_edit_test(&[("src/lib.rs", "pub fn keep() {}\n")]);
+        let (_dir, server) = setup_loaded_edit_test(&[("src/lib.rs", "pub fn keep() {}\n")]);
         let paths = vec!["src/lib.rs".to_string(), "src/missing.rs".to_string()];
 
         let (repo_root, source_authority) =
             super::prepare_batch_paths_for_edit(&server, &paths).expect("batch freshen");
 
-        assert_eq!(repo_root, dir.path());
+        assert_eq!(
+            repo_root,
+            server
+                .capture_repo_root()
+                .expect("loaded edit server should retain its canonical root")
+        );
         assert_eq!(
             source_authority,
             crate::protocol::edit_format::EditSourceAuthority::CurrentIndex
@@ -28885,6 +29930,95 @@ mod tests {
         assert!(
             !text.contains("cross-project targeting is not routed"),
             "a blank `project` must not trip the cross-project refusal: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_knowledge_no_match_and_ccr_round_trip_stay_on_the_facade() {
+        use crate::stel::StelRequest;
+
+        let dir = tempfile::tempdir().expect("knowledge facade tempdir");
+        let docs = dir.path().join("docs");
+        fs::create_dir_all(&docs).expect("knowledge facade docs");
+        for index in 0..16 {
+            fs::write(
+                docs.join(format!("checkpoint-{index:02}.md")),
+                format!(
+                    "# Checkpoint {index}\n## Persistence policy\nCheckpoint policy evidence marker {index:02} is retained after publication.\n"
+                ),
+            )
+            .expect("knowledge facade fixture");
+        }
+        let index = LiveIndex::load(dir.path()).expect("load knowledge facade fixture");
+        let server = SymForgeServer::new(
+            index,
+            "knowledge_facade_test".to_string(),
+            Arc::new(parking_lot::Mutex::new(
+                crate::watcher::WatcherInfo::default(),
+            )),
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        let no_match = server
+            .symforge_stel_handler(&StelRequest {
+                query: "search repository knowledge for orbital zebra lattice".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("compact knowledge no-match");
+        let no_match_json =
+            serde_json::to_value(&no_match).expect("serialize compact knowledge no-match");
+        assert_tool_result_status(&no_match_json, OutcomeClass::EmptyResult);
+        assert_ne!(
+            no_match_json.get("isError"),
+            Some(&serde_json::Value::Bool(true)),
+            "a typed knowledge no-match must remain a successful MCP result"
+        );
+        let no_match_text = tool_result_text(&no_match_json);
+        assert!(
+            no_match_text.contains("Chosen tool: search_knowledge")
+                && no_match_text.contains("no_evidence_complete"),
+            "the facade must preserve the direct no-match shape: {no_match_text}"
+        );
+
+        let truncated = server
+            .symforge_stel_handler(&StelRequest {
+                query: "search repository knowledge for checkpoint policy".to_string(),
+                max_tokens: Some(64),
+                ..Default::default()
+            })
+            .await
+            .expect("compact knowledge CCR result");
+        let truncated_json =
+            serde_json::to_value(&truncated).expect("serialize compact knowledge CCR result");
+        let truncated_text = tool_result_text(&truncated_json);
+        assert!(
+            truncated_text.contains("retrieve: symforge with query=\"retrieve CCR hash ")
+                && !truncated_text.contains("retrieve: symforge_retrieve"),
+            "compact CCR must advertise only its facade redemption route: {truncated_text}"
+        );
+        let handle = truncated_text
+            .split("retrieve CCR hash ")
+            .nth(1)
+            .and_then(|tail| tail.get(..12))
+            .expect("compact facade CCR handle");
+        assert!(handle.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let redeemed = server
+            .symforge_stel_handler(&StelRequest {
+                query: format!("retrieve CCR hash {handle}"),
+                ..Default::default()
+            })
+            .await
+            .expect("redeem compact knowledge CCR through facade");
+        let redeemed_json =
+            serde_json::to_value(&redeemed).expect("serialize redeemed compact CCR result");
+        let redeemed_text = tool_result_text(&redeemed_json);
+        assert!(
+            redeemed_text.contains("docs/checkpoint-09.md")
+                && redeemed_text.contains("Checkpoint policy evidence marker 09"),
+            "facade CCR redemption must return the full safe stored result: {redeemed_text}"
         );
     }
 }

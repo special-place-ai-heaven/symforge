@@ -68,7 +68,8 @@ async fn spawn_repo_sidecar() -> (TempDir, symforge::sidecar::SidecarHandle) {
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn keep() {}\n").expect("write");
     let index = LiveIndex::load(dir.path()).expect("LiveIndex::load");
-    let handle = spawn_sidecar(Arc::clone(&index), "127.0.0.1", None)
+    let control_state = symforge::domain::ControlStateDir::new(dir.path().join("control-state"));
+    let handle = spawn_sidecar(Arc::clone(&index), "127.0.0.1", None, Some(control_state))
         .await
         .expect("spawn_sidecar");
     tokio::time::sleep(Duration::from_millis(20)).await;

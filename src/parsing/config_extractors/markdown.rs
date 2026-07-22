@@ -38,8 +38,8 @@ pub struct MarkdownExtractor;
 
 impl ConfigExtractor for MarkdownExtractor {
     fn extract(&self, content: &[u8]) -> ExtractionResult {
-        let text = match std::str::from_utf8(content) {
-            Ok(s) => s,
+        let decoded = match crate::knowledge::decode_searchable_text(content) {
+            Ok(decoded) => decoded,
             Err(_) => {
                 return ExtractionResult {
                     symbols: vec![],
@@ -54,6 +54,7 @@ impl ConfigExtractor for MarkdownExtractor {
                 };
             }
         };
+        let text = decoded.text;
 
         if text.is_empty() {
             return ExtractionResult {
@@ -67,16 +68,19 @@ impl ConfigExtractor for MarkdownExtractor {
         {
             let raw: Vec<&str> = text.split('\n').collect();
             let mut i = 0usize;
-            let mut byte_offset = 0usize;
+            let mut byte_offset = decoded.leading_bytes as usize;
+            fn clean_line(line: &str) -> &str {
+                line.strip_suffix('\r').unwrap_or(line)
+            }
 
             // Check for frontmatter
-            if raw.first().copied() == Some("---") {
+            if raw.first().copied().map(clean_line) == Some("---") {
                 byte_offset += raw[0].len() + 1; // skip opening ---\n
                 i = 1;
                 let mut closed = false;
                 while i < raw.len() {
                     let line_bytes = raw[i].len() + 1;
-                    if raw[i] == "---" {
+                    if clean_line(raw[i]) == "---" {
                         byte_offset += line_bytes;
                         i += 1;
                         closed = true;
@@ -94,7 +98,7 @@ impl ConfigExtractor for MarkdownExtractor {
             }
 
             while i < raw.len() {
-                lines.push((byte_offset, raw[i]));
+                lines.push((byte_offset, clean_line(raw[i])));
                 byte_offset += raw[i].len();
                 // Only add 1 for the newline delimiter if this isn't the last
                 // segment or the original text actually ends with a newline.
@@ -105,7 +109,7 @@ impl ConfigExtractor for MarkdownExtractor {
             }
         }
 
-        // Parse ATX headers from collected lines.
+        // Parse ATX and Setext headers from collected lines.
         struct HeaderInfo {
             level: u32,
             text: String,
@@ -143,21 +147,73 @@ impl ConfigExtractor for MarkdownExtractor {
                 continue;
             }
 
-            if !line.starts_with('#') {
-                continue;
+            let leading_spaces = line.bytes().take_while(|&byte| byte == b' ').count();
+            let trimmed = &line[leading_spaces.min(line.len())..];
+
+            if leading_spaces <= 3 && trimmed.starts_with('#') {
+                let hashes = trimmed.bytes().take_while(|&byte| byte == b'#').count();
+                if hashes <= 6 {
+                    let rest = &trimmed[hashes..];
+                    if rest.is_empty()
+                        || rest
+                            .bytes()
+                            .next()
+                            .is_some_and(|byte| byte == b' ' || byte == b'\t')
+                    {
+                        let mut title = rest.trim().to_string();
+                        let closing_hashes = title.bytes().rev().take_while(|&b| b == b'#').count();
+                        if closing_hashes > 0 {
+                            let before = title.len() - closing_hashes;
+                            if before == 0
+                                || title.as_bytes()[before - 1].is_ascii_whitespace()
+                            {
+                                title.truncate(before);
+                                title = title.trim_end().to_string();
+                            }
+                        }
+                        headers.push(HeaderInfo {
+                            level: hashes as u32,
+                            text: title,
+                            byte_start: byte_off,
+                            line_index: li,
+                        });
+                        continue;
+                    }
+                }
             }
-            let hashes = line.bytes().take_while(|&b| b == b'#').count();
-            if hashes > 6 {
-                continue;
-            }
-            let rest = &line[hashes..];
-            if let Some(title) = rest.strip_prefix(' ') {
-                headers.push(HeaderInfo {
-                    level: hashes as u32,
-                    text: title.trim_end().to_string(),
-                    byte_start: byte_off,
-                    line_index: li,
-                });
+
+            let underline = trimmed.trim_end();
+            let setext_level = if leading_spaces <= 3
+                && !underline.is_empty()
+                && underline.bytes().all(|byte| byte == b'=')
+            {
+                Some(1)
+            } else if leading_spaces <= 3
+                && !underline.is_empty()
+                && underline.bytes().all(|byte| byte == b'-')
+            {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(level) = setext_level
+                && li > 0
+            {
+                let (title_byte_start, title_line) = lines[li - 1];
+                let title = title_line.trim();
+                let prior_is_heading = headers.iter().any(|header| header.line_index == li - 1);
+                if !title.is_empty()
+                    && !prior_is_heading
+                    && parse_code_fence(title_line).is_none()
+                    && !title.starts_with('#')
+                {
+                    headers.push(HeaderInfo {
+                        level,
+                        text: title.to_string(),
+                        byte_start: title_byte_start,
+                        line_index: li - 1,
+                    });
+                }
             }
         }
 
@@ -407,5 +463,53 @@ mod tests {
         let syms = extract(b"# Real\n\n   ```\n# inside indented fence\n   ```\n## After\n");
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[1].name, "Real.After");
+    }
+
+    #[test]
+    fn markdown_hit_preserves_section_and_line_pointer() {
+        let content = b"\xEF\xBB\xBFpreface\r\n# Section\r\nline \xCE\xB1\r\n## Child\r\nlast";
+        let syms = extract(content);
+
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "Section");
+        assert_eq!(syms[0].byte_range, (12, content.len() as u32));
+        assert_eq!(syms[0].line_range, (1, 5));
+        assert_eq!(syms[1].name, "Section.Child");
+        assert_eq!(syms[1].byte_range, (32, content.len() as u32));
+        assert_eq!(syms[1].line_range, (3, 5));
+    }
+
+    #[test]
+    fn markdown_commonmark_corpus_handles_atx_setext_fence_frontmatter_table_and_link() {
+        let content = br##"---
+title: "# frontmatter is not a heading"
+---
+# ATX [Guide](guide.md) #
+| Name | Value |
+| --- | --- |
+
+```md
+Hidden setext
+=============
+# Hidden ATX
+```
+
+Setext [Top](top.md)
+====================
+
+Setext Child
+-------------
+body
+"##;
+        let syms = extract(content);
+
+        assert_eq!(syms.len(), 3);
+        assert_eq!(syms[0].name, "ATX [Guide](guide.md)");
+        assert_eq!(syms[0].depth, 0);
+        assert_eq!(syms[1].name, "Setext [Top](top.md)");
+        assert_eq!(syms[1].depth, 0);
+        assert_eq!(syms[2].name, "Setext [Top](top.md).Setext Child");
+        assert_eq!(syms[2].depth, 1);
+        assert!(syms.iter().all(|symbol| !symbol.name.contains("Hidden")));
     }
 }

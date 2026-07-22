@@ -6,7 +6,7 @@ use crate::watcher_state::{WatcherInfo, WatcherState};
 
 use super::query::normalize_path_query;
 use super::search::{NoiseClass, NoisePolicy};
-use super::store::{IndexState, IndexedFile, LiveIndex, ParseStatus};
+use super::store::{IndexState, IndexedFile, LiveIndex, ParseStatus, SnapshotVerifyState};
 pub struct HealthStats {
     pub file_count: usize,
     pub symbol_count: usize,
@@ -277,6 +277,23 @@ impl LiveIndex {
         relative_path: &str,
     ) -> Option<AdmissionTierLookupView> {
         let path = normalize_path_query(relative_path);
+        if let Some(entry) = self.manifest_entries.iter().find(|entry| {
+            normalize_path_query(super::store::scouted_catalog_path(&entry.path)) == path
+        }) && let Some(decision) = super::store::compatibility_admission_decision(entry)
+        {
+            let entry_path = super::store::scouted_catalog_path(&entry.path).to_string();
+            return Some(AdmissionTierLookupView {
+                tier: decision.tier,
+                path: entry_path.clone(),
+                size: Some(entry.size),
+                extension: std::path::Path::new(&entry_path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(ToOwned::to_owned),
+                language: entry.language.clone(),
+                reason: decision.reason,
+            });
+        }
         if let Some(file) = self.files.get(&path) {
             return Some(AdmissionTierLookupView {
                 tier: AdmissionTier::Normal,
@@ -288,17 +305,7 @@ impl LiveIndex {
             });
         }
 
-        self.skipped_files
-            .iter()
-            .find(|skipped| normalize_path_query(&skipped.path) == path)
-            .map(|skipped| AdmissionTierLookupView {
-                tier: skipped.tier(),
-                path: skipped.path.clone(),
-                size: Some(skipped.size),
-                extension: skipped.extension.clone(),
-                language: None,
-                reason: skipped.reason(),
-            })
+        None
     }
 
     /// Number of indexed files.
@@ -316,6 +323,12 @@ impl LiveIndex {
         if self.is_empty {
             return false;
         }
+        if matches!(
+            self.snapshot_verify_state,
+            SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+        ) {
+            return false;
+        }
         !self.cb_state.is_tripped()
     }
 
@@ -323,6 +336,12 @@ impl LiveIndex {
     pub fn index_state(&self) -> IndexState {
         if self.is_empty {
             return IndexState::Empty;
+        }
+        if matches!(
+            self.snapshot_verify_state,
+            SnapshotVerifyState::Pending | SnapshotVerifyState::Running
+        ) {
+            return IndexState::Loading;
         }
         if self.cb_state.is_tripped() {
             IndexState::CircuitBreakerTripped {

@@ -191,6 +191,85 @@ fn search_files_debug_ranking_schema_and_roundtrip() {
     assert_eq!(roundtrip.get("debug_ranking"), Some(&Value::Bool(true)));
 }
 
+#[test]
+fn search_knowledge_schema_is_exact_read_only_and_current_scope_only() {
+    fn enum_strings(root: &Map<String, Value>, value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    enum_strings(root, value, output);
+                }
+            }
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                    let referenced = reference
+                        .strip_prefix("#/$defs/")
+                        .and_then(|name| root.get("$defs")?.as_object()?.get(name))
+                        .or_else(|| {
+                            reference
+                                .strip_prefix("#/definitions/")
+                                .and_then(|name| root.get("definitions")?.as_object()?.get(name))
+                        });
+                    if let Some(referenced) = referenced {
+                        enum_strings(root, referenced, output);
+                    }
+                }
+                if let Some(values) = object.get("enum").and_then(Value::as_array) {
+                    output.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+                for value in object.values() {
+                    enum_strings(root, value, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let tools = SymForgeServer::tool_definitions();
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "search_knowledge")
+        .expect("search_knowledge must be advertised on the full router");
+    let schema = tool.input_schema.as_ref();
+
+    let mut properties = schema_property_names(schema);
+    properties.sort();
+    assert_eq!(
+        properties,
+        [
+            "authority_scope",
+            "limit",
+            "max_tokens",
+            "path_prefix",
+            "project",
+            "projects",
+            "query",
+            "source_scope",
+        ]
+    );
+    assert_eq!(schema_required_fields(schema), ["query"]);
+
+    let source_scope = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get("source_scope"))
+        .expect("source_scope schema");
+    let mut advertised_scopes = Vec::new();
+    enum_strings(schema, source_scope, &mut advertised_scopes);
+    advertised_scopes.sort();
+    advertised_scopes.dedup();
+    assert_eq!(advertised_scopes, ["current"]);
+
+    let annotations = tool
+        .annotations
+        .as_ref()
+        .expect("search_knowledge annotations");
+    assert_eq!(annotations.read_only_hint, Some(true));
+    assert_eq!(annotations.destructive_hint, Some(false));
+    assert_eq!(annotations.idempotent_hint, Some(true));
+    assert_eq!(annotations.open_world_hint, Some(false));
+}
+
 schema_roundtrip_test!(roundtrip_index_folder, "index_folder", IndexFolderInput);
 
 #[test]

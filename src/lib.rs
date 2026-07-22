@@ -7,6 +7,7 @@
 pub mod domain;
 pub mod git;
 pub mod hash;
+pub mod knowledge;
 pub mod live_index;
 pub mod parsing;
 pub mod paths;
@@ -18,6 +19,7 @@ pub mod watcher_state;
 pub mod capability;
 pub mod discovery;
 pub mod edit_safety;
+pub mod gitignore_hygiene;
 pub mod idempotency;
 
 // ── Protocol-free STEL storage + calibration seam (D3-ROOT extract-up) ──

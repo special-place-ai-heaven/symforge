@@ -32,6 +32,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::domain::ControlStateDir;
+
 /// File name of the version registry within the SymForge home directory.
 const REGISTRY_FILE: &str = "versions.json";
 
@@ -40,18 +42,15 @@ pub fn self_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Resolve the global SymForge home used for the version registry:
-/// `$SYMFORGE_HOME` when set, else `~/.symforge`. Mirrors the daemon's home
-/// resolution for the common case and does not create the directory.
-pub fn resolve_home() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("SYMFORGE_HOME") {
-        return Some(PathBuf::from(explicit));
-    }
-    dirs::home_dir().map(|home| home.join(".symforge"))
+/// Return the process-wide resolved control-state owner used by the registry.
+pub fn resolve_home() -> Option<ControlStateDir> {
+    crate::paths::process_control_state_placement()
+        .directory()
+        .cloned()
 }
 
-fn registry_path(home: &Path) -> PathBuf {
-    home.join(REGISTRY_FILE)
+fn registry_path(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, REGISTRY_FILE)
 }
 
 /// Canonical path of the currently running executable, best-effort.
@@ -63,17 +62,20 @@ fn current_exe_key() -> Option<String> {
 
 /// Load the registry as a `path -> version` map. Missing or malformed files
 /// yield an empty map — the registry is advisory, never load-bearing.
-fn load(home: &Path) -> BTreeMap<String, String> {
-    std::fs::read(registry_path(home))
+fn load(control_state_dir: &ControlStateDir) -> BTreeMap<String, String> {
+    std::fs::read(registry_path(control_state_dir))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn atomic_write(home: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
-    std::fs::create_dir_all(home)?;
+fn atomic_write(
+    control_state_dir: &ControlStateDir,
+    map: &BTreeMap<String, String>,
+) -> io::Result<()> {
+    crate::paths::ensure_control_state_dir(control_state_dir)?;
     let data = serde_json::to_vec_pretty(map).map_err(io::Error::other)?;
-    let target = registry_path(home);
+    let target = registry_path(control_state_dir);
     // Write to a sibling temp file then rename so a concurrent reader never
     // observes a half-written registry. `rename` replaces the target on both
     // Windows and Unix.
@@ -86,8 +88,8 @@ fn atomic_write(home: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
 /// silent: any failure is ignored so version bookkeeping can never break a
 /// real command. Only writes when the recorded value is missing or changed,
 /// so the hot path (e.g. repeated hook invocations) reads but does not write.
-pub fn record_self(home: &Path) {
-    let _ = record_self_inner(home);
+pub fn record_self(control_state_dir: &ControlStateDir) {
+    let _ = record_self_inner(control_state_dir);
 }
 
 /// [`record_self`] against the default [`resolve_home`] location — the entry
@@ -98,16 +100,16 @@ pub fn record_self_default() {
     }
 }
 
-fn record_self_inner(home: &Path) -> io::Result<()> {
+fn record_self_inner(control_state_dir: &ControlStateDir) -> io::Result<()> {
     let Some(key) = current_exe_key() else {
         return Ok(());
     };
-    let mut map = load(home);
+    let mut map = load(control_state_dir);
     if map.get(&key).map(String::as_str) == Some(self_version()) {
         return Ok(()); // unchanged — avoid a needless write
     }
     map.insert(key, self_version().to_string());
-    atomic_write(home, &map)
+    atomic_write(control_state_dir, &map)
 }
 
 /// A newer SymForge install discovered at a different path than the running
@@ -123,10 +125,10 @@ pub struct StaleBinary {
 /// Returns `Some` when a strictly newer version is registered at a different,
 /// still-existing path than the running binary — i.e. the running binary is
 /// stale. Read-only; performs no writes, no process spawns, no network.
-pub fn detect_stale(home: &Path) -> Option<StaleBinary> {
+pub fn detect_stale(control_state_dir: &ControlStateDir) -> Option<StaleBinary> {
     let running_path = current_exe_key()?;
     let running_version = self_version();
-    let map = load(home);
+    let map = load(control_state_dir);
 
     let mut best: Option<(&String, &String)> = None;
     for (path, version) in &map {
@@ -163,8 +165,8 @@ pub fn detect_stale(home: &Path) -> Option<StaleBinary> {
 /// I/O error or when nothing changed). `symforge update` calls this so the
 /// registry does not accumulate dead entries (e.g. removed git-worktree dev
 /// builds, or the retired `~/.symforge/bin` durable binary once it is removed).
-pub fn prune_missing_entries(home: &Path) -> usize {
-    let map = load(home);
+pub fn prune_missing_entries(control_state_dir: &ControlStateDir) -> usize {
+    let map = load(control_state_dir);
     let before = map.len();
     let pruned: BTreeMap<String, String> = map
         .into_iter()
@@ -181,7 +183,7 @@ pub fn prune_missing_entries(home: &Path) -> usize {
         .collect();
     let removed = before - pruned.len();
     if removed > 0 {
-        let _ = atomic_write(home, &pruned);
+        let _ = atomic_write(control_state_dir, &pruned);
     }
     removed
 }
@@ -242,8 +244,8 @@ pub fn stale_warning(stale: &StaleBinary) -> String {
 
 /// Convenience: the drift warning string, or `None` when the running binary is
 /// the newest known. Callers append this to diagnostics (e.g. `health`).
-pub fn drift_banner(home: &Path) -> Option<String> {
-    detect_stale(home).map(|stale| stale_warning(&stale))
+pub fn drift_banner(control_state_dir: &ControlStateDir) -> Option<String> {
+    detect_stale(control_state_dir).map(|stale| stale_warning(&stale))
 }
 
 /// [`drift_banner`] against the default [`resolve_home`] location.
@@ -256,34 +258,34 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn write_registry(home: &Path, entries: &[(&str, &str)]) {
+    fn write_registry(control_state_dir: &ControlStateDir, entries: &[(&str, &str)]) {
         let map: BTreeMap<String, String> = entries
             .iter()
             .map(|(p, v)| ((*p).to_string(), (*v).to_string()))
             .collect();
-        atomic_write(home, &map).unwrap();
+        atomic_write(control_state_dir, &map).unwrap();
     }
 
     #[test]
     fn record_self_writes_and_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
-        record_self(home);
-        let after_first = std::fs::read_to_string(registry_path(home)).unwrap();
+        let home = ControlStateDir::new(tmp.path().join("control"));
+        record_self(&home);
+        let after_first = std::fs::read_to_string(registry_path(&home)).unwrap();
         let key = current_exe_key().unwrap();
-        let map = load(home);
+        let map = load(&home);
         assert_eq!(map.get(&key).map(String::as_str), Some(self_version()));
 
         // A second record with the same version must not rewrite the file.
-        record_self(home);
-        let after_second = std::fs::read_to_string(registry_path(home)).unwrap();
+        record_self(&home);
+        let after_second = std::fs::read_to_string(registry_path(&home)).unwrap();
         assert_eq!(after_first, after_second);
     }
 
     #[test]
     fn prune_missing_entries_drops_dead_paths_and_keeps_live_ones() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
         // One entry points at a real file, one at a path that no longer exists.
         let live = tmp.path().join("live-symforge");
         std::fs::write(&live, b"binary").unwrap();
@@ -294,19 +296,19 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         write_registry(
-            home,
+            &home,
             &[(live_key.as_str(), "7.15.4"), (dead_key.as_str(), "7.14.4")],
         );
 
-        let removed = prune_missing_entries(home);
+        let removed = prune_missing_entries(&home);
 
         assert_eq!(removed, 1, "exactly the dead entry should be pruned");
-        let map = load(home);
+        let map = load(&home);
         assert!(map.contains_key(&live_key), "live entry kept");
         assert!(!map.contains_key(&dead_key), "dead entry removed");
 
         // Idempotent: a second prune removes nothing.
-        assert_eq!(prune_missing_entries(home), 0);
+        assert_eq!(prune_missing_entries(&home), 0);
     }
 
     #[test]
@@ -317,7 +319,7 @@ mod tests {
         // old immediate-parent-only check kept this dead entry forever; it must be
         // pruned now.
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
 
         let gone_root = tmp.path().join("gone");
         let dead = gone_root.join("deep").join("symforge.exe");
@@ -339,14 +341,14 @@ mod tests {
         let live_key = live.to_string_lossy().into_owned();
 
         write_registry(
-            home,
+            &home,
             &[(live_key.as_str(), "7.15.4"), (dead_key.as_str(), "7.14.4")],
         );
 
-        let removed = prune_missing_entries(home);
+        let removed = prune_missing_entries(&home);
 
         assert_eq!(removed, 1, "the deleted-subtree entry must be pruned");
-        let map = load(home);
+        let map = load(&home);
         assert!(map.contains_key(&live_key), "live entry kept");
         assert!(
             !map.contains_key(&dead_key),
@@ -373,7 +375,7 @@ mod tests {
     #[test]
     fn prune_missing_entries_keeps_entry_on_offline_mount() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
 
         // Find a drive letter whose root does not exist (genuinely unmapped).
         let absent = ('D'..='Z')
@@ -393,18 +395,18 @@ mod tests {
             "an unmapped drive must be classified unreachable despite the pseudo-root"
         );
 
-        write_registry(home, &[(offline_key.as_str(), "7.14.4")]);
+        write_registry(&home, &[(offline_key.as_str(), "7.14.4")]);
 
-        let removed = prune_missing_entries(home);
+        let removed = prune_missing_entries(&home);
 
         assert_eq!(removed, 0, "an offline-mount entry must be kept");
-        assert!(load(home).contains_key(&offline_key), "offline entry kept");
+        assert!(load(&home).contains_key(&offline_key), "offline entry kept");
     }
 
     #[test]
     fn detect_stale_flags_newer_version_at_existing_path() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
         // A real file stands in for the "newer" binary so the existence check passes.
         let newer = tmp.path().join("newer-symforge");
         std::fs::write(&newer, b"binary").unwrap();
@@ -415,14 +417,14 @@ mod tests {
 
         let running = current_exe_key().unwrap();
         write_registry(
-            home,
+            &home,
             &[
                 (running.as_str(), self_version()),
                 (newer_key.as_str(), "999.0.0"),
             ],
         );
 
-        let stale = detect_stale(home).expect("newer version at another path is stale");
+        let stale = detect_stale(&home).expect("newer version at another path is stale");
         assert_eq!(stale.newer_version, "999.0.0");
         assert_eq!(stale.newer_path, newer_key);
         assert_eq!(stale.running_version, self_version());
@@ -431,38 +433,39 @@ mod tests {
     #[test]
     fn detect_stale_ignores_missing_newer_binary() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
         let running = current_exe_key().unwrap();
         // Newer version listed, but its path does not exist on disk.
         write_registry(
-            home,
+            &home,
             &[
                 (running.as_str(), self_version()),
                 ("/nonexistent/symforge-binary", "999.0.0"),
             ],
         );
-        assert!(detect_stale(home).is_none());
+        assert!(detect_stale(&home).is_none());
     }
 
     #[test]
     fn detect_stale_returns_none_when_self_is_newest() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
+        let home = ControlStateDir::new(tmp.path().join("control"));
         let running = current_exe_key().unwrap();
         write_registry(
-            home,
+            &home,
             &[
                 (running.as_str(), self_version()),
                 ("/some/old/symforge", "0.0.1"),
             ],
         );
-        assert!(detect_stale(home).is_none());
+        assert!(detect_stale(&home).is_none());
     }
 
     #[test]
     fn detect_stale_returns_none_on_empty_registry() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(detect_stale(tmp.path()).is_none());
+        let home = ControlStateDir::new(tmp.path().join("control"));
+        assert!(detect_stale(&home).is_none());
     }
 
     #[test]

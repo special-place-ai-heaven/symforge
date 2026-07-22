@@ -35,6 +35,9 @@ pub struct EditContext<'a> {
     pub indexed_absolute_path: &'a Path,
     /// Repository root currently bound to the server.
     pub repo_root: &'a Path,
+    /// Resolved durable owner for per-project replay, frecency, and edit-safety
+    /// snapshots. `None` means this binding is intentionally memory-only.
+    pub project_state_dir: Option<&'a crate::domain::ProjectStateDir>,
     /// Optional caller-supplied working directory. Feature hooks (e.g.
     /// `worktree-awareness`) consume this to redirect writes into the matching
     /// git worktree. `None` means the caller did not supply one and the hook
@@ -153,6 +156,7 @@ mod tests {
             relative_path: "src/lib.rs",
             indexed_absolute_path: &abs,
             repo_root: &repo_root,
+            project_state_dir: None,
             working_directory: None,
         };
         let resolved = DefaultEditHook.resolve_target_path(&ctx).expect("resolves");
@@ -169,6 +173,7 @@ mod tests {
             relative_path: "src/lib.rs",
             indexed_absolute_path: &abs,
             repo_root: &repo_root,
+            project_state_dir: None,
             working_directory: None,
         };
         // Should not panic or mutate anything observable.
@@ -186,6 +191,7 @@ mod tests {
             relative_path: "src/lib.rs",
             indexed_absolute_path: &abs,
             repo_root: &repo_root,
+            project_state_dir: None,
             working_directory: None,
         };
         let resolved = resolve(&ctx).expect("resolves");
@@ -207,6 +213,7 @@ mod tests {
             relative_path: "src/lib.rs",
             indexed_absolute_path: &abs,
             repo_root: &repo_root,
+            project_state_dir: None,
             working_directory: Some(&cwd),
         };
         let resolved = DefaultEditHook.resolve_target_path(&ctx).expect("resolves");
@@ -263,6 +270,7 @@ mod tests {
             relative_path: SENTINEL,
             indexed_absolute_path: &abs,
             repo_root: &repo_root,
+            project_state_dir: None,
             working_directory: Some(Path::new("/worktree")),
         };
         let resolved = resolve(&ctx).expect("resolves");

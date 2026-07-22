@@ -1367,6 +1367,7 @@ pub fn extract_references(
         | LanguageId::Toml
         | LanguageId::Yaml
         | LanguageId::Markdown
+        | LanguageId::Text
         | LanguageId::Env => unreachable!("config types are handled before extract_references"),
         LanguageId::Html | LanguageId::Css | LanguageId::Scss => {
             return (vec![], HashMap::new());
@@ -1875,6 +1876,7 @@ mod tests {
             | LanguageId::Toml
             | LanguageId::Yaml
             | LanguageId::Markdown
+            | LanguageId::Text
             | LanguageId::Env
             | LanguageId::Html
             | LanguageId::Css

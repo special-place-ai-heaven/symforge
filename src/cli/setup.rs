@@ -325,9 +325,20 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
     sink: &mut S,
     browser: &B,
 ) -> anyhow::Result<WizardOutcome> {
+    let placement = crate::paths::process_control_state_placement();
+    run_wizard_with_control_state(args, ctx, sink, browser, placement.directory())
+}
+
+#[doc(hidden)]
+pub fn run_wizard_with_control_state<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
+    args: SetupCliArgs,
+    ctx: &SetupContext,
+    sink: &mut S,
+    browser: &B,
+    control_state_dir: Option<&crate::domain::ControlStateDir>,
+) -> anyhow::Result<WizardOutcome> {
     let registry = ctx.registry();
-    let project_base = ctx.project_base();
-    let existing_profile = OperatorSetupProfile::load(&project_base);
+    let existing_profile = control_state_dir.and_then(OperatorSetupProfile::load);
 
     // --- Step 1: scan (read-only, FR-004) -----------------------------------
     let suggested_port = suggest_free_port(args.port)?;
@@ -508,7 +519,7 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
         now_epoch_ms(),
     );
     profile
-        .save(&project_base)
+        .save(control_state_dir.context("process control state unavailable")?)
         .context("could not persist operator setup profile")?;
 
     // --- Step 5b: offer to open the dashboard (FR-011) ----------------------
@@ -688,6 +699,10 @@ fn installation_type_label(t: InstallationType) -> &'static str {
 mod tests {
     use super::*;
 
+    fn control_over(home: &std::path::Path) -> crate::domain::ControlStateDir {
+        crate::domain::ControlStateDir::new(home.join("control"))
+    }
+
     #[test]
     fn scripted_sink_returns_scripted_answers_and_records_prompts() {
         let mut sink = ScriptedSetupSink::new([1, 0], true);
@@ -743,6 +758,7 @@ mod tests {
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");
+        let control = control_over(home.path());
         let cfg = home.path().join(".claude.json");
         std::fs::write(&cfg, "{}\n").expect("fixture harness config");
 
@@ -754,7 +770,7 @@ mod tests {
         let mut sink = ScriptedSetupSink::new([], true);
         let browser = NoopBrowserOpener::default();
 
-        let outcome = run_wizard(
+        let outcome = run_wizard_with_control_state(
             SetupCliArgs {
                 non_interactive: true,
                 installation_type: Some(InstallationType::Both),
@@ -765,6 +781,7 @@ mod tests {
             &ctx,
             &mut sink,
             &browser,
+            Some(&control),
         )
         .expect("setup should succeed");
 
@@ -777,7 +794,7 @@ mod tests {
             sink.statuses
         );
 
-        let profile = OperatorSetupProfile::load(project.path()).expect("profile persisted");
+        let profile = OperatorSetupProfile::load(&control).expect("profile persisted");
         assert_eq!(profile.installation_type, InstallationType::Both);
         assert!(profile.port > 0);
         assert_eq!(profile.harnesses, vec!["claude"]);
@@ -813,6 +830,7 @@ mod tests {
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");
+        let control = control_over(home.path());
         let cfg = home.path().join(".claude.json");
         let original = "{\n  \"mcpServers\": {}\n}\n";
         std::fs::write(&cfg, original).expect("fixture");
@@ -825,7 +843,7 @@ mod tests {
         let mut sink = ScriptedSetupSink::new([], false);
         let browser = NoopBrowserOpener::default();
 
-        let outcome = run_wizard(
+        let outcome = run_wizard_with_control_state(
             SetupCliArgs {
                 non_interactive: true,
                 installation_type: Some(InstallationType::Both),
@@ -836,6 +854,7 @@ mod tests {
             &ctx,
             &mut sink,
             &browser,
+            Some(&control),
         )
         .expect("a decline is a clean no-op, not an error");
 
@@ -844,7 +863,7 @@ mod tests {
         assert!(outcome.session.is_none());
         assert!(outcome.harness_outcomes.is_empty());
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
-        assert!(OperatorSetupProfile::load(project.path()).is_none());
+        assert!(OperatorSetupProfile::load(&control).is_none());
         // The restate was still presented before the decline (FR-008).
         assert_eq!(sink.confirmations.len(), 1);
     }
@@ -862,6 +881,7 @@ mod tests {
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");
+        let control = control_over(home.path());
         let ctx = SetupContext {
             home: home.path().to_path_buf(),
             working_dir: project.path().to_path_buf(),
@@ -869,7 +889,7 @@ mod tests {
         let mut sink = ScriptedSetupSink::new([], true);
         let browser = NoopBrowserOpener::default();
 
-        let outcome = run_wizard(
+        let outcome = run_wizard_with_control_state(
             SetupCliArgs {
                 non_interactive: true,
                 installation_type: Some(InstallationType::Server),
@@ -880,6 +900,7 @@ mod tests {
             &ctx,
             &mut sink,
             &browser,
+            Some(&control),
         )
         .expect("server-mode setup should start a server when none runs");
         assert!(
@@ -936,6 +957,7 @@ mod tests {
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");
+        let control = control_over(home.path());
         OperatorSetupProfile::new(
             InstallationType::Server,
             running.bound_addr.port(),
@@ -943,7 +965,7 @@ mod tests {
             &[],
             1,
         )
-        .save(project.path())
+        .save(&control)
         .expect("persist profile");
 
         let ctx = SetupContext {
@@ -953,7 +975,7 @@ mod tests {
         let mut sink = ScriptedSetupSink::new([], true);
         let browser = NoopBrowserOpener::default();
 
-        let outcome = run_wizard(
+        let outcome = run_wizard_with_control_state(
             SetupCliArgs {
                 non_interactive: true,
                 installation_type: Some(InstallationType::Server),
@@ -964,6 +986,7 @@ mod tests {
             &ctx,
             &mut sink,
             &browser,
+            Some(&control),
         )
         .expect("server-mode setup should reuse the running server");
         assert!(

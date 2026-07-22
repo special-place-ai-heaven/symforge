@@ -150,7 +150,12 @@ pub(crate) struct AtomicWriteReport {
     pub tee_snapshot: crate::edit_safety::tee::TeeSnapshot,
 }
 
-pub(crate) fn atomic_write_file(path: &Path, content: &[u8]) -> std::io::Result<AtomicWriteReport> {
+pub(crate) fn atomic_write_file(
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
+    path: &Path,
+    content: &[u8],
+) -> std::io::Result<AtomicWriteReport> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -158,12 +163,18 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8]) -> std::io::Result<
             "path has no parent directory",
         )
     })?;
-    let tee_snapshot = crate::edit_safety::tee::Tee::for_target(path)
-        .snapshot(path)
-        .unwrap_or_else(|err| crate::edit_safety::tee::TeeSnapshot::Warning {
+    let tee_snapshot = match project_state_dir {
+        Some(state_dir) => crate::edit_safety::tee::Tee::for_repo(repo_root, state_dir)
+            .snapshot(path)
+            .unwrap_or_else(|err| crate::edit_safety::tee::TeeSnapshot::Warning {
+                original_path: path.to_path_buf(),
+                message: format!("unexpected tee snapshot error: {err}"),
+            }),
+        None => crate::edit_safety::tee::TeeSnapshot::Warning {
             original_path: path.to_path_buf(),
-            message: format!("unexpected tee snapshot error: {err}"),
-        });
+            message: "project state unavailable; tee snapshot disabled".to_string(),
+        },
+    };
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(content)?;
     tmp.flush()?;
@@ -303,6 +314,8 @@ fn lock_for_path(key: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
 /// server — the clobber is closed on every surface (in-process facade, daemon,
 /// serve). The residual is the external-editor case only.
 pub(crate) fn guarded_atomic_write_file(
+    repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
     path: &Path,
     base: &[u8],
     new_content: &[u8],
@@ -349,7 +362,8 @@ pub(crate) fn guarded_atomic_write_file(
         }
     }
 
-    atomic_write_file(path, new_content).map(GuardedWriteOutcome::Written)
+    atomic_write_file(repo_root, project_state_dir, path, new_content)
+        .map(GuardedWriteOutcome::Written)
 }
 
 pub(crate) fn format_tee_snapshot_suffix(report: &AtomicWriteReport) -> String {
@@ -1809,6 +1823,7 @@ pub enum EditOperation {
 pub(crate) fn execute_batch_edit(
     index: &SharedIndex,
     repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
     edits: &[SingleEdit],
     dry_run: bool,
     top_level_working_directory: Option<&Path>,
@@ -2041,6 +2056,7 @@ pub(crate) fn execute_batch_edit(
             relative_path: path,
             indexed_absolute_path: &indexed_abs_path,
             repo_root,
+            project_state_dir,
             working_directory: per_file_working_directory.as_deref(),
         };
         let resolved_target = match super::edit_hooks::resolve(&hook_ctx) {
@@ -2079,7 +2095,12 @@ pub(crate) fn execute_batch_edit(
     let mut write_reports: Vec<Option<AtomicWriteReport>> = vec![None; staged.len()];
     let mut write_error: Option<String> = None;
     for (i, staged_file) in staged.iter().enumerate() {
-        match atomic_write_file(&staged_file.abs_path, &staged_file.new_content) {
+        match atomic_write_file(
+            repo_root,
+            project_state_dir,
+            &staged_file.abs_path,
+            &staged_file.new_content,
+        ) {
             Ok(report) => {
                 write_reports[i] = Some(report);
             }
@@ -2095,7 +2116,12 @@ pub(crate) fn execute_batch_edit(
         let mut rollback_failures: Vec<String> = Vec::new();
         for &written_index in &written {
             let staged_file = &staged[written_index];
-            if let Err(rb_err) = atomic_write_file(&staged_file.abs_path, &staged_file.original) {
+            if let Err(rb_err) = atomic_write_file(
+                repo_root,
+                project_state_dir,
+                &staged_file.abs_path,
+                &staged_file.original,
+            ) {
                 rollback_failures.push(format!("  {}: {rb_err}", staged_file.path));
                 continue;
             }
@@ -2151,6 +2177,7 @@ pub(crate) fn execute_batch_edit(
             relative_path: &staged_file.path,
             indexed_absolute_path: &staged_file.resolved_target.indexed_path,
             repo_root,
+            project_state_dir,
             working_directory: staged_file.working_directory.as_deref(),
         };
         super::edit_hooks::after_commit(&hook_ctx, &staged_file.abs_path);
@@ -2256,6 +2283,7 @@ fn validate_rename_ranges(
 pub(crate) fn execute_batch_rename(
     index: &SharedIndex,
     repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchRenameInput,
 ) -> Result<String, String> {
     // Phase 1: Resolve the definition and find the name within its body.
@@ -2654,6 +2682,7 @@ pub(crate) fn execute_batch_rename(
             relative_path: path,
             indexed_absolute_path: &indexed_abs,
             repo_root,
+            project_state_dir,
             working_directory: working_directory.as_deref(),
         };
         let resolved_target = match super::edit_hooks::resolve(&hook_ctx) {
@@ -2680,7 +2709,9 @@ pub(crate) fn execute_batch_rename(
     let mut written: Vec<usize> = Vec::new(); // indices into staged
     let mut write_error: Option<String> = None;
     for (i, sf) in staged.iter().enumerate() {
-        if let Err(e) = atomic_write_file(&sf.abs_path, &sf.new_content) {
+        if let Err(e) =
+            atomic_write_file(repo_root, project_state_dir, &sf.abs_path, &sf.new_content)
+        {
             write_error = Some(format!("Write failed for {}: {e}", sf.path));
             break;
         }
@@ -2692,7 +2723,9 @@ pub(crate) fn execute_batch_rename(
         let mut rollback_failures: Vec<String> = Vec::new();
         for &wi in &written {
             let sf = &staged[wi];
-            if let Err(rb_err) = atomic_write_file(&sf.abs_path, &sf.original) {
+            if let Err(rb_err) =
+                atomic_write_file(repo_root, project_state_dir, &sf.abs_path, &sf.original)
+            {
                 rollback_failures.push(format!("  {}: {rb_err}", sf.path));
                 continue;
             }
@@ -2750,6 +2783,7 @@ pub(crate) fn execute_batch_rename(
             relative_path: &sf.path,
             indexed_absolute_path: &sf.resolved_target.indexed_path,
             repo_root,
+            project_state_dir,
             working_directory: sf.working_directory.as_deref(),
         };
         super::edit_hooks::after_commit(&hook_ctx, &sf.abs_path);
@@ -2912,6 +2946,7 @@ impl<'de> serde::Deserialize<'de> for InsertTarget {
 pub(crate) fn execute_batch_insert(
     index: &SharedIndex,
     repo_root: &Path,
+    project_state_dir: Option<&crate::domain::ProjectStateDir>,
     input: &BatchInsertInput,
 ) -> Result<Vec<String>, String> {
     struct ResolvedTarget {
@@ -3056,6 +3091,7 @@ pub(crate) fn execute_batch_insert(
             relative_path: &path,
             indexed_absolute_path: &indexed_abs_path,
             repo_root,
+            project_state_dir,
             working_directory: per_file_working_directory.as_deref(),
         };
         let resolved_target = match super::edit_hooks::resolve(&hook_ctx) {
@@ -3091,7 +3127,12 @@ pub(crate) fn execute_batch_insert(
     let mut written: Vec<usize> = Vec::new();
     let mut write_error: Option<String> = None;
     for (i, staged_file) in staged.iter().enumerate() {
-        if let Err(e) = atomic_write_file(&staged_file.abs_path, &staged_file.new_content) {
+        if let Err(e) = atomic_write_file(
+            repo_root,
+            project_state_dir,
+            &staged_file.abs_path,
+            &staged_file.new_content,
+        ) {
             write_error = Some(format!("Write failed for {}: {e}", staged_file.path));
             break;
         }
@@ -3102,7 +3143,12 @@ pub(crate) fn execute_batch_insert(
         let mut rollback_failures: Vec<String> = Vec::new();
         for &written_index in &written {
             let staged_file = &staged[written_index];
-            if let Err(rb_err) = atomic_write_file(&staged_file.abs_path, &staged_file.original) {
+            if let Err(rb_err) = atomic_write_file(
+                repo_root,
+                project_state_dir,
+                &staged_file.abs_path,
+                &staged_file.original,
+            ) {
                 rollback_failures.push(format!("  {}: {rb_err}", staged_file.path));
                 continue;
             }
@@ -3157,6 +3203,7 @@ pub(crate) fn execute_batch_insert(
             relative_path: &staged_file.path,
             indexed_absolute_path: &staged_file.resolved_target.indexed_path,
             repo_root,
+            project_state_dir,
             working_directory: staged_file.working_directory.as_deref(),
         };
         super::edit_hooks::after_commit(&hook_ctx, &staged_file.abs_path);
@@ -3445,7 +3492,7 @@ mod tests {
     fn test_atomic_write_file_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rs");
-        atomic_write_file(&path, b"fn main() {}").unwrap();
+        atomic_write_file(dir.path(), None, &path, b"fn main() {}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"fn main() {}");
     }
 
@@ -3454,7 +3501,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rs");
         std::fs::write(&path, b"old content").unwrap();
-        atomic_write_file(&path, b"new content").unwrap();
+        atomic_write_file(dir.path(), None, &path, b"new content").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new content");
     }
 
@@ -3462,7 +3509,7 @@ mod tests {
     fn test_atomic_write_file_no_leftover_tmp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.rs");
-        atomic_write_file(&path, b"content").unwrap();
+        atomic_write_file(dir.path(), None, &path, b"content").unwrap();
         let tmp = path.with_extension("symforge_tmp");
         assert!(!tmp.exists());
     }
@@ -3548,7 +3595,7 @@ mod tests {
 
         // Edit: overwrite disk with new content and reindex.
         let new_content = b"fn new_content_marker() {}\n";
-        atomic_write_file(&abs_path, new_content).unwrap();
+        atomic_write_file(dir.path(), None, &abs_path, new_content).unwrap();
         reindex_after_write(
             &handle,
             &abs_path,
@@ -4288,7 +4335,7 @@ mod tests {
             },
         ];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), &edits, false, None).unwrap();
+        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a_content = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4332,7 +4379,7 @@ mod tests {
             },
         ];
 
-        let result = execute_batch_edit(&handle, dir.path(), &edits, false, None);
+        let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Overlapping"));
     }
@@ -4372,7 +4419,7 @@ mod tests {
             },
         ];
 
-        let result = execute_batch_edit(&handle, dir.path(), &edits, false, None);
+        let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -4420,7 +4467,7 @@ mod tests {
             working_directory: None,
         }];
 
-        let result = execute_batch_edit(&handle, dir.path(), &edits, false, None);
+        let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("did_you_mean: [foo_bar]"), "error was: {err}");
@@ -4454,7 +4501,7 @@ mod tests {
             working_directory: None,
         }];
 
-        let summaries = execute_batch_edit(&handle, dir.path(), &edits, true, None).unwrap();
+        let summaries = execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap();
         assert_eq!(summaries.len(), 1, "expected one preview line");
         assert!(
             summaries[0].contains("[DRY RUN]"),
@@ -4496,8 +4543,10 @@ mod tests {
             working_directory: None,
         }];
 
-        let real_err = execute_batch_edit(&handle, dir.path(), &edits, false, None).unwrap_err();
-        let dry_err = execute_batch_edit(&handle, dir.path(), &edits, true, None).unwrap_err();
+        let real_err =
+            execute_batch_edit(&handle, dir.path(), None, &edits, false, None).unwrap_err();
+        let dry_err =
+            execute_batch_edit(&handle, dir.path(), None, &edits, true, None).unwrap_err();
 
         assert_eq!(
             real_err, dry_err,
@@ -4550,7 +4599,7 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), &input).unwrap();
+        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let a = std::fs::read_to_string(src.join("a.rs")).unwrap();
@@ -4602,7 +4651,7 @@ mod tests {
             working_directory: None,
         };
 
-        let summaries = execute_batch_insert(&handle, dir.path(), &input).unwrap();
+        let summaries = execute_batch_insert(&handle, dir.path(), None, &input).unwrap();
         assert_eq!(summaries.len(), 2, "expected two preview lines");
         for s in &summaries {
             assert!(s.contains("[DRY RUN]"), "expected [DRY RUN] prefix in: {s}");
@@ -4684,7 +4733,7 @@ mod tests {
             working_directory: None,
         };
 
-        let result = execute_batch_insert(&handle, dir.path(), &input);
+        let result = execute_batch_insert(&handle, dir.path(), None, &input);
 
         let err = result.unwrap_err();
         assert!(
@@ -4792,7 +4841,7 @@ mod tests {
             },
         ];
 
-        let result = execute_batch_edit(&handle, dir.path(), &edits, false, None);
+        let result = execute_batch_edit(&handle, dir.path(), None, &edits, false, None);
 
         let err = result.unwrap_err();
         assert!(
@@ -4870,7 +4919,7 @@ mod tests {
             working_directory: None,
         };
 
-        let out = execute_batch_rename(&handle, dir.path(), &input).unwrap();
+        let out = execute_batch_rename(&handle, dir.path(), None, &input).unwrap();
 
         assert!(
             out.contains("Confident matches (will be applied)"),
@@ -4941,7 +4990,7 @@ mod tests {
             working_directory: None,
         };
 
-        let result = execute_batch_rename(&handle, dir.path(), &input);
+        let result = execute_batch_rename(&handle, dir.path(), None, &input);
 
         // Must be an error.
         let err = result.unwrap_err();
@@ -5597,6 +5646,8 @@ fn uses_it() { Widget::default(); }
         let barrier = Arc::new(Barrier::new(2));
         let target_a = target.clone();
         let target_b = target.clone();
+        let root_a = dir.path().to_path_buf();
+        let root_b = dir.path().to_path_buf();
         let pa = payload_a.clone();
         let pb = payload_b.clone();
         let ba = Arc::clone(&barrier);
@@ -5604,11 +5655,11 @@ fn uses_it() { Widget::default(); }
 
         let ha = std::thread::spawn(move || {
             ba.wait();
-            atomic_write_file(&target_a, &pa)
+            atomic_write_file(&root_a, None, &target_a, &pa)
         });
         let hb = std::thread::spawn(move || {
             bb.wait();
-            atomic_write_file(&target_b, &pb)
+            atomic_write_file(&root_b, None, &target_b, &pb)
         });
 
         let result_a = ha.join().unwrap();
@@ -5641,7 +5692,7 @@ fn uses_it() { Widget::default(); }
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("output.txt");
 
-        atomic_write_file(&target, b"hello world").unwrap();
+        atomic_write_file(dir.path(), None, &target, b"hello world").unwrap();
 
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -5661,7 +5712,7 @@ fn uses_it() { Widget::default(); }
         // Target is in a nonexistent subdirectory — write must fail.
         let bad_target = dir.path().join("nonexistent_subdir").join("file.txt");
 
-        let result = atomic_write_file(&bad_target, b"data");
+        let result = atomic_write_file(dir.path(), None, &bad_target, b"data");
         assert!(result.is_err(), "expected error for nonexistent parent dir");
 
         // No temp files should have leaked into the real dir.
@@ -6357,16 +6408,25 @@ fn uses_it() { Widget::default(); }
             std::fs::write(&path, &base).expect("reset to base");
 
             let barrier = Arc::new(Barrier::new(2));
+            let repo_root = dir.path().to_path_buf();
 
             let spawn_writer = |new_content: Vec<u8>| {
                 let path = path.clone();
                 let base = base.clone();
                 let barrier = Arc::clone(&barrier);
+                let repo_root = repo_root.clone();
                 std::thread::spawn(move || {
                     // Align both threads immediately before entering the guarded
                     // write so the re-read/rename windows overlap maximally.
                     barrier.wait();
-                    match guarded_atomic_write_file(&path, &base, &new_content, Some("guard")) {
+                    match guarded_atomic_write_file(
+                        &repo_root,
+                        None,
+                        &path,
+                        &base,
+                        &new_content,
+                        Some("guard"),
+                    ) {
                         Ok(GuardedWriteOutcome::Written(_)) => WriterResult::Committed,
                         Ok(GuardedWriteOutcome::Rejected) => WriterResult::Rejected,
                         Err(_) => WriterResult::WriteErr,
@@ -6469,12 +6529,14 @@ fn uses_it() { Widget::default(); }
         std::fs::write(&path_b, &base).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
+        let repo_root = dir.path().to_path_buf();
         let spawn = |path: std::path::PathBuf, body: Vec<u8>| {
             let base = base.clone();
             let barrier = Arc::clone(&barrier);
+            let repo_root = repo_root.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                guarded_atomic_write_file(&path, &base, &body, Some("guard"))
+                guarded_atomic_write_file(&repo_root, None, &path, &base, &body, Some("guard"))
                     .expect("guarded write must not error")
             })
         };

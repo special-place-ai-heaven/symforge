@@ -59,8 +59,20 @@ async fn spawn_watcher(
         run_watcher(root, index_clone, info_clone).await;
     });
 
-    // Give the watcher time to initialize the OS-level watch handle.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the registered watcher to finish its mandatory fresh-instance
+    // reconciliation. A fixed sleep races that repair on slower Windows hosts
+    // and can mutate the fixture before the event loop is ready to drain its
+    // already-registered channel.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if watcher_info.lock().state == WatcherState::Active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher should become Active after fresh-instance reconciliation");
 
     watcher_info
 }

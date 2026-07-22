@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use symforge::domain::ProjectStateDir;
 use symforge::live_index::LiveIndex;
 use symforge::protocol::SymForgeServer;
 use symforge::server::{
@@ -27,16 +28,21 @@ use symforge::watcher::WatcherInfo;
 // Store-level: hash-only, raw-once, list-no-raw, revoke
 // ---------------------------------------------------------------------------
 
+fn project_state(root: &std::path::Path) -> ProjectStateDir {
+    ProjectStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
+}
+
 #[test]
 fn mint_persists_hash_only_raw_shown_once() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let store = ApiKeyStore::open(tmp.path());
+    let project_state = project_state(tmp.path());
+    let store = ApiKeyStore::open(&project_state);
     let minted = store.mint("ci").expect("mint");
     let raw = minted.raw_secret.clone();
     assert!(raw.starts_with("sf_"));
 
     // The persisted DB bytes must NOT contain the raw secret anywhere.
-    let db_path = tmp.path().join(".symforge").join("api-keys.db");
+    let db_path = project_state.as_path().join("api-keys.db");
     let bytes = std::fs::read(&db_path).expect("read db");
     let needle = raw.as_bytes();
     let contains = bytes.windows(needle.len()).any(|w| w == needle);
@@ -59,11 +65,12 @@ fn mint_persists_hash_only_raw_shown_once() {
 #[test]
 fn list_never_returns_raw_after_reopen() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let project_state = project_state(tmp.path());
     let raw = {
-        let store = ApiKeyStore::open(tmp.path());
+        let store = ApiKeyStore::open(&project_state);
         store.mint("k").expect("mint").raw_secret
     };
-    let store2 = ApiKeyStore::open(tmp.path());
+    let store2 = ApiKeyStore::open(&project_state);
     // Verify still works (hash persisted), but list cannot reveal raw.
     assert!(store2.verify(&raw));
     let json = serde_json::to_string(&store2.list().expect("list")).expect("serialize");

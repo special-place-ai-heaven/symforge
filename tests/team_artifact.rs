@@ -10,6 +10,24 @@ use std::path::Path;
 use symforge::live_index::LiveIndex;
 use symforge::live_index::persist;
 
+fn bound_state(
+    root: &Path,
+) -> (
+    symforge::domain::RootBinding,
+    symforge::domain::StatePlacement,
+) {
+    let binding = match symforge::discovery::resolve_root_candidate(
+        root,
+        symforge::domain::RootCandidateSource::LaunchCwd,
+        symforge::domain::RootRequestMode::Automatic,
+    ) {
+        symforge::domain::RootResolution::Bound(binding) => binding,
+        resolution => panic!("fixture root should bind: {resolution:?}"),
+    };
+    let placement = symforge::discovery::resolve_state_placement(&binding);
+    (binding, placement)
+}
+
 fn write_fixture(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("mkdir src");
     fs::write(
@@ -29,6 +47,7 @@ fn team_artifact_zstd_round_trip_preserves_content_hash() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     write_fixture(root);
+    let (binding, placement) = bound_state(root);
 
     let shared = LiveIndex::load(root).expect("load index");
     let before_hashes: Vec<(String, String)> = {
@@ -42,7 +61,14 @@ fn team_artifact_zstd_round_trip_preserves_content_hash() {
 
     let report = {
         let index = shared.read();
-        persist::export_artifact(&index, root).expect("export artifact")
+        persist::export_artifact(
+            &index,
+            &binding.canonical_root,
+            binding.access_mode,
+            &placement,
+            &symforge::domain::CapabilityStatus::Available,
+        )
+        .expect("export artifact")
     };
     assert_eq!(report.files, before_hashes.len());
 
@@ -76,7 +102,8 @@ fn team_artifact_zstd_round_trip_preserves_content_hash() {
         !root.join(".symforge").join("index.bin").exists(),
         "this scenario must have no plain index.bin — only the .zst artifact"
     );
-    let imported = persist::load_snapshot(root).expect("load_snapshot should import the artifact");
+    let imported =
+        persist::load_snapshot(root, &placement).expect("load_snapshot should import the artifact");
     assert_eq!(imported.files.len(), before_hashes.len());
     for (path, expected_hash) in &before_hashes {
         let imported_file = imported
@@ -95,11 +122,19 @@ fn team_artifact_corrupt_quarantines_without_partial_serve() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     write_fixture(root);
+    let (binding, placement) = bound_state(root);
 
     let shared = LiveIndex::load(root).expect("load index");
     {
         let index = shared.read();
-        persist::export_artifact(&index, root).expect("export artifact");
+        persist::export_artifact(
+            &index,
+            &binding.canonical_root,
+            binding.access_mode,
+            &placement,
+            &symforge::domain::CapabilityStatus::Available,
+        )
+        .expect("export artifact");
     }
 
     // Corrupt the exported artifact in place (simulates a bad transfer/merge).
@@ -109,7 +144,7 @@ fn team_artifact_corrupt_quarantines_without_partial_serve() {
 
     // A-US2-03: corrupt import falls back to a full rebuild (None), never a
     // partially-loaded index.
-    let result = persist::load_snapshot(root);
+    let result = persist::load_snapshot(root, &placement);
     assert!(
         result.is_none(),
         "corrupt artifact must fall back to a full re-index, not partial-serve"

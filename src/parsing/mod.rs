@@ -51,6 +51,42 @@ pub fn process_file_with_classification(
     let byte_len = bytes.len() as u64;
     let content_hash = digest_hex(bytes);
 
+    // Generic knowledge is exact safe text, not source code. It deliberately
+    // produces no synthetic symbols and never enters tree-sitter.
+    if matches!(language, LanguageId::Text) {
+        let (outcome, parse_diagnostic) = match crate::knowledge::decode_searchable_text(bytes) {
+            Ok(_) => (FileOutcome::Processed, None),
+            Err(_) => {
+                let diagnostic = ParseDiagnostic {
+                    parser: "utf-8".to_string(),
+                    message: "unsupported text encoding".to_string(),
+                    line: None,
+                    column: None,
+                    byte_span: None,
+                    fallback_used: false,
+                };
+                (
+                    FileOutcome::Failed {
+                        error: diagnostic.summary(),
+                    },
+                    Some(diagnostic),
+                )
+            }
+        };
+        return FileProcessingResult {
+            relative_path: relative_path.to_string(),
+            language,
+            classification,
+            outcome,
+            parse_diagnostic,
+            symbols: vec![],
+            byte_len,
+            content_hash,
+            references: vec![],
+            alias_map: HashMap::new(),
+        };
+    }
+
     // Config files use native parsers, not tree-sitter.
     if config_extractors::is_config_language(&language) {
         let result = config_extractors::extractor_for(&language).map(|e| e.extract(bytes));
@@ -308,6 +344,7 @@ pub(crate) fn parse_source(
         | LanguageId::Toml
         | LanguageId::Yaml
         | LanguageId::Markdown
+        | LanguageId::Text
         | LanguageId::Env => unreachable!("config types are handled before parse_source"),
         LanguageId::Html => tree_sitter_html::LANGUAGE.into(),
         LanguageId::Css => tree_sitter_css::LANGUAGE.into(),

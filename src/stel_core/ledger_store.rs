@@ -317,7 +317,8 @@ pub enum StelLedgerStore {
 }
 
 impl StelLedgerStore {
-    /// Open or create the durable ledger db under the project `root`, run
+    /// Open or create the durable ledger db under the resolved project-state
+    /// owner, run
     /// migration, set WAL + busy timeout. On any failure returns `Disabled`
     /// (logged, never panics) — FR-011.
     ///
@@ -336,8 +337,12 @@ impl StelLedgerStore {
     /// calibration is unpromoted, never-surfaced, and re-derives from the retained
     /// ledger samples on the next pass (pre-1.0), so orphaning this one-time
     /// doubled-path data is acceptable.
-    pub fn open(root: &Path, session_id: impl Into<String>) -> Self {
-        let db_path = crate::paths::symforge_db_path(root, crate::paths::STEL_LEDGER_DB_NAME);
+    pub fn open(
+        project_state: &crate::domain::ProjectStateDir,
+        session_id: impl Into<String>,
+    ) -> Self {
+        let db_path =
+            crate::paths::project_state_path(project_state, crate::paths::STEL_LEDGER_DB_NAME);
         match SqliteStelLedgerStore::open(&db_path, session_id) {
             Ok(store) => Self::Sqlite(store),
             Err(err) => {
@@ -1013,8 +1018,9 @@ mod tests {
         use crate::paths::{STEL_LEDGER_DB_NAME, SYMFORGE_DIR_NAME};
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
+        let project_state = crate::domain::ProjectStateDir::new(root.join(SYMFORGE_DIR_NAME));
 
-        let store = StelLedgerStore::open(root, "sess-d1root");
+        let store = StelLedgerStore::open(&project_state, "sess-d1root");
         store.record(&sample_event("p-d1root"));
 
         let single = root.join(SYMFORGE_DIR_NAME).join(STEL_LEDGER_DB_NAME);

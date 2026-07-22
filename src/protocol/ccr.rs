@@ -27,6 +27,16 @@ pub const TOOL_OUTPUT_PROFILES: &[ToolOutputProfile] = &[
         default_max_tokens: 8_000,
     },
     ToolOutputProfile {
+        tool_name: "search_knowledge",
+        ccr_eligible: true,
+        default_max_tokens: 8_000,
+    },
+    ToolOutputProfile {
+        tool_name: "review_knowledge",
+        ccr_eligible: true,
+        default_max_tokens: 8_000,
+    },
+    ToolOutputProfile {
         tool_name: "search_symbols",
         ccr_eligible: true,
         default_max_tokens: 8_000,
@@ -66,6 +76,12 @@ pub struct CcrBlob {
     pub tool_name: String,
     pub formatted_bytes: String,
     pub created_at: Instant,
+    pub secret_policy_version: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcrRetrieveError {
+    SecretPolicyMismatch,
 }
 
 /// Per-session CCR economics counters (011 US5, heuristic).
@@ -144,6 +160,8 @@ impl CcrStore {
                 tool_name: tool_name.to_string(),
                 formatted_bytes: formatted,
                 created_at: Instant::now(),
+                secret_policy_version: matches!(tool_name, "search_knowledge" | "review_knowledge")
+                    .then_some(crate::knowledge::SECRET_POLICY_VERSION),
             },
         );
         self.economics.offloads = self.economics.offloads.saturating_add(1);
@@ -162,6 +180,26 @@ impl CcrStore {
         self.economics.retrieves = self.economics.retrieves.saturating_add(1);
         self.economics.bytes_retrieved = self.economics.bytes_retrieved.saturating_add(bytes);
         Some(blob.formatted_bytes.clone())
+    }
+
+    /// Retrieve already-safe formatted output only under the detector policy
+    /// that admitted it. Generic CCR records carry no policy tag and keep their
+    /// existing behavior; knowledge records fail closed on a version mismatch.
+    pub fn retrieve_checked(
+        &mut self,
+        handle: &str,
+        current_secret_policy_version: u32,
+    ) -> Result<Option<String>, CcrRetrieveError> {
+        let Some(blob) = self.blobs.get(handle) else {
+            return Ok(None);
+        };
+        if blob
+            .secret_policy_version
+            .is_some_and(|stored| stored != current_secret_policy_version)
+        {
+            return Err(CcrRetrieveError::SecretPolicyMismatch);
+        }
+        Ok(self.retrieve(handle))
     }
 
     pub fn get(&self, handle: &str) -> Option<&CcrBlob> {
@@ -213,6 +251,16 @@ pub fn apply_ccr_overflow(
     let omitted_note = "full ranked output stored";
     format!(
         "{summary}\n---\nCCR: {omitted_note} · retrieve: symforge_retrieve with hash=\"{handle}\"\n"
+    )
+}
+
+/// Rewrite an advertised CCR handle for the compact three-tool surface.
+/// The stored blob and hash are unchanged; only the caller-visible redemption
+/// instruction names the `symforge` facade that the client can actually call.
+pub fn rewrite_footer_for_symforge_facade(result: String) -> String {
+    result.replace(
+        "retrieve: symforge_retrieve with hash=\"",
+        "retrieve: symforge with query=\"retrieve CCR hash ",
     )
 }
 
@@ -455,6 +503,33 @@ mod tests {
             store.economics().offloads,
             0,
             "no blob stored for a within-budget response"
+        );
+    }
+
+    #[test]
+    fn knowledge_ccr_is_policy_tagged_and_mismatch_fails_closed() {
+        let mut store = CcrStore::new();
+        let handle = store.insert("search_knowledge", "safe formatted evidence".to_string());
+        assert_eq!(
+            store
+                .get(&handle)
+                .expect("knowledge CCR blob")
+                .secret_policy_version,
+            Some(crate::knowledge::SECRET_POLICY_VERSION)
+        );
+        assert!(matches!(
+            store.retrieve_checked(
+                &handle,
+                crate::knowledge::SECRET_POLICY_VERSION.saturating_add(1)
+            ),
+            Err(CcrRetrieveError::SecretPolicyMismatch)
+        ));
+        assert_eq!(
+            store
+                .retrieve_checked(&handle, crate::knowledge::SECRET_POLICY_VERSION)
+                .expect("matching policy")
+                .expect("knowledge body"),
+            "safe formatted evidence"
         );
     }
 

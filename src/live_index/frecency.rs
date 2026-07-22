@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::domain::ProjectStateDir;
+
 /// Half-life for frecency decay, in seconds. 7 days.
 pub const HALF_LIFE_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -397,14 +399,16 @@ pub fn collection_policy_from_env() -> crate::capability::FrecencyCollectionPoli
 /// through the store's internal connection mutex with no SQLite-level lock
 /// contention. Cross-process contention for persistent collection falls back to
 /// the 5-second `busy_timeout` set in [`FrecencyStore::open`].
-pub fn bump(repo_root: &Path, paths: &[PathBuf]) {
+pub fn bump(repo_root: &Path, project_state: Option<&ProjectStateDir>, paths: &[PathBuf]) {
     if paths.is_empty() {
         return;
     }
     let store = match collection_policy_from_env() {
         crate::capability::FrecencyCollectionPolicy::Disabled => return,
         crate::capability::FrecencyCollectionPolicy::Session => session_store_for(repo_root),
-        crate::capability::FrecencyCollectionPolicy::Persistent => cached_store_for(repo_root),
+        crate::capability::FrecencyCollectionPolicy::Persistent => {
+            project_state.and_then(|state| cached_store_for(repo_root, state))
+        }
     };
     let Some(store) = store else {
         return;
@@ -428,13 +432,14 @@ pub fn bump(repo_root: &Path, paths: &[PathBuf]) {
 /// delete the DB file.
 pub fn ranking_scores_for_paths(
     repo_root: &Path,
+    project_state: Option<&ProjectStateDir>,
     paths: &[&Path],
     now_ts: i64,
 ) -> Result<Option<FrecencyRankingSnapshot>, String> {
     let mut scores = HashMap::new();
     let mut sources = Vec::new();
 
-    if let Some(store) = cached_persistent_for(repo_root) {
+    if let Some(store) = project_state.and_then(cached_persistent_for) {
         // Reuse the cached writer when it exists. The `bulk_scores` SQL
         // executes under the same `FrecencyStore::conn` mutex as bumps and
         // HEAD-reset, so SQL execution is serialized. Snapshot semantics are
@@ -446,8 +451,8 @@ pub fn ranking_scores_for_paths(
                 .map_err(|err| err.to_string())?,
         );
         sources.push("persistent (cached)");
-    } else {
-        let db_path = frecency_db_path(repo_root);
+    } else if let Some(project_state) = project_state {
+        let db_path = frecency_db_path(project_state);
         match FrecencyStore::open_existing_readonly(&db_path) {
             Ok(Some(store)) => {
                 scores.extend(
@@ -493,8 +498,8 @@ fn persistent_cache() -> &'static Mutex<HashMap<PathBuf, Arc<FrecencyStore>>> {
 /// path can never be hand-rolled and doubled (D1-ROOT). All frecency call sites
 /// — cache key, readonly open, init, health probe — go through here so they all
 /// agree byte-for-byte.
-pub(crate) fn frecency_db_path(repo_root: &Path) -> PathBuf {
-    crate::paths::symforge_db_path(repo_root, crate::paths::FRECENCY_DB_NAME)
+pub(crate) fn frecency_db_path(project_state: &ProjectStateDir) -> PathBuf {
+    crate::paths::project_state_path(project_state, crate::paths::FRECENCY_DB_NAME)
 }
 
 /// Look up (or lazily create) the cached [`FrecencyStore`] for `repo_root`.
@@ -509,9 +514,12 @@ pub(crate) fn frecency_db_path(repo_root: &Path) -> PathBuf {
 /// path when policy explicitly requests persistent collection. The reset call
 /// happens INSIDE the cache mutex so two parallel bumps cannot race on policy
 /// application.
-fn cached_store_for(repo_root: &Path) -> Option<std::sync::Arc<FrecencyStore>> {
+fn cached_store_for(
+    repo_root: &Path,
+    project_state: &ProjectStateDir,
+) -> Option<std::sync::Arc<FrecencyStore>> {
     let cache = persistent_cache();
-    let key = frecency_db_path(repo_root);
+    let key = frecency_db_path(project_state);
     let mut guard = cache.lock().ok()?;
     if let Some(existing) = guard.get(&key) {
         return Some(Arc::clone(existing));
@@ -524,9 +532,9 @@ fn cached_store_for(repo_root: &Path) -> Option<std::sync::Arc<FrecencyStore>> {
     Some(store)
 }
 
-fn cached_persistent_for(repo_root: &Path) -> Option<Arc<FrecencyStore>> {
+fn cached_persistent_for(project_state: &ProjectStateDir) -> Option<Arc<FrecencyStore>> {
     let cache = persistent_cache();
-    let key = frecency_db_path(repo_root);
+    let key = frecency_db_path(project_state);
     let guard = cache.lock().ok()?;
     guard.get(&key).map(Arc::clone)
 }
@@ -568,7 +576,11 @@ impl crate::protocol::edit_hooks::EditHook for FrecencyBumpHook {
         ctx: &crate::protocol::edit_hooks::EditContext,
         _resolved_path: &Path,
     ) {
-        bump(ctx.repo_root, &[PathBuf::from(ctx.relative_path)]);
+        bump(
+            ctx.repo_root,
+            ctx.project_state_dir,
+            &[PathBuf::from(ctx.relative_path)],
+        );
     }
 }
 
@@ -964,7 +976,11 @@ mod tests {
         // Route the test path through the production helper so the test exercises
         // the SAME construction production uses (the blind spot that hid D1/D7
         // was a test computing a DIFFERENT path than production).
-        super::frecency_db_path(root)
+        super::frecency_db_path(&project_state(root))
+    }
+
+    fn project_state(root: &Path) -> ProjectStateDir {
+        ProjectStateDir::new(root.join(crate::paths::SYMFORGE_DIR_NAME))
     }
 
     #[test]
@@ -976,7 +992,7 @@ mod tests {
         let path_refs = [path.as_path()];
 
         for _ in 0..3 {
-            let snapshot = super::ranking_scores_for_paths(tmp.path(), &path_refs, 0)
+            let snapshot = super::ranking_scores_for_paths(tmp.path(), None, &path_refs, 0)
                 .expect("read-only ranking score lookup should not fail");
             assert!(
                 snapshot.is_none(),
@@ -999,9 +1015,9 @@ mod tests {
         clear_flag();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = PathBuf::from("src/lib.rs");
-        super::bump(tmp.path(), std::slice::from_ref(&path));
+        super::bump(tmp.path(), None, std::slice::from_ref(&path));
         let path_refs = [path.as_path()];
-        let snapshot = super::ranking_scores_for_paths(tmp.path(), &path_refs, 0)
+        let snapshot = super::ranking_scores_for_paths(tmp.path(), None, &path_refs, 0)
             .expect("session scores ok")
             .expect("session history present");
         assert_eq!(
@@ -1022,7 +1038,8 @@ mod tests {
         // SAFETY: see set_flag_on.
         unsafe { std::env::set_var(FRECENCY_FLAG_ENV, "0") };
         let tmp = tempfile::tempdir().expect("tempdir");
-        super::bump(tmp.path(), &[PathBuf::from("src/lib.rs")]);
+        let state = project_state(tmp.path());
+        super::bump(tmp.path(), Some(&state), &[PathBuf::from("src/lib.rs")]);
         clear_flag();
         assert!(
             !db_path_for(tmp.path()).exists(),
@@ -1035,8 +1052,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         set_flag_on();
         let tmp = tempfile::tempdir().expect("tempdir");
+        let state = project_state(tmp.path());
         super::bump(
             tmp.path(),
+            Some(&state),
             &[PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
         );
         clear_flag();
@@ -1056,7 +1075,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         set_flag_on();
         let tmp = tempfile::tempdir().expect("tempdir");
-        super::bump(tmp.path(), &[]);
+        let state = project_state(tmp.path());
+        super::bump(tmp.path(), Some(&state), &[]);
         clear_flag();
         // Empty slice: short-circuit before opening the store.
         assert!(
@@ -1070,8 +1090,9 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         set_flag_on();
         let tmp = tempfile::tempdir().expect("tempdir");
-        super::bump(tmp.path(), &[PathBuf::from("src/lib.rs")]);
-        super::bump(tmp.path(), &[PathBuf::from("src/lib.rs")]);
+        let state = project_state(tmp.path());
+        super::bump(tmp.path(), Some(&state), &[PathBuf::from("src/lib.rs")]);
+        super::bump(tmp.path(), Some(&state), &[PathBuf::from("src/lib.rs")]);
         clear_flag();
         let store = FrecencyStore::open(&db_path_for(tmp.path())).unwrap();
         let entries = store.last_10_bumps().unwrap();

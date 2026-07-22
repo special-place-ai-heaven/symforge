@@ -101,13 +101,14 @@ fn corrupt_state_file_is_treated_as_never_shown() {
 }
 
 #[test]
-fn state_path_lives_under_symforge_data_dir() {
+fn state_path_lives_under_process_control_state() {
     let dir = tempfile::tempdir().unwrap();
-    let path = onboarding::state_path(dir.path());
+    let control = symforge::domain::ControlStateDir::new(dir.path().join("control-state"));
+    let path = onboarding::state_path(&control);
     assert!(path.ends_with("onboarding.json"));
     assert!(
-        path.to_string_lossy().contains(".symforge"),
-        "state path must be under the symforge data dir: {}",
+        path.starts_with(control.as_path()),
+        "state path must be under process control state: {}",
         path.display()
     );
 }

@@ -21,7 +21,53 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::store::SharedIndex;
+use super::store::{GitTemporalPublicationFence, SharedIndex};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitTemporalComputationRequest {
+    pub(crate) fence: GitTemporalPublicationFence,
+    pub(crate) repo_root: PathBuf,
+}
+
+#[derive(Default)]
+pub(crate) struct GitTemporalJobQueue {
+    running: Option<GitTemporalComputationRequest>,
+    pending_latest: Option<GitTemporalComputationRequest>,
+}
+
+impl GitTemporalJobQueue {
+    fn enqueue(
+        &mut self,
+        request: GitTemporalComputationRequest,
+    ) -> Option<GitTemporalComputationRequest> {
+        if self.running.is_none() {
+            self.running = Some(request.clone());
+            return Some(request);
+        }
+        if self.running.as_ref() == Some(&request) || self.pending_latest.as_ref() == Some(&request)
+        {
+            return None;
+        }
+        self.pending_latest = Some(request);
+        None
+    }
+
+    fn finish(
+        &mut self,
+        completed: &GitTemporalComputationRequest,
+    ) -> Option<GitTemporalComputationRequest> {
+        if self.running.as_ref() != Some(completed) {
+            return None;
+        }
+        if let Some(next) = self.pending_latest.take() {
+            self.running = Some(next.clone());
+            Some(next)
+        } else {
+            self.running = None;
+            None
+        }
+    }
+}
 
 // ── Background computation ──────────────────────────────────────────────
 
@@ -35,59 +81,102 @@ pub fn spawn_git_temporal_computation(index: SharedIndex, repo_root: PathBuf, ex
         return;
     }
 
-    // If data is already Ready, keep serving it while we recompute in the background.
-    let was_ready = index.git_temporal().state == GitTemporalState::Ready;
-
-    if !was_ready
-        && !index.update_git_temporal_at_generation(
-            GitTemporalIndex {
-                state: GitTemporalState::Computing,
-                ..GitTemporalIndex::pending()
-            },
-            expected_gen,
-        )
-    {
+    let fence = index.git_temporal_publication_fence();
+    if fence.project_generation != expected_gen {
         tracing::trace!(
             expected_gen,
-            "stale git temporal computing-state publication skipped"
+            current_gen = fence.project_generation,
+            "stale git temporal computation request skipped"
         );
+        return;
     }
+    let published = index.published_generation();
+    let signals_are_current = published.code_signals.computed_for_content_generation
+        == fence.content_generation
+        && fence.source_version.as_ref()
+            == Some(&published.code_signals.computed_for_source_version)
+        && matches!(
+            published.code_signals.state,
+            GitTemporalState::Ready | GitTemporalState::Unavailable(_)
+        );
+    if signals_are_current {
+        return;
+    }
+    let request = GitTemporalComputationRequest { fence, repo_root };
+    let Some(request) = index.git_temporal_jobs.lock().enqueue(request) else {
+        return;
+    };
 
     tokio::spawn(async move {
-        // Run the computation on a blocking thread (it uses libgit2 which does I/O).
-        let result =
-            tokio::task::spawn_blocking(move || GitTemporalIndex::compute(&repo_root)).await;
-
-        match result {
-            Ok(temporal) => {
-                let files = temporal.files.len();
-                let commits = temporal.stats.total_commits_analyzed;
-                let duration_ms = temporal.stats.compute_duration.as_millis() as u64;
-                if index.update_git_temporal_at_generation(temporal, expected_gen) {
-                    tracing::info!(files, commits, duration_ms, "git temporal index computed");
-                } else {
-                    tracing::trace!(
-                        expected_gen,
-                        files,
-                        commits,
-                        duration_ms,
-                        "stale git temporal publication skipped"
-                    );
-                }
+        let mut request = request;
+        loop {
+            // If data is already Ready, keep serving it while recomputing.
+            let was_ready = index.git_temporal().state == GitTemporalState::Ready;
+            if !was_ready
+                && !index.update_git_temporal_at_fence(
+                    GitTemporalIndex {
+                        state: GitTemporalState::Computing,
+                        ..GitTemporalIndex::pending()
+                    },
+                    &request.fence,
+                )
+            {
+                tracing::trace!("stale git temporal computing-state publication skipped");
             }
-            Err(error) => {
-                tracing::warn!("git temporal computation panicked: {error}");
-                if !was_ready {
-                    let unavailable =
-                        GitTemporalIndex::unavailable(format!("computation panicked: {error}"));
-                    if !index.update_git_temporal_at_generation(unavailable, expected_gen) {
+
+            let repo_root = request.repo_root.clone();
+            let result =
+                tokio::task::spawn_blocking(move || GitTemporalIndex::compute(&repo_root)).await;
+
+            match result {
+                Ok(temporal) => {
+                    let files = temporal.files.len();
+                    let commits = temporal.stats.total_commits_analyzed;
+                    let duration_ms = temporal.stats.compute_duration.as_millis() as u64;
+                    if index.update_git_temporal_at_fence(temporal, &request.fence) {
+                        tracing::info!(files, commits, duration_ms, "git temporal index computed");
+                    } else {
                         tracing::trace!(
-                            expected_gen,
-                            "stale git temporal panic-state publication skipped"
+                            files,
+                            commits,
+                            duration_ms,
+                            "stale git temporal publication skipped"
                         );
                     }
                 }
+                Err(error) => {
+                    tracing::warn!("git temporal computation panicked: {error}");
+                    if !was_ready {
+                        let unavailable =
+                            GitTemporalIndex::unavailable(format!("computation panicked: {error}"));
+                        if !index.update_git_temporal_at_fence(unavailable, &request.fence) {
+                            tracing::trace!("stale git temporal panic-state publication skipped");
+                        }
+                    }
+                }
             }
+
+            // A content/source-version change without another explicit request
+            // still gets exactly one latest recomputation for the same source.
+            let latest_fence = index.git_temporal_publication_fence();
+            if latest_fence.project_generation == request.fence.project_generation
+                && latest_fence.source == request.fence.source
+                && latest_fence != request.fence
+            {
+                index
+                    .git_temporal_jobs
+                    .lock()
+                    .enqueue(GitTemporalComputationRequest {
+                        fence: latest_fence,
+                        repo_root: request.repo_root.clone(),
+                    });
+            }
+
+            let next = index.git_temporal_jobs.lock().finish(&request);
+            let Some(next) = next else {
+                break;
+            };
+            request = next;
         }
     });
 }
@@ -124,7 +213,7 @@ const MEGA_COMMIT_THRESHOLD: usize = 50;
 // ── Public data types ───────────────────────────────────────────────────
 
 /// Per-file temporal metadata derived from git history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitFileHistory {
     /// Total commits touching this file within the analysis window.
     pub commit_count: u32,
@@ -147,7 +236,7 @@ pub struct GitFileHistory {
 }
 
 /// Summary of a single git commit (cheap to clone, display-ready).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitSummary {
     /// Short hash (7 chars).
     pub hash: String,
@@ -162,7 +251,7 @@ pub struct CommitSummary {
 }
 
 /// One contributor's share of a file's commit history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContributorShare {
     pub author: String,
     pub commit_count: u32,
@@ -171,7 +260,7 @@ pub struct ContributorShare {
 }
 
 /// One co-change relationship for a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CoChangeEntry {
     /// Path of the co-changed file.
     pub path: String,
@@ -221,7 +310,7 @@ fn sort_and_cap_co_changes(entries: &mut Vec<CoChangeEntry>, cap: usize) {
 }
 
 /// Repo-wide temporal summary for health reports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitTemporalStats {
     /// Total commits analyzed in this computation.
     pub total_commits_analyzed: u32,
@@ -239,7 +328,7 @@ pub struct GitTemporalStats {
 
 /// The full temporal index — a side-table that lives parallel to the
 /// main `LiveIndex` on `SharedIndexHandle`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GitTemporalIndex {
     /// Per-file temporal metadata, keyed by relative path (forward-slash
     /// normalized, same key space as `LiveIndex::files`).
@@ -251,7 +340,7 @@ pub struct GitTemporalIndex {
 }
 
 /// Lifecycle state of the temporal index.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum GitTemporalState {
     /// Not yet computed (initial state).
     Pending,
