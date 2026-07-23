@@ -21,16 +21,9 @@ pub enum KnowledgeSourceScope {
     All,
 }
 
-#[allow(dead_code)]
-#[derive(JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum AdvertisedKnowledgeSourceScope {
-    Current,
-}
-
-/// Source scopes advertised by `search_knowledge` (Gate L). Unlike
-/// `review_knowledge`, search composes across the captured source set, so it
-/// advertises every implemented P1 scope.
+/// Source scopes advertised by `search_knowledge` and `review_knowledge`
+/// (Gate L): both compose across the captured source set, so every implemented
+/// P1 scope is advertised.
 #[allow(dead_code)]
 #[derive(JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -105,9 +98,10 @@ pub struct ReviewKnowledgeInput {
     /// Optional normalized repository-relative prefix for summary/remediation scope.
     #[serde(default)]
     pub path_prefix: Option<String>,
-    /// Captured repository source scope. Gate J implements only `current`.
+    /// Captured repository source scope: `current` (default), `worktrees`,
+    /// `local_refs`, or `all`. Composed from one captured source set.
     #[serde(default)]
-    #[schemars(with = "AdvertisedKnowledgeSourceScope")]
+    #[schemars(with = "AdvertisedSearchKnowledgeSourceScope")]
     pub source_scope: Option<KnowledgeSourceScope>,
     /// One open project id/alias; mutually exclusive with `projects`.
     #[serde(default)]

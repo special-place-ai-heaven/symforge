@@ -5440,7 +5440,7 @@ impl SymForgeServer {
     /// publication. Complete-plan hashes are computed before output limits or CCR.
     #[tool(
         name = "review_knowledge",
-        description = "Review repository knowledge authority and hygiene in summary, exact-document, or remediation mode. Returns complete aggregate evidence arrays, bridge records, temporal provenance, eligibility blockers, stable per-source review hashes, and a top-level result hash. Gate J supports source_scope='current' only. Read-only and frecency-neutral.",
+        description = "Review repository knowledge authority and hygiene in summary, exact-document, or remediation mode. Returns complete aggregate evidence arrays, bridge records, temporal provenance, eligibility blockers, stable per-source review hashes, and a top-level result hash. source_scope selects 'current' (default), 'worktrees', 'local_refs', or 'all', composed from one captured source set. Read-only and frecency-neutral.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -5486,8 +5486,8 @@ impl SymForgeServer {
             return refusal;
         }
 
-        let generation = self.index.published_source_set().current_generation();
-        match super::knowledge_review::review_current(&generation, &params.0) {
+        let source_set = self.index.published_source_set();
+        match super::knowledge_review::review_scoped(&source_set, &params.0) {
             Ok(output) => self.apply_ccr_budget_with_summary(
                 "review_knowledge",
                 output.rendered,

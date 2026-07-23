@@ -842,4 +842,70 @@ mod tests {
         assert!(all.contains("Source scope searched: all"), "{all}");
         assert!(all.contains("ref:HEAD"), "{all}");
     }
+
+    #[test]
+    fn review_scoped_composes_local_ref_lane_and_reports_typed_empty_worktrees() {
+        use crate::protocol::knowledge_review::review_scoped;
+        use crate::protocol::search_tools::{
+            KnowledgeSourceScope, ReviewKnowledgeInput, ReviewKnowledgeMode,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[(
+                "docs/topic.md",
+                b"# Topic\n\nThe orbital lattice resonates across the source.\n",
+            )],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-review"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref");
+        let set = handle.published_source_set();
+
+        let input = |scope| ReviewKnowledgeInput {
+            mode: ReviewKnowledgeMode::Summary,
+            path: None,
+            path_prefix: None,
+            source_scope: Some(scope),
+            project: None,
+            projects: None,
+            limit: None,
+            max_tokens: None,
+        };
+
+        let local_refs = review_scoped(&set, &input(KnowledgeSourceScope::LocalRefs))
+            .expect("local_refs review");
+        assert!(local_refs.rendered.contains("top_result_hash="));
+        assert!(
+            local_refs.rendered.contains("source_scope=local_refs"),
+            "{}",
+            local_refs.rendered
+        );
+
+        let worktrees = review_scoped(&set, &input(KnowledgeSourceScope::Worktrees));
+        assert!(
+            worktrees
+                .as_ref()
+                .is_err_and(|error| error.contains("no_sources_in_scope")),
+            "{worktrees:?}"
+        );
+
+        let all = review_scoped(&set, &input(KnowledgeSourceScope::All)).expect("all review");
+        assert!(
+            all.rendered.contains("source_scope=all"),
+            "{}",
+            all.rendered
+        );
+    }
 }

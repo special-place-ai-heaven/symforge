@@ -259,7 +259,7 @@ fn search_knowledge_schema_is_exact_read_only_and_multi_source_scope() {
     advertised_scopes.sort();
     advertised_scopes.dedup();
     // Gate L: search_knowledge composes across the captured source set, so it
-    // advertises every implemented P1 scope (review_knowledge stays current-only).
+    // advertises every implemented P1 scope (review_knowledge does the same).
     assert_eq!(
         advertised_scopes,
         ["all", "current", "local_refs", "worktrees"]

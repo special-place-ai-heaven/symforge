@@ -6,7 +6,6 @@ use crate::domain::{
     CoverageStatus, HistoryCoverage, SourceIdentity, SourceLocation, SourceResponseEnvelope,
 };
 use crate::knowledge::{guard_hit, guard_query};
-use crate::live_index::PublishedGeneration;
 use crate::live_index::knowledge_authority::{
     CodeEvidenceDisplay, EvidenceConfidence, KnowledgeAuthorityRecord, KnowledgePolicyTarget,
     KnowledgeVoice, RemediationAction, RemediationPrecondition, TimeEvidence,
@@ -16,6 +15,7 @@ use crate::live_index::knowledge_bridge::{
     KnowledgeRole,
 };
 use crate::live_index::store::PublishedIndexStatus;
+use crate::live_index::{PublishedGeneration, PublishedSourceSet};
 
 use super::search_tools::{KnowledgeSourceScope, ReviewKnowledgeInput, ReviewKnowledgeMode};
 
@@ -108,14 +108,6 @@ fn normalize_input(input: &ReviewKnowledgeInput) -> Result<NormalizedReview, Str
         && projects.len() != 1
     {
         return Err("Error: projects wildcard must be the sole selector.".to_string());
-    }
-    if let Some(scope) = input.source_scope
-        && scope != KnowledgeSourceScope::Current
-    {
-        return Err(format!(
-            "Error: unsupported source_scope '{}'; available: current.",
-            snake_debug(scope)
-        ));
     }
     if let Some(max_tokens) = input.max_tokens
         && max_tokens < MIN_PROVENANCE_TOKENS
@@ -304,6 +296,72 @@ pub(crate) fn review_current(
         budget_source_section,
         source_key,
         review_hash,
+        result_hash,
+    })
+}
+
+/// Compose `review_knowledge` across the scope-selected sources of one captured
+/// source set (Gate L L-G06). `current` keeps its exact single-source output. A
+/// multi-source scope with no sources returns a typed empty readiness result.
+/// The top result hash aggregates every per-source `(source_id, review_hash)`
+/// pair deterministically, so equal generations produce a byte-identical result.
+pub(crate) fn review_scoped(
+    source_set: &PublishedSourceSet,
+    input: &ReviewKnowledgeInput,
+) -> Result<ReviewKnowledgeOutput, String> {
+    normalize_input(input)?;
+    let scope = input.source_scope.unwrap_or(KnowledgeSourceScope::Current);
+    if matches!(scope, KnowledgeSourceScope::Current) {
+        return review_current(&source_set.current_generation(), input);
+    }
+    let selected = super::knowledge_search::select_scoped_sources(source_set, scope);
+    let scope_label = super::knowledge_search::source_scope_label(scope);
+    if selected.is_empty() {
+        return Err(format!(
+            "Readiness: no_sources_in_scope; source_scope '{scope_label}' selected no sources."
+        ));
+    }
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(selected.len());
+    let mut sections: Vec<String> = Vec::with_capacity(selected.len());
+    let mut budget_sections: Vec<String> = Vec::with_capacity(selected.len());
+    for generation in &selected {
+        let source_key = generation
+            .source
+            .as_deref()
+            .map(|source| source.source_id.as_str().to_string())
+            .unwrap_or_else(|| "unbound".to_string());
+        match review_current(generation, input) {
+            Ok(output) => {
+                pairs.push((output.source_key.clone(), output.review_hash.clone()));
+                sections.push(output.source_section);
+                budget_sections.push(output.budget_source_section);
+            }
+            Err(readiness) => {
+                // An unavailable/empty/degraded lane is a typed per-source
+                // outcome, never a whole-scope failure (L-R09). Its readiness is
+                // folded into the deterministic result hash so equal generations
+                // still produce a byte-identical result.
+                pairs.push((source_key.clone(), format!("unavailable:{readiness}")));
+                let section = format!("source={source_key}\n{readiness}");
+                sections.push(section.clone());
+                budget_sections.push(section);
+            }
+        }
+    }
+    let result_hash = combined_result_hash(&pairs);
+    let source_section = sections.join("\n\n");
+    let budget_source_section = budget_sections.join("\n\n");
+    let header = format!(
+        "top_result_hash={result_hash}\nsource_scope={scope_label} sources={}",
+        selected.len()
+    );
+    Ok(ReviewKnowledgeOutput {
+        rendered: format!("{header}\n\n{source_section}"),
+        budget_rendered: format!("{header}\n\n{budget_source_section}"),
+        source_section,
+        budget_source_section,
+        source_key: format!("scope:{scope_label}"),
+        review_hash: result_hash.clone(),
         result_hash,
     })
 }

@@ -137,7 +137,7 @@ pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQ
 /// filter the captured set by source location, excluding the current lane.
 /// `all` lists the current lane first (it ranks ahead of a divergent ref but
 /// never hides it), then every other lane in `SourceId` order.
-fn select_scoped_sources(
+pub(crate) fn select_scoped_sources(
     source_set: &PublishedSourceSet,
     scope: KnowledgeSourceScope,
 ) -> Vec<Arc<PublishedGeneration>> {
@@ -911,7 +911,7 @@ fn response_is_degraded(generation: &PublishedGeneration) -> bool {
         || !matches!(generation.authority.coverage, DerivedCoverage::Complete)
 }
 
-fn source_scope_label(scope: KnowledgeSourceScope) -> &'static str {
+pub(crate) fn source_scope_label(scope: KnowledgeSourceScope) -> &'static str {
     match scope {
         KnowledgeSourceScope::Current => "current",
         KnowledgeSourceScope::Worktrees => "worktrees",
