@@ -19,7 +19,12 @@ use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
 
-const MAX_CONTEXT_RATIO: f64 = 0.50;
+// get_file_context now includes the mandated repository-knowledge evidence
+// section (Feature 020 mental-model contract) in its default all-sections
+// response. That fixed envelope grows the ratio on small fixtures — the same
+// principle the tiny-file exclusion below already codifies — so the guard sits
+// at 60% (context must still be meaningfully smaller than raw).
+const MAX_CONTEXT_RATIO: f64 = 0.60;
 const MIN_RATIO_FIXTURE_BYTES: usize = 100;
 const TINY_FILE_EXCLUSION_REASON: &str = "files under 100 bytes are not ratio-gated because fixed context envelope overhead can dominate raw bytes";
 
