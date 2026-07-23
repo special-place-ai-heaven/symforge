@@ -8,6 +8,47 @@ You are performing an **adversarial code review** of SymForge Feature 020's **Ga
 Two reviewers are looking at this independently (Cursor and Kimi). Reason from the
 code, not the comments. Cite every finding as `path:line`. Empty is a valid answer.
 
+## Review methodology (MANDATORY — shallow reviews miss the real bugs)
+
+A review that only skims outlines finds the 2–3 obvious defects and stops. The
+defects that actually matter hide one layer deeper. Do ALL of this:
+
+1. **Read full function bodies, never outlines/summaries.** Symbol maps elide the
+   bodies — open the actual code in line ranges. Every claim must be traced to
+   real statements you read.
+2. **Trace every shared helper to its signature and check each argument is USED.**
+   When path A and path B both call `helper(x, y)`, open `helper`. An ignored
+   parameter (e.g. `fn scan_secret_bytes(_path, bytes)` — `_path` unused) is
+   exactly where "parity with the other path" silently breaks.
+3. **Do side-by-side PARITY diffs.** For every "same as filesystem ingestion / same
+   as the P0 lane" claim, put the two code paths next to each other and diff them
+   step by step: admission rules (path-based AND content-based), manifest/catalog
+   entries, size limits, symlink/submodule handling, secret rules. List each
+   divergence, however small.
+4. **Construct CONCRETE adversarial inputs.** Not "check secret handling" —
+   "a committed `.env` containing `FOO=bar` (no high-entropy token): withheld or
+   indexed?"; "a `.tfstate`"; "a `.ssh/id_ed25519`". Name the file, the bytes, the
+   expected vs actual outcome. A finding without a concrete trigger is a guess.
+5. **Enumerate concurrency INTERLEAVINGS explicitly.** For each shared-state
+   mutation, write two specific timelines (T1 does X while T2 does Y) and find the
+   one that drops, resurrects, or loses data. "It's under a mutex" is not the end
+   of the analysis — check what's read/computed OUTSIDE the lock and reused inside.
+6. **Trace CONSUMERS before assigning severity.** grep who reads a field before
+   calling its churn "harmful": if `registry_generation` is only read by tests, the
+   churn is cosmetic, not a bug. Severity follows the blast radius you can prove.
+7. **Attack the TESTS, not just the code.** For each test that "proves" an
+   invariant: does it pass vacuously? Does it exercise the query/composition path
+   or only object construction? What real mutation would still let it pass? A
+   construction-only test for a composition invariant is a gap.
+8. **Fail-open vs fail-closed audit.** For every error branch on a security or
+   correctness path, state which way it biases. Example: a worktree whose HEAD
+   read fails → treated as "not checked out" → its branch becomes a P1 lane =
+   fail-OPEN toward a contract violation. Flag every fail-open on an invariant.
+
+If your review does not contain concrete adversarial inputs, at least one parity
+diff, at least one explicit interleaving, and at least one test-attack, it is not
+deep enough — go back to the code.
+
 ## Ground rules
 
 1. **The frozen SpecKit contracts are the authority.** If code disagrees with a frozen

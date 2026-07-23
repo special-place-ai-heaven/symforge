@@ -288,6 +288,17 @@ enum RefBlobRoute {
 /// identical lifecycle/secret decisions regardless of origin. The parse itself is
 /// deferred to the caller so it can be memoized across same-class paths.
 fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
+    // L-R10 secret parity: a sensitive PATH is withheld as metadata-only by path
+    // alone — the exact rule and reason the filesystem scout applies (see
+    // `src/discovery/mod.rs`) — BEFORE any content scan. `classify_stable_content`
+    // only scans CONTENT, so a committed `.env`/private key whose bytes do not
+    // trip the content scanner must still be withheld here, or the ref-blob path
+    // would index a secret the disk path refuses.
+    if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&entry.relative_path) {
+        return RefBlobRoute::Withheld(MetadataOnlyReason::SensitivePath {
+            rule_id: rule_id.to_string(),
+        });
+    }
     let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
     match classify_stable_content(&entry.relative_path, targets, bytes) {
         StableContentAdmission::MetadataOnly(reason) => RefBlobRoute::Withheld(reason),
@@ -459,7 +470,7 @@ pub fn ingest_and_publish_local_ref(
         RefScoutCoverage::Complete => crate::domain::CoverageStatus::Complete,
         RefScoutCoverage::Degraded => crate::domain::CoverageStatus::Degraded,
     };
-    let generation = SharedIndexHandle::build_ref_source_generation(
+    let generation = handle.build_ref_source_generation(
         index,
         repository_id,
         ref_name,
@@ -486,6 +497,14 @@ pub struct ReconcileOutcome {
     /// Linked worktrees found checked out — routed to their own
     /// `ProjectInstance` by a later daemon layer, never ingested as P1 lanes.
     pub checked_out: Vec<CheckedOutWorktree>,
+    /// Per-branch publish failures collected this pass as `(ref_name, error)`.
+    /// A single bare branch failing to ingest must NOT abort the reconcile: the
+    /// failure is recorded here and the deletion pass still runs, so stale lanes
+    /// for deleted/checked-out branches are always reconciled (finding C).
+    pub failed: Vec<(String, String)>,
+    /// True when this pass was skipped because a reconcile was already running for
+    /// this handle (single-flight, finding F). All other vecs are empty.
+    pub skipped: bool,
 }
 
 /// Reconcile the local branch/worktree topology into P1 ref lanes (L-G05/L-R03).
@@ -505,7 +524,37 @@ pub fn reconcile_local_ref_topology(
     repository_id: RepositoryId,
     budget: &LocalRefScoutBudget,
 ) -> Result<ReconcileOutcome, String> {
+    // Single-flight (finding F): a reconcile pass reads the latest git topology,
+    // so if one is already running this pass is redundant and — worse — its
+    // deletion step, working from a now-stale `local_branch_refs` snapshot, could
+    // cross-delete a lane the running pass just published. `try_lock` never blocks,
+    // so a concurrent pass never stalls P0; it skips because the running pass
+    // already reflects the newest refs.
+    let Some(_reconcile_guard) = handle.try_lock_ref_reconcile() else {
+        return Ok(ReconcileOutcome {
+            published: Vec::new(),
+            removed: Vec::new(),
+            checked_out: Vec::new(),
+            failed: Vec::new(),
+            skipped: true,
+        });
+    };
+
     let checked_out = checked_out_worktrees(repository)?;
+
+    // Fail CLOSED (finding E): a worktree that validated but whose HEAD could not
+    // be resolved leaves us unable to prove which branch it holds. Since ANY
+    // bare-looking branch could be the one that worktree has checked out, we abort
+    // the whole pass rather than risk publishing a checked-out branch as a P1 lane
+    // (L-G01). Aborting is safe: reconcile is best-effort P1 background work, the
+    // existing published set is left untouched, and P0 is never blocked.
+    if checked_out.iter().any(|worktree| !worktree.head_resolved) {
+        return Err(
+            "Error: a checked-out worktree's HEAD could not be resolved; local-ref \
+             reconcile fails closed to avoid publishing a checked-out branch as a P1 lane."
+                .to_string(),
+        );
+    }
 
     // The checked-out set: every linked-worktree HEAD branch plus the main
     // repo's own current HEAD branch. Each is the P0 lane of some
@@ -514,13 +563,34 @@ pub fn reconcile_local_ref_topology(
         .iter()
         .filter_map(|w| w.head_ref.clone())
         .collect();
-    if let Some(head_ref) = repository
-        .head()
-        .ok()
-        .filter(|head| head.is_branch())
-        .and_then(|head| head.name().ok().map(str::to_string))
-    {
-        checked_out_refs.insert(head_ref);
+    // Fail CLOSED for the main worktree HEAD too (finding E / Cursor #2): a main
+    // HEAD that is a branch whose name cannot be read must abort — otherwise the
+    // current branch is silently omitted from `checked_out_refs` and becomes
+    // eligible for a P1 lane (L-G01: "checked-out branches are never P1"). A
+    // detached HEAD (no branch here) and an unborn branch (empty repo, no local
+    // branches to publish) are both fine and add nothing.
+    match repository.head() {
+        Ok(head) if head.is_branch() => match head.name() {
+            Ok(name) => {
+                checked_out_refs.insert(name.to_string());
+            }
+            Err(_) => {
+                return Err(
+                    "Error: the main repository HEAD is a branch whose name could \
+                     not be decoded; local-ref reconcile fails closed to avoid \
+                     publishing a checked-out branch as a P1 lane."
+                        .to_string(),
+                );
+            }
+        },
+        Ok(_) => {} // detached main HEAD: no branch checked out at the main worktree
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {}
+        Err(err) => {
+            return Err(format!(
+                "Error: the main repository HEAD could not be read ({err}); \
+                 local-ref reconcile fails closed."
+            ));
+        }
     }
 
     // Local branch refs by full refname (`refs/heads/<branch>`).
@@ -537,26 +607,33 @@ pub fn reconcile_local_ref_topology(
     }
     local_branch_refs.sort();
 
-    // Publish a P1 lane for every bare (non-checked-out) local branch.
+    // Publish a P1 lane for every bare (non-checked-out) local branch. A single
+    // branch failing to ingest is COLLECTED, not fatal (finding C): the deletion
+    // pass below must still reconcile every branch whose ref is gone/checked-out,
+    // so one broken branch cannot strand stale lanes for the others.
     let mut published: Vec<SourceId> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for ref_name in &local_branch_refs {
         if checked_out_refs.contains(ref_name) {
             continue;
         }
-        let source_id = ingest_and_publish_local_ref(
+        match ingest_and_publish_local_ref(
             handle,
             repository,
             ref_name,
             repository_id.clone(),
             budget,
-        )?;
-        published.push(source_id);
+        ) {
+            Ok(source_id) => published.push(source_id),
+            Err(error) => failed.push((ref_name.clone(), error)),
+        }
     }
 
     // Reconcile deletions: drop any existing P1 ref lane for this repository
     // whose branch is no longer a bare local branch (deleted or newly
-    // checked out). Reads a fresh snapshot so the lanes just published above
-    // are already visible.
+    // checked out). Runs unconditionally after the publish pass — a publish
+    // failure above never skips it. Reads a fresh snapshot so the lanes just
+    // published above are already visible.
     let lane_prefix = format!("symforge:git-ref:{}:", repository_id.as_str());
     let current = handle.published_source_set();
     let mut removed: Vec<SourceId> = Vec::new();
@@ -582,6 +659,8 @@ pub fn reconcile_local_ref_topology(
         published,
         removed,
         checked_out,
+        failed,
+        skipped: false,
     })
 }
 
@@ -1782,6 +1861,559 @@ mod tests {
                 .files
                 .contains_key("src/lib.rs"),
             "the offline ref lane is queryable"
+        );
+    }
+
+    /// Stage explicit repository-relative paths (incl. dotfiles/dot-directories) and
+    /// commit them to HEAD. `add_path` force-adds each named path and bypasses ignore
+    /// rules, so a `.env`/`.ssh/id_ed25519` blob is deterministically committed
+    /// without depending on `*`-pathspec dotfile semantics.
+    fn commit_explicit_paths(root: &Path, files: &[(&str, &[u8])], message: &str) {
+        let repository = git2::Repository::open(root).expect("open repo");
+        let mut index = repository.index().expect("index");
+        for (relative, bytes) in files {
+            let full = root.join(relative);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&full, bytes).expect("write file");
+            index.add_path(Path::new(relative)).expect("stage path");
+        }
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_id).expect("tree");
+        let signature =
+            git2::Signature::now("SymForge Test", "symforge@example.invalid").expect("sig");
+        let parent = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("commit");
+    }
+
+    #[test]
+    fn sensitive_path_blob_is_withheld_by_path_even_when_content_is_clean() {
+        // L-R10 secret parity (finding A): a committed `.env`/private-key blob is
+        // withheld as metadata-only by PATH alone — exactly as the filesystem scout
+        // does (src/discovery/mod.rs) — even when its bytes never trip the CONTENT
+        // secret scanner. The identical bytes at a benign path are admitted, proving
+        // the withhold is path-driven, not content-driven.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        // `your_api_key_here` is a placeholder value the content scanner treats as
+        // clean; the ssh blob likewise carries no secret pattern.
+        let env_bytes: &[u8] = b"API_KEY=your_api_key_here\n";
+        commit_explicit_paths(
+            root,
+            &[
+                (".env", env_bytes),
+                (".ssh/id_ed25519", b"benign key material placeholder\n"),
+                ("notes.txt", env_bytes),
+                ("src/lib.rs", b"pub fn kept() {}\n"),
+            ],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let blobs = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+        let route = |relative: &str| {
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| entry.relative_path == relative)
+                .expect("entry present");
+            let bytes = blobs.get(&entry.object_id).expect("bytes").to_vec();
+            route_ref_blob(entry, bytes)
+        };
+
+        match route(".env") {
+            RefBlobIngest::Withheld(MetadataOnlyReason::SensitivePath { rule_id }) => {
+                assert_eq!(rule_id, "path.environment-credentials");
+            }
+            other => panic!("`.env` must be withheld by sensitive path, got {other:?}"),
+        }
+        match route(".ssh/id_ed25519") {
+            RefBlobIngest::Withheld(MetadataOnlyReason::SensitivePath { rule_id }) => {
+                assert_eq!(rule_id, "path.private-key-material");
+            }
+            other => panic!("`id_ed25519` must be withheld by sensitive path, got {other:?}"),
+        }
+        // Identical env bytes at a NON-sensitive path are admitted: the content is
+        // clean, so only the sensitive PATH withholds — filesystem-scout parity.
+        assert!(
+            matches!(route("notes.txt"), RefBlobIngest::Indexed { .. }),
+            "identical env bytes at a benign path must be admitted"
+        );
+
+        let index = build_ref_source_index(&repository, &catalog).expect("build index");
+        assert!(
+            !index.files.contains_key(".env"),
+            "the sensitive `.env` blob must never enter the ref index"
+        );
+        assert!(
+            !index.files.contains_key(".ssh/id_ed25519"),
+            "the private-key blob must never enter the ref index"
+        );
+        assert!(
+            index.files.contains_key("src/lib.rs"),
+            "clean code stays indexed"
+        );
+        assert!(
+            index.files.contains_key("notes.txt"),
+            "clean env-at-benign-path stays indexed"
+        );
+    }
+
+    #[test]
+    fn reconcile_deletion_pass_runs_despite_a_branch_publish_failure() {
+        // Finding C: a single bare branch failing to ingest must NOT abort the pass;
+        // the deletion pass still removes a stale lane for a deleted branch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("doomed", &head_commit, false)
+            .expect("doomed branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-resilient");
+        let doomed_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/doomed",
+            repository_id.as_str()
+        ));
+
+        let first = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            first.published.contains(&doomed_id),
+            "doomed lane published"
+        );
+
+        // A branch ref pointing at a blob (not a commit): its publish fails at
+        // `peel_to_commit`, exercising the collect-and-continue path.
+        let blob_oid = repository.blob(b"not a commit\n").expect("blob");
+        repository
+            .reference("refs/heads/broken", blob_oid, true, "broken ref")
+            .expect("broken ref");
+        // Delete the doomed branch so the deletion pass has stale work to reconcile.
+        repository
+            .find_branch("doomed", git2::BranchType::Local)
+            .expect("find doomed")
+            .delete()
+            .expect("delete doomed");
+
+        let second = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("second reconcile still succeeds");
+
+        assert!(
+            second
+                .failed
+                .iter()
+                .any(|(name, _)| name == "refs/heads/broken"),
+            "the broken branch's publish failure is collected, not fatal: {:?}",
+            second.failed
+        );
+        assert!(
+            second.removed.contains(&doomed_id),
+            "the deletion pass still ran despite the publish failure"
+        );
+        assert!(
+            !handle
+                .published_source_set()
+                .sources
+                .contains_key(&doomed_id),
+            "the stale lane for the deleted branch is gone"
+        );
+    }
+
+    #[test]
+    fn ref_tip_move_advances_lane_generations_without_touching_current() {
+        // Finding D / L-R06: republishing a ref lane after its tip moves advances THAT
+        // lane's publication_generation AND content_generation, while the P0 current
+        // lane's generations stay unchanged (L-R12/L-R13). An identical-tip republish
+        // advances only publication_generation, never content_generation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn a() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+
+        let current_before = handle.published_source_set().current_generation();
+        let cur_pub = current_before.publication_generation;
+        let cur_content = current_before.content_generation;
+
+        let id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-gen"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref");
+        let set1 = handle.published_source_set();
+        let lane1 = set1.sources.get(&id).expect("ref lane");
+        let pub1 = lane1.publication_generation;
+        let content1 = lane1.content_generation;
+        assert!(
+            pub1 > 0,
+            "the ref lane carries a meaningful publication generation, got {pub1}"
+        );
+        assert!(
+            content1 > 0,
+            "the ref lane carries a meaningful content generation, got {content1}"
+        );
+
+        // Move the tip: content changes -> both generations advance for this lane.
+        commit_files(root, &[("src/b.rs", b"pub fn b() {}\n")], "second");
+        ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-gen"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("republish moved ref");
+        let set2 = handle.published_source_set();
+        let lane2 = set2.sources.get(&id).expect("ref lane");
+        assert!(
+            lane2.publication_generation > pub1,
+            "a tip move advances the lane publication generation"
+        );
+        assert!(
+            lane2.content_generation > content1,
+            "a tip move advances the lane content generation"
+        );
+        let pub2 = lane2.publication_generation;
+        let content2 = lane2.content_generation;
+
+        // Same-tip republish: publication advances, content does NOT.
+        ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-gen"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("republish same tip");
+        let set3 = handle.published_source_set();
+        let lane3 = set3.sources.get(&id).expect("ref lane");
+        assert!(
+            lane3.publication_generation > pub2,
+            "an identical-tip republish still advances publication generation"
+        );
+        assert_eq!(
+            lane3.content_generation, content2,
+            "an identical-tip republish keeps content generation stable"
+        );
+
+        // The P0 current lane's generations are untouched by every P1 republish.
+        let current_after = set3.current_generation();
+        assert_eq!(
+            current_after.publication_generation, cur_pub,
+            "a P1 republish must not advance the current lane publication generation"
+        );
+        assert_eq!(
+            current_after.content_generation, cur_content,
+            "a P1 republish must not advance the current lane content generation"
+        );
+    }
+
+    #[test]
+    fn unresolved_worktree_head_fails_reconcile_closed_and_publishes_nothing() {
+        // Finding E / L-G01: a worktree that validates but whose HEAD cannot be
+        // resolved is `head_resolved = false`; reconcile then fails CLOSED rather than
+        // risk publishing a checked-out branch as a P1 lane.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+
+        // A bare branch that WOULD be published if the pass proceeded.
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        // A linked worktree on its own branch, then corrupt its HEAD so it still
+        // validates but resolves to a nonexistent ref (unreadable HEAD).
+        let wt_parent = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_parent.path().join("wt");
+        add_worktree_on_branch(&repository, &wt_path, "wt", "wt-branch");
+        let admin_head = repository.path().join("worktrees").join("wt").join("HEAD");
+        std::fs::write(&admin_head, b"ref: refs/heads/ghost-does-not-exist\n")
+            .expect("corrupt worktree HEAD");
+
+        // The classifier marks the worktree unresolved (fail closed), not detached.
+        let checked_out = checked_out_worktrees(&repository).expect("classify");
+        let wt = checked_out
+            .iter()
+            .find(|w| w.name == "wt")
+            .expect("worktree present");
+        assert!(
+            !wt.head_resolved,
+            "an unreadable worktree HEAD must be marked unresolved"
+        );
+        assert_eq!(wt.head_ref, None);
+
+        // Reconcile fails closed: it returns an error and publishes no lane.
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-failclosed");
+        let result = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an unresolved worktree HEAD must fail the reconcile closed, got {result:?}"
+        );
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+        assert!(
+            !handle.published_source_set().sources.contains_key(&bare_id),
+            "no bare lane is published when the worktree topology is unprovable"
+        );
+    }
+
+    #[test]
+    fn empty_repo_unborn_head_reconciles_cleanly_without_failing_closed() {
+        // Finding E / Cursor #2 (main-HEAD arm): an empty repository has an UNBORN
+        // main HEAD (no commits, no local branches). The main-HEAD read must treat
+        // that as fine — NOT fail closed — and publish nothing. (The main-HEAD
+        // fail-CLOSED path — a branch HEAD whose name cannot be read — is symmetric
+        // with the tested worktree case above.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root); // git init, no commit -> unborn HEAD
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let before = handle.published_source_set().registry_generation;
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            RepositoryId::new("repo-unborn"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("an unborn main HEAD must reconcile cleanly, not fail closed");
+        assert!(
+            outcome.published.is_empty(),
+            "unborn repo publishes no lanes"
+        );
+        assert!(!outcome.skipped);
+        assert_eq!(
+            handle.published_source_set().registry_generation,
+            before,
+            "an unborn repo leaves the registry unchanged"
+        );
+    }
+
+    #[test]
+    fn concurrent_reconcile_is_single_flighted_and_skips() {
+        // Finding F: while a reconcile pass holds the single-flight guard, a second
+        // pass SKIPS (never blocks) rather than racing the publish/deletion steps.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-singleflight");
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+
+        // Simulate an in-flight pass by holding the guard.
+        let guard = handle
+            .try_lock_ref_reconcile()
+            .expect("acquire reconcile guard");
+        let skipped = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("a concurrent reconcile returns Ok(skipped)");
+        assert!(skipped.skipped, "a concurrent reconcile must skip");
+        assert!(
+            skipped.published.is_empty() && skipped.removed.is_empty(),
+            "a skipped pass mutates nothing"
+        );
+        assert!(
+            !handle.published_source_set().sources.contains_key(&bare_id),
+            "the skipped pass published no lane"
+        );
+
+        // Releasing the guard lets a subsequent pass proceed and publish.
+        drop(guard);
+        let ran = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("reconcile proceeds after the guard is released");
+        assert!(!ran.skipped, "the pass runs once the guard is free");
+        assert!(
+            handle.published_source_set().sources.contains_key(&bare_id),
+            "the bare branch is published once the pass actually runs"
+        );
+    }
+
+    #[test]
+    fn source_isolation_holds_through_scoped_query_composition() {
+        // L-R08 (finding H): source isolation must hold through the actual search/
+        // review COMPOSITION path, not just the built bundles. Searching one scope
+        // never surfaces another lane's document.
+        use crate::protocol::knowledge_review::review_scoped;
+        use crate::protocol::knowledge_search::search_scoped;
+        use crate::protocol::search_tools::{
+            KnowledgeSourceScope, ReviewKnowledgeInput, ReviewKnowledgeMode, SearchKnowledgeInput,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[(
+                "docs/current-only.md",
+                b"# Current Only\n\nThe quantum meridian anchors the current worktree lane.\n",
+            )],
+            "current",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        commit_bare_branch_with_doc(
+            &repository,
+            "ref-only",
+            "docs",
+            "ref-only.md",
+            b"# Ref Only\n\nThe helical cascade governs the divergent ref lane.\n",
+        );
+
+        let handle = LiveIndex::load(root).expect("load current lane");
+        ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "refs/heads/ref-only",
+            RepositoryId::new("repo-compose-iso"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref lane");
+        let set = handle.published_source_set();
+
+        let search = |scope, query: &str| {
+            search_scoped(
+                &set,
+                &SearchKnowledgeInput {
+                    query: query.to_string(),
+                    path_prefix: None,
+                    source_scope: Some(scope),
+                    authority_scope: None,
+                    project: None,
+                    projects: None,
+                    limit: None,
+                    max_tokens: None,
+                },
+            )
+        };
+
+        // Each scope finds its OWN document...
+        assert!(
+            search(KnowledgeSourceScope::Current, "quantum meridian")
+                .contains("docs/current-only.md"),
+            "current scope must find its own document"
+        );
+        assert!(
+            search(KnowledgeSourceScope::LocalRefs, "helical cascade").contains("docs/ref-only.md"),
+            "local_refs scope must find its own document"
+        );
+        // ...and NEVER the other lane's, even when querying the other lane's term.
+        let current_for_ref_term = search(KnowledgeSourceScope::Current, "helical cascade");
+        assert!(
+            !current_for_ref_term.contains("docs/ref-only.md"),
+            "current scope leaked a ref-lane document: {current_for_ref_term}"
+        );
+        let refs_for_current_term = search(KnowledgeSourceScope::LocalRefs, "quantum meridian");
+        assert!(
+            !refs_for_current_term.contains("docs/current-only.md"),
+            "local_refs scope leaked the current document: {refs_for_current_term}"
+        );
+
+        // The review composition path is likewise source-isolated.
+        let review = |scope| {
+            review_scoped(
+                &set,
+                &ReviewKnowledgeInput {
+                    mode: ReviewKnowledgeMode::Summary,
+                    path: None,
+                    path_prefix: None,
+                    source_scope: Some(scope),
+                    project: None,
+                    projects: None,
+                    limit: None,
+                    max_tokens: None,
+                },
+            )
+        };
+        let refs_review = review(KnowledgeSourceScope::LocalRefs).expect("local_refs review");
+        assert!(
+            !refs_review.rendered.contains("docs/current-only.md"),
+            "local_refs review leaked the current document: {}",
+            refs_review.rendered
+        );
+        let current_review = review(KnowledgeSourceScope::Current).expect("current review");
+        assert!(
+            !current_review.rendered.contains("docs/ref-only.md"),
+            "current review leaked a ref-lane document: {}",
+            current_review.rendered
         );
     }
 }

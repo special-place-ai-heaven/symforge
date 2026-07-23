@@ -19,8 +19,16 @@ pub struct CheckedOutWorktree {
     /// The worktree's working-directory path.
     pub path: PathBuf,
     /// The branch ref the worktree HEAD points at (`refs/heads/<branch>`), or
-    /// `None` when the worktree HEAD is detached.
+    /// `None` when the worktree HEAD is detached OR could not be resolved (see
+    /// `head_resolved`).
     pub head_ref: Option<String>,
+    /// Whether the worktree HEAD was actually read. `true` covers both a resolved
+    /// branch (`head_ref = Some`) and a genuinely detached HEAD (`head_ref =
+    /// None`). `false` means the worktree validated but its HEAD could NOT be
+    /// resolved — we cannot prove which branch (if any) it holds, so reconcile
+    /// must fail CLOSED rather than risk publishing a checked-out branch as a P1
+    /// lane (L-G01: "checked-out worktrees are never P1").
+    pub head_resolved: bool,
 }
 
 /// Classify a repository's linked worktrees in deterministic (name-sorted) order.
@@ -50,20 +58,28 @@ pub fn checked_out_worktrees(repository: &Repository) -> Result<Vec<CheckedOutWo
             continue;
         }
         let path = worktree.path().to_path_buf();
-        let head_ref = Repository::open_from_worktree(&worktree)
-            .ok()
-            .and_then(|repo| {
-                let head = repo.head().ok()?;
-                if head.is_branch() {
-                    head.name().ok().map(str::to_string)
-                } else {
-                    None
-                }
-            });
+        // Fail CLOSED: distinguish a genuinely detached HEAD (resolved, no branch)
+        // from a HEAD we could not read at all. A validated worktree whose HEAD is
+        // unreadable, or a branch HEAD whose name we cannot decode, is
+        // `head_resolved = false` — reconcile treats that as an unprovable topology
+        // and refuses to publish, so we never mistake a checked-out branch for a
+        // bare one (L-G01).
+        let (head_ref, head_resolved) = match Repository::open_from_worktree(&worktree) {
+            Ok(repo) => match repo.head() {
+                Ok(head) if head.is_branch() => match head.name() {
+                    Ok(name) => (Some(name.to_string()), true),
+                    Err(_) => (None, false),
+                },
+                Ok(_) => (None, true),   // detached HEAD: no branch to protect
+                Err(_) => (None, false), // validated worktree, HEAD unreadable
+            },
+            Err(_) => (None, false), // validated worktree could not be opened
+        };
         out.push(CheckedOutWorktree {
             name: name.to_string(),
             path,
             head_ref,
+            head_resolved,
         });
     }
 
@@ -140,6 +156,7 @@ mod tests {
             Some("refs/heads/feature"),
             "the worktree HEAD branch is captured"
         );
+        assert!(wt.head_resolved, "a readable worktree HEAD is resolved");
         assert!(
             wt.path.ends_with("feature-wt"),
             "the worktree working directory is captured, got {:?}",

@@ -1195,6 +1195,14 @@ pub struct SharedIndexHandle {
     /// the index entry is replaced. Consumed (take) by `analyze_file_impact` to
     /// compute accurate diffs even when the watcher re-indexes before the hook fires.
     pre_update_snapshots: Mutex<HashMap<String, PreUpdateSnapshot>>,
+    /// Single-flights P1 local-ref/worktree reconcile. A reconcile pass reads the
+    /// latest git topology, so two overlapping passes are redundant AND unsafe: the
+    /// older pass's deletion step, working from a stale `local_branch_refs`
+    /// snapshot, could cross-delete a lane the newer pass just published. We
+    /// `try_lock` (never block — reconcile must never stall P0): if a pass is
+    /// already running, a second caller skips, because the running pass already
+    /// reflects the newest refs.
+    ref_reconcile_lock: Mutex<()>,
 }
 
 /// Write guard that republishes lightweight handle state when mutated data is released.
@@ -1324,7 +1332,17 @@ impl SharedIndexHandle {
             git_temporal: ArcSwap::new(temporal),
             git_temporal_jobs: Mutex::new(super::git_temporal::GitTemporalJobQueue::default()),
             pre_update_snapshots: Mutex::new(HashMap::new()),
+            ref_reconcile_lock: Mutex::new(()),
         }
+    }
+
+    /// Acquire the single-flight guard for a P1 ref/worktree reconcile pass.
+    ///
+    /// Returns `None` when a pass is already in flight — the caller must SKIP
+    /// rather than block, because the running pass already reflects the newest
+    /// git refs (finding F). The guard is held for the whole reconcile.
+    pub(crate) fn try_lock_ref_reconcile(&self) -> Option<MutexGuard<'_, ()>> {
+        self.ref_reconcile_lock.try_lock()
     }
 
     /// Build a full published bundle for one local Git ref source (Gate L L-G07).
@@ -1335,7 +1353,16 @@ impl SharedIndexHandle {
     /// resident working tree to walk); the manifest, bridge, and authority are the
     /// same builders the current lane uses, so a ref document links only to ref
     /// code of its own source identity.
+    ///
+    /// Per-source generations (L-R06/L-R13): `publication_generation` is drawn from
+    /// the same monotonic `next_generation` dispenser the P0 path uses, so an
+    /// all-source envelope can observe a ref lane republish. `content_generation`
+    /// advances only when THIS lane's tip commit actually moves (it is carried
+    /// forward unchanged for an identical-tip republish). Building this bundle never
+    /// mutates the P0 current lane's own `PublishedGeneration`, which
+    /// `publish_ref_source` leaves byte-identical, so P0 generations stay put.
     pub(crate) fn build_ref_source_generation(
+        &self,
         index: LiveIndex,
         repository_id: crate::domain::index::RepositoryId,
         ref_name: &str,
@@ -1346,6 +1373,36 @@ impl SharedIndexHandle {
             "symforge:git-ref:{}:{ref_name}",
             repository_id.as_str()
         ));
+
+        // Monotonic publication ticket from the shared dispenser — the same atomic
+        // the P0 swap path pulls from — so this lane's publication_generation is
+        // meaningful and strictly advances on every republish (L-R06).
+        let publication_generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        // content_generation advances only when this lane's tip moved. We read the
+        // currently-published lane for this exact source id and compare its recorded
+        // commit; an identical-tip republish carries the same content generation.
+        // ponytail: best-effort read outside publish_ref_source's writer lock; a
+        // reconcile pass is single-flighted (see `try_lock_ref_reconcile`) and a
+        // ref lane is not republished concurrently with itself, so the TOCTOU window
+        // cannot double-count. Fold this read under the writer lock if that changes.
+        let content_generation = {
+            let published = self.published_source_set.load_full();
+            match published.sources.get(&source_id) {
+                Some(previous) => {
+                    let previous_tip = previous
+                        .source_version
+                        .as_ref()
+                        .and_then(|version| version.commit.as_deref());
+                    if previous_tip == Some(tip_commit) {
+                        previous.content_generation
+                    } else {
+                        previous.content_generation.saturating_add(1)
+                    }
+                }
+                None => 1,
+            }
+        };
+
         let source = Arc::new(SourceIdentity {
             repository_id,
             source_id,
@@ -1364,11 +1421,18 @@ impl SharedIndexHandle {
         let code_signals = Arc::new(CodeSignalsSnapshot {
             state: temporal.state.clone(),
             temporal,
-            computed_for_content_generation: 0,
+            computed_for_content_generation: content_generation,
             computed_for_source_version: (*source_version).clone(),
             coverage,
         });
 
+        // ponytail: ref-lane manifest carries indexed-file usage only; withheld/
+        // catalog-only entries are not enumerated (empty `entries`). No Gate L
+        // contract requires P1 manifest catalog-entry parity — L-R06 (tasks.md)
+        // scopes the all-source envelope to per-source generation/digest/coverage/
+        // review-hash, which the generations above satisfy. Populate from the
+        // `LocalRefCatalog` (incl. its withheld routing decisions) if a future
+        // contract requires ref-lane catalog parity.
         let usage = ManifestResourceUsage {
             catalog_entries: index.files.len() as u64,
             catalog_metadata_bytes: 0,
@@ -1393,27 +1457,28 @@ impl SharedIndexHandle {
         } else {
             FreshnessStatus::Current
         };
-        let published_state = Arc::new(PublishedIndexState::capture(0, &index));
+        let published_state =
+            Arc::new(PublishedIndexState::capture(publication_generation, &index));
         let outline = Arc::new(index.capture_repo_outline_view());
         let bridge = Arc::new(build_knowledge_bridge(
             &index,
             &source,
-            0,
+            content_generation,
             &BridgeLimits::default(),
         ));
         let authority = build_published_authority(
             &index,
             Some(&source),
             Some(&source_version),
-            0,
+            content_generation,
             &bridge,
             &code_signals,
             manifest.as_deref(),
         );
         let live = Arc::new(index);
         Arc::new(PublishedGeneration {
-            publication_generation: 0,
-            content_generation: 0,
+            publication_generation,
+            content_generation,
             project_generation: 0,
             source: Some(source),
             source_version: Some(source_version),
@@ -6511,7 +6576,7 @@ mod tests {
             current_lane.project_generation,
         );
 
-        let ref_gen = SharedIndexHandle::build_ref_source_generation(
+        let ref_gen = handle.build_ref_source_generation(
             LiveIndex::from_source_files(HashMap::new()),
             crate::domain::index::RepositoryId::new("repo-under-test"),
             "refs/heads/feature",
@@ -6564,7 +6629,7 @@ mod tests {
         let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
         let current_id = handle.published_source_set().current_source_id.clone();
 
-        let ref_gen = SharedIndexHandle::build_ref_source_generation(
+        let ref_gen = handle.build_ref_source_generation(
             LiveIndex::from_source_files(HashMap::new()),
             crate::domain::index::RepositoryId::new("repo-under-test"),
             "refs/heads/feature",
