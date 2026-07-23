@@ -1919,7 +1919,7 @@ catalog lineage) occurs only under the per-project mutation lock. `tasks.md` Gat
 items are checked. Gate L is the next open gate; the 24 pre-existing clippy errors are logged above
 for the Gate-M battery.
 
-### Gate L Progress (OPEN — in progress 2026-07-22)
+### Gate L Progress (OPEN — in progress, updated 2026-07-23)
 
 Gate L is the largest gate in the feature (worktrees + local refs, real git2 blob ingestion,
 dedup, multi-source query composition, per-lane concurrency fences). It is being built as
@@ -1936,17 +1936,27 @@ Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `live_
 - Increment 2 — `materialize_ingest_blobs` + `RefBlobBytes` (L-G03 raw-bytes layer), commit
   `60ebddf`. Reads each distinct ingest-decision object ID once (dedup); never materializes
   catalog-only blobs.
-- Module suite: 7 unit tests green (`cargo test --lib live_index::local_ref_scout::tests`,
+- Increment 3 — `route_ref_blob` + `RefBlobIngest` (L-G04), commit `70ea535`. Routes a materialized
+  blob's bytes through the EXACT shared adapters filesystem ingestion uses: `IndexTargets::for_path`
+  (lane routing), `knowledge::classify_stable_content` (secret/LFS/encoding gate), and
+  `parsing::process_file_with_classification` (the one parser) → `IndexedFile`. No second parser or
+  search index. Secret-positive/LFS/undecodable bytes are withheld as metadata-only (no card). This
+  is the L-R10 parity mechanism: same bytes → same lifecycle/extraction/secret result because it is
+  literally the same functions. (A cross-path byte-for-byte parity assertion vs the filesystem lane
+  is deferred to the L-G05 wiring, where both lanes produce comparable published files.)
+- Module suite: 10 unit tests green (`cargo test --lib live_index::local_ref_scout::tests`,
   `-j1 --test-threads=1`); fmt clean; no new clippy warnings in the module.
 
-Remaining Gate L work (in dependency order), NOT yet started — this is the scope escalation to pause
-and confirm direction at, because it reaches into the core extraction/publication/query surfaces:
+The ref-blob INGESTION path is now complete and tested end to end (scout → dedup → shared-adapter
+route). Remaining Gate L work is the PUBLICATION + multi-source QUERY wiring — the deep scope
+escalation into core surfaces. Landmarks confirmed for the next session: `AdmitParseResult`
+(`store.rs:3192`) is `HashMap<String, Arc<IndexedFile>>`; `fold_parse_results_for_scope`
+(`store.rs:3223`) folds parsed files with circuit-breaker + dispositions; `load_with_project_state`
+(`store.rs:3716`) assembles a `LiveIndex`; `PublishedGeneration` (`store.rs`, data-model.md:1227)
+needs live/manifest/health/outline/code_signals/bridge/authority; `PublishedSourceSet`
+(`store.rs:885`) is the `ArcSwap` boundary per `ProjectInstance`. Remaining items, in order:
 
-1. L-G04: route the deduped blob bytes through the SHARED extraction/secret/bridge/authority
-   adapters (do NOT create a second prose parser or search index). Requires understanding how the
-   filesystem path currently feeds bytes into parse/secret so ref blobs reuse the same pipeline
-   keyed by classification/route/extractor version + secret policy version. Covers L-R10 parity.
-2. L-G01/L-G05/L-G07: populate the multi-source `PublishedSourceSet` (today only holds `current`).
+1. L-G01/L-G05/L-G07: populate the multi-source `PublishedSourceSet` (today only holds `current`).
    Reconcile ref/worktree topology atomically under the per-`ProjectInstance` publication writer
    lock; copy the source map under lock, replace only the affected lane's entry, swap once;
    `registry_generation` bumps on membership/bundle change while a P1-only change leaves the current
@@ -1959,6 +1969,9 @@ and confirm direction at, because it reaches into the core extraction/publicatio
    source set per selected `ProjectInstance` (L-R09), with typed empty/degraded lanes and no false
    Complete ref scope (L-R07).
 4. VERIFY L-V01..L-V04 + update this ledger and `tasks.md` Gate-L boxes.
+
+Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; they remain unchecked.
+Known debt unchanged: 24 pre-existing clippy errors branch-wide (Gate-M gate). Nothing pushed.
 
 Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; the boxes there remain
 unchecked. Known debt unchanged: 24 pre-existing clippy errors branch-wide (Gate-M gate).
