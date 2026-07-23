@@ -192,7 +192,7 @@ fn search_files_debug_ranking_schema_and_roundtrip() {
 }
 
 #[test]
-fn search_knowledge_schema_is_exact_read_only_and_current_scope_only() {
+fn search_knowledge_schema_is_exact_read_only_and_multi_source_scope() {
     fn enum_strings(root: &Map<String, Value>, value: &Value, output: &mut Vec<String>) {
         match value {
             Value::Array(values) => {
@@ -258,7 +258,12 @@ fn search_knowledge_schema_is_exact_read_only_and_current_scope_only() {
     enum_strings(schema, source_scope, &mut advertised_scopes);
     advertised_scopes.sort();
     advertised_scopes.dedup();
-    assert_eq!(advertised_scopes, ["current"]);
+    // Gate L: search_knowledge composes across the captured source set, so it
+    // advertises every implemented P1 scope (review_knowledge stays current-only).
+    assert_eq!(
+        advertised_scopes,
+        ["all", "current", "local_refs", "worktrees"]
+    );
 
     let annotations = tool
         .annotations
