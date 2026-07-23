@@ -1018,6 +1018,190 @@ mod tests {
         );
     }
 
+    /// Create a bare local `branch` whose tree holds a single `dir_name/file_name`
+    /// knowledge doc, built entirely in the object database — the working tree is
+    /// never touched, so the current (P0) lane loaded from disk stays isolated.
+    fn commit_bare_branch_with_doc(
+        repository: &Repository,
+        branch: &str,
+        dir_name: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) {
+        let blob = repository.blob(bytes).expect("write blob");
+        let mut dir_builder = repository.treebuilder(None).expect("dir treebuilder");
+        dir_builder
+            .insert(file_name, blob, 0o100644)
+            .expect("insert blob into dir tree");
+        let dir_tree = dir_builder.write().expect("write dir tree");
+        let mut root_builder = repository.treebuilder(None).expect("root treebuilder");
+        root_builder
+            .insert(dir_name, dir_tree, 0o040000)
+            .expect("insert dir into root tree");
+        let root_tree_id = root_builder.write().expect("write root tree");
+        let root_tree = repository.find_tree(root_tree_id).expect("find root tree");
+        let signature =
+            git2::Signature::now("SymForge Test", "symforge@example.invalid").expect("signature");
+        let commit_id = repository
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "ref-only doc",
+                &root_tree,
+                &[],
+            )
+            .expect("commit ref tree");
+        let commit = repository.find_commit(commit_id).expect("find commit");
+        repository
+            .branch(branch, &commit, false)
+            .expect("create bare branch");
+    }
+
+    #[test]
+    fn source_isolation_never_crosses_ref_and_current_boundaries() {
+        // L-R08: a ref (P1) lane's source identity, documents, bridge, and authority
+        // never reference the current (P0) worktree lane's — and vice versa. Each lane
+        // is built from its own LiveIndex + SourceIdentity, so no bridge card or
+        // authority record crosses the source boundary.
+        use crate::domain::index::SourceLocation;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        // Current worktree lane: a distinctive knowledge doc on HEAD.
+        commit_files(
+            root,
+            &[(
+                "docs/current-only.md",
+                b"# Current Only\n\nThe quantum meridian anchors the current worktree lane.\n",
+            )],
+            "current",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        // Bare ref lane: a DIFFERENT distinctive knowledge doc, only in the ODB.
+        commit_bare_branch_with_doc(
+            &repository,
+            "ref-only",
+            "docs",
+            "ref-only.md",
+            b"# Ref Only\n\nThe helical cascade governs the divergent ref lane.\n",
+        );
+
+        // P0 current lane, loaded from the working tree (real WorkingTree identity).
+        let handle = LiveIndex::load(root).expect("load current lane");
+        // P1 ref lane, published into the same handle.
+        let ref_id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "refs/heads/ref-only",
+            RepositoryId::new("repo-isolation"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref lane");
+
+        let set = handle.published_source_set();
+        let current = set.current_generation();
+        let ref_gen = set.sources.get(&ref_id).expect("ref lane generation");
+
+        // --- Source identity isolation ---
+        let current_source = current.source.as_ref().expect("current source identity");
+        let ref_source = ref_gen.source.as_ref().expect("ref source identity");
+        assert!(
+            matches!(current_source.location, SourceLocation::WorkingTree { .. }),
+            "current lane is a WorkingTree source, got {:?}",
+            current_source.location
+        );
+        match &ref_source.location {
+            SourceLocation::GitRef { name } => assert_eq!(name, "refs/heads/ref-only"),
+            other => panic!("ref lane must be a GitRef source, got {other:?}"),
+        }
+        assert_ne!(
+            current_source.source_id, ref_source.source_id,
+            "the two lanes carry distinct source ids"
+        );
+
+        // --- Document isolation: neither lane's files leak into the other ---
+        assert!(current.live.files.contains_key("docs/current-only.md"));
+        assert!(
+            !current.live.files.contains_key("docs/ref-only.md"),
+            "the current lane never carries the ref lane's document"
+        );
+        assert!(ref_gen.live.files.contains_key("docs/ref-only.md"));
+        assert!(
+            !ref_gen.live.files.contains_key("docs/current-only.md"),
+            "the ref lane never carries the current lane's document"
+        );
+
+        // --- Bridge isolation: every card carries its own lane's source + document ---
+        assert!(
+            ref_gen
+                .bridge
+                .cards
+                .iter()
+                .any(|card| card.anchor.path == "docs/ref-only.md"),
+            "the ref bridge has a card for its own document"
+        );
+        for card in &ref_gen.bridge.cards {
+            assert_eq!(
+                &card.anchor.source,
+                ref_source.as_ref(),
+                "a ref bridge card carries the ref source identity"
+            );
+            assert_ne!(
+                card.anchor.path, "docs/current-only.md",
+                "the ref bridge never references the current lane's document"
+            );
+        }
+        assert!(
+            current
+                .bridge
+                .cards
+                .iter()
+                .any(|card| card.anchor.path == "docs/current-only.md"),
+            "the current bridge has a card for its own document"
+        );
+        for card in &current.bridge.cards {
+            assert_eq!(
+                &card.anchor.source,
+                current_source.as_ref(),
+                "a current bridge card carries the current source identity"
+            );
+            assert_ne!(
+                card.anchor.path, "docs/ref-only.md",
+                "the current bridge never references the ref lane's document"
+            );
+        }
+
+        // --- Authority isolation: the authority view is source-local too ---
+        assert_eq!(
+            ref_gen
+                .authority
+                .source
+                .as_ref()
+                .expect("ref authority source"),
+            ref_source.as_ref(),
+            "the ref authority carries the ref source identity"
+        );
+        for record in &ref_gen.authority.records {
+            assert_eq!(&record.unit.source, ref_source.as_ref());
+            assert_ne!(record.unit.path, "docs/current-only.md");
+        }
+        assert_eq!(
+            current
+                .authority
+                .source
+                .as_ref()
+                .expect("current authority source"),
+            current_source.as_ref(),
+            "the current authority carries the current source identity"
+        );
+        for record in &current.authority.records {
+            assert_eq!(&record.unit.source, current_source.as_ref());
+            assert_ne!(record.unit.path, "docs/ref-only.md");
+        }
+    }
+
     #[test]
     fn identical_blob_is_parsed_once_across_same_classification_paths() {
         // L-R02 / L-G03: identical bytes at several same-classification paths are

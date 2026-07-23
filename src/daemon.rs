@@ -125,6 +125,24 @@ fn daemon_idle_shutdown_from_env() -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs.max(60)))
 }
 
+/// Feature 020 / L-V02: gate that turns ON background publication of P1 local-ref
+/// lanes (bare local branches) when a project opens or reloads. OFF by default so
+/// the current-only P0 path keeps its measured latency/memory unchanged — ref
+/// lanes are strictly opt-in. Accepts `1`/`true`/`on` (case-insensitive); anything
+/// else, including unset, is OFF.
+const LOCAL_REF_LANES_ENV: &str = "SYMFORGE_LOCAL_REF_LANES";
+
+fn local_ref_lanes_enabled() -> bool {
+    std::env::var(LOCAL_REF_LANES_ENV)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on"
+            )
+        })
+}
+
 const DAEMON_AUTH_TOKEN_ENV: &str = "SYMFORGE_DAEMON_AUTH_TOKEN";
 const TRACE_SYMBOL_ALIAS_DEPRECATION: &str = concat!(
     "Deprecation warning: `trace_symbol` is retired; ",
@@ -3149,6 +3167,10 @@ impl ProjectSlot {
         }
 
         let expected_gen = index.current_project_generation();
+        // Feature 020 (L-V02): opt-in, gated OFF by default — a no-op unless
+        // SYMFORGE_LOCAL_REF_LANES is set, so the current-only path is unchanged.
+        // Detached fire-and-forget, exactly like the git-temporal spawn below.
+        spawn_local_ref_reconcile(Arc::clone(&index), canonical_root.to_path_buf());
         live_index::git_temporal::spawn_git_temporal_computation(
             index,
             canonical_root.to_path_buf(),
@@ -3156,6 +3178,68 @@ impl ProjectSlot {
         );
         Ok(counts)
     }
+}
+
+/// Feature 020 (L-G05/L-G07/L-V04): publish P1 local-ref lanes for a project's
+/// bare local branches on open/reload, mirroring `spawn_git_temporal_computation`
+/// — fire-and-forget, never blocking P0 readiness. Gated OFF by default
+/// (`local_ref_lanes_enabled`); when OFF this is a no-op and the current-only P0
+/// path is byte-unchanged (L-V02). A non-git/unreadable repo or a failed
+/// reconcile is swallowed: it never surfaces to the caller and never touches the
+/// P0 lane (L-V04). Returns the spawned task handle (mainly so a test can await
+/// it); production drops it to detach.
+///
+// ponytail: republishes ref lanes on open/reload ONLY. Live `.git/refs` movement
+// (a branch created/deleted/moved while the project stays open) is not watched
+// yet, so L-R03 holds across a reopen but not live. Upgrade path: a refs watcher
+// (like the filesystem watcher) that calls `reconcile_local_ref_topology` on ref
+// change.
+fn spawn_local_ref_reconcile(
+    index: SharedIndex,
+    canonical_root: PathBuf,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !local_ref_lanes_enabled() {
+        return None;
+    }
+    // Guard: only spawn if a tokio runtime is available (not the case in some
+    // sync tests) — mirrors `spawn_git_temporal_computation`.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return None;
+    }
+    // Blocking git tree-walk + parse work runs off the async worker threads.
+    Some(tokio::task::spawn_blocking(move || {
+        let Ok(canonical) = dunce::canonicalize(&canonical_root) else {
+            return;
+        };
+        let Ok(repository) = git2::Repository::open(&canonical) else {
+            // Non-git or unreadable repo: no local refs to publish. Never
+            // propagated — the P0 lane is unaffected (L-V04).
+            return;
+        };
+        let project_id = crate::discovery::project_id_for_canonical_root(&canonical);
+        let repository_id =
+            match crate::live_index::persist::capture_repository_source(&canonical, &project_id) {
+                Ok(captured) => captured.source.repository_id,
+                Err(error) => {
+                    tracing::debug!(%error, "local ref reconcile: repository identity unavailable");
+                    return;
+                }
+            };
+        match live_index::local_ref_scout::reconcile_local_ref_topology(
+            &index,
+            &repository,
+            repository_id,
+            &live_index::local_ref_scout::LocalRefScoutBudget::default(),
+        ) {
+            Ok(outcome) => tracing::info!(
+                published = outcome.published.len(),
+                removed = outcome.removed.len(),
+                checked_out = outcome.checked_out.len(),
+                "local ref lanes reconciled",
+            ),
+            Err(error) => tracing::debug!(%error, "local ref reconcile skipped"),
+        }
+    }))
 }
 
 /// Bootstrap a project's live index for a daemon open/switch.
@@ -5559,6 +5643,159 @@ mod tests {
                 daemon_idle_shutdown_from_env(),
                 Some(Duration::from_secs(DEFAULT_DAEMON_IDLE_SHUTDOWN_SECS))
             );
+        }
+    }
+
+    /// Commit `bytes` at `rel` into `repository`'s working tree + HEAD. Mirrors the
+    /// local_ref_scout test helper; used to give the reconcile a real tree to scout.
+    fn ref_lane_commit(
+        repository: &git2::Repository,
+        root: &Path,
+        rel: &str,
+        bytes: &[u8],
+        message: &str,
+    ) {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&full, bytes).expect("write file");
+        let mut index = repository.index().expect("index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("SymForge Test", "symforge@example.invalid").expect("signature");
+        let parent = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("commit");
+    }
+
+    /// L-G05/L-G07/L-V04: with the gate ON, opening/reloading a project publishes a
+    /// P1 `symforge:git-ref:` lane for a bare local branch via the detached
+    /// reconcile spawn.
+    #[tokio::test]
+    async fn local_ref_lanes_gate_on_publishes_bare_branch_lane() {
+        let _env = env_lock().await;
+        let _gate = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, "1");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = git2::Repository::init(root).expect("init repo");
+        ref_lane_commit(
+            &repository,
+            root,
+            "src/lib.rs",
+            b"pub fn a() {}\n",
+            "initial",
+        );
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare-lane", &head_commit, false)
+            .expect("bare branch");
+
+        let index: SharedIndex = Arc::new(crate::live_index::SharedIndexHandle::new(
+            LiveIndex::from_source_files(HashMap::new()),
+        ));
+
+        let task = spawn_local_ref_reconcile(Arc::clone(&index), root.to_path_buf())
+            .expect("gate ON must spawn the reconcile task");
+        task.await.expect("reconcile task completes");
+
+        let set = index.published_source_set();
+        assert!(
+            set.sources
+                .keys()
+                .any(|id| id.as_str().starts_with("symforge:git-ref:")),
+            "gate ON publishes at least one git-ref lane: {:?}",
+            set.sources.keys().map(|id| id.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// L-V02: with the gate OFF (default), the reconcile is never spawned and no
+    /// `symforge:git-ref:` lane appears — the current-only path is unchanged.
+    #[tokio::test]
+    async fn local_ref_lanes_gate_off_publishes_no_ref_lane() {
+        let _env = env_lock().await;
+        let _gate = EnvVarGuard::unset(LOCAL_REF_LANES_ENV);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repository = git2::Repository::init(root).expect("init repo");
+        ref_lane_commit(
+            &repository,
+            root,
+            "src/lib.rs",
+            b"pub fn a() {}\n",
+            "initial",
+        );
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare-lane", &head_commit, false)
+            .expect("bare branch");
+
+        let index: SharedIndex = Arc::new(crate::live_index::SharedIndexHandle::new(
+            LiveIndex::from_source_files(HashMap::new()),
+        ));
+        let before = index.published_source_set().registry_generation;
+
+        assert!(
+            spawn_local_ref_reconcile(Arc::clone(&index), root.to_path_buf()).is_none(),
+            "gate OFF must not spawn a reconcile task"
+        );
+
+        let set = index.published_source_set();
+        assert!(
+            !set.sources
+                .keys()
+                .any(|id| id.as_str().starts_with("symforge:git-ref:")),
+            "gate OFF publishes no git-ref lane"
+        );
+        assert_eq!(
+            set.registry_generation, before,
+            "gate OFF leaves the published source map untouched"
+        );
+    }
+
+    /// The env gate parses `1`/`true`/`on` (case-insensitive) as ON and everything
+    /// else — including unset — as OFF.
+    #[tokio::test]
+    async fn local_ref_lanes_env_gate_parsing() {
+        let _guard = env_lock().await;
+        {
+            let _env = EnvVarGuard::unset(LOCAL_REF_LANES_ENV);
+            assert!(!local_ref_lanes_enabled(), "unset is OFF");
+        }
+        for on in ["1", "true", "on", "TRUE", "On", " on "] {
+            let _env = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, on);
+            assert!(local_ref_lanes_enabled(), "{on:?} is ON");
+        }
+        for off in ["0", "false", "off", "no", "", "2"] {
+            let _env = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, off);
+            assert!(!local_ref_lanes_enabled(), "{off:?} is OFF");
         }
     }
 
