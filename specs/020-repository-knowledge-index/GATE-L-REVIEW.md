@@ -64,11 +64,33 @@ deep enough — go back to the code.
 
 ## The review surface (commits on this branch)
 
-- `85d70dc` — earlier review-fix batch (P0-lane preservation `next_after_current_publish`,
-  degraded ref coverage, multi-source envelope, parse-once with grammar-flavor key).
-- `130f57b` — **engine**: worktree classifier + ref-topology reconcile driver.
-- `5773fd9` — **L-R11** protected-membership test.
-- (pending, in this review) — **gated production reconcile caller** + **L-R08** isolation test.
+- `85d70dc` — P0-lane preservation, degraded ref coverage, multi-source envelope, parse-once.
+- `130f57b` — engine: worktree classifier + ref-topology reconcile driver.
+- `5773fd9` — L-R11 protected-membership test.
+- `f174ea9` — gated production reconcile caller + L-R08 isolation test.
+- `346097f` — review round-1/2 fixes A/C/D/E/F/G/H + main-HEAD fail-closed.
+- `4eb0b68` — cross-project source_scope (B) + L-R11 tool-dispatch coverage (#7).
+
+**This is a VALIDATION round.** The findings below were already reported and fixed; your
+job is to confirm each is ACTUALLY closed (attack it again with the methodology above),
+NOT to re-report it as new. If a fix is incomplete or introduces a regression, that is the
+finding. Verify-these-are-closed:
+
+- **A [L-R10]** ref admission applies `sensitive_path_rule` before the content scan — a
+  committed `.env`/`.ssh/id_*`/`*.tfstate` is withheld byte-identically to the filesystem
+  scout. (Attack: a sensitive path the rule does NOT cover; a path the filesystem scout
+  withholds that the ref path still admits.)
+- **B [L-R09/L-G06]** `execute_cross_project_knowledge/review` capture the whole
+  `PublishedSourceSet` and call `search_scoped`/`review_scoped`. (Attack: default-scope
+  output byte-identical? a scoped multi-project call that still drops a lane?)
+- **C [L-R03]** reconcile deletion pass runs despite a per-branch publish failure
+  (`ReconcileOutcome.failed`). (Attack: an interleaving where a stale lane still survives.)
+- **D [L-R06]** P1 per-source generations are meaningful/monotonic; P0 untouched. (Attack:
+  a republish that fails to advance, or that DOES advance P0.)
+- **E [L-G01]** worktree AND main-HEAD reads fail CLOSED. (Attack: any remaining fail-open
+  error branch that lets a checked-out branch become P1.)
+- **F** reconcile is single-flighted. (Attack: an interleaving that still cross-deletes.)
+- **H [L-R08]** isolation holds through `search_scoped`/`review_scoped` composition.
 
 ### Files & symbols to scrutinize
 

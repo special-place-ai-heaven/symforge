@@ -645,57 +645,85 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 
 ### RED
 
-- [ ] L-R01 Current worktree outranks divergent linked worktree/ref without changing
-  document authority labels.
-- [ ] L-R02 Identical Git blob is parsed once with multiple source mappings.
-- [ ] L-R03 Ref movement invalidates old mappings deterministically.
-- [ ] L-R04 Giant Git blob is catalog-only without materialization.
+- [x] L-R01 Current worktree outranks divergent linked worktree/ref without changing
+  document authority labels. (test `all_scope_lists_current_lane_before_ref_lanes`)
+- [x] L-R02 Identical Git blob is parsed once with multiple source mappings.
+  (test `identical_blob_is_parsed_once_across_same_classification_paths`)
+- [x] L-R03 Ref movement invalidates old mappings deterministically. (tests
+  `ref_movement_replaces_the_lane_and_bumps_registry`,
+  `reconcile_deletion_pass_runs_despite_a_branch_publish_failure`)
+- [x] L-R04 Giant Git blob is catalog-only without materialization. (tests
+  `giant_blob_is_catalog_only_without_materialization`,
+  `catalog_only_blob_bytes_are_not_materialized`)
 - [ ] L-R05 A process-spawn spy fails on any Git/LFS child process while offline
   local-ref ingestion proves no network fetch callback or object materialization.
-- [ ] L-R06 Mixed-freshness all-source envelope reports each source publication/
+  (as_of 2026-07-23: offline half PROVEN — `reconcile_ingests_offline_with_no_remote_configured`;
+  the libgit2-only ingestion path spawns no child process structurally, BUT a runtime
+  process-spawn spy assertion is NOT built. Remaining: the spy.)
+- [x] L-R06 Mixed-freshness all-source envelope reports each source publication/
   content generation, digest, coverage, review hash, and worst overall coverage.
-- [ ] L-R07 Local-ref entry/blob/derived mapping budgets cannot block current-source
-  readiness and cannot publish a false Complete ref scope.
-- [ ] L-R08 Bridge, authority, policy, state placement, cache, and review identities
-  never cross worktree/ref/source boundaries.
-- [ ] L-R09 Current/worktrees/local_refs/all filters, two-project selectors, and
+  (multi-source envelope + P1 per-source generations `ref_tip_move_advances_lane_generations…`)
+- [x] L-R07 Local-ref entry/blob/derived mapping budgets cannot block current-source
+  readiness and cannot publish a false Complete ref scope. (tests
+  `entry_budget_degrades_coverage…`, `degraded_scout_publishes_degraded_ref_manifest_coverage`)
+- [x] L-R08 Bridge, authority, policy, state placement, cache, and review identities
+  never cross worktree/ref/source boundaries. (tests `source_isolation_never_crosses…`,
+  `source_isolation_holds_through_scoped_query_composition`; policy/state/cache identities
+  are per-source by construction of the ref bundle builders.)
+- [x] L-R09 Current/worktrees/local_refs/all filters, two-project selectors, and
   `projects=["*"]` compose deterministically from one captured source set per selected
   `ProjectInstance`; unavailable/empty/degraded source lanes retain typed outcomes.
-- [ ] L-R10 The same Markdown/text/config blob produces lifecycle/extraction/secret/
+  (`search_scoped`/`review_scoped` + cross-project `cross_project_*_source_scope_composes…`)
+- [x] L-R10 The same Markdown/text/config blob produces lifecycle/extraction/secret/
   bridge/authority results identical to filesystem ingestion, except for explicit
-  source and temporal-provenance differences.
-- [ ] L-R11 A second session cannot address an explicit-protected worktree through a
-  wildcard/ref mapping without its own direct exact override.
-- [ ] L-R12 P1 bundle churn racing a long P0 build cannot force unbounded P0 retry or
-  abort; the P0 commit fences only its own source and reaches readiness.
-- [ ] L-R13 Concurrent P0/P1 commits retain both updates. Every source-map change
+  source and temporal-provenance differences. (secret-path parity fix +
+  `sensitive_path_blob_is_withheld_by_path_even_when_content_is_clean`)
+- [x] L-R11 A second session cannot address an explicit-protected worktree through a
+  wildcard/ref mapping without its own direct exact override. (tests
+  `l_r11_second_session_cannot_reach…`, `l_r11_tool_dispatch_blocks_wildcard…`)
+- [x] L-R12 P1 bundle churn racing a long P0 build cannot force unbounded P0 retry or
+  abort; the P0 commit fences only its own source and reaches readiness. (P0 fences on
+  per-lane generations, not `registry_generation`; `publish_ref_source` leaves current byte-identical)
+- [x] L-R13 Concurrent P0/P1 commits retain both updates. Every source-map change
   advances `registry_generation`, while a P1-only swap leaves current-worktree
-  publication/content/project generations unchanged.
-- [ ] L-R14 The same object ID under Markdown and text/config paths shares raw bytes
+  publication/content/project generations unchanged. (tests
+  `p0_publishes_preserve_published_ref_lanes`, `publishing_and_removing_a_ref_source…`)
+- [x] L-R14 The same object ID under Markdown and text/config paths shares raw bytes
   but re-derives classification-specific units, extraction, and secret outcome.
+  (parse cache keyed by `(object_id, classification, language, is_tsx, is_c_header)`)
 
 ### GREEN
 
-- [ ] L-G01 Reuse worktree project ownership for checked-out sources.
-- [ ] L-G02 Add bounded local-ref tree/blob scout through existing `git2`.
-- [ ] L-G03 Deduplicate immutable raw blob bytes by object ID; key parse/extraction by
+- [x] L-G01 Reuse worktree project ownership for checked-out sources. (reconcile excludes
+  checked-out worktree HEADs + main HEAD from P1; fail-closed on unresolved HEAD)
+- [x] L-G02 Add bounded local-ref tree/blob scout through existing `git2`. (`scout_local_ref`)
+- [x] L-G03 Deduplicate immutable raw blob bytes by object ID; key parse/extraction by
   classification/route/extractor version and secret scans by path-policy inputs/
   policy version while retaining source-local identity/generation/policy mappings.
-- [ ] L-G04 Route blobs through the shared scout/extraction/secret/bridge/authority
-  adapters; do not create a second prose parser or search index.
-- [ ] L-G05 Reconcile ref/worktree topology and source mappings atomically.
-- [ ] L-G06 Add source filters/labels/per-source review envelopes and expand advertised
-  source-scope capabilities only after their focused tests pass.
-- [ ] L-G07 Commit every source lane through the owning `ProjectInstance` publication
+  (`materialize_ingest_blobs` dedup + `route_catalog_files` parse cache + sensitive-path rule)
+- [x] L-G04 Route blobs through the shared scout/extraction/secret/bridge/authority
+  adapters; do not create a second prose parser or search index. (`route_ref_blob`/`classify_ref_blob`)
+- [x] L-G05 Reconcile ref/worktree topology and source mappings atomically.
+  (`reconcile_local_ref_topology` + single-flight guard; gated production caller `spawn_local_ref_reconcile`)
+- [x] L-G06 Add source filters/labels/per-source review envelopes and expand advertised
+  source-scope capabilities only after their focused tests pass. (`search_scoped`/`review_scoped`,
+  cross-project dispatch, advertised 4 scopes)
+- [x] L-G07 Commit every source lane through the owning `ProjectInstance` publication
   lock, copying the current map under lock and replacing only the lane's source entry.
+  (`publish_ref_source`/`remove_ref_source`/`next_after_current_publish`)
 
 ### VERIFY
 
-- [ ] L-V01 Worktree/ref/source-scope/parity focused tests are green.
+- [x] L-V01 Worktree/ref/source-scope/parity focused tests are green. (full lib suite 2995/0/2)
 - [ ] L-V02 Current-only default latency/memory is measured and unchanged within the
-  declared budget.
-- [ ] L-V03 All-sources query/review remains bounded, deterministic, and source-local.
-- [ ] L-V04 Local-ref lane failure leaves current-worktree P0 Ready/queryable.
+  declared budget. (as_of 2026-07-23: default path is inert — `SYMFORGE_LOCAL_REF_LANES`
+  OFF by default, gate returns before any git/scout work, so behavior is unchanged BY
+  CONSTRUCTION; BUT a formal latency/memory benchmark is NOT run, and the default path pays
+  one `std::env::var` read per reload (Cursor LOW #8). Remaining: the measurement.)
+- [x] L-V03 All-sources query/review remains bounded, deterministic, and source-local.
+  (scoped composition tests; per-source captured set)
+- [x] L-V04 Local-ref lane failure leaves current-worktree P0 Ready/queryable. (test
+  `failed_ref_ingestion_leaves_the_current_lane_untouched`; reconcile errors never touch P0)
 
 ## Gate M — Health, corpus, surface, and release
 

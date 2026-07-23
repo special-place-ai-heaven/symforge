@@ -2034,6 +2034,43 @@ class) — those are present per-source inside each `search_current` section; ag
 them needs `search_current` to return structured counts rather than a formatted string
 (a larger refactor), so it is logged here rather than bodged. Still nothing pushed.
 
+### Gate L closure — engine + daemon + review round 3 (2026-07-23)
+
+Built the remaining Gate L engine + daemon and closed a third, methodology-led review
+round (Cursor + Kimi). Commits (all on `feat/repository-knowledge-index`, not pushed):
+`130f57b` engine (worktree classifier `checked_out_worktrees` + reconcile driver
+`reconcile_local_ref_topology`); `5773fd9` L-R11 membership test; `f174ea9` gated production
+reconcile caller `spawn_local_ref_reconcile` (OFF by default via `SYMFORGE_LOCAL_REF_LANES`,
+L-V02/L-V04) + L-R08 test; `346097f` review fixes A/C/D/E/F/G/H + main-HEAD fail-closed;
+`4eb0b68` cross-project `source_scope` (B) + L-R11 tool-dispatch coverage.
+
+Review methodology lesson (saved to agentmemory): a generic "review adversarially" brief
+gets only the obvious HIGHs; an 8-point forcing methodology (read full bodies; trace shared
+helpers' arg usage; parity diffs; concrete named-file inputs; explicit interleavings;
+consumer-trace before severity; attack-the-tests; fail-open audit) made Cursor v2 escalate
+the `.env` secret-parity gap to BLOCKER and find the fail-open + vacuous test its v1 missed.
+Baked into `specs/020-repository-knowledge-index/GATE-L-REVIEW.md`.
+
+Findings fixed this cycle: A [L-R10] ref admission now applies `sensitive_path_rule` (secret
+parity — `.env`/`.ssh`/`*.tfstate` withheld by path, was a real gap); B [L-R09/L-G06]
+cross-project search/review honor `source_scope`; C [L-R03] reconcile deletion resilient to
+publish failures; D [L-R06] meaningful monotonic P1 generations; E [L-G01] worktree + main
+HEAD fail-CLOSED; F single-flight reconcile; H [L-R08] isolation through query composition.
+Cleared by both reviewers: P0/P1 locking, L-V04, L-R11 chokepoint, prefix/foreign-repo,
+L-R04, parse-once. Full lib suite 2995/0/2; clippy `-D warnings` clean; fmt clean.
+
+Gate L boxes: 20/22 checked in `tasks.md`. Two honest remainders (NOT bodged): L-R05
+(offline ingestion proven + libgit2-only path is structural, but a runtime process-spawn
+SPY assertion is not built) and L-V02 (default path inert by construction — gate OFF — but a
+formal latency/memory BENCHMARK is not run; one env read per reload, Cursor LOW #8).
+
+Accepted LOW limitations (documented, not fixed): env read on default reload path (Cursor
+#8); idempotent re-publish bumps `registry_generation` per pass (no production consumer —
+tests only); ref-lane manifest omits metadata-only/catalog-only entries (G, no contract
+mandate); symlink blobs indexed as link-text and submodules skipped (minor filesystem-parity
+notes); `Repository::open` (not discover) means subdir-of-repo projects get no ref lanes.
+Still nothing pushed.
+
 ---
 
 ## Windows Headless Process Invariant (2026-07-16)
