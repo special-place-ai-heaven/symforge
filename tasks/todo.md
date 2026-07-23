@@ -1952,39 +1952,51 @@ Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `live_
   `-j1 --test-threads=1`); fmt clean; `cargo check --all-targets` passes; no new clippy warnings in
   the module.
 
-The ref-blob INGESTION path AND the per-source `LiveIndex` assembly are now complete and tested.
-Remaining Gate L work is the PUBLICATION-BUNDLE + multi-source QUERY wiring — the deep scope
-escalation into core surfaces. EXACT reconcile landmarks confirmed for the next session:
-`SharedIndexHandle` (`store.rs:1136`) is the per-`ProjectInstance` owner; it holds
-`published_source_set: ArcSwap<PublishedSourceSet>` (`store.rs:1138`) and `write_mutex: Mutex<()>`
-(`store.rs:1152`, the publication writer lock). `new_with_scout_plan_and_code_signals`
-(`store.rs:1200`) is the template that builds a full `PublishedGeneration`
-(live/manifest/health/outline/code_signals/bridge/authority) from a `LiveIndex` — model the
-ref-source bundle on it. `PublishedGeneration` fields (`store.rs:854`): `source`/`source_version`/
-`manifest` are `Option`; `bridge`/`authority`/`code_signals`/`health`/`outline`/`live` are required
-Arcs. Remaining items, in order:
+- Increment 5 — `SharedIndexHandle::build_ref_source_generation` + `publish_ref_source` /
+  `remove_ref_source` (`store.rs`) + `ingest_and_publish_local_ref` (`local_ref_scout`), L-G07,
+  commit `86d9813`. Wraps the ref-source `LiveIndex` in a full `PublishedGeneration` (GitRef
+  `SourceIdentity`, `SourceVersion working_tree=NotApplicable`, per-source manifest/bridge/authority
+  via the current-lane builders, Pending temporal) and reconciles it into the instance's
+  `PublishedSourceSet` under `write_mutex` (copy map, replace only the ref lane, bump
+  `registry_generation`, swap once). A P1 add/remove leaves the current lane's publication/content/
+  project generations untouched (L-R12/L-R13); the current lane can never be removed. Tests: reconcile
+  registry/lane-isolation + end-to-end scout→publish makes a queryable GitRef lane.
+- Increment 6 — `search_scoped` + `select_scoped_sources` (`knowledge_search.rs`), L-G06 (search),
+  commit `70f59e5`. `search_knowledge` composes `current`/`worktrees`/`local_refs`/`all` from ONE
+  captured `PublishedSourceSet`, reusing the frozen single-source formatter per selected lane
+  (current first for `all`; ranks ahead of a divergent ref but never hides it). `current` is
+  byte-identical to before; an empty P1 scope returns typed `no_sources_in_scope`, never a false
+  complete-absence. Search advertises all four scopes (`AdvertisedSearchKnowledgeSourceScope`);
+  review still advertises current-only. Also fixed a PRE-EXISTING (Gate-K) strict-client schema
+  break (`unit_byte_range` nullable union array → non-nullable `[u32;2]` via schemars).
 
-1. L-G01/L-G07: wrap the ref-source `LiveIndex` in a full `PublishedGeneration` (GitRef
-   `SourceIdentity`; `SourceVersion` branch/commit, `working_tree = NotApplicable`; per-source
-   manifest coverage/digest; outline/code_signals/bridge/authority built the same way as the current
-   lane). Add a reconcile method on `SharedIndexHandle`: lock `write_mutex`, load the current
-   `PublishedSourceSet`, copy its `sources` map, insert/replace ONLY the ref lane's bundle, bump
-   `registry_generation`, `published_source_set.store` once. A P1-only add/update/remove must leave
-   the current worktree's publication/content/project generations unchanged (L-R12/L-R13). Reuse
-   worktree `ProjectInstance` ownership for checked-out sources (L-R08/L-R11).
-3. L-G06: source filters/labels/per-source review envelopes; advertise `worktrees`/`local_refs`/`all`
-   scopes only after their focused tests pass (today `search_knowledge` advertises + implements only
-   `current`; the other scopes deserialize and return typed unsupported). Compose current/worktrees/
-   local_refs/all + two-project selectors + `projects=["*"]` deterministically from one captured
-   source set per selected `ProjectInstance` (L-R09), with typed empty/degraded lanes and no false
-   Complete ref scope (L-R07).
-4. VERIFY L-V01..L-V04 + update this ledger and `tasks.md` Gate-L boxes.
+Verification receipts (this session, all green): full serial lib suite 2967/0/2; module suite 14
+tests; `curate_knowledge` 9/9; `conformance` 20/20; `search_knowledge` 22/22; `surface_default` 5/5;
+`strict_client_schema_compat` 1/1; `watcher_integration` 10/10; `recovery` 4/4; `idempotency` 5/5;
+`init_integration` 27/27; `daemon_aliases` 2/2; `capability_status_integration` 8/8; `cargo fmt
+--check` clean; **`cargo clippy --all-targets --features server -- -D warnings` exit 0** (the 24
+pre-existing branch-wide clippy errors + 3 test-code lints are CLEARED, commit `dc0e0f2`).
 
-Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; they remain unchecked.
-Known debt unchanged: 24 pre-existing clippy errors branch-wide (Gate-M gate). Nothing pushed.
+Also fixed two PRE-EXISTING failures this session (both fail identically at `eaaf867`, before this
+session; the handover receipts never ran these suites): the strict-client schema union-array break
+(above), and `watcher_integration::test_watcher_ignores_non_source_files` — a stale test that assumed
+`.txt`/`.csv` are non-source; under the repository knowledge index they are first-class knowledge
+sources and are indexed, so the test now uses binary content (metadata-only). Commit `38c19b8`.
+
+STATUS: The ref ingestion + publication ENGINE (L-G02/03/04/05/07) and search-side query composition
+(L-G06 for `search_knowledge`) are DONE and tested. STILL OPEN before Gate L can close:
+1. review_knowledge multi-source parity (L-G06 "per-source review envelopes") — review still
+   current-only.
+2. Dedicated RED tests still missing: L-R01 (current outranks divergent ref, focused), L-R03 (ref
+   movement invalidates old mappings — `remove_ref_source` exists but no topology driver/test; it
+   carries `#[allow(dead_code)]` until wired), L-R06 (mixed-freshness all-source envelope), L-R08/
+   L-R11 (protected/identity-boundary focused).
+3. L-G01/L-G05 remainder: checked-out linked worktrees as separate `ProjectInstance`s (today only
+   local-ref P1 lanes on the owning instance are wired).
+4. VERIFY L-V01..L-V04, then check the genuinely-green Gate-L boxes in `tasks.md`.
 
 Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; the boxes there remain
-unchecked. Known debt unchanged: 24 pre-existing clippy errors branch-wide (Gate-M gate).
+unchecked. Nothing pushed.
 
 ---
 
