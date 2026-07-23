@@ -1942,26 +1942,36 @@ Landed so far (new module `src/live_index/local_ref_scout.rs`, wired into `live_
   `parsing::process_file_with_classification` (the one parser) → `IndexedFile`. No second parser or
   search index. Secret-positive/LFS/undecodable bytes are withheld as metadata-only (no card). This
   is the L-R10 parity mechanism: same bytes → same lifecycle/extraction/secret result because it is
-  literally the same functions. (A cross-path byte-for-byte parity assertion vs the filesystem lane
-  is deferred to the L-G05 wiring, where both lanes produce comparable published files.)
-- Module suite: 10 unit tests green (`cargo test --lib live_index::local_ref_scout::tests`,
-  `-j1 --test-threads=1`); fmt clean; no new clippy warnings in the module.
+  literally the same functions.
+- Increment 4 — `LiveIndex::from_source_files` (`store.rs`) + `build_ref_source_index`
+  (`local_ref_scout`), L-G05 foundation, commit `15b1569`. Assembles a queryable, ROOT-LESS
+  `LiveIndex` from the routed files (no filesystem walk / gitignore / coupling); reverse + path
+  indices rebuilt so it answers symbol/reference/text queries like a disk-loaded index. Catalog-only
+  and secret-withheld blobs contribute no file.
+- Module suite: 11 unit tests green (`cargo test --lib live_index::local_ref_scout::tests`,
+  `-j1 --test-threads=1`); fmt clean; `cargo check --all-targets` passes; no new clippy warnings in
+  the module.
 
-The ref-blob INGESTION path is now complete and tested end to end (scout → dedup → shared-adapter
-route). Remaining Gate L work is the PUBLICATION + multi-source QUERY wiring — the deep scope
-escalation into core surfaces. Landmarks confirmed for the next session: `AdmitParseResult`
-(`store.rs:3192`) is `HashMap<String, Arc<IndexedFile>>`; `fold_parse_results_for_scope`
-(`store.rs:3223`) folds parsed files with circuit-breaker + dispositions; `load_with_project_state`
-(`store.rs:3716`) assembles a `LiveIndex`; `PublishedGeneration` (`store.rs`, data-model.md:1227)
-needs live/manifest/health/outline/code_signals/bridge/authority; `PublishedSourceSet`
-(`store.rs:885`) is the `ArcSwap` boundary per `ProjectInstance`. Remaining items, in order:
+The ref-blob INGESTION path AND the per-source `LiveIndex` assembly are now complete and tested.
+Remaining Gate L work is the PUBLICATION-BUNDLE + multi-source QUERY wiring — the deep scope
+escalation into core surfaces. EXACT reconcile landmarks confirmed for the next session:
+`SharedIndexHandle` (`store.rs:1136`) is the per-`ProjectInstance` owner; it holds
+`published_source_set: ArcSwap<PublishedSourceSet>` (`store.rs:1138`) and `write_mutex: Mutex<()>`
+(`store.rs:1152`, the publication writer lock). `new_with_scout_plan_and_code_signals`
+(`store.rs:1200`) is the template that builds a full `PublishedGeneration`
+(live/manifest/health/outline/code_signals/bridge/authority) from a `LiveIndex` — model the
+ref-source bundle on it. `PublishedGeneration` fields (`store.rs:854`): `source`/`source_version`/
+`manifest` are `Option`; `bridge`/`authority`/`code_signals`/`health`/`outline`/`live` are required
+Arcs. Remaining items, in order:
 
-1. L-G01/L-G05/L-G07: populate the multi-source `PublishedSourceSet` (today only holds `current`).
-   Reconcile ref/worktree topology atomically under the per-`ProjectInstance` publication writer
-   lock; copy the source map under lock, replace only the affected lane's entry, swap once;
-   `registry_generation` bumps on membership/bundle change while a P1-only change leaves the current
-   worktree's publication/content/project generations unchanged (L-R12/L-R13). Reuse worktree
-   `ProjectInstance` ownership for checked-out sources (L-R08/L-R11).
+1. L-G01/L-G07: wrap the ref-source `LiveIndex` in a full `PublishedGeneration` (GitRef
+   `SourceIdentity`; `SourceVersion` branch/commit, `working_tree = NotApplicable`; per-source
+   manifest coverage/digest; outline/code_signals/bridge/authority built the same way as the current
+   lane). Add a reconcile method on `SharedIndexHandle`: lock `write_mutex`, load the current
+   `PublishedSourceSet`, copy its `sources` map, insert/replace ONLY the ref lane's bundle, bump
+   `registry_generation`, `published_source_set.store` once. A P1-only add/update/remove must leave
+   the current worktree's publication/content/project generations unchanged (L-R12/L-R13). Reuse
+   worktree `ProjectInstance` ownership for checked-out sources (L-R08/L-R11).
 3. L-G06: source filters/labels/per-source review envelopes; advertise `worktrees`/`local_refs`/`all`
    scopes only after their focused tests pass (today `search_knowledge` advertises + implements only
    `current`; the other scopes deserialize and return typed unsupported). Compose current/worktrees/
