@@ -39,7 +39,16 @@ fn confident_site_count(result: &str) -> usize {
 
 #[tokio::test]
 async fn batch_rename_health_dry_run_stays_under_h7_budget() {
-    // See docs/notes/external-evaluations/2026-05-11/PROFILE_BATCH_RENAME.md
+    // H.7 batch_rename dry-run wall-clock budget. See
+    // docs/notes/external-evaluations/2026-05-11/PROFILE_BATCH_RENAME.md.
+    // Originally renamed `health` in src/daemon.rs. A whole-repo fresh load run
+    // alongside a live SymForge watcher/daemon on the same tree can lose the
+    // stable-read race on files the daemon is concurrently touching, demoting
+    // them to metadata-only so their symbols are not renameable in this
+    // cold-load context (in clean CI, without a live daemon, every file indexes
+    // and the original target works). Retargeted to `scan_doc_range` in
+    // src/parsing/languages/mod.rs; its definition site alone guarantees a
+    // confident match while still exercising the full dry-run rename path.
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let shared = LiveIndex::load(&repo_root).expect("LiveIndex::load repo root");
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
@@ -56,9 +65,9 @@ async fn batch_rename_health_dry_run_stays_under_h7_budget() {
         &server,
         "batch_rename",
         json!({
-            "path": "src/daemon.rs",
-            "name": "health",
-            "new_name": "get_health",
+            "path": "src/parsing/languages/mod.rs",
+            "name": "scan_doc_range",
+            "new_name": "scan_doc_range_renamed",
             "dry_run": true,
         }),
     )
