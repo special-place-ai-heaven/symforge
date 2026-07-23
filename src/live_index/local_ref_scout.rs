@@ -908,4 +908,92 @@ mod tests {
             all.rendered
         );
     }
+
+    #[test]
+    fn all_scope_lists_current_lane_before_ref_lanes() {
+        // L-R01: current worktree outranks a divergent ref (ordered first).
+        use crate::protocol::knowledge_search::select_scoped_sources;
+        use crate::protocol::search_tools::KnowledgeSourceScope;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn a() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let ref_id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-order"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref");
+        let set = handle.published_source_set();
+
+        let all = select_scoped_sources(&set, KnowledgeSourceScope::All);
+        assert_eq!(all.len(), 2, "current + one ref lane");
+        assert_eq!(
+            all[1].source.as_ref().expect("ref lane source").source_id,
+            ref_id,
+            "the ref lane is ordered after the current lane"
+        );
+    }
+
+    #[test]
+    fn ref_movement_replaces_the_lane_and_bumps_registry() {
+        // L-R03: moving a ref updates its mapping deterministically without
+        // duplicating the lane, and every source-map change advances the registry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn a() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-move"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref");
+        let set1 = handle.published_source_set();
+        let tip1 = set1.sources[&id]
+            .source_version
+            .as_ref()
+            .expect("ref version")
+            .commit
+            .clone();
+        let registry1 = set1.registry_generation;
+
+        commit_files(root, &[("src/b.rs", b"pub fn b() {}\n")], "second");
+        let id2 = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-move"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("republish moved ref");
+        assert_eq!(id, id2, "the same ref keeps its source id");
+
+        let set2 = handle.published_source_set();
+        let tip2 = set2.sources[&id]
+            .source_version
+            .as_ref()
+            .expect("ref version")
+            .commit
+            .clone();
+        assert_ne!(tip1, tip2, "ref movement updated the recorded tip");
+        assert!(
+            set2.registry_generation > registry1,
+            "a source-map change advances registry_generation"
+        );
+        assert_eq!(
+            set2.sources.len(),
+            2,
+            "the moved ref replaced its lane rather than duplicating it"
+        );
+    }
 }
