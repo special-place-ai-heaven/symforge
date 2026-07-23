@@ -24,7 +24,9 @@ async fn symforge_retrieve_unknown_hash_errors() {
     let out = server
         .dispatch_tool_for_tests("symforge_retrieve", json!({ "hash": "deadbeefcafe" }))
         .await;
-    assert!(out.contains("unknown or expired hash"));
+    // A well-formed 12-hex hash that is not in the CCR store returns the
+    // graceful not-found handle message (not a crash or empty result).
+    assert!(out.contains("stale or expired handle"), "{out}");
 }
 
 #[tokio::test]

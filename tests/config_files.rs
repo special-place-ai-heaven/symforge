@@ -52,10 +52,10 @@ fn test_all_config_types_discovered_and_indexed() {
     write_file(dir.path(), "config.toml", "[package]\nname = \"test\"\n");
     write_file(dir.path(), "config.yaml", "name: test\n");
     write_file(dir.path(), "README.md", "# Title\nSome content.\n");
-    // Note: `.env` is a dotfile with no extension — discovery skips it because
-    // `from_extension` matches the extension "env", not the filename ".env".
-    // Use `app.env` (which has extension "env") to exercise the Env code path
-    // through the full LiveIndex pipeline.
+    // `app.env` matches the environment-credentials sensitive-path rule
+    // (any `*.env` file), so discovery demotes it to metadata-only for
+    // secret-safety and it is NOT symbol-indexed. The Env extractor code path
+    // is covered directly by `test_env_variables_extracted` via `process_file`.
     write_file(
         dir.path(),
         "app.env",
@@ -72,8 +72,8 @@ fn test_all_config_types_discovered_and_indexed() {
     );
     assert_eq!(
         index.file_count(),
-        5,
-        "should have all 5 config files indexed"
+        4,
+        "json/toml/yaml/md are indexed; app.env is sensitive-path demoted"
     );
 
     assert!(
@@ -93,8 +93,8 @@ fn test_all_config_types_discovered_and_indexed() {
         "README.md should be indexed"
     );
     assert!(
-        index.get_file("app.env").is_some(),
-        "app.env should be indexed"
+        index.get_file("app.env").is_none(),
+        "app.env is sensitive-path demoted (environment-credentials) and not indexed"
     );
 }
 
