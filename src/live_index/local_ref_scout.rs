@@ -8,9 +8,11 @@
 //! materialization. Identical bytes reachable at several paths share one object
 //! ID while each path re-derives its own classification/language (L-R02/L-R14).
 //! `materialize_ingest_blobs` reads each distinct ingest-decision object ID once
-//! and never touches catalog-only blobs (L-G03 raw-bytes layer); routing those
-//! bytes through the shared extraction/secret/bridge adapters is a later stage
-//! (L-G04).
+//! and never touches catalog-only blobs (L-G03 raw-bytes layer). `route_ref_blob`
+//! sends those bytes through the SHARED target-routing/secret/parser adapters —
+//! the same functions filesystem ingestion uses, no second parser or index
+//! (L-G04). Wiring the routed files into the multi-source published set and the
+//! query-composition surface is the remaining stage (L-G05/L-G06/L-G07).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,7 +20,11 @@ use std::sync::Arc;
 use git2::{ObjectType, Repository};
 
 use crate::discovery::DiscoveryLimits;
-use crate::domain::index::{FileClassification, LanguageId};
+use crate::domain::index::{FileClassification, IndexTargets, LanguageId, MetadataOnlyReason};
+use crate::knowledge::{StableContentAdmission, classify_stable_content};
+use crate::parsing::process_file_with_classification;
+
+use super::store::IndexedFile;
 
 /// Default per-blob materialization ceiling. A blob larger than this is
 /// catalogued by object ID and size only; its bytes are never read.
@@ -238,6 +244,48 @@ pub fn materialize_ingest_blobs(
         by_object_id.insert(entry.object_id.clone(), Arc::from(blob.content()));
     }
     Ok(RefBlobBytes { by_object_id })
+}
+
+/// Outcome of routing one ref blob's bytes through the shared adapters.
+#[derive(Debug)]
+pub enum RefBlobIngest {
+    /// Content policy withheld the bytes (secret/LFS/encoding). Metadata only:
+    /// no parsed file, no card, no search/bridge contribution.
+    Withheld(MetadataOnlyReason),
+    /// Parsed into an indexed file for the given ingest lanes.
+    Indexed {
+        targets: IndexTargets,
+        file: Box<IndexedFile>,
+    },
+}
+
+/// Route one ingest-decision ref blob through the SHARED target-routing,
+/// content-policy (secret/LFS/encoding), and parser adapters — the exact same
+/// functions the filesystem ingestion path uses (L-G04). It creates no second
+/// prose parser or search index: `IndexTargets::for_path`,
+/// `classify_stable_content`, and `process_file_with_classification` are the
+/// shared primitives, so identical bytes yield identical lifecycle/extraction/
+/// secret results regardless of whether they arrived from disk or a ref blob.
+pub fn route_ref_blob(entry: &RefBlobEntry, bytes: Vec<u8>) -> RefBlobIngest {
+    let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
+    match classify_stable_content(&entry.relative_path, targets, &bytes) {
+        StableContentAdmission::MetadataOnly(reason) => RefBlobIngest::Withheld(reason),
+        StableContentAdmission::Admitted => {
+            let classification =
+                FileClassification::for_indexed_path(&entry.relative_path, targets);
+            let language = entry.language.clone().unwrap_or(LanguageId::Text);
+            let result = process_file_with_classification(
+                &entry.relative_path,
+                &bytes,
+                language,
+                classification,
+            );
+            RefBlobIngest::Indexed {
+                targets,
+                file: Box::new(IndexedFile::from_parse_result(result, bytes)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,5 +565,62 @@ mod tests {
         );
         assert!(bytes.get(small_id).is_some(), "ingest blob is materialized");
         assert_eq!(bytes.distinct_len(), 1);
+    }
+
+    fn route_single(root: &Path, relative: &str, bytes: &[u8]) -> RefBlobIngest {
+        init_repo(root);
+        commit_files(root, &[(relative, bytes)], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let blobs = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == relative)
+            .expect("entry");
+        let bytes = blobs.get(&entry.object_id).expect("bytes").to_vec();
+        route_ref_blob(entry, bytes)
+    }
+
+    #[test]
+    fn routes_clean_code_blob_through_shared_parser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = route_single(dir.path(), "src/lib.rs", b"pub fn routed() -> u32 { 7 }\n");
+        match outcome {
+            RefBlobIngest::Indexed { targets, file } => {
+                assert_eq!(targets, IndexTargets::Code);
+                assert!(
+                    file.symbols.iter().any(|symbol| symbol.name == "routed"),
+                    "shared parser must extract the ref blob's symbol"
+                );
+                assert!(file.classification.is_code());
+            }
+            other => panic!("expected Indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routes_markdown_blob_to_knowledge_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = route_single(dir.path(), "docs/guide.md", b"# Guide\n\nBody text.\n");
+        match outcome {
+            RefBlobIngest::Indexed { targets, .. } => {
+                assert_eq!(targets, IndexTargets::Knowledge);
+            }
+            other => panic!("expected Indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withholds_secret_positive_blob_as_metadata_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret =
+            b"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n";
+        let outcome = route_single(dir.path(), "config/key.txt", secret);
+        assert!(
+            matches!(outcome, RefBlobIngest::Withheld(_)),
+            "secret-positive ref blob must be withheld, got {outcome:?}"
+        );
     }
 }
