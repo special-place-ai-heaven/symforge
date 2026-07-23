@@ -6990,6 +6990,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn l_r11_second_session_cannot_reach_protected_project_via_wildcard_or_ref_mapping() {
+        // L-R11 (tasks.md:667; source-binding-and-state.md:64-90 test 16;
+        // repository-mental-model.md test 9): a second session cannot address an
+        // explicit-protected project/worktree through a wildcard (`projects=["*"]`),
+        // a subset selector, or any ref/worktree source mapping. Every cross-project
+        // read resolves ONLY against the SESSION's own `project_indexes`, which
+        // `runtime_for_target` builds from `session.servers` (the session's own
+        // opened projects). The id/alias vector is proven by
+        // `protected_membership_is_per_session_and_requires_each_direct_override`;
+        // this closes the wildcard/subset/dispatcher vector and the direct-override
+        // grant. No addressing guard predicate exists or is needed: the session-
+        // scoped `project_indexes` capture IS the enforcement chokepoint.
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let home_a = project_dir("symforge-l-r11-session-a");
+        let home_b = project_dir("symforge-l-r11-session-b");
+        let state = DaemonState::new();
+        let session_a = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_a.path().display().to_string(),
+                client_name: "l-r11-a".to_string(),
+                pid: None,
+            })
+            .expect("open session A");
+        let session_b = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_b.path().display().to_string(),
+                client_name: "l-r11-b".to_string(),
+                pid: None,
+            })
+            .expect("open session B");
+
+        // A modeled protected root with a knowledge document, so the source mappings
+        // L-R11 guards against actually exist to be (un)addressable.
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let protected = fixture.path().join("System32");
+        std::fs::create_dir(&protected).expect("create modeled protected root");
+        std::fs::write(
+            protected.join("guide.md"),
+            "# Protected Guide\n\nThe orbital lattice resonates across the protected source.\n",
+        )
+        .expect("write protected knowledge doc");
+        let protected_id = project_key(&protected.canonicalize().unwrap());
+
+        // Session A directly opens the protected root; session B never does.
+        let opened_a = state
+            .index_folder_for_session(
+                &session_a.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session A direct protected open");
+        assert!(opened_a.contains("Indexed"), "{opened_a}");
+
+        let query = || SearchKnowledgeInput {
+            query: "orbital lattice".to_string(),
+            path_prefix: None,
+            source_scope: None,
+            authority_scope: None,
+            // The dispatcher switches on the `Targets` argument, not these fields.
+            project: None,
+            projects: None,
+            limit: None,
+            max_tokens: None,
+        };
+
+        // Session B's runtime is the ONLY source a cross-project read resolves
+        // against. The raw `projects=["*"]` param resolves to `Targets::All`, which
+        // the dispatcher expands from `project_indexes.keys()` — session B's own
+        // projects only.
+        let runtime_b = state
+            .runtime_for_target(&session_b.session_id, None)
+            .expect("session B home runtime");
+        assert!(
+            matches!(
+                resolve_targets(None, Some(&["*".to_string()]), &runtime_b.project_id),
+                Ok(Targets::All)
+            ),
+            "projects=[\"*\"] must resolve to Targets::All"
+        );
+        assert!(
+            !runtime_b.project_indexes.contains_key(&protected_id),
+            "projects=[\"*\"] (Targets::All = project_indexes.keys()) must NOT include \
+             another session's protected project"
+        );
+
+        // Wildcard: silently scoped to session B's own projects — never errors AND
+        // never covers the protected source.
+        let wildcard = execute_cross_project_knowledge(
+            query(),
+            Targets::All,
+            &runtime_b.project_indexes,
+            &runtime_b.server,
+        )
+        .expect("wildcard over session B's own projects succeeds");
+        assert!(
+            !wildcard.contains(protected_id.as_str()),
+            "the protected project must not appear in a second session's wildcard scope: {wildcard}"
+        );
+
+        // Explicit id and subset selectors naming the protected project are refused
+        // with "project not open": a project id / ref-worktree mapping cannot inherit
+        // another session's protected membership.
+        for targets in [
+            Targets::One(protected_id.clone()),
+            Targets::Subset(vec![protected_id.clone()]),
+        ] {
+            let refused = execute_cross_project_knowledge(
+                query(),
+                targets,
+                &runtime_b.project_indexes,
+                &runtime_b.server,
+            )
+            .expect_err("a protected project the session never opened is not addressable");
+            assert!(
+                refused.to_string().contains("project not open"),
+                "{refused}"
+            );
+        }
+
+        // The direct-override path is the ONLY way in: session B issues its OWN exact
+        // `index_folder(allow_protected_root=true)`.
+        let opened_b = state
+            .index_folder_for_session(
+                &session_b.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session B direct protected open");
+        assert!(opened_b.contains("Indexed"), "{opened_b}");
+
+        let runtime_b2 = state
+            .runtime_for_target(&session_b.session_id, None)
+            .expect("session B home runtime after its own override");
+        assert!(
+            runtime_b2.project_indexes.contains_key(&protected_id),
+            "session B gains wildcard-addressable membership only after its own direct override"
+        );
+        execute_cross_project_knowledge(
+            query(),
+            Targets::One(protected_id.clone()),
+            &runtime_b2.project_indexes,
+            &runtime_b2.server,
+        )
+        .expect("session B can address the protected project after its own direct override");
+    }
+
+    #[tokio::test]
     async fn protected_membership_is_not_inherited_by_reconnect_alias_or_restart() {
         let _guard = env_lock().await;
         let state_home = TempDir::new().expect("private user-local state base");
