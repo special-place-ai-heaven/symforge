@@ -59,6 +59,7 @@ pub(crate) struct KnowledgeCurationCoordinator {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum CurationWriteStage {
     AfterReservation,
     AfterPendingIntentSync,
@@ -421,11 +422,7 @@ impl KnowledgeCurationCoordinator {
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
             let mut record = if let Some(record) = read_replay_record(&record_path)? {
-                if let Err(error) =
-                    verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)
-                {
-                    return Err(error);
-                }
+                verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)?;
                 if record.request_hash != request_hash {
                     return Ok("Error: idempotency_conflict; the key is already bound to a different canonical request."
                         .to_string());
@@ -663,7 +660,7 @@ impl KnowledgeCurationCoordinator {
             #[cfg(not(test))]
             let result = durability_probe(&canonical)
                 .map_err(|_| CapabilityUnavailableReason::AtomicDurabilityUnavailable);
-            self.probe_cache.lock().insert(canonical, result.clone());
+            self.probe_cache.lock().insert(canonical, result);
             result?;
         }
         Ok(())
@@ -1006,7 +1003,7 @@ fn convert_entry(input: &KnowledgePolicyEntryInput) -> Result<KnowledgePolicyEnt
         .iter()
         .map(convert_evidence)
         .collect::<Result<Vec<_>, _>>()?;
-    evidence.sort_by(|left, right| evidence_sort_key(left).cmp(&evidence_sort_key(right)));
+    evidence.sort_by_key(evidence_sort_key);
     Ok(KnowledgePolicyEntry {
         entry_id: input.entry_id.clone(),
         target: convert_target(&input.target)?,
@@ -1348,7 +1345,7 @@ fn render_policy(policy: &KnowledgePolicy) -> Result<Vec<u8>, String> {
             render_target(&mut output, "entries.superseded_by", target);
         }
         let mut evidence = entry.evidence;
-        evidence.sort_by(|left, right| evidence_sort_key(left).cmp(&evidence_sort_key(right)));
+        evidence.sort_by_key(evidence_sort_key);
         for evidence in evidence {
             output.push_str("\n[[entries.evidence]]\n");
             output.push_str(&format!("rule_id = {}\n", toml_string(&evidence.rule_id)));
@@ -1783,6 +1780,7 @@ fn open_and_lock(path: &Path) -> io::Result<File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(path)?;
     file.lock()?;
     Ok(file)
@@ -2375,6 +2373,9 @@ mod tests {
         let mut root_permissions = fs::metadata(read_only.dir.path())
             .expect("root metadata")
             .permissions();
+        // Windows fixture teardown: clear the read-only attribute so TempDir
+        // can remove the tree. clippy's cross-platform caveat does not apply.
+        #[allow(clippy::permissions_set_readonly_false)]
         root_permissions.set_readonly(false);
         fs::set_permissions(read_only.dir.path(), root_permissions)
             .expect("restore source root permissions");

@@ -396,6 +396,10 @@ async fn unavailable_sources_are_rejected_before_durability_probe_state() {
     let mut permissions = fs::metadata(&policy_path)
         .expect("policy metadata")
         .permissions();
+    // Test cleanup on Windows: clear the read-only attribute so TempDir can
+    // remove the file. The cross-platform caveat clippy warns about does not
+    // apply to this single-attribute Windows fixture teardown.
+    #[allow(clippy::permissions_set_readonly_false)]
     permissions.set_readonly(false);
     fs::set_permissions(&policy_path, permissions).expect("clear policy read-only");
 }
@@ -434,6 +438,11 @@ async fn successful_apply_publishes_policy_and_voice_through_the_ordinary_watche
         Arc::clone(&fixture.watcher_info),
         Arc::clone(&stop_token),
     ));
+    // The guard is intentionally held across the await: it throttles the
+    // background watcher during registration so it does not republish (and
+    // stale the captured review hash) before the apply below. This is a bounded
+    // test wait loop, not production async, so await-holding-lock is benign.
+    #[allow(clippy::await_holding_lock)]
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let watcher = fixture.watcher_info.lock();

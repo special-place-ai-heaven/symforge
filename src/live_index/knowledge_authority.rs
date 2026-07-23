@@ -791,6 +791,7 @@ struct PolicyEvaluation {
     global_finding_rule: Option<&'static str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_knowledge_authority(
     live: &LiveIndex,
     source: &SourceIdentity,
@@ -1447,17 +1448,17 @@ fn derive_proposal(
     code_evidence: &CodeEvidenceSummary,
 ) -> RemediationProposal {
     let evidence_ids = summary_finding_ids(code_evidence);
-    if lifecycle == KnowledgeLifecycle::Superseded {
-        if let Some(successor) = successor {
-            return RemediationProposal {
-                action: RemediationAction::MarkSuperseded {
-                    successor: successor.clone(),
-                },
-                confidence: EvidenceConfidence::Deterministic,
-                evidence_ids,
-                unmet_preconditions: Vec::new(),
-            };
-        }
+    if lifecycle == KnowledgeLifecycle::Superseded
+        && let Some(successor) = successor
+    {
+        return RemediationProposal {
+            action: RemediationAction::MarkSuperseded {
+                successor: successor.clone(),
+            },
+            confidence: EvidenceConfidence::Deterministic,
+            evidence_ids,
+            unmet_preconditions: Vec::new(),
+        };
     }
     match voice {
         KnowledgeVoice::Current => RemediationProposal {
@@ -1564,7 +1565,7 @@ fn note_breach(breaches: &mut Vec<LimitBreach>, kind: DerivedLimitKind, omitted:
 }
 
 fn normalize_breaches(breaches: &mut Vec<LimitBreach>) {
-    breaches.sort_by(|left, right| left.kind.cmp(&right.kind));
+    breaches.sort_by_key(|breach| breach.kind);
     let mut normalized: Vec<LimitBreach> = Vec::new();
     for breach in breaches.drain(..) {
         if let Some(last) = normalized

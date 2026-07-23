@@ -794,7 +794,7 @@ where
                 let issue = ScoutIssue {
                     path_id: Some(public_id),
                     safe_path: catalog_path.normalized_utf8.clone(),
-                    kind: ScoutIssueKind::DirectoryEntryUnreadable { kind: kind.clone() },
+                    kind: ScoutIssueKind::DirectoryEntryUnreadable { kind },
                     safe_message: "metadata unavailable".to_string(),
                 };
                 catalog_metadata_bytes = account_catalog_metadata_record(
@@ -1787,10 +1787,10 @@ pub fn resolve_workspace_root(
     cwd_root: Option<PathBuf>,
 ) -> Option<PathBuf> {
     // 1. Explicit env override wins when it passes the shared binding guard.
-    if let Some(candidate) = env_root {
-        if let Some(root) = validate_workspace_candidate(&candidate, "workspace environment root") {
-            return Some(root);
-        }
+    if let Some(candidate) = env_root
+        && let Some(root) = validate_workspace_candidate(&candidate, "workspace environment root")
+    {
+        return Some(root);
     }
 
     // 2. MCP client roots, in order; first valid directory wins.

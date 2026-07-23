@@ -655,6 +655,7 @@ fn bridge_previews(
     (previews, omitted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_response(
     generation: &PublishedGeneration,
     envelope: &crate::domain::SourceResponseEnvelope,

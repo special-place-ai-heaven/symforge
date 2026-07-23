@@ -244,9 +244,7 @@ fn project_root_from_paths(abs_path: &Path, relative_path: &str) -> Option<PathB
 
 fn catalog_terminal_disposition(decision: &ScoutDecision) -> Option<FileDisposition> {
     match decision {
-        ScoutDecision::HardSkip { reason } => Some(FileDisposition::HardSkip {
-            reason: reason.clone(),
-        }),
+        ScoutDecision::HardSkip { reason } => Some(FileDisposition::HardSkip { reason: *reason }),
         ScoutDecision::MetadataOnly { reason } => Some(FileDisposition::MetadataOnly {
             reason: reason.clone(),
         }),
@@ -367,8 +365,8 @@ where
                 return ReindexResult::NotFound;
             }
             let disposition = FileDisposition::Unreadable {
-                stage: stage.clone(),
-                kind: kind.clone(),
+                stage: *stage,
+                kind: *kind,
             };
             if shared.publish_terminal_disposition_at_generation(
                 relative_path,
@@ -430,9 +428,7 @@ where
         let bytes = match stable_read(abs_path, &scouted.stamp) {
             crate::live_index::store::StableReadOutcome::Accepted { bytes, .. } => bytes,
             crate::live_index::store::StableReadOutcome::HardSkip { reason } => {
-                let decision = ScoutDecision::HardSkip {
-                    reason: reason.clone(),
-                };
+                let decision = ScoutDecision::HardSkip { reason };
                 let disposition = catalog_terminal_disposition(&decision)
                     .expect("hard-skip decision must project to a terminal disposition");
                 scouted.decision = decision;
@@ -754,15 +750,15 @@ where
     let transient_paths: HashSet<String> = shared
         .terminal_dispositions()
         .iter()
-        .filter_map(|(path, disposition)| {
+        .filter(|(_, disposition)| {
             matches!(
                 disposition,
                 FileDisposition::Unreadable { .. }
                     | FileDisposition::UnstableDuringRead
                     | FileDisposition::AbortedCircuitBreaker
             )
-            .then(|| path.clone())
         })
+        .map(|(path, _)| path.clone())
         .collect();
     let fresh_plan = match scout() {
         Ok(plan) => Some(plan),
@@ -964,6 +960,7 @@ fn reconcile_for_cause(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_for_cause_with<R, S, T>(
     repo_root: &Path,
     shared: &SharedIndex,

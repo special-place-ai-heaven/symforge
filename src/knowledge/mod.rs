@@ -63,6 +63,7 @@ static SECRET_RULES: std::sync::OnceLock<Result<Vec<SecretRule>, DetectorFailure
     std::sync::OnceLock::new();
 
 fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
+    #[allow(clippy::type_complexity)]
     let definitions: &[(&str, &[&[u8]], &str, usize, bool)] = &[
         (
             "secret.private-key-envelope",

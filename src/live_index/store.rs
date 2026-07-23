@@ -3149,6 +3149,7 @@ pub(crate) fn build_path_indices_from_files(
 }
 
 /// Outcome of running admission and parsing for one discovered file.
+#[allow(clippy::large_enum_variant)]
 enum AdmissionOutcome {
     Parsed(String, IndexedFile, crate::domain::IndexTargets),
     Terminal {
@@ -4351,7 +4352,7 @@ impl LiveIndex {
             path: catalog_path,
             size: file.byte_len,
             language: Some(file.language.clone()),
-            classification: file.classification.clone(),
+            classification: file.classification,
             disposition: FileDisposition::Indexed {
                 targets,
                 parse_status,

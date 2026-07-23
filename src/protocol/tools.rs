@@ -4520,7 +4520,7 @@ impl SymForgeServer {
         let state = sidecar_state_for_server(self);
         let include_tests = include_tests_from_sections(params.0.sections.as_ref());
         let requested_sections = visible_sections(&params.0.sections);
-        let knowledge_requested = requested_sections.as_ref().map_or(true, |sections| {
+        let knowledge_requested = requested_sections.as_ref().is_none_or(|sections| {
             sections.is_empty() || sections.iter().any(|section| section == "knowledge")
         });
         let knowledge_only = requested_sections
@@ -4894,11 +4894,9 @@ impl SymForgeServer {
                 trace_verbosity,
                 trace_input.max_tokens,
             );
-            if knowledge_requested {
-                if let Some(knowledge) = &knowledge {
-                    trace_result.push_str("\n\n");
-                    trace_result.push_str(knowledge);
-                }
+            if knowledge_requested && let Some(knowledge) = &knowledge {
+                trace_result.push_str("\n\n");
+                trace_result.push_str(knowledge);
             }
             let (trace_result, _) =
                 crate::protocol::knowledge_model::enforce_budgeted_code_context_with_knowledge(

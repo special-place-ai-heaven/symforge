@@ -180,16 +180,13 @@ pub struct LimitBreach {
     pub omitted: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum DerivedCoverage {
+    #[default]
     Complete,
-    Truncated { breaches: Vec<LimitBreach> },
-}
-
-impl Default for DerivedCoverage {
-    fn default() -> Self {
-        Self::Complete
-    }
+    Truncated {
+        breaches: Vec<LimitBreach>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
