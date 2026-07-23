@@ -4767,24 +4767,29 @@ fn execute_cross_project_knowledge(
     input.projects = None;
     let max_tokens = input.max_tokens;
 
-    // Capture every source root first. No watcher publication after this point
-    // can split the response between generations.
+    // Capture every source root first. Pinning the WHOLE source-set Arc per
+    // project (not just its current lane) keeps the response immutable — no
+    // watcher publication after this point can split it between generations —
+    // and lets `search_scoped` compose the P1 ref/worktree lanes when
+    // `source_scope` is `local_refs`/`worktrees`/`all` (L-R09/L-G06). With
+    // `source_scope` `None`/`current`, `search_scoped` delegates to
+    // `search_current` on the captured current lane, so the default path stays
+    // byte-identical.
     let captured: Vec<_> = selected_ids
         .iter()
         .map(|id| {
-            let generation = project_indexes
+            let source_set = project_indexes
                 .get(id)
                 .expect("selected projects were validated")
-                .published_source_set()
-                .current_generation();
-            (id.clone(), generation)
+                .published_source_set();
+            (id.clone(), source_set)
         })
         .collect();
 
     let multi = captured.len() > 1;
     let mut sections = Vec::with_capacity(captured.len());
-    for (project_id, generation) in captured {
-        let result = crate::protocol::knowledge_search::search_current(&generation, &input);
+    for (project_id, source_set) in captured {
+        let result = crate::protocol::knowledge_search::search_scoped(&source_set, &input);
         if multi {
             sections.push(format!("── project: {project_id} ──\n{result}"));
         } else {
@@ -4832,21 +4837,29 @@ fn execute_cross_project_review(
     input.project = None;
     input.projects = None;
     let max_tokens = input.max_tokens;
+    // Pin the WHOLE source-set Arc per project so `review_scoped` can compose
+    // the P1 ref/worktree lanes under `source_scope`
+    // `local_refs`/`worktrees`/`all` (L-R09/L-G06). A per-source
+    // unavailable/empty lane is a typed section INSIDE `review_scoped`, not a
+    // whole-scope failure; the outer `?` only surfaces a genuine whole-scope
+    // error (e.g. `no_sources_in_scope`). With `source_scope` `None`/`current`,
+    // `review_scoped` delegates to `review_current` on the captured current
+    // lane, so the default multi-project top-level hash and per-project sections
+    // stay byte-identical.
     let captured: Vec<_> = selected_ids
         .iter()
         .map(|id| {
-            let generation = project_indexes
+            let source_set = project_indexes
                 .get(id)
                 .expect("selected projects were validated")
-                .published_source_set()
-                .current_generation();
-            (id.clone(), generation)
+                .published_source_set();
+            (id.clone(), source_set)
         })
         .collect();
 
     let mut plans = Vec::with_capacity(captured.len());
-    for (project_id, generation) in captured {
-        let output = crate::protocol::knowledge_review::review_current(&generation, &input)
+    for (project_id, source_set) in captured {
+        let output = crate::protocol::knowledge_review::review_scoped(&source_set, &input)
             .map_err(anyhow::Error::msg)?;
         plans.push((project_id, output));
     }
@@ -7381,6 +7394,378 @@ mod tests {
             &runtime_b2.server,
         )
         .expect("session B can address the protected project after its own direct override");
+    }
+
+    /// Build one `PublishedSourceSet` carrying a healthy current worktree lane AND
+    /// a P1 `symforge:git-ref:` lane whose knowledge document exists ONLY on the ref
+    /// lane. Shapes the fixture the two `search_scoped`/`review_scoped` unit tests
+    /// already prove, but wired for the daemon cross-project entry points. The temp
+    /// roots are returned so the caller keeps them alive.
+    fn cross_project_current_and_ref_lanes() -> (TempDir, TempDir, SharedIndex) {
+        // Current worktree lane: "quantum meridian" only.
+        let current_dir = tempfile::tempdir().expect("current tempdir");
+        let current_repo = git2::Repository::init(current_dir.path()).expect("init current repo");
+        ref_lane_commit(
+            &current_repo,
+            current_dir.path(),
+            "docs/current.md",
+            b"# Current\n\nThe quantum meridian anchors only the current worktree.\n",
+            "current worktree doc",
+        );
+        let index = LiveIndex::load(current_dir.path()).expect("load current worktree lane");
+
+        // P1 git-ref lane: "orbital lattice" only, built from a separate repo's HEAD
+        // tree and published onto the SAME handle (current lane left untouched).
+        let ref_dir = tempfile::tempdir().expect("ref tempdir");
+        let ref_repo = git2::Repository::init(ref_dir.path()).expect("init ref repo");
+        ref_lane_commit(
+            &ref_repo,
+            ref_dir.path(),
+            "docs/reflane.md",
+            b"# Ref Lane\n\nThe orbital lattice resonates only on the ref lane.\n",
+            "ref lane doc",
+        );
+        live_index::local_ref_scout::ingest_and_publish_local_ref(
+            &index,
+            &ref_repo,
+            "HEAD",
+            crate::domain::index::RepositoryId::new("repo-cross-scope"),
+            &live_index::local_ref_scout::LocalRefScoutBudget::default(),
+        )
+        .expect("publish P1 ref lane");
+
+        assert!(
+            index
+                .published_source_set()
+                .sources
+                .keys()
+                .any(|id| id.as_str().starts_with("symforge:git-ref:")),
+            "a P1 git-ref lane must exist for the scope-composition test to be meaningful"
+        );
+
+        (current_dir, ref_dir, index)
+    }
+
+    /// [L-R09/L-G06] A multi-project `search_knowledge` with
+    /// `source_scope=local_refs`/`all` composes each selected project's P1 git-ref
+    /// lanes. Before the fix the cross-project path captured only the current lane
+    /// (`search_current`) and silently dropped every ref lane; now it captures the
+    /// whole source-set Arc and calls `search_scoped`. The default (`None`) scope
+    /// stays current-lane only, byte-identical to before.
+    #[tokio::test]
+    async fn cross_project_search_source_scope_composes_local_ref_lane() {
+        use crate::protocol::search_tools::KnowledgeSourceScope;
+
+        let _guard = env_lock().await;
+        let _gate = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, "1");
+
+        let (current_dir, _ref_dir, index) = cross_project_current_and_ref_lanes();
+        let project_indexes: HashMap<String, SharedIndex> =
+            HashMap::from([("proj-cross-scope".to_string(), Arc::clone(&index))]);
+        let server = SymForgeServer::new(
+            Arc::clone(&index),
+            "proj-cross-scope".to_string(),
+            Arc::new(parking_lot::Mutex::new(WatcherInfo::default())),
+            Some(current_dir.path().to_path_buf()),
+            None,
+        );
+
+        let query = |term: &str, scope: Option<KnowledgeSourceScope>| SearchKnowledgeInput {
+            query: term.to_string(),
+            path_prefix: None,
+            source_scope: scope,
+            authority_scope: None,
+            project: None,
+            projects: None,
+            limit: None,
+            max_tokens: None,
+        };
+
+        // local_refs composes the P1 ref lane: the ref-only document is now visible.
+        let refs = execute_cross_project_knowledge(
+            query("orbital lattice", Some(KnowledgeSourceScope::LocalRefs)),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("local_refs cross-project search");
+        assert!(
+            refs.contains("docs/reflane.md"),
+            "local_refs must compose the P1 ref lane: {refs}"
+        );
+
+        // `all` composes the ref lane too.
+        let all = execute_cross_project_knowledge(
+            query("orbital lattice", Some(KnowledgeSourceScope::All)),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("all cross-project search");
+        assert!(
+            all.contains("docs/reflane.md"),
+            "all must compose the P1 ref lane: {all}"
+        );
+
+        // A Subset selector composes the ref lane exactly like All.
+        let subset = execute_cross_project_knowledge(
+            query("orbital lattice", Some(KnowledgeSourceScope::LocalRefs)),
+            Targets::Subset(vec!["proj-cross-scope".to_string()]),
+            &project_indexes,
+            &server,
+        )
+        .expect("subset local_refs cross-project search");
+        assert!(
+            subset.contains("docs/reflane.md"),
+            "subset local_refs must compose the P1 ref lane: {subset}"
+        );
+
+        // Default (source_scope=None) stays current-lane only: the ref-only document
+        // is invisible (the pre-fix behavior, now the ONLY difference from scoped).
+        let default_ref_term = execute_cross_project_knowledge(
+            query("orbital lattice", None),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("default cross-project search");
+        assert!(
+            !default_ref_term.contains("docs/reflane.md"),
+            "default scope must not compose the ref lane: {default_ref_term}"
+        );
+
+        // ...and the default scope still performs a genuine current-lane search.
+        let default_current_term = execute_cross_project_knowledge(
+            query("quantum meridian", None),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("default current-lane search");
+        assert!(
+            default_current_term.contains("docs/current.md"),
+            "default scope must search the current lane: {default_current_term}"
+        );
+    }
+
+    /// [L-R09/L-G06] The same fix for `review_knowledge`: cross-project review now
+    /// captures the whole source-set Arc and calls `review_scoped`, so
+    /// `source_scope=local_refs`/`all` compose the P1 ref lanes. A per-source
+    /// missing-document readiness is a typed section inside `review_scoped`, not a
+    /// whole-scope failure; the default (`None`) scope stays current-lane only.
+    #[tokio::test]
+    async fn cross_project_review_source_scope_composes_local_ref_lane() {
+        use crate::protocol::search_tools::{KnowledgeSourceScope, ReviewKnowledgeMode};
+
+        let _guard = env_lock().await;
+        let _gate = EnvVarGuard::set_str(LOCAL_REF_LANES_ENV, "1");
+
+        let (current_dir, _ref_dir, index) = cross_project_current_and_ref_lanes();
+        let project_indexes: HashMap<String, SharedIndex> =
+            HashMap::from([("proj-cross-scope".to_string(), Arc::clone(&index))]);
+        let server = SymForgeServer::new(
+            Arc::clone(&index),
+            "proj-cross-scope".to_string(),
+            Arc::new(parking_lot::Mutex::new(WatcherInfo::default())),
+            Some(current_dir.path().to_path_buf()),
+            None,
+        );
+
+        let review = |path: &str, scope: Option<KnowledgeSourceScope>| ReviewKnowledgeInput {
+            mode: ReviewKnowledgeMode::Document,
+            path: Some(path.to_string()),
+            path_prefix: None,
+            source_scope: scope,
+            project: None,
+            projects: None,
+            limit: None,
+            max_tokens: None,
+        };
+
+        // local_refs composes the ref lane: the ref-only document is reviewable and
+        // the composed response keeps the top-level hash envelope.
+        let refs = execute_cross_project_review(
+            review("docs/reflane.md", Some(KnowledgeSourceScope::LocalRefs)),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("local_refs cross-project review");
+        assert!(
+            refs.contains("docs/reflane.md"),
+            "local_refs review must compose the P1 ref lane: {refs}"
+        );
+        assert!(
+            refs.contains("top_result_hash="),
+            "composed review preserves the top-level hash envelope: {refs}"
+        );
+
+        // `all` composes the ref lane too; the current lane's missing-document
+        // readiness folds into a typed per-source section, NOT a whole-scope failure.
+        let all = execute_cross_project_review(
+            review("docs/reflane.md", Some(KnowledgeSourceScope::All)),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("all cross-project review (per-source readiness is not a scope failure)");
+        assert!(
+            all.contains("docs/reflane.md"),
+            "all review must compose the P1 ref lane: {all}"
+        );
+
+        // Default (source_scope=None) is current-lane only: a ref-only document is
+        // invisible, so document-mode review over the current lane finds nothing.
+        let default_ref_doc = execute_cross_project_review(
+            review("docs/reflane.md", None),
+            Targets::All,
+            &project_indexes,
+            &server,
+        );
+        assert!(
+            default_ref_doc.is_err(),
+            "default scope must not reach the ref-only document: {default_ref_doc:?}"
+        );
+
+        // ...and default review still serves the current lane's own document.
+        let default_current_doc = execute_cross_project_review(
+            review("docs/current.md", None),
+            Targets::All,
+            &project_indexes,
+            &server,
+        )
+        .expect("default current-lane review");
+        assert!(
+            default_current_doc.contains("docs/current.md"),
+            "default review must serve the current lane: {default_current_doc}"
+        );
+    }
+
+    /// [L-R11] The wildcard/ref-mapping protection holds through the REAL
+    /// tool-dispatch entry point (`execute_tool_call`), not only the
+    /// `execute_cross_project_knowledge` helper the sibling test drives. A
+    /// `search_knowledge` call for session B peeks `project`/`projects`, resolves a
+    /// `Targets` via `resolve_targets`, and dispatches into
+    /// `execute_cross_project_knowledge` against SESSION B's own `project_indexes`.
+    /// So `projects=["*"]` silently scopes to session B's projects and
+    /// `project=<protected_id>` is refused — session B reaches session A's
+    /// ExplicitProtected project ONLY after its own direct
+    /// `index_folder(allow_protected_root=true)`. This is the dispatch chain
+    /// `execute_tool_call` → `resolve_targets` → `execute_cross_project_knowledge`;
+    /// the freshness gate (`call_tool_handler`) merely resolves the same session-
+    /// scoped runtime beforehand and cannot widen it.
+    #[tokio::test]
+    async fn l_r11_tool_dispatch_blocks_wildcard_and_ref_mapping_for_second_session() {
+        let _guard = env_lock().await;
+        let state_home = TempDir::new().expect("private user-local state base");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", state_home.path());
+        let home_a = project_dir("symforge-l-r11-dispatch-a");
+        let home_b = project_dir("symforge-l-r11-dispatch-b");
+        let state = DaemonState::new();
+        let session_a = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_a.path().display().to_string(),
+                client_name: "l-r11-dispatch-a".to_string(),
+                pid: None,
+            })
+            .expect("open session A");
+        let session_b = state
+            .open_project_session(OpenProjectRequest {
+                project_root: home_b.path().display().to_string(),
+                client_name: "l-r11-dispatch-b".to_string(),
+                pid: None,
+            })
+            .expect("open session B");
+
+        // A modeled protected root with a distinctive knowledge document.
+        let fixture = TempDir::new().expect("protected-root fixture parent");
+        let protected = fixture.path().join("System32");
+        std::fs::create_dir(&protected).expect("create modeled protected root");
+        std::fs::write(
+            protected.join("guide.md"),
+            "# Protected Guide\n\nThe orbital lattice resonates across the protected source.\n",
+        )
+        .expect("write protected knowledge doc");
+        let protected_id = project_key(&protected.canonicalize().unwrap());
+
+        // Session A directly opens the protected root; session B never does.
+        state
+            .index_folder_for_session(
+                &session_a.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session A direct protected open");
+
+        // Wildcard via the REAL dispatch: silently scoped to session B's own
+        // projects — never errors AND never reaches the protected source.
+        let runtime_b = state
+            .runtime_for_target(&session_b.session_id, None)
+            .expect("session B runtime");
+        let wildcard = execute_tool_call(
+            runtime_b,
+            "search_knowledge",
+            serde_json::json!({ "query": "orbital lattice", "projects": ["*"] }),
+        )
+        .await
+        .expect("wildcard over session B's own projects succeeds");
+        assert!(
+            !wildcard.contains(protected_id.as_str()),
+            "projects=[\"*\"] must not reach another session's protected project: {wildcard}"
+        );
+        assert!(
+            !wildcard.contains("guide.md"),
+            "the protected document must not leak into session B's wildcard scope: {wildcard}"
+        );
+
+        // Explicit `project=<protected_id>` through the dispatch: refused with
+        // "project not open" — an id/ref mapping cannot inherit A's membership.
+        let runtime_b = state
+            .runtime_for_target(&session_b.session_id, None)
+            .expect("session B runtime");
+        let refused = execute_tool_call(
+            runtime_b,
+            "search_knowledge",
+            serde_json::json!({ "query": "orbital lattice", "project": protected_id.clone() }),
+        )
+        .await
+        .expect_err("a protected project session B never opened is not addressable");
+        assert!(
+            refused.to_string().contains("project not open"),
+            "{refused}"
+        );
+
+        // The direct-override path is the ONLY way in: session B issues its OWN
+        // index_folder(allow_protected_root=true), then the dispatch resolves it.
+        state
+            .index_folder_for_session(
+                &session_b.session_id,
+                IndexFolderInput {
+                    path: protected.display().to_string(),
+                    idempotency_key: None,
+                    add: Some(true),
+                    allow_protected_root: Some(true),
+                },
+            )
+            .expect("session B direct protected open");
+        let runtime_b = state
+            .runtime_for_target(&session_b.session_id, None)
+            .expect("session B runtime after its own override");
+        let after = execute_tool_call(
+            runtime_b,
+            "search_knowledge",
+            serde_json::json!({ "query": "orbital lattice", "project": protected_id.clone() }),
+        )
+        .await
+        .expect("session B can address the protected project after its own direct override");
+        assert!(
+            after.contains("guide.md"),
+            "session B now sees the protected document it opened directly: {after}"
+        );
     }
 
     #[tokio::test]
