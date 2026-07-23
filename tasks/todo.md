@@ -1998,6 +1998,42 @@ STATUS: The ref ingestion + publication ENGINE (L-G02/03/04/05/07) and search-si
 Do NOT check any Gate-L box in `tasks.md` until its item is genuinely green; the boxes there remain
 unchecked. Nothing pushed.
 
+### Gate L adversarial review — rounds 1 & 2 (Cursor, 2026-07-23)
+
+Two independent adversarial passes (Cursor, briefs `CURSOR-REVIEW-PROMPT.md` /
+`CURSOR-REVIEW-PROMPT-2.md`). Round 1: 1 BLOCKER + 3 HIGH + 1 LOW. All fixed and
+re-reviewed (round 2) except one residual HIGH that round 2 itself surfaced in the
+first fix; that too is now fixed. Evidence:
+
+- **BLOCKER (L-R13/L-G07)** — the three P0 publish paths
+  (`swap_and_publish_with_content_change_and_hook`, `publish_prepared_bridge`,
+  `publish_prepared_authority`) rebuilt `PublishedSourceSet.sources` as a fresh
+  single-entry map, wiping every published P1 ref lane on any P0 commit. Fixed with
+  `PublishedSourceSet::next_after_current_publish` (clone map, replace only the
+  current lane, drop a stale prior-current lane on identity change, bump
+  `registry_generation`). Test `p0_publishes_preserve_published_ref_lanes`.
+- **HIGH (L-R07)** — degraded ref scout published `CoverageStatus::Complete`.
+  `build_ref_source_generation` now takes `scout_coverage`; `ingest_and_publish_local_ref`
+  maps `RefScoutCoverage`. Test `degraded_scout_publishes_degraded_ref_manifest_coverage`.
+- **HIGH (L-R06)** — multi-source `search_scoped`/`review_scoped` lacked the top-level
+  envelope. Added per-source working-tree/freshness/coverage/digest + `worst_source_coverage`
+  (worst included source) + secret-policy version. Covered by the composition tests.
+- **HIGH (L-R02/L-R10/L-R14/L-G03)** — identical blob re-parsed per path. `route_catalog_files`
+  memoizes the parse; round 2 caught that the key must also carry the path-selected
+  grammar flavor (`.ts`/`.tsx`, `.c`/`.h`), so the key is
+  `(object_id, classification, language, is_tsx, is_c_header)`. Tests
+  `identical_blob_is_parsed_once_across_same_classification_paths` +
+  `identical_blob_reparsed_per_path_selected_grammar_flavor`.
+- **LOW** — stale `review_knowledge` scope comment in `search_tools.rs`. Fixed.
+
+Gate: `fmt --check` OK, `clippy --all-targets --features server -D warnings` clean, full
+lib suite **2975/0/2** (2026-07-23). ACCEPTED LIMITATION (round-2 MEDIUM, deferred): the
+composed top-level response carries L-R06's named fields but not cross-source SUM
+aggregates (overflow/withheld/authority-filtered totals, a single scope-level no-match
+class) — those are present per-source inside each `search_current` section; aggregating
+them needs `search_current` to return structured counts rather than a formatted string
+(a larger refactor), so it is logged here rather than bodged. Still nothing pushed.
+
 ---
 
 ## Windows Headless Process Invariant (2026-07-16)

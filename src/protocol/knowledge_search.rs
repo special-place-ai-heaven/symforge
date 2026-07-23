@@ -192,7 +192,9 @@ pub(crate) fn select_scoped_sources(
     }
 }
 
-/// Compact per-source identity header for a composed multi-source response.
+/// Per-source identity header for a composed multi-source response (L-R06):
+/// identity, captured working-tree state, publication/content generations,
+/// freshness, manifest coverage, and manifest digest.
 fn render_source_scope_identity(generation: &PublishedGeneration) -> String {
     let location = match generation.source.as_deref().map(|source| &source.location) {
         Some(SourceLocation::WorkingTree { worktree_id }) => format!("worktree:{worktree_id}"),
@@ -204,10 +206,46 @@ fn render_source_scope_identity(generation: &PublishedGeneration) -> String {
         .as_deref()
         .map(|source| source.source_id.as_str().to_string())
         .unwrap_or_else(|| "unbound".to_string());
+    let working_tree = generation
+        .source_version
+        .as_deref()
+        .map(|version| format!("{:?}", version.working_tree))
+        .unwrap_or_else(|| "Unknown".to_string());
+    let digest = generation
+        .manifest
+        .as_deref()
+        .map(|manifest| manifest.digest.as_str())
+        .unwrap_or("none");
     format!(
-        "{location} source_id={source_id} publication_generation={} content_generation={}",
-        generation.publication_generation, generation.content_generation
+        "{location} source_id={source_id} publication_generation={} content_generation={} working_tree={working_tree} freshness={:?} coverage={:?} manifest_digest={digest}",
+        generation.publication_generation,
+        generation.content_generation,
+        generation.freshness,
+        source_coverage(generation),
     )
+}
+
+/// Manifest-declared coverage for one source, defaulting to `Degraded` when no
+/// manifest is published so a composed response never claims a false Complete.
+pub(crate) fn source_coverage(generation: &PublishedGeneration) -> CoverageStatus {
+    generation
+        .manifest
+        .as_deref()
+        .map(|manifest| manifest.coverage)
+        .unwrap_or(CoverageStatus::Degraded)
+}
+
+/// Overall coverage of a composed response equals the worst included source
+/// (L-R06): a single degraded source degrades the whole envelope.
+pub(crate) fn worst_source_coverage(selected: &[Arc<PublishedGeneration>]) -> CoverageStatus {
+    if selected
+        .iter()
+        .any(|generation| source_coverage(generation) == CoverageStatus::Degraded)
+    {
+        CoverageStatus::Degraded
+    } else {
+        CoverageStatus::Complete
+    }
 }
 
 /// Compose `search_knowledge` across the scope-selected sources of one captured
@@ -243,9 +281,11 @@ pub(crate) fn search_scoped(
         })
         .collect();
     format!(
-        "Source scope searched: {}\nSources: {}\n\n{}",
+        "Source scope searched: {}\nSources: {}\nOverall coverage: {:?}\nSecret policy version: {}\n\n{}",
         source_scope_label(scope),
         selected.len(),
+        worst_source_coverage(&selected),
+        crate::knowledge::SECRET_POLICY_VERSION,
         sections.join("\n\n")
     )
 }

@@ -351,9 +351,11 @@ pub(crate) fn review_scoped(
     let result_hash = combined_result_hash(&pairs);
     let source_section = sections.join("\n\n");
     let budget_source_section = budget_sections.join("\n\n");
+    let overall_coverage = super::knowledge_search::worst_source_coverage(&selected);
     let header = format!(
-        "top_result_hash={result_hash}\nsource_scope={scope_label} sources={}",
-        selected.len()
+        "top_result_hash={result_hash}\nsource_scope={scope_label} sources={} overall_coverage={:?}",
+        selected.len(),
+        overall_coverage,
     );
     Ok(ReviewKnowledgeOutput {
         rendered: format!("{header}\n\n{source_section}"),

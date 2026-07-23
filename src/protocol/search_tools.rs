@@ -10,8 +10,8 @@ use super::read_tools::{lenient_bool, lenient_option_vec, lenient_u32, lenient_u
 
 /// Source-scope vocabulary accepted by `search_knowledge` and `review_knowledge`.
 ///
-/// `search_knowledge` composes across all four scopes (Gate L). `review_knowledge`
-/// still executes only `Current` and advertises accordingly.
+/// Both `search_knowledge` and `review_knowledge` compose across all four scopes
+/// (Gate L): `current`, `worktrees`, `local_refs`, and `all`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeSourceScope {

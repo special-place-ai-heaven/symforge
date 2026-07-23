@@ -896,6 +896,30 @@ impl PublishedSourceSet {
                 .expect("published source set must contain its current source"),
         )
     }
+
+    /// Build the next source set after a P0 (current-worktree) publish.
+    ///
+    /// Preserves every P1 ref/worktree lane, replaces only the current lane,
+    /// and bumps `registry_generation`. If the current source identity changed
+    /// (e.g. branch/working-tree switch) the prior current lane is dropped so it
+    /// is not stranded as a phantom lane. This mirrors the P1 lane discipline in
+    /// `publish_ref_source`: a publish only ever rewrites its own source entry.
+    fn next_after_current_publish(
+        &self,
+        current_source_id: SourceId,
+        current_generation: Arc<PublishedGeneration>,
+    ) -> PublishedSourceSet {
+        let mut sources = self.sources.clone();
+        if self.current_source_id != current_source_id {
+            sources.remove(&self.current_source_id);
+        }
+        sources.insert(current_source_id.clone(), current_generation);
+        PublishedSourceSet {
+            registry_generation: self.registry_generation.saturating_add(1),
+            current_source_id,
+            sources,
+        }
+    }
 }
 
 fn unbound_source_id() -> SourceId {
@@ -1316,6 +1340,7 @@ impl SharedIndexHandle {
         repository_id: crate::domain::index::RepositoryId,
         ref_name: &str,
         tip_commit: &str,
+        scout_coverage: crate::domain::CoverageStatus,
     ) -> Arc<PublishedGeneration> {
         let source_id = crate::domain::index::SourceId::new(format!(
             "symforge:git-ref:{}:{ref_name}",
@@ -1355,7 +1380,7 @@ impl SharedIndexHandle {
             crate::knowledge::SECRET_POLICY_VERSION,
             (*source).clone(),
             (*source_version).clone(),
-            crate::domain::CoverageStatus::Complete,
+            scout_coverage,
             Vec::new(),
             Vec::new(),
             usage,
@@ -1802,17 +1827,11 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
         });
-        let mut sources = BTreeMap::new();
-        sources.insert(
-            previous_source_set.current_source_id.clone(),
-            published_generation,
-        );
         self.published_source_set
-            .store(Arc::new(PublishedSourceSet {
-                registry_generation: previous_source_set.registry_generation.saturating_add(1),
-                current_source_id: previous_source_set.current_source_id.clone(),
-                sources,
-            }));
+            .store(Arc::new(previous_source_set.next_after_current_publish(
+                previous_source_set.current_source_id.clone(),
+                published_generation,
+            )));
         true
     }
 
@@ -1873,17 +1892,11 @@ impl SharedIndexHandle {
             health: Arc::clone(&previous.health),
             outline: Arc::clone(&previous.outline),
         });
-        let mut sources = BTreeMap::new();
-        sources.insert(
-            previous_source_set.current_source_id.clone(),
-            published_generation,
-        );
         self.published_source_set
-            .store(Arc::new(PublishedSourceSet {
-                registry_generation: previous_source_set.registry_generation.saturating_add(1),
-                current_source_id: previous_source_set.current_source_id.clone(),
-                sources,
-            }));
+            .store(Arc::new(previous_source_set.next_after_current_publish(
+                previous_source_set.current_source_id.clone(),
+                published_generation,
+            )));
         true
     }
 
@@ -2829,13 +2842,9 @@ impl SharedIndexHandle {
             .as_ref()
             .map(|source| source.source_id.clone())
             .unwrap_or_else(unbound_source_id);
-        let mut sources = BTreeMap::new();
-        sources.insert(current_source_id.clone(), published_generation);
-        let published_source_set = Arc::new(PublishedSourceSet {
-            registry_generation: previous_source_set.registry_generation.saturating_add(1),
-            current_source_id,
-            sources,
-        });
+        let published_source_set = Arc::new(
+            previous_source_set.next_after_current_publish(current_source_id, published_generation),
+        );
         self.live.store(live);
         after_live_swap();
         self.published_state.store(published_state);
@@ -6508,6 +6517,7 @@ mod tests {
             crate::domain::index::RepositoryId::new("repo-under-test"),
             "refs/heads/feature",
             "0123456789abcdef0123456789abcdef01234567",
+            crate::domain::CoverageStatus::Complete,
         );
         let ref_source_id = ref_gen
             .source
@@ -6544,6 +6554,61 @@ mod tests {
             !handle.remove_ref_source(&current_id),
             "the current lane can never be removed as a ref source"
         );
+    }
+
+    #[test]
+    fn p0_publishes_preserve_published_ref_lanes() {
+        // L-R13 / L-G07 regression: a P0 (current-worktree) publish must replace
+        // only the current lane and preserve every published P1 ref lane. Before
+        // the fix, swap_and_publish / publish_prepared_{bridge,authority} rebuilt
+        // the source map with only the current lane, silently dropping refs.
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let current_id = handle.published_source_set().current_source_id.clone();
+
+        let ref_gen = SharedIndexHandle::build_ref_source_generation(
+            LiveIndex::from_source_files(HashMap::new()),
+            crate::domain::index::RepositoryId::new("repo-under-test"),
+            "refs/heads/feature",
+            "0123456789abcdef0123456789abcdef01234567",
+            crate::domain::CoverageStatus::Complete,
+        );
+        let ref_source_id = ref_gen
+            .source
+            .as_ref()
+            .expect("ref source identity")
+            .source_id
+            .clone();
+        handle.publish_ref_source(ref_gen);
+        assert_eq!(handle.published_source_set().sources.len(), 2);
+
+        // A P0 content publish must keep the ref lane and advance the current lane.
+        let before = handle.published_source_set();
+        handle.swap_and_publish(LiveIndex::from_source_files(HashMap::new()));
+        let after = handle.published_source_set();
+        assert!(
+            after.sources.contains_key(&ref_source_id),
+            "a P0 content publish must not drop a published ref lane"
+        );
+        assert_eq!(after.current_source_id, current_id);
+        assert!(
+            after.registry_generation > before.registry_generation,
+            "a source-map change advances registry_generation"
+        );
+        assert!(
+            after.current_generation().publication_generation
+                > before.current_generation().publication_generation,
+            "the current lane advances on a P0 publish"
+        );
+
+        // A prepared-authority P0 publish must also keep the ref lane.
+        let prepared = handle.prepare_authority_rebuild();
+        assert!(handle.publish_prepared_authority(prepared));
+        let after_auth = handle.published_source_set();
+        assert!(
+            after_auth.sources.contains_key(&ref_source_id),
+            "a P0 authority publish must not drop a published ref lane"
+        );
+        assert_eq!(after_auth.sources.len(), 2);
     }
 
     #[test]

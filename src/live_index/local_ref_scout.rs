@@ -26,7 +26,8 @@ use git2::{ObjectType, Repository};
 
 use crate::discovery::DiscoveryLimits;
 use crate::domain::index::{
-    FileClassification, IndexTargets, LanguageId, MetadataOnlyReason, RepositoryId, SourceId,
+    FileClassification, FileProcessingResult, IndexTargets, LanguageId, MetadataOnlyReason,
+    RepositoryId, SourceId,
 };
 use crate::knowledge::{StableContentAdmission, classify_stable_content};
 use crate::parsing::process_file_with_classification;
@@ -266,6 +267,42 @@ pub enum RefBlobIngest {
     },
 }
 
+/// The path-dependent routing decision for one ref blob, from the SHARED
+/// filesystem adapters (target routing + content policy + classification). The
+/// parse is deferred so identical bytes at several same-classification paths can
+/// be parsed once (L-R02); a `Withheld` decision (secret/LFS/encoding) yields no
+/// parse at all.
+enum RefBlobRoute {
+    Withheld(MetadataOnlyReason),
+    Parse {
+        targets: IndexTargets,
+        language: LanguageId,
+        classification: FileClassification,
+    },
+}
+
+/// Run the shared, path-dependent admission for one ref blob (L-R10 parity):
+/// `IndexTargets::for_path` -> `classify_stable_content` -> classification. These
+/// are the exact primitives filesystem ingestion uses, so identical bytes yield
+/// identical lifecycle/secret decisions regardless of origin. The parse itself is
+/// deferred to the caller so it can be memoized across same-class paths.
+fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
+    let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
+    match classify_stable_content(&entry.relative_path, targets, bytes) {
+        StableContentAdmission::MetadataOnly(reason) => RefBlobRoute::Withheld(reason),
+        StableContentAdmission::Admitted => {
+            let classification =
+                FileClassification::for_indexed_path(&entry.relative_path, targets);
+            let language = entry.language.clone().unwrap_or(LanguageId::Text);
+            RefBlobRoute::Parse {
+                targets,
+                language,
+                classification,
+            }
+        }
+    }
+}
+
 /// Route one ingest-decision ref blob through the SHARED target-routing,
 /// content-policy (secret/LFS/encoding), and parser adapters — the exact same
 /// functions the filesystem ingestion path uses (L-G04). It creates no second
@@ -274,13 +311,13 @@ pub enum RefBlobIngest {
 /// shared primitives, so identical bytes yield identical lifecycle/extraction/
 /// secret results regardless of whether they arrived from disk or a ref blob.
 pub fn route_ref_blob(entry: &RefBlobEntry, bytes: Vec<u8>) -> RefBlobIngest {
-    let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
-    match classify_stable_content(&entry.relative_path, targets, &bytes) {
-        StableContentAdmission::MetadataOnly(reason) => RefBlobIngest::Withheld(reason),
-        StableContentAdmission::Admitted => {
-            let classification =
-                FileClassification::for_indexed_path(&entry.relative_path, targets);
-            let language = entry.language.clone().unwrap_or(LanguageId::Text);
+    match classify_ref_blob(entry, &bytes) {
+        RefBlobRoute::Withheld(reason) => RefBlobIngest::Withheld(reason),
+        RefBlobRoute::Parse {
+            targets,
+            language,
+            classification,
+        } => {
             let result = process_file_with_classification(
                 &entry.relative_path,
                 &bytes,
@@ -309,7 +346,39 @@ pub fn build_ref_source_index(
     catalog: &LocalRefCatalog,
 ) -> Result<LiveIndex, String> {
     let blobs = materialize_ingest_blobs(repository, catalog)?;
+    Ok(LiveIndex::from_source_files(
+        route_catalog_files(catalog, &blobs).files,
+    ))
+}
+
+/// Per-path indexed files plus the number of distinct parses actually run.
+/// `parses_performed` is the L-R02 witness: it equals the count of distinct
+/// (object id, classification, language, grammar-flavor) keys among admitted
+/// ingest entries.
+struct RefRouteOutcome {
+    files: HashMap<String, Arc<IndexedFile>>,
+    /// L-R02 witness: distinct parses actually run. Read only by tests; production
+    /// consumes `files` alone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    parses_performed: usize,
+}
+
+/// Route every ingest-decision blob into a per-path `IndexedFile`, parsing each
+/// distinct (object id, classification, language) exactly once (L-R02 / L-G03).
+/// Identical bytes reachable at several same-classification paths reuse one
+/// parse, re-mapped to each path; the same object under a different
+/// classification re-derives its own parse (L-R14). Path-dependent admission
+/// (secret/LFS/encoding) still runs per path via the shared adapters.
+fn route_catalog_files(catalog: &LocalRefCatalog, blobs: &RefBlobBytes) -> RefRouteOutcome {
     let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+    // Key: object id + classification + language + the two path-selected grammar
+    // flavors (`.tsx` vs `.ts`; the `.h` C/C++ disambiguation branch). Same bytes
+    // + same key => one parse, re-mapped to each path.
+    let mut parse_cache: HashMap<
+        (String, FileClassification, LanguageId, bool, bool),
+        FileProcessingResult,
+    > = HashMap::new();
+    let mut parses_performed = 0usize;
     for entry in &catalog.entries {
         if entry.decision != RefBlobDecision::Ingest {
             continue;
@@ -317,11 +386,54 @@ pub fn build_ref_source_index(
         let Some(bytes) = blobs.get(&entry.object_id) else {
             continue;
         };
-        if let RefBlobIngest::Indexed { file, .. } = route_ref_blob(entry, bytes.to_vec()) {
-            files.insert(entry.relative_path.clone(), Arc::new(*file));
-        }
+        let RefBlobRoute::Parse {
+            language,
+            classification,
+            ..
+        } = classify_ref_blob(entry, bytes)
+        else {
+            continue; // withheld: metadata only, no parse, no index contribution
+        };
+        // `process_file_with_classification` also selects the grammar from the
+        // path — `.tsx` needs the TSX grammar and `.h` runs C/C++ header
+        // disambiguation — so two same-language paths can need different parses.
+        // ponytail: mirrors exactly the two path-grammar branches in
+        // `process_file_with_classification`; add a key field if a third appears.
+        let is_tsx = LanguageId::is_tsx_path(&entry.relative_path);
+        let is_c_header = LanguageId::is_c_header_path(&entry.relative_path);
+        let key = (
+            entry.object_id.clone(),
+            classification,
+            language.clone(),
+            is_tsx,
+            is_c_header,
+        );
+        let mut result = match parse_cache.get(&key) {
+            Some(cached) => cached.clone(),
+            None => {
+                parses_performed += 1;
+                let parsed = process_file_with_classification(
+                    &entry.relative_path,
+                    bytes,
+                    language,
+                    classification,
+                );
+                parse_cache.insert(key, parsed.clone());
+                parsed
+            }
+        };
+        // The parse is path-independent except for the label; re-map it to this
+        // path so each source mapping points at its own repository-relative path.
+        result.relative_path = entry.relative_path.clone();
+        files.insert(
+            entry.relative_path.clone(),
+            Arc::new(IndexedFile::from_parse_result(result, bytes.to_vec())),
+        );
     }
-    Ok(LiveIndex::from_source_files(files))
+    RefRouteOutcome {
+        files,
+        parses_performed,
+    }
 }
 
 /// Scout, ingest, and publish one local ref as a P1 source lane (Gate L L-G07).
@@ -340,11 +452,18 @@ pub fn ingest_and_publish_local_ref(
 ) -> Result<SourceId, String> {
     let catalog = scout_local_ref(repository, ref_name, budget)?;
     let index = build_ref_source_index(repository, &catalog)?;
+    // A degraded scout (entry-budget/undecodable) must not publish a false
+    // Complete ref scope (L-R07): carry the scout coverage into the manifest.
+    let coverage = match catalog.coverage {
+        RefScoutCoverage::Complete => crate::domain::CoverageStatus::Complete,
+        RefScoutCoverage::Degraded => crate::domain::CoverageStatus::Degraded,
+    };
     let generation = SharedIndexHandle::build_ref_source_generation(
         index,
         repository_id,
         ref_name,
         &catalog.tip_object_id,
+        coverage,
     );
     let source_id = generation
         .source
@@ -790,6 +909,115 @@ mod tests {
     }
 
     #[test]
+    fn identical_blob_is_parsed_once_across_same_classification_paths() {
+        // L-R02 / L-G03: identical bytes at several same-classification paths are
+        // parsed exactly once and mapped to every path; the same object under a
+        // different classification re-derives its own parse (L-R14).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let body: &[u8] = b"pub fn shared() -> u32 { 7 }\n";
+        commit_files(
+            root,
+            &[("one.rs", body), ("two.rs", body), ("notes.md", body)],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let blobs = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+        assert_eq!(
+            blobs.distinct_len(),
+            1,
+            "identical bytes share one object id"
+        );
+
+        let outcome = route_catalog_files(&catalog, &blobs);
+        assert_eq!(
+            outcome.files.len(),
+            3,
+            "every path is mapped to its own file"
+        );
+        assert_eq!(
+            outcome.parses_performed, 2,
+            "same-class duplicate parsed once; the md path re-derives its own parse"
+        );
+        assert_eq!(
+            outcome.files["two.rs"].relative_path, "two.rs",
+            "each mapping keeps its own path label"
+        );
+    }
+
+    #[test]
+    fn identical_blob_reparsed_per_path_selected_grammar_flavor() {
+        // L-R02 / L-R10 / L-R14: `.ts` and `.tsx` share one LanguageId but the
+        // grammar is path-selected inside `process_file_with_classification`, so
+        // identical bytes at the two paths must NOT share a parse — each re-parses
+        // under its own grammar flavor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let source: &[u8] = b"export const x = 1;\n";
+        commit_files(root, &[("a.ts", source), ("b.tsx", source)], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let blobs = materialize_ingest_blobs(&repository, &catalog).expect("materialize");
+        assert_eq!(
+            blobs.distinct_len(),
+            1,
+            "identical bytes share one object id"
+        );
+
+        let outcome = route_catalog_files(&catalog, &blobs);
+        assert_eq!(outcome.files.len(), 2, "both paths are mapped");
+        assert_eq!(
+            outcome.parses_performed, 2,
+            ".ts and .tsx select different grammars and must not share a parse"
+        );
+    }
+
+    #[test]
+    fn degraded_scout_publishes_degraded_ref_manifest_coverage() {
+        // L-R07: a budget-degraded scout must not publish a false Complete ref
+        // scope — the manifest coverage carries the scout's Degraded status.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[
+                ("a.rs", b"//a\n"),
+                ("b.rs", b"//b\n"),
+                ("c.rs", b"//c\n"),
+                ("d.rs", b"//d\n"),
+            ],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let budget = LocalRefScoutBudget {
+            max_entries: 2,
+            max_blob_materialize_bytes: DEFAULT_MAX_BLOB_MATERIALIZE_BYTES,
+        };
+        let source_id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-degraded"),
+            &budget,
+        )
+        .expect("ingest and publish");
+        let set = handle.published_source_set();
+        let lane = set.sources.get(&source_id).expect("published ref lane");
+        assert_eq!(
+            lane.manifest.as_ref().expect("ref lane manifest").coverage,
+            crate::domain::CoverageStatus::Degraded,
+            "a degraded scout must publish Degraded ref coverage"
+        );
+    }
+
+    #[test]
     fn search_scoped_composes_local_ref_lane_and_reports_typed_empty_worktrees() {
         use crate::protocol::knowledge_search::search_scoped;
         use crate::protocol::search_tools::{KnowledgeSourceScope, SearchKnowledgeInput};
@@ -994,6 +1222,46 @@ mod tests {
             set2.sources.len(),
             2,
             "the moved ref replaced its lane rather than duplicating it"
+        );
+    }
+
+    #[test]
+    fn failed_ref_ingestion_leaves_the_current_lane_untouched() {
+        // L-V04: a local-ref lane failure leaves the current worktree P0 lane
+        // present and queryable, and advances nothing in the published set.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn a() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let before = handle.published_source_set();
+        let before_registry = before.registry_generation;
+        let before_len = before.sources.len();
+        let current_id = before.current_source_id.clone();
+
+        let result = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "refs/heads/does-not-exist",
+            RepositoryId::new("repo-fail"),
+            &LocalRefScoutBudget::default(),
+        );
+        assert!(result.is_err(), "a missing ref must fail to ingest");
+
+        let after = handle.published_source_set();
+        assert_eq!(
+            after.registry_generation, before_registry,
+            "a failed ref ingestion must not advance registry_generation"
+        );
+        assert_eq!(
+            after.sources.len(),
+            before_len,
+            "a failed ref ingestion must not add a lane"
+        );
+        assert!(
+            after.sources.contains_key(&current_id),
+            "the current worktree lane stays present and queryable"
         );
     }
 }
