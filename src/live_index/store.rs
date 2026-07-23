@@ -1303,6 +1303,158 @@ impl SharedIndexHandle {
         }
     }
 
+    /// Build a full published bundle for one local Git ref source (Gate L L-G07).
+    ///
+    /// Models the current-lane bundle in `new_with_scout_plan_and_code_signals`,
+    /// but for a `SourceLocation::GitRef` source assembled from Git blobs rather
+    /// than a filesystem walk. Temporal signals are `Pending` (a ref source has no
+    /// resident working tree to walk); the manifest, bridge, and authority are the
+    /// same builders the current lane uses, so a ref document links only to ref
+    /// code of its own source identity.
+    pub(crate) fn build_ref_source_generation(
+        index: LiveIndex,
+        repository_id: crate::domain::index::RepositoryId,
+        ref_name: &str,
+        tip_commit: &str,
+    ) -> Arc<PublishedGeneration> {
+        let source_id = crate::domain::index::SourceId::new(format!(
+            "symforge:git-ref:{}:{ref_name}",
+            repository_id.as_str()
+        ));
+        let source = Arc::new(SourceIdentity {
+            repository_id,
+            source_id,
+            location: crate::domain::index::SourceLocation::GitRef {
+                name: ref_name.to_string(),
+            },
+        });
+        let source_version = Arc::new(SourceVersion {
+            branch: Some(ref_name.to_string()),
+            commit: Some(tip_commit.to_string()),
+            working_tree: WorkingTreeState::NotApplicable,
+        });
+
+        let temporal = Arc::new(super::git_temporal::GitTemporalIndex::pending());
+        let coverage = capture_history_coverage(&index, &temporal.state);
+        let code_signals = Arc::new(CodeSignalsSnapshot {
+            state: temporal.state.clone(),
+            temporal,
+            computed_for_content_generation: 0,
+            computed_for_source_version: (*source_version).clone(),
+            coverage,
+        });
+
+        let usage = ManifestResourceUsage {
+            catalog_entries: index.files.len() as u64,
+            catalog_metadata_bytes: 0,
+            admitted_content_bytes: index.files.values().map(|file| file.byte_len).sum(),
+        };
+        let manifest = RepositoryManifest::new(
+            1,
+            1,
+            crate::knowledge::SECRET_POLICY_VERSION,
+            (*source).clone(),
+            (*source_version).clone(),
+            crate::domain::CoverageStatus::Complete,
+            Vec::new(),
+            Vec::new(),
+            usage,
+        )
+        .ok()
+        .map(Arc::new);
+
+        let freshness = if index.is_empty {
+            FreshnessStatus::Verifying
+        } else {
+            FreshnessStatus::Current
+        };
+        let published_state = Arc::new(PublishedIndexState::capture(0, &index));
+        let outline = Arc::new(index.capture_repo_outline_view());
+        let bridge = Arc::new(build_knowledge_bridge(
+            &index,
+            &source,
+            0,
+            &BridgeLimits::default(),
+        ));
+        let authority = build_published_authority(
+            &index,
+            Some(&source),
+            Some(&source_version),
+            0,
+            &bridge,
+            &code_signals,
+            manifest.as_deref(),
+        );
+        let live = Arc::new(index);
+        Arc::new(PublishedGeneration {
+            publication_generation: 0,
+            content_generation: 0,
+            project_generation: 0,
+            source: Some(source),
+            source_version: Some(source_version),
+            freshness: Arc::new(freshness),
+            manifest,
+            code_signals,
+            bridge,
+            authority,
+            live,
+            health: published_state,
+            outline,
+        })
+    }
+
+    /// Reconcile one local-ref (P1) source bundle into the published source set.
+    ///
+    /// Copies the current source map under the single publication writer lock,
+    /// inserts or replaces ONLY this ref lane, bumps `registry_generation`, and
+    /// swaps once. The current worktree (P0) bundle is left byte-identical, so a
+    /// P1 add/update/remove never advances the current source's publication,
+    /// content, or project generation (L-R12/L-R13).
+    pub(crate) fn publish_ref_source(&self, generation: Arc<PublishedGeneration>) {
+        let source_id = generation
+            .source
+            .as_ref()
+            .expect("ref-source generation carries a source identity")
+            .source_id
+            .clone();
+        let _guard = self.write_mutex.lock();
+        let current = self.published_source_set.load_full();
+        let mut sources = current.sources.clone();
+        sources.insert(source_id, generation);
+        self.published_source_set
+            .store(Arc::new(PublishedSourceSet {
+                registry_generation: current.registry_generation.saturating_add(1),
+                current_source_id: current.current_source_id.clone(),
+                sources,
+            }));
+    }
+
+    /// Remove one local-ref (P1) source lane from the published source set.
+    ///
+    /// Same discipline as `publish_ref_source`: copy under the writer lock, remove
+    /// only the named lane, bump `registry_generation`, swap once. The current
+    /// source lane cannot be removed. Returns whether a lane was removed.
+    // ponytail: reconcile-remove half of the P1 contract, exercised by tests;
+    // the production caller is the ref-topology reconcile driver (L-R03), not
+    // yet wired. Drop this allow once that driver invalidates moved refs.
+    #[allow(dead_code)]
+    pub(crate) fn remove_ref_source(&self, source_id: &crate::domain::index::SourceId) -> bool {
+        let _guard = self.write_mutex.lock();
+        let current = self.published_source_set.load_full();
+        if source_id == &current.current_source_id || !current.sources.contains_key(source_id) {
+            return false;
+        }
+        let mut sources = current.sources.clone();
+        sources.remove(source_id);
+        self.published_source_set
+            .store(Arc::new(PublishedSourceSet {
+                registry_generation: current.registry_generation.saturating_add(1),
+                current_source_id: current.current_source_id.clone(),
+                sources,
+            }));
+        true
+    }
+
     pub fn shared(index: LiveIndex) -> Arc<Self> {
         Arc::new(Self::new(index))
     }
@@ -6334,6 +6486,62 @@ mod tests {
         assert_eq!(
             indexed.alias_map.get("Map").map(|s| s.as_str()),
             Some("HashMap")
+        );
+    }
+
+    #[test]
+    fn publishing_and_removing_a_ref_source_bumps_registry_without_touching_current_lane() {
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let before = handle.published_source_set();
+        let before_registry = before.registry_generation;
+        let current_id = before.current_source_id.clone();
+        let current_lane = before.current_generation();
+        let (before_pub, before_content, before_project) = (
+            current_lane.publication_generation,
+            current_lane.content_generation,
+            current_lane.project_generation,
+        );
+
+        let ref_gen = SharedIndexHandle::build_ref_source_generation(
+            LiveIndex::from_source_files(HashMap::new()),
+            crate::domain::index::RepositoryId::new("repo-under-test"),
+            "refs/heads/feature",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let ref_source_id = ref_gen
+            .source
+            .as_ref()
+            .expect("ref source identity")
+            .source_id
+            .clone();
+        assert_ne!(ref_source_id, current_id);
+        handle.publish_ref_source(ref_gen);
+
+        let after = handle.published_source_set();
+        assert_eq!(
+            after.registry_generation,
+            before_registry + 1,
+            "registry bumps"
+        );
+        assert_eq!(after.sources.len(), 2);
+        assert!(after.sources.contains_key(&ref_source_id));
+        assert_eq!(after.current_source_id, current_id);
+        let after_current = after.current_generation();
+        assert_eq!(after_current.publication_generation, before_pub);
+        assert_eq!(after_current.content_generation, before_content);
+        assert_eq!(
+            after_current.project_generation, before_project,
+            "a P1 ref add must not advance the current lane's generations"
+        );
+
+        assert!(handle.remove_ref_source(&ref_source_id));
+        let removed = handle.published_source_set();
+        assert_eq!(removed.registry_generation, before_registry + 2);
+        assert_eq!(removed.sources.len(), 1);
+        assert!(!removed.sources.contains_key(&ref_source_id));
+        assert!(
+            !handle.remove_ref_source(&current_id),
+            "the current lane can never be removed as a ref source"
         );
     }
 

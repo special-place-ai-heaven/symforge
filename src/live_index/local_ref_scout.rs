@@ -12,10 +12,12 @@
 //! sends those bytes through the SHARED target-routing/secret/parser adapters —
 //! the same functions filesystem ingestion uses, no second parser or index
 //! (L-G04). `build_ref_source_index` assembles those routed files into a
-//! queryable, root-less `LiveIndex` for one ref source (L-G05 foundation).
-//! Publishing that source into the owning instance's multi-source
-//! `PublishedSourceSet` under its publication lock, plus the query-composition
-//! surface, is the remaining stage (L-G06/L-G07).
+//! queryable, root-less `LiveIndex` for one ref source (L-G05). `SharedIndexHandle`
+//! wraps it in a full published bundle and reconciles it into the instance's
+//! multi-source `PublishedSourceSet` under the publication writer lock;
+//! `ingest_and_publish_local_ref` is the end-to-end entry point (L-G07). The
+//! remaining stage is the query-composition surface (L-G06): advertising and
+//! composing the `worktrees`/`local_refs`/`all` source scopes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -23,11 +25,13 @@ use std::sync::Arc;
 use git2::{ObjectType, Repository};
 
 use crate::discovery::DiscoveryLimits;
-use crate::domain::index::{FileClassification, IndexTargets, LanguageId, MetadataOnlyReason};
+use crate::domain::index::{
+    FileClassification, IndexTargets, LanguageId, MetadataOnlyReason, RepositoryId, SourceId,
+};
 use crate::knowledge::{StableContentAdmission, classify_stable_content};
 use crate::parsing::process_file_with_classification;
 
-use super::store::{IndexedFile, LiveIndex};
+use super::store::{IndexedFile, LiveIndex, SharedIndexHandle};
 
 /// Default per-blob materialization ceiling. A blob larger than this is
 /// catalogued by object ID and size only; its bytes are never read.
@@ -318,6 +322,38 @@ pub fn build_ref_source_index(
         }
     }
     Ok(LiveIndex::from_source_files(files))
+}
+
+/// Scout, ingest, and publish one local ref as a P1 source lane (Gate L L-G07).
+///
+/// End-to-end entry point: resolve and scout the ref, build its root-less
+/// `LiveIndex` from the shared-adapter-routed blobs, wrap it in a full
+/// published bundle, and reconcile it into `handle`'s `PublishedSourceSet`
+/// under the single publication writer lock. The current worktree lane is left
+/// untouched. Returns the published ref source id.
+pub fn ingest_and_publish_local_ref(
+    handle: &SharedIndexHandle,
+    repository: &Repository,
+    ref_name: &str,
+    repository_id: RepositoryId,
+    budget: &LocalRefScoutBudget,
+) -> Result<SourceId, String> {
+    let catalog = scout_local_ref(repository, ref_name, budget)?;
+    let index = build_ref_source_index(repository, &catalog)?;
+    let generation = SharedIndexHandle::build_ref_source_generation(
+        index,
+        repository_id,
+        ref_name,
+        &catalog.tip_object_id,
+    );
+    let source_id = generation
+        .source
+        .as_ref()
+        .expect("ref-source generation carries a source identity")
+        .source_id
+        .clone();
+    handle.publish_ref_source(generation);
+    Ok(source_id)
 }
 
 #[cfg(test)]
@@ -696,6 +732,60 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.name == "indexed_symbol"),
             "ref-source index must carry parsed symbols"
+        );
+    }
+
+    #[test]
+    fn ingest_and_publish_makes_a_queryable_ref_lane_without_touching_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[("src/lib.rs", b"pub fn ref_lane_symbol() -> bool { true }\n")],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let before = handle.published_source_set();
+        let current_id = before.current_source_id.clone();
+
+        let source_id = ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-e2e"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("ingest and publish");
+
+        let set = handle.published_source_set();
+        assert_eq!(set.registry_generation, before.registry_generation + 1);
+        assert_eq!(
+            set.current_source_id, current_id,
+            "current lane identity is stable"
+        );
+        let lane = set.sources.get(&source_id).expect("published ref lane");
+        assert!(
+            lane.live.files.contains_key("src/lib.rs"),
+            "the ref lane is queryable"
+        );
+        assert!(
+            lane.live.files["src/lib.rs"]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "ref_lane_symbol")
+        );
+        match &lane.source.as_ref().expect("lane source").location {
+            crate::domain::index::SourceLocation::GitRef { name } => assert_eq!(name, "HEAD"),
+            other => panic!("expected GitRef location, got {other:?}"),
+        }
+        assert_eq!(
+            lane.source_version
+                .as_ref()
+                .expect("lane version")
+                .working_tree,
+            crate::domain::index::WorkingTreeState::NotApplicable
         );
     }
 }
