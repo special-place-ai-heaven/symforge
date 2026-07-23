@@ -788,4 +788,58 @@ mod tests {
             crate::domain::index::WorkingTreeState::NotApplicable
         );
     }
+
+    #[test]
+    fn search_scoped_composes_local_ref_lane_and_reports_typed_empty_worktrees() {
+        use crate::protocol::knowledge_search::search_scoped;
+        use crate::protocol::search_tools::{KnowledgeSourceScope, SearchKnowledgeInput};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[(
+                "docs/topic.md",
+                b"# Topic\n\nThe orbital lattice resonates across the source.\n",
+            )],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        ingest_and_publish_local_ref(
+            &handle,
+            &repository,
+            "HEAD",
+            RepositoryId::new("repo-scope"),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish ref");
+        let set = handle.published_source_set();
+
+        let input = |scope| SearchKnowledgeInput {
+            query: "orbital lattice".to_string(),
+            path_prefix: None,
+            source_scope: Some(scope),
+            authority_scope: None,
+            project: None,
+            projects: None,
+            limit: None,
+            max_tokens: None,
+        };
+
+        let local_refs = search_scoped(&set, &input(KnowledgeSourceScope::LocalRefs));
+        assert!(
+            local_refs.contains("Source scope searched: local_refs"),
+            "{local_refs}"
+        );
+        assert!(local_refs.contains("ref:HEAD"), "{local_refs}");
+
+        let worktrees = search_scoped(&set, &input(KnowledgeSourceScope::Worktrees));
+        assert!(worktrees.contains("no_sources_in_scope"), "{worktrees}");
+
+        let all = search_scoped(&set, &input(KnowledgeSourceScope::All));
+        assert!(all.contains("Source scope searched: all"), "{all}");
+        assert!(all.contains("ref:HEAD"), "{all}");
+    }
 }

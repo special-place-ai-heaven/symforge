@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::domain::{CoverageStatus, FreshnessStatus, LanguageId, SourceLocation};
 use crate::knowledge::{guard_hit, guard_query, project_markdown_sections};
@@ -12,7 +13,7 @@ use crate::live_index::knowledge_authority::{KnowledgeAuthorityRecord, Knowledge
 use crate::live_index::knowledge_bridge::{
     BridgeEvidenceKind, BridgeResolution, CodeAnchorId, DerivedCoverage, KnowledgeAnchor,
 };
-use crate::live_index::{PublishedGeneration, PublishedIndexStatus};
+use crate::live_index::{PublishedGeneration, PublishedIndexStatus, PublishedSourceSet};
 
 use super::search_tools::{KnowledgeAuthorityScope, KnowledgeSourceScope, SearchKnowledgeInput};
 
@@ -112,15 +113,6 @@ pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQ
     {
         return Err("Error: projects wildcard must be the sole selector.".to_string());
     }
-    if let Some(scope) = input.source_scope
-        && scope != KnowledgeSourceScope::Current
-    {
-        return Err(format!(
-            "Error: unsupported source_scope '{}'; available: current.",
-            source_scope_label(scope)
-        ));
-    }
-
     let path_prefix = normalize_path_prefix(input.path_prefix.as_deref())?;
     let terms = significant_terms(phrase);
     let authority_scope = input
@@ -137,6 +129,125 @@ pub(crate) fn validate_input(input: &SearchKnowledgeInput) -> Result<NormalizedQ
         authority_scope,
         limit,
     })
+}
+
+/// Select the published generations a source scope addresses, deterministically.
+///
+/// `current` is the single current-worktree lane. `local_refs`/`worktrees`
+/// filter the captured set by source location, excluding the current lane.
+/// `all` lists the current lane first (it ranks ahead of a divergent ref but
+/// never hides it), then every other lane in `SourceId` order.
+fn select_scoped_sources(
+    source_set: &PublishedSourceSet,
+    scope: KnowledgeSourceScope,
+) -> Vec<Arc<PublishedGeneration>> {
+    let current_id = &source_set.current_source_id;
+    let is_git_ref = |generation: &PublishedGeneration| {
+        matches!(
+            generation.source.as_deref().map(|source| &source.location),
+            Some(SourceLocation::GitRef { .. })
+        )
+    };
+    let is_worktree = |generation: &PublishedGeneration| {
+        matches!(
+            generation.source.as_deref().map(|source| &source.location),
+            Some(SourceLocation::WorkingTree { .. })
+        )
+    };
+    match scope {
+        KnowledgeSourceScope::Current => source_set
+            .sources
+            .get(current_id)
+            .map(Arc::clone)
+            .into_iter()
+            .collect(),
+        KnowledgeSourceScope::LocalRefs => source_set
+            .sources
+            .iter()
+            .filter(|(id, generation)| *id != current_id && is_git_ref(generation))
+            .map(|(_, generation)| Arc::clone(generation))
+            .collect(),
+        KnowledgeSourceScope::Worktrees => source_set
+            .sources
+            .iter()
+            .filter(|(id, generation)| *id != current_id && is_worktree(generation))
+            .map(|(_, generation)| Arc::clone(generation))
+            .collect(),
+        KnowledgeSourceScope::All => {
+            let mut selected: Vec<Arc<PublishedGeneration>> = source_set
+                .sources
+                .get(current_id)
+                .map(Arc::clone)
+                .into_iter()
+                .collect();
+            selected.extend(
+                source_set
+                    .sources
+                    .iter()
+                    .filter(|(id, _)| *id != current_id)
+                    .map(|(_, generation)| Arc::clone(generation)),
+            );
+            selected
+        }
+    }
+}
+
+/// Compact per-source identity header for a composed multi-source response.
+fn render_source_scope_identity(generation: &PublishedGeneration) -> String {
+    let location = match generation.source.as_deref().map(|source| &source.location) {
+        Some(SourceLocation::WorkingTree { worktree_id }) => format!("worktree:{worktree_id}"),
+        Some(SourceLocation::GitRef { name }) => format!("ref:{name}"),
+        None => "unbound".to_string(),
+    };
+    let source_id = generation
+        .source
+        .as_deref()
+        .map(|source| source.source_id.as_str().to_string())
+        .unwrap_or_else(|| "unbound".to_string());
+    format!(
+        "{location} source_id={source_id} publication_generation={} content_generation={}",
+        generation.publication_generation, generation.content_generation
+    )
+}
+
+/// Compose `search_knowledge` across the scope-selected sources of one captured
+/// source set (Gate L L-G06). `current` keeps its exact single-source output. A
+/// multi-source scope that selects no sources returns a typed empty readiness
+/// result rather than a false complete-absence claim.
+pub(crate) fn search_scoped(
+    source_set: &PublishedSourceSet,
+    input: &SearchKnowledgeInput,
+) -> String {
+    if let Err(error) = validate_input(input) {
+        return error;
+    }
+    let scope = input.source_scope.unwrap_or(KnowledgeSourceScope::Current);
+    if matches!(scope, KnowledgeSourceScope::Current) {
+        return search_current(&source_set.current_generation(), input);
+    }
+    let selected = select_scoped_sources(source_set, scope);
+    if selected.is_empty() {
+        return format!(
+            "Readiness: no_sources_in_scope; source_scope '{}' selected no sources.",
+            source_scope_label(scope)
+        );
+    }
+    let sections: Vec<String> = selected
+        .iter()
+        .map(|generation| {
+            format!(
+                "== source: {} ==\n{}",
+                render_source_scope_identity(generation),
+                search_current(generation, input)
+            )
+        })
+        .collect();
+    format!(
+        "Source scope searched: {}\nSources: {}\n\n{}",
+        source_scope_label(scope),
+        selected.len(),
+        sections.join("\n\n")
+    )
 }
 
 pub(crate) fn search_current(

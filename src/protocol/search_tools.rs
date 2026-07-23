@@ -8,11 +8,10 @@ use crate::live_index::search;
 
 use super::read_tools::{lenient_bool, lenient_option_vec, lenient_u32, lenient_u64};
 
-/// Frozen source-scope vocabulary accepted by `search_knowledge`.
+/// Source-scope vocabulary accepted by `search_knowledge` and `review_knowledge`.
 ///
-/// Gate I executes only `Current`; the other known values deserialize so the
-/// handler can return an explicit unsupported-scope result. The field schema
-/// separately advertises only the implemented capability.
+/// `search_knowledge` composes across all four scopes (Gate L). `review_knowledge`
+/// still executes only `Current` and advertises accordingly.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeSourceScope {
@@ -27,6 +26,19 @@ pub enum KnowledgeSourceScope {
 #[serde(rename_all = "snake_case")]
 enum AdvertisedKnowledgeSourceScope {
     Current,
+}
+
+/// Source scopes advertised by `search_knowledge` (Gate L). Unlike
+/// `review_knowledge`, search composes across the captured source set, so it
+/// advertises every implemented P1 scope.
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum AdvertisedSearchKnowledgeSourceScope {
+    Current,
+    Worktrees,
+    LocalRefs,
+    All,
 }
 
 /// Retrieval voice filter for repository knowledge.
@@ -49,9 +61,10 @@ pub struct SearchKnowledgeInput {
     /// Optional normalized repository-relative prefix; traversal is rejected.
     #[serde(default)]
     pub path_prefix: Option<String>,
-    /// Captured repository source scope. Gate I implements only `current`.
+    /// Captured repository source scope: `current` (default), `worktrees`,
+    /// `local_refs`, or `all`. Composed from one captured source set.
     #[serde(default)]
-    #[schemars(with = "AdvertisedKnowledgeSourceScope")]
+    #[schemars(with = "AdvertisedSearchKnowledgeSourceScope")]
     pub source_scope: Option<KnowledgeSourceScope>,
     /// Authority/retrieval voice filter. Defaults to `default`.
     #[serde(default)]
@@ -149,6 +162,7 @@ pub struct KnowledgePolicyTargetInput {
     pub path: String,
     pub content_hash: String,
     #[serde(default)]
+    #[schemars(with = "[u32; 2]")]
     pub unit_byte_range: Option<[u32; 2]>,
     #[serde(default)]
     pub unit_hash: Option<String>,

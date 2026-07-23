@@ -254,7 +254,10 @@ async fn validation_refuses_empty_traversal_unsupported_scope_and_selector_confl
         "traversal: {traversal}"
     );
 
-    let unsupported = fixture
+    // `worktrees`/`local_refs`/`all` are supported scopes (Gate L). This
+    // single-worktree fixture publishes no P1 sources, so a P1 scope composes
+    // to a typed empty-scope readiness result, never a false complete-absence.
+    let empty_scope = fixture
         .server
         .dispatch_tool_for_tests(
             "search_knowledge",
@@ -262,8 +265,8 @@ async fn validation_refuses_empty_traversal_unsupported_scope_and_selector_confl
         )
         .await;
     assert!(
-        unsupported.contains("unsupported source_scope") && unsupported.contains("current"),
-        "unsupported source scope: {unsupported}"
+        empty_scope.contains("no_sources_in_scope"),
+        "empty worktrees scope: {empty_scope}"
     );
 
     let conflict = fixture

@@ -5387,7 +5387,7 @@ impl SymForgeServer {
     /// only the current source; other frozen source scopes arrive in Gate L.
     #[tool(
         name = "search_knowledge",
-        description = "Search exact repository knowledge evidence with captured source/version/generation provenance, deterministic authority filtering, bounded bridge previews, and explicit coverage. Gate I supports source_scope='current' only. Read-only and frecency-neutral.",
+        description = "Search exact repository knowledge evidence with captured source/version/generation provenance, deterministic authority filtering, bounded bridge previews, and explicit coverage. source_scope selects 'current' (default), 'worktrees', 'local_refs', or 'all', composed from one captured source set. Read-only and frecency-neutral.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -5434,8 +5434,7 @@ impl SymForgeServer {
         }
 
         let source_set = self.index.published_source_set();
-        let generation = source_set.current_generation();
-        let output = super::knowledge_search::search_current(&generation, &params.0);
+        let output = super::knowledge_search::search_scoped(&source_set, &params.0);
         self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
     }
 
