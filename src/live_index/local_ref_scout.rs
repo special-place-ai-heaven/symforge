@@ -11,10 +11,13 @@
 //! and never touches catalog-only blobs (L-G03 raw-bytes layer). `route_ref_blob`
 //! sends those bytes through the SHARED target-routing/secret/parser adapters —
 //! the same functions filesystem ingestion uses, no second parser or index
-//! (L-G04). Wiring the routed files into the multi-source published set and the
-//! query-composition surface is the remaining stage (L-G05/L-G06/L-G07).
+//! (L-G04). `build_ref_source_index` assembles those routed files into a
+//! queryable, root-less `LiveIndex` for one ref source (L-G05 foundation).
+//! Publishing that source into the owning instance's multi-source
+//! `PublishedSourceSet` under its publication lock, plus the query-composition
+//! surface, is the remaining stage (L-G06/L-G07).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use git2::{ObjectType, Repository};
@@ -24,7 +27,7 @@ use crate::domain::index::{FileClassification, IndexTargets, LanguageId, Metadat
 use crate::knowledge::{StableContentAdmission, classify_stable_content};
 use crate::parsing::process_file_with_classification;
 
-use super::store::IndexedFile;
+use super::store::{IndexedFile, LiveIndex};
 
 /// Default per-blob materialization ceiling. A blob larger than this is
 /// catalogued by object ID and size only; its bytes are never read.
@@ -286,6 +289,35 @@ pub fn route_ref_blob(entry: &RefBlobEntry, bytes: Vec<u8>) -> RefBlobIngest {
             }
         }
     }
+}
+
+/// Build a queryable in-memory `LiveIndex` for one local ref source.
+///
+/// Every ingest-decision blob is materialized once (dedup by object ID) and
+/// routed through the shared parser/secret adapters; catalog-only and
+/// content-withheld blobs contribute no indexed file. The resulting index has
+/// no filesystem root — it is assembled purely from the routed files (L-G05
+/// source-index foundation). It is not yet published into a `PublishedSourceSet`
+/// (L-G07); that reconciliation runs under the owning instance's publication
+/// lock.
+pub fn build_ref_source_index(
+    repository: &Repository,
+    catalog: &LocalRefCatalog,
+) -> Result<LiveIndex, String> {
+    let blobs = materialize_ingest_blobs(repository, catalog)?;
+    let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::new();
+    for entry in &catalog.entries {
+        if entry.decision != RefBlobDecision::Ingest {
+            continue;
+        }
+        let Some(bytes) = blobs.get(&entry.object_id) else {
+            continue;
+        };
+        if let RefBlobIngest::Indexed { file, .. } = route_ref_blob(entry, bytes.to_vec()) {
+            files.insert(entry.relative_path.clone(), Arc::new(*file));
+        }
+    }
+    Ok(LiveIndex::from_source_files(files))
 }
 
 #[cfg(test)]
@@ -621,6 +653,49 @@ mod tests {
         assert!(
             matches!(outcome, RefBlobIngest::Withheld(_)),
             "secret-positive ref blob must be withheld, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn builds_queryable_ref_source_index_excluding_withheld_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let secret =
+            b"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n";
+        commit_files(
+            root,
+            &[
+                ("src/lib.rs", b"pub fn indexed_symbol() -> u32 { 1 }\n"),
+                ("docs/guide.md", b"# Guide\n\nProse.\n"),
+                ("config/key.txt", secret),
+            ],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let catalog =
+            scout_local_ref(&repository, "HEAD", &LocalRefScoutBudget::default()).expect("scout");
+        let index = build_ref_source_index(&repository, &catalog).expect("build index");
+
+        assert!(!index.is_empty, "ref-source index must not be empty");
+        assert!(
+            index.files.contains_key("src/lib.rs"),
+            "routed code blob must be indexed"
+        );
+        assert!(
+            index.files.contains_key("docs/guide.md"),
+            "routed knowledge blob must be indexed"
+        );
+        assert!(
+            !index.files.contains_key("config/key.txt"),
+            "secret-withheld blob must never enter the index"
+        );
+        assert!(
+            index.files["src/lib.rs"]
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "indexed_symbol"),
+            "ref-source index must carry parsed symbols"
         );
     }
 }

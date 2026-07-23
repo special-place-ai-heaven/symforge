@@ -3862,6 +3862,42 @@ impl LiveIndex {
         }
     }
 
+    /// Build a queryable `LiveIndex` directly from an in-memory set of already
+    /// parsed files, with no filesystem walk or root.
+    ///
+    /// This backs Gate-L local-ref sources (`local_ref_scout::build_ref_source_index`):
+    /// their `IndexedFile`s come from Git blob bytes routed through the shared
+    /// parser/secret adapters, not from disk, so there is no source root to scout
+    /// and no `.gitignore`/coupling store to load. Reverse and path indices are
+    /// rebuilt so the resulting index answers symbol/reference/text queries exactly
+    /// like a filesystem-loaded one.
+    pub(crate) fn from_source_files(files: HashMap<String, Arc<IndexedFile>>) -> LiveIndex {
+        let is_empty = files.is_empty();
+        let trigram_index = super::trigram::TrigramIndex::build_from_files(&files);
+        let mut index = LiveIndex {
+            files,
+            loaded_at: Instant::now(),
+            loaded_at_system: SystemTime::now(),
+            load_duration: Duration::ZERO,
+            cb_state: CircuitBreakerState::new(0.20),
+            is_empty,
+            load_source: IndexLoadSource::FreshLoad,
+            snapshot_verify_state: SnapshotVerifyState::NotNeeded,
+            reverse_index: HashMap::new(),
+            files_by_basename: HashMap::new(),
+            files_by_dir_component: HashMap::new(),
+            trigram_index,
+            gitignore: None,
+            manifest_entries: Vec::new(),
+            coupling_store: None,
+            local_empty_reason: Arc::new(parking_lot::RwLock::new(None)),
+            indexed_root: None,
+        };
+        index.rebuild_reverse_index();
+        index.rebuild_path_indices();
+        index
+    }
+
     /// Create an empty `SharedIndex` with no files loaded.
     ///
     /// Used when `SYMFORGE_AUTO_INDEX=false`. The caller must call `reload()` to populate it.
