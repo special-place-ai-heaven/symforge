@@ -33,6 +33,7 @@ use crate::knowledge::{StableContentAdmission, classify_stable_content};
 use crate::parsing::process_file_with_classification;
 
 use super::store::{IndexedFile, LiveIndex, SharedIndexHandle};
+use super::worktree_topology::{CheckedOutWorktree, checked_out_worktrees};
 
 /// Default per-blob materialization ceiling. A blob larger than this is
 /// catalogued by object ID and size only; its bytes are never read.
@@ -473,6 +474,115 @@ pub fn ingest_and_publish_local_ref(
         .clone();
     handle.publish_ref_source(generation);
     Ok(source_id)
+}
+
+/// Outcome of one local ref/worktree topology reconcile.
+#[derive(Debug)]
+pub struct ReconcileOutcome {
+    /// Ref lanes published (fresh or tip-updated) this pass.
+    pub published: Vec<SourceId>,
+    /// Ref lanes removed this pass (branch deleted or newly checked out).
+    pub removed: Vec<SourceId>,
+    /// Linked worktrees found checked out — routed to their own
+    /// `ProjectInstance` by a later daemon layer, never ingested as P1 lanes.
+    pub checked_out: Vec<CheckedOutWorktree>,
+}
+
+/// Reconcile the local branch/worktree topology into P1 ref lanes (L-G05/L-R03).
+///
+/// A P1 ref lane is published for every *bare* local branch — a local branch
+/// that is NOT checked out in any linked worktree AND is NOT the main repo's own
+/// current HEAD. The current worktree is the P0 lane and a checked-out linked
+/// worktree is a separate `ProjectInstance`'s own P0 lane; neither may ever
+/// become a P1 lane (`data-model.md:1258-1263`). Existing ref lanes whose branch
+/// no longer exists as a bare local branch (deleted, or newly checked out) are
+/// removed. Every source-map mutation goes through `publish_ref_source` /
+/// `remove_ref_source`, which hold the publication writer lock, bump
+/// `registry_generation`, and preserve the P0 current lane untouched.
+pub fn reconcile_local_ref_topology(
+    handle: &SharedIndexHandle,
+    repository: &Repository,
+    repository_id: RepositoryId,
+    budget: &LocalRefScoutBudget,
+) -> Result<ReconcileOutcome, String> {
+    let checked_out = checked_out_worktrees(repository)?;
+
+    // The checked-out set: every linked-worktree HEAD branch plus the main
+    // repo's own current HEAD branch. Each is the P0 lane of some
+    // ProjectInstance and must never be ingested as a P1 ref lane.
+    let mut checked_out_refs: BTreeSet<String> = checked_out
+        .iter()
+        .filter_map(|w| w.head_ref.clone())
+        .collect();
+    if let Some(head_ref) = repository
+        .head()
+        .ok()
+        .filter(|head| head.is_branch())
+        .and_then(|head| head.name().ok().map(str::to_string))
+    {
+        checked_out_refs.insert(head_ref);
+    }
+
+    // Local branch refs by full refname (`refs/heads/<branch>`).
+    let mut local_branch_refs: Vec<String> = Vec::new();
+    let branches = repository
+        .branches(Some(git2::BranchType::Local))
+        .map_err(|err| format!("Error: local branches are unavailable: {err}."))?;
+    for branch in branches {
+        let (branch, _kind) =
+            branch.map_err(|err| format!("Error: a local branch entry is unreadable: {err}."))?;
+        if let Ok(name) = branch.get().name() {
+            local_branch_refs.push(name.to_string());
+        }
+    }
+    local_branch_refs.sort();
+
+    // Publish a P1 lane for every bare (non-checked-out) local branch.
+    let mut published: Vec<SourceId> = Vec::new();
+    for ref_name in &local_branch_refs {
+        if checked_out_refs.contains(ref_name) {
+            continue;
+        }
+        let source_id = ingest_and_publish_local_ref(
+            handle,
+            repository,
+            ref_name,
+            repository_id.clone(),
+            budget,
+        )?;
+        published.push(source_id);
+    }
+
+    // Reconcile deletions: drop any existing P1 ref lane for this repository
+    // whose branch is no longer a bare local branch (deleted or newly
+    // checked out). Reads a fresh snapshot so the lanes just published above
+    // are already visible.
+    let lane_prefix = format!("symforge:git-ref:{}:", repository_id.as_str());
+    let current = handle.published_source_set();
+    let mut removed: Vec<SourceId> = Vec::new();
+    for source_id in current.sources.keys() {
+        if source_id == &current.current_source_id {
+            continue;
+        }
+        if !source_id.as_str().starts_with("symforge:git-ref:") {
+            continue;
+        }
+        // Only reconcile lanes owned by THIS repository id; leave any other's.
+        let Some(ref_name) = source_id.as_str().strip_prefix(&lane_prefix) else {
+            continue;
+        };
+        let still_bare = local_branch_refs.iter().any(|branch| branch == ref_name)
+            && !checked_out_refs.contains(ref_name);
+        if !still_bare && handle.remove_ref_source(source_id) {
+            removed.push(source_id.clone());
+        }
+    }
+
+    Ok(ReconcileOutcome {
+        published,
+        removed,
+        checked_out,
+    })
 }
 
 #[cfg(test)]
@@ -1262,6 +1372,232 @@ mod tests {
         assert!(
             after.sources.contains_key(&current_id),
             "the current worktree lane stays present and queryable"
+        );
+    }
+
+    /// Create a fresh branch and check it out in a linked worktree at `path`.
+    fn add_worktree_on_branch(repository: &Repository, path: &Path, name: &str, branch: &str) {
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch(branch, &head_commit, false)
+            .expect("branch");
+        let reference = repository
+            .find_reference(&format!("refs/heads/{branch}"))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repository
+            .worktree(name, path, Some(&opts))
+            .expect("add worktree");
+    }
+
+    #[test]
+    fn reconcile_publishes_bare_branch_and_excludes_checked_out_worktree_branch() {
+        // L-G01: a checked-out linked-worktree branch stays a separate
+        // ProjectInstance's P0 lane and is never ingested as a P1 ref lane, while a
+        // bare local branch becomes a P1 ref lane (data-model.md:1258-1263).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let main_ref = repository
+            .head()
+            .expect("head")
+            .name()
+            .expect("head name")
+            .to_string();
+
+        // A bare local branch (no worktree) alongside a checked-out linked worktree.
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+        let wt_parent = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_parent.path().join("checked");
+        add_worktree_on_branch(&repository, &wt_path, "checked-wt", "checked");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-topology");
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("reconcile");
+
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+        let checked_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/checked",
+            repository_id.as_str()
+        ));
+        let main_id = SourceId::new(format!(
+            "symforge:git-ref:{}:{main_ref}",
+            repository_id.as_str()
+        ));
+
+        let set = handle.published_source_set();
+        assert!(
+            set.sources.contains_key(&bare_id),
+            "the bare branch gets a P1 lane"
+        );
+        assert!(
+            !set.sources.contains_key(&checked_id),
+            "the checked-out worktree branch is NOT a P1 lane"
+        );
+        assert!(
+            !set.sources.contains_key(&main_id),
+            "the current worktree HEAD (P0) is never a P1 lane"
+        );
+        assert!(outcome.published.contains(&bare_id));
+        assert!(!outcome.published.contains(&checked_id));
+        assert!(
+            outcome
+                .checked_out
+                .iter()
+                .any(|w| w.head_ref.as_deref() == Some("refs/heads/checked")),
+            "the checked-out worktree is surfaced for its own ProjectInstance routing"
+        );
+    }
+
+    #[test]
+    fn reconcile_removes_lane_for_deleted_branch_and_advances_registry() {
+        // L-R03: a ref lane whose branch was deleted is removed deterministically,
+        // and every source-map change advances registry_generation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("doomed", &head_commit, false)
+            .expect("branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-delete");
+        let doomed_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/doomed",
+            repository_id.as_str()
+        ));
+
+        let first = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            first.published.contains(&doomed_id),
+            "bare branch published"
+        );
+        let registry_after_publish = handle.published_source_set().registry_generation;
+        assert!(
+            handle
+                .published_source_set()
+                .sources
+                .contains_key(&doomed_id),
+            "the bare branch lane exists before deletion"
+        );
+
+        repository
+            .find_branch("doomed", git2::BranchType::Local)
+            .expect("find branch")
+            .delete()
+            .expect("delete branch");
+
+        let second = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("second reconcile");
+
+        assert!(
+            second.removed.contains(&doomed_id),
+            "the deleted branch's lane is removed"
+        );
+        let set = handle.published_source_set();
+        assert!(
+            !set.sources.contains_key(&doomed_id),
+            "the deleted branch's lane is gone"
+        );
+        assert!(
+            set.registry_generation > registry_after_publish,
+            "removing a lane advances registry_generation"
+        );
+    }
+
+    #[test]
+    fn reconcile_ingests_offline_with_no_remote_configured() {
+        // L-R05: local-ref ingestion needs no network. This fixture has NO git
+        // remote configured, so a successful reconcile proves no fetch is required.
+        //
+        // No Git/LFS subprocess is ever spawned during this path: the whole
+        // scout/ingest chain is libgit2 (git2, `vendored-libgit2`) FFI in-process —
+        // never `std::process::Command` — so there is no child process that could
+        // reach the network in the first place.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn offline() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("offline-ref", &head_commit, false)
+            .expect("branch");
+
+        assert!(
+            repository.remotes().expect("remotes").is_empty(),
+            "the fixture genuinely has no git remote"
+        );
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-offline");
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("offline reconcile succeeds without a remote");
+
+        let ref_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/offline-ref",
+            repository_id.as_str()
+        ));
+        assert!(
+            outcome.published.contains(&ref_id),
+            "the offline ref lane is published without any fetch"
+        );
+        assert!(
+            handle.published_source_set().sources[&ref_id]
+                .live
+                .files
+                .contains_key("src/lib.rs"),
+            "the offline ref lane is queryable"
         );
     }
 }

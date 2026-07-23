@@ -1459,10 +1459,9 @@ impl SharedIndexHandle {
     /// Same discipline as `publish_ref_source`: copy under the writer lock, remove
     /// only the named lane, bump `registry_generation`, swap once. The current
     /// source lane cannot be removed. Returns whether a lane was removed.
-    // ponytail: reconcile-remove half of the P1 contract, exercised by tests;
-    // the production caller is the ref-topology reconcile driver (L-R03), not
-    // yet wired. Drop this allow once that driver invalidates moved refs.
-    #[allow(dead_code)]
+    ///
+    /// Production caller: `reconcile_local_ref_topology` (L-G05/L-R03), which
+    /// invalidates the lane of a deleted or newly-checked-out branch.
     pub(crate) fn remove_ref_source(&self, source_id: &crate::domain::index::SourceId) -> bool {
         let _guard = self.write_mutex.lock();
         let current = self.published_source_set.load_full();

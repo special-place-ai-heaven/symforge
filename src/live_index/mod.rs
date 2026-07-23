@@ -19,6 +19,7 @@ pub mod search;
 pub mod store;
 pub mod trigram;
 pub mod view;
+pub mod worktree_topology;
 
 pub use query::{
     ContextBundleFoundView, ContextBundleReferenceView, ContextBundleSectionView,
