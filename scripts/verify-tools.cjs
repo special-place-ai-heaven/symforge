@@ -88,17 +88,22 @@ function grepOracle(pattern) {
 // byte-exact so a real regression still FAILs (proven by the over-mask check).
 //   - publication=/content=/generation=: monotonic per-publish counters.
 //   - budget-limited (was: full): token-budget truncation race on the envelope.
-//   - content_hash=/link_id=: for knowledge links that point INTO the snapshot
-//     files themselves (these fixtures self-reference), these hashes fold in the
-//     source's content-generation, so a golden that embeds them has no fixpoint
-//     (writing the hash changes the file, changing the hash). bytes=, the
-//     path:line target, counts, coverage, resolution, bridge_index and the whole
-//     outline stay byte-exact and carry the regression signal.
+//   - source=/content_hash=/link_id=: identity hashes that fold in the source
+//     ROOT BINDING (the absolute repo path -> differs Windows `E:\` vs Linux CI
+//     `/home/runner/...`) and, for links pointing INTO the snapshot files
+//     themselves (these fixtures self-reference), content-generation with no
+//     golden fixpoint. bytes=, the path:line target, counts, coverage,
+//     resolution, bridge_index and the whole outline stay byte-exact and carry
+//     the regression signal. (Snapshots are NOT rewritten to placeholders: the
+//     stored value is redacted here on BOTH sides at compare time, and leaving
+//     the file bytes unchanged preserves the self-referential byte-offset
+//     fixpoint.)
 function normalize(text) {
   return text
     .replace(/publication=\d+/g, "publication=<gen>")
     .replace(/content=\d+/g, "content=<gen>")
     .replace(/generation=\d+/g, "generation=<gen>")
+    .replace(/source=[0-9a-f]+/g, "source=<src>")
     .replace(/content_hash=[0-9a-f]+/g, "content_hash=<hash>")
     .replace(/link_id=[0-9a-f]+/g, "link_id=<id>")
     // Truncation footer's pre-truncation size estimate: computed over raw output
