@@ -771,14 +771,17 @@ pub fn reconcile_local_ref_topology(
         // deletion pass keeps the lane (its branch is still in `local_branch_refs`),
         // so skipping publish is safe. A branch tip we cannot resolve falls through
         // to a normal (re)publish attempt.
-        let current_tip = repository.refname_to_id(ref_name).ok().map(|oid| oid.to_string());
+        let current_tip = repository
+            .refname_to_id(ref_name)
+            .ok()
+            .map(|oid| oid.to_string());
         if let Some(tip) = current_tip.as_deref() {
             let unchanged = handle
                 .published_source_set()
                 .sources
                 .get(&source_id)
                 .and_then(|lane| lane.source_version.as_ref())
-                .map(|version| version.commit.as_deref() == Some(tip.as_str()))
+                .map(|version| version.commit.as_deref() == Some(tip))
                 .unwrap_or(false);
             if unchanged {
                 continue;
@@ -2361,7 +2364,12 @@ mod tests {
 
         let blob_oid = repository.blob(b"not a commit\n").expect("blob");
         repository
-            .reference("refs/heads/bare", blob_oid, true, "move branch to bad object")
+            .reference(
+                "refs/heads/bare",
+                blob_oid,
+                true,
+                "move branch to bad object",
+            )
             .expect("move branch ref");
 
         let second = reconcile_local_ref_topology(
