@@ -2109,7 +2109,12 @@ a push-CI gate); M-012 embedded-mode ("embed") gate GREEN (embed --lib 1282/0 �
 paths gated behind `feature="server"`, embed = principled no-watcher mode); M-013 feature-wide
 adversarial pass (Cursor Gate-M/AAP review; accepted blockers resolved). REMAINING MEASURED
 LIMITATION: M-004 corpus ≥50%-token-reduction is measurement-only — the A019 token oracles are
-contentious, so this is a documented measurement rather than a hard-enforced gate.
+contentious, so this is a documented measurement rather than a hard-enforced gate. Also (surfaced
+by the Kimi K3 Gate-M review): `clippy --no-default-features --features embed --all-targets` is RED
+because ~65 `tests/*.rs` integration binaries unconditionally reference server-only modules
+(`sidecar`/`watcher`/`daemon`/`protocol`); embed is exercised via `--lib` (the M-012 gate, green
+1283/0). A file-level `#![cfg(feature="server")]` guard on those test binaries would close it —
+tracked, not done.
 
 ---
 

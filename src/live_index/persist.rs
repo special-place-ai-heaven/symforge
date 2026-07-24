@@ -2208,6 +2208,21 @@ async fn background_verify_with_hook<F>(
         }
     }
 
+    // Under `embed` there is no watcher to re-parse the changed/new files that
+    // the stat-check detected in step 1, so fold them into the reported mismatch
+    // set. Freshness then resolves to `Degraded` (SnapshotVerificationFailed)
+    // rather than mislabeling unreconciled changes as `Current`. Under `server`
+    // those files were re-parsed above, so they are correctly not mismatches.
+    #[cfg(not(feature = "server"))]
+    let spot_mismatches = {
+        let mut mismatches = spot_mismatches;
+        mismatches.extend(stat_result.changed);
+        mismatches.extend(stat_result.new_files);
+        mismatches.sort();
+        mismatches.dedup();
+        mismatches
+    };
+
     if !index.mark_snapshot_verify_completed_at_fence(commit_fence, spot_mismatches) {
         return;
     }
@@ -3134,6 +3149,73 @@ mod tests {
                 assert_eq!(report.omitted_path_count(), 0);
             }
             other => panic!("expected completed snapshot verify report, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "server"))]
+    #[tokio::test]
+    async fn test_background_verify_embed_folds_stat_changed_into_mismatches() {
+        // Embed contract (no watcher): a file the stat-check flags as changed must
+        // degrade freshness even when the 10% content-hash spot sample would clear
+        // it. Isolate the stat-only path — identical content on disk and in the
+        // snapshot (so spot_verify sees no mismatch), but the recorded snapshot
+        // mtime is older than the on-disk mtime (so stat_check flags it changed).
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("src").join("main.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"fn main() {}\n").unwrap();
+        let disk_mtime = std::fs::metadata(&file_path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
+        let mut index = make_live_index_with_files(vec![("src/main.rs", b"fn main() {}\n")]);
+        index.files.insert(
+            "src/main.rs".to_string(),
+            Arc::new(make_indexed_file("src/main.rs", b"fn main() {}\n")),
+        );
+        serialize_index(&index, tmp.path()).expect("serialize should succeed");
+
+        let snapshot = load_snapshot(tmp.path()).expect("snapshot should load");
+        let mut snapshot_mtimes = snapshot
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.mtime_secs))
+            .collect::<HashMap<_, _>>();
+        // `build_snapshot` re-stats the disk mtime, so the recorded mtime currently
+        // equals the on-disk mtime. Force it OLDER so `stat_check_files_from_view`
+        // reports the file as changed while the byte-identical content keeps the
+        // spot sample clean — isolating the embed-only fold-in path.
+        snapshot_mtimes.insert("src/main.rs".to_string(), disk_mtime.saturating_sub(1_000));
+
+        let loaded = snapshot_to_live_index(snapshot, tmp.path());
+        let shared = crate::live_index::SharedIndexHandle::shared(loaded);
+
+        background_verify(shared.clone(), tmp.path().to_path_buf(), snapshot_mtimes).await;
+
+        let published = shared.published_state();
+        match &published.snapshot_verify_state {
+            SnapshotVerifyState::Completed(report) => {
+                assert!(
+                    report.mismatched_paths.contains(&"src/main.rs".to_string()),
+                    "stat-changed file must be folded into mismatches under embed, got {:?}",
+                    report.mismatched_paths
+                );
+            }
+            other => panic!("expected completed snapshot verify report, got {other:?}"),
+        }
+
+        match &*shared.freshness_status() {
+            crate::domain::FreshnessStatus::Degraded { reason_codes, .. } => {
+                assert!(
+                    reason_codes
+                        .contains(&crate::domain::FreshnessReason::SnapshotVerificationFailed),
+                    "expected SnapshotVerificationFailed, got {reason_codes:?}"
+                );
+            }
+            other => panic!("expected Degraded freshness under embed, got {other:?}"),
         }
     }
 
