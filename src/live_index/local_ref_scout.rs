@@ -560,6 +560,34 @@ fn purge_repo_ref_lanes(handle: &SharedIndexHandle, repository_id: &RepositoryId
     }
 }
 
+fn fail_closed_topology_error(
+    handle: &SharedIndexHandle,
+    repository_id: &RepositoryId,
+    message: String,
+) -> String {
+    purge_repo_ref_lanes(handle, repository_id);
+    message
+}
+
+fn remove_failed_ref_lane_if_stale(
+    handle: &SharedIndexHandle,
+    source_id: &SourceId,
+    current_tip: Option<&str>,
+) -> bool {
+    let published = handle.published_source_set();
+    let Some(lane) = published.sources.get(source_id) else {
+        return false;
+    };
+    let published_tip = lane
+        .source_version
+        .as_ref()
+        .and_then(|version| version.commit.as_deref());
+    if current_tip.is_some_and(|tip| published_tip == Some(tip)) {
+        return false;
+    }
+    handle.remove_ref_source(source_id)
+}
+
 /// Reconcile the local branch/worktree topology into P1 ref lanes (L-G05/L-R03).
 ///
 /// A P1 ref lane is published for every *bare* local branch — a local branch
@@ -593,7 +621,8 @@ pub fn reconcile_local_ref_topology(
         });
     };
 
-    let checked_out = checked_out_worktrees(repository)?;
+    let checked_out = checked_out_worktrees(repository)
+        .map_err(|error| fail_closed_topology_error(handle, &repository_id, error))?;
 
     // Fail CLOSED (finding E): a worktree that validated but whose HEAD could not
     // be resolved leaves us unable to prove which branch it holds. Since ANY
@@ -700,10 +729,21 @@ pub fn reconcile_local_ref_topology(
     let mut local_branch_refs: Vec<String> = Vec::new();
     let branches = repository
         .branches(Some(git2::BranchType::Local))
-        .map_err(|err| format!("Error: local branches are unavailable: {err}."))?;
+        .map_err(|err| {
+            fail_closed_topology_error(
+                handle,
+                &repository_id,
+                format!("Error: local branches are unavailable: {err}."),
+            )
+        })?;
     for branch in branches {
-        let (branch, _kind) =
-            branch.map_err(|err| format!("Error: a local branch entry is unreadable: {err}."))?;
+        let (branch, _kind) = branch.map_err(|err| {
+            fail_closed_topology_error(
+                handle,
+                &repository_id,
+                format!("Error: a local branch entry is unreadable: {err}."),
+            )
+        })?;
         if let Ok(name) = branch.get().name() {
             local_branch_refs.push(name.to_string());
         }
@@ -717,11 +757,13 @@ pub fn reconcile_local_ref_topology(
     // pass below must still reconcile every branch whose ref is gone/checked-out,
     // so one broken branch cannot strand stale lanes for the others.
     let mut published: Vec<SourceId> = Vec::new();
+    let mut removed: Vec<SourceId> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
     for ref_name in &local_branch_refs {
         if checked_out_refs.contains(ref_name) {
             continue;
         }
+        let source_id = SourceId::new(format!("{lane_prefix}{ref_name}"));
         // Finding S1: skip the full materialize+parse republish when this branch
         // tip has not moved since its lane was last published. `build_ref_source_
         // generation` already carries `content_generation` forward on an
@@ -729,9 +771,8 @@ pub fn reconcile_local_ref_topology(
         // deletion pass keeps the lane (its branch is still in `local_branch_refs`),
         // so skipping publish is safe. A branch tip we cannot resolve falls through
         // to a normal (re)publish attempt.
-        if let Ok(oid) = repository.refname_to_id(ref_name) {
-            let tip = oid.to_string();
-            let source_id = SourceId::new(format!("{lane_prefix}{ref_name}"));
+        let current_tip = repository.refname_to_id(ref_name).ok().map(|oid| oid.to_string());
+        if let Some(tip) = current_tip.as_deref() {
             let unchanged = handle
                 .published_source_set()
                 .sources
@@ -751,7 +792,12 @@ pub fn reconcile_local_ref_topology(
             budget,
         ) {
             Ok(source_id) => published.push(source_id),
-            Err(error) => failed.push((ref_name.clone(), error)),
+            Err(error) => {
+                if remove_failed_ref_lane_if_stale(handle, &source_id, current_tip.as_deref()) {
+                    removed.push(source_id);
+                }
+                failed.push((ref_name.clone(), error));
+            }
         }
     }
 
@@ -761,7 +807,6 @@ pub fn reconcile_local_ref_topology(
     // failure above never skips it. Reads a fresh snapshot so the lanes just
     // published above are already visible.
     let current = handle.published_source_set();
-    let mut removed: Vec<SourceId> = Vec::new();
     for source_id in current.sources.keys() {
         if source_id == &current.current_source_id {
             continue;
@@ -2277,6 +2322,75 @@ mod tests {
     }
 
     #[test]
+    fn moved_ref_publish_failure_removes_previous_lane() {
+        // A branch whose tip moves but cannot be rebuilt must fail closed by
+        // removing the old lane; otherwise source_scope=local_refs keeps serving
+        // content from the previous commit as if it still described the branch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-stale-tip");
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+
+        reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            handle.published_source_set().sources.contains_key(&bare_id),
+            "the bare lane is published before the ref moves"
+        );
+
+        let blob_oid = repository.blob(b"not a commit\n").expect("blob");
+        repository
+            .reference("refs/heads/bare", blob_oid, true, "move branch to bad object")
+            .expect("move branch ref");
+
+        let second = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("publish failure is collected, not fatal");
+
+        assert!(
+            second
+                .failed
+                .iter()
+                .any(|(name, _)| name == "refs/heads/bare"),
+            "the moved bad ref's publish failure is reported: {:?}",
+            second.failed
+        );
+        assert!(
+            second.removed.contains(&bare_id),
+            "the previous lane for the moved bad ref is invalidated"
+        );
+        assert!(
+            !handle.published_source_set().sources.contains_key(&bare_id),
+            "the stale lane is not left queryable after the tip moved"
+        );
+    }
+
+    #[test]
     fn reconcile_from_a_linked_worktree_excludes_the_main_worktree_branch() {
         // Finding D2 (L-G01): when the project is opened AT a linked worktree,
         // `repository.head()` is the WORKTREE's HEAD — the MAIN worktree's
@@ -2334,6 +2448,63 @@ mod tests {
         assert!(
             !set.sources.contains_key(&feature_id),
             "the linked worktree's own branch is also not a P1 lane"
+        );
+    }
+
+    #[test]
+    fn worktree_topology_read_error_purges_existing_ref_lanes() {
+        // If topology cannot be enumerated at all, no existing P1 lane can be
+        // proven still bare. Purge instead of returning early and serving stale
+        // ref snapshots under local_refs/all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-topology-error");
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+
+        reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            handle.published_source_set().sources.contains_key(&bare_id),
+            "the bare lane is published on the clean pass"
+        );
+
+        std::fs::write(repository.path().join("worktrees"), b"not a directory")
+            .expect("corrupt worktrees listing path");
+        let result = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "unreadable topology should fail closed, got {result:?}"
+        );
+        assert!(
+            !handle.published_source_set().sources.contains_key(&bare_id),
+            "the old ref lane is purged when topology cannot be read"
         );
     }
 
