@@ -125,7 +125,16 @@ async fn concurrent_range_reads_under_staleness_do_not_hang() {
 
     let join = async {
         for h in handles {
-            let _ = h.await.expect("task panicked");
+            let out = h.await.expect("task panicked");
+            // Mirror the fresh test (assert real content, not just non-hang).
+            // The substring is common to the pre-reconcile (`...document`) and
+            // post-reconcile (`...document v2`) bodies, so it tolerates a read
+            // racing the concurrent reindex without pinning a specific version.
+            assert!(
+                out.contains("concurrency fixture document"),
+                "each concurrent stale range read must return real fixture content \
+                 (pre- or post-reconcile), never empty/garbage; got:\n{out}"
+            );
         }
     };
 

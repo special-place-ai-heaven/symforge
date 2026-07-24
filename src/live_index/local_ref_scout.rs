@@ -1548,6 +1548,9 @@ mod tests {
         );
     }
 
+    // Server-only: composes `crate::protocol` knowledge search, which is gated
+    // behind `feature = "server"` and absent from the embed build.
+    #[cfg(feature = "server")]
     #[test]
     fn search_scoped_composes_local_ref_lane_and_reports_typed_empty_worktrees() {
         use crate::protocol::knowledge_search::search_scoped;
@@ -1602,6 +1605,9 @@ mod tests {
         assert!(all.contains("ref:HEAD"), "{all}");
     }
 
+    // Server-only: composes `crate::protocol` knowledge review, which is gated
+    // behind `feature = "server"` and absent from the embed build.
+    #[cfg(feature = "server")]
     #[test]
     fn review_scoped_composes_local_ref_lane_and_reports_typed_empty_worktrees() {
         use crate::protocol::knowledge_review::review_scoped;
@@ -1668,6 +1674,9 @@ mod tests {
         );
     }
 
+    // Server-only: uses `crate::protocol` scoped-source selection, which is
+    // gated behind `feature = "server"` and absent from the embed build.
+    #[cfg(feature = "server")]
     #[test]
     fn all_scope_lists_current_lane_before_ref_lanes() {
         // L-R01: current worktree outranks a divergent ref (ordered first).
@@ -2801,6 +2810,9 @@ mod tests {
         );
     }
 
+    // Server-only: drives the `crate::protocol` scoped search/review
+    // composition, gated behind `feature = "server"` (absent from embed).
+    #[cfg(feature = "server")]
     #[test]
     fn source_isolation_holds_through_scoped_query_composition() {
         // L-R08 (finding H): source isolation must hold through the actual search/

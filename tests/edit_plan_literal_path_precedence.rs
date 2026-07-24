@@ -78,11 +78,12 @@ fn edit_plan_existing_literal_path_beats_extension_symbol_collision() {
         ("docs/notes.md", "md"),
         ("types/foo.d.ts", "ts"),
     ] {
-        // Skip cases whose file type is not indexed in this environment — only
-        // the ones that produced a real file entry can be asserted.
-        if !indexed.iter().any(|p| p == target) {
-            continue;
-        }
+        // Every named case must be a real indexed file — a skipped case is a
+        // silently vacuous assertion, so fail loudly if the fixture regressed.
+        assert!(
+            indexed.iter().any(|p| p == target),
+            "fixture invalid: named case {target:?} not indexed; files: {indexed:?}"
+        );
         let plan = plan_edit(&index, &temporal, target);
 
         assert!(
@@ -97,4 +98,85 @@ fn edit_plan_existing_literal_path_beats_extension_symbol_collision() {
              Plan:\n{plan}"
         );
     }
+}
+
+/// AAP-001 defect 1: a path-shaped basename (`notes.md`) that matches several
+/// files by trailing segment must pick a DETERMINISTIC winner (sorted-first)
+/// and report the ambiguity — never a HashMap-iteration-order coin flip.
+#[test]
+fn edit_plan_ambiguous_basename_is_deterministic() {
+    let dir = TempDir::new().expect("tempdir");
+    write_file(dir.path(), "docs/notes.md", "# Docs\n\nDocs body.\n");
+    write_file(
+        dir.path(),
+        "archive/notes.md",
+        "# Archive\n\nArchive body.\n",
+    );
+
+    let shared = LiveIndex::load(dir.path()).expect("LiveIndex::load failed");
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let indexed: Vec<String> = index.all_files().map(|(p, _)| p.to_string()).collect();
+    for expected in ["docs/notes.md", "archive/notes.md"] {
+        assert!(
+            indexed.iter().any(|p| p == expected),
+            "fixture invalid: {expected} not indexed; files: {indexed:?}"
+        );
+    }
+
+    // `archive/notes.md` sorts before `docs/notes.md`, so it is the stable pick.
+    let plan = plan_edit(&index, &temporal, "notes.md");
+    assert!(
+        plan.contains("Found file: archive/notes.md"),
+        "ambiguous basename must resolve deterministically to the sorted-first \
+         path. Plan:\n{plan}"
+    );
+    assert!(
+        plan.contains("Ambiguous file target 'notes.md'"),
+        "an ambiguous basename must surface the ambiguity, not a silent pick. \
+         Plan:\n{plan}"
+    );
+    // Determinism: repeated calls (each re-iterating the HashMap) must agree.
+    for _ in 0..8 {
+        assert_eq!(
+            plan_edit(&index, &temporal, "notes.md"),
+            plan,
+            "ambiguous-basename resolution must be stable across calls"
+        );
+    }
+}
+
+/// AAP-001 defect 2: a BARE identifier (`agents`, no `.`/`/`) that merely
+/// suffix-matches an extensionless file (`tools/agents`) must NOT short-circuit
+/// to the file plan — it must run the symbol cascade so `fn agents` is reached.
+#[test]
+fn edit_plan_bare_target_reaches_symbol_over_extensionless_file() {
+    let dir = TempDir::new().expect("tempdir");
+    write_file(dir.path(), "src/lib.rs", "fn agents() {}\n");
+    // `agents` is a recognized extensionless narrative basename → indexed as
+    // Text, so its path (`tools/agents`) is a real trailing-segment suffix.
+    write_file(dir.path(), "tools/agents", "team roster\n");
+
+    let shared = LiveIndex::load(dir.path()).expect("LiveIndex::load failed");
+    let index = shared.read();
+    let temporal = empty_temporal();
+
+    let indexed: Vec<String> = index.all_files().map(|(p, _)| p.to_string()).collect();
+    assert!(
+        indexed.iter().any(|p| p == "tools/agents"),
+        "fixture invalid: extensionless tools/agents not indexed; files: {indexed:?}"
+    );
+
+    let plan = plan_edit(&index, &temporal, "agents");
+    assert!(
+        plan.contains("agents in src/lib.rs"),
+        "bare target must reach the `fn agents` symbol, not be suppressed by the \
+         extensionless file `tools/agents`. Plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Found file: tools/agents"),
+        "bare target must not short-circuit to the extensionless-file plan. \
+         Plan:\n{plan}"
+    );
 }

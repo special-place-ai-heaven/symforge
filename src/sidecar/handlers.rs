@@ -860,11 +860,10 @@ async fn impact_text(
     }
 
     let should_auto_index_new_file = {
-        let extension = std::path::Path::new(&normalized_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let is_supported = crate::domain::LanguageId::from_extension(extension).is_some();
+        // AAP-002: `from_path` (not `from_extension`) so extensionless narrative
+        // entry points and dotfiles (README, .env, .gitignore) auto-index the
+        // same way discovery admits them.
+        let is_supported = crate::domain::LanguageId::from_path(&normalized_path).is_some();
         let indexed = {
             let guard = state.index.read();
             guard.get_file(&normalized_path).is_some()
@@ -908,16 +907,13 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
     // SF-AAP-002 is scoped to genuinely NON-PARSER files (no code parser exists
     // for the type — the artifact/binary case). A parser-supported file demoted
     // for SIZE is NOT this case: it keeps the honest oversize refusal that
-    // impact_admission (a frozen behavioral contract) pins. `from_extension` is
-    // the same parser-support signal impact_text uses for auto-indexing, so the
-    // wording stays truthful in both branches.
-    // ponytail: extension-based; a content-detected Text file at Tier-2 would read
-    // as non-parser, but such files index at Tier-1 and never reach here.
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let has_code_parser = crate::domain::LanguageId::from_extension(extension).is_some();
+    // impact_admission (a frozen behavioral contract) pins. `from_path` is the
+    // same parser-support signal impact_text uses for auto-indexing (and that
+    // discovery admits by), so the wording stays truthful in both branches.
+    // AAP-002: `from_path` (not `from_extension`) recognizes extensionless
+    // Text/Env entry points (README, .env, .gitignore) as parser-supported, so a
+    // demoted one keeps the oversize refusal; `.bin` still reads as non-parser.
+    let has_code_parser = crate::domain::LanguageId::from_path(path).is_some();
 
     if has_code_parser {
         return format!(

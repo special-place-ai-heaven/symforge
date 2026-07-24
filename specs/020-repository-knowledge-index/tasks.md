@@ -787,9 +787,17 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 - [x] M-009 Run `cargo check --features server`. (subsumed by clippy --all-targets --features server, clean)
 - [x] M-010 Run `cargo clippy --all-targets --features server -- -D warnings`. (clean throughout, last at HEAD 40d6250)
 - [x] M-011 Run focused suites and serial server all-target suite. (single clean run: 113 test binaries, 0 failed, 0 panics across lib + all integration targets at HEAD 40d6250; also a push-CI gate.)
-- [ ] M-012 Run exact embed gate.
-- [ ] M-013 Run adversarial implementation review; resolve accepted blockers.
-- [ ] M-014 Update `tasks/todo.md` review/evidence and measured limitations.
+- [x] M-012 Run exact embed gate. (GREEN: `cargo test --no-default-features --features embed
+  --lib` = 1282 passed/0 failed; was RED with 13 compile errors. Watcher/protocol-dependent
+  paths in `persist.rs`/`local_ref_scout.rs` gated behind `#[cfg(feature="server")]` — server
+  byte-identical, embed = principled no-watcher mode.)
+- [x] M-013 Run adversarial implementation review; resolve accepted blockers. (Cursor Gate-M/AAP
+  review — briefs `GATE-M-REVIEW.md` + `gate-m-review-cursor-2026-07-24.md`; accepted blockers
+  resolved this commit: edit_plan ambiguous-path determinism + bare-symbol cascade [AAP-001],
+  `from_path` parity [AAP-002], M-002/AAP-003 test strengthening.)
+- [x] M-014 Update `tasks/todo.md` review/evidence and measured limitations. (`tasks/todo.md`
+  "Gate M evidence + measured limitations (M-014)"; accepted proxies for retry/bridge-version/
+  in-flight documented; remaining measured limitation = M-004 token reduction is measurement-only.)
 - [x] M-015 Verify every delegated worker is stopped and left no child process tree.
   (as_of 2026-07-24: `git worktree list` = main only, no stray worktrees; no orphaned
   cargo/rustc from any delegated agent; the running `symforge.exe`/`node.exe` are the live

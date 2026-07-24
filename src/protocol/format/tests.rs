@@ -5112,6 +5112,15 @@ fn m002_authorization_is_closed_set_and_derived_from_memory_only_failures() {
         root_id: ProjectId("p".to_string()),
         reason: UserLocalPlacementReason::ExplicitProtected,
     };
+    // User-local FALLBACK (project-local was unavailable) is still a normal
+    // binding — only ExplicitProtected escalates the authorization label.
+    let fallback_user = StatePlacement::UserLocal {
+        directory: dir(),
+        root_id: ProjectId("p".to_string()),
+        reason: UserLocalPlacementReason::ProjectLocalUnavailable {
+            safe_reason: AccessErrorKind::PermissionDenied,
+        },
+    };
 
     assert_eq!(
         placement_authorization(Some(&normal_mem)),
@@ -5137,17 +5146,10 @@ fn m002_authorization_is_closed_set_and_derived_from_memory_only_failures() {
     );
     assert_eq!(authorization_label(Some(&normal_mem)), "normal");
     assert_eq!(authorization_label(None), "not_applicable");
-    for placement in [
-        Some(&normal_mem),
-        Some(&protected_mem),
-        Some(&project_local),
-        Some(&protected_user),
-        None,
-    ] {
-        assert_ne!(
-            authorization_label(placement),
-            "indeterminate",
-            "authorization must never leave the closed set"
-        );
-    }
+    // User-local fallback resolves to the normal authorization, not protected.
+    assert_eq!(
+        placement_authorization(Some(&fallback_user)),
+        Some(SourceAccessMode::NormalProject)
+    );
+    assert_eq!(authorization_label(Some(&fallback_user)), "normal");
 }

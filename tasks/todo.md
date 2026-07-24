@@ -2104,10 +2104,12 @@ M-003/005/006/007; `18a237d` M-015.
   **M-007** memory-only checkpoint = typed persistence_unavailable + applied=false. **M-015**
   no leaked workers/worktrees. **M-008/009/010** fmt/check/clippy green throughout (lib 3012/0/4).
 
-MEASURED LIMITATIONS / open Gate-M items: M-011 serial all-target suite (also a push-CI gate);
-M-004 corpus ≥50%-token-reduction measurement (A019 token oracles are contentious — may be a
-documented limitation rather than a clean pass); M-012 embedded-mode ("embed") gate;
-M-013 feature-wide adversarial pass (Cursor already reviewed the M-001 health surface).
+CLOSED with the final Gate-M commit: M-011 serial all-target suite (113 binaries, 0 failed; also
+a push-CI gate); M-012 embedded-mode ("embed") gate GREEN (embed --lib 1282/0 — watcher/protocol
+paths gated behind `feature="server"`, embed = principled no-watcher mode); M-013 feature-wide
+adversarial pass (Cursor Gate-M/AAP review; accepted blockers resolved). REMAINING MEASURED
+LIMITATION: M-004 corpus ≥50%-token-reduction is measurement-only — the A019 token oracles are
+contentious, so this is a documented measurement rather than a hard-enforced gate.
 
 ---
 

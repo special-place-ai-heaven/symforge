@@ -2124,6 +2124,7 @@ async fn background_verify_with_hook<F>(
     let Some(mut commit_fence) = index.mark_snapshot_verify_running_at_fence(captured_base) else {
         return;
     };
+    #[cfg(feature = "server")]
     let expected_gen = commit_fence.project_generation;
 
     // 1. Stat-check all files (fast: just metadata reads)
@@ -2147,24 +2148,33 @@ async fn background_verify_with_hook<F>(
         }
     }
 
-    // 3. Re-parse changed files
-    let to_reparse: Vec<String> = stat_result
-        .changed
-        .into_iter()
-        .chain(stat_result.new_files)
-        .collect();
+    // 3. Re-parse changed files. Reindexing routes through the watcher's
+    //    admission path; embed has no watcher, so changed/new files are
+    //    detected but not re-parsed here (reconciliation is server-only).
+    #[cfg(feature = "server")]
+    {
+        let to_reparse: Vec<String> = stat_result
+            .changed
+            .into_iter()
+            .chain(stat_result.new_files)
+            .collect();
 
-    for rel_path in &to_reparse {
-        if !index.matches_publication_fence(commit_fence) {
-            return;
+        for rel_path in &to_reparse {
+            if !index.matches_publication_fence(commit_fence) {
+                return;
+            }
+            let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let _ = crate::watcher::admit_and_index_single_path(
+                rel_path,
+                &abs_path,
+                &index,
+                expected_gen,
+            );
+            if index.current_project_generation() != expected_gen {
+                return;
+            }
+            commit_fence = index.publication_fence();
         }
-        let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let _ =
-            crate::watcher::admit_and_index_single_path(rel_path, &abs_path, &index, expected_gen);
-        if index.current_project_generation() != expected_gen {
-            return;
-        }
-        commit_fence = index.publication_fence();
     }
 
     // 4. Spot-verify sample (10%) for content hash mismatches
@@ -2176,18 +2186,26 @@ async fn background_verify_with_hook<F>(
 
     let spot_count = spot_mismatches.len();
 
-    // Re-parse spot-check mismatches
-    for rel_path in &spot_mismatches {
-        if !index.matches_publication_fence(commit_fence) {
-            return;
+    // Re-parse spot-check mismatches (server-only; see step 3 — embed reports
+    // detected mismatches but has no watcher to re-parse them).
+    #[cfg(feature = "server")]
+    {
+        for rel_path in &spot_mismatches {
+            if !index.matches_publication_fence(commit_fence) {
+                return;
+            }
+            let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let _ = crate::watcher::admit_and_index_single_path(
+                rel_path,
+                &abs_path,
+                &index,
+                expected_gen,
+            );
+            if index.current_project_generation() != expected_gen {
+                return;
+            }
+            commit_fence = index.publication_fence();
         }
-        let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let _ =
-            crate::watcher::admit_and_index_single_path(rel_path, &abs_path, &index, expected_gen);
-        if index.current_project_generation() != expected_gen {
-            return;
-        }
-        commit_fence = index.publication_fence();
     }
 
     if !index.mark_snapshot_verify_completed_at_fence(commit_fence, spot_mismatches) {
@@ -2762,6 +2780,9 @@ mod tests {
         assert_eq!(ready.authority.records, before_ready.authority.records);
     }
 
+    // Server-only: exercises the watcher admission reparse path, which the embed
+    // build (no watcher) does not run.
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn background_verify_uses_shared_admission_for_large_new_file() {
         let tmp = TempDir::new().unwrap();
@@ -2798,6 +2819,9 @@ mod tests {
         );
     }
 
+    // Server-only: drives the watcher admission + reconcile paths directly, which
+    // the embed build (no watcher) does not compile.
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn cold_watch_reconcile_and_background_verify_have_identical_knowledge_units_and_dispositions()
      {
