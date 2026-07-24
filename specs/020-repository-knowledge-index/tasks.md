@@ -773,9 +773,9 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
   `tools::tests::test_checkpoint_now_memory_only_is_typed_persistence_unavailable_not_error` — bound
   root, no state placement; asserts `persistence_unavailable`+`applied=false`, not the hard-error branch;
   the `-> String` handler makes "not an Err/protocol error" structural.)
-- [ ] M-008 Run `cargo fmt --check`.
-- [ ] M-009 Run `cargo check --features server`.
-- [ ] M-010 Run `cargo clippy --all-targets --features server -- -D warnings`.
+- [x] M-008 Run `cargo fmt --check`. (green throughout; last confirmed at HEAD 40d6250)
+- [x] M-009 Run `cargo check --features server`. (subsumed by clippy --all-targets --features server, clean)
+- [x] M-010 Run `cargo clippy --all-targets --features server -- -D warnings`. (clean throughout, last at HEAD 40d6250)
 - [x] M-011 Run focused suites and serial server all-target suite. (single clean run: 113 test binaries, 0 failed, 0 panics across lib + all integration targets at HEAD 40d6250; also a push-CI gate.)
 - [ ] M-012 Run exact embed gate.
 - [ ] M-013 Run adversarial implementation review; resolve accepted blockers.
