@@ -780,7 +780,10 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 - [ ] M-012 Run exact embed gate.
 - [ ] M-013 Run adversarial implementation review; resolve accepted blockers.
 - [ ] M-014 Update `tasks/todo.md` review/evidence and measured limitations.
-- [ ] M-015 Verify every delegated worker is stopped and left no child process tree.
+- [x] M-015 Verify every delegated worker is stopped and left no child process tree.
+  (as_of 2026-07-24: `git worktree list` = main only, no stray worktrees; no orphaned
+  cargo/rustc from any delegated agent; the running `symforge.exe`/`node.exe` are the live
+  MCP daemon + Claude Code infrastructure, not agent child processes.)
 
 ## Dependencies
 
