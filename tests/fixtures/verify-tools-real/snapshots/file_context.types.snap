@@ -50,4 +50,15 @@ Imports from (5 sources):
   serde_json::Value (1 symbols)
   serde_json::json (1 symbols)
 
-~4780 tokens vs whole-file read; ~523 tokens vs ~50-line windowed read (competent-manual baseline)
+Knowledge evidence:
+  source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e publication=<gen> content=<gen> target=file:src/types.rs
+  counts total=6 shown=5 overflow=1 ambiguous=0 missing=0
+  coverage bridge=complete authority=complete
+  1. cases.jsonl:7 bytes=1990..2002 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=1 resolution=resolved_exact lifecycle=active voice=unknown
+  2. cases.jsonl:8 bytes=2269..2281 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=2 resolution=resolved_exact lifecycle=active voice=unknown
+  3. snapshots/file_context.types.snap:2 bytes=58..70 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=10 resolution=resolved_exact lifecycle=active voice=unknown
+  4. snapshots/file_context.types.snap:3 bytes=109..121 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=11 resolution=resolved_exact lifecycle=active voice=unknown
+  5. snapshots/file_context.types.snap:5 bytes=131..143 content_hash=<hash> source=5190313ba7f36ed7f2a148310f805650ab5bc2276e8cccba75a60a11334ffc5e generation=<gen> link_id=<id> bridge_index=12 resolution=resolved_exact lifecycle=active voice=unknown
+
+
+[truncated] Truncated at ~1000 tokens. Original output is ~<n> tokens; budget is 1000 tokens.
