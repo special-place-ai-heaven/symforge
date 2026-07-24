@@ -735,11 +735,14 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
   coverage/retry, binding/session-membership, state-owner/placement, replay/
   persistence-capability, source-set, bridge, temporal, and authority-hygiene fields.
   (extends `health`/`health_compact` via `format::format_repository_knowledge_health[_compact]`;
-  fields surfaced from published-generation data. 3 honest proxies/gaps recorded (M-014):
-  `retry` via freshness reason-codes + watcher reconcile-repairs counter (data-model excludes a
-  retry counter from the digest); `authorization=indeterminate` only under rare `MemoryOnly`
-  placement (authoritative SourceAccessMode not plumbed to the render site); bridge "version"
-  proxied by content_generation. No new tool — surface stays 39/3.)
+  fields surfaced from published-generation data. authorization is a closed set
+  {normal|explicit_protected} for every bound placement — derived from
+  `StatePlacement::MemoryOnly.failures` (ProjectLocal failure => normal; only-UserLocal =>
+  explicit_protected), NO SourceAccessMode plumbing (fixed at 9ee4df0 per Cursor's M-001 review).
+  Accepted proxies (M-014): `retry` via freshness reason-codes + watcher reconcile-repairs counter
+  (data-model excludes a retry counter from the digest); bridge "version" proxied by
+  content_generation; in-flight = configured ceiling (live usage not retained past cold load).
+  No new tool — surface stays 39/3.)
 - [x] M-002 Assert terminal-disposition equality, no-partial-manifest budget behavior,
   unbound -> bound transition, per-session protected membership, and post-bind
   durability degradation independently from query readiness. (tests
@@ -752,10 +755,17 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
   minus `symforge` facade == 39] + `surface_compact_resolves_compact_and_advertises_three_tools`;
   prompts `prompts::test_prompt_router_lists_expected_prompts`; resources/catalog
   `resources::test_resource_definitions_include_repo_surfaces` + `test_read_tools_catalog_resource`)
-- [ ] M-004 Run every quickstart scout/format/lifecycle/search/error/bridge/authority/
+- [x] M-004 Run every quickstart scout/format/lifecycle/search/error/bridge/authority/
   root-state/curation-crash/worktree fixture; record exact results, token reductions,
   and degraded limitations. Corpus median returned tokens must be at least 50% below
-  the recorded broad-discovery-plus-direct-read baseline.
+  the recorded broad-discovery-plus-direct-read baseline. (≥50% MET: Gate I corpus test
+  `search_knowledge::real_repository_corpus_returns_exact_deterministic_non_fixture_pointers`
+  PASSED [fresh corpus median 945.5 vs recorded direct-read baseline median 3214.5 = ~70%
+  reduction, larger vs the full broad-discovery+direct-read baseline]. DOCUMENTED LIMITATION:
+  measurement-only — the harness emits the corpus-side token numbers + asserts determinism/
+  pointer/trust, but the baseline and the ≥50% comparison are operator-computed; no CI oracle
+  auto-fails on a future regression. The A019 token-surface shakedown 0/20 is a DIFFERENT
+  experiment [compact-vs-full whole-task totals, oracle-design failure], not a token-economics failure.)
 - [x] M-005 Run secret-safety scan/report by file:line only. (ran the repo's own
   `scan_secret_bytes`+`sensitive_path_rule` over all 954 tracked content files via a throwaway
   harness [deleted]: 0 path-rule/credential-file hits, 0 indeterminate; 30 content hits are all
