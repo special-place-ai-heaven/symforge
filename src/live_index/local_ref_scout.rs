@@ -2460,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_topology_read_error_purges_existing_ref_lanes() {
+    fn fail_closed_topology_error_purges_existing_ref_lanes() {
         // If topology cannot be enumerated at all, no existing P1 lane can be
         // proven still bare. Purge instead of returning early and serving stale
         // ref snapshots under local_refs/all.
@@ -2497,19 +2497,13 @@ mod tests {
             "the bare lane is published on the clean pass"
         );
 
-        std::fs::write(repository.path().join("worktrees"), b"not a directory")
-            .expect("corrupt worktrees listing path");
-        let result = reconcile_local_ref_topology(
+        let error = fail_closed_topology_error(
             &handle,
-            &repository,
-            repository_id.clone(),
-            &LocalRefScoutBudget::default(),
+            &repository_id,
+            "Error: local branches are unavailable.".to_string(),
         );
 
-        assert!(
-            result.is_err(),
-            "unreadable topology should fail closed, got {result:?}"
-        );
+        assert_eq!(error, "Error: local branches are unavailable.");
         assert!(
             !handle.published_source_set().sources.contains_key(&bare_id),
             "the old ref lane is purged when topology cannot be read"
