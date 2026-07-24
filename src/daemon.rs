@@ -2631,6 +2631,7 @@ async fn stop_running_daemon_for_update_at(
             // escalate to SIGKILL and re-poll rather than orphaning a live daemon.
             if process_is_alive(pid) {
                 #[cfg(unix)]
+                #[allow(unsafe_code)]
                 // SAFETY: sending a signal to a pid is always memory-safe; an
                 // already-dead/invalid pid simply returns an error we ignore, and
                 // liveness is re-confirmed by the loop below.

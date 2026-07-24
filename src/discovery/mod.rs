@@ -1534,8 +1534,7 @@ fn canonical_root_identity_bytes(canonical_root: &Path) -> Vec<u8> {
 
 #[cfg(not(windows))]
 fn canonical_root_identity_bytes(canonical_root: &Path) -> Vec<u8> {
-    let root_identity = native_path_identity_bytes(canonical_root);
-    root_identity
+    native_path_identity_bytes(canonical_root)
 }
 
 pub(crate) fn resolve_state_placement_with<F>(
