@@ -2080,6 +2080,35 @@ mandate); symlink blobs indexed as link-text and submodules skipped (minor files
 notes); `Repository::open` (not discover) means subdir-of-repo projects get no ref lanes.
 Still nothing pushed.
 
+### Gate M evidence + measured limitations (M-014, 2026-07-24)
+
+Commits (branch `feat/repository-knowledge-index`, not pushed): `883d997` AAP blockers;
+`1f52606` M-001/M-002 health fields + assertions; `9ee4df0` M-001 review fixes +
+M-003/005/006/007; `18a237d` M-015.
+
+- **AAP** SF-AAP-001/002/003 CLOSED: edit_plan literal-path precedence FIXED;
+  get_file_content concurrency already-satisfied (regression coverage); analyze_file_impact
+  non-parser false-absence FIXED (narrowed to `LanguageId::from_extension` so oversized parser
+  files keep their refusal).
+- **M-001/M-002** health knowledge section (full + compact) + 6 assertions. Cursor-reviewed;
+  5 findings resolved in code (authorization now derived from `MemoryOnly.failures` — no
+  SourceAccessMode plumbing; gitignore-hygiene field; live_postcondition token; target mix
+  rendering; unbound closed-set). Accepted-as-shipped: retry via freshness reason-codes +
+  reconcile-repairs counter (data-model excludes a retry counter from the digest); bridge
+  "version" proxied by content_generation (bridge has no version field); in-flight = configured
+  ceiling not live usage (usage not retained past cold load — out of "surface existing data" scope).
+- **M-003** full surface == exactly 39 (== tool_definitions() minus the `symforge` facade),
+  compact == 3; prompts/resources/catalog cited. **M-005** secret scan CLEAN (954 files, 0
+  credential-file hits; scanner exposes rule_id+count only). **M-006** policy-mismatch re-scout
+  + no-canary covered; the logs clause holds by construction (sensitive bytes never resident).
+  **M-007** memory-only checkpoint = typed persistence_unavailable + applied=false. **M-015**
+  no leaked workers/worktrees. **M-008/009/010** fmt/check/clippy green throughout (lib 3012/0/4).
+
+MEASURED LIMITATIONS / open Gate-M items: M-011 serial all-target suite (also a push-CI gate);
+M-004 corpus ≥50%-token-reduction measurement (A019 token oracles are contentious — may be a
+documented limitation rather than a clean pass); M-012 embedded-mode ("embed") gate;
+M-013 feature-wide adversarial pass (Cursor already reviewed the M-001 health surface).
+
 ---
 
 ## Windows Headless Process Invariant (2026-07-16)
