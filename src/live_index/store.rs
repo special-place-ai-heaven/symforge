@@ -185,6 +185,16 @@ impl InflightByteBudget {
     }
 }
 
+/// Configured peak in-flight admission byte budget (M-001 health surface).
+///
+/// This is operational health state, not manifest identity (data-model.md
+/// §ManifestResourceUsage: "In-flight/peak/derived-state usage is operational
+/// health state"), so it is reconstructed from the same env source the
+/// admission gate uses rather than stored in the published generation.
+pub fn configured_inflight_byte_budget() -> u64 {
+    InflightByteBudget::from_env().total
+}
+
 /// RAII permit that returns its held bytes to the [`InflightByteBudget`] and
 /// wakes waiters on drop. Dropping it is the point at which the large file's
 /// bytes are considered no longer in flight. Owned (holds an `Arc`) so it can be

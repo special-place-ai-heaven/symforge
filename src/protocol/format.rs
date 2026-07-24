@@ -1956,6 +1956,459 @@ pub fn health_report_compact_from_published_state(
     output
 }
 
+// ── Feature 020 repository-knowledge health (M-001) ──────────────────────────
+//
+// Surfaces already-published Feature 020 evidence (manifest, dispositions,
+// source set, bridge, authority hygiene) plus source-binding/runtime state
+// (binding, authorization, placement, persistence, replay, session membership,
+// query readiness) into `health` / `health_compact`. Every field reads data
+// that already exists after Gates A–L; nothing here recomputes index state.
+
+use crate::domain::{
+    CapabilityStatus, CapabilityUnavailableReason, CatalogEntry, CoverageStatus, FileDisposition,
+    FreshnessStatus, ParseStatus, RepositoryManifest, SourceAccessMode, StatePlacement,
+    UserLocalPlacementReason,
+};
+use crate::live_index::CodeSignalsSnapshot;
+use crate::live_index::knowledge_authority::{KnowledgeAuthorityView, PolicyLedgerStatus};
+use crate::live_index::knowledge_bridge::{DerivedCoverage, KnowledgeBridge};
+use crate::live_index::store::PublishedSourceSet;
+
+/// Reachable source-binding/runtime state for the M-001 health surface. Every
+/// field is available on the per-session `SymForgeServer`; nothing here needs
+/// daemon session-table plumbing.
+pub struct SourceBindingHealthView<'a> {
+    /// A source root is bound to this runtime (`repo_root` is `Some`).
+    pub bound: bool,
+    /// Resolved project-state placement, or `None` when unbound.
+    pub placement: Option<&'a StatePlacement>,
+    /// Runtime durability of the selected state owner (independent of readiness).
+    pub persistence: CapabilityStatus,
+    /// Resolved calling-session identity (real for a daemon session, a
+    /// `local-process-<pid>` sentinel for the in-process path).
+    pub session_id: &'a str,
+    /// True when the report is served through a daemon session (membership
+    /// authority applies); false for the local in-process path.
+    pub daemon_session: bool,
+    /// The live query generation is usable (`Ready`).
+    pub query_ready: bool,
+}
+
+/// Short, stable prefix of a digest/id for bounded health display.
+fn short_digest(value: &str) -> &str {
+    // Char-boundary safe: digests/source-ids are ASCII hex today, but the
+    // helper takes an arbitrary &str, so never byte-slice mid-codepoint.
+    match value.char_indices().nth(12) {
+        Some((idx, _)) => &value[..idx],
+        None => value,
+    }
+}
+
+fn coverage_label(coverage: CoverageStatus) -> &'static str {
+    match coverage {
+        CoverageStatus::Complete => "complete",
+        CoverageStatus::Degraded => "degraded",
+    }
+}
+
+fn placement_label(placement: Option<&StatePlacement>) -> &'static str {
+    match placement {
+        Some(StatePlacement::ProjectLocal { .. }) => "project_local",
+        Some(StatePlacement::UserLocal { .. }) => "user_local",
+        Some(StatePlacement::MemoryOnly { .. }) => "memory_only",
+        None => "unbound",
+    }
+}
+
+/// Authorization derived from the resolved placement. `explicit_protected`
+/// always lands in user-local (it skips the project-local probe), and a
+/// project-local placement is only ever reached by a normal source, so both are
+/// definitive. `MemoryOnly` is genuinely ambiguous (explicit-protected skip vs
+/// both-tier normal failure) and the authoritative `SourceAccessMode` is not
+/// plumbed to this render site, so it reports `indeterminate` rather than
+/// guessing. ponytail: placement-derived; plumb `SourceAccessMode` end-to-end
+/// only if the memory-only ambiguity ever needs to be resolved in health.
+fn placement_authorization(placement: Option<&StatePlacement>) -> Option<SourceAccessMode> {
+    match placement {
+        Some(StatePlacement::ProjectLocal { .. }) => Some(SourceAccessMode::NormalProject),
+        Some(StatePlacement::UserLocal {
+            reason: UserLocalPlacementReason::ExplicitProtected,
+            ..
+        }) => Some(SourceAccessMode::ExplicitProtected),
+        Some(StatePlacement::UserLocal {
+            reason: UserLocalPlacementReason::ProjectLocalUnavailable { .. },
+            ..
+        }) => Some(SourceAccessMode::NormalProject),
+        Some(StatePlacement::MemoryOnly { .. }) | None => None,
+    }
+}
+
+fn authorization_label(placement: Option<&StatePlacement>) -> &'static str {
+    match placement_authorization(placement) {
+        Some(SourceAccessMode::NormalProject) => "normal",
+        Some(SourceAccessMode::ExplicitProtected) => "explicit_protected",
+        None => "indeterminate",
+    }
+}
+
+fn capability_unavailable_code(reason: CapabilityUnavailableReason) -> &'static str {
+    match reason {
+        CapabilityUnavailableReason::ExplicitProtectedSource => "explicit_protected_source",
+        CapabilityUnavailableReason::SourceReadOnly => "source_read_only",
+        CapabilityUnavailableReason::PersistentStateUnavailable => "persistent_state_unavailable",
+        CapabilityUnavailableReason::DurableMutationReplayUnavailable => {
+            "durable_mutation_replay_unavailable"
+        }
+        CapabilityUnavailableReason::NonProjectLocalPlacement => "non_project_local_placement",
+        CapabilityUnavailableReason::AtomicDurabilityUnavailable => "atomic_durability_unavailable",
+    }
+}
+
+/// Maps persistence capability to the source-binding contract's
+/// healthy/degraded/disabled trichotomy. "disabled" means state was never
+/// durable for this binding; "degraded" means a durable placement lost
+/// durability after binding.
+fn persistence_label(status: CapabilityStatus) -> String {
+    match status {
+        CapabilityStatus::Available => "healthy".to_string(),
+        CapabilityStatus::Unavailable { reason } => {
+            let state = match reason {
+                CapabilityUnavailableReason::AtomicDurabilityUnavailable
+                | CapabilityUnavailableReason::DurableMutationReplayUnavailable => "degraded",
+                _ => "disabled",
+            };
+            format!("{state}({})", capability_unavailable_code(reason))
+        }
+    }
+}
+
+fn replay_label(placement: Option<&StatePlacement>, persistence: CapabilityStatus) -> &'static str {
+    match (placement, persistence) {
+        (
+            Some(StatePlacement::ProjectLocal { .. } | StatePlacement::UserLocal { .. }),
+            CapabilityStatus::Available,
+        ) => "available",
+        _ => "unavailable",
+    }
+}
+
+fn render_source_binding_line(binding: &SourceBindingHealthView<'_>) -> String {
+    let mut line = format!(
+        "  binding={} authorization={} placement={} persistence={} replay={} query_readiness={}",
+        if binding.bound { "bound" } else { "unbound" },
+        authorization_label(binding.placement),
+        placement_label(binding.placement),
+        persistence_label(binding.persistence),
+        replay_label(binding.placement, binding.persistence),
+        if binding.query_ready {
+            "ready"
+        } else {
+            "not_ready"
+        },
+    );
+    // Memory-only fallback reason codes (contract: "safe fallback reason codes").
+    if let Some(StatePlacement::MemoryOnly { failures }) = binding.placement
+        && !failures.is_empty()
+    {
+        let reasons: Vec<String> = failures
+            .iter()
+            .map(|failure| format!("{:?}:{:?}", failure.location, failure.safe_reason))
+            .collect();
+        line.push_str(&format!(" fallback_reasons=[{}]", reasons.join(",")));
+    }
+    // Current-session membership authority: a daemon session is a member by
+    // routing; the local process has no session-membership model.
+    let membership = if binding.daemon_session {
+        "member"
+    } else {
+        "local_process"
+    };
+    line.push_str(&format!(
+        " session={} membership={membership}",
+        binding.session_id
+    ));
+    line
+}
+
+/// Coverage/digest tokens for one manifest. Shared by the primary manifest line
+/// and the per-source source-set line so a source's terminal state is rendered
+/// identically wherever it appears (M-002 terminal-disposition equality).
+fn manifest_coverage_digest(manifest: Option<&RepositoryManifest>) -> String {
+    match manifest {
+        Some(manifest) => format!(
+            "coverage={} digest={}",
+            coverage_label(manifest.coverage),
+            short_digest(&manifest.digest),
+        ),
+        None => "coverage=absent digest=none".to_string(),
+    }
+}
+
+fn freshness_label(freshness: &FreshnessStatus) -> String {
+    match freshness {
+        FreshnessStatus::Current => "current".to_string(),
+        FreshnessStatus::Verifying => "verifying".to_string(),
+        FreshnessStatus::Degraded { reason_codes, .. } => {
+            let codes: Vec<String> = reason_codes.iter().map(|r| format!("{r:?}")).collect();
+            format!("degraded[{}]", codes.join(","))
+        }
+    }
+}
+
+/// Manifest line. A budget-degraded or unbound observation is reported as an
+/// explicit `absent` marker (never a silent partial manifest — data-model.md
+/// §ManifestResourceUsage: a partial observation "is not a `RepositoryManifest`").
+fn render_manifest_line(
+    manifest: Option<&RepositoryManifest>,
+    freshness: &FreshnessStatus,
+    inflight_budget_bytes: u64,
+) -> String {
+    match manifest {
+        Some(manifest) => format!(
+            "Manifest: {} freshness={} entries={} metadata_bytes={} admitted_bytes={} inflight_budget_bytes={}",
+            manifest_coverage_digest(Some(manifest)),
+            freshness_label(freshness),
+            manifest.usage.catalog_entries,
+            manifest.usage.catalog_metadata_bytes,
+            manifest.usage.admitted_content_bytes,
+            inflight_budget_bytes,
+        ),
+        None => format!(
+            "Manifest: absent (unbound or budget-degraded source; no partial manifest is published) freshness={} inflight_budget_bytes={}",
+            freshness_label(freshness),
+            inflight_budget_bytes,
+        ),
+    }
+}
+
+/// Per-terminal-disposition counts across the manifest catalog. Every catalog
+/// entry maps to exactly one terminal disposition, so a file is counted once.
+fn render_disposition_line(entries: &[CatalogEntry]) -> String {
+    let mut indexed = 0u64;
+    let mut metadata_only = 0u64;
+    let mut hard_skip = 0u64;
+    let mut unreadable = 0u64;
+    let mut unstable = 0u64;
+    let mut aborted = 0u64;
+    let mut parsed = 0u64;
+    let mut partial = 0u64;
+    let mut failed = 0u64;
+    for entry in entries {
+        match &entry.disposition {
+            FileDisposition::Indexed { parse_status, .. } => {
+                indexed += 1;
+                match parse_status {
+                    ParseStatus::Parsed => parsed += 1,
+                    ParseStatus::PartialParse => partial += 1,
+                    ParseStatus::Failed => failed += 1,
+                }
+            }
+            FileDisposition::MetadataOnly { .. } => metadata_only += 1,
+            FileDisposition::HardSkip { .. } => hard_skip += 1,
+            FileDisposition::Unreadable { .. } => unreadable += 1,
+            FileDisposition::UnstableDuringRead => unstable += 1,
+            FileDisposition::AbortedCircuitBreaker => aborted += 1,
+        }
+    }
+    format!(
+        "Dispositions: indexed={indexed} metadata_only={metadata_only} hard_skip={hard_skip} unreadable={unreadable} unstable={unstable} aborted={aborted} (parse parsed={parsed} partial={partial} failed={failed})"
+    )
+}
+
+/// One source-set entry line. Uses [`manifest_coverage_digest`] so the current
+/// source renders identically here and in the primary manifest line.
+fn render_source_entry_line(
+    source_id_short: &str,
+    is_current: bool,
+    publication_generation: u64,
+    content_generation: u64,
+    project_generation: u64,
+    manifest: Option<&RepositoryManifest>,
+) -> String {
+    format!(
+        "  {}{} gen=pub{}/content{}/proj{} {} entries={}",
+        source_id_short,
+        if is_current { "*" } else { "" },
+        publication_generation,
+        content_generation,
+        project_generation,
+        manifest_coverage_digest(manifest),
+        manifest.map(|m| m.usage.catalog_entries).unwrap_or(0),
+    )
+}
+
+const MAX_HEALTH_SOURCES: usize = 8;
+
+fn render_source_set_section(source_set: &PublishedSourceSet) -> String {
+    let mut out = format!(
+        "Source set: registry_generation={} current={} sources={}",
+        source_set.registry_generation,
+        short_digest(source_set.current_source_id.as_str()),
+        source_set.sources.len(),
+    );
+    for (source_id, generation) in source_set.sources.iter().take(MAX_HEALTH_SOURCES) {
+        out.push('\n');
+        out.push_str(&render_source_entry_line(
+            short_digest(source_id.as_str()),
+            *source_id == source_set.current_source_id,
+            generation.publication_generation,
+            generation.content_generation,
+            generation.project_generation,
+            generation.manifest.as_deref(),
+        ));
+    }
+    if source_set.sources.len() > MAX_HEALTH_SOURCES {
+        out.push_str(&format!(
+            "\n  … {} more source(s) omitted",
+            source_set.sources.len() - MAX_HEALTH_SOURCES
+        ));
+    }
+    out
+}
+
+fn derived_coverage_label(coverage: &DerivedCoverage) -> String {
+    match coverage {
+        DerivedCoverage::Complete => "complete".to_string(),
+        DerivedCoverage::Truncated { breaches } => {
+            let omitted: u64 = breaches.iter().map(|breach| breach.omitted).sum();
+            format!("truncated({omitted} omitted)")
+        }
+    }
+}
+
+fn render_bridge_line(bridge: &KnowledgeBridge, content_generation: u64) -> String {
+    format!(
+        "Bridge: coverage={} cards={} forward_links={} knowledge_links={} version=content{}",
+        derived_coverage_label(&bridge.coverage),
+        bridge.cards.len(),
+        bridge.forward.len(),
+        bridge.knowledge_links.len(),
+        content_generation,
+    )
+}
+
+fn render_temporal_line(code_signals: &CodeSignalsSnapshot) -> String {
+    use crate::live_index::git_temporal::GitTemporalState;
+    let state = match &code_signals.state {
+        GitTemporalState::Pending => "pending".to_string(),
+        GitTemporalState::Computing => "computing".to_string(),
+        GitTemporalState::Unavailable(reason) => format!("unavailable({reason})"),
+        GitTemporalState::Ready => "ready".to_string(),
+    };
+    let coverage = if code_signals.coverage.complete_to_root {
+        "complete_to_root".to_string()
+    } else if code_signals.coverage.limitations.is_empty() {
+        "incomplete".to_string()
+    } else {
+        let limits: Vec<String> = code_signals
+            .coverage
+            .limitations
+            .iter()
+            .map(|limit| format!("{limit:?}"))
+            .collect();
+        format!("limited[{}]", limits.join(","))
+    };
+    format!("Temporal: state={state} coverage={coverage}")
+}
+
+fn policy_status_label(status: &PolicyLedgerStatus) -> String {
+    match status {
+        PolicyLedgerStatus::Absent => "absent".to_string(),
+        PolicyLedgerStatus::Valid => "valid".to_string(),
+        PolicyLedgerStatus::Malformed => "malformed".to_string(),
+        PolicyLedgerStatus::UnsupportedVersion { found } => format!(
+            "unsupported_version({})",
+            found
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        PolicyLedgerStatus::InvalidEntries => "invalid_entries".to_string(),
+    }
+}
+
+fn render_authority_hygiene_line(authority: &KnowledgeAuthorityView) -> String {
+    format!(
+        "Authority hygiene: rule_version={} policy_version={} secret_policy_version={} policy_status={} curation_eligible={} records={} filtered_suppressions={} coverage={}",
+        authority.versions.authority_rule_version,
+        authority.versions.policy_version,
+        authority.versions.secret_policy_version,
+        policy_status_label(&authority.policy_status),
+        authority.curation_eligible,
+        authority.records.len(),
+        authority.skipped_suppression_ids.len(),
+        derived_coverage_label(&authority.coverage),
+    )
+}
+
+/// Full Feature 020 repository-knowledge health section (M-001). Extends the
+/// `health` report; every field is read from the already-published source set
+/// plus the reachable source-binding state.
+pub fn format_repository_knowledge_health(
+    source_set: &PublishedSourceSet,
+    binding: &SourceBindingHealthView<'_>,
+    inflight_budget_bytes: u64,
+) -> String {
+    let generation = source_set.current_generation();
+    let mut section = String::from("── Repository knowledge (Feature 020) ──\n");
+    section.push_str(&render_source_binding_line(binding));
+    section.push('\n');
+    section.push_str(&render_manifest_line(
+        generation.manifest.as_deref(),
+        generation.freshness.as_ref(),
+        inflight_budget_bytes,
+    ));
+    if let Some(manifest) = generation.manifest.as_deref() {
+        section.push('\n');
+        section.push_str(&render_disposition_line(&manifest.entries));
+    }
+    section.push('\n');
+    section.push_str(&render_source_set_section(source_set));
+    section.push('\n');
+    section.push_str(&render_bridge_line(
+        generation.bridge.as_ref(),
+        generation.content_generation,
+    ));
+    section.push('\n');
+    section.push_str(&render_temporal_line(generation.code_signals.as_ref()));
+    section.push('\n');
+    section.push_str(&render_authority_hygiene_line(
+        generation.authority.as_ref(),
+    ));
+    section
+}
+
+/// Compact Feature 020 repository-knowledge health (M-001). Two lines: a binding
+/// summary and a one-line knowledge digest. Kept genuinely compact.
+pub fn format_repository_knowledge_health_compact(
+    source_set: &PublishedSourceSet,
+    binding: &SourceBindingHealthView<'_>,
+) -> String {
+    let generation = source_set.current_generation();
+    let manifest_summary = match generation.manifest.as_deref() {
+        Some(manifest) => format!("manifest={}", coverage_label(manifest.coverage)),
+        None => "manifest=absent".to_string(),
+    };
+    format!(
+        "Source binding: binding={} authorization={} placement={} persistence={} replay={} readiness={}\nKnowledge: {} sources={} bridge={} authority(rule/policy/secret)={}/{}/{}",
+        if binding.bound { "bound" } else { "unbound" },
+        authorization_label(binding.placement),
+        placement_label(binding.placement),
+        persistence_label(binding.persistence),
+        replay_label(binding.placement, binding.persistence),
+        if binding.query_ready {
+            "ready"
+        } else {
+            "not_ready"
+        },
+        manifest_summary,
+        source_set.sources.len(),
+        derived_coverage_label(&generation.bridge.coverage),
+        generation.authority.versions.authority_rule_version,
+        generation.authority.versions.policy_version,
+        generation.authority.versions.secret_policy_version,
+    )
+}
+
 fn sidecar_pid_label(status: &crate::sidecar::port_file::SidecarStatus) -> String {
     status
         .pid

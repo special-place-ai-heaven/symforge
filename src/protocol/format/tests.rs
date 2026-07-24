@@ -4915,3 +4915,154 @@ fn test_inspect_match_scope_and_enclosing_do_not_double_kind() {
         "enclosing line should carry the kind exactly once; got: {result}"
     );
 }
+
+// ── Feature 020 repository-knowledge health (M-001/M-002) ─────────────────────
+
+/// Build a small canonical `RepositoryManifest` with the given coverage and per
+/// entry terminal dispositions, for the M-002 rendering-layer invariants.
+fn m002_tiny_manifest(
+    coverage: CoverageStatus,
+    entries: Vec<(&str, FileDisposition)>,
+) -> RepositoryManifest {
+    use crate::domain::{
+        CatalogEntry, CatalogPath, FileClassification, ManifestResourceUsage, RepositoryId,
+        SourceId, SourceIdentity, SourceLocation, SourceVersion, WorkingTreeState,
+    };
+    let catalog: Vec<CatalogEntry> = entries
+        .into_iter()
+        .map(|(path, disposition)| CatalogEntry {
+            path: CatalogPath {
+                public_id: path.to_string(),
+                normalized_utf8: Some(path.to_string()),
+            },
+            size: 10,
+            language: None,
+            classification: FileClassification::for_code_path(path),
+            disposition,
+            content_hash: None,
+        })
+        .collect();
+    let usage = ManifestResourceUsage {
+        catalog_entries: catalog.len() as u64,
+        catalog_metadata_bytes: 128,
+        admitted_content_bytes: 64,
+    };
+    RepositoryManifest::new(
+        1,
+        1,
+        crate::knowledge::SECRET_POLICY_VERSION,
+        SourceIdentity {
+            repository_id: RepositoryId::new("repo-test"),
+            source_id: SourceId::new("source-test"),
+            location: SourceLocation::WorkingTree {
+                worktree_id: "wt-test".to_string(),
+            },
+        },
+        SourceVersion {
+            branch: None,
+            commit: None,
+            working_tree: WorkingTreeState::NotApplicable,
+        },
+        coverage,
+        catalog,
+        Vec::new(),
+        usage,
+    )
+    .expect("tiny manifest builds")
+}
+
+/// M-002(a): a source's terminal admission disposition (encoded in the canonical
+/// digest) is rendered identically wherever the source appears — the primary
+/// manifest line and the per-source source-set line both derive it from the same
+/// manifest via the shared token helper, and the disposition aggregate counts a
+/// terminal disposition exactly once.
+#[test]
+fn m002_terminal_disposition_is_rendered_identically_wherever_a_source_appears() {
+    let manifest = m002_tiny_manifest(
+        CoverageStatus::Complete,
+        vec![
+            (
+                "src/ok.rs",
+                FileDisposition::Indexed {
+                    targets: crate::domain::IndexTargets::Code,
+                    parse_status: crate::domain::ParseStatus::Parsed,
+                },
+            ),
+            (
+                "src/broken.rs",
+                FileDisposition::Indexed {
+                    targets: crate::domain::IndexTargets::Code,
+                    parse_status: crate::domain::ParseStatus::Failed,
+                },
+            ),
+        ],
+    );
+
+    let tokens = manifest_coverage_digest(Some(&manifest));
+    let manifest_line = render_manifest_line(Some(&manifest), &FreshnessStatus::Current, 1024);
+    let source_line = render_source_entry_line("srcshort", true, 1, 1, 1, Some(&manifest));
+    assert!(
+        manifest_line.contains(&tokens),
+        "primary manifest line must carry the shared coverage/digest tokens: {manifest_line}"
+    );
+    assert!(
+        source_line.contains(&tokens),
+        "per-source line must carry the same coverage/digest tokens: {source_line}"
+    );
+
+    // The Failed entry is counted once as failed, never also as parsed.
+    let dispositions = render_disposition_line(&manifest.entries);
+    assert!(dispositions.contains("indexed=2"), "{dispositions}");
+    assert!(dispositions.contains("parsed=1"), "{dispositions}");
+    assert!(dispositions.contains("failed=1"), "{dispositions}");
+}
+
+/// M-002(b): a budget-degraded observation is reported as bounded/degraded and
+/// never as a silent partial manifest — a Degraded manifest renders
+/// `coverage=degraded` (not `complete`), and a budget-exceeded observation
+/// (which publishes NO manifest) renders an explicit `absent` marker carrying
+/// the capacity reason.
+#[test]
+fn m002_budget_degraded_manifest_reports_bounded_never_a_silent_partial() {
+    let degraded = m002_tiny_manifest(
+        CoverageStatus::Degraded,
+        vec![(
+            "src/lib.rs",
+            FileDisposition::Indexed {
+                targets: crate::domain::IndexTargets::Code,
+                parse_status: crate::domain::ParseStatus::Parsed,
+            },
+        )],
+    );
+    let degraded_line = render_manifest_line(Some(&degraded), &FreshnessStatus::Current, 4096);
+    assert!(
+        degraded_line.contains("coverage=degraded"),
+        "degraded coverage must be surfaced: {degraded_line}"
+    );
+    assert!(
+        !degraded_line.contains("coverage=complete"),
+        "degraded coverage must never masquerade as complete: {degraded_line}"
+    );
+
+    let budget_hit = render_manifest_line(
+        None,
+        &FreshnessStatus::Degraded {
+            last_valid_content_generation: 3,
+            reason_codes: vec![crate::domain::FreshnessReason::CatalogEntryCapacityExceeded],
+        },
+        4096,
+    );
+    assert!(budget_hit.contains("absent"), "{budget_hit}");
+    assert!(
+        budget_hit.contains("no partial manifest"),
+        "budget-degraded state must state that no partial manifest is published: {budget_hit}"
+    );
+    assert!(
+        budget_hit.contains("CatalogEntryCapacityExceeded"),
+        "the capacity reason must be surfaced: {budget_hit}"
+    );
+    assert!(
+        !budget_hit.contains("coverage=complete"),
+        "an absent manifest must never render as complete coverage: {budget_hit}"
+    );
+}

@@ -6744,6 +6744,10 @@ impl SymForgeServer {
         quarantine_window: format::QuarantineWindow,
     ) -> String {
         let published = self.index.published_state();
+        // Capture before `session_id` is consumed: a `Some` session id means the
+        // report is served through a daemon session (membership authority
+        // applies); local in-process reports carry `None`.
+        let session_is_daemon = session_id.is_some();
         let runtime_status =
             self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
@@ -6832,6 +6836,26 @@ impl SymForgeServer {
         result.push('\n');
         result.push_str(&curation_health);
 
+        // Feature 020 repository-knowledge health (M-001): manifest, dispositions,
+        // source set, bridge, temporal, authority hygiene, plus source-binding/
+        // runtime state. All read from already-published state; nothing recomputed.
+        let source_set = self.index.published_source_set();
+        let rk_placement = self.capture_state_placement();
+        let binding_view = format::SourceBindingHealthView {
+            bound: self.capture_repo_root().is_some(),
+            placement: rk_placement.as_ref(),
+            persistence: *self.persistence_health.read(),
+            session_id: &runtime_status.session_id,
+            daemon_session: session_is_daemon,
+            query_ready: published.status_label() == "Ready",
+        };
+        result.push('\n');
+        result.push_str(&format::format_repository_knowledge_health(
+            &source_set,
+            &binding_view,
+            crate::live_index::store::configured_inflight_byte_budget(),
+        ));
+
         // Append worktree-awareness misuse counter (rolling last-hour window).
         result.push('\n');
         result.push_str(&format!(
@@ -6894,6 +6918,7 @@ impl SymForgeServer {
         project_root: Option<PathBuf>,
     ) -> String {
         let published = self.index.published_state();
+        let session_is_daemon = session_id.is_some();
         let runtime_status =
             self.runtime_status_for(&published, mode, project_id, session_id, project_root);
         let watcher_guard = self.watcher_info.lock();
@@ -6975,6 +7000,23 @@ impl SymForgeServer {
         };
         result.push('\n');
         result.push_str(&curation_health);
+
+        // Feature 020 repository-knowledge health (M-001), compact form.
+        let source_set = self.index.published_source_set();
+        let rk_placement = self.capture_state_placement();
+        let binding_view = format::SourceBindingHealthView {
+            bound: self.capture_repo_root().is_some(),
+            placement: rk_placement.as_ref(),
+            persistence: *self.persistence_health.read(),
+            session_id: &runtime_status.session_id,
+            daemon_session: session_is_daemon,
+            query_ready: published.status_label() == "Ready",
+        };
+        result.push('\n');
+        result.push_str(&format::format_repository_knowledge_health_compact(
+            &source_set,
+            &binding_view,
+        ));
 
         if let Some(drift) = crate::version_registry::drift_banner_default() {
             result.push('\n');
@@ -19080,6 +19122,170 @@ mod tests {
                 && compact.contains("reset_state=none")
                 && compact.contains("index_state=fresh_process"),
             "compact daemon health should retain bounded source/reset state: {compact}"
+        );
+    }
+
+    /// M-001 smoke: the Feature 020 repository-knowledge section renders in both the
+    /// full and compact health reports, and compact stays genuinely compact.
+    #[tokio::test]
+    async fn m001_health_surfaces_repository_knowledge_section_full_and_compact() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+
+        let full = server.health_for_daemon_session(
+            "p".to_string(),
+            "s".to_string(),
+            temp.path().to_path_buf(),
+            crate::protocol::format::QuarantineWindow::default(),
+        );
+        for marker in [
+            "── Repository knowledge (Feature 020) ──",
+            "binding=bound",
+            "Manifest:",
+            "Source set: registry_generation=",
+            "Bridge: coverage=",
+            "Temporal: state=",
+            "Authority hygiene: rule_version=",
+        ] {
+            assert!(
+                full.contains(marker),
+                "full health missing `{marker}`: {full}"
+            );
+        }
+
+        let compact = server.health_compact_for_daemon_session(
+            "p".to_string(),
+            "s".to_string(),
+            temp.path().to_path_buf(),
+        );
+        assert!(
+            compact.contains("Source binding: binding=bound"),
+            "compact health must carry the binding summary: {compact}"
+        );
+        assert!(
+            compact.contains("Knowledge: manifest="),
+            "compact health must carry a one-line knowledge digest: {compact}"
+        );
+        assert!(
+            !compact.contains("── Repository knowledge (Feature 020) ──"),
+            "compact health must not expand the full section header: {compact}"
+        );
+    }
+
+    /// M-002(c): health reflects a project moving from unbound to a bound state on
+    /// the same runtime.
+    #[tokio::test]
+    async fn m002_health_reflects_unbound_to_bound_transition() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+
+        let unbound = server.health_for_runtime(
+            crate::protocol::format::RuntimeMode::LocalProcess,
+            None,
+            None,
+            None,
+            crate::protocol::format::QuarantineWindow::default(),
+        );
+        assert!(
+            unbound.contains("binding=unbound") && unbound.contains("placement=unbound"),
+            "unbound health must report an unbound binding: {unbound}"
+        );
+
+        // Bind the same server to a project-local root.
+        let temp = TempDir::new().expect("tempdir should be created");
+        *server.repo_root.write() = Some(temp.path().to_path_buf());
+        *server.state_placement.write() = Some(crate::domain::StatePlacement::ProjectLocal {
+            directory: project_state(temp.path()),
+        });
+        *server.persistence_health.write() = crate::domain::CapabilityStatus::Available;
+
+        let bound = server.health_for_runtime(
+            crate::protocol::format::RuntimeMode::LocalProcess,
+            None,
+            None,
+            None,
+            crate::protocol::format::QuarantineWindow::default(),
+        );
+        assert!(
+            bound.contains("binding=bound") && bound.contains("placement=project_local"),
+            "bound health must report a bound project-local binding: {bound}"
+        );
+    }
+
+    /// M-002(d): a daemon session bound to an explicit-protected source is reported
+    /// as a member, with `explicit_protected` authorization — consistent with the
+    /// L-R11 per-session membership model.
+    #[tokio::test]
+    async fn m002_health_shows_per_session_protected_membership() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let temp = TempDir::new().expect("tempdir should be created");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+        // Model an explicit-protected binding: it lands in user-local placement
+        // (skips the project-local probe), which is how health derives authorization.
+        *server.state_placement.write() = Some(crate::domain::StatePlacement::UserLocal {
+            directory: project_state(temp.path()),
+            root_id: crate::domain::ProjectId("project-protected-test".to_string()),
+            reason: crate::domain::UserLocalPlacementReason::ExplicitProtected,
+        });
+
+        let session_id = "session-protected-a".to_string();
+        let health = server.health_for_daemon_session(
+            "project-protected-test".to_string(),
+            session_id.clone(),
+            temp.path().to_path_buf(),
+            crate::protocol::format::QuarantineWindow::default(),
+        );
+        assert!(
+            health.contains("authorization=explicit_protected"),
+            "protected binding must surface explicit_protected authorization: {health}"
+        );
+        assert!(
+            health.contains(&format!("session={session_id} membership=member")),
+            "a daemon session must be reported a member of its bound project: {health}"
+        );
+    }
+
+    /// M-002(e): post-bind durability degradation is reported independently from
+    /// query readiness — a durable placement that loses atomic durability shows a
+    /// degraded persistence/replay while the live query surface stays ready.
+    #[tokio::test]
+    async fn m002_post_bind_durability_degradation_is_independent_of_query_readiness() {
+        let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
+        let temp = TempDir::new().expect("tempdir should be created");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![(key, file)]),
+            Some(temp.path().to_path_buf()),
+        );
+
+        // A healthy placement loses atomic durability after binding.
+        *server.persistence_health.write() = crate::domain::CapabilityStatus::Unavailable {
+            reason: crate::domain::CapabilityUnavailableReason::AtomicDurabilityUnavailable,
+        };
+
+        let health = server.health_for_daemon_session(
+            "project-e".to_string(),
+            "session-e".to_string(),
+            temp.path().to_path_buf(),
+            crate::protocol::format::QuarantineWindow::default(),
+        );
+        assert!(
+            health.contains("persistence=degraded(atomic_durability_unavailable)"),
+            "durability degradation must be surfaced: {health}"
+        );
+        assert!(
+            health.contains("query_readiness=ready"),
+            "query readiness must stay ready independent of durability: {health}"
+        );
+        assert!(
+            health.contains("replay=unavailable"),
+            "durable replay must follow persistence, not readiness: {health}"
         );
     }
 

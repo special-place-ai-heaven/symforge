@@ -731,12 +731,21 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 
 ## Gate M — Health, corpus, surface, and release
 
-- [ ] M-001 Add health manifest/target/disposition/metadata/admitted/in-flight byte/
+- [x] M-001 Add health manifest/target/disposition/metadata/admitted/in-flight byte/
   coverage/retry, binding/session-membership, state-owner/placement, replay/
   persistence-capability, source-set, bridge, temporal, and authority-hygiene fields.
-- [ ] M-002 Assert terminal-disposition equality, no-partial-manifest budget behavior,
+  (extends `health`/`health_compact` via `format::format_repository_knowledge_health[_compact]`;
+  fields surfaced from published-generation data. 3 honest proxies/gaps recorded (M-014):
+  `retry` via freshness reason-codes + watcher reconcile-repairs counter (data-model excludes a
+  retry counter from the digest); `authorization=indeterminate` only under rare `MemoryOnly`
+  placement (authoritative SourceAccessMode not plumbed to the render site); bridge "version"
+  proxied by content_generation. No new tool — surface stays 39/3.)
+- [x] M-002 Assert terminal-disposition equality, no-partial-manifest budget behavior,
   unbound -> bound transition, per-session protected membership, and post-bind
-  durability degradation independently from query readiness.
+  durability degradation independently from query readiness. (tests
+  `m002_terminal_disposition_is_rendered_identically…`, `m002_budget_degraded_manifest_reports_bounded…`,
+  `m002_health_reflects_unbound_to_bound_transition`, `m002_health_shows_per_session_protected_membership`,
+  `m002_post_bind_durability_degradation_is_independent_of_query_readiness`)
 - [ ] M-003 Assert full surface is exactly 39 tools and compact surface remains 3;
   annotations/resources/prompts/catalog/docs match shipped behavior.
 - [ ] M-004 Run every quickstart scout/format/lifecycle/search/error/bridge/authority/
