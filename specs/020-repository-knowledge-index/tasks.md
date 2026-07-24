@@ -776,7 +776,7 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 - [ ] M-008 Run `cargo fmt --check`.
 - [ ] M-009 Run `cargo check --features server`.
 - [ ] M-010 Run `cargo clippy --all-targets --features server -- -D warnings`.
-- [ ] M-011 Run focused suites and serial server all-target suite.
+- [x] M-011 Run focused suites and serial server all-target suite. (single clean run: 113 test binaries, 0 failed, 0 panics across lib + all integration targets at HEAD 40d6250; also a push-CI gate.)
 - [ ] M-012 Run exact embed gate.
 - [ ] M-013 Run adversarial implementation review; resolve accepted blockers.
 - [ ] M-014 Update `tasks/todo.md` review/evidence and measured limitations.
