@@ -140,6 +140,10 @@ pub fn scout_local_ref(
     let mut distinct: BTreeSet<git2::Oid> = BTreeSet::new();
     let mut total_distinct_blob_bytes = 0u64;
     let mut coverage = RefScoutCoverage::Complete;
+    // Finding D5: the entry budget must bound EVERY visited tree entry — subtrees
+    // included — not just ingested blobs. A tree of millions of nested empty dirs
+    // otherwise does unbounded `find_tree` work while still reporting Complete.
+    let mut visited = 0u64;
 
     // Manual bounded DFS. Git tree entries are already name-sorted; a final
     // sort over accumulated paths gives one deterministic canonical order and
@@ -147,6 +151,13 @@ pub fn scout_local_ref(
     let mut stack: Vec<(git2::Tree<'_>, String)> = vec![(root_tree, String::new())];
     'walk: while let Some((tree, prefix)) = stack.pop() {
         for entry in tree.iter() {
+            // Count the entry FIRST so trees and blobs alike are bounded; on
+            // exceed, stop the walk and report degraded coverage.
+            if visited >= budget.max_entries {
+                coverage = RefScoutCoverage::Degraded;
+                break 'walk;
+            }
+            visited += 1;
             let Ok(name) = std::str::from_utf8(entry.name_bytes()) else {
                 // A non-UTF-8 tree entry name is not addressable by our
                 // repository-relative path model; record degraded coverage.
@@ -166,10 +177,6 @@ pub fn scout_local_ref(
                     stack.push((subtree, path));
                 }
                 Some(ObjectType::Blob) => {
-                    if entries.len() as u64 >= budget.max_entries {
-                        coverage = RefScoutCoverage::Degraded;
-                        break 'walk;
-                    }
                     let oid = entry.id();
                     // Header read only: size and type without materializing bytes.
                     let (size, _kind) = odb.read_header(oid).map_err(|_| {
@@ -283,10 +290,11 @@ enum RefBlobRoute {
 }
 
 /// Run the shared, path-dependent admission for one ref blob (L-R10 parity):
-/// `IndexTargets::for_path` -> `classify_stable_content` -> classification. These
-/// are the exact primitives filesystem ingestion uses, so identical bytes yield
-/// identical lifecycle/secret decisions regardless of origin. The parse itself is
-/// deferred to the caller so it can be memoized across same-class paths.
+/// sensitive-path → shared PATH+SIZE tiers → binary sniff → `classify_stable_content`
+/// → classification. These are the exact primitives filesystem ingestion uses, so
+/// identical bytes yield identical lifecycle/secret decisions regardless of origin.
+/// The parse itself is deferred to the caller so it can be memoized across
+/// same-class paths.
 fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
     // L-R10 secret parity: a sensitive PATH is withheld as metadata-only by path
     // alone — the exact rule and reason the filesystem scout applies (see
@@ -298,6 +306,24 @@ fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
         return RefBlobRoute::Withheld(MetadataOnlyReason::SensitivePath {
             rule_id: rule_id.to_string(),
         });
+    }
+    // L-R10/L-G04 admission parity (finding D1): the filesystem scout also routes
+    // every entry through `classify_admission`'s PATH+SIZE tiers (dependency
+    // lockfile, denylisted extension, oversize) and an 8 KB binary sniff. Run the
+    // SAME shared helper + predicate here so a committed lockfile, an oversized
+    // data blob, or a binary is withheld exactly as on disk. `entry.size` is the
+    // ODB header size, so an oversized blob is withheld before its bytes are
+    // parsed (catalog-only blobs never reach this function at all).
+    if let Some(reason) = crate::discovery::path_admission_reason(
+        std::path::Path::new(&entry.relative_path),
+        entry.size,
+    ) {
+        return RefBlobRoute::Withheld(reason);
+    }
+    // Match the disk probe exactly: the filesystem scout sniffs the first ≤8 KB.
+    let sniff_len = bytes.len().min(crate::domain::index::BINARY_SNIFF_BYTES);
+    if crate::discovery::is_binary_content(&bytes[..sniff_len]) {
+        return RefBlobRoute::Withheld(MetadataOnlyReason::Binary);
     }
     let targets = IndexTargets::for_path(&entry.relative_path, entry.language.as_ref());
     match classify_stable_content(&entry.relative_path, targets, bytes) {
@@ -315,14 +341,16 @@ fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
     }
 }
 
-/// Route one ingest-decision ref blob through the SHARED target-routing,
-/// content-policy (secret/LFS/encoding), and parser adapters — the exact same
-/// functions the filesystem ingestion path uses (L-G04). It creates no second
-/// prose parser or search index: `IndexTargets::for_path`,
-/// `classify_stable_content`, and `process_file_with_classification` are the
-/// shared primitives, so identical bytes yield identical lifecycle/extraction/
-/// secret results regardless of whether they arrived from disk or a ref blob.
-pub fn route_ref_blob(entry: &RefBlobEntry, bytes: Vec<u8>) -> RefBlobIngest {
+/// Route ONE ingest-decision ref blob through the SHARED admission + parser
+/// adapters. Production ingestion routes blobs through `route_catalog_files` (which
+/// memoizes parses across same-class paths); BOTH paths share `classify_ref_blob`
+/// for admission, so they cannot drift on the withhold decision (the D1 root
+/// cause). This single-blob wrapper is exercised only by the test harness — hence
+/// `pub(crate)` and the not-test dead-code allowance — and stays byte-for-byte
+/// aligned with production because it delegates to the same `classify_ref_blob` and
+/// `process_file_with_classification` primitives.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn route_ref_blob(entry: &RefBlobEntry, bytes: Vec<u8>) -> RefBlobIngest {
     match classify_ref_blob(entry, &bytes) {
         RefBlobRoute::Withheld(reason) => RefBlobIngest::Withheld(reason),
         RefBlobRoute::Parse {
@@ -507,6 +535,31 @@ pub struct ReconcileOutcome {
     pub skipped: bool,
 }
 
+/// Purge every P1 ref lane owned by `repository_id` from the published set
+/// (finding D4).
+///
+/// Called when reconcile fails CLOSED on unprovable topology: with the checked-out
+/// set unprovable, NO existing P1 lane can be proven to still be a bare branch, so
+/// a lane for a branch that is NOW checked out would otherwise survive the aborted
+/// deletion pass and keep serving a P0 branch as a P1 lane. Dropping all of this
+/// repo's ref lanes is the only safe state; the next successful reconcile
+/// republishes the genuinely-bare ones. Each removal goes through
+/// `remove_ref_source` (writer lock, registry bump, P0 lane left untouched).
+fn purge_repo_ref_lanes(handle: &SharedIndexHandle, repository_id: &RepositoryId) {
+    let lane_prefix = format!("symforge:git-ref:{}:", repository_id.as_str());
+    let current = handle.published_source_set();
+    let lanes: Vec<SourceId> = current
+        .sources
+        .keys()
+        .filter(|id| *id != &current.current_source_id)
+        .filter(|id| id.as_str().starts_with(lane_prefix.as_str()))
+        .cloned()
+        .collect();
+    for source_id in &lanes {
+        handle.remove_ref_source(source_id);
+    }
+}
+
 /// Reconcile the local branch/worktree topology into P1 ref lanes (L-G05/L-R03).
 ///
 /// A P1 ref lane is published for every *bare* local branch — a local branch
@@ -547,8 +600,12 @@ pub fn reconcile_local_ref_topology(
     // bare-looking branch could be the one that worktree has checked out, we abort
     // the whole pass rather than risk publishing a checked-out branch as a P1 lane
     // (L-G01). Aborting is safe: reconcile is best-effort P1 background work, the
-    // existing published set is left untouched, and P0 is never blocked.
+    // P0 current lane is never touched. Finding D4: purge every P1 lane for this
+    // repo BEFORE aborting — an unprovable checked-out set means no existing P1
+    // lane can be proven still bare, so a lane for a now-checked-out branch must
+    // not survive the skipped deletion pass.
     if checked_out.iter().any(|worktree| !worktree.head_resolved) {
+        purge_repo_ref_lanes(handle, &repository_id);
         return Err(
             "Error: a checked-out worktree's HEAD could not be resolved; local-ref \
              reconcile fails closed to avoid publishing a checked-out branch as a P1 lane."
@@ -575,6 +632,7 @@ pub fn reconcile_local_ref_topology(
                 checked_out_refs.insert(name.to_string());
             }
             Err(_) => {
+                purge_repo_ref_lanes(handle, &repository_id);
                 return Err(
                     "Error: the main repository HEAD is a branch whose name could \
                      not be decoded; local-ref reconcile fails closed to avoid \
@@ -586,10 +644,55 @@ pub fn reconcile_local_ref_topology(
         Ok(_) => {} // detached main HEAD: no branch checked out at the main worktree
         Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {}
         Err(err) => {
+            purge_repo_ref_lanes(handle, &repository_id);
             return Err(format!(
                 "Error: the main repository HEAD could not be read ({err}); \
                  local-ref reconcile fails closed."
             ));
+        }
+    }
+
+    // Finding D2 (L-G01): when THIS instance was opened AT a linked worktree,
+    // `repository.head()` above is the WORKTREE's HEAD — the MAIN worktree's
+    // checked-out branch (its own P0 lane) is invisible here and would be wrongly
+    // republished as a P1 lane. Opening a linked worktree as a project is supported
+    // (data-model.md:1260-1263), so union the main worktree's HEAD from the common
+    // dir, with the SAME fail-closed arms as the main-HEAD block above.
+    if repository.is_worktree() {
+        let main = match Repository::open(repository.commondir()) {
+            Ok(main) => main,
+            Err(err) => {
+                purge_repo_ref_lanes(handle, &repository_id);
+                return Err(format!(
+                    "Error: the main worktree repository could not be opened from the \
+                     common dir ({err}); local-ref reconcile fails closed."
+                ));
+            }
+        };
+        match main.head() {
+            Ok(head) if head.is_branch() => match head.name() {
+                Ok(name) => {
+                    checked_out_refs.insert(name.to_string());
+                }
+                Err(_) => {
+                    purge_repo_ref_lanes(handle, &repository_id);
+                    return Err(
+                        "Error: the main worktree HEAD is a branch whose name could \
+                         not be decoded; local-ref reconcile fails closed to avoid \
+                         publishing a checked-out branch as a P1 lane."
+                            .to_string(),
+                    );
+                }
+            },
+            Ok(_) => {} // detached main worktree HEAD: no branch checked out there
+            Err(err) if err.code() == git2::ErrorCode::UnbornBranch => {}
+            Err(err) => {
+                purge_repo_ref_lanes(handle, &repository_id);
+                return Err(format!(
+                    "Error: the main worktree HEAD could not be read ({err}); \
+                     local-ref reconcile fails closed."
+                ));
+            }
         }
     }
 
@@ -607,6 +710,8 @@ pub fn reconcile_local_ref_topology(
     }
     local_branch_refs.sort();
 
+    let lane_prefix = format!("symforge:git-ref:{}:", repository_id.as_str());
+
     // Publish a P1 lane for every bare (non-checked-out) local branch. A single
     // branch failing to ingest is COLLECTED, not fatal (finding C): the deletion
     // pass below must still reconcile every branch whose ref is gone/checked-out,
@@ -616,6 +721,27 @@ pub fn reconcile_local_ref_topology(
     for ref_name in &local_branch_refs {
         if checked_out_refs.contains(ref_name) {
             continue;
+        }
+        // Finding S1: skip the full materialize+parse republish when this branch
+        // tip has not moved since its lane was last published. `build_ref_source_
+        // generation` already carries `content_generation` forward on an
+        // identical-tip republish, so the scout+ingest is provably redundant. The
+        // deletion pass keeps the lane (its branch is still in `local_branch_refs`),
+        // so skipping publish is safe. A branch tip we cannot resolve falls through
+        // to a normal (re)publish attempt.
+        if let Ok(oid) = repository.refname_to_id(ref_name) {
+            let tip = oid.to_string();
+            let source_id = SourceId::new(format!("{lane_prefix}{ref_name}"));
+            let unchanged = handle
+                .published_source_set()
+                .sources
+                .get(&source_id)
+                .and_then(|lane| lane.source_version.as_ref())
+                .map(|version| version.commit.as_deref() == Some(tip.as_str()))
+                .unwrap_or(false);
+            if unchanged {
+                continue;
+            }
         }
         match ingest_and_publish_local_ref(
             handle,
@@ -634,7 +760,6 @@ pub fn reconcile_local_ref_topology(
     // checked out). Runs unconditionally after the publish pass — a publish
     // failure above never skips it. Reads a fresh snapshot so the lanes just
     // published above are already visible.
-    let lane_prefix = format!("symforge:git-ref:{}:", repository_id.as_str());
     let current = handle.published_source_set();
     let mut removed: Vec<SourceId> = Vec::new();
     for source_id in current.sources.keys() {
@@ -862,6 +987,39 @@ mod tests {
         let catalog = scout_local_ref(&repository, "HEAD", &budget).expect("scout");
         assert_eq!(catalog.coverage, RefScoutCoverage::Degraded);
         assert_eq!(catalog.entries.len(), 2);
+    }
+
+    #[test]
+    fn tree_entries_count_against_the_scout_budget() {
+        // Finding D5: the entry budget must count EVERY visited tree entry (subtrees
+        // included), not just ingested blobs. Here four blobs live under four
+        // subtrees — eight tree entries total. A blob-only budget of 5 would never
+        // trip and would wrongly report Complete; counting subtrees degrades the
+        // walk, bounding the unbounded `find_tree` work a deep-empty-dir tree causes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[
+                ("d0/f.rs", b"//0\n"),
+                ("d1/f.rs", b"//1\n"),
+                ("d2/f.rs", b"//2\n"),
+                ("d3/f.rs", b"//3\n"),
+            ],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let budget = LocalRefScoutBudget {
+            max_entries: 5,
+            max_blob_materialize_bytes: DEFAULT_MAX_BLOB_MATERIALIZE_BYTES,
+        };
+        let catalog = scout_local_ref(&repository, "HEAD", &budget).expect("scout");
+        assert_eq!(
+            catalog.coverage,
+            RefScoutCoverage::Degraded,
+            "subtree entries must count against the budget, degrading coverage"
+        );
     }
 
     #[test]
@@ -1977,6 +2135,60 @@ mod tests {
     }
 
     #[test]
+    fn dependency_lockfile_ref_blob_is_withheld_matching_filesystem_admission() {
+        // Finding D1 (L-R10/L-G04): a committed dependency lockfile is withheld
+        // metadata-only from a ref exactly as `classify_admission` withholds it on
+        // disk — its machine-generated content is never parsed into junk symbols.
+        // The `Lockfile` reason is byte-identical to the filesystem scout's.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = route_single(
+            dir.path(),
+            "deps/package-lock.json",
+            b"{\n  \"name\": \"x\",\n  \"lockfileVersion\": 3\n}\n",
+        );
+        assert!(
+            matches!(
+                outcome,
+                RefBlobIngest::Withheld(MetadataOnlyReason::Lockfile)
+            ),
+            "a committed lockfile must be withheld as Lockfile, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_data_ref_blob_is_withheld_from_odb_header_matching_filesystem() {
+        // Finding D1 (L-R10/L-G04): a >1 MiB data blob is withheld `OversizedData`
+        // from the ODB header size, before its bytes are parsed — identical to the
+        // filesystem size tier (1 MiB data / 4 MiB code).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big_csv = vec![b'a'; 2 * 1024 * 1024];
+        let outcome = route_single(dir.path(), "data/export.csv", &big_csv);
+        assert!(
+            matches!(
+                outcome,
+                RefBlobIngest::Withheld(MetadataOnlyReason::OversizedData)
+            ),
+            "a 2 MiB .csv must be withheld as OversizedData, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn binary_ref_blob_is_withheld_via_shared_sniff_matching_filesystem() {
+        // Finding D1 (L-R10/L-G04): a small binary blob at a NON-denylisted
+        // extension is withheld via the SAME 8 KB binary-sniff predicate the
+        // filesystem scout applies, matching its `Binary` reason. (`.dat` is not on
+        // the extension denylist, so it must reach the content sniff, not the
+        // denylist tier.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary: &[u8] = b"\x00\x01\x02BINARY\x00PAYLOAD\x00\xff\xfe";
+        let outcome = route_single(dir.path(), "assets/blob.dat", binary);
+        assert!(
+            matches!(outcome, RefBlobIngest::Withheld(MetadataOnlyReason::Binary)),
+            "a small binary blob must be withheld as Binary, got {outcome:?}"
+        );
+    }
+
+    #[test]
     fn reconcile_deletion_pass_runs_despite_a_branch_publish_failure() {
         // Finding C: a single bare branch failing to ingest must NOT abort the pass;
         // the deletion pass still removes a stale lane for a deleted branch.
@@ -2052,6 +2264,253 @@ mod tests {
                 .sources
                 .contains_key(&doomed_id),
             "the stale lane for the deleted branch is gone"
+        );
+    }
+
+    #[test]
+    fn reconcile_from_a_linked_worktree_excludes_the_main_worktree_branch() {
+        // Finding D2 (L-G01): when the project is opened AT a linked worktree,
+        // `repository.head()` is the WORKTREE's HEAD — the MAIN worktree's
+        // checked-out branch is its own P0 lane and must be unioned from the common
+        // dir, never republished as a P1 lane (data-model.md:1260-1263).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let main = git2::Repository::open(root).expect("open main");
+        let main_ref = main
+            .head()
+            .expect("head")
+            .name()
+            .expect("head name")
+            .to_string();
+
+        // Add a linked worktree on a NEW branch and open THAT as the project.
+        let wt_parent = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_parent.path().join("feature-wt");
+        add_worktree_on_branch(&main, &wt_path, "feature-wt", "feature");
+        let worktree_repo = git2::Repository::open(&wt_path).expect("open worktree");
+        assert!(
+            worktree_repo.is_worktree(),
+            "the project is opened at a linked worktree"
+        );
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-wt-open");
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &worktree_repo,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("reconcile from a linked worktree");
+
+        let main_id = SourceId::new(format!(
+            "symforge:git-ref:{}:{main_ref}",
+            repository_id.as_str()
+        ));
+        let feature_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/feature",
+            repository_id.as_str()
+        ));
+        let set = handle.published_source_set();
+        assert!(
+            !set.sources.contains_key(&main_id),
+            "the MAIN worktree branch is never a P1 lane when reconciling from a linked worktree"
+        );
+        assert!(
+            !outcome.published.contains(&main_id),
+            "the main branch is not among the published lanes"
+        );
+        assert!(
+            !set.sources.contains_key(&feature_id),
+            "the linked worktree's own branch is also not a P1 lane"
+        );
+    }
+
+    #[test]
+    fn fail_closed_reconcile_purges_stale_ref_lanes() {
+        // Finding D4: when topology becomes unprovable the pass fails closed BEFORE
+        // the deletion pass, so a pre-existing P1 lane for a branch that may now be
+        // checked out must be purged — else a P0 branch keeps being served as a P1
+        // lane.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-failclosed");
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+
+        // A clean first pass publishes the bare-branch P1 lane.
+        reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            handle.published_source_set().sources.contains_key(&bare_id),
+            "the bare lane is published on the clean pass"
+        );
+
+        // Add a linked worktree, then corrupt its HEAD so the topology is
+        // unprovable (head_resolved == false).
+        let wt_parent = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_parent.path().join("checked");
+        add_worktree_on_branch(&repository, &wt_path, "checked-wt", "checked");
+        let admin_head = root
+            .join(".git")
+            .join("worktrees")
+            .join("checked-wt")
+            .join("HEAD");
+        std::fs::write(&admin_head, b"\x00\x01 not a ref\n").expect("corrupt worktree HEAD");
+
+        let result = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an unprovable topology fails the reconcile closed, got {result:?}"
+        );
+        assert!(
+            !handle.published_source_set().sources.contains_key(&bare_id),
+            "the pre-existing bare P1 lane is purged on the fail-closed abort"
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_publish_a_moved_worktree_branch() {
+        // Finding D3 (reconcile level): a moved-but-not-pruned worktree is
+        // classified checked-out from its admin HEAD, so its branch is excluded from
+        // P1 — never published as a bare lane even though `validate()` fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+
+        let wt_parent = tempfile::tempdir().expect("wt tempdir");
+        let wt_path = wt_parent.path().join("moved-wt");
+        add_worktree_on_branch(&repository, &wt_path, "moved-wt", "moved");
+        std::fs::remove_dir_all(&wt_path).expect("remove worktree working dir");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-moved");
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("reconcile with a moved worktree");
+
+        let moved_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/moved",
+            repository_id.as_str()
+        ));
+        assert!(
+            !outcome.published.contains(&moved_id),
+            "the moved worktree's branch is not published as a bare lane"
+        );
+        assert!(
+            !handle
+                .published_source_set()
+                .sources
+                .contains_key(&moved_id),
+            "no P1 lane exists for the moved worktree's branch"
+        );
+        assert!(
+            outcome
+                .checked_out
+                .iter()
+                .any(|w| w.head_ref.as_deref() == Some("refs/heads/moved")),
+            "the moved worktree is surfaced as checked-out via its admin HEAD"
+        );
+    }
+
+    #[test]
+    fn unchanged_branch_tip_skips_republish() {
+        // Finding S1: republishing a bare branch whose tip has not moved is provably
+        // redundant (build_ref_source_generation carries content_generation forward
+        // on an identical tip). The second reconcile must skip the scout+ingest
+        // entirely, leaving the lane's publication_generation untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("bare", &head_commit, false)
+            .expect("bare branch");
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-s1");
+        let bare_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/bare",
+            repository_id.as_str()
+        ));
+
+        let first = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("first reconcile");
+        assert!(
+            first.published.contains(&bare_id),
+            "the first pass publishes the bare lane"
+        );
+        let gen_after_first = handle
+            .published_source_set()
+            .sources
+            .get(&bare_id)
+            .expect("lane present after first pass")
+            .publication_generation;
+
+        let second = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("second reconcile");
+        assert!(
+            !second.published.contains(&bare_id),
+            "an unchanged tip is NOT republished"
+        );
+        let gen_after_second = handle
+            .published_source_set()
+            .sources
+            .get(&bare_id)
+            .expect("lane still present after second pass")
+            .publication_generation;
+        assert_eq!(
+            gen_after_first, gen_after_second,
+            "publication_generation is untouched when the tip did not move"
         );
     }
 
@@ -2247,21 +2706,27 @@ mod tests {
 
     #[test]
     fn concurrent_reconcile_is_single_flighted_and_skips() {
-        // Finding F: while a reconcile pass holds the single-flight guard, a second
-        // pass SKIPS (never blocks) rather than racing the publish/deletion steps.
+        // Finding F / S2a: single-flight is proven with REAL threads. While one
+        // thread holds the reconcile guard, a contender running CONCURRENTLY on
+        // another thread must SKIP (never block, never race the publish/deletion
+        // steps); once the guard is free, the next pass runs and publishes. This is
+        // deterministic — the contender is spawned while the guard is held — so
+        // exactly one attempt runs and the other skips.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         init_repo(root);
         commit_files(root, &[("src/lib.rs", b"pub fn base() {}\n")], "initial");
-        let repository = git2::Repository::open(root).expect("open");
-        let head_commit = repository
-            .head()
-            .expect("head")
-            .peel_to_commit()
-            .expect("peel");
-        repository
-            .branch("bare", &head_commit, false)
-            .expect("bare branch");
+        {
+            let repository = git2::Repository::open(root).expect("open");
+            let head_commit = repository
+                .head()
+                .expect("head")
+                .peel_to_commit()
+                .expect("peel");
+            repository
+                .branch("bare", &head_commit, false)
+                .expect("bare branch");
+        }
 
         let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
         let repository_id = RepositoryId::new("repo-singleflight");
@@ -2270,40 +2735,69 @@ mod tests {
             repository_id.as_str()
         ));
 
-        // Simulate an in-flight pass by holding the guard.
-        let guard = handle
-            .try_lock_ref_reconcile()
-            .expect("acquire reconcile guard");
-        let skipped = reconcile_local_ref_topology(
-            &handle,
-            &repository,
-            repository_id.clone(),
-            &LocalRefScoutBudget::default(),
-        )
-        .expect("a concurrent reconcile returns Ok(skipped)");
-        assert!(skipped.skipped, "a concurrent reconcile must skip");
+        // A contender running on another thread WHILE this thread holds the guard
+        // must skip — deterministic single-flight, no busy-wait race. Each thread
+        // opens its own `Repository` (git2::Repository is not `Sync`).
+        let contender = std::thread::scope(|scope| {
+            let guard = handle
+                .try_lock_ref_reconcile()
+                .expect("acquire the reconcile guard");
+            let outcome = scope
+                .spawn(|| {
+                    let repo = git2::Repository::open(root).expect("open in contender");
+                    reconcile_local_ref_topology(
+                        &handle,
+                        &repo,
+                        repository_id.clone(),
+                        &LocalRefScoutBudget::default(),
+                    )
+                    .expect("the contender reconcile returns Ok(skipped)")
+                })
+                .join()
+                .expect("join contender");
+            drop(guard);
+            outcome
+        });
         assert!(
-            skipped.published.is_empty() && skipped.removed.is_empty(),
-            "a skipped pass mutates nothing"
+            contender.skipped,
+            "a reconcile attempted concurrently while the guard is held must skip"
+        );
+        assert!(
+            contender.published.is_empty() && contender.removed.is_empty(),
+            "the skipped pass mutates nothing"
         );
         assert!(
             !handle.published_source_set().sources.contains_key(&bare_id),
             "the skipped pass published no lane"
         );
 
-        // Releasing the guard lets a subsequent pass proceed and publish.
-        drop(guard);
-        let ran = reconcile_local_ref_topology(
-            &handle,
-            &repository,
-            repository_id.clone(),
-            &LocalRefScoutBudget::default(),
-        )
-        .expect("reconcile proceeds after the guard is released");
-        assert!(!ran.skipped, "the pass runs once the guard is free");
+        // With the guard free, a pass on its own thread runs and publishes.
+        let runner = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let repo = git2::Repository::open(root).expect("open in runner");
+                    reconcile_local_ref_topology(
+                        &handle,
+                        &repo,
+                        repository_id.clone(),
+                        &LocalRefScoutBudget::default(),
+                    )
+                    .expect("the guard-free reconcile runs")
+                })
+                .join()
+                .expect("join runner")
+        });
+        assert!(
+            !runner.skipped,
+            "the guard-free pass runs (skipped == false)"
+        );
+        assert!(
+            runner.published.contains(&bare_id),
+            "the runner publishes the bare lane"
+        );
         assert!(
             handle.published_source_set().sources.contains_key(&bare_id),
-            "the bare branch is published once the pass actually runs"
+            "the final lane set is correct"
         );
     }
 

@@ -2083,6 +2083,46 @@ use crate::domain::index::{
     AdmissionDecision, AdmissionTier, HARD_SKIP_BYTES, METADATA_ONLY_BYTES, SkipReason,
 };
 
+/// Shared PATH+SIZE admission tiers (Feature 020 L-R10/L-G04 parity).
+///
+/// Returns the `MetadataOnlyReason` a `(path, size)` pair earns from the
+/// dependency-lockfile basename, denylisted-extension, and language-aware oversize
+/// thresholds — the exact tiers `classify_admission` applies on disk — or `None`
+/// when the pair clears them all. Content-dependent tiers (binary sniff, secret
+/// scan, LFS pointer) are NOT decided here; the caller runs those on bytes.
+///
+/// Both the filesystem scout (`classify_admission`) and the local-ref-blob scout
+/// (`classify_ref_blob` in `live_index::local_ref_scout`) route through THIS one
+/// function, so an identical `(path, size)` withholds identically regardless of
+/// origin — one home, no copy to drift (the L-R10/L-G04 root cause of finding D1).
+pub fn path_admission_reason(path: &Path, size: u64) -> Option<MetadataOnlyReason> {
+    use crate::domain::index::{
+        METADATA_ONLY_CODE_BYTES, is_denylisted_extension, is_dependency_lockfile,
+    };
+
+    // Dependency lockfiles (exact basename) before the size tier, so a >1 MiB
+    // lockfile still reports `Lockfile` rather than `OversizedData`.
+    if is_dependency_lockfile(path) {
+        return Some(MetadataOnlyReason::Lockfile);
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && is_denylisted_extension(ext)
+    {
+        return Some(MetadataOnlyReason::GeneratedOrVendor);
+    }
+    // Code languages get the larger 4 MiB threshold; data/markup keep 1 MiB.
+    let size_threshold = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::domain::LanguageId::from_extension)
+        .filter(crate::domain::LanguageId::is_code_language)
+        .map_or(METADATA_ONLY_BYTES, |_| METADATA_ONLY_CODE_BYTES);
+    if size > size_threshold {
+        return Some(MetadataOnlyReason::OversizedData);
+    }
+    None
+}
+
 /// Classify a file's admission tier. Returns AdmissionDecision with both tier and reason.
 ///
 /// Precedence (first match wins):
@@ -2092,49 +2132,29 @@ use crate::domain::index::{
 /// 4. Metadata-only size threshold (1MB data / 4MB code) → Tier 2
 /// 5. Binary sniff (null bytes in first 8KB) → Tier 2
 /// 6. All else → Tier 1
+///
+/// Tiers 2–4 (the PATH+SIZE decision) live in `path_admission_reason`, shared
+/// with the local-ref-blob scout so both origins withhold identically (L-R10/
+/// L-G04, finding D1).
 pub fn classify_admission(
     path: &std::path::Path,
     file_size: u64,
     content_sample: Option<&[u8]>,
 ) -> AdmissionDecision {
-    use crate::domain::index::{is_denylisted_extension, is_dependency_lockfile};
-
     if file_size > HARD_SKIP_BYTES {
         return AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling);
     }
-    // Dependency lockfiles are machine-generated manifests: their resolved
-    // dependency trees parse into thousands of meaningless key/value symbols that
-    // pollute symbol counts and `conventions` complexity stats. Demote to Tier-2
-    // metadata-only (path stays searchable; no symbol extraction). Checked before
-    // the size threshold so a >1MB lockfile still reports `lockfile`, not `>1MB`.
-    if is_dependency_lockfile(path) {
-        return AdmissionDecision::skip(
-            AdmissionTier::MetadataOnly,
-            SkipReason::DependencyLockfile,
-        );
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && is_denylisted_extension(ext)
-    {
-        return AdmissionDecision::skip(
-            AdmissionTier::MetadataOnly,
-            SkipReason::DenylistedExtension,
-        );
-    }
-    // Language-aware threshold (dogfood #1/#7, 2026-07-06): code languages get
-    // METADATA_ONLY_CODE_BYTES (4MB) before demotion — >1MB first-party source
-    // is load-bearing in real repos and tree-sitter parses it in milliseconds.
-    // Data/markup formats keep the 1MB threshold (symbol-pollution guard).
-    let size_threshold = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(crate::domain::LanguageId::from_extension)
-        .filter(crate::domain::LanguageId::is_code_language)
-        .map_or(METADATA_ONLY_BYTES, |_| {
-            crate::domain::index::METADATA_ONLY_CODE_BYTES
-        });
-    if file_size > size_threshold {
-        return AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::SizeThreshold);
+    // Shared PATH+SIZE tiers (lockfile / denylisted extension / oversize). One
+    // home, so the filesystem scout and the ref-blob scout cannot drift.
+    if let Some(reason) = path_admission_reason(path, file_size) {
+        let skip = match reason {
+            MetadataOnlyReason::Lockfile => SkipReason::DependencyLockfile,
+            MetadataOnlyReason::OversizedData => SkipReason::SizeThreshold,
+            // `path_admission_reason` returns only Lockfile / OversizedData /
+            // GeneratedOrVendor; the denylisted extension is the sole remainder.
+            _ => SkipReason::DenylistedExtension,
+        };
+        return AdmissionDecision::skip(AdmissionTier::MetadataOnly, skip);
     }
     if let Some(content) = content_sample
         && is_binary_content(content)
