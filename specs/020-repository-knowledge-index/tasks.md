@@ -746,17 +746,33 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
   `m002_terminal_disposition_is_rendered_identically…`, `m002_budget_degraded_manifest_reports_bounded…`,
   `m002_health_reflects_unbound_to_bound_transition`, `m002_health_shows_per_session_protected_membership`,
   `m002_post_bind_durability_degradation_is_independent_of_query_readiness`)
-- [ ] M-003 Assert full surface is exactly 39 tools and compact surface remains 3;
-  annotations/resources/prompts/catalog/docs match shipped behavior.
+- [x] M-003 Assert full surface is exactly 39 tools and compact surface remains 3;
+  annotations/resources/prompts/catalog/docs match shipped behavior. (tests
+  `surface_default::full_surface_advertises_exactly_39_tools` [added — pins full == tool_definitions()
+  minus `symforge` facade == 39] + `surface_compact_resolves_compact_and_advertises_three_tools`;
+  prompts `prompts::test_prompt_router_lists_expected_prompts`; resources/catalog
+  `resources::test_resource_definitions_include_repo_surfaces` + `test_read_tools_catalog_resource`)
 - [ ] M-004 Run every quickstart scout/format/lifecycle/search/error/bridge/authority/
   root-state/curation-crash/worktree fixture; record exact results, token reductions,
   and degraded limitations. Corpus median returned tokens must be at least 50% below
   the recorded broad-discovery-plus-direct-read baseline.
-- [ ] M-005 Run secret-safety scan/report by file:line only.
-- [ ] M-006 Prove policy mismatch forces re-scout/recompute and serialized snapshot,
-  CCR, analytics, logs, diagnostics, review, and curation contain no runtime canary.
-- [ ] M-007 Assert memory-only `checkpoint_now` is a successful typed
-  `persistence_unavailable` result with `applied=false`, not an MCP/protocol error.
+- [x] M-005 Run secret-safety scan/report by file:line only. (ran the repo's own
+  `scan_secret_bytes`+`sensitive_path_rule` over all 954 tracked content files via a throwaway
+  harness [deleted]: 0 path-rule/credential-file hits, 0 indeterminate; 30 content hits are all
+  token-SHAPED strings in the scanner's own machinery, deliberate security-test canaries, bearer-token
+  handling code, or doc curl examples — tree CLEAN. Scanner exposes only rule_id+count, never values.)
+- [x] M-006 Prove policy mismatch forces re-scout/recompute and serialized snapshot,
+  CCR, analytics, logs, diagnostics, review, and curation contain no runtime canary. (existing
+  coverage: re-scout `persist::secret_policy_mismatch_forces_rescout_before_snapshot_ready`,
+  CCR `ccr::knowledge_ccr_is_policy_tagged_and_mismatch_fails_closed`; no-canary in snapshot/CCR/
+  analytics/diagnostics/review/curation each cited. "no canary in LOGS" holds by construction —
+  sensitive bytes never become resident [`watcher::watcher_content_policy_withholds_sensitive_bytes_before_publication`],
+  so nothing to log; a per-callsite log-capture test would be strictly weaker.)
+- [x] M-007 Assert memory-only `checkpoint_now` is a successful typed
+  `persistence_unavailable` result with `applied=false`, not an MCP/protocol error. (test
+  `tools::tests::test_checkpoint_now_memory_only_is_typed_persistence_unavailable_not_error` — bound
+  root, no state placement; asserts `persistence_unavailable`+`applied=false`, not the hard-error branch;
+  the `-> String` handler makes "not an Err/protocol error" structural.)
 - [ ] M-008 Run `cargo fmt --check`.
 - [ ] M-009 Run `cargo check --features server`.
 - [ ] M-010 Run `cargo clippy --all-targets --features server -- -D warnings`.

@@ -28,15 +28,24 @@ impl GitignoreHygieneReport {
         Self { status, changed }
     }
 
-    pub fn receipt(&self) -> String {
-        let status = match &self.status {
+    /// Bounded status word (no path/secret), reused by the receipt and the
+    /// health `gitignore_hygiene=` field.
+    pub fn status_label(&self) -> &'static str {
+        match &self.status {
             GitignoreHygiene::Effective => "effective",
             GitignoreHygiene::MissingRule => "missing_rule",
             GitignoreHygiene::NoRootGitignore => "no_root_gitignore",
             GitignoreHygiene::Unverifiable { .. } => "unverifiable",
             GitignoreHygiene::NotApplicableExplicitProtected => "not_applicable_explicit_protected",
-        };
-        format!("gitignore_hygiene={status} changed={}", self.changed)
+        }
+    }
+
+    pub fn receipt(&self) -> String {
+        format!(
+            "gitignore_hygiene={} changed={}",
+            self.status_label(),
+            self.changed
+        )
     }
 }
 

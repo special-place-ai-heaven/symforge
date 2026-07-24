@@ -3448,6 +3448,31 @@ fn current_exe_shadow_report() -> Option<crate::path_shadow::ShadowReport> {
     Some(report)
 }
 
+/// Read-only `.gitignore` hygiene status for the health `gitignore_hygiene=`
+/// field (source-binding-and-state.md Health contract). `None` when unbound.
+/// Explicit-protected roots are not applicable (hygiene never touches a
+/// protected root); every other bound root is observed without mutation via
+/// `ObserveOnly` — the same code path bind/init use, never a second checker.
+fn gitignore_hygiene_status(
+    repo_root: Option<&Path>,
+    placement: Option<&crate::domain::StatePlacement>,
+) -> Option<&'static str> {
+    let root = repo_root?;
+    if matches!(
+        crate::protocol::format::placement_authorization(placement),
+        Some(crate::domain::SourceAccessMode::ExplicitProtected)
+    ) {
+        return Some("not_applicable_explicit_protected");
+    }
+    Some(
+        crate::gitignore_hygiene::reconcile_project_gitignore(
+            root,
+            crate::gitignore_hygiene::GitignoreHygieneAuthority::ObserveOnly,
+        )
+        .status_label(),
+    )
+}
+
 /// Extract the `version=<token>` value emitted on the runtime-status line of a
 /// `health` / `health_compact` report (see `format::format_runtime_status`).
 ///
@@ -6841,13 +6866,16 @@ impl SymForgeServer {
         // runtime state. All read from already-published state; nothing recomputed.
         let source_set = self.index.published_source_set();
         let rk_placement = self.capture_state_placement();
+        let rk_root = self.capture_repo_root();
+        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
         let binding_view = format::SourceBindingHealthView {
-            bound: self.capture_repo_root().is_some(),
+            bound: rk_root.is_some(),
             placement: rk_placement.as_ref(),
             persistence: *self.persistence_health.read(),
             session_id: &runtime_status.session_id,
             daemon_session: session_is_daemon,
             query_ready: published.status_label() == "Ready",
+            gitignore_hygiene: rk_gitignore,
         };
         result.push('\n');
         result.push_str(&format::format_repository_knowledge_health(
@@ -7004,13 +7032,16 @@ impl SymForgeServer {
         // Feature 020 repository-knowledge health (M-001), compact form.
         let source_set = self.index.published_source_set();
         let rk_placement = self.capture_state_placement();
+        let rk_root = self.capture_repo_root();
+        let rk_gitignore = gitignore_hygiene_status(rk_root.as_deref(), rk_placement.as_ref());
         let binding_view = format::SourceBindingHealthView {
-            bound: self.capture_repo_root().is_some(),
+            bound: rk_root.is_some(),
             placement: rk_placement.as_ref(),
             persistence: *self.persistence_health.read(),
             session_id: &runtime_status.session_id,
             daemon_session: session_is_daemon,
             query_ready: published.status_label() == "Ready",
+            gitignore_hygiene: rk_gitignore,
         };
         result.push('\n');
         result.push_str(&format::format_repository_knowledge_health_compact(
@@ -14067,6 +14098,40 @@ mod tests {
         );
     }
 
+    /// M-007: with persistence unavailable (a bound repo root but memory-only — no
+    /// resolved state placement), `checkpoint_now` returns a SUCCESSFUL typed result
+    /// carrying `persistence_unavailable` + `applied=false` — a normal tool result,
+    /// never an `Err`/MCP protocol error. The `-> String` return type makes the
+    /// "not a protocol error" guarantee structural: the handler has no error path,
+    /// so this pins the unavailable ENVELOPE the memory-only branch must emit.
+    #[tokio::test]
+    async fn test_checkpoint_now_memory_only_is_typed_persistence_unavailable_not_error() {
+        let server = make_server(make_live_index_empty());
+        let dir = tempfile::tempdir().expect("create temp repo root");
+        // Bind a real root but NO state placement -> memory-only persistence.
+        server.set_bound_project_state(Some(dir.path().to_path_buf()), None);
+
+        let output = server
+            .checkpoint_now(Parameters(super::CheckpointNowInput {
+                verify_after_write: None,
+                export_artifact: None,
+            }))
+            .await;
+
+        assert!(
+            output.contains("persistence_unavailable"),
+            "memory-only checkpoint must carry the typed persistence_unavailable reason, got: {output}"
+        );
+        assert!(
+            output.contains("applied=false"),
+            "memory-only checkpoint must report applied=false, got: {output}"
+        );
+        assert!(
+            !output.contains("Checkpoint failed"),
+            "memory-only unavailability is a successful typed result, not a hard failure, got: {output}"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_repo_map_returns_directory_breakdown() {
         let sym = make_symbol("main", SymbolKind::Function, 1, 3);
@@ -19150,6 +19215,8 @@ mod tests {
             "Bridge: coverage=",
             "Temporal: state=",
             "Authority hygiene: rule_version=",
+            "live_postcondition=established",
+            "gitignore_hygiene=",
         ] {
             assert!(
                 full.contains(marker),
@@ -19191,8 +19258,20 @@ mod tests {
             crate::protocol::format::QuarantineWindow::default(),
         );
         assert!(
-            unbound.contains("binding=unbound") && unbound.contains("placement=unbound"),
+            unbound.contains("binding=unbound"),
             "unbound health must report an unbound binding: {unbound}"
+        );
+        assert!(
+            !unbound.contains("authorization="),
+            "unbound health must omit the bound-only authorization token: {unbound}"
+        );
+        // A local (non-daemon) render must show local_process membership — proving
+        // the membership label actually varies (the daemon path shows `member`),
+        // not a constant. The real L-R11 non-inheritance is proven in
+        // daemon::tests::protected_membership_is_per_session_and_requires_each_direct_override.
+        assert!(
+            unbound.contains("membership=local_process"),
+            "a local render must show local_process membership, not member: {unbound}"
         );
 
         // Bind the same server to a project-local root.

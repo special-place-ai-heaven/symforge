@@ -5015,6 +5015,11 @@ fn m002_terminal_disposition_is_rendered_identically_wherever_a_source_appears()
     assert!(dispositions.contains("indexed=2"), "{dispositions}");
     assert!(dispositions.contains("parsed=1"), "{dispositions}");
     assert!(dispositions.contains("failed=1"), "{dispositions}");
+    // Both entries are code-only ingest targets (M-001 "target" mix).
+    assert!(
+        dispositions.contains("targets code=2 knowledge=0 both=0"),
+        "{dispositions}"
+    );
 }
 
 /// M-002(b): a budget-degraded observation is reported as bounded/degraded and
@@ -5065,4 +5070,84 @@ fn m002_budget_degraded_manifest_reports_bounded_never_a_silent_partial() {
         !budget_hit.contains("coverage=complete"),
         "an absent manifest must never render as complete coverage: {budget_hit}"
     );
+}
+
+/// M-002/HIGH-1: `authorization` stays inside the closed `normal |
+/// explicit_protected` set and is derivable from placement alone — including the
+/// `MemoryOnly` case, which is resolved from `failures` (a `ProjectLocal` failure
+/// means a normal both-tier failure; only-`UserLocal` failures mean the
+/// project-local probe was skipped, i.e. explicit-protected). It never reports
+/// `indeterminate`.
+#[test]
+fn m002_authorization_is_closed_set_and_derived_from_memory_only_failures() {
+    use crate::domain::{
+        AccessErrorKind, ProjectId, ProjectStateDir, SourceAccessMode, StateFailure,
+        StateLocationKind, StatePlacement, UserLocalPlacementReason,
+    };
+    // Absolute path required by ProjectStateDir; the directory is never read by
+    // placement_authorization (it inspects only the variant/reason/failures).
+    let dir = || ProjectStateDir::new(std::env::temp_dir().join("state"));
+
+    let normal_mem = StatePlacement::MemoryOnly {
+        failures: vec![
+            StateFailure {
+                location: StateLocationKind::ProjectLocal,
+                safe_reason: AccessErrorKind::PermissionDenied,
+            },
+            StateFailure {
+                location: StateLocationKind::UserLocal,
+                safe_reason: AccessErrorKind::PermissionDenied,
+            },
+        ],
+    };
+    let protected_mem = StatePlacement::MemoryOnly {
+        failures: vec![StateFailure {
+            location: StateLocationKind::UserLocal,
+            safe_reason: AccessErrorKind::PermissionDenied,
+        }],
+    };
+    let project_local = StatePlacement::ProjectLocal { directory: dir() };
+    let protected_user = StatePlacement::UserLocal {
+        directory: dir(),
+        root_id: ProjectId("p".to_string()),
+        reason: UserLocalPlacementReason::ExplicitProtected,
+    };
+
+    assert_eq!(
+        placement_authorization(Some(&normal_mem)),
+        Some(SourceAccessMode::NormalProject)
+    );
+    assert_eq!(
+        placement_authorization(Some(&protected_mem)),
+        Some(SourceAccessMode::ExplicitProtected)
+    );
+    assert_eq!(
+        placement_authorization(Some(&project_local)),
+        Some(SourceAccessMode::NormalProject)
+    );
+    assert_eq!(
+        placement_authorization(Some(&protected_user)),
+        Some(SourceAccessMode::ExplicitProtected)
+    );
+    assert_eq!(placement_authorization(None), None);
+
+    assert_eq!(
+        authorization_label(Some(&protected_mem)),
+        "explicit_protected"
+    );
+    assert_eq!(authorization_label(Some(&normal_mem)), "normal");
+    assert_eq!(authorization_label(None), "not_applicable");
+    for placement in [
+        Some(&normal_mem),
+        Some(&protected_mem),
+        Some(&project_local),
+        Some(&protected_user),
+        None,
+    ] {
+        assert_ne!(
+            authorization_label(placement),
+            "indeterminate",
+            "authorization must never leave the closed set"
+        );
+    }
 }

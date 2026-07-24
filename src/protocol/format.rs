@@ -1966,8 +1966,8 @@ pub fn health_report_compact_from_published_state(
 
 use crate::domain::{
     CapabilityStatus, CapabilityUnavailableReason, CatalogEntry, CoverageStatus, FileDisposition,
-    FreshnessStatus, ParseStatus, RepositoryManifest, SourceAccessMode, StatePlacement,
-    UserLocalPlacementReason,
+    FreshnessStatus, ParseStatus, RepositoryManifest, SourceAccessMode, StateLocationKind,
+    StatePlacement, UserLocalPlacementReason,
 };
 use crate::live_index::CodeSignalsSnapshot;
 use crate::live_index::knowledge_authority::{KnowledgeAuthorityView, PolicyLedgerStatus};
@@ -1992,6 +1992,9 @@ pub struct SourceBindingHealthView<'a> {
     pub daemon_session: bool,
     /// The live query generation is usable (`Ready`).
     pub query_ready: bool,
+    /// Bounded `.gitignore` hygiene status word (read-only observe), or `None`
+    /// when unbound. Computed at the call site so this module stays I/O-free.
+    pub gitignore_hygiene: Option<&'a str>,
 }
 
 /// Short, stable prefix of a digest/id for bounded health display.
@@ -2020,15 +2023,20 @@ fn placement_label(placement: Option<&StatePlacement>) -> &'static str {
     }
 }
 
-/// Authorization derived from the resolved placement. `explicit_protected`
-/// always lands in user-local (it skips the project-local probe), and a
-/// project-local placement is only ever reached by a normal source, so both are
-/// definitive. `MemoryOnly` is genuinely ambiguous (explicit-protected skip vs
-/// both-tier normal failure) and the authoritative `SourceAccessMode` is not
-/// plumbed to this render site, so it reports `indeterminate` rather than
-/// guessing. ponytail: placement-derived; plumb `SourceAccessMode` end-to-end
-/// only if the memory-only ambiguity ever needs to be resolved in health.
-fn placement_authorization(placement: Option<&StatePlacement>) -> Option<SourceAccessMode> {
+/// Authorization derived from the resolved placement, closed to the contract's
+/// `normal | explicit_protected` set for any bound source.
+///
+/// `explicit_protected` always skips the project-local probe, so its state
+/// placement is either `UserLocal{ExplicitProtected}` or a `MemoryOnly` whose
+/// failures contain **no** `ProjectLocal` failure. A normal binding always
+/// attempts project-local first, so a normal both-tier failure records a
+/// `ProjectLocal` failure in `MemoryOnly` (see
+/// `discovery::resolve_state_placement_with`). That makes the closed set fully
+/// derivable from placement — no authoritative `SourceAccessMode` plumbing
+/// needed. `None` is returned only for an unbound runtime (no placement).
+pub(crate) fn placement_authorization(
+    placement: Option<&StatePlacement>,
+) -> Option<SourceAccessMode> {
     match placement {
         Some(StatePlacement::ProjectLocal { .. }) => Some(SourceAccessMode::NormalProject),
         Some(StatePlacement::UserLocal {
@@ -2039,7 +2047,17 @@ fn placement_authorization(placement: Option<&StatePlacement>) -> Option<SourceA
             reason: UserLocalPlacementReason::ProjectLocalUnavailable { .. },
             ..
         }) => Some(SourceAccessMode::NormalProject),
-        Some(StatePlacement::MemoryOnly { .. }) | None => None,
+        Some(StatePlacement::MemoryOnly { failures }) => {
+            if failures
+                .iter()
+                .any(|failure| failure.location == StateLocationKind::ProjectLocal)
+            {
+                Some(SourceAccessMode::NormalProject)
+            } else {
+                Some(SourceAccessMode::ExplicitProtected)
+            }
+        }
+        None => None,
     }
 }
 
@@ -2047,7 +2065,9 @@ fn authorization_label(placement: Option<&StatePlacement>) -> &'static str {
     match placement_authorization(placement) {
         Some(SourceAccessMode::NormalProject) => "normal",
         Some(SourceAccessMode::ExplicitProtected) => "explicit_protected",
-        None => "indeterminate",
+        // Unbound only: no source is authorized, so the closed bound-source set
+        // does not apply.
+        None => "not_applicable",
     }
 }
 
@@ -2093,9 +2113,27 @@ fn replay_label(placement: Option<&StatePlacement>, persistence: CapabilityStatu
 }
 
 fn render_source_binding_line(binding: &SourceBindingHealthView<'_>) -> String {
+    let membership = if binding.daemon_session {
+        "member"
+    } else {
+        "local_process"
+    };
+    if !binding.bound {
+        // Unbound: placement/authorization/persistence/replay are bound-source
+        // concepts whose closed enumerations have no unbound value, so they are
+        // omitted rather than rendered out-of-set.
+        return format!(
+            "  binding=unbound query_readiness={} session={} membership={membership}",
+            if binding.query_ready {
+                "ready"
+            } else {
+                "not_ready"
+            },
+            binding.session_id,
+        );
+    }
     let mut line = format!(
-        "  binding={} authorization={} placement={} persistence={} replay={} query_readiness={}",
-        if binding.bound { "bound" } else { "unbound" },
+        "  binding=bound authorization={} placement={} persistence={} replay={} query_readiness={} live_postcondition=established",
         authorization_label(binding.placement),
         placement_label(binding.placement),
         persistence_label(binding.persistence),
@@ -2106,6 +2144,14 @@ fn render_source_binding_line(binding: &SourceBindingHealthView<'_>) -> String {
             "not_ready"
         },
     );
+    // `live_postcondition=established`: a bound, attached session has a live
+    // binding/generation. The transient `live_postcondition_unavailable` result
+    // is an idempotency-replay outcome, not observable standing health. It is a
+    // separate token from `query_readiness` on purpose — a bound binding can be
+    // established while its generation is not yet queryable.
+    if let Some(status) = binding.gitignore_hygiene {
+        line.push_str(&format!(" gitignore_hygiene={status}"));
+    }
     // Memory-only fallback reason codes (contract: "safe fallback reason codes").
     if let Some(StatePlacement::MemoryOnly { failures }) = binding.placement
         && !failures.is_empty()
@@ -2116,13 +2162,6 @@ fn render_source_binding_line(binding: &SourceBindingHealthView<'_>) -> String {
             .collect();
         line.push_str(&format!(" fallback_reasons=[{}]", reasons.join(",")));
     }
-    // Current-session membership authority: a daemon session is a member by
-    // routing; the local process has no session-membership model.
-    let membership = if binding.daemon_session {
-        "member"
-    } else {
-        "local_process"
-    };
     line.push_str(&format!(
         " session={} membership={membership}",
         binding.session_id
@@ -2193,14 +2232,26 @@ fn render_disposition_line(entries: &[CatalogEntry]) -> String {
     let mut parsed = 0u64;
     let mut partial = 0u64;
     let mut failed = 0u64;
+    // Ingest-target mix over indexed entries (M-001 "target").
+    let mut target_code = 0u64;
+    let mut target_knowledge = 0u64;
+    let mut target_both = 0u64;
     for entry in entries {
         match &entry.disposition {
-            FileDisposition::Indexed { parse_status, .. } => {
+            FileDisposition::Indexed {
+                parse_status,
+                targets,
+            } => {
                 indexed += 1;
                 match parse_status {
                     ParseStatus::Parsed => parsed += 1,
                     ParseStatus::PartialParse => partial += 1,
                     ParseStatus::Failed => failed += 1,
+                }
+                match (targets.includes_code(), targets.includes_knowledge()) {
+                    (true, true) => target_both += 1,
+                    (true, false) => target_code += 1,
+                    (false, _) => target_knowledge += 1,
                 }
             }
             FileDisposition::MetadataOnly { .. } => metadata_only += 1,
@@ -2211,7 +2262,7 @@ fn render_disposition_line(entries: &[CatalogEntry]) -> String {
         }
     }
     format!(
-        "Dispositions: indexed={indexed} metadata_only={metadata_only} hard_skip={hard_skip} unreadable={unreadable} unstable={unstable} aborted={aborted} (parse parsed={parsed} partial={partial} failed={failed})"
+        "Dispositions: indexed={indexed} metadata_only={metadata_only} hard_skip={hard_skip} unreadable={unreadable} unstable={unstable} aborted={aborted} (parse parsed={parsed} partial={partial} failed={failed}) (targets code={target_code} knowledge={target_knowledge} both={target_both})"
     )
 }
 
@@ -2388,18 +2439,27 @@ pub fn format_repository_knowledge_health_compact(
         Some(manifest) => format!("manifest={}", coverage_label(manifest.coverage)),
         None => "manifest=absent".to_string(),
     };
+    let readiness = if binding.query_ready {
+        "ready"
+    } else {
+        "not_ready"
+    };
+    // Unbound: omit bound-only closed-set fields (placement/authorization/…).
+    let binding_line = if binding.bound {
+        format!(
+            "Source binding: binding=bound authorization={} placement={} persistence={} replay={} readiness={} gitignore={}",
+            authorization_label(binding.placement),
+            placement_label(binding.placement),
+            persistence_label(binding.persistence),
+            replay_label(binding.placement, binding.persistence),
+            readiness,
+            binding.gitignore_hygiene.unwrap_or("n/a"),
+        )
+    } else {
+        format!("Source binding: binding=unbound readiness={readiness}")
+    };
     format!(
-        "Source binding: binding={} authorization={} placement={} persistence={} replay={} readiness={}\nKnowledge: {} sources={} bridge={} authority(rule/policy/secret)={}/{}/{}",
-        if binding.bound { "bound" } else { "unbound" },
-        authorization_label(binding.placement),
-        placement_label(binding.placement),
-        persistence_label(binding.persistence),
-        replay_label(binding.placement, binding.persistence),
-        if binding.query_ready {
-            "ready"
-        } else {
-            "not_ready"
-        },
+        "{binding_line}\nKnowledge: {} sources={} bridge={} authority(rule/policy/secret)={}/{}/{}",
         manifest_summary,
         source_set.sources.len(),
         derived_coverage_label(&generation.bridge.coverage),
