@@ -8,6 +8,7 @@
 //! `guarded_daemon_start`: acquire the start lock, re-check for a live
 //! compatible daemon, stop an incompatible record, and only then bind in the
 //! current process — all under the lock.
+#![cfg(feature = "server")]
 
 use symforge::daemon::{GuardedStart, guarded_daemon_start_at, spawn_daemon_at};
 use symforge::domain::ControlStateDir;

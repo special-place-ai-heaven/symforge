@@ -1,4 +1,5 @@
 //! Compression economics counters (011 US5).
+#![cfg(feature = "server")]
 
 use serde_json::json;
 use symforge::live_index::LiveIndex;

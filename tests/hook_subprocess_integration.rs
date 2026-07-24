@@ -36,6 +36,7 @@
 //! `<session>\t<workflow>\t<outcome>`. The session id is left unpinned
 //! (normalized to `-` when no daemon session file is present), leaving only
 //! the `(workflow, outcome)` pair checked.
+#![cfg(feature = "server")]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

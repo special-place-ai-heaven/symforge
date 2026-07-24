@@ -1,4 +1,5 @@
 //! CCR retrieve round-trip (011 US2).
+#![cfg(feature = "server")]
 
 use serde_json::json;
 use symforge::live_index::LiveIndex;

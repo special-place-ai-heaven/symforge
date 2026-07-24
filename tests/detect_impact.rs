@@ -6,6 +6,7 @@
 //! bootstraps a real 2-commit history there, mirroring `git.rs`'s own
 //! `make_test_repo` helper (git CLI for repo setup only, never production
 //! code).
+#![cfg(feature = "server")]
 
 use std::fs;
 use std::path::Path;
