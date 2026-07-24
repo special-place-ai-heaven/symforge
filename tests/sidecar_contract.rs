@@ -42,7 +42,9 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use symforge::{
-    domain::{LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord},
+    domain::{
+        ControlStateDir, LanguageId, ReferenceKind, ReferenceRecord, SymbolKind, SymbolRecord,
+    },
     live_index::{IndexedFile, LiveIndex, ParseStatus, SharedIndex},
     sidecar::spawn_sidecar,
 };
@@ -50,8 +52,8 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
-// Serialize all cwd-manipulating tests (spawn_sidecar writes port files into
-// cwd/.symforge). tokio::sync::Mutex is Send so it can be held across awaits.
+// Serialize all cwd-manipulating tests. Sidecar descriptors use an explicitly
+// injected control-state owner; cwd remains aligned with each repository fixture.
 // ---------------------------------------------------------------------------
 
 static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -203,6 +205,10 @@ fn build_shared_index(files: Vec<IndexedFile>) -> SharedIndex {
     shared
 }
 
+fn control_state(root: &Path) -> ControlStateDir {
+    ControlStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
+}
+
 // ---------------------------------------------------------------------------
 // HTTP + cwd helpers
 // ---------------------------------------------------------------------------
@@ -295,6 +301,7 @@ async fn test_health_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -326,6 +333,7 @@ async fn test_stats_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -363,6 +371,7 @@ async fn test_outline_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -409,6 +418,7 @@ async fn test_impact_edit_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -467,6 +477,7 @@ async fn test_impact_new_file_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -504,6 +515,7 @@ async fn test_symbol_context_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -550,6 +562,7 @@ async fn test_repo_map_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");
@@ -590,6 +603,7 @@ async fn test_prompt_context_contract_golden() {
         Arc::clone(&index),
         "127.0.0.1",
         Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
     )
     .await
     .expect("spawn_sidecar");

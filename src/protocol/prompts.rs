@@ -52,6 +52,12 @@ pub struct DebugPromptInput {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct AdminPromptInput {}
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct KnowledgeHygienePromptInput {
+    /// Optional repository-relative path prefix to constrain the review.
+    pub path_prefix: Option<String>,
+}
+
 #[prompt_router(vis = "pub(crate)")]
 impl SymForgeServer {
     #[prompt(
@@ -229,6 +235,30 @@ impl SymForgeServer {
     }
 
     #[prompt(
+        name = "symforge-knowledge-hygiene",
+        description = "Review repository knowledge evidence and prepare advisory remediation proposals without mutating files."
+    )]
+    pub(crate) async fn knowledge_hygiene_prompt(
+        &self,
+        params: Parameters<KnowledgeHygienePromptInput>,
+    ) -> GetPromptResult {
+        let messages = vec![
+            PromptMessage::new_text(
+                Role::User,
+                build_knowledge_hygiene_instructions(
+                    &self.project_name,
+                    params.0.path_prefix.as_deref(),
+                ),
+            ),
+            PromptMessage::new_resource_link(Role::User, repo_health_resource()),
+            PromptMessage::new_resource_link(Role::User, repo_map_resource()),
+        ];
+        GetPromptResult::new(messages).with_description(
+            "Review exact knowledge evidence, propose the smallest safe remediation, and stop for explicit approval before any preview or mutation.",
+        )
+    }
+
+    #[prompt(
         name = "symforge-admin",
         description = "Return the running SymForge operator dashboard URL, or guidance to start it."
     )]
@@ -262,6 +292,25 @@ impl SymForgeServer {
     }
 }
 
+fn build_knowledge_hygiene_instructions(project_name: &str, path_prefix: Option<&str>) -> String {
+    if path_prefix.is_some_and(|path| crate::knowledge::guard_query(path).is_err()) {
+        return "Knowledge hygiene prompt rejected by repository safety policy. No review, proposal, cache entry, or mutation workflow was created."
+            .to_string();
+    }
+    let scope = path_prefix
+        .map(|path| format!("path_prefix=\"{path}\""))
+        .unwrap_or_else(|| "repository scope".to_string());
+    format!(
+        "Review repository knowledge hygiene for project '{project_name}' in {scope}.\n\n\
+         1. Call review_knowledge(mode=\"summary\", source_scope=\"current\") and preserve its source identity, complete-plan review_hash, top_result_hash, and coverage.\n\
+         2. Use review_knowledge(mode=\"remediation\") for bounded proposals. Inspect exact document dossiers with mode=\"document\" and corroborate code anchors through search_knowledge or context sections=[\"knowledge\"].\n\
+         3. Treat lifecycle, authority domain, aggregate code evidence, and voice as independent axes. Never infer ownership, implementation status, conflict, or deletion from age, contributors, lexical similarity, or prose judgment.\n\
+         4. Keep every proposal advisory. Report protected roles, unique-content checks, inbound live links, source-local ownership evidence, temporal coverage, and every unmet precondition. Deletion_candidate is evidence-only; this workflow never moves, edits, or deletes a document.\n\
+         5. Present the smallest supported action and confidence basis, then STOP for explicit user approval. This prompt cannot approve an action or mutate policy. Only after approval may a separate curate_knowledge preview be requested; preview must precede any apply.\n\
+         6. Do not copy raw secret-positive content into findings, plans, diagnostics, or follow-up prompts."
+    )
+}
+
 /// Read-only resolution of the running operator dashboard URL for the
 /// `symforge-admin` prompt: load the project's `OperatorSetupProfile` for the
 /// remembered port and, if a server is reachable there, return its `/admin` URL.
@@ -270,10 +319,10 @@ impl SymForgeServer {
 /// This performs an HTTP reachability probe on its own current-thread runtime, so
 /// it MUST run off the async worker (the caller wraps it in `spawn_blocking`). It
 /// never starts a server — that is the `symforge admin` CLI verb's job (D3).
-fn resolve_running_dashboard_url(repo_root: Option<std::path::PathBuf>) -> Option<String> {
+fn resolve_running_dashboard_url(_repo_root: Option<std::path::PathBuf>) -> Option<String> {
     use std::time::Duration;
-    let base = repo_root?;
-    let profile = crate::cli::operator_profile::OperatorSetupProfile::load(&base)?;
+    let control_state_dir = crate::paths::process_control_state_placement().directory()?;
+    let profile = crate::cli::operator_profile::OperatorSetupProfile::load(control_state_dir)?;
     let addr = std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         profile.port,
@@ -619,7 +668,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index: crate::live_index::trigram::TrigramIndex::new(),
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -641,7 +690,7 @@ mod tests {
         let by_name: HashMap<&str, &rmcp::model::Prompt> =
             prompts.iter().map(|p| (p.name.as_str(), p)).collect();
 
-        // All seven prompts are advertised. 009 US3 (T024): symforge-admin is the
+        // All eight prompts are advertised. 009 US3 (T024): symforge-admin is the
         // universal in-harness affordance.
         for name in [
             "symforge-review",
@@ -650,6 +699,7 @@ mod tests {
             "symforge-onboard",
             "symforge-refactor",
             "symforge-debug",
+            "symforge-knowledge-hygiene",
             "symforge-admin",
         ] {
             assert!(by_name.contains_key(name), "missing prompt: {name}");
@@ -690,6 +740,10 @@ mod tests {
         expect_desc(
             "symforge-debug",
             "Generate a detailed debugging plan using SymForge call tracing and change analysis.",
+        );
+        expect_desc(
+            "symforge-knowledge-hygiene",
+            "Review repository knowledge evidence and prepare advisory remediation proposals without mutating files.",
         );
         expect_desc(
             "symforge-admin",
@@ -734,8 +788,43 @@ mod tests {
             args("symforge-debug"),
             HashMap::from([("error".into(), true), ("path".into(), false)]),
         );
+        assert_eq!(
+            args("symforge-knowledge-hygiene"),
+            HashMap::from([("path_prefix".into(), false)]),
+        );
         // AdminPromptInput has no fields -> no declared arguments.
         assert!(args("symforge-admin").is_empty());
+    }
+
+    #[test]
+    fn knowledge_hygiene_prompt_pins_advisory_flow_and_rejects_sensitive_scope_without_echo() {
+        let instructions =
+            build_knowledge_hygiene_instructions("prompt_project", Some("docs/design"));
+        for required in [
+            "review_knowledge(mode=\"summary\"",
+            "review_knowledge(mode=\"remediation\")",
+            "mode=\"document\"",
+            "STOP for explicit user approval",
+            "curate_knowledge preview",
+            "prompt cannot approve",
+            "never moves, edits, or deletes",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "missing hygiene workflow contract {required}: {instructions}"
+            );
+        }
+
+        let canary = ["runtime", "-", "prompt", "-", "canary"].concat();
+        let sensitive_scope = format!("docs/token={canary}");
+        let rejected =
+            build_knowledge_hygiene_instructions("prompt_project", Some(&sensitive_scope));
+        assert!(rejected.contains("rejected by repository safety policy"));
+        assert!(!rejected.contains(&canary), "sensitive scope must not echo");
+        assert!(
+            !rejected.contains("review_knowledge") && !rejected.contains("curate_knowledge"),
+            "a rejected prompt must not create a review or proposal workflow"
+        );
     }
 
     #[tokio::test]

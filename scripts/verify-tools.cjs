@@ -84,6 +84,35 @@ function grepOracle(pattern) {
   return { hits, grepMissing: false };
 }
 
+// Redact ONLY fields tied to LIVE index-generation state; everything else stays
+// byte-exact so a real regression still FAILs (proven by the over-mask check).
+//   - publication=/content=/generation=: monotonic per-publish counters.
+//   - budget-limited (was: full): token-budget truncation race on the envelope.
+//   - source=/content_hash=/link_id=: identity hashes that fold in the source
+//     ROOT BINDING (the absolute repo path -> differs Windows `E:\` vs Linux CI
+//     `/home/runner/...`) and, for links pointing INTO the snapshot files
+//     themselves (these fixtures self-reference), content-generation with no
+//     golden fixpoint. bytes=, the path:line target, counts, coverage,
+//     resolution, bridge_index and the whole outline stay byte-exact and carry
+//     the regression signal. (Snapshots are NOT rewritten to placeholders: the
+//     stored value is redacted here on BOTH sides at compare time, and leaving
+//     the file bytes unchanged preserves the self-referential byte-offset
+//     fixpoint.)
+function normalize(text) {
+  return text
+    .replace(/publication=\d+/g, "publication=<gen>")
+    .replace(/content=\d+/g, "content=<gen>")
+    .replace(/generation=\d+/g, "generation=<gen>")
+    .replace(/source=[0-9a-f]+/g, "source=<src>")
+    .replace(/content_hash=[0-9a-f]+/g, "content_hash=<hash>")
+    .replace(/link_id=[0-9a-f]+/g, "link_id=<id>")
+    // Truncation footer's pre-truncation size estimate: computed over raw output
+    // that embeds the live counters above, so it tips (e.g. ~1010 vs ~1011) with
+    // their digit width. The fixed "budget is 1000 tokens" claim stays byte-exact.
+    .replace(/Original output is ~\d+ tokens/g, "Original output is ~<n> tokens")
+    .replace(/budget-limited \(was: full\)/g, "full");
+}
+
 function readSnapshot(name) {
   const p = path.join(SNAP_DIR, name);
   return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
@@ -222,7 +251,9 @@ async function runCase(session, c) {
   if (c.judge === "snapshot" || c.judge === "write_snapshot") {
     // For write cases, snapshot the RESULTING FILE (proves the write landed clean);
     // for read cases, snapshot the tool's text output. File already restored above.
-    const captured = isWrite ? writtenContent : text;
+    // normalize() redacts live index-generation counters before the compare AND
+    // before --update writes, so committed goldens store the placeholder form.
+    const captured = normalize(isWrite ? writtenContent : text);
 
     const snap = readSnapshot(c.snapshot);
     if (snap === null) {
@@ -232,8 +263,9 @@ async function runCase(session, c) {
       }
       return { verdict: "REVIEW", reason: `no snapshot yet — run --update after eyeballing`, text: captured };
     }
-    if (snap === captured) return { verdict: "PASS", reason: "byte-identical to snapshot", text: captured };
-    return { verdict: "FAIL", reason: `differs from snapshot ${c.snapshot}`, text: captured, snap };
+    const snapN = normalize(snap);
+    if (snapN === captured) return { verdict: "PASS", reason: "byte-identical to snapshot", text: captured };
+    return { verdict: "FAIL", reason: `differs from snapshot ${c.snapshot}`, text: captured, snap: snapN };
   }
 
   return { verdict: "FAIL", reason: `unknown judge '${c.judge}'`, text };

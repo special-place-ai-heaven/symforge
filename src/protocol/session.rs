@@ -349,22 +349,20 @@ impl SessionContext {
                 let hash = hash_symbol_params_json(args);
                 self.try_symbol_cache_hit(path, name, hash, force_refresh)
             }
-            "get_file_context" | "get_file_content" => {
+            "get_file_context" => {
                 let path = args.get("path")?.as_str()?.trim();
                 if path.is_empty() {
                     return None;
                 }
-                let hash = if tool == "get_file_context" {
-                    hash_file_context_params_json(args)
-                } else {
-                    hash_file_content_params_json(args)
-                };
-                if tool == "get_file_context" {
-                    self.try_file_context_cache_hit(path, hash, force_refresh)
-                } else {
-                    self.try_file_content_cache_hit(path, hash, force_refresh)
-                }
+                let hash = hash_file_context_params_json(args);
+                self.try_file_context_cache_hit(path, hash, force_refresh)
             }
+            // `get_file_content` owns a generation-aware cache key that is
+            // computed only after targeted freshness and publication capture.
+            // The plan-only STEL admission layer has neither identity, so it
+            // must execute the primitive instead of reusing a potentially stale
+            // pre-publication fetch.
+            "get_file_content" => None,
             _ => None,
         }
     }
@@ -426,10 +424,21 @@ pub fn hash_value(value: &serde_json::Value) -> u64 {
     hasher.finish()
 }
 
-pub fn hash_file_context_params(max_tokens: Option<u64>, sections: Option<&[String]>) -> u64 {
+pub fn hash_file_context_params(
+    max_tokens: Option<u64>,
+    sections: Option<&[String]>,
+    project: &str,
+    source: Option<&str>,
+    publication_generation: u64,
+    content_generation: u64,
+) -> u64 {
     hash_value(&serde_json::json!({
         "max_tokens": max_tokens,
         "sections": sections,
+        "project": project,
+        "source": source,
+        "publication_generation": publication_generation,
+        "content_generation": content_generation,
     }))
 }
 

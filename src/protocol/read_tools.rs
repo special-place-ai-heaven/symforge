@@ -477,7 +477,7 @@ pub struct GetRepoMapInput {
 
 /// Input for `get_file_context`.
 #[derive(Serialize, JsonSchema)]
-#[schemars(transform = add_include_tests_schema)]
+#[schemars(transform = add_file_context_schema)]
 pub struct GetFileContextInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
@@ -490,7 +490,7 @@ pub struct GetFileContextInput {
     /// Optional max token budget, matching hook behavior.
     #[serde(default, deserialize_with = "lenient_u64")]
     pub max_tokens: Option<u64>,
-    /// Optional list of sections to include. Allowed values: "outline", "imports", "consumers", "references", "git". Omit to include all sections.
+    /// Optional list of sections to include. Allowed values: "outline", "imports", "consumers", "references", "git", "knowledge". Omit or pass an empty list to include all sections.
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<String>")]
     pub sections: Option<Vec<String>>,
@@ -535,7 +535,7 @@ impl<'de> Deserialize<'de> for GetFileContextInput {
 
 /// Input for `get_symbol_context`.
 #[derive(Serialize, JsonSchema)]
-#[schemars(transform = add_include_tests_schema)]
+#[schemars(transform = add_symbol_context_schema)]
 pub struct GetSymbolContextInput {
     /// Optional explicit project selector (daemon sessions with multiple open
     /// projects): an open project ID or unique project name. Omit for the
@@ -561,7 +561,7 @@ pub struct GetSymbolContextInput {
     pub bundle: Option<bool>,
     /// Optional trace-analysis sections. When provided, switches to trace mode: definition,
     /// callers, callees, implementations, type dependencies, git activity.
-    /// Valid values: "dependents", "siblings", "implementations", "git".
+    /// Valid values: "dependents", "siblings", "implementations", "git", "knowledge".
     /// Omit for default symbol-context mode. Pass empty array for all trace sections.
     #[serde(default, deserialize_with = "lenient_option_vec")]
     #[schemars(with = "Vec<String>")]
@@ -1162,4 +1162,84 @@ fn validate_chunk_mode(input: &GetFileContentInput) -> Result<search::FileConten
         chunk_index,
         max_lines,
     ))
+}
+
+fn add_sections_allowlist(schema: &mut Schema, values: &[&str]) {
+    if let Some(serde_json::Value::Object(properties)) = schema.get_mut("properties")
+        && let Some(serde_json::Value::Object(sections)) = properties.get_mut("sections")
+    {
+        sections.insert(
+            "items".to_string(),
+            serde_json::json!({ "type": "string", "enum": values }),
+        );
+    }
+}
+
+fn add_file_context_schema(schema: &mut Schema) {
+    add_include_tests_schema(schema);
+    add_sections_allowlist(
+        schema,
+        &[
+            "outline",
+            "imports",
+            "consumers",
+            "references",
+            "git",
+            "knowledge",
+        ],
+    );
+}
+
+fn add_symbol_context_schema(schema: &mut Schema) {
+    add_include_tests_schema(schema);
+    add_sections_allowlist(
+        schema,
+        &[
+            "dependents",
+            "siblings",
+            "implementations",
+            "git",
+            "knowledge",
+        ],
+    );
+}
+
+#[cfg(test)]
+mod knowledge_section_schema_tests {
+    use super::*;
+
+    fn section_values<T: JsonSchema>() -> Vec<String> {
+        let schema = serde_json::to_value(schemars::schema_for!(T)).expect("schema json");
+        schema["properties"]["sections"]["items"]["enum"]
+            .as_array()
+            .expect("sections enum")
+            .iter()
+            .map(|value| value.as_str().expect("string enum").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn context_schemas_advertise_the_exact_knowledge_section_allowlists() {
+        assert_eq!(
+            section_values::<GetFileContextInput>(),
+            [
+                "outline",
+                "imports",
+                "consumers",
+                "references",
+                "git",
+                "knowledge",
+            ]
+        );
+        assert_eq!(
+            section_values::<GetSymbolContextInput>(),
+            [
+                "dependents",
+                "siblings",
+                "implementations",
+                "git",
+                "knowledge",
+            ]
+        );
+    }
 }

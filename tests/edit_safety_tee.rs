@@ -1,5 +1,11 @@
+use std::path::Path;
 use std::time::Duration;
+use symforge::domain::ProjectStateDir;
 use symforge::edit_safety::tee::{TEE_MAX_FILE_BYTES, Tee, TeeRetention, TeeSnapshot};
+
+fn project_state(root: &Path) -> ProjectStateDir {
+    ProjectStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
+}
 
 #[test]
 fn tee_snapshot_creates_recovery_copy_under_symforge_dir() {
@@ -9,8 +15,11 @@ fn tee_snapshot_creates_recovery_copy_under_symforge_dir() {
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     let original = b"pub fn original() {}\n";
     std::fs::write(&file_path, original).unwrap();
+    let project_state = project_state(temp.path());
 
-    let snapshot = Tee::for_repo(temp.path()).snapshot(&file_path).unwrap();
+    let snapshot = Tee::for_repo(temp.path(), &project_state)
+        .snapshot(&file_path)
+        .unwrap();
     let record = match snapshot {
         TeeSnapshot::Created(record) => record,
         other => panic!("expected created snapshot, got {other:?}"),
@@ -20,7 +29,7 @@ fn tee_snapshot_creates_recovery_copy_under_symforge_dir() {
     assert!(
         record
             .tee_path
-            .starts_with(temp.path().join(".symforge").join("tee"))
+            .starts_with(project_state.as_path().join("tee"))
     );
     assert_eq!(std::fs::read(&record.tee_path).unwrap(), original);
     assert!(record.recovery_hint().contains(".symforge/tee/"));
@@ -34,11 +43,13 @@ fn tee_snapshot_retains_at_most_max_count_records() {
     let file_path = temp.path().join("src/lib.rs");
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, b"pub fn original() {}\n").unwrap();
+    let project_state = project_state(temp.path());
 
     // Small explicit cap keeps the test fast and independent of env defaults.
     const CAP: usize = 5;
     let tee = Tee::with_retention(
         temp.path(),
+        &project_state,
         TeeRetention {
             max_count: CAP,
             max_age: None,
@@ -54,7 +65,7 @@ fn tee_snapshot_retains_at_most_max_count_records() {
         created_paths.push(record.tee_path);
     }
 
-    let tee_dir = temp.path().join(".symforge").join("tee");
+    let tee_dir = project_state.as_path().join("tee");
     let retained = std::fs::read_dir(&tee_dir).unwrap().count();
     assert_eq!(retained, CAP);
     assert!(
@@ -71,7 +82,8 @@ fn tee_snapshot_retains_at_most_max_count_records() {
 fn tee_snapshot_prunes_by_age_at_write_time() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(".git")).unwrap();
-    let tee_dir = temp.path().join(".symforge").join("tee");
+    let project_state = project_state(temp.path());
+    let tee_dir = project_state.as_path().join("tee");
     std::fs::create_dir_all(&tee_dir).unwrap();
 
     // Plant a stale snapshot far in the past, with a synthetic old mtime
@@ -88,6 +100,7 @@ fn tee_snapshot_prunes_by_age_at_write_time() {
 
     let tee = Tee::with_retention(
         temp.path(),
+        &project_state,
         TeeRetention {
             max_count: 0, // disable count; isolate age pruning
             max_age: Some(Duration::from_secs(7 * 86_400)),
@@ -109,7 +122,8 @@ fn tee_snapshot_prunes_by_age_at_write_time() {
 fn tee_snapshot_pruning_disabled_when_both_limits_zero() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(".git")).unwrap();
-    let tee_dir = temp.path().join(".symforge").join("tee");
+    let project_state = project_state(temp.path());
+    let tee_dir = project_state.as_path().join("tee");
     std::fs::create_dir_all(&tee_dir).unwrap();
 
     // An ancient snapshot that age-pruning would normally remove.
@@ -124,6 +138,7 @@ fn tee_snapshot_pruning_disabled_when_both_limits_zero() {
     // Both dimensions disabled (env=0 equivalent): no pruning at all.
     let tee = Tee::with_retention(
         temp.path(),
+        &project_state,
         TeeRetention {
             max_count: 0,
             max_age: None,
@@ -158,8 +173,11 @@ fn tee_snapshot_skips_files_larger_than_size_cap() {
     let file_path = temp.path().join("src/large.rs");
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, vec![b'x'; TEE_MAX_FILE_BYTES + 1]).unwrap();
+    let project_state = project_state(temp.path());
 
-    let snapshot = Tee::for_repo(temp.path()).snapshot(&file_path).unwrap();
+    let snapshot = Tee::for_repo(temp.path(), &project_state)
+        .snapshot(&file_path)
+        .unwrap();
 
     assert!(matches!(
         snapshot,
@@ -168,5 +186,5 @@ fn tee_snapshot_skips_files_larger_than_size_cap() {
             max_size
         } if size == TEE_MAX_FILE_BYTES + 1 && max_size == TEE_MAX_FILE_BYTES
     ));
-    assert!(!temp.path().join(".symforge").join("tee").exists());
+    assert!(!project_state.as_path().join("tee").exists());
 }

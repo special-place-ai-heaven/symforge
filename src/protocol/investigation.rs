@@ -389,7 +389,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index,
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,

@@ -21,7 +21,7 @@
 
 SymForge is a local-first [MCP](https://modelcontextprotocol.io) server for AI coding agents. It gives an agent a fast, symbol-aware view of a repository so it can ask precise questions instead of reading whole files, running broad grep commands, or editing code with blind text replacement.
 
-It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and by default exposes the full **36-tool MCP surface**; the **compact 3-tool surface** (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`. Either way it ships resources and prompts for repo orientation, code reading, search, reference tracing, impact analysis, and structural edits.
+It is written in Rust, indexes code with tree-sitter, keeps the active workspace in memory, and by default exposes the full **39-tool MCP surface**; the **compact 3-tool surface** (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`. Either way it ships resources and prompts for repo orientation, code and repository-knowledge reading, search, review, guarded curation, reference tracing, impact analysis, and structural edits.
 
 > [!IMPORTANT]
 > SymForge is for **code intelligence and code editing**.
@@ -64,10 +64,11 @@ SymForge answers the same questions from an in-memory, symbol-level index:
 | Broad `grep -r` | `search_text` with enclosing-symbol grouping | Matches arrive with structure, not raw lines |
 | Guessing who calls a function | `find_references` / `get_symbol_context` | Exact call sites, imports, and type usages |
 | Find-and-replace refactors | `replace_symbol_body`, `batch_rename` | Structural edits validated against the index |
+| Re-reading docs to recover a past decision or rule | `search_knowledge` | Exact doc/spec evidence with heading context and `file:line`, code scopes untouched |
 
 Every response carries a machine-readable **trust envelope** so the agent knows exactly how much to believe it — and every truncation is disclosed with the real cost, never silently applied.
 
-**Token economics (measured, honest)**: The full 36-tool surface carries ~7k tokens of schema/description overhead. The 70–95% savings figures (e.g. for `get_file_context`) are mean ranges from actual test runs on code, not theoretical best-case. When used for code with the right tools (outlines first, compact modes, targeted symbols), net context usage is lower than naive full-file reads + greps because large irrelevant source is avoided. Trivial or prose-only work can lose on the overhead. See `grok-symforge-analysis-report.md` and the wiki benchmarks for the data. For lower overhead use `SYMFORGE_SURFACE=compact`.
+**Token economics (measured, honest)**: The pre-knowledge 36-tool v8.15.0 surface measured ~7k tokens of schema/description overhead; the current full surface has 39 tools and must be measured as its own payload. The 70–95% savings figures (e.g. for `get_file_context`) are mean ranges from actual test runs on code, not theoretical best-case. When used for code with the right tools (outlines first, compact modes, targeted symbols), net context usage is lower than naive full-file reads + greps because large irrelevant source is avoided. Trivial or prose-only work can lose on the overhead. See `grok-symforge-analysis-report.md` and the wiki benchmarks for the data. For lower overhead use `SYMFORGE_SURFACE=compact`.
 
 Measured numbers also live in the wiki: [Benchmarks and Token Savings](https://github.com/special-place-ai-heaven/symforge/wiki/Benchmarks-and-Token-Savings).
 
@@ -76,13 +77,15 @@ Measured numbers also live in the wiki: [Benchmarks and Token Savings](https://g
 - **Live repository index:** Builds and maintains an in-memory index of source files, symbols, references, file contents, and git-derived ranking signals so agents can query the codebase without repeatedly scanning the filesystem.
 - **Symbol-aware reading:** Lets agents inspect file outlines, imports, consumers, exact source excerpts, full symbol bodies, and symbol context before deciding whether they need a raw file read.
 - **Search and exploration:** Searches symbols, text, file paths, natural-language concepts, and AST-shaped patterns with bounded output and ranking reasons.
+- **Repository knowledge index:** Indexes repository prose — docs, specs, plans, ADRs, runbooks, agent instructions, and safe configs — as a query scope separate from code, so `search_knowledge` returns exact evidence with heading context, `file:line` pointers, and captured source/generation provenance, while prose stays out of code symbol and reference results.
+- **Knowledge hygiene and curation:** `review_knowledge` builds read-only remediation dossiers that separate current-implementation evidence from declared intent, history, and unresolved claims; `curate_knowledge` is preview-first and only writes the repo-owned `.symforge-knowledge.toml` policy ledger, never editing, moving, or deleting documents.
 - **Reference and impact tracing:** Finds call sites, imports, type usages, implementations, file dependents, symbol diffs, and changed files so agents can understand blast radius before editing.
 - **Structural editing:** Replaces, inserts, deletes, batch-edits, and renames symbols by indexed structure instead of blind string replacement, then reports edit status and affected paths.
 - **Safe retry semantics:** Supports optional idempotency keys for indexing and structural edit mutations. Replaying the same key with the same canonical request returns the stored result; reusing the key for a different request fails deterministically.
 - **Snapshot and recovery safeguards:** Writes byte-exact index snapshots through explicit checkpoints, verifies snapshots when requested, and quarantines corrupt or version-incompatible snapshots instead of silently serving them.
 - **Malformed-file diagnostics:** Isolates parser failures to the affected file and exposes `validate_file_syntax` for line-and-column diagnostics when source or config files are malformed.
 - **Local daemon mode:** Can run a shared local daemon for multiple agent sessions while keeping the query path local-first and workspace-aware.
-- **Resources and prompts:** Exposes MCP resources for repo health, outlines, maps, changes, file context, file content, and symbol context, plus prompts for review, architecture, triage, onboarding, refactoring, and debugging.
+- **Resources and prompts:** Exposes MCP resources for repo health, outlines, maps, changes, file context, file content, and symbol context, plus prompts for review, architecture, triage, onboarding, refactoring, debugging, and knowledge hygiene.
 - **Embeddable engine:** Ships an engine-only build (`--no-default-features --features embed`) behind a semver-stable flat facade, so other agentic platforms can compile the indexing and search core without the server, daemon, or CLI surfaces.
 - **Local analytics:** Optionally records bounded, local-only tool-call metadata in SQLite so operators can inspect usage without exporting source code.
 - **npm binary distribution:** Installs as an npm package with a JavaScript launcher plus a platform-specific optional package. It does not run a postinstall downloader or bootstrap client configs during install.
@@ -125,6 +128,10 @@ Multiple sessions can share one local daemon. The daemon binds loopback-only by 
 
 `symforge::embed` is a flat, semver-public facade over the indexing/search/parsing core. A compile-time contract test pins every exported name and full function signature, so a breaking change fails SymForge's own build — not a downstream integrator's. CI builds the engine-only feature for glibc **and musl** targets, which is how SymForge stays both an independent product and an easily integrated library for other agentic platforms.
 
+### Repository knowledge as a separate, trust-labeled scope
+
+A single metadata-first scout gives every in-scope file exactly one terminal disposition, so a multi-gigabyte model or dataset is cataloged by metadata and never read, while docs and specs become searchable prose that is kept out of code symbol and reference results. Each knowledge unit carries separate lifecycle, authority, code-evidence, and retrieval-voice axes: `review_knowledge` can only call a current-implementation claim diverged on exact proof — a missing path or symbol, or a structured-value mismatch — while age, filesystem mtime, and later commits are review signals, never staleness proof, and a declared proposal, ADR, or north star stays labeled intent instead of being marked stale. Curation is ledger-only and preview-first, and secret-bearing content fails closed to metadata-only under a versioned detector, withheld from every response, snapshot, and log.
+
 ## How It Works
 
 ```mermaid
@@ -136,8 +143,11 @@ flowchart LR
     Startup -->|shared sessions| Daemon["optional local daemon<br/>(loopback, token auth)"]
     Daemon --> Local
 
-    Workspace["workspace files"] --> Parser["tree-sitter parsers<br/>19 languages + config extractors"]
+    Workspace["workspace files"] --> Scout["metadata-first scout<br/>one terminal disposition per file"]
+    Scout --> Parser["tree-sitter parsers<br/>19 languages + config extractors"]
+    Scout --> Knowledge["repository-knowledge lane<br/>docs, specs, safe configs"]
     Parser --> Local
+    Knowledge --> Local
     Watcher["filesystem watcher"] --> Local
     Git["git status, diffs, history"] --> Signals["frecency, co-change,<br/>temporal hotspots"]
     Signals --> Local
@@ -145,7 +155,7 @@ flowchart LR
     Local --> Snapshot[".symforge/index.bin<br/>(checkpointed, verified, quarantined)"]
     Snapshot --> Local
 
-    Local --> Tools["full 36-tool default surface<br/>(compact-3 opt-in)<br/>resources + prompts<br/>trust envelopes"]
+    Local --> Tools["full 39-tool default surface<br/>(compact-3 opt-in)<br/>resources + prompts<br/>trust envelopes"]
     Tools --> Client
 
     Tools --> Edits["structural edit engine"]
@@ -329,13 +339,13 @@ symforge update
 
 ## MCP Tools
 
-By default SymForge exposes the full **36-tool** surface below through MCP `tools/list`, advertising every tool individually. The **compact 3-tool surface** — `symforge` (read/search/navigate), `symforge_edit` (structural edits), and `status` (index health + honest economics) — is a documented opt-in escape hatch: set `SYMFORGE_SURFACE=compact` to collapse to it for token-sensitive setups. The tools are grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
+By default SymForge exposes the full **39-tool** surface below through MCP `tools/list`, advertising every tool individually. The **compact 3-tool surface** — `symforge` (read/search/navigate), `symforge_edit` (structural edits), and `status` (index health + honest economics) — is a documented opt-in escape hatch: set `SYMFORGE_SURFACE=compact` to collapse to it for token-sensitive setups. The tools are grouped by how an agent should use them. Exact parameters, output shapes, and worked examples for every tool: [Tool Reference](https://github.com/special-place-ai-heaven/symforge/wiki/Tool-Reference).
 
 ### Orient
 
 | Tool | Use |
 |---|---|
-| `health` | Check index health, watcher state, parse resilience, runtime identity, sidecar state, and capability state |
+| `health` | Check index health, watcher state, parse resilience, runtime identity, sidecar state, capability state, and repository-knowledge health (source binding, disposition accounting, freshness, secret-policy version) |
 | `health_compact` | Smaller health summary for prompt budgets |
 | `get_repo_map` | Get a bounded repository map |
 | `explore` | Explore a broad concept across symbols, files, and patterns with noise filtering and ranking reasons |
@@ -368,6 +378,16 @@ By default SymForge exposes the full **36-tool** surface below through MCP `tool
 | `search_symbols` | Find functions, structs, classes, methods, types, modules, and other symbols |
 | `search_text` | Search text with enclosing symbol context; supports literal terms, OR terms, regex, and AST structural search |
 | `search_files` | Find and rank paths, resolve ambiguous paths, and optionally use frecency or co-change ranking |
+
+### Knowledge
+
+Repository prose is a query scope separate from code. These tools read documents, specs, plans, and safe configs with exact provenance; they never surface prose in code symbol or reference results, never bump frecency, and honor `source_scope` (`current` by default, or `worktrees` / `local_refs` / `all` composed from one captured source set). Scope a call to another project with `project` or `projects`.
+
+| Tool | Use |
+|---|---|
+| `search_knowledge` | Search exact repository-knowledge evidence with captured source, version, and generation provenance, deterministic authority filtering, bounded bridge previews, and explicit coverage |
+| `review_knowledge` | Build read-only authority-and-hygiene dossiers (summary, exact-document, or remediation mode) with aggregate evidence, bridge records, temporal provenance, eligibility blockers, and stable per-source hashes |
+| `curate_knowledge` | Preview-first policy changes for one current worktree; apply only writes the repo-owned `.symforge-knowledge.toml` ledger and never edits, moves, or deletes documents |
 
 ### Trace Impact
 
@@ -430,6 +450,7 @@ SymForge also exposes protocol resources and prompts. These are current shipped 
 | `symforge-onboard` | Codebase onboarding |
 | `symforge-refactor` | Refactor planning |
 | `symforge-debug` | Debugging plan |
+| `symforge-knowledge-hygiene` | Review knowledge evidence and prepare advisory remediation proposals without mutating files |
 
 ## Ranking And Search Signals
 

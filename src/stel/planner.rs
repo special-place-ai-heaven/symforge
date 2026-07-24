@@ -274,6 +274,11 @@ fn plan_carries_path(plan: &StelPlan, request: &StelRequest) -> bool {
 
 /// Build a draft plan for compact `symforge` (L1 → L2).
 pub fn build_plan(request: &StelRequest) -> StelPlan {
+    // Compact CCR redemption is an explicit facade protocol, not a fuzzy search
+    // phrase. Recognize it before every ordinary routing heuristic.
+    if let Some(step) = facade_ccr_retrieval_step(request) {
+        return build_plan_from_steps(request, vec![step]);
+    }
     // A caller that supplies a bare-identifier `symbol` clearly wants THAT
     // symbol, not a full-text search over the natural-language `query`. Honor it
     // for find/auto intent (the buckets that would otherwise run a query-side
@@ -288,6 +293,15 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     if let Some(step) = orient_lookup_step(request) {
         return build_plan_from_steps(request, vec![step]);
     }
+    // An explicit repository-knowledge phrase must win before multi-term find
+    // fusion; otherwise the words "search repository knowledge" are treated as
+    // filename/code terms and the facade never reaches search_knowledge.
+    if matches!(
+        smart_query::classify_intent(request.query.trim()),
+        smart_query::QueryIntent::SearchKnowledge { .. }
+    ) {
+        return build_plan_from_steps(request, vec![route_with_smart_query(request)]);
+    }
     // US4 find fusion: a multi-word fuzzy find query that matches no explicit
     // routing phrase fans out across BOTH the path/file matcher (with the gated
     // co-change boost) and the symbol-name matcher, merged by the serve
@@ -298,6 +312,26 @@ pub fn build_plan(request: &StelRequest) -> StelPlan {
     }
     let step = plan_step(request);
     build_plan_from_steps(request, vec![step])
+}
+
+fn facade_ccr_retrieval_step(request: &StelRequest) -> Option<PlannedStep> {
+    const PREFIX: &str = "retrieve ccr hash ";
+    let query = request.query.trim();
+    let lowercase = query.to_ascii_lowercase();
+    let hash = query.get(PREFIX.len()..)?.trim();
+    if !lowercase.starts_with(PREFIX)
+        || hash.len() != 12
+        || !hash.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(PlannedStep {
+        tool: "symforge_retrieve".to_string(),
+        intent: IntentBucket::Meta,
+        confidence: RouteConfidence::Exact,
+        rationale: "explicit compact CCR redemption",
+        args: json!({ "hash": hash.to_ascii_lowercase() }),
+    })
 }
 
 /// Facade-boundary contract check for the `symbol` field. When a caller drops a
@@ -1134,6 +1168,18 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
         "search_text" => json!({ "query": request.query.trim() }),
         "search_symbols" => json!({ "query": request.query.trim() }),
         "search_files" => json!({ "query": request.query.trim() }),
+        "search_knowledge" => {
+            let mut args = json!({ "query": request.query.trim() });
+            if let Some(path) = request
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                args["path_prefix"] = json!(path);
+            }
+            args
+        }
         "get_file_context" => {
             json!({ "path": request.path.clone().unwrap_or_else(|| request.query.trim().to_string()) })
         }
@@ -1163,16 +1209,20 @@ fn default_args_for_tool(tool: &str, request: &StelRequest) -> Value {
 
 fn intent_bucket_for_tool(tool: &str) -> IntentBucket {
     match tool {
-        "search_text" | "search_symbols" | "search_files" => IntentBucket::Find,
+        "search_text" | "search_symbols" | "search_files" | "search_knowledge" => {
+            IntentBucket::Find
+        }
         "get_file_context" | "get_file_content" | "get_symbol" => IntentBucket::Read,
         "find_references" | "get_symbol_context" => IntentBucket::Trace,
         "find_dependents" | "what_changed" | "analyze_file_impact" | "diff_symbols" => {
             IntentBucket::Impact
         }
         "explore" | "get_repo_map" | "conventions" => IntentBucket::Orient,
-        "context_inventory" | "investigation_suggest" | "ask" | "health_compact" => {
-            IntentBucket::Meta
-        }
+        "context_inventory"
+        | "investigation_suggest"
+        | "ask"
+        | "health_compact"
+        | "symforge_retrieve" => IntentBucket::Meta,
         _ => IntentBucket::Auto,
     }
 }

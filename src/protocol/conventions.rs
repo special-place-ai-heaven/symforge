@@ -51,6 +51,7 @@ fn code_language_bucket(language: &crate::domain::index::LanguageId) -> Option<&
         | LanguageId::Toml
         | LanguageId::Yaml
         | LanguageId::Markdown
+        | LanguageId::Text
         | LanguageId::Env
         | LanguageId::Html
         | LanguageId::Css

@@ -438,11 +438,18 @@ pub async fn workflow_source_read_handler(
     outline_handler(State(state), Query(params)).await
 }
 
-pub(crate) fn outline_tool_text(
+pub(crate) fn outline_tool_text_for_generation(
     state: &SidecarState,
+    published: &crate::live_index::PublishedGeneration,
     params: &OutlineParams,
 ) -> Result<String, StatusCode> {
-    outline_text(state, params, TOOL_RENDER_OPTIONS)
+    outline_text_for_generation(
+        state,
+        published,
+        params,
+        TOOL_RENDER_OPTIONS,
+        ContextSourceAuthority::CurrentIndex,
+    )
 }
 
 fn outline_hook_text(state: &SidecarState, params: &OutlineParams) -> Result<String, StatusCode> {
@@ -515,7 +522,18 @@ fn outline_text(
     options: RenderOptions,
 ) -> Result<String, StatusCode> {
     let source_authority = freshen_sidecar_path_if_stale(state, &params.path);
-    let guard = state.index.read();
+    let published = state.index.published_generation();
+    outline_text_for_generation(state, &published, params, options, source_authority)
+}
+
+fn outline_text_for_generation(
+    state: &SidecarState,
+    published: &crate::live_index::PublishedGeneration,
+    params: &OutlineParams,
+    options: RenderOptions,
+    source_authority: ContextSourceAuthority,
+) -> Result<String, StatusCode> {
+    let guard = published.live.as_ref();
 
     // Return 404 for non-indexed files.
     let file = guard.get_file(&params.path).ok_or(StatusCode::NOT_FOUND)?;
@@ -686,14 +704,12 @@ fn outline_text(
         }
     }
 
-    drop(guard);
-
     // Build "Git activity" section from temporal intelligence.
     if include_section("git") {
         use crate::live_index::git_temporal::{
             GitTemporalState, churn_bar, churn_label, relative_time,
         };
-        let temporal = state.index.git_temporal();
+        let temporal = &published.code_signals.temporal;
         if temporal.state == GitTemporalState::Ready
             && let Some(history) = temporal.files.get(&params.path)
         {
@@ -822,106 +838,104 @@ async fn impact_text(
     params: &ImpactParams,
     options: RenderOptions,
 ) -> Result<String, StatusCode> {
-    // Admission coherence (dogfood #7, 2026-07-06): this path used to
-    // force-index ANY file via process_file + update_file, bypassing the
-    // admission gate that the bulk walk and the watcher both apply. The result
-    // was flapping: analyze_file_impact admitted an oversized file, the next
-    // watcher event demoted it again. Apply the SAME gate here — a Tier-2/3
-    // file gets an honest refusal plus a skip-registry update, never a silent
-    // admit that the watcher will undo.
-    if let Some(refusal) = impact_admission_refusal(&state, &params.path) {
-        return Ok(refusal);
+    let root = resolve_repo_root(&state)?;
+    let requested = std::path::Path::new(&params.path);
+    let absolute = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let relative =
+        crate::watcher::normalize_event_path(&absolute, &root).ok_or(StatusCode::BAD_REQUEST)?;
+    let normalized_path = crate::live_index::query::normalize_path_query(&relative);
+    if normalized_path.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let is_new_file = params.new_file.unwrap_or(false);
 
     if is_new_file {
         // HOOK-06: Index a new file from disk.
-        return handle_new_file_impact(state, &params.path, options).await;
+        return handle_new_file_impact(state, &normalized_path, options).await;
     }
 
     let should_auto_index_new_file = {
-        let extension = std::path::Path::new(&params.path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let is_supported = crate::domain::LanguageId::from_extension(extension).is_some();
+        // AAP-002: `from_path` (not `from_extension`) so extensionless narrative
+        // entry points and dotfiles (README, .env, .gitignore) auto-index the
+        // same way discovery admits them.
+        let is_supported = crate::domain::LanguageId::from_path(&normalized_path).is_some();
         let indexed = {
             let guard = state.index.read();
-            guard.get_file(&params.path).is_some()
+            guard.get_file(&normalized_path).is_some()
         };
         is_supported
             && !indexed
             && resolve_repo_root(&state)
-                .map(|root| root.join(&params.path).is_file())
+                .map(|root| root.join(&normalized_path).is_file())
                 .unwrap_or(false)
     };
 
     if should_auto_index_new_file {
-        return handle_new_file_impact(state, &params.path, options).await;
+        return handle_new_file_impact(state, &normalized_path, options).await;
     }
 
     // HOOK-05: Re-index existing file and compute symbol diff.
-    handle_edit_impact(state, &params.path, options).await
+    handle_edit_impact(state, &normalized_path, options).await
 }
 
-/// Run the admission gate for the impact path. Returns `Some(refusal_text)`
-/// when the on-disk file classifies Tier-2/3 — the caller must not parse or
-/// insert it. Also records the demotion in the skip registry so `health` and
-/// the watcher agree with what this refusal says. Returns `None` for Tier-1
-/// files, unreadable paths (downstream NOT_FOUND handling owns those), and
-/// files outside a resolvable repo root.
-fn impact_admission_refusal(state: &SidecarState, path: &str) -> Option<String> {
-    use crate::domain::index::{AdmissionTier, BINARY_SNIFF_BYTES, SkippedFile};
+fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
+    use crate::domain::index::AdmissionTier;
 
-    let root = resolve_repo_root(state).ok()?;
-    let abs_path = root.join(path);
-    let metadata = std::fs::metadata(&abs_path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let file_size = metadata.len();
-    // Content sample for the binary sniff — bounded read, never the whole file.
-    let sample = std::fs::File::open(&abs_path).ok().and_then(|mut f| {
-        use std::io::Read;
-        let mut buf = vec![0u8; BINARY_SNIFF_BYTES];
-        let n = f.read(&mut buf).ok()?;
-        buf.truncate(n);
-        Some(buf)
-    });
-    let decision = crate::discovery::classify_admission(&abs_path, file_size, sample.as_deref());
-    if decision.tier == AdmissionTier::Normal {
-        return None;
-    }
-    let tier_label = match decision.tier {
+    let view = state.index.read().capture_admission_tier_lookup_view(path);
+    let Some(view) = view else {
+        return format!(
+            "Not indexed: {path} is excluded by repository scope. The admission gate applies to \
+             analyze_file_impact the same as bulk load and the watcher (no force-admit)."
+        );
+    };
+    let tier_label = match view.tier {
+        AdmissionTier::Normal => "Tier 1",
         AdmissionTier::MetadataOnly => "Tier 2 (metadata only)",
         AdmissionTier::HardSkip => "Tier 3 (hard skip)",
-        AdmissionTier::Normal => unreachable!("Normal returned above"),
     };
-    let reason = decision
+    let reason = view
         .reason
-        .map(|r| r.to_string())
+        .map(|reason| reason.to_string())
         .unwrap_or_else(|| "policy".to_string());
-    let extension = abs_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_string());
-    let sf = SkippedFile {
-        path: path.to_string(),
-        size: file_size,
-        extension,
-        decision,
-    };
-    let expected_gen = state.index.current_project_generation();
-    state
-        .index
-        .demote_to_skipped_at_generation(path, sf, expected_gen);
-    Some(format!(
-        "Not indexed: {path} is {tier_label} — reason: {reason}, size {:.1} MB. \
-         The admission gate applies to analyze_file_impact the same as bulk load \
-         and the watcher (no force-admit). Use get_file_content for raw reads.",
-        file_size as f64 / (1024.0 * 1024.0)
-    ))
+    let size_mb = view.size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+
+    // SF-AAP-002 is scoped to genuinely NON-PARSER files (no code parser exists
+    // for the type — the artifact/binary case). A parser-supported file demoted
+    // for SIZE is NOT this case: it keeps the honest oversize refusal that
+    // impact_admission (a frozen behavioral contract) pins. `from_path` is the
+    // same parser-support signal impact_text uses for auto-indexing (and that
+    // discovery admits by), so the wording stays truthful in both branches.
+    // AAP-002: `from_path` (not `from_extension`) recognizes extensionless
+    // Text/Env entry points (README, .env, .gitignore) as parser-supported, so a
+    // demoted one keeps the oversize refusal; `.bin` still reads as non-parser.
+    let has_code_parser = crate::domain::LanguageId::from_path(path).is_some();
+
+    if has_code_parser {
+        return format!(
+            "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
+             The admission gate applies to analyze_file_impact the same as bulk load \
+             and the watcher (no force-admit). Use get_file_content for raw reads."
+        );
+    }
+
+    let generation = state.index.current_project_generation();
+    // Reconciled non-parser file: EXISTS in the catalog, analysis simply
+    // unsupported. Report truthful existence + generation/Tier evidence and a
+    // typed unsupported-analysis outcome — never false absence for a tracked file.
+    format!(
+        "── Impact: {path} ──\n\
+         Status: exists (analysis unsupported — {tier_label}, no code parser)\n\
+         exists: true\n\
+         Tier: {tier_label} — reason: {reason}, size {size_mb:.1} MB\n\
+         Generation: {generation}\n\
+         The file IS tracked (metadata only), not absent; impact/symbol analysis is \
+         unsupported for this file type. Use get_file_content for raw reads."
+    )
 }
 
 async fn handle_new_file_impact(
@@ -929,46 +943,40 @@ async fn handle_new_file_impact(
     path: &str,
     options: RenderOptions,
 ) -> Result<String, StatusCode> {
-    use crate::domain::LanguageId;
-
-    // Determine language from file extension.
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    let language = LanguageId::from_extension(extension).ok_or(StatusCode::NOT_FOUND)?;
-
-    // Read file from disk. The sidecar doesn't know the project root, so
-    // we look up the root from the existing index as a heuristic.
-    // For new files, we try to find them relative to cwd.
     let abs_path = resolve_repo_root(&state)?.join(path);
     let path_owned = path.to_string();
-    let lang_clone = language.clone();
-    let (bytes, result, mtime_secs) =
-        tokio::task::spawn_blocking(move || -> Result<_, StatusCode> {
-            // Read mtime BEFORE content to avoid TOCTOU: if the file changes
-            // between reads, the recorded mtime will be older than the content,
-            // ensuring the watcher re-indexes on the next pass.
-            let mtime_secs = std::fs::metadata(&abs_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let bytes = std::fs::read(&abs_path).map_err(|_| StatusCode::NOT_FOUND)?;
-            let result = crate::parsing::process_file(&path_owned, &bytes, lang_clone);
-            Ok((bytes, result, mtime_secs))
-        })
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    let index = state.index.clone();
+    let expected_gen = index.current_project_generation();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::watcher::admit_and_index_single_path(&path_owned, &abs_path, &index, expected_gen)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match outcome {
+        crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
+        crate::watcher::ReindexResult::Skipped => return Ok(impact_skipped_text(&state, path)),
+        crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        crate::watcher::ReindexResult::ReadError(_) => {
+            return Ok(format!(
+                "Not indexed: {path} is temporarily unreadable; last-valid state was retained."
+            ));
+        }
+    }
 
     // Build symbol kind breakdown.
     let mut kind_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for sym in &result.symbols {
-        *kind_counts.entry(sym.kind.to_string()).or_insert(0) += 1;
-    }
+    let language = {
+        let index = state.index.read();
+        let file = index.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
+        for symbol in &file.symbols {
+            *kind_counts.entry(symbol.kind.to_string()).or_insert(0) += 1;
+        }
+        file.language.clone()
+    };
 
     let mut kind_parts: Vec<String> = kind_counts
         .iter()
@@ -980,11 +988,6 @@ async fn handle_new_file_impact(
     } else {
         kind_parts.join(", ")
     };
-
-    // Index the file.
-    let indexed = crate::live_index::store::IndexedFile::from_parse_result(result, bytes)
-        .with_mtime(mtime_secs);
-    state.index.update_file(path.to_string(), indexed);
 
     // Update symbol cache with empty pre-edit snapshot (it's new, no pre-state).
     {
@@ -1047,8 +1050,6 @@ async fn handle_edit_impact(
     path: &str,
     options: RenderOptions,
 ) -> Result<String, StatusCode> {
-    use crate::domain::LanguageId;
-
     // Get pre-edit symbols and bytes: sidecar cache → index pre-update snapshot → current index.
     //
     // The index pre-update snapshot (`take_pre_update_snapshot`) fixes a race
@@ -1097,61 +1098,28 @@ async fn handle_edit_impact(
     // File byte_len before re-indexing (content baseline comes from `pre_content` above).
     let file_bytes_pre: u64 = pre_content.as_ref().map_or(0, |b| b.len() as u64);
 
-    // Determine language.
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    let language =
-        LanguageId::from_extension(extension).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Read file from disk and re-index.
     let abs_path = resolve_repo_root(&state)?.join(path);
     let path_owned = path.to_string();
-
-    enum ReadOutcome {
-        Ok {
-            bytes: Vec<u8>,
-            result: Box<crate::domain::FileProcessingResult>,
-            mtime_secs: u64,
-        },
-        NotFound,
-    }
-
+    let index = state.index.clone();
+    let expected_gen = index.current_project_generation();
     let outcome = tokio::task::spawn_blocking(move || {
-        // Read mtime BEFORE content to avoid TOCTOU: if the file changes
-        // between reads, the recorded mtime will be older than the content,
-        // ensuring the watcher re-indexes on the next pass.
-        let mtime_secs = std::fs::metadata(&abs_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        match std::fs::read(&abs_path) {
-            Ok(bytes) => {
-                let result = crate::parsing::process_file(&path_owned, &bytes, language);
-                ReadOutcome::Ok {
-                    bytes,
-                    result: Box::new(result),
-                    mtime_secs,
-                }
-            }
-            Err(_) => ReadOutcome::NotFound,
-        }
+        crate::watcher::admit_and_index_single_path(&path_owned, &abs_path, &index, expected_gen)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let (bytes, result, mtime_secs) = match outcome {
-        ReadOutcome::NotFound => {
+    match outcome {
+        crate::watcher::ReindexResult::Reindexed | crate::watcher::ReindexResult::HashSkip => {}
+        crate::watcher::ReindexResult::Skipped => return Ok(impact_skipped_text(&state, path)),
+        crate::watcher::ReindexResult::ReadError(_) => {
+            return Ok(format!(
+                "── Impact: {path} ──\nStatus: temporarily unreadable — last-valid state retained"
+            ));
+        }
+        crate::watcher::ReindexResult::NotFound | crate::watcher::ReindexResult::Removed => {
             // File not on disk — remove it from the index so stale data is purged.
-            let prev_symbol_count = {
-                let guard = state.index.read();
-                guard.get_file(path).map(|f| f.symbols.len()).unwrap_or(0)
-            };
-            state.index.remove_file(path);
+            let prev_symbol_count = pre_symbols.len();
+            state.index.remove_file_at_generation(path, expected_gen);
             // Also clear the symbol cache entry.
             {
                 let mut cache = state.symbol_cache.write();
@@ -1185,30 +1153,28 @@ async fn handle_edit_impact(
             };
             return Ok(text);
         }
-        ReadOutcome::Ok {
-            bytes,
-            result,
-            mtime_secs,
-        } => (bytes, result, mtime_secs),
+    }
+
+    // The shared publication seam captures its own pre-update snapshot. This
+    // handler already captured the authoritative baseline above, so drain the
+    // duplicate before it can leak into a later impact call.
+    let _ = state.index.take_pre_update_snapshot(path);
+    let (post_symbols, post_content) = {
+        let index = state.index.read();
+        let file = index.get_file(path).ok_or(StatusCode::NOT_FOUND)?;
+        let symbols: Vec<SymbolSnapshot> = file
+            .symbols
+            .iter()
+            .map(|symbol| SymbolSnapshot {
+                name: symbol.name.clone(),
+                kind: symbol.kind.to_string(),
+                line_range: symbol.line_range,
+                byte_range: symbol.byte_range,
+            })
+            .collect();
+        (symbols, file.content.clone())
     };
-
-    let file_bytes: u64 = (bytes.len() as u64).max(file_bytes_pre);
-
-    let post_symbols: Vec<SymbolSnapshot> = result
-        .symbols
-        .iter()
-        .map(|s| SymbolSnapshot {
-            name: s.name.clone(),
-            kind: s.kind.to_string(),
-            line_range: s.line_range,
-            byte_range: s.byte_range,
-        })
-        .collect();
-
-    let post_content = bytes.clone();
-    let indexed = crate::live_index::store::IndexedFile::from_parse_result(*result, bytes)
-        .with_mtime(mtime_secs);
-    state.index.update_file(path.to_string(), indexed);
+    let file_bytes: u64 = (post_content.len() as u64).max(file_bytes_pre);
 
     // Compute symbol diff using positional proximity for duplicate name+kind pairs.
     let mut matched_pre = vec![false; pre_symbols.len()];
@@ -1389,11 +1355,18 @@ pub async fn workflow_search_hit_expansion_handler(
     symbol_context_handler(State(state), Query(params)).await
 }
 
-pub(crate) fn symbol_context_tool_text(
+pub(crate) fn symbol_context_tool_text_for_generation(
     state: &SidecarState,
+    published: &crate::live_index::PublishedGeneration,
     params: &SymbolContextParams,
 ) -> Result<String, StatusCode> {
-    symbol_context_text(state, params, TOOL_RENDER_OPTIONS)
+    symbol_context_text_for_generation(
+        state,
+        published,
+        params,
+        TOOL_RENDER_OPTIONS,
+        ContextSourceAuthority::CurrentIndex,
+    )
 }
 
 fn symbol_context_hook_text(
@@ -1415,8 +1388,18 @@ fn symbol_context_text(
     } else {
         ContextSourceAuthority::CurrentIndex
     };
-    let guard = state.index.read();
-    let published = state.index.published_state();
+    let published = state.index.published_generation();
+    symbol_context_text_for_generation(state, &published, params, options, source_authority)
+}
+
+fn symbol_context_text_for_generation(
+    state: &SidecarState,
+    published: &crate::live_index::PublishedGeneration,
+    params: &SymbolContextParams,
+    options: RenderOptions,
+    source_authority: ContextSourceAuthority,
+) -> Result<String, StatusCode> {
+    let guard = published.live.as_ref();
 
     let references = if let Some(path) = params.path.as_deref() {
         match guard.find_exact_references_for_symbol(
@@ -1483,22 +1466,24 @@ fn symbol_context_text(
         guard
             .get_file(path)
             .map(parse_state_label)
-            .unwrap_or_else(|| aggregate_parse_state_label(std::iter::empty(), &published))
+            .unwrap_or_else(|| {
+                aggregate_parse_state_label(std::iter::empty(), published.health.as_ref())
+            })
     } else if let Some(file) = params.file.as_deref() {
         guard
             .get_file(file)
             .map(parse_state_label)
-            .unwrap_or_else(|| aggregate_parse_state_label(std::iter::empty(), &published))
+            .unwrap_or_else(|| {
+                aggregate_parse_state_label(std::iter::empty(), published.health.as_ref())
+            })
     } else {
         aggregate_parse_state_label(
             map.keys()
                 .filter_map(|file_path| guard.get_file(file_path))
                 .map(|file| &file.parse_status),
-            &published,
+            published.health.as_ref(),
         )
     };
-
-    drop(guard);
 
     // Sort files for deterministic output.
     let mut files: Vec<String> = map.keys().cloned().collect();
@@ -1696,8 +1681,17 @@ fn is_intra_workspace_path(path: &str) -> bool {
         .any(|segment| segment == "..")
 }
 pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> {
-    // Single lock acquisition covers both the directory stats and key-types passes.
-    let guard = state.index.read();
+    let generation = state.index.published_source_set().current_generation();
+    repo_map_text_for_generation(&generation)
+}
+
+/// Render the compact topology from exactly one immutable publication root.
+/// Callers that also append knowledge/authority evidence must pass the same
+/// captured generation so no live/temporal/bridge lane can cross a swap.
+pub(crate) fn repo_map_text_for_generation(
+    generation: &crate::live_index::PublishedGeneration,
+) -> Result<String, StatusCode> {
+    let guard = generation.live.as_ref();
 
     let total_files = guard.file_count();
     let total_symbols = guard.symbol_count();
@@ -1827,9 +1821,11 @@ pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> 
 
             // Churn from the lock-free temporal snapshot; 0.0 when temporal is
             // not Ready or the file is absent (read-only — no frecency bump).
-            let temporal = state.index.git_temporal();
+            let temporal = generation.code_signals.temporal.as_ref();
             let churn_of = |path: &str| -> f32 {
-                if temporal.state == crate::live_index::git_temporal::GitTemporalState::Ready {
+                if generation.code_signals.state
+                    == crate::live_index::git_temporal::GitTemporalState::Ready
+                {
                     temporal
                         .files
                         .get(path)
@@ -1880,8 +1876,6 @@ pub(crate) fn repo_map_text(state: &SidecarState) -> Result<String, StatusCode> 
             }
         }
     }
-
-    drop(guard);
 
     // Apply budget (1000 tokens = 4000 bytes).
     // Medium repos (up to ~70 directories) fit without truncation.
@@ -2729,7 +2723,7 @@ mod tests {
             files_by_dir_component: HashMap::new(),
             trigram_index,
             gitignore: None,
-            skipped_files: Vec::new(),
+            manifest_entries: Vec::new(),
             coupling_store: None,
             local_empty_reason: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             indexed_root: None,
@@ -3561,6 +3555,105 @@ mod tests {
             result.contains("0 files"),
             "empty index should show 0 files"
         );
+    }
+
+    #[test]
+    fn repo_map_from_captured_generation_never_mixes_a_later_publication() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        let source = project.path().join("src/model.rs");
+        std::fs::write(&source, "pub struct OldMarker;\n").expect("old source");
+        let shared = LiveIndex::load(project.path()).expect("old index");
+        let captured = shared.published_source_set().current_generation();
+
+        std::fs::write(&source, "pub struct NewMarker;\n").expect("new source");
+        shared.reload(project.path()).expect("new publication");
+        let next = shared.published_source_set().current_generation();
+
+        let old_map = repo_map_text_for_generation(&captured).expect("old map");
+        let new_map = repo_map_text_for_generation(&next).expect("new map");
+        assert!(old_map.contains("OldMarker"), "{old_map}");
+        assert!(!old_map.contains("NewMarker"), "{old_map}");
+        assert!(new_map.contains("NewMarker"), "{new_map}");
+        assert!(!new_map.contains("OldMarker"), "{new_map}");
+    }
+
+    #[test]
+    fn outline_from_captured_generation_never_mixes_a_later_publication() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        let source = project.path().join("src/model.rs");
+        std::fs::write(&source, "pub struct OldOutlineMarker;\n").expect("old source");
+        let shared = LiveIndex::load(project.path()).expect("old index");
+        let state = SidecarState {
+            index: shared.clone(),
+            token_stats: TokenStats::new(),
+            repo_root: Some(project.path().to_path_buf()),
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let captured = shared.published_source_set().current_generation();
+
+        std::fs::write(&source, "pub struct NewOutlineMarker;\n").expect("new source");
+        shared.reload(project.path()).expect("new publication");
+        let next = shared.published_source_set().current_generation();
+        let params = OutlineParams {
+            path: "src/model.rs".to_string(),
+            max_tokens: None,
+            sections: Some(vec!["outline".to_string()]),
+        };
+
+        let old_outline =
+            outline_tool_text_for_generation(&state, &captured, &params).expect("old outline");
+        let new_outline =
+            outline_tool_text_for_generation(&state, &next, &params).expect("new outline");
+        assert!(old_outline.contains("OldOutlineMarker"), "{old_outline}");
+        assert!(!old_outline.contains("NewOutlineMarker"), "{old_outline}");
+        assert!(new_outline.contains("NewOutlineMarker"), "{new_outline}");
+        assert!(!new_outline.contains("OldOutlineMarker"), "{new_outline}");
+    }
+
+    #[test]
+    fn symbol_context_from_captured_generation_never_mixes_a_later_publication() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        let source = project.path().join("src/lib.rs");
+        std::fs::write(
+            &source,
+            "pub fn target() {}\npub fn old_caller() { target(); }\n",
+        )
+        .expect("old source");
+        let shared = LiveIndex::load(project.path()).expect("old index");
+        let state = SidecarState {
+            index: shared.clone(),
+            token_stats: TokenStats::new(),
+            repo_root: Some(project.path().to_path_buf()),
+            symbol_cache: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let captured = shared.published_source_set().current_generation();
+
+        std::fs::write(
+            &source,
+            "pub fn target() {}\npub fn new_caller() { target(); }\n",
+        )
+        .expect("new source");
+        shared.reload(project.path()).expect("new publication");
+        let next = shared.published_source_set().current_generation();
+        let params = SymbolContextParams {
+            name: "target".to_string(),
+            file: None,
+            path: Some("src/lib.rs".to_string()),
+            symbol_kind: Some("fn".to_string()),
+            symbol_line: Some(1),
+        };
+
+        let old_context = symbol_context_tool_text_for_generation(&state, &captured, &params)
+            .expect("old context");
+        let new_context =
+            symbol_context_tool_text_for_generation(&state, &next, &params).expect("new context");
+        assert!(old_context.contains("old_caller"), "{old_context}");
+        assert!(!old_context.contains("new_caller"), "{old_context}");
+        assert!(new_context.contains("new_caller"), "{new_context}");
+        assert!(!new_context.contains("old_caller"), "{new_context}");
     }
 
     #[test]
@@ -6179,7 +6272,9 @@ mod tests {
             symbol_line: None,
         };
 
-        let tool = symbol_context_tool_text(&state, &params).expect("tool render");
+        let published = state.index.published_generation();
+        let tool = symbol_context_tool_text_for_generation(&state, &published, &params)
+            .expect("tool render");
 
         // Sanity: the body really is larger than the old 400-byte budget, so
         // this test would have failed before the budget was raised.

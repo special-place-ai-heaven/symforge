@@ -13,9 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use symforge::domain::{ProjectStateDir, RootCandidateSource, RootRequestMode, RootResolution};
 use symforge::live_index::LiveIndex;
 use symforge::live_index::frecency::{self, FRECENCY_FLAG_ENV, FrecencyStore};
-use symforge::paths::{FRECENCY_DB_NAME, symforge_db_path};
+use symforge::paths::FRECENCY_DB_NAME;
 use symforge::protocol::SymForgeServer;
 use symforge::watcher::WatcherInfo;
 use tempfile::TempDir;
@@ -30,38 +31,55 @@ mod git_test_helpers {
 struct Fixture {
     _dir: TempDir,
     root: PathBuf,
+    project_state: ProjectStateDir,
     server: SymForgeServer,
 }
 
 impl Fixture {
     fn new(files: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
+        let raw_root = dir.path().to_path_buf();
         for (rel, content) in files {
-            let path = root.join(rel);
+            let path = raw_root.join(rel);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("create parent dir");
             }
             fs::write(&path, content).expect("write fixture file");
         }
-        let shared = LiveIndex::load(&root).expect("LiveIndex::load");
+        let RootResolution::Bound(binding) = symforge::discovery::resolve_root_candidate(
+            &raw_root,
+            RootCandidateSource::LaunchCwd,
+            RootRequestMode::Automatic,
+        ) else {
+            panic!("temporary project root must bind");
+        };
+        let root = binding.canonical_root.clone();
+        let state_placement = symforge::discovery::resolve_state_placement(&binding);
+        let project_state = state_placement
+            .directory()
+            .expect("temporary project must have durable state")
+            .clone();
+        let shared = LiveIndex::load_for_state_placement(&root, &state_placement)
+            .expect("LiveIndex::load_for_state_placement");
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
-        let server = SymForgeServer::new(
+        let server = SymForgeServer::new_with_state_placement(
             shared,
             "call_time_frecency_test".to_string(),
             watcher_info,
             Some(root.clone()),
+            Some(state_placement),
             None,
         );
         Self {
             _dir: dir,
             root,
+            project_state,
             server,
         }
     }
 
     fn db_path(&self) -> PathBuf {
-        symforge_db_path(&self.root, FRECENCY_DB_NAME)
+        self.project_state.as_path().join(FRECENCY_DB_NAME)
     }
 
     fn open_store(&self) -> FrecencyStore {
@@ -352,7 +370,11 @@ async fn cached_writer_post_reset_visible_to_ranking() {
     }
 
     advance_head(&fx.root, 501);
-    frecency::bump(&fx.root, &[PathBuf::from("src/file_b_new.rs")]);
+    frecency::bump(
+        &fx.root,
+        Some(&fx.project_state),
+        &[PathBuf::from("src/file_b_new.rs")],
+    );
 
     let result = call(
         &fx.server,
@@ -373,12 +395,21 @@ async fn concurrent_bump_and_rank_under_persistent_policy_completes() {
         ("src/file_a.rs", "pub fn item_a() {}\n"),
         ("src/file_b.rs", "pub fn item_b() {}\n"),
     ]);
-    frecency::bump(&fx.root, &[PathBuf::from("src/file_a.rs")]);
+    frecency::bump(
+        &fx.root,
+        Some(&fx.project_state),
+        &[PathBuf::from("src/file_a.rs")],
+    );
 
     let bump_root = fx.root.clone();
+    let bump_state = fx.project_state.clone();
     let bump_task = tokio::task::spawn_blocking(move || {
         for _ in 0..20 {
-            frecency::bump(&bump_root, &[PathBuf::from("src/file_b.rs")]);
+            frecency::bump(
+                &bump_root,
+                Some(&bump_state),
+                &[PathBuf::from("src/file_b.rs")],
+            );
         }
     });
     let result = call(

@@ -91,6 +91,7 @@ mod contract {
     //!   * a removed or renamed item -> the `use` / path fails to compile,
     //!   * a changed function/method signature -> the `fn`-pointer binding
     //!     fails to compile (type mismatch).
+    //!
     //! A breaking change to the contract therefore trips SymForge's own embed
     //! test suite at compile time, not a downstream consumer at integration
     //! time. The bindings are checked by the compiler; the body need not run.
@@ -162,6 +163,7 @@ mod contract {
         // internal path) — removal/rename of the re-export breaks compilation.
         let _search_symbols: fn(&LiveIndex, &str, Option<&str>, usize) -> SymbolSearchResult =
             crate::embed::search_symbols;
+        #[allow(clippy::type_complexity)]
         let _search_text: fn(
             &LiveIndex,
             Option<&str>,

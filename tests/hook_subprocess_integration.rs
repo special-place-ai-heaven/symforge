@@ -12,17 +12,17 @@
 //! These tests spawn the real `symforge` binary in a tempdir and pin each
 //! site end-to-end:
 //!
-//!   1. `no_sidecar` — port file missing and daemon fallback fails.
+//!   1. `no_sidecar` — sidecar descriptor missing and daemon fallback fails.
 //!      Exercises `record_hook_outcome_with_detail(NoSidecar,
 //!      reason="sidecar_port_missing")`.
-//!   2. `stale_port` — port file present but the listener never accepts,
+//!   2. `stale_port` — sidecar descriptor present but the listener never accepts,
 //!      so the subprocess's 50ms HTTP read times out. Exercises
 //!      `record_hook_outcome_with_detail(NoSidecar,
 //!      reason="sidecar_port_stale")`.
-//!   3. `routed_success` — port file points at a minimal in-test TCP
+//!   3. `routed_success` — sidecar descriptor points at a minimal in-test TCP
 //!      responder that returns `HTTP/1.1 200 OK`. Exercises the plain
 //!      `record_hook_outcome(Routed)` call on the success path.
-//!   4. `stale_sidecar_with_live_daemon` — port file present but the
+//!   4. `stale_sidecar_with_live_daemon` — descriptor present but the
 //!      sidecar is dead, while a mock daemon is reachable via
 //!      `SYMFORGE_HOME`. Pins the stale-sidecar daemon fallback: the hook
 //!      must serve the daemon's ENRICHED body and record `DaemonFallback`,
@@ -36,6 +36,7 @@
 //! `<session>\t<workflow>\t<outcome>`. The session id is left unpinned
 //! (normalized to `-` when no daemon session file is present), leaving only
 //! the `(workflow, outcome)` pair checked.
+#![cfg(feature = "server")]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -51,12 +52,31 @@ use tempfile::TempDir;
 /// `test_record_hook_outcome_writes_to_adoption_log_file_constant`
 /// catches it; if the constant's consumer inside `run_hook` drops its
 /// call site, these tests catch it. The pair pins the full chain.
-const ADOPTION_LOG_RELATIVE: &str = ".symforge/hook-adoption.log";
+const ADOPTION_LOG_FILE: &str = "hook-adoption.log";
 
-/// Mirrors `PORT_FILE` in `src/cli/hook.rs`. Any rename of either side
-/// without updating this constant breaks the stale-port and routed
-/// tests loudly.
-const PORT_FILE_RELATIVE: &str = ".symforge/sidecar.port";
+fn write_sidecar_descriptor(control_root: &Path, project_root: &Path, port: u16) {
+    let control_state = symforge::domain::ControlStateDir::new(control_root.to_path_buf());
+    symforge::sidecar::port_file::write_session_descriptor(
+        &control_state,
+        port,
+        Some("hook-subprocess-test"),
+        Some(project_root),
+    )
+    .expect("write sidecar session descriptor");
+}
+
+fn write_daemon_port(control_root: &Path, port: u16) {
+    let control_state = symforge::domain::ControlStateDir::new(control_root.to_path_buf());
+    let daemon_dir = symforge::paths::control_state_path(&control_state, "daemon");
+    std::fs::create_dir_all(&daemon_dir).expect("create daemon control directory");
+    std::fs::write(
+        daemon_dir.join(symforge::paths::os_tagged_runtime_file_name(
+            "daemon", "port",
+        )),
+        port.to_string(),
+    )
+    .expect("write daemon port file");
+}
 
 /// Minimal PostToolUse/Read payload for the stdin-routing path. The
 /// `.rs` extension keeps `should_fail_open_read` from downgrading the
@@ -81,7 +101,7 @@ fn run_hook_no_sidecar_writes_source_read_no_sidecar_event() {
 #[test]
 fn run_hook_stale_port_writes_source_read_no_sidecar_event() {
     let tmp = TempDir::new().expect("tempdir creation");
-    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
+    let home = TempDir::new().expect("control-state tempdir creation");
 
     // Bind an ephemeral port and HOLD the listener for the entire test —
     // never accept. Subprocess's TCP connect may succeed (SYN queued) or
@@ -90,10 +110,14 @@ fn run_hook_stale_port_writes_source_read_no_sidecar_event() {
     // `run_hook` into the stale-port branch.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stale-port listener");
     let stale_port = listener.local_addr().expect("stale-port local_addr").port();
-    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), stale_port.to_string())
-        .expect("write stale port file");
+    write_sidecar_descriptor(home.path(), tmp.path(), stale_port);
 
-    let contents = run_hook_in_tempdir(tmp.path(), READ_PAYLOAD);
+    let contents = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    )
+    .1;
     drop(listener);
 
     assert!(
@@ -121,20 +145,29 @@ fn run_hook_routed_success_writes_source_read_routed_event() {
     // closes the connection and lets the subprocess's `read_to_string`
     // return.
     let mock = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             let mut buf = [0u8; 2048];
-            let _ = stream.read(&mut buf);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            if stream.read(&mut buf).is_ok_and(|read| read > 0) {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
         }
     });
 
     let tmp = TempDir::new().expect("tempdir creation");
-    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
-    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), port.to_string())
-        .expect("write mock port file");
+    let home = TempDir::new().expect("control-state tempdir creation");
+    write_sidecar_descriptor(home.path(), tmp.path(), port);
 
-    let contents = run_hook_in_tempdir(tmp.path(), READ_PAYLOAD);
+    let contents = run_hook_in_tempdir_with_env(
+        tmp.path(),
+        READ_PAYLOAD,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    )
+    .1;
 
     // Best-effort join: if the subprocess served successfully, the mock
     // has already exited. If it failed early, the accept thread may still
@@ -175,9 +208,6 @@ fn run_hook_stale_sidecar_with_live_daemon_routes_via_daemon_fallback() {
 
     // The repo cwd whose canonical root the daemon must advertise.
     let tmp = TempDir::new().expect("tempdir creation");
-    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
-    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), stale_port.to_string())
-        .expect("write stale port file");
 
     // The daemon process matches projects by canonical root (same
     // canonicalization + normalization the hook applies), so advertise the
@@ -189,10 +219,8 @@ fn run_hook_stale_sidecar_with_live_daemon_routes_via_daemon_fallback() {
 
     // SYMFORGE_HOME hosts the daemon port file the hook's daemon fallback reads.
     let home = TempDir::new().expect("home tempdir creation");
-    let daemon_port_file = home
-        .path()
-        .join(format!("daemon.{}.port", std::env::consts::OS));
-    std::fs::write(&daemon_port_file, daemon_port.to_string()).expect("write daemon port file");
+    write_sidecar_descriptor(home.path(), tmp.path(), stale_port);
+    write_daemon_port(home.path(), daemon_port);
 
     let daemon_thread = thread::spawn(move || serve_mock_daemon(daemon, &canonical_root));
 
@@ -247,17 +275,10 @@ fn run_hook_stale_sidecar_and_dead_daemon_degrades_to_pass_through() {
         .port();
 
     let tmp = TempDir::new().expect("tempdir creation");
-    std::fs::create_dir_all(tmp.path().join(".symforge")).expect("create .symforge dir");
-    std::fs::write(tmp.path().join(PORT_FILE_RELATIVE), stale_port.to_string())
-        .expect("write stale port file");
 
     let home = TempDir::new().expect("home tempdir creation");
-    std::fs::write(
-        home.path()
-            .join(format!("daemon.{}.port", std::env::consts::OS)),
-        dead_daemon_port.to_string(),
-    )
-    .expect("write daemon port file");
+    write_sidecar_descriptor(home.path(), tmp.path(), stale_port);
+    write_daemon_port(home.path(), dead_daemon_port);
 
     let (stdout, log) = run_hook_in_tempdir_with_env(
         tmp.path(),
@@ -397,7 +418,13 @@ fn write_http_ok(stream: &mut std::net::TcpStream, body: &str) {
 /// the subprocess doesn't exit, exits non-zero, or doesn't create the
 /// log file. Shared across all three site tests.
 fn run_hook_in_tempdir(cwd: &Path, payload: &str) -> String {
-    run_hook_in_tempdir_with_env(cwd, payload, &[]).1
+    let home = TempDir::new().expect("control-state tempdir creation");
+    run_hook_in_tempdir_with_env(
+        cwd,
+        payload,
+        &[("SYMFORGE_HOME", home.path().to_string_lossy().as_ref())],
+    )
+    .1
 }
 
 /// Like `run_hook_in_tempdir` but allows injecting extra environment variables
@@ -408,6 +435,11 @@ fn run_hook_in_tempdir_with_env(
     payload: &str,
     extra_env: &[(&str, &str)],
 ) -> (String, String) {
+    let control_root = extra_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (*key == "SYMFORGE_HOME").then_some(Path::new(*value)))
+        .expect("hook subprocess tests must inject an isolated SYMFORGE_HOME");
     let bin = env!("CARGO_BIN_EXE_symforge");
     let mut command = symforge::process_util::hidden_command(bin);
     command
@@ -444,10 +476,10 @@ fn run_hook_in_tempdir_with_env(
         let _ = out.read_to_string(&mut stdout);
     }
 
-    let log_path = cwd.join(ADOPTION_LOG_RELATIVE);
+    let log_path = control_root.join(ADOPTION_LOG_FILE);
     assert!(
         log_path.exists(),
-        "run_hook must append to {ADOPTION_LOG_RELATIVE} under the child's cwd; \
+        "run_hook must append to {ADOPTION_LOG_FILE} under the injected control-state root; \
          missing at {}. This usually means a record_hook_outcome* call was \
          removed from the run_hook dispatch branch being exercised.",
         log_path.display()

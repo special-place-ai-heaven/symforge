@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use super::{SidecarHandle, SidecarState, TokenStats, port_file, router};
+use crate::domain::ControlStateDir;
 use crate::live_index::store::SharedIndex;
 
 /// Spawn the HTTP sidecar.
@@ -34,15 +35,18 @@ pub async fn spawn_sidecar(
     index: SharedIndex,
     bind_host: &str,
     repo_root: Option<PathBuf>,
+    control_state_dir: Option<ControlStateDir>,
 ) -> anyhow::Result<SidecarHandle> {
     // Allow overriding bind host via env var.
     let resolved_host =
         std::env::var("SYMFORGE_SIDECAR_BIND").unwrap_or_else(|_| bind_host.to_string());
 
     // Clean up stale files from a previous crashed sidecar.
-    port_file::check_stale(&resolved_host);
-    // Ensure local sidecar mode does not inherit a daemon session routing file.
-    port_file::cleanup_session_file();
+    if let Some(state_dir) = control_state_dir.as_ref() {
+        port_file::check_stale(state_dir, &resolved_host, repo_root.as_deref());
+        // Ensure local sidecar mode does not inherit a daemon session routing file.
+        port_file::cleanup_session_file(state_dir);
+    }
 
     // Bind to an OS-assigned ephemeral port with SO_REUSEADDR so a TIME_WAIT
     // socket on the picked port does not block the bind. On Windows this
@@ -66,18 +70,19 @@ pub async fn spawn_sidecar(
     // Task 8: one atomic per-adapter descriptor (no daemon session for a
     // purely local sidecar) so hook scripts can locate this sidecar without
     // clobbering a sibling's record.
-    port_file::write_session_descriptor(port, None, repo_root.as_deref())?;
+    if let Some(state_dir) = control_state_dir.as_ref() {
+        port_file::write_session_descriptor(state_dir, port, None, repo_root.as_deref())?;
+    }
 
     // Install panic hook to clean up port files if the process panics.
-    let symforge_dir = crate::paths::select_runtime_data_base(
-        repo_root.as_deref(),
-        std::env::current_dir().ok().as_deref(),
-    );
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        port_file::cleanup_own_descriptor_at(&symforge_dir);
-        previous_hook(info);
-    }));
+    if let Some(state_dir) = control_state_dir.as_ref() {
+        let sidecar_dir = crate::paths::control_state_path(state_dir, "sidecar");
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            port_file::cleanup_own_descriptor_at(&sidecar_dir);
+            previous_hook(info);
+        }));
+    }
 
     info!("sidecar listening on {resolved_host}:{port}");
 
@@ -101,6 +106,7 @@ pub async fn spawn_sidecar(
     // Spawn the server task. The returned `JoinHandle` is surfaced on
     // `SidecarHandle::server_join` so callers can deterministically await
     // listener drop via `shutdown_and_join`.
+    let shutdown_control_state_dir = control_state_dir.clone();
     let server_join = tokio::spawn(async move {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
@@ -114,7 +120,9 @@ pub async fn spawn_sidecar(
         }
 
         // Task 8: remove ONLY this sidecar's descriptor after shutdown.
-        port_file::cleanup_own_descriptor(None);
+        if let Some(state_dir) = shutdown_control_state_dir.as_ref() {
+            port_file::cleanup_own_descriptor(state_dir);
+        }
         tracing::info!("sidecar shut down, session descriptor cleaned up");
     });
 

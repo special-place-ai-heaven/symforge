@@ -485,7 +485,7 @@ fn prepare_project_wide_rename(
 }
 
 fn begin_mutation_replay<T: Serialize>(
-    repo_root: &Path,
+    server: &SymForgeServer,
     tool_name: &str,
     input: &T,
     idempotency_key: Option<&str>,
@@ -504,7 +504,10 @@ fn begin_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    match crate::idempotency::begin_tool_replay(repo_root, tool_name, raw_key, &request) {
+    let project_state = server.capture_project_state_dir().ok_or_else(|| {
+        "Error: durable project-state replay is unavailable for this binding.".to_string()
+    })?;
+    match crate::idempotency::begin_tool_replay(&project_state, tool_name, raw_key, &request) {
         Ok(crate::idempotency::ReplayStart::FirstExecution(active)) => Ok(Some(active)),
         Ok(crate::idempotency::ReplayStart::Replay(response)) => Err(response),
         Err(error) => Err(crate::idempotency::format_tool_error(&error)),
@@ -528,7 +531,7 @@ fn begin_mutation_replay<T: Serialize>(
 /// - `Err(output)` — an idempotency conflict (same key, different request) or a
 ///   store error, already formatted for return to the client.
 fn probe_mutation_replay<T: Serialize>(
-    repo_root: &Path,
+    server: &SymForgeServer,
     tool_name: &str,
     input: &T,
     idempotency_key: Option<&str>,
@@ -547,7 +550,10 @@ fn probe_mutation_replay<T: Serialize>(
         map.remove("idempotency_key");
     }
 
-    crate::idempotency::probe_tool_replay(repo_root, tool_name, raw_key, &request)
+    let project_state = server.capture_project_state_dir().ok_or_else(|| {
+        "Error: durable project-state replay is unavailable for this binding.".to_string()
+    })?;
+    crate::idempotency::probe_tool_replay(&project_state, tool_name, raw_key, &request)
         .map_err(|error| crate::idempotency::format_tool_error(&error))
 }
 
@@ -574,7 +580,7 @@ fn probe_mutation_replay<T: Serialize>(
 /// writes), `Ok(None)` on a miss (proceed through the normal gates), and
 /// `Err(output)` on an idempotency conflict or store error.
 pub(crate) fn probe_symforge_edit_apply_replay(
-    repo_root: &Path,
+    server: &SymForgeServer,
     step_tool: &str,
     step_args: &serde_json::Value,
     idempotency_key: Option<&str>,
@@ -590,7 +596,7 @@ pub(crate) fn probe_symforge_edit_apply_replay(
         ($input:ty) => {{
             let input: $input = serde_json::from_value(step_args.clone())
                 .map_err(|error| crate::idempotency::format_tool_error(&error.into()))?;
-            probe_mutation_replay(repo_root, step_tool, &input, idempotency_key, dry_run)
+            probe_mutation_replay(server, step_tool, &input, idempotency_key, dry_run)
         }};
     }
 
@@ -760,12 +766,13 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "replace_symbol_body",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -783,6 +790,7 @@ impl SymForgeServer {
             relative_path: &params.0.path,
             indexed_absolute_path: &abs_path,
             repo_root: &repo_root,
+            project_state_dir: project_state.as_ref(),
             working_directory,
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
@@ -915,6 +923,8 @@ impl SymForgeServer {
         // base and disk are the same file's bytes — line-ending differences
         // between worktree and index never enter this compare.
         let write_report = match edit::guarded_atomic_write_file(
+            &repo_root,
+            project_state.as_ref(),
             &resolved_path,
             &file.content,
             &new_content,
@@ -1043,12 +1053,13 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "insert_symbol",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -1066,6 +1077,7 @@ impl SymForgeServer {
             relative_path: &params.0.path,
             indexed_absolute_path: &abs_path,
             repo_root: &repo_root,
+            project_state_dir: project_state.as_ref(),
             working_directory,
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
@@ -1145,7 +1157,12 @@ impl SymForgeServer {
         } else {
             edit::build_insert_after(&file.content, &sym, &params.0.content, line_ending)
         };
-        let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
+        let write_report = match edit::atomic_write_file(
+            &repo_root,
+            project_state.as_ref(),
+            &resolved_path,
+            &new_content,
+        ) {
             Ok(report) => report,
             Err(e) => {
                 let output = format!("Error writing {}: {e}", params.0.path);
@@ -1232,12 +1249,13 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "delete_symbol",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -1255,6 +1273,7 @@ impl SymForgeServer {
             relative_path: &params.0.path,
             indexed_absolute_path: &abs_path,
             repo_root: &repo_root,
+            project_state_dir: project_state.as_ref(),
             working_directory,
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
@@ -1329,7 +1348,12 @@ impl SymForgeServer {
         let deleted_bytes = (sym.byte_range.1 - sym.byte_range.0) as usize;
         let line_ending = edit::detect_line_ending(&file.content);
         let new_content = edit::build_delete(&file.content, &sym, line_ending);
-        let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
+        let write_report = match edit::atomic_write_file(
+            &repo_root,
+            project_state.as_ref(),
+            &resolved_path,
+            &new_content,
+        ) {
             Ok(report) => report,
             Err(e) => {
                 let output = format!("Error writing {}: {e}", params.0.path);
@@ -1418,12 +1442,13 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "edit_within_symbol",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -1441,6 +1466,7 @@ impl SymForgeServer {
             relative_path: &params.0.path,
             indexed_absolute_path: &abs_path,
             repo_root: &repo_root,
+            project_state_dir: project_state.as_ref(),
             working_directory,
         };
         let resolved_target = match edit_hooks::resolve(&hook_ctx) {
@@ -1697,7 +1723,12 @@ impl SymForgeServer {
         let old_sym_bytes = sym_end - sym_start;
         let effective_range = (sym.effective_start(), sym.byte_range.1);
         let new_content = edit::apply_splice(&file.content, effective_range, new_body.as_bytes());
-        let write_report = match edit::atomic_write_file(&resolved_path, &new_content) {
+        let write_report = match edit::atomic_write_file(
+            &repo_root,
+            project_state.as_ref(),
+            &resolved_path,
+            &new_content,
+        ) {
             Ok(report) => report,
             Err(e) => {
                 let output = format!("Error writing {}: {e}", params.0.path);
@@ -1821,13 +1852,14 @@ impl SymForgeServer {
             Ok(prepared) => prepared,
             Err(e) => return e,
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let dry_run = params.0.dry_run.unwrap_or(false);
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "batch_edit",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -1839,6 +1871,7 @@ impl SymForgeServer {
         match edit::execute_batch_edit(
             &self.index,
             &repo_root,
+            project_state.as_ref(),
             &params.0.edits,
             dry_run,
             params
@@ -1919,6 +1952,7 @@ impl SymForgeServer {
             Some(root) => root,
             None => return "Error: no repository root configured.".to_string(),
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
@@ -1930,7 +1964,7 @@ impl SymForgeServer {
         let source_authority = prepare_project_wide_rename(self, &repo_root);
         let dry_run = params.0.dry_run.unwrap_or(false);
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "batch_rename",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -1939,7 +1973,8 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_rename(&self.index, &repo_root, &params.0) {
+        match edit::execute_batch_rename(&self.index, &repo_root, project_state.as_ref(), &params.0)
+        {
             Ok(summary) => {
                 let write_semantics = if dry_run {
                     edit_format::EditWriteSemantics::DryRunNoWrites
@@ -2031,13 +2066,14 @@ impl SymForgeServer {
             Ok(prepared) => prepared,
             Err(e) => return e,
         };
+        let project_state = self.capture_project_state_dir();
         let project_config_trust_suffix = match project_config_trust_response_suffix(&repo_root) {
             Ok(suffix) => suffix,
             Err(message) => return message,
         };
         let dry_run = params.0.dry_run.unwrap_or(false);
         let idempotency = match begin_mutation_replay(
-            &repo_root,
+            self,
             "batch_insert",
             &params.0,
             params.0.idempotency_key.as_deref(),
@@ -2046,7 +2082,8 @@ impl SymForgeServer {
             Ok(idempotency) => idempotency,
             Err(output) => return output,
         };
-        match edit::execute_batch_insert(&self.index, &repo_root, &params.0) {
+        match edit::execute_batch_insert(&self.index, &repo_root, project_state.as_ref(), &params.0)
+        {
             Ok(summaries) => {
                 let file_count = params
                     .0

@@ -8,6 +8,225 @@ use crate::live_index::search;
 
 use super::read_tools::{lenient_bool, lenient_option_vec, lenient_u32, lenient_u64};
 
+/// Source-scope vocabulary accepted by `search_knowledge` and `review_knowledge`.
+///
+/// Both `search_knowledge` and `review_knowledge` compose across all four scopes
+/// (Gate L): `current`, `worktrees`, `local_refs`, and `all`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeSourceScope {
+    Current,
+    Worktrees,
+    LocalRefs,
+    All,
+}
+
+/// Source scopes advertised by `search_knowledge` and `review_knowledge`
+/// (Gate L): both compose across the captured source set, so every implemented
+/// P1 scope is advertised.
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum AdvertisedSearchKnowledgeSourceScope {
+    Current,
+    Worktrees,
+    LocalRefs,
+    All,
+}
+
+/// Retrieval voice filter for repository knowledge.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeAuthorityScope {
+    Default,
+    Current,
+    Intent,
+    History,
+    All,
+}
+
+/// Exact Gate I input for `search_knowledge`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchKnowledgeInput {
+    /// Non-empty natural-language or identifier query.
+    pub query: String,
+    /// Optional normalized repository-relative prefix; traversal is rejected.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Captured repository source scope: `current` (default), `worktrees`,
+    /// `local_refs`, or `all`. Composed from one captured source set.
+    #[serde(default)]
+    #[schemars(with = "AdvertisedSearchKnowledgeSourceScope")]
+    pub source_scope: Option<KnowledgeSourceScope>,
+    /// Authority/retrieval voice filter. Defaults to `default`.
+    #[serde(default)]
+    pub authority_scope: Option<KnowledgeAuthorityScope>,
+    /// One open project id/alias; mutually exclusive with `projects`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Explicit open-project ids/aliases or `["*"]`; mutually exclusive with `project`.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub projects: Option<Vec<String>>,
+    /// Maximum number of complete hits. Defaults to ten and is server-bounded.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Bounded response budget; truncation preserves complete provenance.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub max_tokens: Option<u64>,
+}
+
+/// Frozen read-only review modes for `review_knowledge`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewKnowledgeMode {
+    Summary,
+    Document,
+    Remediation,
+}
+
+/// Exact Gate J input for `review_knowledge`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewKnowledgeInput {
+    /// Review projection: aggregate summary, exact document, or ranked remediation.
+    pub mode: ReviewKnowledgeMode,
+    /// Exact normalized repository-relative path. Required by `document` mode.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional normalized repository-relative prefix for summary/remediation scope.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Captured repository source scope: `current` (default), `worktrees`,
+    /// `local_refs`, or `all`. Composed from one captured source set.
+    #[serde(default)]
+    #[schemars(with = "AdvertisedSearchKnowledgeSourceScope")]
+    pub source_scope: Option<KnowledgeSourceScope>,
+    /// One open project id/alias; mutually exclusive with `projects`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Explicit open-project ids/aliases or `["*"]`; mutually exclusive with `project`.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub projects: Option<Vec<String>>,
+    /// Maximum number of complete dossiers. Defaults to ten and is server-bounded.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub limit: Option<u32>,
+    /// Bounded response budget; complete-plan hashes are computed before budgeting.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub max_tokens: Option<u64>,
+}
+
+/// Lifecycle value accepted by the repository knowledge policy writer.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgePolicyLifecycleInput {
+    Active,
+    Proposed,
+    Accepted,
+    Implemented,
+    Deferred,
+    Rejected,
+    Withdrawn,
+    Deprecated,
+    Superseded,
+    Archived,
+    Historical,
+    Unknown,
+}
+
+/// Optional authority-domain assertion accepted by the policy writer.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgePolicyAuthorityDomainInput {
+    CurrentImplementation,
+    NormativeIntent,
+    Decision,
+    Operations,
+    Governance,
+    HistoricalRecord,
+    Unknown,
+}
+
+/// Exact byte-identity target guarded by one curation action.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgePolicyTargetInput {
+    pub path: String,
+    pub content_hash: String,
+    #[serde(default)]
+    #[schemars(with = "[u32; 2]")]
+    pub unit_byte_range: Option<[u32; 2]>,
+    #[serde(default)]
+    pub unit_hash: Option<String>,
+}
+
+/// Secret-safe evidence reference stored in the policy ledger.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgePolicyEvidenceInput {
+    pub rule_id: String,
+    #[serde(default)]
+    pub knowledge: Option<KnowledgePolicyTargetInput>,
+    #[serde(default)]
+    pub code_path: Option<String>,
+}
+
+/// One complete policy entry for an upsert mutation.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgePolicyEntryInput {
+    pub entry_id: String,
+    pub target: KnowledgePolicyTargetInput,
+    pub lifecycle: KnowledgePolicyLifecycleInput,
+    #[serde(default)]
+    pub authority_domain: Option<KnowledgePolicyAuthorityDomainInput>,
+    #[serde(default)]
+    pub superseded_by: Option<KnowledgePolicyTargetInput>,
+    #[serde(default)]
+    pub evidence: Vec<KnowledgePolicyEvidenceInput>,
+    pub justification_code: String,
+}
+
+/// Ledger-only mutations. Move/delete/document-edit operations are intentionally
+/// absent from the closed schema.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KnowledgePolicyMutationInput {
+    Upsert {
+        entry: KnowledgePolicyEntryInput,
+    },
+    Remove {
+        entry_id: String,
+        expected_target: KnowledgePolicyTargetInput,
+    },
+}
+
+/// An explicitly approved review action and its exact policy mutation.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgePolicyActionInput {
+    pub action_id: String,
+    pub mutation: KnowledgePolicyMutationInput,
+}
+
+/// Preview-first Gate K input for one current-worktree source.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CurateKnowledgeInput {
+    pub actions: Vec<KnowledgePolicyActionInput>,
+    pub if_source_review_hash: String,
+    pub if_manifest_digest: String,
+    pub if_policy_digest: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub apply: bool,
+    #[schemars(required)]
+    pub project: Option<String>,
+}
+
 /// Input for `search_symbols`.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct SearchSymbolsInput {

@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use symforge::domain::ProjectStateDir;
 use symforge::live_index::LiveIndex;
 use symforge::live_index::frecency::{FRECENCY_FLAG_ENV, FrecencyStore};
 use symforge::live_index::persist::init_frecency_store;
@@ -32,6 +33,10 @@ mod git_test_helpers {
         env!("CARGO_MANIFEST_DIR"),
         "/src/git/test_helpers.rs"
     ));
+}
+
+fn project_state(root: &Path) -> ProjectStateDir {
+    ProjectStateDir::new(root.join(symforge::paths::SYMFORGE_DIR_NAME))
 }
 
 struct Fixture {
@@ -456,6 +461,53 @@ async fn search_text_does_not_bump() {
 }
 
 #[tokio::test]
+async fn map_search_review_and_ask_knowledge_do_not_bump() {
+    let fx = Fixture::new(&[(
+        "docs/recovery.md",
+        "# Recovery\nShutdown is not a safe persistence boundary.\n",
+    )]);
+    let _flag = FlagGuard::on();
+
+    let direct = call(
+        &fx.server,
+        "search_knowledge",
+        json!({"query": "safe persistence boundary", "source_scope": "current"}),
+    )
+    .await;
+    assert!(
+        direct.contains("docs/recovery.md"),
+        "direct knowledge retrieval must exercise a real hit: {direct}"
+    );
+
+    let routed = call(
+        &fx.server,
+        "ask",
+        json!({"query": "what do the docs say about safe persistence boundary"}),
+    )
+    .await;
+    assert!(
+        routed.contains("Chosen tool: search_knowledge"),
+        "ask must exercise the knowledge route: {routed}"
+    );
+    let map = call(&fx.server, "get_repo_map", json!({"detail": "compact"})).await;
+    assert!(map.contains("Index:"), "map must execute: {map}");
+    let review = call(
+        &fx.server,
+        "review_knowledge",
+        json!({"mode": "summary", "source_scope": "current"}),
+    )
+    .await;
+    assert!(
+        review.contains("review_hash="),
+        "review must execute: {review}"
+    );
+    assert!(
+        !fx.db_path().exists(),
+        "map, direct search, review, and ask must not create a frecency database"
+    );
+}
+
+#[tokio::test]
 async fn search_symbols_does_not_bump() {
     let fx = Fixture::new(&[("src/lib.rs", "pub fn find_user() {}\n")]);
     let _flag = FlagGuard::on();
@@ -693,7 +745,7 @@ fn head_change_halves_scores_at_100_commits() {
     }
 
     advance_head(root, 100);
-    init_frecency_store(root);
+    init_frecency_store(root, &project_state(root));
 
     let store = FrecencyStore::open(&db_path).expect("reopen");
     assert_eq!(
@@ -722,7 +774,7 @@ fn head_change_resets_scores_at_1000_commits() {
     }
 
     advance_head(root, 1000);
-    init_frecency_store(root);
+    init_frecency_store(root, &project_state(root));
 
     let store = FrecencyStore::open(&db_path).expect("reopen");
     assert_eq!(
@@ -739,14 +791,16 @@ fn ten_parallel_bumps_yield_hit_count_ten() {
     let _flag = FlagGuard::on();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
+    let state = project_state(&root);
     let p = PathBuf::from("src/x.rs");
 
     thread::scope(|s| {
         for _ in 0..10 {
             let root = root.clone();
+            let state = state.clone();
             let p = p.clone();
             s.spawn(move || {
-                symforge::live_index::frecency::bump(&root, &[p]);
+                symforge::live_index::frecency::bump(&root, Some(&state), &[p]);
             });
         }
     });

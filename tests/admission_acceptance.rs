@@ -72,7 +72,7 @@ fn test_admission_tier_acceptance() {
         5,
         "expected 5 Tier-1 (indexed) files, got {tier1}; skipped={:?}",
         index
-            .skipped_files()
+            .compatibility_skipped_files()
             .iter()
             .map(|sf| (&sf.path, sf.reason()))
             .collect::<Vec<_>>()
@@ -95,8 +95,8 @@ fn test_admission_tier_acceptance() {
 
     // None of the skipped files should appear as indexed files
     let skipped_paths: Vec<String> = index
-        .skipped_files()
-        .iter()
+        .compatibility_skipped_files()
+        .into_iter()
         .map(|sf| sf.path.replace('\\', "/"))
         .collect();
 
@@ -126,8 +126,8 @@ fn test_admission_tier_acceptance() {
 
     // A denylisted extension
     let ckpt = index
-        .skipped_files()
-        .iter()
+        .compatibility_skipped_files()
+        .into_iter()
         .find(|sf| sf.path.replace('\\', "/").ends_with("models/v2.ckpt"))
         .expect("models/v2.ckpt should be in skipped_files");
     assert_eq!(
@@ -138,8 +138,8 @@ fn test_admission_tier_acceptance() {
 
     // The oversized file
     let big = index
-        .skipped_files()
-        .iter()
+        .compatibility_skipped_files()
+        .into_iter()
         .find(|sf| sf.path.replace('\\', "/").ends_with("data/big_config.json"))
         .expect("data/big_config.json should be in skipped_files");
     assert_eq!(
@@ -150,8 +150,8 @@ fn test_admission_tier_acceptance() {
 
     // The binary file
     let bin = index
-        .skipped_files()
-        .iter()
+        .compatibility_skipped_files()
+        .into_iter()
         .find(|sf| sf.path.replace('\\', "/").ends_with("data/custom.dat"))
         .expect("data/custom.dat should be in skipped_files");
     assert_eq!(
@@ -196,7 +196,7 @@ fn snapshot_tiers(index: &symforge::live_index::LiveIndex) -> TierSnapshot {
     let mut tier2: BTreeMap<String, SkipReason> = BTreeMap::new();
     let mut tier3: BTreeMap<String, SkipReason> = BTreeMap::new();
 
-    for sf in index.skipped_files() {
+    for sf in index.compatibility_skipped_files() {
         let path = sf.path.replace('\\', "/");
         let reason = sf
             .reason()
@@ -383,8 +383,8 @@ fn test_admission_dependency_lockfiles_are_tier2() {
             "{label} {name} must NOT be a Tier-1 indexed file"
         );
         let sf = index
-            .skipped_files()
-            .iter()
+            .compatibility_skipped_files()
+            .into_iter()
             .find(|sf| sf.path.replace('\\', "/").ends_with(name))
             .unwrap_or_else(|| panic!("{label} {name} should be in skipped_files"));
         assert_eq!(

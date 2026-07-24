@@ -59,8 +59,20 @@ async fn spawn_watcher(
         run_watcher(root, index_clone, info_clone).await;
     });
 
-    // Give the watcher time to initialize the OS-level watch handle.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the registered watcher to finish its mandatory fresh-instance
+    // reconciliation. A fixed sleep races that repair on slower Windows hosts
+    // and can mutate the fixture before the event loop is ready to drain its
+    // already-registered channel.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if watcher_info.lock().state == WatcherState::Active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher should become Active after fresh-instance reconciliation");
 
     watcher_info
 }
@@ -601,9 +613,13 @@ async fn test_watcher_atomic_save_noop_content() {
 // Test 8: Watcher ignores non-source files (e.g., README.md)
 // ---------------------------------------------------------------------------
 
-/// Prove that creating a non-source file does NOT cause it to be indexed.
+/// Prove that creating a genuinely non-indexable file does NOT add it to the
+/// resident file map.
 ///
-/// The watcher must filter out files with unsupported extensions.
+/// Under the repository knowledge index, text/markdown/config (including `.txt`
+/// and `.csv`) are first-class knowledge sources and ARE indexed, so this test
+/// uses binary content, which routes to a metadata-only disposition and never
+/// enters the resident `file_count()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_watcher_ignores_non_source_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -617,9 +633,14 @@ async fn test_watcher_ignores_non_source_files() {
 
     let _watcher_info = spawn_watcher(&dir, &shared).await;
 
-    // Create truly non-source files — should be ignored by the watcher
-    write_file(dir.path(), "notes.txt", "some notes");
-    write_file(dir.path(), "data.csv", "a,b,c");
+    // Binary content is sniffed to a metadata-only disposition and never joins
+    // the resident file map, so these must not change file_count().
+    fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 255, 254, 0, 42]).unwrap();
+    fs::write(
+        dir.path().join("image.png"),
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x00, 0x1a],
+    )
+    .unwrap();
 
     wait_debounce().await;
 

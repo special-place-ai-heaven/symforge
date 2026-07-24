@@ -2,7 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::domain::{FileClassification, LanguageId};
+use crate::domain::{
+    AccessErrorKind, AccessStage, CatalogPath, CoverageStatus, FileClassification, FileStamp,
+    FreshnessReason, HardSkipReason, IndexTargets, LanguageId, ManifestResourceUsage,
+    MetadataOnlyReason, ProjectId, RootBinding, RootCandidateSource, RootClass, RootRefusalReason,
+    RootRequestMode, RootResolution, ScoutDecision, ScoutIssue, ScoutIssueKind, ScoutedEntry,
+    SourceAccessMode, StateFailure, StateLocationKind, StatePlacement, UnboundReason,
+    UserLocalPlacementReason,
+};
 
 /// A file found during directory traversal that has a recognized language extension.
 #[derive(Debug, Clone)]
@@ -25,6 +32,8 @@ pub struct DiscoveredFile {
 pub struct DiscoveredEntry {
     /// Relative path from the root, using forward slashes.
     pub relative_path: String,
+    /// Lossless repository-relative native path used by the metadata-first scout.
+    pub relative_os_path: PathBuf,
     /// Absolute path on disk.
     pub absolute_path: PathBuf,
     /// File size in bytes from the walk metadata (no extra stat syscall).
@@ -35,12 +44,155 @@ pub struct DiscoveredEntry {
     pub classification: FileClassification,
 }
 
+/// Immutable metadata-first observation consumed by later content execution.
+#[derive(Debug, Clone)]
+pub struct ScoutPlan {
+    pub coverage: CoverageStatus,
+    pub entries: Vec<ScoutedEntry>,
+    pub issues: Vec<ScoutIssue>,
+    pub usage: ManifestResourceUsage,
+}
+
+/// Recompute canonical ordering, coverage, and resource accounting after a
+/// generation-fenced incremental manifest mutation.
+pub(crate) fn refresh_scout_plan(plan: &mut ScoutPlan) -> Result<()> {
+    plan.entries.sort_by_cached_key(|entry| {
+        scout_order_key(
+            entry.path.normalized_utf8.as_deref(),
+            Some(entry.path.public_id.as_str()),
+        )
+    });
+    plan.issues.sort_by_cached_key(|issue| {
+        scout_order_key(issue.safe_path.as_deref(), issue.path_id.as_deref())
+    });
+
+    let limits = DiscoveryLimits::from_env();
+    let mut catalog_metadata_bytes = 2u64;
+    for issue in &plan.issues {
+        catalog_metadata_bytes = account_catalog_metadata_record(
+            catalog_metadata_bytes,
+            &("issue", issue),
+            limits.max_catalog_metadata_bytes,
+        )?;
+    }
+    let mut admitted_content_bytes = 0u64;
+    for entry in &plan.entries {
+        catalog_metadata_bytes = account_catalog_metadata_record(
+            catalog_metadata_bytes,
+            &(
+                "entry",
+                &entry.path,
+                entry.stamp.size,
+                &entry.language,
+                entry.classification,
+                &entry.decision,
+            ),
+            limits.max_catalog_metadata_bytes,
+        )?;
+        if matches!(entry.decision, ScoutDecision::Ingest { .. }) {
+            admitted_content_bytes = admitted_content_bytes.saturating_add(entry.stamp.size);
+        }
+    }
+
+    plan.coverage = if plan.issues.is_empty()
+        && plan
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.decision, ScoutDecision::Unavailable { .. }))
+    {
+        CoverageStatus::Complete
+    } else {
+        CoverageStatus::Degraded
+    };
+    plan.usage = ManifestResourceUsage {
+        catalog_entries: plan.entries.len() as u64,
+        catalog_metadata_bytes,
+        admitted_content_bytes,
+    };
+    Ok(())
+}
+
+/// A candidate scout refused before a manifest exists because a catalog budget
+/// was exhausted. This is operational freshness state, never a manifest issue.
+#[derive(Debug)]
+pub struct ScoutCapacityError {
+    reason: FreshnessReason,
+    safe_message: String,
+}
+
+impl ScoutCapacityError {
+    fn new(reason: FreshnessReason, safe_message: String) -> Self {
+        Self {
+            reason,
+            safe_message,
+        }
+    }
+
+    pub fn reason(&self) -> FreshnessReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for ScoutCapacityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.safe_message)
+    }
+}
+
+impl std::error::Error for ScoutCapacityError {}
+
+/// Canonical repository-relative subtrees that are outside source scope.
+///
+/// The name-based `.git` / `.symforge` exclusions are universal. This policy
+/// carries resolved state directories whose names are not universal (for
+/// example, a user-local state root configured beneath the repository). Keeping
+/// the policy repository-relative lets watcher paths be rejected before any
+/// metadata or content I/O.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceExclusions {
+    relative_subtrees: Vec<PathBuf>,
+}
+
+impl SourceExclusions {
+    pub(crate) fn for_state_placement(root: &Path, placement: &StatePlacement) -> Self {
+        let directory = match placement {
+            StatePlacement::ProjectLocal { directory }
+            | StatePlacement::UserLocal { directory, .. } => directory.as_path(),
+            StatePlacement::MemoryOnly { .. } => return Self::default(),
+        };
+
+        let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canonical_directory =
+            dunce::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let relative = canonical_directory
+            .strip_prefix(&canonical_root)
+            .or_else(|_| directory.strip_prefix(root));
+        let Ok(relative) = relative else {
+            return Self::default();
+        };
+
+        let mut relative_subtrees = vec![relative.to_path_buf()];
+        relative_subtrees.sort();
+        relative_subtrees.dedup();
+        Self { relative_subtrees }
+    }
+
+    pub(crate) fn excludes_relative(&self, relative_path: &Path) -> bool {
+        self.relative_subtrees
+            .iter()
+            .any(|subtree| relative_path.starts_with(subtree))
+    }
+}
+
 /// Environment variable overriding the maximum number of files a single
 /// discovery pass will accept before refusing to index the tree.
 const MAX_INDEX_FILES_ENV: &str = "SYMFORGE_MAX_INDEX_FILES";
 /// Environment variable overriding the maximum cumulative byte size a single
-/// discovery pass will accept before refusing to index the tree.
+/// discovery pass will admit as file payload before refusing to index the tree.
 const MAX_INDEX_BYTES_ENV: &str = "SYMFORGE_MAX_INDEX_BYTES";
+/// Environment variable overriding the maximum canonical public catalog metadata
+/// bytes a single scout candidate may retain.
+const MAX_CATALOG_METADATA_BYTES_ENV: &str = "SYMFORGE_MAX_CATALOG_METADATA_BYTES";
 
 /// Default file-count ceiling. Generous enough for very large real monorepos
 /// (this repo is ~230 files; 50k+ file monorepos are common), while still well
@@ -51,6 +203,13 @@ const DEFAULT_MAX_INDEX_FILES: u64 = 200_000;
 /// whose discoverable files exceed this is almost certainly a generated-file
 /// bomb, a mounted volume, or an accidental scratch root, not a project.
 const DEFAULT_MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Default canonical catalog-metadata ceiling: 512 MiB. This remains independent
+/// from both file count and admitted payload bytes.
+const DEFAULT_MAX_CATALOG_METADATA_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum exact UTF-8 spelling retained in a persisted catalog descriptor.
+/// Longer native paths remain addressable transiently but are published only by
+/// their bounded opaque ID.
+const MAX_CATALOG_SAFE_PATH_BYTES: usize = 64 * 1024;
 
 /// Resource ceilings applied DURING the filesystem walk, before any in-memory
 /// index build commits to the discovered set. Bounding the streaming walk (not
@@ -64,6 +223,8 @@ pub struct DiscoveryLimits {
     pub max_files: u64,
     /// Maximum cumulative bytes of accepted files before refusing the tree.
     pub max_bytes: u64,
+    /// Maximum canonical encoded bytes of public catalog metadata.
+    pub max_catalog_metadata_bytes: u64,
 }
 
 impl DiscoveryLimits {
@@ -74,9 +235,12 @@ impl DiscoveryLimits {
     pub fn from_env() -> Self {
         let max_files = parse_positive_env(MAX_INDEX_FILES_ENV).unwrap_or(DEFAULT_MAX_INDEX_FILES);
         let max_bytes = parse_positive_env(MAX_INDEX_BYTES_ENV).unwrap_or(DEFAULT_MAX_INDEX_BYTES);
+        let max_catalog_metadata_bytes = parse_positive_env(MAX_CATALOG_METADATA_BYTES_ENV)
+            .unwrap_or(DEFAULT_MAX_CATALOG_METADATA_BYTES);
         Self {
             max_files,
             max_bytes,
+            max_catalog_metadata_bytes,
         }
     }
 }
@@ -86,6 +250,7 @@ impl Default for DiscoveryLimits {
         Self {
             max_files: DEFAULT_MAX_INDEX_FILES,
             max_bytes: DEFAULT_MAX_INDEX_BYTES,
+            max_catalog_metadata_bytes: DEFAULT_MAX_CATALOG_METADATA_BYTES,
         }
     }
 }
@@ -189,38 +354,73 @@ fn is_under_repo_root_build_dir(relative_path: &str, target_dir_child: Option<&s
     matches!(target_dir_child, Some(child) if child == first)
 }
 
-/// SF-025: returns `true` when any component of `relative_path` (forward-slash
-/// normalized, relative to the repo root) is a "hidden" dotfile/dotdir — a
-/// segment beginning with `.` other than the `.`/`..` traversal segments.
-///
-/// The bulk discovery walk (`discover_all_files`) uses `ignore::WalkBuilder`
-/// with its default `.hidden(true)`, which skips any entry whose name — or an
-/// ancestor directory's name — starts with `.` (e.g. `.github/workflows/ci.yml`,
-/// `.travis.yml`). The single-file (re)index choke point in the watcher did NOT
-/// apply that rule, so a freshen-on-read of a tracked hidden file would parse
-/// and INSERT it even though a fresh bulk load never discovered it. That made
-/// index membership query-history-dependent: a file was invisible to
-/// `search_files` until someone happened to `get_file_context` it, and identical
-/// health calls disagreed across processes. This predicate lets the single-file
-/// path apply the SAME hidden-path exclusion as the walk, keeping admission
-/// symmetric and the index deterministic from scan policy alone.
-pub fn path_has_hidden_component(relative_path: &str) -> bool {
-    relative_path
-        .split('/')
-        .any(|component| component.starts_with('.') && component != "." && component != "..")
+/// VCS/runtime internals are outside source scope even when ignore rules
+/// explicitly re-include them. Other repository-owned hidden paths remain
+/// discoverable and flow through normal ignore/admission policy.
+pub(crate) fn path_is_hard_scope_excluded(relative_path: &Path) -> bool {
+    relative_path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".symforge")
+        })
+    })
+}
+
+fn repository_walk(root: &Path, exclusions: &SourceExclusions) -> ignore::Walk {
+    let filter_root = root.to_path_buf();
+    let exclusions = exclusions.clone();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(false).filter_entry(move |entry| {
+        entry
+            .path()
+            .strip_prefix(&filter_root)
+            .is_ok_and(|relative| {
+                !path_is_hard_scope_excluded(relative) && !exclusions.excludes_relative(relative)
+            })
+    });
+    builder.build()
 }
 
 /// Build the graceful, explicit over-cap error. Surfaced to the caller (and
 /// thus the MCP client) instead of an OOM/panic, and it names the override knob
 /// so an operator with a genuinely huge repo can raise the ceiling.
-fn tree_too_large_error(files: u64, bytes: u64, limits: &DiscoveryLimits) -> anyhow::Error {
-    anyhow::anyhow!(
+fn tree_too_large_message(files: u64, bytes: u64, limits: &DiscoveryLimits) -> String {
+    format!(
         "tree too large to index ({files} files / {bytes} bytes exceeds limit of \
          {max_files} files / {max_bytes} bytes); set {MAX_INDEX_FILES_ENV} or \
          {MAX_INDEX_BYTES_ENV} to override",
         max_files = limits.max_files,
         max_bytes = limits.max_bytes,
     )
+}
+
+fn catalog_entry_capacity_error(files: u64, bytes: u64, limits: &DiscoveryLimits) -> anyhow::Error {
+    ScoutCapacityError::new(
+        FreshnessReason::CatalogEntryCapacityExceeded,
+        tree_too_large_message(files, bytes, limits),
+    )
+    .into()
+}
+
+fn admitted_content_capacity_error(
+    files: u64,
+    bytes: u64,
+    limits: &DiscoveryLimits,
+) -> anyhow::Error {
+    anyhow::anyhow!(tree_too_large_message(files, bytes, limits))
+}
+
+fn catalog_metadata_capacity_error(bytes: u64, limit: u64) -> anyhow::Error {
+    ScoutCapacityError::new(
+        FreshnessReason::CatalogMetadataCapacityExceeded,
+        format!(
+            "catalog metadata capacity exceeded ({bytes} bytes exceeds limit of {limit} bytes); \
+             set {MAX_CATALOG_METADATA_BYTES_ENV} to override"
+        ),
+    )
+    .into()
 }
 
 /// Discover all source files under `root` that have a recognized language extension.
@@ -231,8 +431,13 @@ fn tree_too_large_error(files: u64, bytes: u64, limits: &DiscoveryLimits) -> any
 /// - Refuses trees that exceed [`DiscoveryLimits`] with a graceful error rather
 ///   than collecting an unbounded set and OOM-ing the in-memory index build.
 pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
-    use ignore::WalkBuilder;
+    discover_files_with_exclusions(root, &SourceExclusions::default())
+}
 
+pub fn discover_files_with_exclusions(
+    root: &Path,
+    exclusions: &SourceExclusions,
+) -> Result<Vec<DiscoveredFile>> {
     // Canonicalize root so that strip_prefix succeeds even when the walker
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -244,7 +449,7 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
     // Repo-root build-dir child designated by CARGO_TARGET_DIR, resolved once.
     let target_dir_child = cargo_target_dir_root_child(&root);
     let mut files: Vec<DiscoveredFile> = Vec::new();
-    for entry_result in WalkBuilder::new(&root).build() {
+    for entry_result in repository_walk(&root, exclusions) {
         let Ok(entry) = entry_result else { continue };
         let path =
             std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
@@ -255,19 +460,16 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
             continue;
         }
 
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let Some(language) = LanguageId::from_extension(ext) else {
-            continue;
-        };
-
         // Compute relative path from root
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;
         };
         // Normalize backslashes to forward slashes
         let relative_path = relative.to_string_lossy().replace('\\', "/");
+        let Some(language) = LanguageId::from_path(&relative_path) else {
+            continue;
+        };
+        let targets = IndexTargets::for_path(&relative_path, Some(&language));
 
         // Repo-independent skip for Cargo build dirs at the REPO ROOT level
         // (`target`, `target-wsl`, `CARGO_TARGET_DIR`, …). `/target` is usually
@@ -281,11 +483,15 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
         // Refuse BEFORE growing the set past the ceiling, so a huge tree returns
         // a graceful error rather than collecting an unbounded path vector.
         if files.len() as u64 >= limits.max_files {
-            return Err(tree_too_large_error(files.len() as u64 + 1, 0, &limits));
+            return Err(catalog_entry_capacity_error(
+                files.len() as u64 + 1,
+                0,
+                &limits,
+            ));
         }
 
         files.push(DiscoveredFile {
-            classification: FileClassification::for_code_path(&relative_path),
+            classification: FileClassification::for_indexed_path(&relative_path, targets),
             relative_path,
             absolute_path: path,
             language,
@@ -306,27 +512,40 @@ pub fn discover_files(root: &Path) -> Result<Vec<DiscoveredFile>> {
 /// - Sets `language = None` for files with unrecognized extensions.
 /// - Returns files sorted case-insensitively by `relative_path`.
 /// - Refuses trees that exceed [`DiscoveryLimits`] (file count AND cumulative
-///   bytes) with a graceful error rather than collecting an unbounded set and
-///   OOM-ing / panicking the in-memory index build in `LiveIndex::load`.
+///   admitted bytes) with a graceful error rather than collecting an unbounded
+///   set and OOM-ing / panicking the in-memory index build in `LiveIndex::load`.
 ///
 /// This is the discovery entry point used by the full `LiveIndex::load`, so the
 /// byte ceiling is enforced here (file sizes are already known from the walk
-/// metadata, so no extra `stat` is needed to track cumulative bytes).
+/// metadata, so no extra `stat` is needed to track cumulative admitted bytes).
 pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
-    use ignore::WalkBuilder;
+    discover_all_files_with_exclusions(root, &SourceExclusions::default())
+}
 
+pub fn discover_all_files_with_exclusions(
+    root: &Path,
+    exclusions: &SourceExclusions,
+) -> Result<Vec<DiscoveredEntry>> {
+    discover_all_files_with_exclusions_and_issues(root, exclusions).map(|(entries, _)| entries)
+}
+
+fn discover_all_files_with_exclusions_and_issues(
+    root: &Path,
+    exclusions: &SourceExclusions,
+) -> Result<(Vec<DiscoveredEntry>, Vec<ScoutIssue>)> {
     // Canonicalize root so that strip_prefix succeeds even when the walker
     // resolves symlinks to their canonical targets.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    // Bound the streaming walk by accepted file count AND cumulative bytes,
-    // refusing the moment either ceiling is crossed — before the unbounded
-    // path/byte set is handed to the in-memory index build.
+    // Bound the streaming walk by accepted file count AND cumulative admitted
+    // bytes, refusing the moment either ceiling is crossed — before the
+    // unbounded path/byte set is handed to the in-memory index build.
     let limits = DiscoveryLimits::from_env();
     // Repo-root build-dir child designated by CARGO_TARGET_DIR, resolved once.
     let target_dir_child = cargo_target_dir_root_child(&root);
     let mut total_bytes: u64 = 0;
     let mut entries: Vec<DiscoveredEntry> = Vec::new();
+    let mut issues = Vec::new();
     // SF-012(B): the repo-root build-dir heuristic (`is_under_repo_root_build_dir`)
     // matches `target-<alnum>` by design (e.g. `target-wsl`, a `CARGO_TARGET_DIR`
     // variant), but false-positives on legitimately tracked source dirs whose name
@@ -337,8 +556,18 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     // the common case — no root-level `target-*` dir — pays nothing. `None` means
     // "no git / unreadable index" (fail open: heuristic decides alone, as before).
     let mut tracked_for_build_dirs: Option<Option<std::collections::HashSet<String>>> = None;
-    for entry_result in WalkBuilder::new(&root).build() {
-        let Ok(entry) = entry_result else { continue };
+    for entry_result in repository_walk(&root, exclusions) {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                let kind = error
+                    .io_error()
+                    .map(std::io::Error::kind)
+                    .unwrap_or(std::io::ErrorKind::Other);
+                issues.push(walk_issue_for_error(&root, ignore_error_path(&error), kind));
+                continue;
+            }
+        };
         let path =
             std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
 
@@ -383,20 +612,32 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
         }
 
         // Attempt language detection; None for unknown/denylisted extensions.
-        let language = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(LanguageId::from_extension);
+        let language = LanguageId::from_path(&relative_path);
+        let targets = IndexTargets::for_path(&relative_path, language.as_ref());
+        let classification = FileClassification::for_indexed_path(&relative_path, targets);
 
-        let classification = FileClassification::for_code_path(&relative_path);
+        // Apply metadata-terminal admission before accounting. Files that are
+        // already MetadataOnly or HardSkip are never read, so their declared
+        // size must not consume the ingest budget.
+        let admitted_bytes = match classify_admission(&path, file_size, None).tier {
+            AdmissionTier::Normal => file_size,
+            AdmissionTier::MetadataOnly | AdmissionTier::HardSkip => 0,
+        };
 
         // Refuse BEFORE pushing past either ceiling. `saturating_add` keeps the
-        // byte counter from wrapping on a pathological tree; once it crosses the
-        // limit we return the graceful error instead of continuing to allocate.
+        // admitted-byte counter from wrapping on a pathological tree; once it
+        // crosses the limit we return the graceful error instead of allocating.
         let projected_files = entries.len() as u64 + 1;
-        let projected_bytes = total_bytes.saturating_add(file_size);
-        if projected_files > limits.max_files || projected_bytes > limits.max_bytes {
-            return Err(tree_too_large_error(
+        let projected_bytes = total_bytes.saturating_add(admitted_bytes);
+        if projected_files > limits.max_files {
+            return Err(catalog_entry_capacity_error(
+                projected_files,
+                projected_bytes,
+                &limits,
+            ));
+        }
+        if projected_bytes > limits.max_bytes {
+            return Err(admitted_content_capacity_error(
                 projected_files,
                 projected_bytes,
                 &limits,
@@ -406,6 +647,7 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
 
         entries.push(DiscoveredEntry {
             relative_path,
+            relative_os_path: relative.to_path_buf(),
             absolute_path: path,
             file_size,
             language,
@@ -416,7 +658,515 @@ pub fn discover_all_files(root: &Path) -> Result<Vec<DiscoveredEntry>> {
     // Cache sort keys once instead of lowercasing paths on every comparator call.
     entries.sort_by_cached_key(|entry| entry.relative_path.to_lowercase());
 
-    Ok(entries)
+    Ok((entries, issues))
+}
+
+/// Build an immutable metadata-first plan without retaining file payload bytes.
+pub fn scout_repository(root: &Path) -> Result<ScoutPlan> {
+    scout_repository_with_metadata(root, |path| std::fs::metadata(path))
+}
+
+pub fn scout_repository_with_exclusions(
+    root: &Path,
+    exclusions: &SourceExclusions,
+) -> Result<ScoutPlan> {
+    scout_repository_with_io_and_exclusions(
+        root,
+        exclusions,
+        |path| std::fs::metadata(path),
+        read_binary_probe,
+    )
+}
+
+fn scout_repository_with_metadata<F>(root: &Path, metadata_reader: F) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+{
+    scout_repository_with_io(root, metadata_reader, read_binary_probe)
+}
+
+fn scout_repository_with_io<F, P>(
+    root: &Path,
+    metadata_reader: F,
+    probe_reader: P,
+) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
+    scout_repository_with_io_and_exclusions(
+        root,
+        &SourceExclusions::default(),
+        metadata_reader,
+        probe_reader,
+    )
+}
+
+/// Scout one watcher/reconciliation path through the same metadata-first
+/// admission pipeline as a cold repository walk.
+pub(crate) fn scout_single_path_with_io<F, P>(
+    relative_path: &str,
+    absolute_path: &Path,
+    metadata_reader: F,
+    probe_reader: P,
+) -> Result<ScoutedEntry>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
+    let language = LanguageId::from_path(relative_path);
+    let targets = IndexTargets::for_path(relative_path, language.as_ref());
+    let discovered = DiscoveredEntry {
+        relative_path: relative_path.to_string(),
+        relative_os_path: PathBuf::from(relative_path),
+        absolute_path: absolute_path.to_path_buf(),
+        file_size: 0,
+        language,
+        classification: FileClassification::for_indexed_path(relative_path, targets),
+    };
+    let plan = scout_entries_with_io(vec![discovered], metadata_reader, probe_reader, Vec::new())?;
+    plan.entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("single-path scout produced no entry for {relative_path}"))
+}
+
+pub(crate) fn scout_single_path(relative_path: &str, absolute_path: &Path) -> Result<ScoutedEntry> {
+    scout_single_path_with_io(
+        relative_path,
+        absolute_path,
+        |path| std::fs::metadata(path),
+        read_binary_probe,
+    )
+}
+
+fn scout_repository_with_io_and_exclusions<F, P>(
+    root: &Path,
+    exclusions: &SourceExclusions,
+    metadata_reader: F,
+    probe_reader: P,
+) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
+    let (discovered, walk_issues) =
+        discover_all_files_with_exclusions_and_issues(root, exclusions)?;
+    scout_entries_with_io(discovered, metadata_reader, probe_reader, walk_issues)
+}
+
+fn scout_entries_with_io<F, P>(
+    discovered: Vec<DiscoveredEntry>,
+    metadata_reader: F,
+    mut probe_reader: P,
+    mut issues: Vec<ScoutIssue>,
+) -> Result<ScoutPlan>
+where
+    F: Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    P: FnMut(&Path, usize) -> std::io::Result<Vec<u8>>,
+{
+    // The compatibility walk supplies path candidates only. Its metadata fallback
+    // is not authoritative here: this observation either yields real metadata or a
+    // typed issue, never a fabricated size.
+    let mut admitted_content_bytes = 0u64;
+    let limits = DiscoveryLimits::from_env();
+    // Exact compact-JSON array framing for the canonical logical metadata records.
+    let mut catalog_metadata_bytes = 2u64;
+    let mut entries = Vec::with_capacity(discovered.len());
+    let mut degraded = !issues.is_empty();
+
+    for issue in &issues {
+        catalog_metadata_bytes = account_catalog_metadata_record(
+            catalog_metadata_bytes,
+            &("issue", issue),
+            limits.max_catalog_metadata_bytes,
+        )?;
+    }
+
+    for mut entry in discovered {
+        let (catalog_path, path_reason) = catalog_path_projection(&entry.relative_os_path);
+        let public_id = catalog_path.public_id.clone();
+        let metadata = match metadata_reader(&entry.absolute_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                degraded = true;
+                let kind = access_error_kind(error.kind());
+                let issue = ScoutIssue {
+                    path_id: Some(public_id),
+                    safe_path: catalog_path.normalized_utf8.clone(),
+                    kind: ScoutIssueKind::DirectoryEntryUnreadable { kind },
+                    safe_message: "metadata unavailable".to_string(),
+                };
+                catalog_metadata_bytes = account_catalog_metadata_record(
+                    catalog_metadata_bytes,
+                    &("issue", &issue),
+                    limits.max_catalog_metadata_bytes,
+                )?;
+                issues.push(issue);
+                let scouted_entry = ScoutedEntry {
+                    path: catalog_path,
+                    absolute_path: Some(entry.absolute_path),
+                    stamp: FileStamp {
+                        size: entry.file_size,
+                        created_hint: None,
+                        modified_hint: None,
+                        platform_id: None,
+                    },
+                    language: entry.language,
+                    classification: entry.classification,
+                    decision: ScoutDecision::Unavailable {
+                        stage: AccessStage::Metadata,
+                        kind,
+                    },
+                };
+                catalog_metadata_bytes = account_catalog_metadata_record(
+                    catalog_metadata_bytes,
+                    &(
+                        "entry",
+                        &scouted_entry.path,
+                        scouted_entry.stamp.size,
+                        &scouted_entry.language,
+                        scouted_entry.classification,
+                        &scouted_entry.decision,
+                    ),
+                    limits.max_catalog_metadata_bytes,
+                )?;
+                entries.push(scouted_entry);
+                continue;
+            }
+        };
+
+        entry.file_size = metadata.len();
+        let decision = if let Some(reason) = path_reason {
+            ScoutDecision::MetadataOnly { reason }
+        } else if let Some(rule_id) = crate::knowledge::sensitive_path_rule(&entry.relative_path) {
+            ScoutDecision::MetadataOnly {
+                reason: MetadataOnlyReason::SensitivePath {
+                    rule_id: rule_id.to_string(),
+                },
+            }
+        } else {
+            match scout_decision_for_discovered(&entry, None) {
+                ScoutDecision::Ingest { .. } => match probe_reader(
+                    &entry.absolute_path,
+                    crate::domain::index::BINARY_SNIFF_BYTES,
+                ) {
+                    Ok(sample) => scout_decision_for_discovered(&entry, Some(&sample)),
+                    Err(error) => {
+                        degraded = true;
+                        ScoutDecision::Unavailable {
+                            stage: AccessStage::Probe,
+                            kind: access_error_kind(error.kind()),
+                        }
+                    }
+                },
+                terminal => terminal,
+            }
+        };
+        if matches!(decision, ScoutDecision::Ingest { .. }) {
+            admitted_content_bytes = admitted_content_bytes.saturating_add(entry.file_size);
+        }
+        let scouted_entry = ScoutedEntry {
+            path: catalog_path,
+            absolute_path: Some(entry.absolute_path),
+            stamp: FileStamp {
+                size: entry.file_size,
+                created_hint: metadata.created().ok(),
+                modified_hint: metadata.modified().ok(),
+                platform_id: None,
+            },
+            language: entry.language,
+            classification: entry.classification,
+            decision,
+        };
+        catalog_metadata_bytes = account_catalog_metadata_record(
+            catalog_metadata_bytes,
+            &(
+                "entry",
+                &scouted_entry.path,
+                scouted_entry.stamp.size,
+                &scouted_entry.language,
+                scouted_entry.classification,
+                &scouted_entry.decision,
+            ),
+            limits.max_catalog_metadata_bytes,
+        )?;
+        entries.push(scouted_entry);
+    }
+
+    entries.sort_by_cached_key(|entry| {
+        scout_order_key(
+            entry.path.normalized_utf8.as_deref(),
+            Some(entry.path.public_id.as_str()),
+        )
+    });
+    let collision_issues = path_identity_collision_issues(&entries);
+    if !collision_issues.is_empty() {
+        degraded = true;
+        for issue in collision_issues {
+            catalog_metadata_bytes = account_catalog_metadata_record(
+                catalog_metadata_bytes,
+                &("issue", &issue),
+                limits.max_catalog_metadata_bytes,
+            )?;
+            issues.push(issue);
+        }
+    }
+    issues.sort_by_cached_key(|issue| {
+        scout_order_key(issue.safe_path.as_deref(), issue.path_id.as_deref())
+    });
+
+    Ok(ScoutPlan {
+        coverage: if degraded {
+            CoverageStatus::Degraded
+        } else {
+            CoverageStatus::Complete
+        },
+        usage: ManifestResourceUsage {
+            catalog_entries: entries.len() as u64,
+            catalog_metadata_bytes,
+            admitted_content_bytes,
+        },
+        entries,
+        issues,
+    })
+}
+
+fn account_catalog_metadata_record<T: serde::Serialize + ?Sized>(
+    current_bytes: u64,
+    record: &T,
+    limit: u64,
+) -> Result<u64> {
+    let encoded_bytes = serde_json::to_vec(record)?.len() as u64;
+    let separator_bytes = u64::from(current_bytes > 2);
+    let projected_bytes = current_bytes
+        .saturating_add(separator_bytes)
+        .saturating_add(encoded_bytes);
+    if projected_bytes > limit {
+        Err(catalog_metadata_capacity_error(projected_bytes, limit))
+    } else {
+        Ok(projected_bytes)
+    }
+}
+
+fn catalog_path_for_relative(path: &Path) -> CatalogPath {
+    catalog_path_projection(path).0
+}
+
+fn catalog_path_projection(path: &Path) -> (CatalogPath, Option<MetadataOnlyReason>) {
+    let (normalized_utf8, reason) = match path.to_str() {
+        None => (None, Some(MetadataOnlyReason::UnsupportedPathEncoding)),
+        Some(value) if value.len() > MAX_CATALOG_SAFE_PATH_BYTES => {
+            (None, Some(MetadataOnlyReason::PathMetadataTooLarge))
+        }
+        Some(value) if !is_safe_catalog_path(path, value) => {
+            (None, Some(MetadataOnlyReason::UnsupportedPathEncoding))
+        }
+        Some(value) => (Some(normalize_catalog_path(value)), None),
+    };
+    let mut identity = Vec::new();
+
+    if let Some(safe_path) = normalized_utf8.as_deref() {
+        identity.extend_from_slice(b"symforge-catalog-path-v1:utf8\0");
+        identity.extend_from_slice(safe_path.as_bytes());
+    } else {
+        identity.extend_from_slice(b"symforge-catalog-path-v1:native\0");
+        identity.extend_from_slice(&native_path_identity_bytes(path));
+    }
+
+    (
+        CatalogPath {
+            public_id: crate::hash::digest_hex(&identity),
+            normalized_utf8,
+        },
+        reason,
+    )
+}
+
+fn is_safe_catalog_path(path: &Path, value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(char::is_control)
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(windows)]
+fn normalize_catalog_path(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn normalize_catalog_path(value: &str) -> String {
+    value.to_string()
+}
+
+#[cfg(unix)]
+fn native_path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn native_path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_path_identity_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_encoded_bytes().to_vec()
+}
+
+fn scout_order_key(
+    safe_path: Option<&str>,
+    public_id: Option<&str>,
+) -> (u8, String, Vec<u8>, String) {
+    match safe_path {
+        Some(path) => (
+            0,
+            path.to_lowercase(),
+            path.as_bytes().to_vec(),
+            public_id.unwrap_or_default().to_string(),
+        ),
+        None => (
+            1,
+            String::new(),
+            Vec::new(),
+            public_id.unwrap_or_default().to_string(),
+        ),
+    }
+}
+
+fn path_identity_collision_issues(entries: &[ScoutedEntry]) -> Vec<ScoutIssue> {
+    let mut issues = Vec::new();
+    let mut start = 0usize;
+
+    while start < entries.len() {
+        let Some(path) = entries[start].path.normalized_utf8.as_deref() else {
+            start += 1;
+            continue;
+        };
+        let folded = path.to_lowercase();
+        let mut end = start + 1;
+        while end < entries.len()
+            && entries[end]
+                .path
+                .normalized_utf8
+                .as_deref()
+                .is_some_and(|candidate| candidate.to_lowercase() == folded)
+        {
+            end += 1;
+        }
+
+        let has_distinct_spellings = entries[start..end]
+            .windows(2)
+            .any(|pair| pair[0].path.normalized_utf8 != pair[1].path.normalized_utf8);
+        if has_distinct_spellings {
+            for entry in &entries[start..end] {
+                issues.push(ScoutIssue {
+                    path_id: Some(entry.path.public_id.clone()),
+                    safe_path: entry.path.normalized_utf8.clone(),
+                    kind: ScoutIssueKind::PathIdentityCollision,
+                    safe_message: "case-fold path identity collision".to_string(),
+                });
+            }
+        }
+        start = end;
+    }
+
+    issues
+}
+
+fn walk_issue_for_error(
+    root: &Path,
+    failed_path: Option<&Path>,
+    kind: std::io::ErrorKind,
+) -> ScoutIssue {
+    let catalog_path = failed_path
+        .and_then(|path| path.strip_prefix(root).ok())
+        .map(catalog_path_for_relative);
+    ScoutIssue {
+        path_id: catalog_path.as_ref().map(|path| path.public_id.clone()),
+        safe_path: catalog_path.and_then(|path| path.normalized_utf8),
+        kind: ScoutIssueKind::DirectoryEntryUnreadable {
+            kind: access_error_kind(kind),
+        },
+        safe_message: "directory entry unavailable".to_string(),
+    }
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            ignore_error_path(err)
+        }
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::Loop { child, .. } => Some(child.as_path()),
+        ignore::Error::Io(_)
+        | ignore::Error::Glob { .. }
+        | ignore::Error::UnrecognizedFileType(_)
+        | ignore::Error::InvalidDefinition => None,
+    }
+}
+
+pub(crate) fn access_error_kind(kind: std::io::ErrorKind) -> AccessErrorKind {
+    match kind {
+        std::io::ErrorKind::NotFound => AccessErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => AccessErrorKind::PermissionDenied,
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            AccessErrorKind::InvalidData
+        }
+        std::io::ErrorKind::OutOfMemory => AccessErrorKind::ResourceExhausted,
+        _ => AccessErrorKind::Other,
+    }
+}
+
+fn read_binary_probe(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::with_capacity(max_bytes);
+    std::fs::File::open(path)?
+        .take(max_bytes as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn scout_decision_for_discovered(
+    entry: &DiscoveredEntry,
+    content_sample: Option<&[u8]>,
+) -> ScoutDecision {
+    let admission = classify_admission(&entry.absolute_path, entry.file_size, content_sample);
+    match admission.tier {
+        AdmissionTier::Normal => ScoutDecision::Ingest {
+            targets: IndexTargets::for_path(&entry.relative_path, entry.language.as_ref()),
+        },
+        AdmissionTier::HardSkip => ScoutDecision::HardSkip {
+            reason: match admission.reason {
+                Some(SkipReason::SizeCeiling) => HardSkipReason::PerFileCeiling,
+                _ => HardSkipReason::ArtifactType,
+            },
+        },
+        AdmissionTier::MetadataOnly => ScoutDecision::MetadataOnly {
+            reason: match admission.reason {
+                Some(SkipReason::DependencyLockfile) => MetadataOnlyReason::Lockfile,
+                Some(SkipReason::BinaryContent) => MetadataOnlyReason::Binary,
+                Some(SkipReason::SizeThreshold) => MetadataOnlyReason::OversizedData,
+                Some(SkipReason::DenylistedExtension)
+                | Some(SkipReason::Untracked)
+                | Some(SkipReason::GeneratedOutput) => MetadataOnlyReason::GeneratedOrVendor,
+                Some(SkipReason::UnsupportedLanguage) | Some(SkipReason::SizeCeiling) | None => {
+                    MetadataOnlyReason::UnsupportedTextEncoding
+                }
+            },
+        },
+    }
 }
 
 /// Load all `.gitignore` patterns from a repository root and nested directories.
@@ -578,6 +1328,311 @@ pub fn workspace_root_env_override() -> Option<PathBuf> {
     validate_workspace_candidate(Path::new(trimmed), WORKSPACE_ROOT_ENV)
 }
 
+#[cfg(windows)]
+fn is_device_or_special_namespace(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut native: Vec<u16> = path.as_os_str().encode_wide().collect();
+    for unit in &mut native {
+        if (*unit >= b'A' as u16) && (*unit <= b'Z' as u16) {
+            *unit += (b'a' - b'A') as u16;
+        }
+    }
+    let starts_with = |prefix: &str| {
+        let prefix: Vec<u16> = prefix.encode_utf16().collect();
+        native.starts_with(&prefix)
+    };
+
+    starts_with(r"\\.\")
+        || starts_with(r"\\?\globalroot\")
+        || starts_with(r"\\?\device\")
+        || starts_with(r"\device\")
+        || starts_with(r"\??\")
+}
+
+#[cfg(unix)]
+fn is_device_or_special_namespace(path: &Path) -> bool {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+        return false;
+    }
+    matches!(
+        components.next(),
+        Some(std::path::Component::Normal(component))
+            if component == "dev" || component == "proc" || component == "sys"
+    )
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_device_or_special_namespace(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_special_filesystem_entry(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        let kind = metadata.file_type();
+        kind.is_block_device() || kind.is_char_device() || kind.is_fifo() || kind.is_socket()
+    })
+}
+
+#[cfg(not(unix))]
+fn is_special_filesystem_entry(_path: &Path) -> bool {
+    false
+}
+
+/// Resolve one declared source root without selecting or touching project state.
+pub fn resolve_root_candidate(
+    candidate: &Path,
+    source: RootCandidateSource,
+    mode: RootRequestMode,
+) -> RootResolution {
+    resolve_root_candidate_with(
+        candidate,
+        source,
+        mode,
+        |path| path.is_dir(),
+        |path| path.canonicalize(),
+    )
+}
+
+fn resolve_root_candidate_with<D, C>(
+    candidate: &Path,
+    source: RootCandidateSource,
+    mode: RootRequestMode,
+    is_directory: D,
+    canonicalize: C,
+) -> RootResolution
+where
+    D: Fn(&Path) -> bool,
+    C: Fn(&Path) -> std::io::Result<PathBuf>,
+{
+    let safe_path_id = || {
+        format!(
+            "path-{}",
+            crate::hash::digest_hex(&native_path_identity_bytes(candidate))
+        )
+    };
+    let unbound = |reason| RootResolution::Unbound {
+        rejected_source: Some(source),
+        reason: UnboundReason::Refused(reason),
+        safe_path_id: Some(safe_path_id()),
+    };
+
+    if is_device_or_special_namespace(candidate) || is_special_filesystem_entry(candidate) {
+        return unbound(RootRefusalReason::DeviceOrSpecialNamespace);
+    }
+
+    let raw_is_protected =
+        crate::paths::is_sensitive_path(candidate) || is_forbidden_root(candidate);
+    if raw_is_protected
+        && !matches!(
+            mode,
+            RootRequestMode::ExplicitIndexFolder {
+                allow_protected_root: true
+            }
+        )
+    {
+        return unbound(RootRefusalReason::ProtectedRootRequiresExplicitOverride);
+    }
+    if !is_directory(candidate) {
+        return unbound(RootRefusalReason::MissingOrNotDirectory);
+    }
+    let canonical_root = match canonicalize(candidate) {
+        Ok(root) => root,
+        Err(_) => return unbound(RootRefusalReason::CanonicalizationFailed),
+    };
+    if is_device_or_special_namespace(&canonical_root)
+        || is_special_filesystem_entry(&canonical_root)
+    {
+        return unbound(RootRefusalReason::DeviceOrSpecialNamespace);
+    }
+    let canonical_is_protected =
+        crate::paths::is_sensitive_path(&canonical_root) || is_forbidden_root(&canonical_root);
+    let class = if raw_is_protected || canonical_is_protected {
+        RootClass::Protected
+    } else {
+        RootClass::Normal
+    };
+
+    let access_mode = match (class, mode) {
+        (
+            RootClass::Protected,
+            RootRequestMode::ExplicitIndexFolder {
+                allow_protected_root: true,
+            },
+        ) => SourceAccessMode::ExplicitProtected,
+        (RootClass::Protected, _) => {
+            return unbound(RootRefusalReason::ProtectedRootRequiresExplicitOverride);
+        }
+        (RootClass::Normal, _) => SourceAccessMode::NormalProject,
+        (RootClass::NeverIndexable, _) => unreachable!("terminal roots return before binding"),
+    };
+    RootResolution::Bound(RootBinding {
+        source,
+        root_id: project_id_for_canonical_root(&canonical_root),
+        canonical_root,
+        access_mode,
+    })
+}
+
+/// Derive the daemon/catalog identity for an already-canonical source root.
+///
+/// Keep this in the root-resolution layer so every consumer uses the same
+/// platform-equivalence rule and cannot disagree about the user-local state
+/// directory for one binding.
+pub(crate) fn project_id_for_canonical_root(canonical_root: &Path) -> ProjectId {
+    #[cfg(windows)]
+    let platform_domain: &[u8] = b"windows";
+    #[cfg(unix)]
+    let platform_domain: &[u8] = b"unix";
+    #[cfg(not(any(windows, unix)))]
+    let platform_domain: &[u8] = b"other";
+    let root_identity = canonical_root_identity_bytes(canonical_root);
+    let mut digest_input = Vec::with_capacity(48 + root_identity.len());
+    digest_input.extend_from_slice(b"symforge.project-state-root\0v1\0");
+    digest_input.extend_from_slice(platform_domain);
+    digest_input.push(0);
+    digest_input.extend_from_slice(&(root_identity.len() as u64).to_le_bytes());
+    digest_input.extend_from_slice(&root_identity);
+
+    ProjectId(format!(
+        "project-v1-{}",
+        crate::hash::digest_hex(&digest_input)
+    ))
+}
+
+#[cfg(windows)]
+fn canonical_root_identity_bytes(canonical_root: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `Path::canonicalize` returns a verbatim `\\?\` path on Windows while
+    // `dunce::canonicalize` deliberately returns the equivalent ordinary form.
+    // Project identity must describe the directory, not which canonicalizer a
+    // caller used, or binding and persistence can disagree about one root.
+    let canonical_root = dunce::simplified(canonical_root);
+    let mut identity = Vec::new();
+    for decoded in std::char::decode_utf16(canonical_root.as_os_str().encode_wide()) {
+        match decoded {
+            Ok(character) => {
+                let character = if character == '/' { '\\' } else { character };
+                for folded in character.to_lowercase() {
+                    identity.push(0);
+                    identity.extend_from_slice(&u32::from(folded).to_le_bytes());
+                }
+            }
+            Err(unpaired) => {
+                identity.push(1);
+                identity.extend_from_slice(&unpaired.unpaired_surrogate().to_le_bytes());
+            }
+        }
+    }
+    identity
+}
+
+#[cfg(not(windows))]
+fn canonical_root_identity_bytes(canonical_root: &Path) -> Vec<u8> {
+    native_path_identity_bytes(canonical_root)
+}
+
+pub(crate) fn resolve_state_placement_with<F>(
+    binding: &RootBinding,
+    user_local_directory: Option<PathBuf>,
+    mut prepare: F,
+) -> StatePlacement
+where
+    F: FnMut(&Path) -> std::result::Result<(), AccessErrorKind>,
+{
+    let mut failures = Vec::new();
+    let user_reason = if binding.access_mode == SourceAccessMode::ExplicitProtected {
+        UserLocalPlacementReason::ExplicitProtected
+    } else {
+        let project_directory = binding.canonical_root.join(".symforge");
+        match prepare_state_directory_with(&project_directory, &mut prepare) {
+            Ok(()) => {
+                return StatePlacement::ProjectLocal {
+                    directory: crate::domain::ProjectStateDir::new(project_directory),
+                };
+            }
+            Err(safe_reason) => {
+                failures.push(StateFailure {
+                    location: StateLocationKind::ProjectLocal,
+                    safe_reason,
+                });
+                UserLocalPlacementReason::ProjectLocalUnavailable { safe_reason }
+            }
+        }
+    };
+
+    if let Some(directory) = user_local_directory {
+        match prepare_state_directory_with(&directory, &mut prepare) {
+            Ok(()) => {
+                return StatePlacement::UserLocal {
+                    directory: crate::domain::ProjectStateDir::new(directory),
+                    root_id: binding.root_id.clone(),
+                    reason: user_reason,
+                };
+            }
+            Err(safe_reason) => failures.push(StateFailure {
+                location: StateLocationKind::UserLocal,
+                safe_reason,
+            }),
+        }
+    } else {
+        failures.push(StateFailure {
+            location: StateLocationKind::UserLocal,
+            safe_reason: AccessErrorKind::NotFound,
+        });
+    }
+    StatePlacement::MemoryOnly { failures }
+}
+
+fn prepare_state_directory_with<F>(
+    directory: &Path,
+    prepare: &mut F,
+) -> std::result::Result<(), AccessErrorKind>
+where
+    F: FnMut(&Path) -> std::result::Result<(), AccessErrorKind>,
+{
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            if crate::paths::state_directory_metadata_is_unsafe(&metadata) {
+                return Err(AccessErrorKind::InvalidData);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(access_error_kind(error.kind())),
+    }
+
+    prepare(directory)?;
+
+    let metadata =
+        std::fs::symlink_metadata(directory).map_err(|error| access_error_kind(error.kind()))?;
+    if crate::paths::state_directory_metadata_is_unsafe(&metadata) {
+        Err(AccessErrorKind::InvalidData)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn resolve_state_placement(binding: &RootBinding) -> StatePlacement {
+    let user_local_directory = crate::paths::resolve_user_local_project_state_base()
+        .ok()
+        .map(|base| base.join("projects").join(&binding.root_id.0));
+    resolve_state_placement_with(binding, user_local_directory, |directory| {
+        std::fs::create_dir_all(directory).map_err(|error| access_error_kind(error.kind()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| access_error_kind(error.kind()))?;
+        }
+        Ok(())
+    })
+}
+
 /// Validate a workspace-root candidate through the SAME guard chain used by
 /// `SYMFORGE_WORKSPACE_ROOT` and CWD discovery: it must be an existing directory
 /// that passes [`is_forbidden_root`]. Returns `Some(path)` only when both hold;
@@ -711,27 +1766,29 @@ pub fn parse_root_uri(uri: &str) -> Option<PathBuf> {
 /// Resolve the workspace root from the three resolution sources in strict
 /// precedence order, independent of process global state so it is unit-testable:
 ///
-/// 1. `env_root` — the validated [`WORKSPACE_ROOT_ENV`] override (explicit operator intent).
+/// 1. `env_root` — the [`WORKSPACE_ROOT_ENV`] override (explicit operator intent).
 /// 2. `root_uris` — MCP client-declared roots, in client order (the open workspace folder).
 /// 3. `cwd_root` — the launch-CWD walk result from [`find_project_root`] (last resort).
 ///
-/// Each MCP root URI is parsed via [`parse_root_uri`] and validated through the
-/// SAME [`validate_workspace_candidate`] guard as the env override, so a client
-/// cannot push a forbidden root (home dir, drive root, system path) past the
-/// trust boundary. The first source that yields a usable directory wins; a
-/// forbidden or unparseable client root is skipped, not fatal.
+/// Every candidate is validated through the SAME
+/// [`validate_workspace_candidate`] guard, so no automatic source can push a
+/// forbidden root (home dir, drive root, system path) past the trust boundary.
+/// The first source that yields a usable directory wins; a forbidden or
+/// unparseable candidate is skipped, not fatal.
 ///
 /// `env_root` and `cwd_root` are passed pre-resolved (the caller owns reading
-/// `WORKSPACE_ROOT_ENV` and walking the CWD) so this function performs no I/O
-/// beyond validating the candidate directories, keeping the precedence logic
-/// pure and testable with a temp-dir fixture.
+/// `WORKSPACE_ROOT_ENV` and walking the CWD). This function still validates
+/// them at the final binding boundary, keeping the precedence logic testable
+/// with a temp-dir fixture without trusting caller provenance.
 pub fn resolve_workspace_root(
     env_root: Option<PathBuf>,
     root_uris: &[String],
     cwd_root: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    // 1. Explicit env override wins outright (already validated by its caller).
-    if let Some(root) = env_root {
+    // 1. Explicit env override wins when it passes the shared binding guard.
+    if let Some(candidate) = env_root
+        && let Some(root) = validate_workspace_candidate(&candidate, "workspace environment root")
+    {
         return Some(root);
     }
 
@@ -745,8 +1802,8 @@ pub fn resolve_workspace_root(
         }
     }
 
-    // 3. Launch-CWD walk (already validated by find_project_root).
-    cwd_root
+    // 3. Launch-CWD walk, revalidated at the final binding boundary.
+    cwd_root.and_then(|candidate| validate_workspace_candidate(&candidate, "launch CWD root"))
 }
 
 /// Returns `true` if `path` is a directory that should never be auto-indexed
@@ -1025,6 +2082,46 @@ use crate::domain::index::{
     AdmissionDecision, AdmissionTier, HARD_SKIP_BYTES, METADATA_ONLY_BYTES, SkipReason,
 };
 
+/// Shared PATH+SIZE admission tiers (Feature 020 L-R10/L-G04 parity).
+///
+/// Returns the `MetadataOnlyReason` a `(path, size)` pair earns from the
+/// dependency-lockfile basename, denylisted-extension, and language-aware oversize
+/// thresholds — the exact tiers `classify_admission` applies on disk — or `None`
+/// when the pair clears them all. Content-dependent tiers (binary sniff, secret
+/// scan, LFS pointer) are NOT decided here; the caller runs those on bytes.
+///
+/// Both the filesystem scout (`classify_admission`) and the local-ref-blob scout
+/// (`classify_ref_blob` in `live_index::local_ref_scout`) route through THIS one
+/// function, so an identical `(path, size)` withholds identically regardless of
+/// origin — one home, no copy to drift (the L-R10/L-G04 root cause of finding D1).
+pub fn path_admission_reason(path: &Path, size: u64) -> Option<MetadataOnlyReason> {
+    use crate::domain::index::{
+        METADATA_ONLY_CODE_BYTES, is_denylisted_extension, is_dependency_lockfile,
+    };
+
+    // Dependency lockfiles (exact basename) before the size tier, so a >1 MiB
+    // lockfile still reports `Lockfile` rather than `OversizedData`.
+    if is_dependency_lockfile(path) {
+        return Some(MetadataOnlyReason::Lockfile);
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && is_denylisted_extension(ext)
+    {
+        return Some(MetadataOnlyReason::GeneratedOrVendor);
+    }
+    // Code languages get the larger 4 MiB threshold; data/markup keep 1 MiB.
+    let size_threshold = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::domain::LanguageId::from_extension)
+        .filter(crate::domain::LanguageId::is_code_language)
+        .map_or(METADATA_ONLY_BYTES, |_| METADATA_ONLY_CODE_BYTES);
+    if size > size_threshold {
+        return Some(MetadataOnlyReason::OversizedData);
+    }
+    None
+}
+
 /// Classify a file's admission tier. Returns AdmissionDecision with both tier and reason.
 ///
 /// Precedence (first match wins):
@@ -1034,49 +2131,29 @@ use crate::domain::index::{
 /// 4. Metadata-only size threshold (1MB data / 4MB code) → Tier 2
 /// 5. Binary sniff (null bytes in first 8KB) → Tier 2
 /// 6. All else → Tier 1
+///
+/// Tiers 2–4 (the PATH+SIZE decision) live in `path_admission_reason`, shared
+/// with the local-ref-blob scout so both origins withhold identically (L-R10/
+/// L-G04, finding D1).
 pub fn classify_admission(
     path: &std::path::Path,
     file_size: u64,
     content_sample: Option<&[u8]>,
 ) -> AdmissionDecision {
-    use crate::domain::index::{is_denylisted_extension, is_dependency_lockfile};
-
     if file_size > HARD_SKIP_BYTES {
         return AdmissionDecision::skip(AdmissionTier::HardSkip, SkipReason::SizeCeiling);
     }
-    // Dependency lockfiles are machine-generated manifests: their resolved
-    // dependency trees parse into thousands of meaningless key/value symbols that
-    // pollute symbol counts and `conventions` complexity stats. Demote to Tier-2
-    // metadata-only (path stays searchable; no symbol extraction). Checked before
-    // the size threshold so a >1MB lockfile still reports `lockfile`, not `>1MB`.
-    if is_dependency_lockfile(path) {
-        return AdmissionDecision::skip(
-            AdmissionTier::MetadataOnly,
-            SkipReason::DependencyLockfile,
-        );
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && is_denylisted_extension(ext)
-    {
-        return AdmissionDecision::skip(
-            AdmissionTier::MetadataOnly,
-            SkipReason::DenylistedExtension,
-        );
-    }
-    // Language-aware threshold (dogfood #1/#7, 2026-07-06): code languages get
-    // METADATA_ONLY_CODE_BYTES (4MB) before demotion — >1MB first-party source
-    // is load-bearing in real repos and tree-sitter parses it in milliseconds.
-    // Data/markup formats keep the 1MB threshold (symbol-pollution guard).
-    let size_threshold = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(crate::domain::LanguageId::from_extension)
-        .filter(crate::domain::LanguageId::is_code_language)
-        .map_or(METADATA_ONLY_BYTES, |_| {
-            crate::domain::index::METADATA_ONLY_CODE_BYTES
-        });
-    if file_size > size_threshold {
-        return AdmissionDecision::skip(AdmissionTier::MetadataOnly, SkipReason::SizeThreshold);
+    // Shared PATH+SIZE tiers (lockfile / denylisted extension / oversize). One
+    // home, so the filesystem scout and the ref-blob scout cannot drift.
+    if let Some(reason) = path_admission_reason(path, file_size) {
+        let skip = match reason {
+            MetadataOnlyReason::Lockfile => SkipReason::DependencyLockfile,
+            MetadataOnlyReason::OversizedData => SkipReason::SizeThreshold,
+            // `path_admission_reason` returns only Lockfile / OversizedData /
+            // GeneratedOrVendor; the denylisted extension is the sole remainder.
+            _ => SkipReason::DenylistedExtension,
+        };
+        return AdmissionDecision::skip(AdmissionTier::MetadataOnly, skip);
     }
     if let Some(content) = content_sample
         && is_binary_content(content)
@@ -1382,8 +2459,15 @@ mod tests {
         create_file(tmp.path(), "ignored.rs", "fn ignored() {}");
 
         let files = discover_files(tmp.path()).unwrap();
-        assert_eq!(files.len(), 1, "ignored.rs should be excluded");
-        assert_eq!(files[0].relative_path, "main.rs");
+        let paths: Vec<&str> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![".gitignore", "main.rs"],
+            "generic text admission must retain .gitignore while its rule excludes ignored.rs"
+        );
     }
 
     #[test]
@@ -1625,59 +2709,118 @@ mod tests {
         }
     }
 
-    // ── SF-025: hidden-path scan-policy predicate ──
-    //
-    // The bulk walk skips hidden dotfiles/dotdirs; the single-file (re)index path
-    // must mirror that so index membership is deterministic from scan policy.
+    // ── Feature 020: repository-owned hidden knowledge vs hard scope ──
     mod hidden_path {
         use super::*;
 
         #[test]
-        fn detects_hidden_directory_component() {
-            assert!(path_has_hidden_component(".github/workflows/ci.yml"));
-            assert!(path_has_hidden_component(
-                "deps/hiredis/.github/release.yml"
-            ));
-            assert!(path_has_hidden_component(".travis.yml"));
-            assert!(path_has_hidden_component("a/b/.hidden"));
+        fn detects_only_vcs_and_runtime_state_components() {
+            assert!(path_is_hard_scope_excluded(Path::new(
+                ".symforge/index.bin"
+            )));
+            assert!(path_is_hard_scope_excluded(Path::new(
+                "nested/.symforge/tee/edit.rs"
+            )));
+            assert!(path_is_hard_scope_excluded(Path::new(".git/objects/pack")));
+            assert!(path_is_hard_scope_excluded(Path::new(
+                "nested/.SYmFoRgE/state.rs"
+            )));
         }
 
         #[test]
-        fn allows_visible_paths_and_traversal_segments() {
-            assert!(!path_has_hidden_component("src/main.rs"));
-            assert!(!path_has_hidden_component("README.md"));
-            // `.`/`..` traversal segments are not "hidden" file names.
-            assert!(!path_has_hidden_component("./src/main.rs"));
-            assert!(!path_has_hidden_component("../sibling/main.rs"));
-            // A dot inside a name (not a leading-dot component) is visible.
-            assert!(!path_has_hidden_component("src/a.b.c/main.rs"));
+        fn allows_repository_owned_hidden_knowledge_and_traversal_segments() {
+            assert!(!path_is_hard_scope_excluded(Path::new(
+                ".github/workflows/ci.yml"
+            )));
+            assert!(!path_is_hard_scope_excluded(Path::new(".codex/AGENTS.md")));
+            assert!(!path_is_hard_scope_excluded(Path::new(".travis.yml")));
+            assert!(!path_is_hard_scope_excluded(Path::new("src/main.rs")));
+            assert!(!path_is_hard_scope_excluded(Path::new(
+                "../sibling/main.rs"
+            )));
+            assert!(!path_is_hard_scope_excluded(Path::new("src/a.b.c/main.rs")));
         }
 
         #[test]
-        fn discover_all_files_skips_hidden_supported_extension_files() {
+        fn discover_all_files_includes_hidden_knowledge_but_excludes_runtime_internals() {
             let tmp = TempDir::new().unwrap();
-            // A hidden dir with a SUPPORTED extension inside — the exact SF-025
-            // shape (e.g. `.github/workflows/ci.yml`).
             create_file(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
             create_file(tmp.path(), ".travis.yml", "language: rust\n");
-            // Visible source must still be discovered.
+            create_file(tmp.path(), ".symforge/tee/snapshot.rs", "fn state() {}\n");
+            create_file(tmp.path(), ".git/objects/fake.rs", "fn git_state() {}\n");
             create_file(tmp.path(), "src/main.rs", "fn main() {}");
 
             let entries = discover_all_files(tmp.path()).unwrap();
             let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
 
             assert!(
-                !paths.contains(&".github/workflows/ci.yml"),
-                "hidden-dir file must not be discovered by the bulk walk: {paths:?}"
+                paths.contains(&".github/workflows/ci.yml"),
+                "repository-owned hidden knowledge must be discovered: {paths:?}"
             );
             assert!(
-                !paths.contains(&".travis.yml"),
-                "hidden dotfile must not be discovered by the bulk walk: {paths:?}"
+                paths.contains(&".travis.yml"),
+                "repository-owned hidden files must be discovered: {paths:?}"
+            );
+            assert!(paths.contains(&"src/main.rs"));
+            assert!(
+                !paths.contains(&".symforge/tee/snapshot.rs")
+                    && !paths.contains(&".git/objects/fake.rs"),
+                "VCS/runtime internals must be pruned independently: {paths:?}"
+            );
+        }
+
+        #[test]
+        fn symforge_is_hard_excluded_under_every_state_placement() {
+            let tmp = TempDir::new().unwrap();
+            create_file(
+                tmp.path(),
+                ".gitignore",
+                "!/.symforge/\n!/.symforge/**\n!/.git/\n!/.git/**\n",
+            );
+            create_file(tmp.path(), ".github/workflows/ci.yml", "name: ci\n");
+            create_file(tmp.path(), ".codex/AGENTS.md", "# instructions\n");
+            create_file(tmp.path(), "src/main.rs", "fn main() {}\n");
+
+            // Stale/on-source artifacts representing each placement outcome must
+            // remain outside source scope independently of ignore configuration.
+            create_file(
+                tmp.path(),
+                ".symforge/project-local/index.rs",
+                "fn project_state() {}\n",
+            );
+            create_file(
+                tmp.path(),
+                ".symforge/user-local/projects/project-v1/state.rs",
+                "fn user_state() {}\n",
+            );
+            create_file(
+                tmp.path(),
+                "nested/.symforge/memory-only/stale.rs",
+                "fn stale_state() {}\n",
+            );
+            create_file(tmp.path(), ".git/objects/fake.rs", "fn vcs_internal() {}\n");
+
+            let plan = scout_repository(tmp.path()).expect("scout repository");
+            let paths: Vec<&str> = plan
+                .entries
+                .iter()
+                .filter_map(|entry| entry.path.normalized_utf8.as_deref())
+                .collect();
+
+            assert!(
+                paths.contains(&".github/workflows/ci.yml") && paths.contains(&".codex/AGENTS.md"),
+                "repository-owned hidden knowledge is the control proving this is a hard runtime-state exclusion, not a blanket hidden-path skip: {paths:?}"
             );
             assert!(
-                paths.contains(&"src/main.rs"),
-                "visible source must be discovered: {paths:?}"
+                paths.iter().all(|path| {
+                    !path.split('/').any(|component| {
+                        component.eq_ignore_ascii_case(".symforge")
+                            || component.eq_ignore_ascii_case(".git")
+                    })
+                }),
+                "VCS/runtime internals must stay outside the manifest for every placement: {paths:?}"
             );
+            assert!(paths.contains(&"src/main.rs"));
         }
     }
 
@@ -2318,19 +3461,24 @@ mod tests {
         // env vars are process-global, so two tests setting them concurrently
         // would interfere.
         static ENV_LOCK: Mutex<()> = Mutex::new(());
-
         struct LimitEnvGuard {
             files_prev: Option<OsString>,
             bytes_prev: Option<OsString>,
+            catalog_metadata_bytes_prev: Option<OsString>,
         }
 
         #[allow(unsafe_code)] // test-only env guard; mutation is serialized by ENV_LOCK.
         impl LimitEnvGuard {
             /// Set both limit env vars (any `None` clears that var) and capture
             /// the prior values for restoration on drop.
-            fn set(max_files: Option<&str>, max_bytes: Option<&str>) -> Self {
+            fn set(
+                max_files: Option<&str>,
+                max_bytes: Option<&str>,
+                max_catalog_metadata_bytes: Option<&str>,
+            ) -> Self {
                 let files_prev = std::env::var_os(MAX_INDEX_FILES_ENV);
                 let bytes_prev = std::env::var_os(MAX_INDEX_BYTES_ENV);
+                let catalog_metadata_bytes_prev = std::env::var_os(MAX_CATALOG_METADATA_BYTES_ENV);
                 // SAFETY: env mutation is serialized by ENV_LOCK held by the caller;
                 // no concurrent env readers in this single-threaded test section.
                 unsafe {
@@ -2342,10 +3490,15 @@ mod tests {
                         Some(v) => std::env::set_var(MAX_INDEX_BYTES_ENV, v),
                         None => std::env::remove_var(MAX_INDEX_BYTES_ENV),
                     }
+                    match max_catalog_metadata_bytes {
+                        Some(v) => std::env::set_var(MAX_CATALOG_METADATA_BYTES_ENV, v),
+                        None => std::env::remove_var(MAX_CATALOG_METADATA_BYTES_ENV),
+                    }
                 }
                 Self {
                     files_prev,
                     bytes_prev,
+                    catalog_metadata_bytes_prev,
                 }
             }
         }
@@ -2363,6 +3516,10 @@ mod tests {
                         Some(v) => std::env::set_var(MAX_INDEX_BYTES_ENV, v),
                         None => std::env::remove_var(MAX_INDEX_BYTES_ENV),
                     }
+                    match &self.catalog_metadata_bytes_prev {
+                        Some(v) => std::env::set_var(MAX_CATALOG_METADATA_BYTES_ENV, v),
+                        None => std::env::remove_var(MAX_CATALOG_METADATA_BYTES_ENV),
+                    }
                 }
             }
         }
@@ -2372,6 +3529,10 @@ mod tests {
             let limits = DiscoveryLimits::default();
             assert_eq!(limits.max_files, DEFAULT_MAX_INDEX_FILES);
             assert_eq!(limits.max_bytes, DEFAULT_MAX_INDEX_BYTES);
+            assert_eq!(
+                limits.max_catalog_metadata_bytes,
+                DEFAULT_MAX_CATALOG_METADATA_BYTES
+            );
             // 200k files is comfortably above a very large real monorepo.
             assert!(limits.max_files >= 200_000);
         }
@@ -2379,23 +3540,29 @@ mod tests {
         #[test]
         fn parse_positive_env_rejects_zero_empty_and_garbage() {
             let _lock = ENV_LOCK.lock().unwrap();
-            let _guard = LimitEnvGuard::set(Some("0"), Some("not-a-number"));
+            let _guard = LimitEnvGuard::set(Some("0"), Some("not-a-number"), Some("0"));
             // Zero and non-numeric overrides are ignored, so the defaults stand —
             // a typo can never silently disable indexing.
             assert_eq!(parse_positive_env(MAX_INDEX_FILES_ENV), None);
             assert_eq!(parse_positive_env(MAX_INDEX_BYTES_ENV), None);
+            assert_eq!(parse_positive_env(MAX_CATALOG_METADATA_BYTES_ENV), None);
             let limits = DiscoveryLimits::from_env();
             assert_eq!(limits.max_files, DEFAULT_MAX_INDEX_FILES);
             assert_eq!(limits.max_bytes, DEFAULT_MAX_INDEX_BYTES);
+            assert_eq!(
+                limits.max_catalog_metadata_bytes,
+                DEFAULT_MAX_CATALOG_METADATA_BYTES
+            );
         }
 
         #[test]
         fn from_env_honors_valid_override() {
             let _lock = ENV_LOCK.lock().unwrap();
-            let _guard = LimitEnvGuard::set(Some("5"), Some("4096"));
+            let _guard = LimitEnvGuard::set(Some("5"), Some("4096"), Some("8192"));
             let limits = DiscoveryLimits::from_env();
             assert_eq!(limits.max_files, 5);
             assert_eq!(limits.max_bytes, 4096);
+            assert_eq!(limits.max_catalog_metadata_bytes, 8192);
         }
 
         #[test]
@@ -2403,7 +3570,7 @@ mod tests {
             // No env override: the generous default cap must not interfere with a
             // small, ordinary project.
             let _lock = ENV_LOCK.lock().unwrap();
-            let _guard = LimitEnvGuard::set(None, None);
+            let _guard = LimitEnvGuard::set(None, None, None);
             let tmp = TempDir::new().unwrap();
             create_file(tmp.path(), "main.rs", "fn main() {}");
             create_file(tmp.path(), "lib.rs", "pub fn f() {}");
@@ -2420,7 +3587,7 @@ mod tests {
         fn over_file_cap_yields_graceful_error_not_panic() {
             let _lock = ENV_LOCK.lock().unwrap();
             // Cap at 2 files; create 5 source files to exceed it.
-            let _guard = LimitEnvGuard::set(Some("2"), None);
+            let _guard = LimitEnvGuard::set(Some("2"), None, None);
             let tmp = TempDir::new().unwrap();
             for i in 0..5 {
                 create_file(tmp.path(), &format!("f{i}.rs"), "fn x() {}");
@@ -2447,7 +3614,7 @@ mod tests {
             // Very high file cap, tiny byte cap (8 bytes). A single non-empty file
             // exceeds the byte ceiling, exercising the cumulative-bytes path that
             // only `discover_all_files` enforces.
-            let _guard = LimitEnvGuard::set(Some("1000000"), Some("8"));
+            let _guard = LimitEnvGuard::set(Some("1000000"), Some("8"), None);
             let tmp = TempDir::new().unwrap();
             create_file(
                 tmp.path(),
@@ -2468,6 +3635,133 @@ mod tests {
         }
 
         #[test]
+        fn scout_sparse_hard_skip_does_not_consume_ingest_budget() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _guard = LimitEnvGuard::set(Some("1000000"), Some("1024"), None);
+            let tmp = TempDir::new().unwrap();
+
+            let sparse = tmp.path().join("huge.log");
+            std::fs::File::create(&sparse)
+                .unwrap()
+                .set_len(HARD_SKIP_BYTES + 1)
+                .unwrap();
+            create_file(tmp.path(), "main.rs", "fn main() {}");
+
+            let entries = discover_all_files(tmp.path())
+                .expect("metadata-terminal hard skip must not consume admitted-byte budget");
+            assert_eq!(entries.len(), 2);
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.relative_path == "huge.log")
+            );
+            assert!(entries.iter().any(|entry| entry.relative_path == "main.rs"));
+        }
+
+        #[test]
+        fn catalog_entry_ceiling_never_publishes_false_complete_manifest() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let _guard = LimitEnvGuard::set(Some("1"), Some("1073741824"), None);
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "main.rs", "fn main() {}");
+            create_file(tmp.path(), "model.gguf", "catalog only");
+
+            let error = scout_repository(tmp.path())
+                .expect_err("an over-cap candidate must not return a partial scout plan");
+            assert!(error.to_string().contains("tree too large to index"));
+            assert!(error.to_string().contains(MAX_INDEX_FILES_ENV));
+        }
+
+        #[test]
+        fn catalog_metadata_budget_is_independent_and_never_publishes_partial_manifest() {
+            let _lock = ENV_LOCK.lock().unwrap();
+            let tmp = TempDir::new().unwrap();
+            let artifact = tmp.path().join("model.gguf");
+            std::fs::File::create(&artifact)
+                .unwrap()
+                .set_len(HARD_SKIP_BYTES + 1)
+                .unwrap();
+
+            let exact_usage = {
+                let _guard = LimitEnvGuard::set(Some("10"), Some("1"), Some("1048576"));
+                let plan = scout_repository(tmp.path())
+                    .expect("metadata-terminal payload size must not consume catalog metadata");
+                assert_eq!(plan.usage.catalog_entries, 1);
+                assert_eq!(plan.usage.admitted_content_bytes, 0);
+                assert!(plan.usage.catalog_metadata_bytes > 0);
+                plan.usage.catalog_metadata_bytes
+            };
+
+            {
+                let below_exact = (exact_usage - 1).to_string();
+                let _guard = LimitEnvGuard::set(Some("10"), Some("1"), Some(&below_exact));
+                let error = scout_repository(tmp.path())
+                    .expect_err("metadata over-cap must return no partial scout plan");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("catalog metadata capacity exceeded")
+                );
+                assert!(error.to_string().contains(MAX_CATALOG_METADATA_BYTES_ENV));
+            }
+
+            let exact = exact_usage.to_string();
+            let _guard = LimitEnvGuard::set(Some("10"), Some("1"), Some(&exact));
+            let plan = scout_repository(tmp.path())
+                .expect("the exact canonical metadata byte ceiling must be accepted");
+            assert_eq!(plan.usage.catalog_metadata_bytes, exact_usage);
+            assert_eq!(plan.entries.len(), 1);
+        }
+
+        #[test]
+        fn cold_start_budget_exhaustion_yields_distinct_typed_capacity_reasons() {
+            let _lock = ENV_LOCK.lock().unwrap();
+
+            let entry_limited = TempDir::new().unwrap();
+            create_file(entry_limited.path(), "main.rs", "fn main() {}");
+            create_file(entry_limited.path(), "README.md", "knowledge");
+            let entry_error = {
+                let _guard = LimitEnvGuard::set(Some("1"), Some("1073741824"), None);
+                scout_repository(entry_limited.path())
+                    .expect_err("entry exhaustion must publish no partial cold-start plan")
+            };
+            let entry_reason = entry_error
+                .downcast_ref::<ScoutCapacityError>()
+                .expect("entry exhaustion must remain a typed capacity refusal")
+                .reason();
+
+            let metadata_limited = TempDir::new().unwrap();
+            create_file(metadata_limited.path(), "README.md", "knowledge");
+            let exact_metadata_bytes = {
+                let _guard = LimitEnvGuard::set(Some("10"), Some("1073741824"), None);
+                scout_repository(metadata_limited.path())
+                    .expect("calibration scout must fit")
+                    .usage
+                    .catalog_metadata_bytes
+            };
+            let metadata_error = {
+                let below_exact = (exact_metadata_bytes - 1).to_string();
+                let _guard = LimitEnvGuard::set(Some("10"), Some("1073741824"), Some(&below_exact));
+                scout_repository(metadata_limited.path())
+                    .expect_err("metadata exhaustion must publish no partial cold-start plan")
+            };
+            let metadata_reason = metadata_error
+                .downcast_ref::<ScoutCapacityError>()
+                .expect("metadata exhaustion must remain a typed capacity refusal")
+                .reason();
+
+            assert_eq!(
+                entry_reason,
+                crate::domain::FreshnessReason::CatalogEntryCapacityExceeded
+            );
+            assert_eq!(
+                metadata_reason,
+                crate::domain::FreshnessReason::CatalogMetadataCapacityExceeded
+            );
+            assert_ne!(entry_reason, metadata_reason);
+        }
+
+        #[test]
         fn raised_cap_lets_a_previously_over_cap_tree_index() {
             let _lock = ENV_LOCK.lock().unwrap();
             let tmp = TempDir::new().unwrap();
@@ -2476,15 +3770,512 @@ mod tests {
             }
             // Low cap: refused.
             {
-                let _guard = LimitEnvGuard::set(Some("2"), None);
+                let _guard = LimitEnvGuard::set(Some("2"), None, None);
                 assert!(discover_files(tmp.path()).is_err());
             }
             // Raised cap: accepted — the limit is genuinely configurable.
             {
-                let _guard = LimitEnvGuard::set(Some("100"), None);
+                let _guard = LimitEnvGuard::set(Some("100"), None, None);
                 let files = discover_files(tmp.path()).expect("raised cap indexes the tree");
                 assert_eq!(files.len(), 4);
             }
+        }
+    }
+
+    mod metadata_first_scout {
+        use super::*;
+        use crate::domain::{AccessErrorKind, CoverageStatus, ScoutIssueKind};
+        use std::ffi::OsString;
+        use std::io;
+
+        #[cfg(unix)]
+        fn opaque_relative_path(marker: u16) -> PathBuf {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = if marker & 1 == 0 { 0xff } else { 0xfe };
+            PathBuf::from(OsString::from_vec(vec![
+                b'o', b'p', b'a', b'q', b'u', b'e', invalid, b'.', b'r', b's',
+            ]))
+        }
+
+        #[cfg(windows)]
+        fn opaque_relative_path(marker: u16) -> PathBuf {
+            use std::os::windows::ffi::OsStringExt;
+
+            PathBuf::from(OsString::from_wide(&[
+                b'o' as u16,
+                b'p' as u16,
+                b'a' as u16,
+                b'q' as u16,
+                b'u' as u16,
+                b'e' as u16,
+                marker,
+                b'.' as u16,
+                b'r' as u16,
+                b's' as u16,
+            ]))
+        }
+
+        #[test]
+        fn scout_metadata_failure_retains_unavailable_entry_with_walk_stamp() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "main.rs", "fn main() {}");
+            let expected_size = std::fs::metadata(tmp.path().join("main.rs")).unwrap().len();
+
+            let plan = scout_repository_with_metadata(tmp.path(), |_path| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected metadata failure",
+                ))
+            })
+            .expect("per-entry metadata failure must degrade the plan, not abort it");
+
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(
+                plan.entries[0].path.normalized_utf8.as_deref(),
+                Some("main.rs")
+            );
+            assert_eq!(plan.entries[0].stamp.size, expected_size);
+            assert!(matches!(
+                plan.entries[0].decision,
+                ScoutDecision::Unavailable {
+                    stage: crate::domain::AccessStage::Metadata,
+                    kind: AccessErrorKind::PermissionDenied
+                }
+            ));
+            assert_eq!(plan.coverage, CoverageStatus::Degraded);
+            assert_eq!(plan.issues.len(), 1);
+            assert_eq!(plan.issues[0].safe_path.as_deref(), Some("main.rs"));
+            assert!(matches!(
+                plan.issues[0].kind,
+                ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: AccessErrorKind::PermissionDenied
+                }
+            ));
+        }
+
+        #[test]
+        fn walk_failure_retains_bounded_path_issue() {
+            let tmp = TempDir::new().unwrap();
+            let failed_path = tmp.path().join("blocked").join("child.rs");
+            let issue = walk_issue_for_error(
+                tmp.path(),
+                Some(&failed_path),
+                io::ErrorKind::PermissionDenied,
+            );
+
+            let plan = scout_entries_with_io(
+                Vec::new(),
+                |_path| -> io::Result<std::fs::Metadata> { unreachable!("no discovered entries") },
+                |_path, _limit| -> io::Result<Vec<u8>> { unreachable!("no discovered entries") },
+                vec![issue],
+            )
+            .expect("walk issue must remain a bounded degraded scout result");
+
+            assert_eq!(plan.coverage, CoverageStatus::Degraded);
+            assert!(plan.entries.is_empty());
+            assert_eq!(plan.issues.len(), 1);
+            assert_eq!(
+                plan.issues[0].safe_path.as_deref(),
+                Some("blocked/child.rs")
+            );
+            assert!(plan.issues[0].path_id.is_some());
+            assert!(matches!(
+                plan.issues[0].kind,
+                ScoutIssueKind::DirectoryEntryUnreadable {
+                    kind: AccessErrorKind::PermissionDenied
+                }
+            ));
+        }
+
+        #[test]
+        fn scout_manifest_is_total_and_deterministically_sorted() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "zeta.rs", "pub fn zeta() {}");
+            create_file(tmp.path(), "README.md", "# Read me");
+            create_file(tmp.path(), "model.gguf", "catalog only");
+
+            let first = scout_repository(tmp.path()).expect("first scout must succeed");
+            let second = scout_repository(tmp.path()).expect("second scout must succeed");
+
+            assert_eq!(first.coverage, CoverageStatus::Complete);
+            assert!(first.issues.is_empty());
+            assert_eq!(first.usage.catalog_entries, 3);
+            assert_eq!(first.entries, second.entries);
+
+            let paths = first
+                .entries
+                .iter()
+                .map(|entry| entry.path.normalized_utf8.as_deref().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, ["model.gguf", "README.md", "zeta.rs"]);
+
+            assert!(matches!(
+                first.entries[0].decision,
+                ScoutDecision::MetadataOnly { .. }
+            ));
+            assert!(matches!(
+                first.entries[1].decision,
+                ScoutDecision::Ingest {
+                    targets: IndexTargets::Knowledge
+                }
+            ));
+            assert!(matches!(
+                first.entries[2].decision,
+                ScoutDecision::Ingest {
+                    targets: IndexTargets::Code
+                }
+            ));
+        }
+
+        #[test]
+        fn scout_uses_authoritative_target_routing_and_text_classification() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "guide.rst", "Guide\n=====\n");
+            create_file(tmp.path(), "settings.toml", "enabled = true\n");
+            create_file(tmp.path(), "page.html", "<main>hello</main>\n");
+
+            let plan = scout_repository(tmp.path()).expect("scout must succeed");
+            let entry = |path: &str| {
+                plan.entries
+                    .iter()
+                    .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+                    .unwrap_or_else(|| panic!("missing routed entry {path}"))
+            };
+
+            assert!(matches!(
+                entry("guide.rst").decision,
+                ScoutDecision::Ingest {
+                    targets: IndexTargets::Knowledge
+                }
+            ));
+            assert!(entry("guide.rst").classification.is_text());
+
+            assert!(matches!(
+                entry("settings.toml").decision,
+                ScoutDecision::Ingest {
+                    targets: IndexTargets::CodeAndKnowledge
+                }
+            ));
+            assert!(entry("settings.toml").classification.is_code());
+            assert!(entry("settings.toml").classification.is_config);
+
+            assert!(matches!(
+                entry("page.html").decision,
+                ScoutDecision::Ingest {
+                    targets: IndexTargets::Code
+                }
+            ));
+        }
+
+        #[test]
+        fn sensitive_path_is_terminal_before_any_content_probe() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), ".env", "placeholder=true\n");
+
+            let mut probed = Vec::new();
+            let plan = scout_repository_with_io(
+                tmp.path(),
+                |path| std::fs::metadata(path),
+                |path, _max_bytes| {
+                    probed.push(path.to_path_buf());
+                    Ok(Vec::new())
+                },
+            )
+            .expect("sensitive paths must remain catalog-visible");
+
+            let entry = plan
+                .entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some(".env"))
+                .expect("sensitive path must remain in the scout catalog");
+            assert!(matches!(
+                &entry.decision,
+                ScoutDecision::MetadataOnly {
+                    reason: MetadataOnlyReason::SensitivePath { rule_id }
+                } if rule_id == "path.environment-credentials"
+            ));
+            assert!(probed.is_empty(), "path policy must run before content I/O");
+        }
+
+        #[test]
+        fn scout_binary_probe_never_exceeds_binary_sniff_bytes() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "notes.txt", "plain text");
+            create_file(tmp.path(), "model.gguf", "catalog only");
+            std::fs::File::create(tmp.path().join("huge.log"))
+                .unwrap()
+                .set_len(HARD_SKIP_BYTES + 1)
+                .unwrap();
+
+            let mut probes = Vec::new();
+            let plan = scout_repository_with_io(
+                tmp.path(),
+                |path| std::fs::metadata(path),
+                |path, max_bytes| {
+                    probes.push((
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                        max_bytes,
+                    ));
+                    Ok(Vec::new())
+                },
+            )
+            .expect("bounded probing must produce a scout plan");
+
+            assert_eq!(plan.entries.len(), 3);
+            assert_eq!(
+                probes,
+                vec![(
+                    "notes.txt".to_string(),
+                    crate::domain::index::BINARY_SNIFF_BYTES
+                )],
+                "only undecided candidates may be probed, through the exact hard bound"
+            );
+        }
+
+        #[test]
+        fn scout_case_fold_pair_is_total_and_failure_is_per_entry() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "lower.rs", "pub fn lower() {}");
+            create_file(tmp.path(), "upper.rs", "pub fn upper() {}");
+
+            let lower_path = tmp.path().join("lower.rs");
+            let candidates = vec![
+                DiscoveredEntry {
+                    relative_path: "a.rs".to_string(),
+                    relative_os_path: PathBuf::from("a.rs"),
+                    absolute_path: lower_path.clone(),
+                    file_size: 0,
+                    language: Some(LanguageId::Rust),
+                    classification: FileClassification::for_code_path("a.rs"),
+                },
+                DiscoveredEntry {
+                    relative_path: "A.rs".to_string(),
+                    relative_os_path: PathBuf::from("A.rs"),
+                    absolute_path: tmp.path().join("upper.rs"),
+                    file_size: 0,
+                    language: Some(LanguageId::Rust),
+                    classification: FileClassification::for_code_path("A.rs"),
+                },
+            ];
+
+            let complete = scout_entries_with_io(
+                candidates.clone(),
+                |path| std::fs::metadata(path),
+                |_path, _max_bytes| Ok(Vec::new()),
+                Vec::new(),
+            )
+            .expect("case-fold pair must remain scoutable");
+            let ordered_paths = complete
+                .entries
+                .iter()
+                .map(|entry| entry.path.normalized_utf8.as_deref().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ordered_paths, ["A.rs", "a.rs"]);
+            assert_ne!(
+                complete.entries[0].path.public_id,
+                complete.entries[1].path.public_id
+            );
+            assert_eq!(complete.coverage, CoverageStatus::Degraded);
+            assert_eq!(complete.issues.len(), 2);
+            assert!(
+                complete
+                    .issues
+                    .iter()
+                    .all(|issue| issue.kind == ScoutIssueKind::PathIdentityCollision)
+            );
+            assert_eq!(
+                complete
+                    .issues
+                    .iter()
+                    .filter_map(|issue| issue.safe_path.as_deref())
+                    .collect::<Vec<_>>(),
+                ["A.rs", "a.rs"]
+            );
+
+            let degraded = scout_entries_with_io(
+                candidates,
+                |path| {
+                    if path == lower_path {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "injected per-entry failure",
+                        ))
+                    } else {
+                        std::fs::metadata(path)
+                    }
+                },
+                |_path, _max_bytes| Ok(Vec::new()),
+                Vec::new(),
+            )
+            .expect("one failed case-fold peer must not abort the other");
+
+            assert_eq!(degraded.coverage, CoverageStatus::Degraded);
+            assert_eq!(degraded.entries.len(), 2);
+            let unavailable = degraded
+                .entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some("a.rs"))
+                .expect("metadata failure must retain the failed peer");
+            assert!(matches!(
+                unavailable.decision,
+                ScoutDecision::Unavailable {
+                    stage: crate::domain::AccessStage::Metadata,
+                    kind: crate::domain::AccessErrorKind::PermissionDenied,
+                }
+            ));
+            assert_ne!(
+                degraded.entries[0].path.public_id,
+                degraded.entries[1].path.public_id
+            );
+            assert_eq!(
+                degraded
+                    .issues
+                    .iter()
+                    .filter(|issue| matches!(
+                        issue.kind,
+                        ScoutIssueKind::DirectoryEntryUnreadable { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                degraded
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.kind == ScoutIssueKind::PathIdentityCollision)
+                    .count(),
+                2
+            );
+        }
+
+        #[test]
+        fn non_utf8_path_is_opaque_catalog_only_without_lossy_collision() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "first.rs", "pub fn first() {}");
+            create_file(tmp.path(), "second.rs", "pub fn second() {}");
+
+            let first_opaque = opaque_relative_path(0xd800);
+            let second_opaque = opaque_relative_path(0xd801);
+            assert_eq!(
+                first_opaque.to_string_lossy(),
+                second_opaque.to_string_lossy(),
+                "fixture must prove two native identities collide under lossy conversion"
+            );
+
+            let candidates = vec![
+                DiscoveredEntry {
+                    relative_path: first_opaque.to_string_lossy().into_owned(),
+                    relative_os_path: first_opaque,
+                    absolute_path: tmp.path().join("first.rs"),
+                    file_size: 0,
+                    language: Some(LanguageId::Rust),
+                    classification: FileClassification::for_code_path("first.rs"),
+                },
+                DiscoveredEntry {
+                    relative_path: second_opaque.to_string_lossy().into_owned(),
+                    relative_os_path: second_opaque,
+                    absolute_path: tmp.path().join("second.rs"),
+                    file_size: 0,
+                    language: Some(LanguageId::Rust),
+                    classification: FileClassification::for_code_path("second.rs"),
+                },
+            ];
+
+            let mut probe_count = 0usize;
+            let plan = scout_entries_with_io(
+                candidates,
+                |path| std::fs::metadata(path),
+                |_path, _max_bytes| {
+                    probe_count += 1;
+                    Ok(Vec::new())
+                },
+                Vec::new(),
+            )
+            .expect("opaque paths must remain catalogable");
+
+            assert_eq!(plan.entries.len(), 2);
+            assert_eq!(probe_count, 0);
+            assert!(
+                plan.entries
+                    .iter()
+                    .all(|entry| entry.path.normalized_utf8.is_none())
+            );
+            assert_ne!(
+                plan.entries[0].path.public_id,
+                plan.entries[1].path.public_id
+            );
+            assert!(plan.entries.iter().all(|entry| matches!(
+                entry.decision,
+                ScoutDecision::MetadataOnly {
+                    reason: MetadataOnlyReason::UnsupportedPathEncoding
+                }
+            )));
+        }
+
+        #[test]
+        fn unsafe_or_oversized_path_is_opaque_without_retaining_spelling() {
+            let tmp = TempDir::new().unwrap();
+            create_file(tmp.path(), "payload.md", "# safe payload");
+            let absolute_path = tmp.path().join("payload.md");
+            let oversized = "x".repeat(MAX_CATALOG_SAFE_PATH_BYTES + 1);
+            let candidates = vec![
+                DiscoveredEntry {
+                    relative_path: "unsafe".to_string(),
+                    relative_os_path: PathBuf::from("line\nbreak.md"),
+                    absolute_path: absolute_path.clone(),
+                    file_size: 0,
+                    language: None,
+                    classification: FileClassification::for_code_path("payload.md"),
+                },
+                DiscoveredEntry {
+                    relative_path: "oversized".to_string(),
+                    relative_os_path: PathBuf::from(&oversized),
+                    absolute_path,
+                    file_size: 0,
+                    language: None,
+                    classification: FileClassification::for_code_path("payload.md"),
+                },
+            ];
+
+            let mut probe_count = 0usize;
+            let plan = scout_entries_with_io(
+                candidates,
+                |path| std::fs::metadata(path),
+                |_path, _max_bytes| {
+                    probe_count += 1;
+                    Ok(Vec::new())
+                },
+                Vec::new(),
+            )
+            .expect("unsafe path metadata must remain catalogable by opaque ID");
+
+            assert_eq!(probe_count, 0);
+            assert_eq!(plan.entries.len(), 2);
+            assert!(
+                plan.entries
+                    .iter()
+                    .all(|entry| entry.path.normalized_utf8.is_none())
+            );
+            assert_ne!(
+                plan.entries[0].path.public_id,
+                plan.entries[1].path.public_id
+            );
+            assert!(plan.entries.iter().any(|entry| matches!(
+                entry.decision,
+                ScoutDecision::MetadataOnly {
+                    reason: MetadataOnlyReason::UnsupportedPathEncoding
+                }
+            )));
+            assert!(plan.entries.iter().any(|entry| matches!(
+                entry.decision,
+                ScoutDecision::MetadataOnly {
+                    reason: MetadataOnlyReason::PathMetadataTooLarge
+                }
+            )));
+            assert!(plan.entries.iter().all(|entry| {
+                entry.path.normalized_utf8.as_deref() != Some(oversized.as_str())
+            }));
         }
     }
 
@@ -2844,6 +4635,318 @@ mod tests {
                 resolve_workspace_root(None, &roots, None).is_none(),
                 "no env, all-forbidden roots, no CWD -> no workspace (must not widen trust)"
             );
+        }
+
+        #[test]
+        fn automatic_protected_roots_stay_unbound_before_source_or_project_state_io() {
+            let tmp = TempDir::new().unwrap();
+            let protected = tmp.path().join("System32");
+            std::fs::create_dir(&protected).unwrap();
+            let protected_uri = file_uri(&protected);
+
+            assert!(
+                resolve_workspace_root(Some(protected.clone()), &[], None).is_none(),
+                "workspace environment candidates must pass the shared root gate"
+            );
+            assert!(
+                resolve_workspace_root(None, &[protected_uri], None).is_none(),
+                "MCP client candidates must pass the shared root gate"
+            );
+            assert!(
+                resolve_workspace_root(None, &[], Some(protected.clone())).is_none(),
+                "launch-CWD candidates must pass the shared root gate"
+            );
+            assert!(
+                !protected.join(".symforge").exists(),
+                "rejected automatic roots must not receive per-project state"
+            );
+        }
+
+        #[test]
+        fn device_or_uncanonicalizable_root_remains_nonindexable_with_override() {
+            let override_mode = RootRequestMode::ExplicitIndexFolder {
+                allow_protected_root: true,
+            };
+            let device_namespace = if cfg!(windows) {
+                PathBuf::from(r"\\.\NUL")
+            } else {
+                PathBuf::from("/dev/null")
+            };
+
+            let device = resolve_root_candidate(
+                &device_namespace,
+                RootCandidateSource::ExplicitIndexFolder,
+                override_mode,
+            );
+            assert!(
+                matches!(
+                    device,
+                    RootResolution::Unbound {
+                        reason: UnboundReason::Refused(RootRefusalReason::DeviceOrSpecialNamespace),
+                        ..
+                    }
+                ),
+                "explicit protected-root authority must never authorize a device namespace: {device:?}"
+            );
+
+            let ordinary = TempDir::new().unwrap();
+            let uncanonicalizable = resolve_root_candidate_with(
+                ordinary.path(),
+                RootCandidateSource::ExplicitIndexFolder,
+                override_mode,
+                |_| true,
+                |_| Err(std::io::Error::other("injected canonicalization failure")),
+            );
+            assert!(
+                matches!(
+                    uncanonicalizable,
+                    RootResolution::Unbound {
+                        reason: UnboundReason::Refused(RootRefusalReason::CanonicalizationFailed),
+                        ..
+                    }
+                ),
+                "override must not turn an unknown canonical identity into a binding: {uncanonicalizable:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_verbatim_and_simplified_roots_share_project_id() {
+            let root = TempDir::new().unwrap();
+            let verbatim = root.path().canonicalize().unwrap();
+            let simplified = dunce::canonicalize(root.path()).unwrap();
+
+            assert_eq!(
+                project_id_for_canonical_root(&verbatim),
+                project_id_for_canonical_root(&simplified),
+                "equivalent Windows canonical path spellings must select one user-local state identity"
+            );
+        }
+
+        #[test]
+        fn explicit_protected_root_uses_user_local_then_memory_only() {
+            let tmp = TempDir::new().unwrap();
+            let protected = tmp.path().join("System32");
+            std::fs::create_dir(&protected).unwrap();
+            let RootResolution::Bound(binding) = resolve_root_candidate(
+                &protected,
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: true,
+                },
+            ) else {
+                panic!("the modeled protected root should bind with direct authority");
+            };
+            let user_state = tmp.path().join("private-user-state");
+
+            let placement =
+                resolve_state_placement_with(&binding, Some(user_state.clone()), |candidate| {
+                    assert_eq!(candidate, user_state);
+                    std::fs::create_dir_all(candidate)
+                        .map_err(|error| access_error_kind(error.kind()))
+                });
+            match placement {
+                crate::domain::StatePlacement::UserLocal {
+                    directory,
+                    root_id,
+                    reason: crate::domain::UserLocalPlacementReason::ExplicitProtected,
+                } => {
+                    assert_eq!(directory.as_path(), user_state);
+                    assert_eq!(root_id, binding.root_id);
+                }
+                other => panic!("expected user-local placement, got {other:?}"),
+            }
+            assert!(!protected.join(".symforge").exists());
+
+            let placement = resolve_state_placement_with(&binding, Some(user_state), |_| {
+                Err(AccessErrorKind::PermissionDenied)
+            });
+            match placement {
+                crate::domain::StatePlacement::MemoryOnly { failures } => {
+                    assert_eq!(failures.len(), 1);
+                    assert_eq!(
+                        failures[0].location,
+                        crate::domain::StateLocationKind::UserLocal
+                    );
+                    assert_eq!(failures[0].safe_reason, AccessErrorKind::PermissionDenied);
+                }
+                other => panic!("expected memory-only placement, got {other:?}"),
+            }
+            assert!(!protected.join(".symforge").exists());
+        }
+
+        #[test]
+        fn readable_unwritable_project_relocates_state_without_retargeting_source() {
+            let project = TempDir::new().unwrap();
+            std::fs::write(project.path().join("lib.rs"), "pub fn readable() {}\n").unwrap();
+            let RootResolution::Bound(binding) = resolve_root_candidate(
+                project.path(),
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: false,
+                },
+            ) else {
+                panic!("ordinary readable project should bind");
+            };
+            let bound_source = binding.canonical_root.clone();
+            let bound_id = binding.root_id.clone();
+            let project_state = bound_source.join(".symforge");
+            let user_base = TempDir::new().unwrap();
+            let user_state = user_base.path().join("projects").join(&bound_id.0);
+            let mut attempts = Vec::new();
+
+            let placement =
+                resolve_state_placement_with(&binding, Some(user_state.clone()), |candidate| {
+                    attempts.push(candidate.to_path_buf());
+                    if candidate == project_state {
+                        Err(AccessErrorKind::PermissionDenied)
+                    } else {
+                        std::fs::create_dir_all(candidate)
+                            .map_err(|error| access_error_kind(error.kind()))
+                    }
+                });
+
+            assert_eq!(attempts, vec![project_state.clone(), user_state.clone()]);
+            assert_eq!(binding.canonical_root, bound_source);
+            assert_eq!(binding.root_id, bound_id);
+            assert!(std::fs::read_to_string(bound_source.join("lib.rs")).is_ok());
+            assert!(!project_state.exists());
+            match placement {
+                StatePlacement::UserLocal {
+                    directory,
+                    root_id,
+                    reason:
+                        UserLocalPlacementReason::ProjectLocalUnavailable {
+                            safe_reason: AccessErrorKind::PermissionDenied,
+                        },
+                } => {
+                    assert_eq!(directory.as_path(), user_state);
+                    assert_eq!(root_id, binding.root_id);
+                }
+                other => panic!("expected user-local fallback, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn project_symforge_symlink_or_reparse_point_uses_global_without_following() {
+            let project = TempDir::new().unwrap();
+            std::fs::write(project.path().join("lib.rs"), "pub fn readable() {}\n").unwrap();
+            let RootResolution::Bound(binding) = resolve_root_candidate(
+                project.path(),
+                RootCandidateSource::ExplicitIndexFolder,
+                RootRequestMode::ExplicitIndexFolder {
+                    allow_protected_root: false,
+                },
+            ) else {
+                panic!("ordinary readable project should bind");
+            };
+
+            let outside = TempDir::new().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            std::fs::write(&sentinel, b"outside state remains untouched\n").unwrap();
+            let project_state = binding.canonical_root.join(".symforge");
+            #[cfg(unix)]
+            let link_result = std::os::unix::fs::symlink(outside.path(), &project_state);
+            #[cfg(windows)]
+            let link_result = std::os::windows::fs::symlink_dir(outside.path(), &project_state);
+            let linked = if let Err(error) = link_result {
+                #[cfg(windows)]
+                {
+                    assert_eq!(error.raw_os_error(), Some(1314));
+                    std::fs::write(&project_state, b"unsafe state entry\n").unwrap();
+                    false
+                }
+                #[cfg(not(windows))]
+                panic!("test host must support directory symlinks: {error}");
+            } else {
+                true
+            };
+
+            let user_base = TempDir::new().unwrap();
+            let user_state = user_base.path().join("projects").join(&binding.root_id.0);
+            let placement =
+                resolve_state_placement_with(&binding, Some(user_state.clone()), |candidate| {
+                    std::fs::create_dir_all(candidate)
+                        .map_err(|error| access_error_kind(error.kind()))?;
+                    std::fs::write(candidate.join("prepared"), b"prepared\n")
+                        .map_err(|error| access_error_kind(error.kind()))
+                });
+
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"outside state remains untouched\n"
+            );
+            assert!(!outside.path().join("prepared").exists());
+            if !linked {
+                assert!(crate::paths::state_directory_entry_type_is_unsafe(
+                    true, false, true
+                ));
+                assert_eq!(
+                    std::fs::read(&project_state).unwrap(),
+                    b"unsafe state entry\n"
+                );
+            }
+            assert_eq!(
+                std::fs::read(user_state.join("prepared")).unwrap(),
+                b"prepared\n"
+            );
+            match placement {
+                StatePlacement::UserLocal {
+                    directory,
+                    root_id,
+                    reason:
+                        UserLocalPlacementReason::ProjectLocalUnavailable {
+                            safe_reason: AccessErrorKind::InvalidData,
+                        },
+                } => {
+                    assert_eq!(directory.as_path(), user_state);
+                    assert_eq!(root_id, binding.root_id);
+                }
+                other => panic!("expected user-local fallback, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn root_state_key_coalesces_aliases_and_isolates_repos_and_worktrees() {
+            fn bind(root: &Path) -> RootBinding {
+                let RootResolution::Bound(binding) = resolve_root_candidate(
+                    root,
+                    RootCandidateSource::ExplicitIndexFolder,
+                    RootRequestMode::ExplicitIndexFolder {
+                        allow_protected_root: false,
+                    },
+                ) else {
+                    panic!("ordinary root should bind: {}", root.display());
+                };
+                binding
+            }
+
+            let parent_a = TempDir::new().unwrap();
+            let parent_b = TempDir::new().unwrap();
+            let repo_a = parent_a.path().join("same-name");
+            let repo_b = parent_b.path().join("same-name");
+            let linked_worktree = parent_a.path().join("linked-worktree");
+            for root in [&repo_a, &repo_b, &linked_worktree] {
+                std::fs::create_dir(root).unwrap();
+            }
+            std::fs::write(
+                linked_worktree.join(".git"),
+                format!("gitdir: {}/.git/worktrees/linked\n", repo_a.display()),
+            )
+            .unwrap();
+
+            let primary = bind(&repo_a);
+            let alias = bind(&repo_a.join("."));
+            let same_basename_other_repo = bind(&repo_b);
+            let worktree = bind(&linked_worktree);
+
+            assert_eq!(primary.canonical_root, alias.canonical_root);
+            assert_eq!(primary.root_id, alias.root_id);
+            assert_ne!(primary.root_id, same_basename_other_repo.root_id);
+            assert_ne!(primary.root_id, worktree.root_id);
+            assert!(primary.root_id.0.starts_with("project-v1-"));
+            assert_eq!(primary.root_id.0.len(), "project-v1-".len() + 64);
+            assert!(!primary.root_id.0.contains("same-name"));
         }
 
         #[test]

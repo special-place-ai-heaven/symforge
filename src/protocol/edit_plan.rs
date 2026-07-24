@@ -40,6 +40,9 @@ pub fn plan_edit(
     // Try to find the target as a symbol first
     let mut symbol_hits = Vec::new();
     let mut file_hit = None;
+    // AAP-001: populated when a path-shaped bare target matches several files
+    // by trailing path segment; drives the deterministic pick + ambiguity note.
+    let mut ambiguous_file_matches: Vec<String> = Vec::new();
 
     if let Some((target_path, target_name)) = qualified_target {
         let mut path_matched = false;
@@ -62,10 +65,58 @@ pub fn plan_edit(
             collect_type_scoped_hits(&mut symbol_hits, index, target_path, target_name);
         }
     } else {
-        for (path, file) in index.all_files() {
-            collect_selector_hits(&mut symbol_hits, path, file, target);
-            if path.ends_with(target) || path == target {
-                file_hit = Some(path.clone());
+        // SF-AAP-001: an existing repo-relative path (exact match, or a full
+        // trailing path-segment suffix like `notes.md` → `docs/notes.md`) is a
+        // LITERAL path and must beat symbol/generated-path heuristics. Without
+        // this short-circuit, `find_candidates_cascade` strips `config.json` →
+        // `json` (qualification stripping) and matches an unrelated symbol, so
+        // the plan recommended a DIFFERENT path. A literal path routes straight
+        // to the file plan and never the symbol branch.
+        // AAP-001: exact `path == target` is a deterministic file hit. A
+        // PATH-SHAPED target (contains `/` or a dotted extension) resolves
+        // against a full trailing path segment, collecting ALL matches so a
+        // duplicate basename picks deterministically (sorted-first) and reports
+        // the ambiguity instead of a HashMap-order coin flip. A BARE identifier
+        // (no `.`, no `/`) must NOT short-circuit on a mere suffix match against
+        // an extensionless file — it falls through to the symbol cascade so
+        // e.g. `Handler` still resolves `fn Handler` even when `tools/Handler`
+        // exists.
+        let exact = index
+            .all_files()
+            .find_map(|(path, _)| (path == target).then(|| path.clone()));
+        if let Some(path) = exact {
+            file_hit = Some(path);
+        } else {
+            let path_shaped = target.contains('/') || target.contains('.');
+            let mut suffix_matches: Vec<String> = if path_shaped {
+                let needle = format!("/{target}");
+                let mut matches: Vec<String> = index
+                    .all_files()
+                    .filter(|(path, _)| path.ends_with(needle.as_str()))
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                matches.sort();
+                matches
+            } else {
+                Vec::new()
+            };
+            match suffix_matches.len() {
+                // Bare identifier, or a path-shaped target with no literal file:
+                // run the normal symbol cascade so a symbol is never lost to a
+                // mere extensionless-file suffix match.
+                0 => {
+                    for (path, file) in index.all_files() {
+                        collect_selector_hits(&mut symbol_hits, path, file, target);
+                        if path.ends_with(target) || path == target {
+                            file_hit = Some(path.clone());
+                        }
+                    }
+                }
+                1 => file_hit = Some(suffix_matches.remove(0)),
+                _ => {
+                    file_hit = Some(suffix_matches[0].clone());
+                    ambiguous_file_matches = suffix_matches;
+                }
             }
         }
     }
@@ -154,6 +205,15 @@ pub fn plan_edit(
         && symbol_hits.is_empty()
     {
         lines.push(format!("Found file: {}", path));
+        if ambiguous_file_matches.len() > 1 {
+            lines.push(format!(
+                "⚠ Ambiguous file target '{}' matched {} paths ({}); selected '{}' (first sorted). Pass a fuller path to disambiguate.",
+                target,
+                ambiguous_file_matches.len(),
+                ambiguous_file_matches.join(", "),
+                path
+            ));
+        }
         lines.push("\nSuggested approach:".to_string());
         lines.push(format!(
             "  1. get_file_context(path=\"{path}\", sections=[\"outline\"]) — understand structure"

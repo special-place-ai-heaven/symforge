@@ -359,6 +359,32 @@ fn run_init_with_paths(
         );
     }
 
+    let gitignore_hygiene = match crate::discovery::resolve_root_candidate(
+        working_dir,
+        crate::domain::RootCandidateSource::InitCwd,
+        crate::domain::RootRequestMode::Init,
+    ) {
+        crate::domain::RootResolution::Bound(binding) => {
+            let authority = if binding.access_mode == crate::domain::SourceAccessMode::NormalProject
+            {
+                crate::gitignore_hygiene::GitignoreHygieneAuthority::ProjectAwareInit
+            } else {
+                crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitProtected
+            };
+            crate::gitignore_hygiene::reconcile_project_gitignore(
+                &binding.canonical_root,
+                authority,
+            )
+        }
+        crate::domain::RootResolution::Unbound { .. } => {
+            crate::gitignore_hygiene::reconcile_project_gitignore(
+                working_dir,
+                crate::gitignore_hygiene::GitignoreHygieneAuthority::ExplicitProtected,
+            )
+        }
+    };
+    eprintln!("{}", gitignore_hygiene.receipt());
+
     paths::ensure_runtime_symforge_dir(Some(working_dir))
         .context("ensuring symforge runtime data directory")?;
 
@@ -448,6 +474,9 @@ const SYMFORGE_TOOL_NAMES: &[&str] = &[
     "mcp__symforge__get_symbol_context",
     "mcp__symforge__search_symbols",
     "mcp__symforge__search_text",
+    "mcp__symforge__search_knowledge",
+    "mcp__symforge__review_knowledge",
+    "mcp__symforge__curate_knowledge",
     "mcp__symforge__search_files",
     "mcp__symforge__find_references",
     "mcp__symforge__find_dependents",
@@ -488,6 +517,9 @@ const CLAUDE_ALWAYS_ALLOW: &[&str] = &[
     "get_symbol_context",
     "search_symbols",
     "search_text",
+    "search_knowledge",
+    "review_knowledge",
+    "curate_knowledge",
     "search_files",
     "find_references",
     "find_dependents",
@@ -732,7 +764,7 @@ pub fn register_mcp_server(
         .entry("disabled".to_string())
         .or_insert_with(|| Value::Bool(false));
     // Claude Code has native deferred tool loading, so pin the full surface —
-    // this makes the 37-name allowlist coherent (spec §4). Never clobber a
+    // this makes the 39-name allowlist coherent (spec §4). Never clobber a
     // user-set value (the 8.10.1 SYMFORGE_SURFACE=full wipe).
     insert_env_defaults(entry, &[("SYMFORGE_SURFACE", "full")]);
     union_allow_names(entry, "alwaysAllow", CLAUDE_ALWAYS_ALLOW);
@@ -2002,6 +2034,8 @@ mod tests {
             "\"symforge_edit\"",
             "\"status\"",
             "\"search_symbols\"",
+            "\"search_knowledge\"",
+            "\"review_knowledge\"",
         ] {
             assert!(
                 content.contains(name),

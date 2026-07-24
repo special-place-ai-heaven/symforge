@@ -1,4 +1,5 @@
 //! Session cache-hit for full read tools (011 US1).
+#![cfg(feature = "server")]
 
 use serde_json::json;
 use symforge::live_index::LiveIndex;

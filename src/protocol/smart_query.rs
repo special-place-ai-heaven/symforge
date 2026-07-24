@@ -23,6 +23,10 @@ pub enum QueryIntent {
     UnderstandImplementations { name: String },
     /// "search for X in code", "grep X", code pattern
     SearchCode { pattern: String },
+    /// Explicit repository-documentation/knowledge question.
+    SearchKnowledge { query: String },
+    /// Broad repository orientation request routed to the combined captured map.
+    RepositoryOrientation,
     /// "what depends on X", "dependents of X"
     FindDependents { target: String },
     /// "implementations of X", "who implements X"
@@ -87,6 +91,41 @@ pub(crate) fn classify_intent_with_match(query: &str) -> (QueryIntent, bool) {
     // it into UnderstandSymbol.
     if let Some(topic) = detect_tool_help(&lower) {
         return (QueryIntent::ToolHelp { topic }, true);
+    }
+
+    if lower.starts_with("orient me in this repository")
+        || lower.starts_with("orient me in the repository")
+        || lower.starts_with("give me a repository overview")
+        || lower.starts_with("show the repository map")
+        || lower.starts_with("where should i start in this codebase")
+    {
+        return (QueryIntent::RepositoryOrientation, true);
+    }
+
+    // Explicit knowledge phrasing only. Keeping this narrow prevents generic
+    // symbol/code questions from being stolen by the documentation lane.
+    if let Some(subject) = strip_prefix_phrase(
+        &lower,
+        &[
+            "search repository knowledge for ",
+            "search knowledge for ",
+            "find repository knowledge about ",
+            "what do the docs say about ",
+            "what does the documentation say about ",
+            "find in docs ",
+        ],
+    ) {
+        return (
+            QueryIntent::SearchKnowledge {
+                query: subject
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim_end_matches('?')
+                    .trim()
+                    .to_string(),
+            },
+            true,
+        );
     }
 
     // --- Pattern: "who/what calls X" or "callers of X" or "references to X" ---
@@ -477,6 +516,18 @@ pub fn assess_route(intent: &QueryIntent, matched_prefix: bool) -> RouteAssessme
                 }
             }
         }
+        QueryIntent::SearchKnowledge { .. } => RouteAssessment {
+            confidence: RouteConfidence::Exact,
+            rationale: "matched explicit repository-knowledge phrasing",
+            suggested_next_step: None,
+        },
+        QueryIntent::RepositoryOrientation => RouteAssessment {
+            confidence: RouteConfidence::Exact,
+            rationale: "matched an explicit repository-orientation request",
+            suggested_next_step: Some(
+                "Use the exact role and code anchors in the combined map for focused follow-up.",
+            ),
+        },
         QueryIntent::ToolHelp { .. } => RouteAssessment {
             confidence: RouteConfidence::Exact,
             rationale: "matched a tool-recommendation question about SymForge's own tool surface",
@@ -534,6 +585,10 @@ pub fn route_invocation(intent: &QueryIntent) -> String {
         QueryIntent::SearchCode { pattern } => {
             format!("search_text(query=\"{pattern}\")")
         }
+        QueryIntent::SearchKnowledge { query } => {
+            format!("search_knowledge(query=\"{query}\", source_scope=\"current\")")
+        }
+        QueryIntent::RepositoryOrientation => "get_repo_map(detail=\"compact\")".to_string(),
         QueryIntent::FindDependents { target } => {
             format!("find_dependents(path=\"{target}\")")
         }
@@ -560,6 +615,8 @@ pub fn route_tool_name(intent: &QueryIntent) -> &'static str {
         QueryIntent::UnderstandSymbol { .. } => "get_symbol_context",
         QueryIntent::UnderstandImplementations { .. } => "find_references",
         QueryIntent::SearchCode { .. } => "search_text",
+        QueryIntent::SearchKnowledge { .. } => "search_knowledge",
+        QueryIntent::RepositoryOrientation => "get_repo_map",
         QueryIntent::FindDependents { .. } => "find_dependents",
         QueryIntent::FindImplementations { .. } => "find_references",
         QueryIntent::ToolHelp { .. } => "ask",
@@ -1124,6 +1181,25 @@ mod tests {
         match classify_intent("error handling patterns") {
             QueryIntent::Explore { query } => assert_eq!(query, "error handling patterns"),
             other => panic!("Expected Explore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_repository_orientation_routes_to_combined_map() {
+        for query in [
+            "orient me in this repository",
+            "give me a repository overview",
+            "show the repository map",
+            "where should I start in this codebase",
+        ] {
+            let (intent, matched) = classify_intent_with_match(query);
+            assert!(matched, "{query}");
+            assert!(matches!(intent, QueryIntent::RepositoryOrientation));
+            assert_eq!(route_tool_name(&intent), "get_repo_map");
+            assert_eq!(
+                route_invocation(&intent),
+                "get_repo_map(detail=\"compact\")"
+            );
         }
     }
 

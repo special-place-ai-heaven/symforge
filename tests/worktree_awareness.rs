@@ -189,6 +189,7 @@ struct WorktreeFixture {
     _dir: TempDir,
     root: PathBuf,
     worktree_root: PathBuf,
+    project_state: symforge::domain::ProjectStateDir,
     server: SymForgeServer,
 }
 
@@ -210,19 +211,37 @@ impl WorktreeFixture {
         let worktree_root = container.join("wt_one");
         git_worktree_add(&root, &worktree_root, "tentacle/test");
 
-        let shared = LiveIndex::load(&root).expect("LiveIndex::load");
+        let symforge::domain::RootResolution::Bound(binding) =
+            symforge::discovery::resolve_root_candidate(
+                &root,
+                symforge::domain::RootCandidateSource::LaunchCwd,
+                symforge::domain::RootRequestMode::Automatic,
+            )
+        else {
+            panic!("temporary project root must bind");
+        };
+        let canonical_root = binding.canonical_root.clone();
+        let state_placement = symforge::discovery::resolve_state_placement(&binding);
+        let project_state = state_placement
+            .directory()
+            .expect("temporary project must have durable state")
+            .clone();
+        let shared = LiveIndex::load_for_state_placement(&canonical_root, &state_placement)
+            .expect("LiveIndex::load_for_state_placement");
         let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
-        let server = SymForgeServer::new(
+        let server = SymForgeServer::new_with_state_placement(
             shared,
             "worktree_awareness_test".to_string(),
             watcher_info,
-            Some(root.clone()),
+            Some(canonical_root),
+            Some(state_placement),
             None,
         );
         Self {
             _dir: dir,
             root,
             worktree_root,
+            project_state,
             server,
         }
     }
@@ -808,7 +827,7 @@ async fn tee_snapshot_uses_resolved_worktree_target_before_write() {
     assert_contains(&result, "Tee snapshot:");
     assert_contains(&result, "rerouted: true");
 
-    let tee_dir = fx.worktree_root.join(".symforge").join("tee");
+    let tee_dir = symforge::paths::project_state_path(&fx.project_state, "tee");
     let mut snapshot_contents = Vec::new();
     for entry in fs::read_dir(&tee_dir)
         .unwrap_or_else(|e| panic!("expected tee dir at {}: {e}", tee_dir.display()))

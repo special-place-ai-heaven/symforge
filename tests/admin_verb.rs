@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use symforge::cli::admin::{
-    AdminCliArgs, operator_server_reachable, run_admin, start_operator_server,
+    AdminCliArgs, operator_server_reachable, run_admin_with_control_state, start_operator_server,
 };
 use symforge::cli::browser::{BrowserOpenOutcome, NoopBrowserOpener};
 use symforge::cli::operator_profile::{AuthPosture, OperatorSetupProfile};
@@ -28,6 +28,10 @@ use symforge::cli::setup::{InstallationType, SetupContext};
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn control_state(home: &std::path::Path) -> symforge::domain::ControlStateDir {
+    symforge::domain::ControlStateDir::new(home.join("control-state"))
 }
 
 #[test]
@@ -43,6 +47,7 @@ fn admin_reuses_running_server_on_profile_port() {
 
     let project = tempfile::tempdir().expect("temp project");
     let home = tempfile::tempdir().expect("temp home");
+    let control = control_state(home.path());
     OperatorSetupProfile::new(
         InstallationType::Server,
         running_port,
@@ -50,7 +55,7 @@ fn admin_reuses_running_server_on_profile_port() {
         &[],
         1,
     )
-    .save(project.path())
+    .save(&control)
     .expect("persist profile");
 
     let ctx = SetupContext {
@@ -59,8 +64,13 @@ fn admin_reuses_running_server_on_profile_port() {
     };
     let browser = NoopBrowserOpener::default();
 
-    let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
-        .expect("admin should reuse the running server");
+    let outcome = run_admin_with_control_state(
+        &AdminCliArgs { no_open: false },
+        &ctx,
+        &browser,
+        Some(&control),
+    )
+    .expect("admin should reuse the running server");
 
     // Reused the existing server: same port, no second listener started.
     assert!(
@@ -88,8 +98,9 @@ fn admin_reuses_running_server_on_profile_port() {
 fn admin_starts_server_when_none_running_and_persists_port() {
     let project = tempfile::tempdir().expect("temp project");
     let home = tempfile::tempdir().expect("temp home");
+    let control = control_state(home.path());
     assert!(
-        OperatorSetupProfile::load(project.path()).is_none(),
+        OperatorSetupProfile::load(&control).is_none(),
         "no profile to start"
     );
 
@@ -99,8 +110,13 @@ fn admin_starts_server_when_none_running_and_persists_port() {
     };
     let browser = NoopBrowserOpener::default();
 
-    let outcome = run_admin(&AdminCliArgs { no_open: false }, &ctx, &browser)
-        .expect("admin should start a server when none runs");
+    let outcome = run_admin_with_control_state(
+        &AdminCliArgs { no_open: false },
+        &ctx,
+        &browser,
+        Some(&control),
+    )
+    .expect("admin should start a server when none runs");
 
     // Started fresh (not reused), reachable, and the URL is bound + answers.
     assert!(
@@ -116,7 +132,7 @@ fn admin_starts_server_when_none_running_and_persists_port() {
     assert_eq!(browser.opened_urls().len(), 1);
 
     // The bound port was persisted so the next admin run reuses it (FR-012/015).
-    let profile = OperatorSetupProfile::load(project.path()).expect("port persisted");
+    let profile = OperatorSetupProfile::load(&control).expect("port persisted");
     assert_eq!(profile.port, outcome.session.bound_addr.port());
 }
 
@@ -131,6 +147,7 @@ fn admin_no_open_skips_browser_but_still_reports_url() {
 
     let project = tempfile::tempdir().expect("temp project");
     let home = tempfile::tempdir().expect("temp home");
+    let control = control_state(home.path());
     OperatorSetupProfile::new(
         InstallationType::Server,
         running.bound_addr.port(),
@@ -138,7 +155,7 @@ fn admin_no_open_skips_browser_but_still_reports_url() {
         &[],
         1,
     )
-    .save(project.path())
+    .save(&control)
     .expect("persist profile");
 
     let ctx = SetupContext {
@@ -147,8 +164,13 @@ fn admin_no_open_skips_browser_but_still_reports_url() {
     };
     let browser = NoopBrowserOpener::default();
 
-    let outcome = run_admin(&AdminCliArgs { no_open: true }, &ctx, &browser)
-        .expect("admin --no-open should report the URL without opening");
+    let outcome = run_admin_with_control_state(
+        &AdminCliArgs { no_open: true },
+        &ctx,
+        &browser,
+        Some(&control),
+    )
+    .expect("admin --no-open should report the URL without opening");
 
     assert!(outcome.reused_server);
     // --no-open: the browser opener was NOT invoked, the URL is still returned.

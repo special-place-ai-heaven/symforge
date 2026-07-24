@@ -20,6 +20,8 @@
 use anyhow::{Context, bail};
 use std::process::Stdio;
 
+use crate::domain::ControlStateDir;
+
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
 /// `std::env::consts::OS`, `arch` is `std::env::consts::ARCH`.
@@ -90,14 +92,17 @@ pub(crate) enum InstalledProbe {
 /// does not prove the recorded pid owns the port (recycled-pid hazard). Only a
 /// `Dead` record is cleaned so the next launch starts clean.
 fn clear_dead_sidecar_record() -> Option<String> {
-    use crate::sidecar::port_file::{SidecarLiveness, cleanup_files_at, read_sidecar_status_at};
+    use crate::sidecar::port_file::{
+        SidecarLiveness, cleanup_files, cleanup_stale_descriptors, read_sidecar_status,
+    };
 
-    let dir = std::path::Path::new(".symforge");
-    let status = read_sidecar_status_at(dir, "127.0.0.1");
+    let control_state_dir: ControlStateDir = crate::version_registry::resolve_home()?;
+    let project_root = std::env::current_dir().ok();
+    let status = read_sidecar_status(&control_state_dir, "127.0.0.1", project_root.as_deref());
     // Task 8: purge stale per-adapter descriptors alongside the legacy files.
-    crate::sidecar::port_file::cleanup_stale_descriptors_at(dir, "127.0.0.1");
+    cleanup_stale_descriptors(&control_state_dir, "127.0.0.1");
     if matches!(status.liveness, SidecarLiveness::Dead) {
-        cleanup_files_at(dir);
+        cleanup_files(&control_state_dir);
         Some("cleared a stale sidecar record".to_string())
     } else {
         None
@@ -109,10 +114,6 @@ fn clear_dead_sidecar_record() -> Option<String> {
 /// in the standard MCP server config and routinely points at the SAME default
 /// `~/.symforge`), else `~/.symforge/bin`. Returns `None` only when neither is
 /// resolvable.
-fn durable_bin_dir() -> Option<std::path::PathBuf> {
-    crate::version_registry::resolve_home().map(|home| home.join("bin"))
-}
-
 /// Remove the retired durable-install artifacts under the resolved durable `bin`
 /// directory (`$SYMFORGE_HOME/bin` when set, else `~/.symforge/bin`) — the only
 /// place the retired durable mechanism ever wrote. The real safety invariant is
@@ -120,9 +121,14 @@ fn durable_bin_dir() -> Option<std::path::PathBuf> {
 /// Best-effort; callers must only invoke this AFTER clients are re-registered off
 /// the orphan.
 fn remove_orphan_durable_bin() -> Vec<String> {
-    let Some(bin) = durable_bin_dir() else {
+    let Some(control_state_dir) = crate::version_registry::resolve_home() else {
         return Vec::new();
     };
+    remove_orphan_durable_bin_at(&control_state_dir)
+}
+
+fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateDir) -> Vec<String> {
+    let bin = control_state_dir.as_path().join("bin");
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok());
@@ -1430,7 +1436,9 @@ mod tests {
         let self_exe = std::env::current_exe().unwrap();
         assert!(self_exe.exists(), "precondition: running exe exists");
 
-        let summary = remove_orphan_durable_bin();
+        let summary = remove_orphan_durable_bin_at(&crate::domain::ControlStateDir::new(
+            home.path().to_path_buf(),
+        ));
 
         assert!(
             !leftover.exists(),

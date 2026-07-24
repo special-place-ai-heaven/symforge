@@ -1,13 +1,12 @@
 //! Port and PID file management for the HTTP sidecar.
 //!
-//! All files live under `.symforge/` beside the project when one is known, or
-//! under the user-level SymForge home when the launch cwd is unsafe/unwritable
-//! (see [`crate::paths::ensure_runtime_symforge_dir`]).
+//! All active files live under the process-global control-state `sidecar/`
+//! namespace. Legacy fixed filenames remain read-only migration fallbacks.
 //! The hook binary reads the sidecar port file to locate the running sidecar.
 //!
 //! Runtime filenames are OS-tagged (`sidecar.<os>.port`, see
 //! [`crate::paths::os_tagged_runtime_file_name`]) so a Windows symforge and a
-//! WSL/Linux symforge sharing one physical project `.symforge/` dir can never read
+//! WSL/Linux symforge sharing one control-state root can never read
 //! each other's loopback port. The writer (here) and the `symforge hook` reader both
 //! derive the tag from the same compile-time `std::env::consts::OS`, so for a given
 //! OS they always agree. Legacy un-tagged files are still READ as a fallback for one
@@ -18,7 +17,10 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::domain::ControlStateDir;
+
 pub const DIR_NAME: &str = crate::paths::SYMFORGE_DIR_NAME;
+const SIDECAR_CONTROL_DIR: &str = "sidecar";
 
 // Legacy (pre-OS-tag) names. Read-only fallback + cleanup for one release window.
 const LEGACY_PORT_FILE: &str = "sidecar.port";
@@ -48,23 +50,25 @@ fn read_runtime_file(dir: &Path, tagged: &str, legacy: &str) -> io::Result<Strin
     }
 }
 
-/// Ensure a usable `.symforge/` runtime directory for sidecar port/pid files.
-pub fn ensure_symforge_dir(project_root: Option<&Path>) -> io::Result<PathBuf> {
-    crate::paths::ensure_runtime_symforge_dir(project_root)
+/// Ensure the process-global sidecar descriptor namespace.
+pub fn ensure_symforge_dir(control_state_dir: &ControlStateDir) -> io::Result<PathBuf> {
+    crate::paths::ensure_control_state_dir(control_state_dir)?;
+    let dir = resolve_symforge_dir(control_state_dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
-/// Resolve the runtime `.symforge/` directory without creating it.
-fn resolve_symforge_dir(project_root: Option<&Path>) -> PathBuf {
-    let cwd = std::env::current_dir().ok();
-    crate::paths::select_runtime_data_base(project_root, cwd.as_deref())
+/// Resolve the isolated sidecar namespace without creating it.
+fn resolve_symforge_dir(control_state_dir: &ControlStateDir) -> PathBuf {
+    crate::paths::control_state_path(control_state_dir, SIDECAR_CONTROL_DIR)
 }
 
 /// Write the sidecar port to `.symforge/sidecar.port`.
 ///
 /// The file contains ONLY the port number as ASCII digits, no trailing newline.
 /// This is the convention the hook binary relies on.
-pub fn write_port_file(port: u16, project_root: Option<&Path>) -> io::Result<()> {
-    let dir = ensure_symforge_dir(project_root)?;
+pub fn write_port_file(port: u16, control_state_dir: &ControlStateDir) -> io::Result<()> {
+    let dir = ensure_symforge_dir(control_state_dir)?;
     let path = dir.join(port_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{port}")?;
@@ -74,8 +78,8 @@ pub fn write_port_file(port: u16, project_root: Option<&Path>) -> io::Result<()>
 /// Write the sidecar PID to `.symforge/sidecar.<os>.pid`.
 ///
 /// The file contains ONLY the PID as ASCII digits, no trailing newline.
-pub fn write_pid_file(pid: u32, project_root: Option<&Path>) -> io::Result<()> {
-    let dir = ensure_symforge_dir(project_root)?;
+pub fn write_pid_file(pid: u32, control_state_dir: &ControlStateDir) -> io::Result<()> {
+    let dir = ensure_symforge_dir(control_state_dir)?;
     let path = dir.join(pid_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{pid}")?;
@@ -83,8 +87,8 @@ pub fn write_pid_file(pid: u32, project_root: Option<&Path>) -> io::Result<()> {
 }
 
 /// Write the daemon/session proxy identifier to `.symforge/sidecar.<os>.session`.
-pub fn write_session_file(session_id: &str, project_root: Option<&Path>) -> io::Result<()> {
-    let dir = ensure_symforge_dir(project_root)?;
+pub fn write_session_file(session_id: &str, control_state_dir: &ControlStateDir) -> io::Result<()> {
+    let dir = ensure_symforge_dir(control_state_dir)?;
     let path = dir.join(session_file_name());
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{session_id}")?;
@@ -92,8 +96,8 @@ pub fn write_session_file(session_id: &str, project_root: Option<&Path>) -> io::
 }
 
 /// Remove only the daemon/session proxy file, preserving any live local sidecar port/pid files.
-pub fn cleanup_session_file() {
-    let dir = PathBuf::from(DIR_NAME);
+pub fn cleanup_session_file(control_state_dir: &ControlStateDir) {
+    let dir = resolve_symforge_dir(control_state_dir);
     let _ = std::fs::remove_file(dir.join(session_file_name()));
     let _ = std::fs::remove_file(dir.join(LEGACY_SESSION_FILE));
 }
@@ -101,8 +105,8 @@ pub fn cleanup_session_file() {
 /// Read and parse the port from `.symforge/sidecar.<os>.port` (legacy fallback).
 ///
 /// Returns an error if the file doesn't exist or contains invalid data.
-pub fn read_port() -> io::Result<u16> {
-    read_port_at(&resolve_symforge_dir(None))
+pub fn read_port(control_state_dir: &ControlStateDir) -> io::Result<u16> {
+    read_port_at(&resolve_symforge_dir(control_state_dir))
 }
 
 fn read_port_at(dir: &Path) -> io::Result<u16> {
@@ -196,11 +200,12 @@ pub(crate) fn write_descriptor_for_pid_at(
 /// Public writer: this adapter's descriptor for `port`/`session_id` under the
 /// project's runtime `.symforge/` dir.
 pub fn write_session_descriptor(
+    control_state_dir: &ControlStateDir,
     port: u16,
     session_id: Option<&str>,
     project_root: Option<&Path>,
 ) -> io::Result<()> {
-    let dir = ensure_symforge_dir(project_root)?;
+    let dir = ensure_symforge_dir(control_state_dir)?;
     write_descriptor_for_pid_at(&dir, std::process::id(), port, session_id, project_root)
 }
 
@@ -215,8 +220,8 @@ pub(crate) fn cleanup_descriptor_for_pid_at(dir: &Path, pid: u32) {
 
 /// Remove ONLY this process's descriptor (Task 8 contract: an adapter's
 /// shutdown can never delete or invalidate a sibling adapter's record).
-pub fn cleanup_own_descriptor(project_root: Option<&Path>) {
-    cleanup_descriptor_for_pid_at(&resolve_symforge_dir(project_root), std::process::id());
+pub fn cleanup_own_descriptor(control_state_dir: &ControlStateDir) {
+    cleanup_descriptor_for_pid_at(&resolve_symforge_dir(control_state_dir), std::process::id());
 }
 
 /// Same, against an explicit dir (panic hooks cannot rely on CWD).
@@ -261,8 +266,17 @@ fn read_descriptors_at(dir: &Path) -> Vec<SessionDescriptor> {
 /// naming a DIFFERENT project root than this dir's project is rejected, never
 /// "last writer wins"), live port first, then freshest `updated_at`, with a
 /// stable smallest-pid tie break.
-fn select_descriptor_status(dir: &Path, bind_host: &str) -> Option<SidecarStatus> {
-    let expected_root = dir.parent().map(|parent| parent.display().to_string());
+struct SelectedSidecar {
+    status: SidecarStatus,
+    session_id: Option<String>,
+}
+
+fn select_descriptor_status(
+    dir: &Path,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> Option<SelectedSidecar> {
+    let expected_root = expected_project_root.map(|root| root.display().to_string());
     let mut candidates: Vec<(SessionDescriptor, bool)> = Vec::new();
     let mut rejected = 0usize;
     for descriptor in read_descriptors_at(dir) {
@@ -277,13 +291,16 @@ fn select_descriptor_status(dir: &Path, bind_host: &str) -> Option<SidecarStatus
         candidates.push((descriptor, alive));
     }
     if candidates.is_empty() {
-        return (rejected > 0).then(|| SidecarStatus {
-            pid: None,
-            port: None,
-            liveness: SidecarLiveness::NoSidecar,
-            detail: Some(format!(
-                "{rejected} descriptor(s) rejected: project-root identity mismatch"
-            )),
+        return (rejected > 0).then(|| SelectedSidecar {
+            status: SidecarStatus {
+                pid: None,
+                port: None,
+                liveness: SidecarLiveness::NoSidecar,
+                detail: Some(format!(
+                    "{rejected} descriptor(s) rejected: project-root identity mismatch"
+                )),
+            },
+            session_id: None,
         });
     }
     candidates.sort_by(|a, b| {
@@ -292,24 +309,27 @@ fn select_descriptor_status(dir: &Path, bind_host: &str) -> Option<SidecarStatus
             .then(a.0.pid.cmp(&b.0.pid))
     });
     let (best, alive) = &candidates[0];
-    Some(SidecarStatus {
-        pid: Some(best.pid),
-        port: Some(best.port),
-        liveness: if *alive {
-            SidecarLiveness::Alive
-        } else {
-            SidecarLiveness::Dead
-        },
-        detail: Some(format!(
-            "descriptor sidecar.{} ({} candidate(s){})",
-            best.pid,
-            candidates.len(),
-            if rejected > 0 {
-                format!(", {rejected} identity-rejected")
+    Some(SelectedSidecar {
+        status: SidecarStatus {
+            pid: Some(best.pid),
+            port: Some(best.port),
+            liveness: if *alive {
+                SidecarLiveness::Alive
             } else {
-                String::new()
-            }
-        )),
+                SidecarLiveness::Dead
+            },
+            detail: Some(format!(
+                "descriptor sidecar.{} ({} candidate(s){})",
+                best.pid,
+                candidates.len(),
+                if rejected > 0 {
+                    format!(", {rejected} identity-rejected")
+                } else {
+                    String::new()
+                }
+            )),
+        },
+        session_id: best.session_id.clone(),
     })
 }
 
@@ -355,7 +375,7 @@ pub struct SidecarStatus {
 }
 
 impl SidecarStatus {
-    fn no_sidecar() -> Self {
+    pub(crate) fn no_sidecar() -> Self {
         Self {
             pid: None,
             port: None,
@@ -389,12 +409,17 @@ fn sidecar_port_is_alive(bind_host: &str, port: u16) -> io::Result<bool> {
     Ok(TcpStream::connect_timeout(&sock_addr, Duration::from_millis(200)).is_ok())
 }
 
-pub fn read_sidecar_status_at(symforge_dir: &Path, bind_host: &str) -> SidecarStatus {
+fn read_sidecar_status_for_root_at(
+    symforge_dir: &Path,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> SidecarStatus {
     // Task 8: per-adapter descriptors are authoritative; the fixed files below
     // are only a read-compatible migration aid for records written by older
     // binaries.
-    if let Some(status) = select_descriptor_status(symforge_dir, bind_host) {
-        return status;
+    if let Some(selected) = select_descriptor_status(symforge_dir, bind_host, expected_project_root)
+    {
+        return selected.status;
     }
     if !sidecar_files_exist(symforge_dir) {
         return SidecarStatus::no_sidecar();
@@ -444,15 +469,51 @@ pub fn read_sidecar_status_at(symforge_dir: &Path, bind_host: &str) -> SidecarSt
     }
 }
 
-pub fn read_sidecar_status(bind_host: &str) -> SidecarStatus {
-    read_sidecar_status_at(&resolve_symforge_dir(None), bind_host)
+pub fn read_sidecar_status_at(symforge_dir: &Path, bind_host: &str) -> SidecarStatus {
+    read_sidecar_status_for_root_at(symforge_dir, bind_host, symforge_dir.parent())
+}
+
+pub fn read_sidecar_status(
+    control_state_dir: &ControlStateDir,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> SidecarStatus {
+    read_sidecar_status_for_root_at(
+        &resolve_symforge_dir(control_state_dir),
+        bind_host,
+        expected_project_root,
+    )
+}
+
+/// Resolve the best project-matching sidecar descriptor for hook routing.
+pub fn read_sidecar_endpoint(
+    control_state_dir: &ControlStateDir,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> io::Result<(u16, Option<String>)> {
+    let dir = resolve_symforge_dir(control_state_dir);
+    if let Some(selected) = select_descriptor_status(&dir, bind_host, expected_project_root)
+        && let Some(port) = selected.status.port
+    {
+        return Ok((port, selected.session_id));
+    }
+
+    let port = read_port_at(&dir)?;
+    let session_id = read_runtime_file(&dir, &session_file_name(), LEGACY_SESSION_FILE)
+        .ok()
+        .map(|contents| contents.trim().to_string());
+    Ok((port, session_id))
 }
 
 /// Remove both port and PID files. Ignores all errors.
 ///
 /// Called during sidecar shutdown — it is safe to call even if files don't exist.
-pub fn cleanup_files() {
-    cleanup_files_at(&resolve_symforge_dir(None));
+pub fn cleanup_files(control_state_dir: &ControlStateDir) {
+    cleanup_files_at(&resolve_symforge_dir(control_state_dir));
+}
+
+pub fn cleanup_stale_descriptors(control_state_dir: &ControlStateDir, bind_host: &str) {
+    cleanup_stale_descriptors_at(&resolve_symforge_dir(control_state_dir), bind_host);
 }
 
 /// Remove port/PID/session files from a specific directory (both the OS-tagged names
@@ -474,63 +535,32 @@ pub fn cleanup_files_at(dir: &std::path::Path) {
 /// 200 ms timeout. If the connection succeeds the sidecar is alive and returns `false`.
 /// If the connection is refused or times out, the files are stale: calls `cleanup_files()`
 /// and returns `true`.
-pub fn check_stale(bind_host: &str) -> bool {
-    let port = match read_port() {
-        Ok(p) => p,
-        Err(_) => return false, // No port file — nothing to clean up.
-    };
-
-    match sidecar_port_is_alive(bind_host, port) {
-        Ok(true) => false, // Connection succeeded — sidecar is still alive.
-        Ok(false) => {
-            // Connection refused or timed out — files are stale.
-            cleanup_files();
+pub fn check_stale(
+    control_state_dir: &ControlStateDir,
+    bind_host: &str,
+    expected_project_root: Option<&Path>,
+) -> bool {
+    match read_sidecar_status(control_state_dir, bind_host, expected_project_root).liveness {
+        SidecarLiveness::Alive | SidecarLiveness::NoSidecar => false,
+        SidecarLiveness::Dead => {
+            cleanup_stale_descriptors(control_state_dir, bind_host);
+            cleanup_files(control_state_dir);
             true
         }
-        Err(_) => {
-            // Cannot determine staleness when the address is unparseable —
-            // default to "not stale" to avoid deleting a live sidecar's files.
-            false
-        }
+        SidecarLiveness::Unknown => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serialize all cwd-manipulating tests so they don't interfere with each other.
-    /// cwd is process-global — parallel manipulation causes flaky failures.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    fn stable_cwd() -> PathBuf {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-    }
-
-    fn restore_cwd(path: &std::path::Path) {
-        if std::env::set_current_dir(path).is_err() {
-            std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))
-                .expect("manifest dir must be a valid cwd fallback");
-        }
-    }
-
-    /// Run a test with cwd set to a temp directory so file operations are isolated.
-    /// Holds `CWD_LOCK` for the duration, restores cwd on exit (even on panic).
-    fn with_temp_dir<F: FnOnce() + std::panic::UnwindSafe>(f: F) {
-        let _guard = CWD_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn with_temp_control(f: impl FnOnce(&ControlStateDir, &Path)) {
         let tmp = TempDir::new().unwrap();
-        let original = stable_cwd();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let result = std::panic::catch_unwind(f);
-        restore_cwd(&original);
-        drop(tmp);
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        let control = ControlStateDir::new(tmp.path().join("control"));
+        let sidecar_dir = resolve_symforge_dir(&control);
+        f(&control, &sidecar_dir);
     }
 
     /// Task 8 (recovered finding): closing one adapter must not delete or
@@ -620,19 +650,18 @@ mod tests {
 
     #[test]
     fn test_write_read_port_roundtrip() {
-        with_temp_dir(|| {
-            write_port_file(12345, None).expect("write_port_file should succeed");
-            let port = read_port().expect("read_port should succeed after write");
+        with_temp_control(|control, _| {
+            write_port_file(12345, control).expect("write_port_file should succeed");
+            let port = read_port(control).expect("read_port should succeed after write");
             assert_eq!(port, 12345, "port roundtrip must preserve value");
         });
     }
 
     #[test]
     fn test_write_port_file_no_trailing_newline() {
-        with_temp_dir(|| {
-            write_port_file(8080, None).expect("write_port_file should succeed");
-            // Read while still inside the temp cwd so the relative path resolves correctly.
-            let port_path = PathBuf::from(DIR_NAME).join(port_file_name());
+        with_temp_control(|control, dir| {
+            write_port_file(8080, control).expect("write_port_file should succeed");
+            let port_path = dir.join(port_file_name());
             let bytes = std::fs::read(&port_path).unwrap();
             assert_eq!(
                 bytes, b"8080",
@@ -643,9 +672,8 @@ mod tests {
 
     #[test]
     fn test_write_is_os_tagged_only() {
-        with_temp_dir(|| {
-            write_port_file(8080, None).expect("write_port_file should succeed");
-            let dir = PathBuf::from(DIR_NAME);
+        with_temp_control(|control, dir| {
+            write_port_file(8080, control).expect("write_port_file should succeed");
             // Writer is tag-pure: the OS-tagged file exists, the legacy name does NOT.
             assert!(
                 dir.join(port_file_name()).exists(),
@@ -664,22 +692,22 @@ mod tests {
 
     #[test]
     fn test_read_falls_back_to_legacy_untagged() {
-        with_temp_dir(|| {
+        with_temp_control(|control, _| {
             // Simulate a sidecar started by an OLD (pre-tag) binary.
-            let dir = ensure_symforge_dir(None).expect("dir");
+            let dir = ensure_symforge_dir(control).expect("dir");
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"7777").unwrap();
-            let port = read_port().expect("read_port must fall back to legacy file");
+            let port = read_port(control).expect("read_port must fall back to legacy file");
             assert_eq!(port, 7777, "legacy fallback must read the un-tagged port");
         });
     }
 
     #[test]
     fn test_tagged_wins_over_legacy() {
-        with_temp_dir(|| {
-            let dir = ensure_symforge_dir(None).expect("dir");
+        with_temp_control(|control, _| {
+            let dir = ensure_symforge_dir(control).expect("dir");
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"1111").unwrap();
             std::fs::write(dir.join(port_file_name()), b"2222").unwrap();
-            let port = read_port().expect("read_port should succeed");
+            let port = read_port(control).expect("read_port should succeed");
             assert_eq!(
                 port, 2222,
                 "OS-tagged file must take precedence over legacy"
@@ -689,11 +717,10 @@ mod tests {
 
     #[test]
     fn test_cleanup_removes_files() {
-        with_temp_dir(|| {
-            write_port_file(9000, None).expect("write should succeed");
-            write_pid_file(12345, None).expect("write should succeed");
+        with_temp_control(|control, dir| {
+            write_port_file(9000, control).expect("write should succeed");
+            write_pid_file(12345, control).expect("write should succeed");
             // Also drop legacy files to prove cleanup removes BOTH.
-            let dir = PathBuf::from(DIR_NAME);
             std::fs::write(dir.join(LEGACY_PORT_FILE), b"9000").unwrap();
             std::fs::write(dir.join(LEGACY_PID_FILE), b"12345").unwrap();
 
@@ -706,7 +733,7 @@ mod tests {
                 "tagged pid file should exist before cleanup"
             );
 
-            cleanup_files();
+            cleanup_files(control);
 
             for name in [
                 port_file_name(),
@@ -724,16 +751,16 @@ mod tests {
 
     #[test]
     fn test_cleanup_is_noop_when_no_files() {
-        with_temp_dir(|| {
+        with_temp_control(|control, _| {
             // Should not panic even if files don't exist.
-            cleanup_files();
+            cleanup_files(control);
         });
     }
 
     #[test]
     fn test_read_port_missing_returns_error() {
-        with_temp_dir(|| {
-            let result = read_port();
+        with_temp_control(|control, _| {
+            let result = read_port(control);
             assert!(
                 result.is_err(),
                 "read_port should return error when file is missing"
@@ -743,8 +770,8 @@ mod tests {
 
     #[test]
     fn test_ensure_symforge_dir_creates_directory() {
-        with_temp_dir(|| {
-            let dir = ensure_symforge_dir(None).expect("ensure_symforge_dir should succeed");
+        with_temp_control(|control, _| {
+            let dir = ensure_symforge_dir(control).expect("ensure_symforge_dir should succeed");
             assert!(
                 dir.exists(),
                 ".symforge directory should exist after ensure_symforge_dir"
@@ -755,34 +782,33 @@ mod tests {
 
     #[test]
     fn test_ensure_symforge_dir_idempotent() {
-        with_temp_dir(|| {
-            ensure_symforge_dir(None).expect("first call should succeed");
-            ensure_symforge_dir(None).expect("second call should also succeed (idempotent)");
+        with_temp_control(|control, _| {
+            ensure_symforge_dir(control).expect("first call should succeed");
+            ensure_symforge_dir(control).expect("second call should also succeed (idempotent)");
         });
     }
     #[test]
     fn test_check_stale_returns_false_when_no_port_file() {
-        with_temp_dir(|| {
-            let is_stale = check_stale("127.0.0.1");
+        with_temp_control(|control, _| {
+            let is_stale = check_stale(control, "127.0.0.1", None);
             assert!(!is_stale, "no port file means nothing is stale");
         });
     }
 
     #[test]
     fn test_check_stale_cleans_up_when_port_is_closed() {
-        with_temp_dir(|| {
+        with_temp_control(|control, dir| {
             // Write a port that is very unlikely to have anything listening.
-            write_port_file(19999, None).expect("write should succeed");
-            write_pid_file(99999, None).expect("write should succeed");
+            write_port_file(19999, control).expect("write should succeed");
+            write_pid_file(99999, control).expect("write should succeed");
 
-            let is_stale = check_stale("127.0.0.1");
+            let is_stale = check_stale(control, "127.0.0.1", None);
             assert!(
                 is_stale,
                 "port 19999 should be detected as stale (nothing listening)"
             );
 
             // Cleanup should have been called.
-            let dir = PathBuf::from(DIR_NAME);
             assert!(
                 !dir.join(port_file_name()).exists(),
                 "port file cleaned up after stale detection"

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use symforge::domain::ControlStateDir;
 use symforge::live_index::persist;
 use symforge::live_index::{IndexState, LiveIndex, ParseStatus};
 use tempfile::tempdir;
@@ -32,6 +33,21 @@ fn write_file(dir: &Path, name: &str, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn project_binding(root: &Path) -> symforge::domain::RootBinding {
+    match symforge::discovery::resolve_root_candidate(
+        root,
+        symforge::domain::RootCandidateSource::LaunchCwd,
+        symforge::domain::RootRequestMode::Automatic,
+    ) {
+        symforge::domain::RootResolution::Bound(binding) => binding,
+        resolution => panic!("fixture root should bind: {resolution:?}"),
+    }
+}
+
+fn state_placement(root: &Path) -> symforge::domain::StatePlacement {
+    symforge::discovery::resolve_state_placement(&project_binding(root))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -61,64 +77,6 @@ fn symforge_binary_path() -> Option<PathBuf> {
     binary_unix.exists().then_some(binary_unix)
 }
 
-fn read_trimmed(path: &Path) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|contents| contents.trim().to_string())
-        .filter(|contents| !contents.is_empty())
-}
-
-// The spawned sidecar writes OS-tagged runtime files (sidecar.<os>.port); these test
-// helpers run on the SAME OS as the spawned binary, so std::env::consts::OS matches.
-// Fall back to the legacy un-tagged name for resilience.
-fn read_runtime(dir: &Path, stem: &str, ext: &str) -> Option<String> {
-    let sf = dir.join(".symforge");
-    let tagged = format!("{stem}.{}.{ext}", std::env::consts::OS);
-    read_trimmed(&sf.join(&tagged)).or_else(|| read_trimmed(&sf.join(format!("{stem}.{ext}"))))
-}
-
-/// Task 8: adapters now write one per-process JSON descriptor under
-/// `.symforge/sessions/` instead of the fixed port/pid/session files. Read
-/// the descriptor first; fall back to the legacy fixed files so the probe
-/// still understands records from older binaries.
-fn read_session_descriptor(dir: &Path) -> Option<(u16, Option<String>)> {
-    let sessions = dir.join(".symforge").join("sessions");
-    let os_tag = format!(".{}.json", std::env::consts::OS);
-    for entry in std::fs::read_dir(&sessions).ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("sidecar.") || !name.ends_with(&os_tag) {
-            continue;
-        }
-        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-            continue;
-        };
-        let Some(port) = value["port"].as_u64() else {
-            continue;
-        };
-        let session = value["session_id"].as_str().map(str::to_string);
-        return Some((port as u16, session));
-    }
-    None
-}
-
-fn read_sidecar_port(dir: &Path) -> Option<u16> {
-    if let Some((port, _)) = read_session_descriptor(dir) {
-        return Some(port);
-    }
-    read_runtime(dir, "sidecar", "port")?.parse().ok()
-}
-
-fn read_session_id(dir: &Path) -> Option<String> {
-    if let Some((_, session)) = read_session_descriptor(dir) {
-        return session;
-    }
-    read_runtime(dir, "sidecar", "session")
-}
-
 /// Make a synchronous raw HTTP GET request to `127.0.0.1:{port}{path}`.
 fn raw_http_get(port: u16, path: &str) -> anyhow::Result<String> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
@@ -141,9 +99,16 @@ fn raw_http_get(port: u16, path: &str) -> anyhow::Result<String> {
     Ok(body)
 }
 
-fn fetch_startup_surface(dir: &Path) -> Option<StartupSurface> {
-    let port = read_sidecar_port(dir)?;
-    let session_id = read_session_id(dir);
+fn fetch_startup_surface(
+    project_root: &Path,
+    control_state: &ControlStateDir,
+) -> Option<StartupSurface> {
+    let (port, session_id) = symforge::sidecar::port_file::read_sidecar_endpoint(
+        control_state,
+        "127.0.0.1",
+        Some(project_root),
+    )
+    .ok()?;
     let path = session_id
         .as_ref()
         .map(|session_id| format!("/v1/sessions/{session_id}/sidecar/health"))
@@ -247,6 +212,8 @@ fn test_startup_loads_all_files() {
 #[test]
 fn test_startup_binary_reports_branch_health() {
     let dir = tempdir().unwrap();
+    let control_home = tempdir().unwrap();
+    let control_state = ControlStateDir::new(control_home.path().to_path_buf());
     fs::create_dir(dir.path().join(".git")).unwrap();
     write_file(dir.path(), "src/main.rs", "fn main() {}\n");
     write_file(dir.path(), "src/lib.rs", "pub fn helper() {}\n");
@@ -261,6 +228,7 @@ fn test_startup_binary_reports_branch_health() {
         .current_dir(dir.path())
         .env("RUST_LOG", "info")
         .env("SYMFORGE_NO_DAEMON", "1")
+        .env("SYMFORGE_HOME", control_state.as_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -280,7 +248,7 @@ fn test_startup_binary_reports_branch_health() {
             panic!("startup process exited before health probe completed: {status}");
         }
 
-        if let Some(surface) = fetch_startup_surface(dir.path()) {
+        if let Some(surface) = fetch_startup_surface(dir.path(), &control_state) {
             if first_surface.is_none() {
                 first_surface = Some(surface.clone());
             }
@@ -1197,6 +1165,7 @@ fn test_get_file_content_with_around_symbol() {
 #[test]
 fn test_persist_round_trip() {
     let dir = tempdir().unwrap();
+    let placement = state_placement(dir.path());
 
     // Create source files
     write_file(dir.path(), "main.rs", "fn main() {}\nfn helper() {}");
@@ -1208,15 +1177,15 @@ fn test_persist_round_trip() {
     // Serialize it
     {
         let guard = shared.read();
-        persist::serialize_index(&guard, dir.path()).expect("serialize should succeed");
+        persist::serialize_index(&guard, dir.path(), &placement).expect("serialize should succeed");
     }
 
     // Load snapshot
-    let snapshot =
-        persist::load_snapshot(dir.path()).expect("snapshot should be loadable after serialize");
+    let snapshot = persist::load_snapshot(dir.path(), &placement)
+        .expect("snapshot should be loadable after serialize");
 
     assert_eq!(
-        snapshot.version, 4,
+        snapshot.version, 7,
         "snapshot version should match current schema"
     );
     assert_eq!(snapshot.files.len(), 2, "snapshot should contain 2 files");
@@ -1271,6 +1240,7 @@ fn test_persist_round_trip() {
 #[test]
 fn test_persist_corrupt_fallback() {
     let dir = tempdir().unwrap();
+    let placement = state_placement(dir.path());
 
     // Write garbage bytes where index.bin should be
     fs::create_dir_all(dir.path().join(".symforge")).unwrap();
@@ -1281,7 +1251,7 @@ fn test_persist_corrupt_fallback() {
     .unwrap();
 
     // Must return None without panicking
-    let result = persist::load_snapshot(dir.path());
+    let result = persist::load_snapshot(dir.path(), &placement);
     assert!(
         result.is_none(),
         "corrupt index.bin must return None, not panic"
@@ -1304,22 +1274,28 @@ fn test_persist_corrupt_fallback() {
 
 #[test]
 fn test_persist_version_mismatch() {
-    use std::collections::HashMap;
     use symforge::live_index::persist::IndexSnapshot;
 
     let dir = tempdir().unwrap();
+    let binding = project_binding(dir.path());
+    let placement = symforge::discovery::resolve_state_placement(&binding);
 
-    // Manually create a snapshot with a future version number
-    let future_snapshot = IndexSnapshot {
-        version: 999,
-        files: HashMap::new(),
-    };
+    // Start from a complete current snapshot so this fixture remains coupled
+    // only to the version gate, not every required header field.
+    write_file(dir.path(), "future.rs", "fn future() {}");
+    let shared = LiveIndex::load(dir.path()).unwrap();
+    persist::serialize_index(&shared.read(), dir.path(), &placement)
+        .expect("current snapshot should serialize");
+    let snapshot_path = dir.path().join(".symforge").join("index.bin");
+    let current_bytes = fs::read(&snapshot_path).unwrap();
+    let mut future_snapshot: IndexSnapshot =
+        postcard::from_bytes(&current_bytes).expect("current snapshot should deserialize");
+    future_snapshot.version = 999;
     let bytes = postcard::to_stdvec(&future_snapshot).expect("postcard serialize should work");
-    fs::create_dir_all(dir.path().join(".symforge")).unwrap();
-    fs::write(dir.path().join(".symforge").join("index.bin"), &bytes).unwrap();
+    fs::write(snapshot_path, &bytes).unwrap();
 
     // Must return None (version mismatch)
-    let result = persist::load_snapshot(dir.path());
+    let result = persist::load_snapshot(dir.path(), &placement);
     assert!(result.is_none(), "version mismatch must return None");
 }
 

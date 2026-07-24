@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::domain::{ControlStateDir, ProjectStateDir};
 use crate::{hash, paths};
 
 const KEY_HASH_FRAME_PREFIX: &[u8] = b"symforge-idempotency-key-v1\0";
@@ -197,8 +198,22 @@ pub struct FileReplayStore {
 }
 
 impl FileReplayStore {
-    pub fn open(project_root: &Path) -> Result<Self, IdempotencyError> {
-        let idempotency_dir = paths::ensure_idempotency_dir(project_root)?;
+    pub fn open(project_state: &ProjectStateDir) -> Result<Self, IdempotencyError> {
+        Self::open_in(paths::project_state_path(
+            project_state,
+            paths::IDEMPOTENCY_DIR_NAME,
+        ))
+    }
+
+    pub fn open_control(control_state: &ControlStateDir) -> Result<Self, IdempotencyError> {
+        Self::open_in(paths::control_state_path(
+            control_state,
+            paths::IDEMPOTENCY_DIR_NAME,
+        ))
+    }
+
+    fn open_in(idempotency_dir: PathBuf) -> Result<Self, IdempotencyError> {
+        fs::create_dir_all(&idempotency_dir)?;
         let records_dir = idempotency_dir.join("records");
         let quarantine_dir = idempotency_dir.join("quarantine");
         fs::create_dir_all(&records_dir)?;
@@ -406,25 +421,20 @@ impl FileReplayStore {
 }
 
 pub fn begin_index_folder_replay(
-    store_root: &Path,
-    conflict_probe_root: Option<&Path>,
+    control_state: &ControlStateDir,
     canonical_request_root: &Path,
     raw_key: &str,
     reset_requested: bool,
+    allow_protected_root: bool,
 ) -> Result<ReplayStart, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
-    let request_hash = index_folder_request_hash(canonical_request_root, reset_requested)?;
+    let request_hash = index_folder_request_hash(
+        canonical_request_root,
+        reset_requested,
+        allow_protected_root,
+    )?;
 
-    if let Some(probe_root) = conflict_probe_root
-        && !same_normalized_path(probe_root, store_root)
-    {
-        let probe_store = FileReplayStore::open(probe_root)?;
-        if let Some(record) = probe_store.replay_if_present(&key, &request_hash)? {
-            return Ok(ReplayStart::Replay(replay_response(&record)));
-        }
-    }
-
-    let store = FileReplayStore::open(store_root)?;
+    let store = FileReplayStore::open_control(control_state)?;
 
     match store.check_or_reserve(&key, &request_hash)? {
         ReplayDecision::FirstExecution(_) => Ok(ReplayStart::FirstExecution(ActiveReplay {
@@ -437,14 +447,14 @@ pub fn begin_index_folder_replay(
 }
 
 pub fn begin_tool_replay(
-    store_root: &Path,
+    project_state: &ProjectStateDir,
     tool_name: &str,
     raw_key: &str,
     request: &Value,
 ) -> Result<ReplayStart, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
     let request_hash = RequestHash::for_tool_request(tool_name, request)?;
-    let store = FileReplayStore::open(store_root)?;
+    let store = FileReplayStore::open(project_state)?;
 
     match store.check_or_reserve(&key, &request_hash)? {
         ReplayDecision::FirstExecution(_) => Ok(ReplayStart::FirstExecution(ActiveReplay {
@@ -475,14 +485,14 @@ pub fn begin_tool_replay(
 /// consuming a reservation, so a later `begin_tool_replay` on the miss path
 /// still sees a clean slate.
 pub fn probe_tool_replay(
-    store_root: &Path,
+    project_state: &ProjectStateDir,
     tool_name: &str,
     raw_key: &str,
     request: &Value,
 ) -> Result<Option<String>, IdempotencyError> {
     let key = IdempotencyKey::new(raw_key)?;
     let request_hash = RequestHash::for_tool_request(tool_name, request)?;
-    let store = FileReplayStore::open(store_root)?;
+    let store = FileReplayStore::open(project_state)?;
 
     match store.replay_if_present(&key, &request_hash)? {
         Some(record) => Ok(Some(replay_response(&record))),
@@ -490,19 +500,17 @@ pub fn probe_tool_replay(
     }
 }
 
-fn same_normalized_path(left: &Path, right: &Path) -> bool {
-    normalized_path_string(left) == normalized_path_string(right)
-}
-
 pub fn index_folder_request_hash(
     canonical_root: &Path,
     reset_requested: bool,
+    allow_protected_root: bool,
 ) -> Result<RequestHash, IdempotencyError> {
     RequestHash::for_tool_request(
         "index_folder",
         &json!({
             "path": normalized_path_string(canonical_root),
             "reset": reset_requested,
+            "allow_protected_root": allow_protected_root,
         }),
     )
 }
@@ -528,6 +536,18 @@ pub fn format_tool_error(error: &IdempotencyError) -> String {
         IdempotencyError::Conflict { .. } => format!("Idempotency conflict: {error}"),
         _ => format!("Idempotency error: {error}"),
     }
+}
+
+pub fn format_live_postcondition_unavailable(
+    historical_receipt: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    format!(
+        "applied=false outcome=live_postcondition_unavailable\n\
+         historical_receipt_begin\n{historical_receipt}\n\
+         historical_receipt_end\n\
+         live_postcondition_error={error}"
+    )
 }
 
 fn normalized_path_string(path: &Path) -> String {
