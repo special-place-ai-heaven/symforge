@@ -26,6 +26,39 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.15.0...v8.16.0) (2026-07-24)
+
+
+### Features
+
+* checkpoint repository knowledge index implementation ([eaaf867](https://github.com/special-place-ai-heaven/symforge/commit/eaaf867c30c1c32f3fa5f5195955ef40cb764b69))
+* **curation:** close Gate K durability and continuity audit ([ed104aa](https://github.com/special-place-ai-heaven/symforge/commit/ed104aa6d0c110fbbae7104499db438258e7db2d))
+* **gate-l:** gated production reconcile caller + L-R08 source-isolation test ([f174ea9](https://github.com/special-place-ai-heaven/symforge/commit/f174ea9fe8b2f1e4472a8afc4be05578790a3fac))
+* **gate-l:** worktree classifier + ref-topology reconcile driver (L-G01/L-G05/L-R03/L-R05) ([130f57b](https://github.com/special-place-ai-heaven/symforge/commit/130f57b92a04566a69eaef8d979fbd085105e74a))
+* **gate-m:** M-001 health knowledge fields + M-002 assertions ([1f52606](https://github.com/special-place-ai-heaven/symforge/commit/1f5260666017147af2dd48019904a5dc2605c457))
+* **gate-m:** M-001 review fixes + M-003/005/006/007 verification ([9ee4df0](https://github.com/special-place-ai-heaven/symforge/commit/9ee4df089626cda2c24c5ab2229dce50d4a4ba00))
+* **local-ref:** add bounded in-process git2 tree/blob scout (Gate L L-G02) ([fd9bdeb](https://github.com/special-place-ai-heaven/symforge/commit/fd9bdeb260ca475c6625e0659b343d06b1b62cd1))
+* **local-ref:** assemble queryable root-less ref-source LiveIndex (Gate L L-G05 foundation) ([15b1569](https://github.com/special-place-ai-heaven/symforge/commit/15b15697151b083e199cb56c5e6b8d6f9bff20a9))
+* **local-ref:** object-ID-deduplicated ref blob byte store (Gate L L-G03) ([60ebddf](https://github.com/special-place-ai-heaven/symforge/commit/60ebddfc1f38318b256a0a441a7396297a2d3a7e))
+* **local-ref:** publish ref source into multi-source set under lock (Gate L L-G07) ([86d9813](https://github.com/special-place-ai-heaven/symforge/commit/86d9813fa9c97613ed013bc281777366d11e8c66))
+* **local-ref:** route ref blobs through shared secret/parser adapters (Gate L L-G04) ([70ea535](https://github.com/special-place-ai-heaven/symforge/commit/70ea535b4006a98d6d894b1885a911369f083ab5))
+* **review:** compose review_knowledge across source scopes (Gate L L-G06 parity) ([ff2efa5](https://github.com/special-place-ai-heaven/symforge/commit/ff2efa581abceb92a9433caecf68c79818c9c138))
+* **search:** compose search_knowledge across source scopes (Gate L L-G06) ([70f59e5](https://github.com/special-place-ai-heaven/symforge/commit/70f59e560fe7fdc53cf910bb9d475563f564b7de))
+
+
+### Bug Fixes
+
+* **aap:** close SF-AAP-001/002/003 tool-contract release blockers ([883d997](https://github.com/special-place-ai-heaven/symforge/commit/883d997862a80ff661b303fb2cadd616aa4de243))
+* **build:** green embed --all-targets clippy — gate server-only tests + embed contract lints ([1eed53c](https://github.com/special-place-ai-heaven/symforge/commit/1eed53c87c582a11a32719c61ae9bc2bf7422f1b))
+* **build:** resolve Linux-only lint gates the branch's unix paths tripped ([3dc8685](https://github.com/special-place-ai-heaven/symforge/commit/3dc86852d1179afbe17796a1de71896ca38eda16))
+* **gate-l:** close adversarial-review findings — P0 lane preservation, ref coverage, parse-once, multi-source envelope ([85d70dc](https://github.com/special-place-ai-heaven/symforge/commit/85d70dc52acaa0b5eea667dae546c32919e84f72))
+* **gate-l:** close adversarial-review findings — secret-path parity, reconcile resilience, fail-closed worktrees, P1 generations ([346097f](https://github.com/special-place-ai-heaven/symforge/commit/346097f3ef65094041b7a965455f3cca47834d14))
+* **gate-l:** close cross-model validation findings — admission parity, worktree-instance HEAD, fail-closed hardening ([483aa84](https://github.com/special-place-ai-heaven/symforge/commit/483aa84b18b1a2baa3ce6845c9ab3e536f3f7b95))
+* **gate-l:** cross-project search/review honor source_scope (L-R09/L-G06) + L-R11 tool-dispatch coverage ([4eb0b68](https://github.com/special-place-ai-heaven/symforge/commit/4eb0b68814822f475c3eb0db057de04cf3362f52))
+* **gate-m:** close M-012 embed gate + resolve Cursor AAP review findings ([315c2b9](https://github.com/special-place-ai-heaven/symforge/commit/315c2b997fe07d21a73647df003dd9ad1c624268))
+* **gate-m:** embed background_verify reports honest Degraded freshness (Kimi K3 review blocker) ([2dcfa41](https://github.com/special-place-ai-heaven/symforge/commit/2dcfa4150acf17e18f8b6a81272471e55e7d43a3))
+* **lint:** drive clippy --all-targets to zero (Gate-M gate blocker) ([dc0e0f2](https://github.com/special-place-ai-heaven/symforge/commit/dc0e0f209bf7608656541d350fb52fd2207c09d1))
+
 ## [8.15.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.14.1...v8.15.0) (2026-07-14)
 
 Version 8.15.0 changes 74 files with 7,591 additions and 85 deletions. Most
