@@ -62,10 +62,24 @@ pub fn plan_edit(
             collect_type_scoped_hits(&mut symbol_hits, index, target_path, target_name);
         }
     } else {
-        for (path, file) in index.all_files() {
-            collect_selector_hits(&mut symbol_hits, path, file, target);
-            if path.ends_with(target) || path == target {
-                file_hit = Some(path.clone());
+        // SF-AAP-001: an existing repo-relative path (exact match, or a full
+        // trailing path-segment suffix like `notes.md` → `docs/notes.md`) is a
+        // LITERAL path and must beat symbol/generated-path heuristics. Without
+        // this short-circuit, `find_candidates_cascade` strips `config.json` →
+        // `json` (qualification stripping) and matches an unrelated symbol, so
+        // the plan recommended a DIFFERENT path. A literal path routes straight
+        // to the file plan and never the symbol branch.
+        let literal_path = index.all_files().find_map(|(path, _)| {
+            (path == target || path.ends_with(format!("/{target}").as_str())).then(|| path.clone())
+        });
+        if let Some(path) = literal_path {
+            file_hit = Some(path);
+        } else {
+            for (path, file) in index.all_files() {
+                collect_selector_hits(&mut symbol_hits, path, file, target);
+                if path.ends_with(target) || path == target {
+                    file_hit = Some(path.clone());
+                }
             }
         }
     }

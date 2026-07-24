@@ -904,10 +904,41 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
         .map(|reason| reason.to_string())
         .unwrap_or_else(|| "policy".to_string());
     let size_mb = view.size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+
+    // SF-AAP-002 is scoped to genuinely NON-PARSER files (no code parser exists
+    // for the type — the artifact/binary case). A parser-supported file demoted
+    // for SIZE is NOT this case: it keeps the honest oversize refusal that
+    // impact_admission (a frozen behavioral contract) pins. `from_extension` is
+    // the same parser-support signal impact_text uses for auto-indexing, so the
+    // wording stays truthful in both branches.
+    // ponytail: extension-based; a content-detected Text file at Tier-2 would read
+    // as non-parser, but such files index at Tier-1 and never reach here.
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let has_code_parser = crate::domain::LanguageId::from_extension(extension).is_some();
+
+    if has_code_parser {
+        return format!(
+            "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
+             The admission gate applies to analyze_file_impact the same as bulk load \
+             and the watcher (no force-admit). Use get_file_content for raw reads."
+        );
+    }
+
+    let generation = state.index.current_project_generation();
+    // Reconciled non-parser file: EXISTS in the catalog, analysis simply
+    // unsupported. Report truthful existence + generation/Tier evidence and a
+    // typed unsupported-analysis outcome — never false absence for a tracked file.
     format!(
-        "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
-         The admission gate applies to analyze_file_impact the same as bulk load \
-         and the watcher (no force-admit). Use get_file_content for raw reads."
+        "── Impact: {path} ──\n\
+         Status: exists (analysis unsupported — {tier_label}, no code parser)\n\
+         exists: true\n\
+         Tier: {tier_label} — reason: {reason}, size {size_mb:.1} MB\n\
+         Generation: {generation}\n\
+         The file IS tracked (metadata only), not absent; impact/symbol analysis is \
+         unsupported for this file type. Use get_file_content for raw reads."
     )
 }
 

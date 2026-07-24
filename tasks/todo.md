@@ -977,13 +977,22 @@ harness sessions (installed daemons pick up the fixes) → `cargo clean`.
   - [ ] Gates E-M: continue only in frozen order after each prior gate is green.
 - [ ] Before final review/commit/push, close the AAP-reproduced SymForge tool-contract report in
   priority order with behavioral REDs, focused GREENs, impact review, and regression coverage:
-  - [ ] SF-AAP-001: literal existing repo-relative paths (`.md`, `.ts`, `.d.ts`, `.test.ts`, `.json`,
+  - [x] SF-AAP-001: literal existing repo-relative paths (`.md`, `.ts`, `.d.ts`, `.test.ts`, `.json`,
     `.ps1`, dotted basenames, and symbol-free files) always beat symbol/generated heuristics in
     `edit_plan`; return a typed file limitation when needed and never recommend another path.
-  - [ ] SF-AAP-003: parallel `get_file_content` range calls complete, queue within a bounded time, or
+    (FIXED: `plan_edit` short-circuits an existing literal path — exact or `/`-anchored suffix —
+    before the symbol cascade, which was stripping `config.json`->`json`. Tests
+    `edit_plan_literal_path_precedence` + 9 `edit_plan_symbol_line` regressions.)
+  - [x] SF-AAP-003: parallel `get_file_content` range calls complete, queue within a bounded time, or
     return a typed busy/unsupported result with request/cancellation diagnostics; never hang.
-  - [ ] SF-AAP-002: `analyze_file_impact` reports stable `exists=true` plus generation/Tier-2 evidence
+    (ALREADY SATISFIED — did not reproduce: 32 concurrent range calls incl. the reconcile write
+    path complete in ~0.1s; no lock held across await; regression coverage `get_file_content_concurrency`.
+    Caveat: the daemon proxy/IPC transport is not exercised in-process.)
+  - [x] SF-AAP-002: `analyze_file_impact` reports stable `exists=true` plus generation/Tier-2 evidence
     and a typed unsupported-analysis result for newly reconciled non-parser files, never false absence.
+    (FIXED: `impact_skipped_text` reports `exists:true` + Tier + Generation + typed unsupported ONLY for
+    genuinely non-parser files — `LanguageId::from_extension` gate — so size-demoted PARSER files keep
+    their `impact_refuses_oversized_*` refusal. Tests `analyze_file_impact_non_parser`; `impact_admission` 5/5.)
   Do not claim SpecKit 020's Markdown/read work alone fixes any of these independent contracts.
 - [ ] Verify token-efficient retrieval on real architecture/spec/plan documents
   and document the results.
