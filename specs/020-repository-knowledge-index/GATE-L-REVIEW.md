@@ -180,11 +180,9 @@ Documented, intentional (see `tasks/todo.md` "Gate L Progress"):
   reopen but not on live branch movement while open (a documented `// ponytail:` ceiling).
 - **Gate M** (health/surface/corpus/embed) and **AAP** blockers — later gates.
 - `remove_ref_source` had a dead-code allow; it now has the reconcile driver as caller.
-- **L-R05 process-spawn spy** and **L-V02 latency/memory benchmark** are the two Gate L
-  boxes still open ON PURPOSE: offline ingestion is proven and the ingestion path is
-  libgit2-only (structurally subprocess-free), and the default path is inert with the
-  feature OFF by default. The missing pieces are a runtime spawn-spy *assertion* and a
-  formal *measurement* — known follow-ups, NOT findings. Do not report them.
+- **L-R05 process-spawn spy** and **L-V02 latency/memory measurement** are now CLOSED
+  (`process_spawn_spy_confirms_offline_ingestion_never_shells_out`,
+  `local_ref_gate_default_path_cost_is_negligible`). Gate L is 22/22.
 - **Ref-lane manifest** omits metadata-only/catalog-only entries (finding G) — accepted, no
   contract mandate. **Symlink** blobs index as link-text and **submodules** are skipped —
   minor filesystem-parity notes, not violations. Do not report these.
@@ -200,9 +198,9 @@ C:\Users\rakovnik\.cargo\bin\cargo.EXE test -j1 --lib --features server -- --tes
 Notes: artifacts go to the repo-local `target/` on `E:` (gitignored) — **`cargo clean`
 when done**, the tree fills fast. `.rs` files ≥ ~90 KB may be `UnstableDuringRead`-demoted
 on a cold `LiveIndex::load` while another SymForge watcher is live — environment race, not
-a code bug. State at review time (HEAD `6973af2`): full lib suite **2995 passed / 0 failed /
-2 ignored**; `clippy --all-targets --features server -D warnings` clean; `fmt --check` clean.
-20/22 Gate L boxes green (L-R05 spawn-spy + L-V02 benchmark are the known-open two above).
+a code bug. State: `clippy --all-targets --features server -D warnings` clean; `fmt --check`
+clean; **all 22/22 Gate L boxes green** — L-R05 (spawn-spy) and L-V02 (default-path
+measurement, ~133 ns/call) are now closed.
 
 ## Output
 

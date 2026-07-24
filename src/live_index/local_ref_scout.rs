@@ -2910,4 +2910,265 @@ mod tests {
             current_review.rendered
         );
     }
+
+    // ----- Gate L VERIFY: L-R05 process-spawn spy + L-V02 default-path cost -----
+
+    /// Test-only env guard: sets/removes a process env var and restores the prior
+    /// value on drop. The lib suite runs `--test-threads=1`, so mutating process
+    /// env in a test is safe (no concurrent readers). Mirrors the `EnvVarGuard` in
+    /// `daemon.rs` / `tools.rs`, adding an `OsStr` setter for `PATH`.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[allow(unsafe_code)] // test-only env guard; single-threaded test context.
+    impl EnvVarGuard {
+        fn set_os(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: lib tests run single-threaded (--test-threads=1); no concurrent env readers.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            Self::set_os(key, value.as_ref())
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: lib tests run single-threaded (--test-threads=1); no concurrent env readers.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // test-only env guard restores process env on drop.
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                // SAFETY: lib tests run single-threaded (--test-threads=1); no concurrent env readers.
+                Some(previous) => unsafe {
+                    std::env::set_var(self.key, previous);
+                },
+                // SAFETY: lib tests run single-threaded (--test-threads=1); no concurrent env readers.
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    /// Plant CANARY stub executables that a `git` / `git-lfs` spawn would resolve
+    /// to. Each stub, if ever invoked, appends a line to `canary`. On Unix the
+    /// extensionless `git`/`git-lfs` shell scripts get a `#!/bin/sh` shebang and the
+    /// exec bit; on Windows the `.bat`/`.cmd` variants cover the `cmd`-resolved
+    /// `CreateProcess` lookup. The absolute canary path is baked into each stub, so
+    /// the stub needs no env of its own.
+    fn write_git_spawn_canary_stubs(bin_dir: &Path, canary: &Path) {
+        let canary_display = canary.to_string_lossy();
+
+        // Windows cmd-resolved stubs.
+        let batch = format!("@echo off\r\necho spawned >> \"{canary_display}\"\r\nexit /b 0\r\n");
+        for name in ["git.bat", "git-lfs.bat", "git.cmd", "git-lfs.cmd"] {
+            std::fs::write(bin_dir.join(name), batch.as_bytes())
+                .expect("write windows canary stub");
+        }
+
+        // Unix shell stubs (best-effort on non-Unix hosts: the file is written, the
+        // exec bit is Unix-only).
+        let script = format!("#!/bin/sh\necho spawned >> \"{canary_display}\"\nexit 0\n");
+        for name in ["git", "git-lfs"] {
+            let path = bin_dir.join(name);
+            std::fs::write(&path, script.as_bytes()).expect("write unix canary stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path)
+                    .expect("stub metadata")
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).expect("chmod canary stub");
+            }
+        }
+    }
+
+    /// L-R05 (spy half): a process-spawn spy proves offline local-ref ingestion
+    /// spawns NO `git`/`git-lfs` child process. The scout/ingest chain is pure
+    /// vendored-libgit2 FFI (ODB reads; no smudge/LFS filter), so it never shells
+    /// out to Git or Git-LFS — there is no child process that could fetch or
+    /// materialize an object over the network.
+    ///
+    /// We plant canary stubs named `git`/`git-lfs` (plus Windows `.bat`/`.cmd`
+    /// variants) on a temp `PATH` and point `GIT_EXEC_PATH` at the same dir; each
+    /// stub, if ever invoked, appends to a canary file. Running the FULL offline
+    /// ref ingestion under that hostile env and asserting the canary was NEVER
+    /// created proves no subprocess ran. Because libgit2 spawns nothing, the canary
+    /// stays clean on every platform — the test's standing value is regression
+    /// detection: it fails loudly if a future change puts a Git/LFS subprocess on
+    /// this path.
+    ///
+    /// Platform caveat: the stub is reliably invocable as a shell script on Unix
+    /// (shebang + exec bit); on Windows the `.bat`/`.cmd` stubs cover the
+    /// `cmd`-resolved `CreateProcess` lookup. Since libgit2 never spawns, the
+    /// expected outcome (canary absent) is identical on all platforms.
+    ///
+    /// `#[ignore]`d (run via `--ignored`, like the perf smokes): it mutates
+    /// process-global `PATH`/`GIT_EXEC_PATH`, and `std::env::set_var` racing another
+    /// test's live background thread reading env is UB — so it must not run inside
+    /// the default multi-fixture suite. Run isolated:
+    /// `cargo test --lib --features server -- --ignored --test-threads=1 process_spawn_spy`
+    #[test]
+    #[ignore]
+    fn process_spawn_spy_confirms_offline_ingestion_never_shells_out() {
+        let bin_dir = tempfile::tempdir().expect("bin tempdir");
+        let canary = bin_dir.path().join("spawned.canary");
+        write_git_spawn_canary_stubs(bin_dir.path(), &canary);
+
+        // Prepend the hostile bin dir to PATH and point GIT_EXEC_PATH at it, so any
+        // git/git-lfs spawn (argv[0] lookup or git's own helper dir) resolves to a
+        // canary stub. GIT_TERMINAL_PROMPT=0 forbids interactive fallback. Guards
+        // restore the prior env on drop; libgit2 ignores all three, which is the
+        // point.
+        let previous_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut search = bin_dir.path().as_os_str().to_owned();
+        search.push(if cfg!(windows) { ";" } else { ":" });
+        search.push(&previous_path);
+        let _path = EnvVarGuard::set_os("PATH", &search);
+        let _exec = EnvVarGuard::set_os("GIT_EXEC_PATH", bin_dir.path().as_os_str());
+        let _prompt = EnvVarGuard::set_str("GIT_TERMINAL_PROMPT", "0");
+
+        // Full offline ref ingestion: a temp git repo with NO remote, a couple of
+        // committed files, and a bare branch — the same fixture as
+        // `reconcile_ingests_offline_with_no_remote_configured`, run here under the
+        // spy so even repo setup is watched.
+        let dir = tempfile::tempdir().expect("repo tempdir");
+        let root = dir.path();
+        init_repo(root);
+        commit_files(
+            root,
+            &[
+                ("src/lib.rs", b"pub fn spy() {}\n"),
+                ("docs/readme.md", b"# spy\n"),
+            ],
+            "initial",
+        );
+        let repository = git2::Repository::open(root).expect("open");
+        let head_commit = repository
+            .head()
+            .expect("head")
+            .peel_to_commit()
+            .expect("peel");
+        repository
+            .branch("spy-ref", &head_commit, false)
+            .expect("branch");
+        assert!(
+            repository.remotes().expect("remotes").is_empty(),
+            "the spy fixture has no git remote — a successful ingest needs no fetch"
+        );
+
+        let handle = SharedIndexHandle::new(LiveIndex::from_source_files(HashMap::new()));
+        let repository_id = RepositoryId::new("repo-spy");
+        let outcome = reconcile_local_ref_topology(
+            &handle,
+            &repository,
+            repository_id.clone(),
+            &LocalRefScoutBudget::default(),
+        )
+        .expect("offline reconcile succeeds under the process-spawn spy");
+
+        let ref_id = SourceId::new(format!(
+            "symforge:git-ref:{}:refs/heads/spy-ref",
+            repository_id.as_str()
+        ));
+        assert!(
+            outcome.published.contains(&ref_id),
+            "the local ref lane is published — the full ingest path actually ran"
+        );
+
+        assert!(
+            !canary.exists(),
+            "L-R05: a git/git-lfs subprocess was spawned during local-ref ingestion \
+             (canary file {} exists) — this path must be pure libgit2 FFI with no \
+             Git/LFS child process",
+            canary.display()
+        );
+    }
+
+    /// L-V02 (default-path latency): with the local-ref lanes feature OFF (its
+    /// default — `SYMFORGE_LOCAL_REF_LANES` unset), the ONLY cost added to the
+    /// per-reload default path is a single `std::env::var` gate read
+    /// (`daemon::local_ref_lanes_enabled`, mirrored below). This ignored perf smoke
+    /// measures that gate's mean per-call cost over many iterations, PRINTS it, and
+    /// asserts it stays under a deliberately generous budget — a gross-regression
+    /// tripwire (e.g. someone puts real git/scout work on the default path), not a
+    /// moving baseline.
+    ///
+    /// The behavioral half — a default (gate-OFF) reload publishes NO
+    /// `symforge:git-ref:` lane and leaves `registry_generation` untouched — is
+    /// covered by `daemon::tests::local_ref_lanes_gate_off_publishes_no_ref_lane`.
+    /// Together they show the current-only default path is unchanged by
+    /// construction: OFF short-circuits before any git/scout work, and this
+    /// measurement confirms the residual gate read is negligible.
+    ///
+    /// Run with: `cargo test --lib --features server -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn local_ref_gate_default_path_cost_is_negligible() {
+        const LOCAL_REF_LANES_ENV: &str = "SYMFORGE_LOCAL_REF_LANES";
+        // Force the default (feature OFF); the guard restores any ambient value.
+        let _gate = EnvVarGuard::unset(LOCAL_REF_LANES_ENV);
+
+        // Exact mirror of `daemon::local_ref_lanes_enabled` — the sole cost the
+        // feature adds to the default reload path.
+        let gate_read = || {
+            std::env::var(LOCAL_REF_LANES_ENV)
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on"
+                    )
+                })
+        };
+
+        const ITERATIONS: u32 = 100_000;
+        // Warm the env lock / allocator before timing.
+        for _ in 0..1_000 {
+            std::hint::black_box(gate_read());
+        }
+
+        let mut enabled = 0u64;
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            if std::hint::black_box(gate_read()) {
+                enabled += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            std::hint::black_box(enabled),
+            0,
+            "gate is OFF by default, so no iteration reports enabled"
+        );
+
+        let per_call_ns = elapsed.as_nanos() as f64 / f64::from(ITERATIONS);
+        println!(
+            "L-V02 default-path gate read: {ITERATIONS} iterations in {elapsed:?} = \
+             {per_call_ns:.1} ns/call"
+        );
+
+        // Generous budget: a process-local env read is tens-to-hundreds of ns, so
+        // 50 us/call is ~100x-1000x headroom (never flakes) yet still trips on a
+        // gross regression — real git tree-walk/scout work would be milliseconds.
+        assert!(
+            per_call_ns < 50_000.0,
+            "L-V02: default-path gate read averaged {per_call_ns:.1} ns/call, over the \
+             50000 ns budget — the current-only default path gained non-negligible cost"
+        );
+    }
 }

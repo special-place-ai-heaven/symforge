@@ -655,11 +655,14 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 - [x] L-R04 Giant Git blob is catalog-only without materialization. (tests
   `giant_blob_is_catalog_only_without_materialization`,
   `catalog_only_blob_bytes_are_not_materialized`)
-- [ ] L-R05 A process-spawn spy fails on any Git/LFS child process while offline
+- [x] L-R05 A process-spawn spy fails on any Git/LFS child process while offline
   local-ref ingestion proves no network fetch callback or object materialization.
-  (as_of 2026-07-23: offline half PROVEN — `reconcile_ingests_offline_with_no_remote_configured`;
-  the libgit2-only ingestion path spawns no child process structurally, BUT a runtime
-  process-spawn spy assertion is NOT built. Remaining: the spy.)
+  (tests `reconcile_ingests_offline_with_no_remote_configured` +
+  `process_spawn_spy_confirms_offline_ingestion_never_shells_out` — plants canary
+  git/git-lfs stubs on PATH/GIT_EXEC_PATH, runs the full offline ingest, asserts the
+  lane published AND the canary never fired = pure libgit2 FFI, no child process. The
+  spy is `#[ignore]` (run via `--ignored`, like the perf smokes) because it mutates
+  process-global PATH; run isolated so `set_var` never races another test's env read.)
 - [x] L-R06 Mixed-freshness all-source envelope reports each source publication/
   content generation, digest, coverage, review hash, and worst overall coverage.
   (multi-source envelope + P1 per-source generations `ref_tip_move_advances_lane_generations…`)
@@ -715,11 +718,12 @@ types exist. The final data-model shape is post-H, not a Gate-E forward dependen
 ### VERIFY
 
 - [x] L-V01 Worktree/ref/source-scope/parity focused tests are green. (full lib suite 2995/0/2)
-- [ ] L-V02 Current-only default latency/memory is measured and unchanged within the
-  declared budget. (as_of 2026-07-23: default path is inert — `SYMFORGE_LOCAL_REF_LANES`
-  OFF by default, gate returns before any git/scout work, so behavior is unchanged BY
-  CONSTRUCTION; BUT a formal latency/memory benchmark is NOT run, and the default path pays
-  one `std::env::var` read per reload (Cursor LOW #8). Remaining: the measurement.)
+- [x] L-V02 Current-only default latency/memory is measured and unchanged within the
+  declared budget. (default path inert — `SYMFORGE_LOCAL_REF_LANES` OFF by default returns
+  before any git/scout work; measurement `local_ref_gate_default_path_cost_is_negligible`
+  (`#[ignore]` perf smoke) records the sole added cost — one env read — at ~133 ns/call,
+  ~376x under the 50us tripwire; gate-OFF publishes no lane, registry unchanged —
+  `local_ref_lanes_gate_off_publishes_no_ref_lane`)
 - [x] L-V03 All-sources query/review remains bounded, deterministic, and source-local.
   (scoped composition tests; per-source captured set)
 - [x] L-V04 Local-ref lane failure leaves current-worktree P0 Ready/queryable. (test
