@@ -2,11 +2,26 @@
 
 You are performing an **adversarial code review** of SymForge Feature 020's **Gate L**
 (worktrees + local refs) on branch `feat/repository-knowledge-index` in
-`E:\project\symforge` (a Rust MCP server). Find defects and contract violations and
-**report them** — do not broadly rewrite. Produce findings; the maintainer decides.
+`E:\project\symforge` (a Rust MCP server).
 
-Two reviewers are looking at this independently (Cursor and Kimi). Reason from the
-code, not the comments. Cite every finding as `path:line`. Empty is a valid answer.
+Two jobs, both wanted:
+1. **Find defects and contract violations** — bugs, races, parity gaps, fail-opens.
+2. **Suggest improvements** — better designs, simplifications, hardening, missing tests,
+   clearer invariants — EVEN WHERE THERE IS NO OUTRIGHT BUG. A "this works but here's a
+   stronger/cleaner way" is a valid and wanted contribution, not noise.
+
+**For every item — defect OR suggestion — propose a CONCRETE fix**: the specific change
+(sketch the diff or name the function + the new logic), not just "consider improving X". We
+expect to act on your fixes, so make them actionable and scoped.
+
+**READ-ONLY: do NOT edit any file, run any edit, or apply any change yourself.** This is a
+review, not an implementation task. Output every fix as a *description or diff sketch inside
+your report* — the maintainer's engineer applies them. Touching the code yourself is out of
+scope and unwanted; propose, don't patch.
+
+Two reviewers are looking at this independently (Cursor and Kimi). Reason from the code, not
+the comments. Cite every item as `path:line`. "Nothing above LOW and no worthwhile
+improvement" is a valid answer — but only after you've genuinely looked (see methodology).
 
 ## Review methodology (MANDATORY — shallow reviews miss the real bugs)
 
@@ -103,8 +118,15 @@ finding. Verify-these-are-closed:
     publishes a P1 lane per **bare** local branch; removes lanes for refs that are deleted
     or newly checked out; returns `checked_out` for a later daemon layer. (L-G05/L-R03.)
   - `route_catalog_files` parse cache keyed by `(object_id, classification, language,
-    is_tsx, is_c_header)` (L-R02/L-R14; the flavor keys were a round-2 fix).
-  - `source_isolation_never_crosses_ref_and_current_boundaries` test (L-R08).
+    is_tsx, is_c_header)` (L-R02/L-R14); `classify_ref_blob` applies `sensitive_path_rule`
+    before the content scan (L-R10 secret-path parity).
+  - tests `source_isolation_never_crosses_ref_and_current_boundaries` and
+    `source_isolation_holds_through_scoped_query_composition` (L-R08);
+    `sensitive_path_blob_is_withheld_by_path_even_when_content_is_clean` (A);
+    `reconcile_deletion_pass_runs_despite_a_branch_publish_failure` (C);
+    `ref_tip_move_advances_lane_generations_without_touching_current` (D);
+    `unresolved_worktree_head_fails_reconcile_closed…` + `empty_repo_unborn_head_reconciles_cleanly…` (E);
+    `concurrent_reconcile_is_single_flighted_and_skips` (F).
 - **`src/live_index/store.rs`** — `PublishedSourceSet::next_after_current_publish` (P0
   publish preserves P1 lanes), `publish_ref_source`/`remove_ref_source` (locked,
   registry_generation-safe), `build_ref_source_generation` (ref bundle from ref identity).
@@ -158,6 +180,14 @@ Documented, intentional (see `tasks/todo.md` "Gate L Progress"):
   reopen but not on live branch movement while open (a documented `// ponytail:` ceiling).
 - **Gate M** (health/surface/corpus/embed) and **AAP** blockers — later gates.
 - `remove_ref_source` had a dead-code allow; it now has the reconcile driver as caller.
+- **L-R05 process-spawn spy** and **L-V02 latency/memory benchmark** are the two Gate L
+  boxes still open ON PURPOSE: offline ingestion is proven and the ingestion path is
+  libgit2-only (structurally subprocess-free), and the default path is inert with the
+  feature OFF by default. The missing pieces are a runtime spawn-spy *assertion* and a
+  formal *measurement* — known follow-ups, NOT findings. Do not report them.
+- **Ref-lane manifest** omits metadata-only/catalog-only entries (finding G) — accepted, no
+  contract mandate. **Symlink** blobs index as link-text and **submodules** are skipped —
+  minor filesystem-parity notes, not violations. Do not report these.
 
 ## Verification commands (repo-pinned; clean up after)
 
@@ -170,9 +200,23 @@ C:\Users\rakovnik\.cargo\bin\cargo.EXE test -j1 --lib --features server -- --tes
 Notes: artifacts go to the repo-local `target/` on `E:` (gitignored) — **`cargo clean`
 when done**, the tree fills fast. `.rs` files ≥ ~90 KB may be `UnstableDuringRead`-demoted
 on a cold `LiveIndex::load` while another SymForge watcher is live — environment race, not
-a code bug. Current state at review time: full lib suite green; clippy `-D warnings` clean.
+a code bug. State at review time (HEAD `6973af2`): full lib suite **2995 passed / 0 failed /
+2 ignored**; `clippy --all-targets --features server -D warnings` clean; `fmt --check` clean.
+20/22 Gate L boxes green (L-R05 spawn-spy + L-V02 benchmark are the known-open two above).
 
 ## Output
 
-Findings list (BLOCKER→LOW): claim, failure scenario, `file:line`, contract ID. If a
-piece is clean, say so. If nothing is above LOW, say so plainly — do not invent issues.
+A written report (no file edits — see READ-ONLY above), in two parts:
+
+**Part 1 — Defects** (BLOCKER→LOW, most severe first). Each: one-line claim; concrete
+failure scenario (inputs → wrong output/crash); `file:line`; contract ID; and a **proposed
+fix** (diff sketch or the exact function + new logic).
+
+**Part 2 — Suggestions** (improvements with no outright bug): better design, simplification,
+hardening, a stronger/missing test, a clearer invariant. Each: what and why; `file:line`; and
+the **proposed change**. Mark each suggestion's value (high/medium/low) so the maintainer can
+prioritize.
+
+If a piece is genuinely clean and you have no worthwhile improvement, say so plainly — do not
+invent issues. But per the methodology, "clean" is only credible after concrete adversarial
+inputs, a parity diff, an interleaving, and a test-attack.
