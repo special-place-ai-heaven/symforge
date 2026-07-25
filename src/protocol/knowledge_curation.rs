@@ -439,6 +439,7 @@ impl KnowledgeCurationCoordinator {
                         &curation_dir,
                         &record_path,
                         record,
+                        &generation,
                         &plan,
                         &request_hash,
                     ));
