@@ -312,7 +312,7 @@ impl KnowledgeCurationCoordinator {
         let result = (|| {
             let generation = index.published_source_set().current_generation();
             let plan = curation_plan_current(&generation)?;
-            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &plan)
+            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation, &plan)
         })();
         let unlock_result = unlock_file(&lock_file).map_err(|error| durable_state_error(&error));
         result?;
@@ -418,7 +418,13 @@ impl KnowledgeCurationCoordinator {
             if let Some(record) = read_replay_record(&record_path)? {
                 verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)?;
             }
-            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &plan)?;
+            self.recover_pending_records(
+                repo_root,
+                &curation_dir,
+                &replay_dir,
+                &generation,
+                &plan,
+            )?;
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
             let mut record = if let Some(record) = read_replay_record(&record_path)? {
@@ -433,6 +439,7 @@ impl KnowledgeCurationCoordinator {
                         &curation_dir,
                         &record_path,
                         record,
+                        &generation,
                         &plan,
                         &request_hash,
                     ));
@@ -518,6 +525,7 @@ impl KnowledgeCurationCoordinator {
         curation_dir: &Path,
         record_path: &Path,
         mut record: ReplayRecord,
+        generation: &crate::live_index::PublishedGeneration,
         plan: &CurationReviewPlan,
         request_hash: &str,
     ) -> String {
@@ -530,11 +538,9 @@ impl KnowledgeCurationCoordinator {
             return "Error: idempotency_conflict; the key is already bound to a different canonical request."
                 .to_string();
         }
-        match &record.state {
+        match record.state.clone() {
             ReplayState::Succeeded { receipt } => receipt.render(),
-            ReplayState::Failed { output } | ReplayState::Indeterminate { output } => {
-                output.clone()
-            }
+            ReplayState::Failed { output } | ReplayState::Indeterminate { output } => output,
             ReplayState::Reserved => {
                 "Error: pending_reserved_request; retry the identical request to resume validation."
                     .to_string()
@@ -549,13 +555,28 @@ impl KnowledgeCurationCoordinator {
                     Ok(bytes) => bytes,
                     Err(error) => return error,
                 };
-                if current == *post_image {
+                if current == post_image {
                     if let Err(error) = sync_committed_file(&policy_path) {
                         return durable_state_error(&error);
                     }
-                } else if current == *pre_image {
+                } else if current == pre_image {
+                    if let Err(output) = validate_pending_replay_under_current_rules(
+                        repo_root,
+                        generation,
+                        &record.request,
+                        &pre_image,
+                        &post_image,
+                    ) {
+                        record.state = ReplayState::Failed {
+                            output: output.clone(),
+                        };
+                        if let Err(error) = write_replay_record(record_path, &record) {
+                            return error;
+                        }
+                        return output;
+                    }
                     if let Err(error) =
-                        durable_replace(&policy_path, post_image, ".symforge-curation-recovery-")
+                        durable_replace(&policy_path, &post_image, ".symforge-curation-recovery-")
                     {
                         return error;
                     }
@@ -568,7 +589,6 @@ impl KnowledgeCurationCoordinator {
                     let _ = write_replay_record(record_path, &record);
                     return output;
                 }
-                let receipt = receipt.clone();
                 record.state = ReplayState::Succeeded {
                     receipt: receipt.clone(),
                 };
@@ -585,6 +605,7 @@ impl KnowledgeCurationCoordinator {
         repo_root: &Path,
         curation_dir: &Path,
         replay_dir: &Path,
+        generation: &crate::live_index::PublishedGeneration,
         plan: &CurationReviewPlan,
     ) -> Result<(), String> {
         let entries = match fs::read_dir(replay_dir) {
@@ -617,6 +638,7 @@ impl KnowledgeCurationCoordinator {
                 curation_dir,
                 &path,
                 record,
+                generation,
                 plan,
                 &request_hash,
             );
@@ -966,6 +988,30 @@ fn validate_removal_compatibility(proposal: &RemediationAction) -> Result<(), St
         Ok(())
     } else {
         Err("Error: mutation_action_mismatch; policy removal is not authorized by the fresh review action."
+            .to_string())
+    }
+}
+
+fn validate_pending_replay_under_current_rules(
+    repo_root: &Path,
+    generation: &crate::live_index::PublishedGeneration,
+    request: &CurateKnowledgeInput,
+    pre_image: &[u8],
+    post_image: &[u8],
+) -> Result<(), String> {
+    if !request.actions.iter().any(|action| {
+        matches!(
+            &action.mutation,
+            KnowledgePolicyMutationInput::Remove { .. }
+        )
+    }) {
+        return Ok(());
+    }
+    let prepared = prepare_mutation(generation, repo_root, request)?;
+    if prepared.pre_image == pre_image && prepared.post_image == post_image {
+        Ok(())
+    } else {
+        Err("Error: pending_replay_mismatch; recorded policy image no longer matches current curation rules."
             .to_string())
     }
 }
@@ -2294,6 +2340,131 @@ mod tests {
                 .len(),
             1,
             "rejected preview must not remove the policy entry"
+        );
+    }
+
+    #[test]
+    fn pending_remove_replay_must_reauthorize_before_recovery_write() {
+        let fixture = CrashFixture::new("pending-remove-action-mismatch");
+        let root = fixture.dir.path();
+        let seed_plan =
+            curation_plan_current(&fixture.index.published_source_set().current_generation())
+                .expect("seed curation plan");
+        let seed_action = seed_plan
+            .actions
+            .values()
+            .find(|action| {
+                !matches!(
+                    action.proposal_action,
+                    RemediationAction::DeletionCandidate { .. }
+                )
+            })
+            .expect("non-delete review action")
+            .clone();
+        let entry_id = "entry-pending-remove-mismatch".to_string();
+        let policy = KnowledgePolicy {
+            version: POLICY_VERSION,
+            entries: vec![KnowledgePolicyEntry {
+                entry_id: entry_id.clone(),
+                target: seed_action.target.clone(),
+                lifecycle: KnowledgeLifecycle::Unknown,
+                authority_domain: None,
+                superseded_by: None,
+                evidence: Vec::new(),
+                justification_code: "seed-policy-entry".to_string(),
+            }],
+        };
+        fs::write(
+            root.join(POLICY_FILE),
+            render_policy(&policy).expect("policy render"),
+        )
+        .expect("seed policy");
+        fixture.index.reload(root).expect("reload seeded policy");
+
+        let generation = fixture.index.published_source_set().current_generation();
+        let plan = curation_plan_current(&generation).expect("fresh curation plan");
+        let reviewed = plan
+            .actions
+            .values()
+            .find(|action| {
+                action.target == seed_action.target
+                    && !matches!(
+                        action.proposal_action,
+                        RemediationAction::DeletionCandidate { .. }
+                    )
+            })
+            .expect("fresh non-delete action for seeded target");
+        let key = "pending-remove-action-mismatch";
+        let mut input = CurateKnowledgeInput {
+            actions: vec![KnowledgePolicyActionInput {
+                action_id: reviewed.action_id.clone(),
+                mutation: KnowledgePolicyMutationInput::Remove {
+                    entry_id,
+                    expected_target: target_input(&reviewed.target),
+                },
+            }],
+            if_source_review_hash: plan.review_hash,
+            if_manifest_digest: plan.manifest_digest,
+            if_policy_digest: plan.policy_digest,
+            idempotency_key: Some(key.to_string()),
+            apply: true,
+            project: Some("current-project".to_string()),
+        };
+
+        let pre_image = fs::read(root.join(POLICY_FILE)).expect("seed policy bytes");
+        let post_image = render_policy(&KnowledgePolicy {
+            version: POLICY_VERSION,
+            entries: Vec::new(),
+        })
+        .expect("legacy unauthorized post-image");
+        let request_hash = canonical_request_hash(&input);
+        let key_digest = domain_digest("knowledge-curation-key-v1", key.as_bytes());
+        let curation_dir = root.join(".symforge").join(CURATION_STATE_DIR);
+        let replay_dir = curation_dir.join(REPLAY_DIR);
+        fs::create_dir_all(&replay_dir).expect("replay dir");
+        input.idempotency_key = None;
+        input.project = None;
+        let record = ReplayRecord {
+            version: RECORD_VERSION,
+            key_digest: key_digest.clone(),
+            request_hash: request_hash.clone(),
+            binding: capture_binding(root, &plan).expect("source binding"),
+            request: input,
+            state: ReplayState::PendingWrite {
+                pre_image: pre_image.clone(),
+                post_image: post_image.clone(),
+                receipt: StoredReceipt {
+                    request_hash,
+                    pre_digest: crate::hash::digest_hex(&pre_image),
+                    post_digest: crate::hash::digest_hex(&post_image),
+                    publication_generation: plan.publication_generation,
+                    diff: replacement_diff(&pre_image, &post_image).expect("legacy diff"),
+                },
+            },
+        };
+        write_replay_record(&replay_dir.join(format!("{key_digest}.json")), &record)
+            .expect("legacy pending replay record");
+
+        let mut replay_input = record.request.clone();
+        replay_input.idempotency_key = Some(key.to_string());
+        replay_input.project = Some("current-project".to_string());
+        let output = KnowledgeCurationCoordinator::default().execute(
+            &fixture.index,
+            root,
+            Some(&fixture.placement),
+            CapabilityStatus::Available,
+            &replay_input,
+        );
+
+        assert!(output.contains("mutation_action_mismatch"), "{output}");
+        let policy_after = fs::read(root.join(POLICY_FILE)).expect("policy after rejected replay");
+        assert_eq!(
+            parse_knowledge_policy(&policy_after)
+                .expect("policy remains valid")
+                .entries
+                .len(),
+            1,
+            "rejected replay must not remove the policy entry"
         );
     }
 
