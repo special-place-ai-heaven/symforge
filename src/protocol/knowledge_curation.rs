@@ -418,12 +418,7 @@ impl KnowledgeCurationCoordinator {
             if let Some(record) = read_replay_record(&record_path)? {
                 verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)?;
             }
-            self.recover_pending_records(
-                repo_root,
-                &curation_dir,
-                &replay_dir,
-                &generation,
-            )?;
+            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation)?;
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
             let mut record = if let Some(record) = read_replay_record(&record_path)? {
