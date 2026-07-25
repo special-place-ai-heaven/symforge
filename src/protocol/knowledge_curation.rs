@@ -312,7 +312,7 @@ impl KnowledgeCurationCoordinator {
         let result = (|| {
             let generation = index.published_source_set().current_generation();
             let plan = curation_plan_current(&generation)?;
-            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &plan)
+            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation, &plan)
         })();
         let unlock_result = unlock_file(&lock_file).map_err(|error| durable_state_error(&error));
         result?;
@@ -418,7 +418,13 @@ impl KnowledgeCurationCoordinator {
             if let Some(record) = read_replay_record(&record_path)? {
                 verify_record_binding(repo_root, &curation_dir, &record_path, &record, &plan)?;
             }
-            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &plan)?;
+            self.recover_pending_records(
+                repo_root,
+                &curation_dir,
+                &replay_dir,
+                &generation,
+                &plan,
+            )?;
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
             let mut record = if let Some(record) = read_replay_record(&record_path)? {
@@ -518,6 +524,7 @@ impl KnowledgeCurationCoordinator {
         curation_dir: &Path,
         record_path: &Path,
         mut record: ReplayRecord,
+        generation: &crate::live_index::PublishedGeneration,
         plan: &CurationReviewPlan,
         request_hash: &str,
     ) -> String {
@@ -554,6 +561,17 @@ impl KnowledgeCurationCoordinator {
                         return durable_state_error(&error);
                     }
                 } else if current == *pre_image {
+                    if let Err(error) = reauthorize_pending_write(
+                        generation, repo_root, &record, pre_image, post_image, receipt,
+                    ) {
+                        record.state = ReplayState::Failed {
+                            output: error.clone(),
+                        };
+                        if let Err(write_error) = write_replay_record(record_path, &record) {
+                            return write_error;
+                        }
+                        return error;
+                    }
                     if let Err(error) =
                         durable_replace(&policy_path, post_image, ".symforge-curation-recovery-")
                     {
@@ -585,6 +603,7 @@ impl KnowledgeCurationCoordinator {
         repo_root: &Path,
         curation_dir: &Path,
         replay_dir: &Path,
+        generation: &crate::live_index::PublishedGeneration,
         plan: &CurationReviewPlan,
     ) -> Result<(), String> {
         let entries = match fs::read_dir(replay_dir) {
@@ -617,6 +636,7 @@ impl KnowledgeCurationCoordinator {
                 curation_dir,
                 &path,
                 record,
+                generation,
                 plan,
                 &request_hash,
             );
@@ -957,6 +977,38 @@ fn apply_reviewed_mutation(
             }
             entries.remove(entry_id);
         }
+    }
+    Ok(())
+}
+
+fn reauthorize_pending_write(
+    generation: &crate::live_index::PublishedGeneration,
+    repo_root: &Path,
+    record: &ReplayRecord,
+    pre_image: &[u8],
+    post_image: &[u8],
+    receipt: &StoredReceipt,
+) -> Result<(), String> {
+    if canonical_request_hash(&record.request) != record.request_hash
+        || receipt.request_hash != record.request_hash
+    {
+        return Err(
+            "Error: durable_replay_record_mismatch; no policy mutation was acknowledged."
+                .to_string(),
+        );
+    }
+    let prepared = prepare_mutation(generation, repo_root, &record.request)?;
+    if prepared.pre_image != pre_image
+        || prepared.post_image != post_image
+        || prepared.pre_digest != receipt.pre_digest
+        || prepared.post_digest != receipt.post_digest
+        || prepared.publication_generation != receipt.publication_generation
+        || prepared.diff != receipt.diff
+    {
+        return Err(
+            "Error: stale_replay_image; durable replay record no longer matches a fresh curation authorization."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -2206,6 +2258,35 @@ mod tests {
                 .expect("third-state policy after recovery"),
             third_state,
             "indeterminate recovery must not overwrite third-state bytes"
+        );
+        assert_eq!(fixture.execute(&coordinator), recovered);
+    }
+
+    #[test]
+    fn pending_write_recovery_reauthorizes_current_review_before_write() {
+        let fixture = CrashFixture::new("stale-pending-write-review");
+        let coordinator = KnowledgeCurationCoordinator::default();
+        coordinator.set_failpoint_for_tests(CurationWriteStage::AfterPendingIntentSync);
+        let interrupted = fixture.execute(&coordinator);
+        assert!(interrupted.contains("injected_curation_crash"));
+
+        fs::write(
+            fixture.dir.path().join("docs/current.md"),
+            "# Current behavior\nThe source changed after review.\n",
+        )
+        .expect("change reviewed knowledge source");
+        fixture
+            .index
+            .reload(fixture.dir.path())
+            .expect("reload changed knowledge source");
+
+        let recovered = fixture.execute(&coordinator);
+        assert!(recovered.contains("stale_review_hash"), "{recovered}");
+        assert_eq!(
+            read_policy_bytes(&fixture.dir.path().join(POLICY_FILE))
+                .expect("read policy after failed recovery"),
+            Vec::<u8>::new(),
+            "stale pending replay must not write the stored policy post-image"
         );
         assert_eq!(fixture.execute(&coordinator), recovered);
     }
