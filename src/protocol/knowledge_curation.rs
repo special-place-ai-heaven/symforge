@@ -436,7 +436,6 @@ impl KnowledgeCurationCoordinator {
                 if !matches!(record.state, ReplayState::Reserved) {
                     return Ok(self.handle_existing_record(
                         repo_root,
-                        &curation_dir,
                         &record_path,
                         record,
                         &generation,
@@ -522,13 +521,15 @@ impl KnowledgeCurationCoordinator {
     fn handle_existing_record(
         &self,
         repo_root: &Path,
-        curation_dir: &Path,
         record_path: &Path,
         mut record: ReplayRecord,
         generation: &crate::live_index::PublishedGeneration,
         plan: &CurationReviewPlan,
         request_hash: &str,
     ) -> String {
+        let Some(curation_dir) = record_path.parent().and_then(Path::parent) else {
+            return durable_state_error(&"replay path has no curation parent");
+        };
         if let Err(error) =
             verify_record_binding(repo_root, curation_dir, record_path, &record, plan)
         {
@@ -635,7 +636,6 @@ impl KnowledgeCurationCoordinator {
             let request_hash = record.request_hash.clone();
             let output = self.handle_existing_record(
                 repo_root,
-                curation_dir,
                 &path,
                 record,
                 generation,
