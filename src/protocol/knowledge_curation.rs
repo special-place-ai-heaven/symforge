@@ -311,8 +311,8 @@ impl KnowledgeCurationCoordinator {
             .map_err(|error| durable_state_error(&error))?;
         let result = (|| {
             let generation = index.published_source_set().current_generation();
-            let plan = curation_plan_current(&generation)?;
-            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation, &plan)
+            let _plan = curation_plan_current(&generation)?;
+            self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation)
         })();
         let unlock_result = unlock_file(&lock_file).map_err(|error| durable_state_error(&error));
         result?;
@@ -423,7 +423,6 @@ impl KnowledgeCurationCoordinator {
                 &curation_dir,
                 &replay_dir,
                 &generation,
-                &plan,
             )?;
             generation = index.published_source_set().current_generation();
             plan = curation_plan_current(&generation)?;
@@ -607,7 +606,6 @@ impl KnowledgeCurationCoordinator {
         curation_dir: &Path,
         replay_dir: &Path,
         generation: &crate::live_index::PublishedGeneration,
-        plan: &CurationReviewPlan,
     ) -> Result<(), String> {
         let entries = match fs::read_dir(replay_dir) {
             Ok(entries) => entries,
