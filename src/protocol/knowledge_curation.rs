@@ -440,7 +440,6 @@ impl KnowledgeCurationCoordinator {
                         &record_path,
                         record,
                         &generation,
-                        &plan,
                         &request_hash,
                     ));
                 }
@@ -526,11 +525,14 @@ impl KnowledgeCurationCoordinator {
         record_path: &Path,
         mut record: ReplayRecord,
         generation: &crate::live_index::PublishedGeneration,
-        plan: &CurationReviewPlan,
         request_hash: &str,
     ) -> String {
+        let plan = match curation_plan_current(generation) {
+            Ok(plan) => plan,
+            Err(error) => return error,
+        };
         if let Err(error) =
-            verify_record_binding(repo_root, curation_dir, record_path, &record, plan)
+            verify_record_binding(repo_root, curation_dir, record_path, &record, &plan)
         {
             return error;
         }
@@ -638,7 +640,6 @@ impl KnowledgeCurationCoordinator {
                 &path,
                 record,
                 generation,
-                plan,
                 &request_hash,
             );
             if output.contains("status=applied") {
