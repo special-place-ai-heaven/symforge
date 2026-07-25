@@ -938,6 +938,7 @@ fn apply_reviewed_mutation(
             entry_id,
             expected_target,
         } => {
+            validate_removal_compatibility(&reviewed.proposal_action)?;
             let target = convert_target(expected_target)?;
             if target != reviewed.target {
                 return Err(
@@ -958,6 +959,15 @@ fn apply_reviewed_mutation(
         }
     }
     Ok(())
+}
+
+fn validate_removal_compatibility(proposal: &RemediationAction) -> Result<(), String> {
+    if matches!(proposal, RemediationAction::DeletionCandidate { .. }) {
+        Ok(())
+    } else {
+        Err("Error: mutation_action_mismatch; policy removal is not authorized by the fresh review action."
+            .to_string())
+    }
 }
 
 fn validate_proposal_compatibility(
@@ -2048,6 +2058,19 @@ mod tests {
             .expect("initial commit");
     }
 
+    fn target_input(target: &KnowledgePolicyTarget) -> KnowledgePolicyTargetInput {
+        let range = target
+            .unit_byte_range
+            .as_ref()
+            .expect("reviewed target has a unit range");
+        KnowledgePolicyTargetInput {
+            path: target.path.clone(),
+            content_hash: target.content_hash.clone(),
+            unit_byte_range: Some([range.start, range.end]),
+            unit_hash: target.unit_hash.clone(),
+        }
+    }
+
     fn commit_file(root: &Path, relative_path: &str, bytes: &[u8], message: &str) {
         fs::write(root.join(relative_path), bytes).expect("write committed fixture file");
         let repository = git2::Repository::open(root).expect("open Git fixture");
@@ -2185,6 +2208,93 @@ mod tests {
             "indeterminate recovery must not overwrite third-state bytes"
         );
         assert_eq!(fixture.execute(&coordinator), recovered);
+    }
+
+    #[test]
+    fn remove_mutation_must_match_a_deletion_candidate_review_action() {
+        let fixture = CrashFixture::new("remove-action-mismatch");
+        let root = fixture.dir.path();
+        let seed_plan =
+            curation_plan_current(&fixture.index.published_source_set().current_generation())
+                .expect("seed curation plan");
+        let seed_action = seed_plan
+            .actions
+            .values()
+            .find(|action| {
+                !matches!(
+                    action.proposal_action,
+                    RemediationAction::DeletionCandidate { .. }
+                )
+            })
+            .expect("non-delete review action")
+            .clone();
+        let entry_id = "entry-remove-mismatch".to_string();
+        let policy = KnowledgePolicy {
+            version: POLICY_VERSION,
+            entries: vec![KnowledgePolicyEntry {
+                entry_id: entry_id.clone(),
+                target: seed_action.target.clone(),
+                lifecycle: KnowledgeLifecycle::Unknown,
+                authority_domain: None,
+                superseded_by: None,
+                evidence: Vec::new(),
+                justification_code: "seed-policy-entry".to_string(),
+            }],
+        };
+        fs::write(
+            root.join(POLICY_FILE),
+            render_policy(&policy).expect("policy render"),
+        )
+        .expect("seed policy");
+        fixture.index.reload(root).expect("reload seeded policy");
+
+        let generation = fixture.index.published_source_set().current_generation();
+        let plan = curation_plan_current(&generation).expect("fresh curation plan");
+        let reviewed = plan
+            .actions
+            .values()
+            .find(|action| {
+                action.target == seed_action.target
+                    && !matches!(
+                        action.proposal_action,
+                        RemediationAction::DeletionCandidate { .. }
+                    )
+            })
+            .expect("fresh non-delete action for seeded target");
+        let input = CurateKnowledgeInput {
+            actions: vec![KnowledgePolicyActionInput {
+                action_id: reviewed.action_id.clone(),
+                mutation: KnowledgePolicyMutationInput::Remove {
+                    entry_id,
+                    expected_target: target_input(&reviewed.target),
+                },
+            }],
+            if_source_review_hash: plan.review_hash,
+            if_manifest_digest: plan.manifest_digest,
+            if_policy_digest: plan.policy_digest,
+            idempotency_key: None,
+            apply: false,
+            project: Some("current-project".to_string()),
+        };
+
+        let output = KnowledgeCurationCoordinator::default().execute(
+            &fixture.index,
+            root,
+            Some(&fixture.placement),
+            CapabilityStatus::Available,
+            &input,
+        );
+
+        assert!(output.contains("mutation_action_mismatch"), "{output}");
+        let policy_after = fs::read(root.join(POLICY_FILE)).expect("policy after rejected preview");
+        assert_eq!(
+            parse_knowledge_policy(&policy_after)
+                .expect("policy remains valid")
+                .entries
+                .len(),
+            1,
+            "rejected preview must not remove the policy entry"
+        );
     }
 
     #[test]
