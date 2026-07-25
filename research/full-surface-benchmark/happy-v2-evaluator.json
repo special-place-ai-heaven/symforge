@@ -1,0 +1,231 @@
+{
+  "schema_version": "SFBENCH-adjudication-decisions-1",
+  "evidence_artifact": {
+    "name": "formal-happy-v2-20260712.jsonl",
+    "sha256": "4f3418ce3b949c9e504a936fd34a56a3c527571323f57753998ddbaac919dee1"
+  },
+  "cases": {
+    "SF-analyze_file_impact-001": {
+      "status": "fail",
+      "checks": [{"id": "same-file-dependent", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-analyze_file_impact-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-ask-001": {
+      "status": "pass",
+      "checks": [{"id": "route-and-answer", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-ask-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-batch_edit-001": {
+      "status": "pass",
+      "checks": [{"id": "patch-hash-and-replay", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-batch_edit-001:rep1-3", "baseline-patches.json:SF-batch_edit-001"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-batch_insert-001": {
+      "status": "fail",
+      "checks": [{"id": "exact-inserted-bytes", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-batch_insert-001:rep1-3", "baseline-patches.json:SF-batch_insert-001"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-batch_rename-001": {
+      "status": "pass",
+      "checks": [{"id": "exact-bound-sites", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-batch_rename-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-checkpoint_now-001": {
+      "status": "pass",
+      "checks": [{"id": "write-verify-restore", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-checkpoint_now-001:rep1-5"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "pass"
+    },
+    "SF-context_inventory-001": {
+      "status": "manual_pending",
+      "checks": [{"id": "fresh-session-inventory", "status": "manual_pending", "evidence": ["runner preflight populated the measured session before SF-context_inventory-001"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "manual_pending"
+    },
+    "SF-conventions-001": {
+      "status": "manual_pending",
+      "checks": [{"id": "project-convention-rubric", "status": "manual_pending", "evidence": ["formal-happy-v2-20260712:SF-conventions-001:rep1-3", "no frozen semantic scoring rubric"]}],
+      "baseline_equivalence": "invalid",
+      "baseline_correctness": "fail"
+    },
+    "SF-delete_symbol-001": {
+      "status": "pass",
+      "checks": [{"id": "patch-hash-and-replay", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-delete_symbol-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-detect_impact-001": {
+      "status": "fail",
+      "checks": [{"id": "changed-symbol-and-blast-set", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-detect_impact-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-diff_symbols-001": {
+      "status": "pass",
+      "checks": [{"id": "symbol-delta", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-diff_symbols-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-edit_plan-001": {
+      "status": "pass",
+      "checks": [{"id": "target-reference-sequence", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-edit_plan-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-edit_within_symbol-001": {
+      "status": "pass",
+      "checks": [{"id": "bounded-edit-and-replay", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-edit_within_symbol-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-explore-001": {
+      "status": "manual_pending",
+      "checks": [{"id": "concept-ranking-rubric", "status": "manual_pending", "evidence": ["formal-happy-v2-20260712:SF-explore-001:rep1-3", "no frozen relevance-grade rubric"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "manual_pending"
+    },
+    "SF-find_dependents-001": {
+      "status": "fail",
+      "checks": [{"id": "python-relative-import", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-find_dependents-001:rep1-3", "oracle.json:dependent_files.Python"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-find_references-001": {
+      "status": "fail",
+      "checks": [{"id": "matching-local-project-selector", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-find_references-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-get_file_content-001": {
+      "status": "pass",
+      "checks": [{"id": "exact-bytes-and-pagination", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-get_file_content-001:rep1-3"]}],
+      "baseline_equivalence": "invalid",
+      "baseline_correctness": "fail"
+    },
+    "SF-get_file_context-001": {
+      "status": "fail",
+      "checks": [{"id": "exact-file-context-sets", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-get_file_context-001:rep1-3", "oracle.json:dependent_files.Python"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-get_repo_map-001": {
+      "status": "pass",
+      "checks": [{"id": "inventory-counts", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-get_repo_map-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-get_symbol-001": {
+      "status": "pass",
+      "checks": [{"id": "exact-symbol-body-and-span", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-get_symbol-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-get_symbol_context-001": {
+      "status": "fail",
+      "checks": [{"id": "resolved-project-call-graph", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-get_symbol_context-001:rep1-3", "oracle.json:graphs.call_edges.Rust"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-health-001": {
+      "status": "fail",
+      "checks": [{"id": "snapshot-admission-parity", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-health-001:rep1-5"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "pass"
+    },
+    "SF-health_compact-001": {
+      "status": "pass",
+      "checks": [{"id": "same-session-full-parity", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-health_compact-001:rep1-3"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "pass"
+    },
+    "SF-index_folder-001": {
+      "status": "fail",
+      "checks": [{"id": "identity-counts-and-replay-evidence", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-index_folder-001:rep1-5"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "pass"
+    },
+    "SF-insert_symbol-001": {
+      "status": "fail",
+      "checks": [{"id": "exact-inserted-bytes", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-insert_symbol-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-inspect_match-001": {
+      "status": "pass",
+      "checks": [{"id": "nested-enclosure", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-inspect_match-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-investigation_suggest-001": {
+      "status": "fail",
+      "checks": [{"id": "unloaded-call-graph-suggestions", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-investigation_suggest-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-replace_symbol_body-001": {
+      "status": "pass",
+      "checks": [{"id": "patch-hash-and-replay", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-replace_symbol_body-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-search_files-001": {
+      "status": "pass",
+      "checks": [{"id": "duplicate-paths-and-ranking", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-search_files-001:rep1-3"]}],
+      "baseline_equivalence": "invalid",
+      "baseline_correctness": "fail"
+    },
+    "SF-search_symbols-001": {
+      "status": "fail",
+      "checks": [{"id": "matching-local-project-selector", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-search_symbols-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-search_text-001": {
+      "status": "fail",
+      "checks": [{"id": "matching-local-project-selector", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-search_text-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-status-001": {
+      "status": "fail",
+      "checks": [{"id": "manifest-and-runtime-identity", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-status-001:rep1-3"]}],
+      "baseline_equivalence": "capability_only",
+      "baseline_correctness": "pass"
+    },
+    "SF-symforge_edit-001": {
+      "status": "fail",
+      "checks": [{"id": "same-key-replay", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-symforge_edit-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-symforge_retrieve-001": {
+      "status": "pass",
+      "checks": [{"id": "stored-payload-hash-and-repeat", "status": "pass", "evidence": ["formal-happy-v2-20260712:SF-symforge_retrieve-001:rep1-3"]}],
+      "baseline_equivalence": "invalid",
+      "baseline_correctness": "fail"
+    },
+    "SF-validate_file_syntax-001": {
+      "status": "fail",
+      "checks": [{"id": "malformed-json-rejection", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-validate_file_syntax-001:rep1-3"]}],
+      "baseline_equivalence": "valid",
+      "baseline_correctness": "pass"
+    },
+    "SF-what_changed-001": {
+      "status": "fail",
+      "checks": [{"id": "git-status-and-rename-fidelity", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-what_changed-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    },
+    "SF-symforge-001": {
+      "status": "fail",
+      "checks": [{"id": "intent-route-and-fact-parity", "status": "fail", "evidence": ["formal-happy-v2-20260712:SF-symforge-001:rep1-3"]}],
+      "baseline_equivalence": "lower_bound",
+      "baseline_correctness": "pass"
+    }
+  }
+}

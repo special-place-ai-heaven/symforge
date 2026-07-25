@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "purpose": "Allow only transport- or process-identity differences in normalized stdio versus HTTP comparisons.",
+  "json_pointer_allowlist": [
+    "/id"
+  ],
+  "text_replacements": [],
+  "freeform_text_policy": "Never regex-normalize freeform tool content. Normalize only typed protocol fields named in json_pointer_allowlist; otherwise report the transport difference.",
+  "never_normalize": [
+    "paths",
+    "project_id",
+    "file_or_symbol_counts",
+    "symbols_or_references",
+    "ranked_result_order",
+    "trust_or_completeness_fields",
+    "errors",
+    "substantive_content"
+  ]
+}
