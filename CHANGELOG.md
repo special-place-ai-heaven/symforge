@@ -26,6 +26,17 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.0...v8.16.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **curation:** reject unauthorized policy removals ([c13927b](https://github.com/special-place-ai-heaven/symforge/commit/c13927b3e17ea5d86a67d695f0500c47a9cd91cc))
+* **daemon:** keep idle shutdown from interrupting active requests ([82d7d3e](https://github.com/special-place-ai-heaven/symforge/commit/82d7d3e0c283b7b7d54264b5926de790b5c9ab24))
+* **local-ref:** correct stale lane regression build ([3705c8e](https://github.com/special-place-ai-heaven/symforge/commit/3705c8e7c5be3bcd23246e16b018a5c78cbad5b0))
+* **local-ref:** fail closed on stale ref lanes ([ec5999f](https://github.com/special-place-ai-heaven/symforge/commit/ec5999f296f45fa7c1da5786d5dee4f748b1d7c6))
+* **local-ref:** fail closed on stale ref lanes ([51e2f47](https://github.com/special-place-ai-heaven/symforge/commit/51e2f474c319aed0283b1958621cae7c055d7aab))
+
 ## [8.16.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.15.0...v8.16.0) (2026-07-24)
 
 
