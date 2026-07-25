@@ -227,11 +227,29 @@ pub struct DaemonState {
     control_state_dir: Option<ControlStateDir>,
     /// Concurrency governor — limits parallel tool calls and enforces timeouts.
     governor: crate::sidecar::governor::RequestGovernor,
-    /// Epoch millis of the last AUTHENTICATED request — the idle-shutdown signal.
+    /// Epoch millis of the last completed AUTHENTICATED request — the idle-shutdown signal.
     last_activity_at: AtomicU64,
+    /// Authenticated handlers currently in flight. Idle shutdown must not cut
+    /// off active writes or long indexing requests.
+    active_authenticated_requests: AtomicU64,
     /// Notified by the reaper once the idle-shutdown window elapses;
     /// `run_daemon_until_shutdown` treats it like a shutdown signal.
     idle_shutdown: tokio::sync::Notify,
+}
+
+struct AuthenticatedActivityGuard {
+    state: SharedDaemonState,
+}
+
+impl Drop for AuthenticatedActivityGuard {
+    fn drop(&mut self) {
+        self.state
+            .last_activity_at
+            .store(now_epoch_millis(), Ordering::Relaxed);
+        self.state
+            .active_authenticated_requests
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Tracks whether a ProjectInstance has been fully activated (watcher + git temporal started).
@@ -567,7 +585,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<(), StatusCode> {
+fn authorize_daemon_request(
+    state: &SharedDaemonState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedActivityGuard, StatusCode> {
     // Fail-closed: the daemon always holds a token (see `DaemonState.auth_token`),
     // so there is no unauthenticated-allow path. A local process that cannot read
     // the 0o600 token file (and has no env pin) can no longer drive the daemon.
@@ -601,7 +622,12 @@ fn authorize_daemon_request(state: &DaemonState, headers: &HeaderMap) -> Result<
         state
             .last_activity_at
             .store(now_epoch_millis(), Ordering::Relaxed);
-        Ok(())
+        state
+            .active_authenticated_requests
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(AuthenticatedActivityGuard {
+            state: Arc::clone(state),
+        })
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
@@ -768,6 +794,7 @@ impl DaemonState {
             control_state_dir,
             governor: crate::sidecar::governor::RequestGovernor::new(),
             last_activity_at: AtomicU64::new(now_epoch_millis()),
+            active_authenticated_requests: AtomicU64::new(0),
             idle_shutdown: tokio::sync::Notify::new(),
         }
     }
@@ -3530,6 +3557,10 @@ pub async fn spawn_daemon_at(
                 tracing::info!(reaped, ttl_secs = ttl.as_secs(), "session reaper sweep");
             }
             if let Some(idle) = idle_shutdown_after {
+                if state.active_authenticated_requests.load(Ordering::Relaxed) > 0 {
+                    idle_fired = false;
+                    continue;
+                }
                 let idle_ms = now_epoch_millis()
                     .saturating_sub(state.last_activity_at.load(Ordering::Relaxed));
                 if idle_ms >= idle.as_millis() as u64 {
@@ -3624,7 +3655,7 @@ async fn list_projects_handler(
     State(state): State<SharedDaemonState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ProjectSummary>>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     Ok(Json(state.list_projects()))
 }
 
@@ -3633,7 +3664,7 @@ async fn project_health_handler(
     headers: HeaderMap,
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Json<ProjectHealth>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     state
         .project_health(&project_id)
         .map(Json)
@@ -3645,7 +3676,7 @@ async fn list_sessions_handler(
     headers: HeaderMap,
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Json<Vec<SessionSummary>>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     state
         .list_sessions(&project_id)
         .map(Json)
@@ -3657,7 +3688,7 @@ async fn open_project_session_handler(
     headers: HeaderMap,
     Json(request): Json<OpenProjectRequest>,
 ) -> Result<Json<OpenProjectResponse>, (StatusCode, String)> {
-    authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     let state_for_load = Arc::clone(&state);
     let response =
         tokio::task::spawn_blocking(move || state_for_load.open_project_session(request))
@@ -3688,7 +3719,7 @@ async fn call_tool_handler(
     Json(mut params): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::response::IntoResponse;
-    authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
+    let _activity = authorize_daemon_request(&state, &headers).map_err(daemon_auth_error)?;
     if tool_name == "index_folder" {
         let input = decode_params::<IndexFolderInput>(params).map_err(bad_request)?;
         let state_for_index = state.clone();
@@ -3985,7 +4016,7 @@ async fn sidecar_health_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Json<crate::sidecar::handlers::HealthResponse>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4010,7 +4041,7 @@ async fn sidecar_outline_handler(
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::OutlineParams>,
 ) -> Result<String, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4038,7 +4069,7 @@ async fn sidecar_impact_handler(
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::ImpactParams>,
 ) -> Result<String, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4066,7 +4097,7 @@ async fn sidecar_symbol_context_handler(
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::SymbolContextParams>,
 ) -> Result<String, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4093,7 +4124,7 @@ async fn sidecar_repo_map_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<String, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4118,7 +4149,7 @@ async fn sidecar_prompt_context_handler(
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<crate::sidecar::handlers::PromptContextParams>,
 ) -> Result<String, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4145,7 +4176,7 @@ async fn sidecar_stats_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Json<crate::sidecar::StatsSnapshot>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     let runtime = state
         .session_runtime(&session_id)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -4171,7 +4202,7 @@ async fn heartbeat_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Json<HeartbeatResponse>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     Ok(Json(state.heartbeat(&session_id)))
 }
 
@@ -4180,7 +4211,7 @@ async fn close_session_handler(
     headers: HeaderMap,
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Json<CloseSessionResponse>, StatusCode> {
-    authorize_daemon_request(&state, &headers)?;
+    let _activity = authorize_daemon_request(&state, &headers)?;
     state
         .close_session(&session_id)
         .map(Json)
@@ -5618,15 +5649,20 @@ mod tests {
     /// real handshake must present it — `authorize_daemon_request` is strict.
     fn authed_client(handle: &DaemonHandle) -> reqwest::Client {
         let token = handle.state.auth_token.clone();
+        let headers = bearer_headers(&token);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build authed reqwest client")
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
         let mut headers = header::HeaderMap::new();
         let mut value =
             header::HeaderValue::from_str(&format!("Bearer {token}")).expect("valid bearer header");
         value.set_sensitive(true);
         headers.insert(header::AUTHORIZATION, value);
-        reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("build authed reqwest client")
+        headers
     }
 
     #[tokio::test]
@@ -5860,6 +5896,43 @@ mod tests {
         handle.server_task.await.expect("daemon server task");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn daemon_idle_shutdown_waits_for_in_flight_authenticated_request() {
+        let _guard = env_lock().await;
+        let daemon_home = TempDir::new().expect("daemon home");
+        let _home = EnvVarGuard::set("SYMFORGE_HOME", daemon_home.path());
+        let _idle = EnvVarGuard::set_str(DAEMON_IDLE_SHUTDOWN_ENV, "60");
+
+        let handle = spawn_daemon("127.0.0.1").await.expect("spawn daemon");
+        let state = Arc::clone(&handle.state);
+        tokio::task::yield_now().await;
+
+        let activity = authorize_daemon_request(&state, &bearer_headers(&state.auth_token))
+            .expect("authenticated request guard");
+        state
+            .last_activity_at
+            .store(now_epoch_millis().saturating_sub(60_001), Ordering::Relaxed);
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), state.idle_shutdown.notified())
+                .await
+                .is_err(),
+            "idle shutdown must not fire while an authenticated handler is still in flight"
+        );
+
+        drop(activity);
+        assert_eq!(
+            state.active_authenticated_requests.load(Ordering::Relaxed),
+            0
+        );
+
+        handle.reaper_task.abort();
+        let _ = handle.shutdown_tx.send(());
+        handle.server_task.await.expect("daemon server task");
+    }
+
     #[test]
     fn project_instance_load_consumes_exported_team_artifact() {
         // A teammate who just `git clone`d has `.symforge/index.bin.zst` (the
@@ -5994,11 +6067,11 @@ mod tests {
 
     #[test]
     fn authorize_daemon_request_constant_time_token_check() {
-        fn state_with_token(token: &str) -> DaemonState {
-            DaemonState::with_token(token.to_string())
+        fn state_with_token(token: &str) -> SharedDaemonState {
+            Arc::new(DaemonState::with_token(token.to_string()))
         }
 
-        fn bearer_headers(value: &str) -> HeaderMap {
+        fn raw_auth_headers(value: &str) -> HeaderMap {
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::AUTHORIZATION,
@@ -6011,32 +6084,49 @@ mod tests {
 
         // Correct token accepts.
         assert!(
-            authorize_daemon_request(&state, &bearer_headers("Bearer the-real-token-value"))
+            authorize_daemon_request(&state, &raw_auth_headers("Bearer the-real-token-value"))
                 .is_ok()
+        );
+        assert_eq!(
+            state.active_authenticated_requests.load(Ordering::Relaxed),
+            0,
+            "successful auth guard should decrement on drop"
         );
 
         // Wrong token (same length) still 401s — fail-closed preserved.
-        assert_eq!(
-            authorize_daemon_request(&state, &bearer_headers("Bearer the-real-token-WRONG")),
-            Err(StatusCode::UNAUTHORIZED)
+        assert!(
+            matches!(
+                authorize_daemon_request(&state, &raw_auth_headers("Bearer the-real-token-WRONG")),
+                Err(StatusCode::UNAUTHORIZED)
+            ),
+            "wrong token must 401"
         );
 
         // Empty token still 401s.
-        assert_eq!(
-            authorize_daemon_request(&state, &bearer_headers("Bearer ")),
-            Err(StatusCode::UNAUTHORIZED)
+        assert!(
+            matches!(
+                authorize_daemon_request(&state, &raw_auth_headers("Bearer ")),
+                Err(StatusCode::UNAUTHORIZED)
+            ),
+            "empty token must 401"
         );
 
         // Missing Authorization header still 401s.
-        assert_eq!(
-            authorize_daemon_request(&state, &HeaderMap::new()),
-            Err(StatusCode::UNAUTHORIZED)
+        assert!(
+            matches!(
+                authorize_daemon_request(&state, &HeaderMap::new()),
+                Err(StatusCode::UNAUTHORIZED)
+            ),
+            "missing Authorization must 401"
         );
 
         // Wrong scheme still 401s.
-        assert_eq!(
-            authorize_daemon_request(&state, &bearer_headers("Basic the-real-token-value")),
-            Err(StatusCode::UNAUTHORIZED)
+        assert!(
+            matches!(
+                authorize_daemon_request(&state, &raw_auth_headers("Basic the-real-token-value")),
+                Err(StatusCode::UNAUTHORIZED)
+            ),
+            "wrong scheme must 401"
         );
     }
 
