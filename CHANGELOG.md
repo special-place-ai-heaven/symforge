@@ -26,6 +26,17 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.1...v8.16.2) (2026-07-26)
+
+
+### Bug Fixes
+
+* **curation:** bind upserts to reviewed actions ([6aaab7b](https://github.com/special-place-ai-heaven/symforge/commit/6aaab7b8c0a34ce4247bb23032214b2710ab329e))
+* **curation:** bind upserts to reviewed actions ([0c8e147](https://github.com/special-place-ai-heaven/symforge/commit/0c8e1475a31d394b5f5b003077a494bf291d5732))
+* **curation:** pass generation to replay resume ([d182165](https://github.com/special-place-ai-heaven/symforge/commit/d1821651bd16d4af5aef3f7383c3ff88b192e161))
+* **curation:** reauthorize pending replay writes ([c5cc103](https://github.com/special-place-ai-heaven/symforge/commit/c5cc103df7c9a29274ec72351f52d002eaf06a9c))
+* **curation:** reauthorize pending replay writes ([70e5cc5](https://github.com/special-place-ai-heaven/symforge/commit/70e5cc565754831799aa508353415a46b6c8bdb8))
+
 ## [8.16.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.0...v8.16.1) (2026-07-25)
 
 

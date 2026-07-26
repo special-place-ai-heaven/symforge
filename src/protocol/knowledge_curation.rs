@@ -19,7 +19,7 @@ use crate::live_index::knowledge_authority::{
     AuthorityDomain, KnowledgeLifecycle, KnowledgePolicy, KnowledgePolicyEntry,
     KnowledgePolicyTarget, PolicyEvidenceRef, RemediationAction, parse_knowledge_policy,
 };
-use crate::live_index::knowledge_bridge::CodeAnchorId;
+use crate::live_index::knowledge_bridge::{CodeAnchorId, KnowledgeAnchor};
 
 use super::knowledge_review::{CurationReviewPlan, curation_plan_current};
 use super::search_tools::{
@@ -1021,29 +1021,34 @@ fn validate_proposal_compatibility(
     proposal: &RemediationAction,
     entry: &KnowledgePolicyEntryInput,
 ) -> Result<(), String> {
-    let compatible = match entry.lifecycle {
-        KnowledgePolicyLifecycleInput::Unknown => true,
-        KnowledgePolicyLifecycleInput::Superseded => matches!(
-            proposal,
-            RemediationAction::MergeInto { .. }
-                | RemediationAction::MarkSuperseded { .. }
-                | RemediationAction::DeletionCandidate { .. }
+    let compatible = match proposal {
+        RemediationAction::Archive => {
+            entry.lifecycle == KnowledgePolicyLifecycleInput::Archived
+                && entry.superseded_by.is_none()
+        }
+        RemediationAction::MergeInto { target }
+        | RemediationAction::MarkSuperseded { successor: target } => {
+            entry.lifecycle == KnowledgePolicyLifecycleInput::Superseded
+                && superseded_by_matches_reviewed_anchor(entry.superseded_by.as_ref(), target)
+        }
+        RemediationAction::DeletionCandidate { retained } => match entry.lifecycle {
+            KnowledgePolicyLifecycleInput::Superseded => {
+                superseded_by_matches_reviewed_anchor(entry.superseded_by.as_ref(), retained)
+            }
+            KnowledgePolicyLifecycleInput::Archived => entry.superseded_by.is_none(),
+            _ => false,
+        },
+        RemediationAction::RelabelIntent
+        | RemediationAction::Keep
+        | RemediationAction::NeedsReview => matches!(
+            entry.lifecycle,
+            KnowledgePolicyLifecycleInput::Unknown | KnowledgePolicyLifecycleInput::Proposed
         ),
-        KnowledgePolicyLifecycleInput::Archived => matches!(
-            proposal,
-            RemediationAction::Archive | RemediationAction::DeletionCandidate { .. }
-        ),
-        KnowledgePolicyLifecycleInput::Proposed => matches!(
-            proposal,
-            RemediationAction::RelabelIntent
-                | RemediationAction::Keep
-                | RemediationAction::NeedsReview
-        ),
-        _ => !matches!(
-            proposal,
-            RemediationAction::Archive
-                | RemediationAction::DeletionCandidate { .. }
-                | RemediationAction::MarkSuperseded { .. }
+        RemediationAction::Update => !matches!(
+            entry.lifecycle,
+            KnowledgePolicyLifecycleInput::Superseded
+                | KnowledgePolicyLifecycleInput::Archived
+                | KnowledgePolicyLifecycleInput::Historical
         ),
     };
     if compatible {
@@ -1052,6 +1057,17 @@ fn validate_proposal_compatibility(
         Err("Error: mutation_action_mismatch; policy lifecycle is not authorized by the fresh review action."
             .to_string())
     }
+}
+
+fn superseded_by_matches_reviewed_anchor(
+    target: Option<&KnowledgePolicyTargetInput>,
+    anchor: &KnowledgeAnchor,
+) -> bool {
+    target.is_some_and(|target| {
+        target.path == anchor.path
+            && target.content_hash == anchor.content_hash
+            && target.unit_byte_range == Some([anchor.byte_range.start, anchor.byte_range.end])
+    })
 }
 
 fn convert_entry(input: &KnowledgePolicyEntryInput) -> Result<KnowledgePolicyEntry, String> {
@@ -1987,7 +2003,10 @@ fn durable_state_error(_error: &impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccessErrorKind, ProjectId, ProjectStateDir};
+    use crate::domain::{
+        AccessErrorKind, ProjectId, ProjectStateDir, RepositoryId, SourceId, SourceIdentity,
+        SourceLocation,
+    };
     use crate::live_index::LiveIndex;
 
     struct CrashFixture {
@@ -2116,6 +2135,100 @@ mod tests {
             unit_byte_range: Some([range.start, range.end]),
             unit_hash: target.unit_hash.clone(),
         }
+    }
+
+    fn test_anchor(path: &str, content_hash: &str, start: u32, end: u32) -> KnowledgeAnchor {
+        KnowledgeAnchor {
+            id: crate::live_index::knowledge_bridge::KnowledgeAnchorId {
+                path: path.to_string(),
+                content_hash: content_hash.to_string(),
+                start_byte: start,
+            },
+            source: SourceIdentity {
+                repository_id: RepositoryId::new("repo"),
+                source_id: SourceId::new("source"),
+                location: SourceLocation::WorkingTree {
+                    worktree_id: "worktree".to_string(),
+                },
+            },
+            content_generation: 1,
+            path: path.to_string(),
+            content_hash: content_hash.to_string(),
+            byte_range: start..end,
+            line_range: 1..2,
+        }
+    }
+
+    fn anchor_target_input(anchor: &KnowledgeAnchor) -> KnowledgePolicyTargetInput {
+        KnowledgePolicyTargetInput {
+            path: anchor.path.clone(),
+            content_hash: anchor.content_hash.clone(),
+            unit_byte_range: Some([anchor.byte_range.start, anchor.byte_range.end]),
+            unit_hash: Some("f".repeat(64)),
+        }
+    }
+
+    fn policy_entry_input(
+        lifecycle: KnowledgePolicyLifecycleInput,
+        superseded_by: Option<KnowledgePolicyTargetInput>,
+    ) -> KnowledgePolicyEntryInput {
+        KnowledgePolicyEntryInput {
+            entry_id: "entry-review-binding".to_string(),
+            target: KnowledgePolicyTargetInput {
+                path: "docs/old.md".to_string(),
+                content_hash: "a".repeat(64),
+                unit_byte_range: Some([0, 8]),
+                unit_hash: Some("b".repeat(64)),
+            },
+            lifecycle,
+            authority_domain: None,
+            superseded_by,
+            evidence: Vec::new(),
+            justification_code: "review-binding".to_string(),
+        }
+    }
+
+    #[test]
+    fn deletion_candidate_upsert_cannot_use_unknown_lifecycle() {
+        let retained = test_anchor("docs/current.md", &"c".repeat(64), 0, 12);
+        let entry = policy_entry_input(KnowledgePolicyLifecycleInput::Unknown, None);
+
+        let error = validate_proposal_compatibility(
+            &RemediationAction::DeletionCandidate { retained },
+            &entry,
+        )
+        .expect_err("deletion candidates must not authorize unrelated upserts");
+
+        assert!(error.contains("mutation_action_mismatch"), "{error}");
+    }
+
+    #[test]
+    fn supersede_review_upsert_must_match_reviewed_successor() {
+        let successor = test_anchor("docs/current.md", &"c".repeat(64), 0, 12);
+        let wrong_successor = test_anchor("docs/other.md", &"d".repeat(64), 0, 12);
+        let wrong_entry = policy_entry_input(
+            KnowledgePolicyLifecycleInput::Superseded,
+            Some(anchor_target_input(&wrong_successor)),
+        );
+
+        let error = validate_proposal_compatibility(
+            &RemediationAction::MarkSuperseded {
+                successor: successor.clone(),
+            },
+            &wrong_entry,
+        )
+        .expect_err("supersede reviews must bind to the reviewed successor");
+        assert!(error.contains("mutation_action_mismatch"), "{error}");
+
+        let matching_entry = policy_entry_input(
+            KnowledgePolicyLifecycleInput::Superseded,
+            Some(anchor_target_input(&successor)),
+        );
+        validate_proposal_compatibility(
+            &RemediationAction::MarkSuperseded { successor },
+            &matching_entry,
+        )
+        .expect("matching reviewed successor remains authorized");
     }
 
     fn commit_file(root: &Path, relative_path: &str, bytes: &[u8], message: &str) {
