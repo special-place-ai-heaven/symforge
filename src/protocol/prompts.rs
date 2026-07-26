@@ -319,9 +319,25 @@ fn build_knowledge_hygiene_instructions(project_name: &str, path_prefix: Option<
 /// This performs an HTTP reachability probe on its own current-thread runtime, so
 /// it MUST run off the async worker (the caller wraps it in `spawn_blocking`). It
 /// never starts a server — that is the `symforge admin` CLI verb's job (D3).
-fn resolve_running_dashboard_url(_repo_root: Option<std::path::PathBuf>) -> Option<String> {
-    use std::time::Duration;
+fn resolve_running_dashboard_url(repo_root: Option<std::path::PathBuf>) -> Option<String> {
     let control_state_dir = crate::paths::process_control_state_placement().directory()?;
+    resolve_running_dashboard_url_in(repo_root, control_state_dir)
+}
+
+/// Reachability check against an EXPLICIT control-state dir.
+///
+/// `resolve_running_dashboard_url` reached straight for the process-global
+/// placement, which is a `OnceLock` and therefore not overridable. That left the
+/// no-server guidance test unable to isolate itself: any sibling test that
+/// started a real operator server and wrote a profile made this probe succeed,
+/// so the prompt correctly reported a running dashboard and the test failed by
+/// execution order. Taking the dir as an argument makes the dependency
+/// injectable without changing which dir production resolves.
+fn resolve_running_dashboard_url_in(
+    _repo_root: Option<std::path::PathBuf>,
+    control_state_dir: &crate::domain::ControlStateDir,
+) -> Option<String> {
+    use std::time::Duration;
     let profile = crate::cli::operator_profile::OperatorSetupProfile::load(control_state_dir)?;
     let addr = std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -827,24 +843,32 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_admin_prompt_returns_guidance_when_no_server() {
-        // make_server() has no bound repo_root, so there is no profile / running
-        // server to resolve: the prompt must return the honest "run `symforge
-        // admin`" guidance rather than a fabricated URL (URL-or-guidance, D2).
-        let server = make_server();
-        let result = server
-            .admin_prompt(Parameters(AdminPromptInput::default()))
-            .await;
+    #[test]
+    fn resolve_running_dashboard_url_in_is_none_without_a_profile() {
+        // Isolation contract: resolution reads the profile from the control-state
+        // dir it is GIVEN. Previously it reached for the process-global
+        // placement (a OnceLock), so a sibling test that started a real operator
+        // server made this path resolve a URL and the no-server guidance test
+        // below failed purely by execution order.
+        let dir = tempfile::tempdir().expect("temp control state");
+        let control = crate::domain::ControlStateDir::new(dir.path().join("control"));
+        assert_eq!(
+            resolve_running_dashboard_url_in(None, &control),
+            None,
+            "an empty control-state dir has no profile, so no dashboard resolves"
+        );
+    }
 
-        let text = result
-            .messages
-            .iter()
-            .find_map(|message| match &message.content {
-                rmcp::model::ContentBlock::Text(content) => Some(content.text.clone()),
-                _ => None,
-            })
-            .expect("admin prompt returns a text message");
+    #[test]
+    fn test_admin_prompt_returns_guidance_when_no_server() {
+        // No profile in this isolated control-state dir, so nothing resolves: the
+        // prompt body must be the honest "run `symforge admin`" guidance rather
+        // than a fabricated URL (URL-or-guidance, D2).
+        let dir = tempfile::tempdir().expect("temp control state");
+        let control = crate::domain::ControlStateDir::new(dir.path().join("control"));
+        let dashboard_url = resolve_running_dashboard_url_in(None, &control);
+        assert_eq!(dashboard_url, None, "no profile must resolve no dashboard");
+        let text = build_admin_instructions("prompt_project", dashboard_url.as_deref());
 
         // Guidance points at the CLI verb that actually starts the server.
         assert!(
@@ -865,6 +889,31 @@ mod tests {
         assert!(
             text.contains("returns immediately"),
             "guidance must state the reuse path returns immediately: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_prompt_returns_a_text_message() {
+        // End-to-end wiring: the handler resolves off the async runtime and always
+        // returns a body. Whether THIS machine has an operator server running is
+        // ambient state, so assert only what holds either way — the URL-vs-guidance
+        // split is covered against an isolated control-state dir above.
+        let server = make_server();
+        let result = server
+            .admin_prompt(Parameters(AdminPromptInput::default()))
+            .await;
+
+        let text = result
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                rmcp::model::ContentBlock::Text(content) => Some(content.text.clone()),
+                _ => None,
+            })
+            .expect("admin prompt returns a text message");
+        assert!(
+            text.contains("SymForge Operator Dashboard"),
+            "every admin prompt body carries the dashboard heading: {text}"
         );
     }
 
