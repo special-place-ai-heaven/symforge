@@ -434,8 +434,16 @@ pub fn run_wizard_with_control_state<S: SetupSink + ?Sized, B: BrowserOpener + ?
             // sourced from the env (api_key_env), never an inline key; serve::run
             // enforces refuse-to-start for any non-loopback address regardless.
             // This slice binds loopback only, so no key is passed.
+            //
+            // `explicit = args.port.is_some()`: a real `--port N` is an operator
+            // demand and must fail loudly if occupied (FR-002/003) rather than
+            // silently binding and persisting a different port than the one the
+            // action plan (Step 2, above) told the operator would be used. No
+            // `--port` means `bind_addr` is only `suggested_port` — a genuine
+            // preference, correctly soft.
             session = Some(start_operator_server(
                 Some(bind_addr),
+                args.port.is_some(),
                 None,
                 None,
                 ADMIN_SERVE_START_DEADLINE,
@@ -951,9 +959,14 @@ mod tests {
         use crate::cli::browser::NoopBrowserOpener;
 
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running =
-            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
-                .expect("operator server should come up");
+        let running = start_operator_server(
+            Some(preferred),
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("operator server should come up");
 
         let home = tempfile::tempdir().expect("temp home");
         let project = tempfile::tempdir().expect("temp project");

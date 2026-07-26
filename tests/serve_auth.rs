@@ -126,6 +126,7 @@ async fn non_loopback_without_key_refuses_to_start() {
         explicit_listen: true,
         api_key: None,
         api_key_env: None,
+        bound_addr_tx: None,
     };
     let err = run(args)
         .await

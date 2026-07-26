@@ -686,6 +686,15 @@ fn roles_for_card(
             RoleEvidence::DeclaredSpan(anchor.clone()),
         );
     }
+    if is_license_path(path) {
+        roles.insert(
+            KnowledgeRole::OwnershipGovernance,
+            RoleEvidence::PathConvention {
+                rule_id: "role.path.license.v1".to_string(),
+                anchor: anchor.clone(),
+            },
+        );
+    }
     if roles.is_empty() {
         roles.insert(
             KnowledgeRole::Other,
@@ -1140,6 +1149,24 @@ fn is_codeowners_path(path: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case("CODEOWNERS"))
+}
+
+/// Exact-filename match for `LICENSE` / `LICENSE.<ext>` (any case, e.g. `license.md`,
+/// `LICENSE.txt`), mirroring [`is_codeowners_path`]. A license file duplicated
+/// across paths (root + `npm/LICENSE`, or per-subpackage in a vendored tree) is
+/// duplicated by packaging/legal necessity, not content drift — deleting a copy
+/// can break `npm publish`'s license packaging or a vendored dependency's own
+/// license terms. This is a filename check, not a substring/token match: a doc
+/// that merely discusses licensing (e.g. `docs/license-notes.md`) must not match.
+fn is_license_path(path: &str) -> bool {
+    let Some(stem) = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split('.').next())
+    else {
+        return false;
+    };
+    stem.eq_ignore_ascii_case("LICENSE") || stem.eq_ignore_ascii_case("LICENCE")
 }
 
 fn resolve_repo_path<'a>(
@@ -1916,6 +1943,65 @@ mod tests {
             *role == KnowledgeRole::OwnershipGovernance
                 && matches!(evidence, RoleEvidence::DeclaredSpan(anchor) if anchor.id == declared_owner.anchor.id)
         }));
+    }
+
+    /// A `LICENSE` file that is byte-identical across paths (root + `npm/LICENSE`,
+    /// or a vendored subpackage) is duplicated by PACKAGING NECESSITY, not drift —
+    /// `npm/package.json`'s `files` array requires a co-located `LICENSE` in the
+    /// published tarball. Without a role here, `review_knowledge`'s duplicate
+    /// detector (`effective_action`/`effective_confidence` in
+    /// `knowledge_review.rs`) proposed deleting `npm/LICENSE` as a
+    /// `strong_candidate` exact-duplicate — which would break `npm publish`'s
+    /// license packaging if a caller trusted that label. `OwnershipGovernance` is
+    /// the same role `.github/CODEOWNERS` already gets (a legally/organizationally
+    /// mandated file, not curatable content), and it is what `protected_roles` in
+    /// `knowledge_review.rs` uses to keep a unit out of deletion proposals.
+    #[test]
+    fn license_files_get_ownership_governance_role_regardless_of_directory() {
+        let (_root, shared) = fixture(&[
+            ("LICENSE", "PolyForm Noncommercial License 1.0.0\n"),
+            ("npm/LICENSE", "PolyForm Noncommercial License 1.0.0\n"),
+            ("vendor/pkg/LICENSE.txt", "MIT License\n"),
+            ("docs/license-notes.md", "# Licensing\nSee LICENSE.\n"),
+        ]);
+
+        let bridge = bridge(&shared);
+        for path in ["LICENSE", "npm/LICENSE", "vendor/pkg/LICENSE.txt"] {
+            let card = bridge
+                .cards
+                .iter()
+                .find(|card| card.anchor.path == path)
+                .unwrap_or_else(|| panic!("card for {path}"));
+            assert!(
+                card.roles.iter().any(|(role, evidence)| {
+                    *role == KnowledgeRole::OwnershipGovernance
+                        && matches!(
+                            evidence,
+                            RoleEvidence::PathConvention { rule_id, anchor }
+                                if rule_id == "role.path.license.v1"
+                                    && anchor.id == card.anchor.id
+                        )
+                }),
+                "{path} must get OwnershipGovernance via a path-convention rule, got: {:?}",
+                card.roles
+            );
+        }
+
+        // A markdown file that merely MENTIONS "license" in its own name must NOT
+        // be swept in — only the exact `LICENSE`/`LICENSE.<ext>` filename pattern.
+        for card in bridge
+            .cards
+            .iter()
+            .filter(|card| card.anchor.path == "docs/license-notes.md")
+        {
+            assert!(
+                card.roles
+                    .iter()
+                    .all(|(role, _)| *role != KnowledgeRole::OwnershipGovernance),
+                "a file merely discussing licensing must not be treated as the license file itself: {:?}",
+                card.roles
+            );
+        }
     }
 
     #[test]

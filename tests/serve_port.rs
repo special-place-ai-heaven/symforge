@@ -24,6 +24,11 @@
 //! * `explicit_occupied_fails_loudly` — an EXPLICIT address (the `bind_listener`
 //!   path `serve::run` uses when `explicit_listen == true`) returns an `Err` on
 //!   an occupied port: no silent substitution (FR-002/003).
+//! * `explicit_occupied_by_another_symforge_fails_loudly` — the realistic
+//!   version of the above: the occupier is ALSO a `bind_listener` bind (a real
+//!   second `symforge serve --listen`), not a plain std squatter. `bind_listener`
+//!   used to set `SO_REUSEADDR`, which let this pass silently — the second serve
+//!   would bind, report healthy, and accept zero connections.
 //! * `default_listen_constant_is_loopback_8787` — pins the historical default the
 //!   no-address path prefers.
 //!
@@ -43,13 +48,12 @@ use symforge::server::serve::{
     DEFAULT_LISTEN, bind_listener, probe_free_listener, probe_free_port,
 };
 
-/// Occupy a loopback port with an **exclusive** listener (plain `std` bind, no
-/// `SO_REUSEADDR`) — the honest reproduction of a real squatter (`wslrelay` /
-/// another service). A `bind_listener` (which sets `SO_REUSEADDR`) on the same
-/// port then fails, so the probe actually falls back. A `bind_listener` occupier
-/// would (wrongly) let the probe share the port and never fall back: on Windows
-/// two sockets share a port only if both set `SO_REUSEADDR`, and on Linux
-/// `SO_REUSEADDR` does not let a second socket bind an active listening port.
+/// Occupy a loopback port with a plain `std` listener (no `SO_REUSEADDR`) — the
+/// honest reproduction of a real squatter (`wslrelay` / another service).
+/// `bind_listener` on the same port fails against this occupier regardless of
+/// its own reuse setting, so this occupier alone cannot prove `bind_listener`
+/// rejects an occupied port HONESTLY — see `occupy_with_bind_listener` below,
+/// which is the occupier that actually exercises that claim.
 fn occupy_a_port() -> (std::net::TcpListener, SocketAddr) {
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("exclusive occupy a loopback port");
@@ -140,6 +144,37 @@ async fn explicit_occupied_fails_loudly() {
     assert!(
         result.is_err(),
         "an explicit occupied address must fail loudly (no substitution)"
+    );
+
+    drop(occupier);
+}
+
+/// Occupy a port the same way a REAL second `symforge serve` would: via
+/// `bind_listener` itself, not a plain std bind. This is the realistic collision
+/// `explicit_occupied_fails_loudly` cannot exercise — its squatter is a plain
+/// std listener, which fails against ANY second bind regardless of that bind's
+/// own reuse setting, so it can never prove `bind_listener` rejects a REUSING
+/// occupier honestly.
+fn occupy_with_bind_listener() -> (tokio::net::TcpListener, SocketAddr) {
+    let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener occupy");
+    let addr = listener.local_addr().expect("local_addr");
+    (listener, addr)
+}
+
+#[tokio::test]
+async fn explicit_occupied_by_another_symforge_fails_loudly() {
+    // The realistic collision: operator runs `symforge serve --listen 127.0.0.1:X`
+    // twice. Both binds go through `bind_listener`. The second MUST fail — an
+    // explicit `--listen` promises fail-loudly-if-occupied (FR-002/003), and a
+    // silent second bind would accept zero connections while looking healthy
+    // (the OS delivers all traffic to whichever bound first).
+    let (occupier, occupied) = occupy_with_bind_listener();
+
+    let result = bind_listener(occupied);
+    assert!(
+        result.is_err(),
+        "a second bind_listener on a port another bind_listener already holds \
+         must fail loudly, not silently share the port: {result:?}"
     );
 
     drop(occupier);
