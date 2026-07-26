@@ -20,19 +20,78 @@
 - Full real-repo coupling calibration is operator-triggered with
   `SYMFORGE_CALIBRATION_REPOS`; standard CI must not depend on local paths.
 
-## Merging PRs (release-please double-count guard)
+## Merging PRs (release-please visibility — verified 2026-07-26)
 
-GitHub's default merge commit puts the PR title in the commit BODY;
-release-please parses merge-commit bodies for conventional messages, so a
-plain `gh pr merge --merge` lands every PR in the changelog TWICE (merge
-commit + inner commit). Always override the body with non-conventional text:
+Verified directly against `googleapis/release-please-action@v5` source
+(`manifest.ts`, `github.ts`, `commit.ts`) and live CI logs on this repo
+(`prepare-release` job). The previous guidance in this section was wrong and
+had made several real, merged, CI-green `fix:` commits invisible to
+release-please for a full day (stuck at 8.16.3; see agentmemory `[symforge]`
+for the incident writeup).
+
+**What release-please actually does:** its commit walker reads `main`'s
+history backward from HEAD via GitHub's GraphQL `history` connection,
+stopping the instant it reaches the SHA already recorded as the last release
+for this package. Every commit it visits before that cutoff — merge commits
+*and*, depending on git-graph shape, a merged branch's own inner commits —
+becomes a parse candidate. For each candidate, it parses that commit's own
+raw git message (subject + body as committed, not the PR description) and
+`git log --no-merges` at the CI gate doesn't change what release-please
+sees — that flag only governs `execution/conventional_commits.py`'s own
+subject-format validation, a separate, unrelated check.
+
+Two failure modes, both confirmed from real history on this repo:
+
+- **Double-count (the original real bug):** GitHub's *default* `--merge`
+  commit body is the PR title (already conventional here). release-please's
+  parser splits a commit's message on any blank-line boundary where the next
+  paragraph itself looks conventional, and counts that paragraph as an
+  independent commit *attributed to the merge commit's own SHA*. If the
+  underlying branch's own inner commit (same conventional message) is *also*
+  swept into that release cycle's candidate window — which happens whenever
+  the previous release boundary sits far enough back in history — you get
+  the exact same changelog line twice, once per SHA. This really happened:
+  8.16.2's CHANGELOG has duplicate "bind upserts to reviewed actions" and
+  "reauthorize pending replay writes" entries (one via the merge commit,
+  one via the inner commit).
+- **Total invisibility (the regression the old guidance caused):**
+  overriding the merge commit's *body* to non-conventional text
+  (`--body "PR #<N>"`) while leaving the *subject* as GitHub's generic
+  `Merge pull request #N from ...` means NEITHER the subject NOR the body is
+  parseable. There is no other fallback. Once the underlying branch's inner
+  commits also miss the candidate window (graph-shape dependent, and NOT
+  reliable — it silently failed here), the whole PR contributes zero
+  changelog entries and zero version bump, forever, with no error raised.
+  This is what actually happened to PRs #470, #471, #472, #475.
+
+**The fix — default to squash-merge:**
 
 ```
-gh pr merge <N> --merge --delete-branch --body "PR #<N>"
+gh pr merge <N> --squash --delete-branch
 ```
 
-Subject stays GitHub's default (`Merge pull request #N ...`, ignored by
-release-please); inner commits are counted exactly once.
+`gh`'s default squash subject is the PR title + `(#N)`; this repo's own CI
+(`.github/workflows/ci.yml` `conventional-commits` job) already enforces
+that every PR title is conventional before merge, so the resulting squash
+commit's subject is automatically valid. A squash commit has no second
+parent and no reachable inner commits at all, so there is nothing left for
+either failure mode above to act on — deterministically, not by graph-shape
+luck. This does trade away per-commit granularity/bisectability inside a
+single PR on `main`; the full inner-commit history remains visible on the
+(closed) PR itself via the GitHub API/UI indefinitely.
+
+If a PR's inner-commit history must stay reachable on `main` (rare — e.g. a
+deliberately staged multi-commit landing), use `--merge` but give the merge
+commit's own SUBJECT the real conventional message (not just the body):
+
+```
+gh pr merge <N> --merge --delete-branch --subject "fix(scope): description (#<N>)" --body "PR #<N>"
+```
+
+This is parsed directly off the header with no split needed, so it's
+reliable — but it does not fully eliminate the double-count risk above if
+history later happens to also sweep in that PR's inner commits, so prefer
+squash unless there's a specific reason not to.
 
 ## Architecture
 
