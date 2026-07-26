@@ -41,8 +41,9 @@ fn admin_reuses_running_server_on_profile_port() {
     // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
     // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
     // this is a generous upper bound, not the expected wait (warm start = seconds).
-    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(60))
-        .expect("operator server should come up");
+    let running =
+        start_operator_server(Some(preferred), false, None, None, Duration::from_secs(60))
+            .expect("operator server should come up");
     let running_port = running.bound_addr.port();
 
     let project = tempfile::tempdir().expect("temp project");
@@ -142,8 +143,9 @@ fn admin_no_open_skips_browser_but_still_reports_url() {
     // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
     // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
     // this is a generous upper bound, not the expected wait (warm start = seconds).
-    let running = start_operator_server(Some(preferred), None, None, Duration::from_secs(60))
-        .expect("operator server should come up");
+    let running =
+        start_operator_server(Some(preferred), false, None, None, Duration::from_secs(60))
+            .expect("operator server should come up");
 
     let project = tempfile::tempdir().expect("temp project");
     let home = tempfile::tempdir().expect("temp home");

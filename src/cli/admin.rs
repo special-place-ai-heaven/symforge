@@ -124,23 +124,25 @@ pub fn operator_server_reachable(addr: SocketAddr, timeout: Duration) -> bool {
 /// `api_key` / `api_key_env` are threaded straight into [`ServeArgs`] so a network
 /// bind can carry a key sourced from the environment (the wizard never passes an
 /// inline key on a routable bind — `serve::run` refuses that anyway).
+///
+/// `explicit` is the caller's own answer to "did the operator demand this exact
+/// port, or is it a preference (a remembered port, or the default)?" — this
+/// function cannot infer that from `preferred` alone, because both cases pass a
+/// concrete `SocketAddr`. Pass `true` only when a real operator input (e.g. a
+/// CLI `--port`/`--listen` flag) named `preferred`; an occupied port then fails
+/// loudly (FR-002/003) instead of silently landing on a different address that
+/// then gets persisted to config under the operator's back. Pass `false` for a
+/// remembered/default port, where a caller wanting *a* server, not that exact
+/// one, expects a graceful fallback.
 pub fn start_operator_server(
     preferred: Option<SocketAddr>,
+    explicit: bool,
     api_key: Option<String>,
     api_key_env: Option<String>,
     deadline: Duration,
 ) -> anyhow::Result<ServerSessionDescriptor> {
     // Step 1: let serve pick AND own the port — the caller never touches it, so
     // there is no interval in which it is chosen but unowned.
-    //
-    // `explicit_listen` stays FALSE here on purpose. It means "the operator
-    // named this exact port, fail loudly if it is taken", and nobody on this
-    // path did: `preferred` is a *preference* — a remembered port to land back
-    // on, or the default — not a demand. Setting it true made an occupied
-    // preference a hard failure, which only looked survivable while
-    // `SO_REUSEADDR` was silently letting two servers share one address. False
-    // routes through `probe_free_listener`, which honors the preference when
-    // free and falls back to a genuinely free operator port when not.
     let requested = preferred.map_or_else(
         || crate::server::serve::DEFAULT_LISTEN.to_string(),
         |addr| addr.to_string(),
@@ -148,7 +150,7 @@ pub fn start_operator_server(
     let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
     let serve_args = ServeArgs {
         listen: requested,
-        explicit_listen: false,
+        explicit_listen: explicit,
         api_key,
         api_key_env,
         bound_addr_tx: Some(bound_tx),
@@ -174,20 +176,23 @@ pub fn start_operator_server(
         })
         .map_err(|e| anyhow::anyhow!("could not spawn operator-server thread: {e}"))?;
 
-    // Step 2: wait to be TOLD the bound address, then confirm it serves. The
-    // report arrives once the listener is live, so the remaining poll only
-    // covers router/middleware setup, never a port that might never bind.
+    // Step 2: wait to be TOLD the bound address (or the bind error), then
+    // confirm it serves. The report arrives once the listener is live (or the
+    // bind has definitively failed), so the remaining poll only covers
+    // router/middleware setup, never a port that might never bind.
     // `serve::run` loads the whole workspace index BEFORE it binds, so the wait
-    // for the address covers indexing as well as the bind — on a loaded machine
+    // for the report covers indexing as well as the bind — on a loaded machine
     // that is the slow part. Give it the full deadline, then give reachability
     // its own: sharing one budget would let a slow index consume the time the
     // router needs to come up, failing a server that was going to work.
-    let bound_addr = bound_rx.recv_timeout(deadline).map_err(|_| {
-        anyhow::anyhow!(
+    let bound_addr = match bound_rx.recv_timeout(deadline) {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(bind_error)) => anyhow::bail!("operator server failed to start: {bind_error}"),
+        Err(_) => anyhow::bail!(
             "operator server did not report a bound address within {deadline:?} \
              (index load + bind)"
-        )
-    })?;
+        ),
+    };
 
     let start = Instant::now();
     let probe_timeout = Duration::from_millis(250);
@@ -248,8 +253,8 @@ pub(crate) fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Re
 
 /// First bindable operator-range address on `host`, or `None` if the ranges are
 /// exhausted. Restricted to [`serve::operator_port_candidates`] so the returned
-/// port is one the OS does not hand out on its own — the property that makes it
-/// survive this selector's drop-then-rebind gap.
+/// port is one the OS does not hand out on its own — it stays free longer than
+/// an OS ephemeral port would once this function's own probe listener drops.
 fn first_free_operator_addr(host: IpAddr) -> Option<SocketAddr> {
     crate::server::serve::operator_port_candidates().find_map(|port| {
         let addr = SocketAddr::new(host, port);
@@ -438,8 +443,13 @@ pub fn run_admin_with_control_state<B: crate::cli::browser::BrowserOpener + ?Siz
         Some(s) => s,
         None => {
             let preferred = preferred_start_addr(existing_profile.as_ref());
-            let started =
-                start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)?;
+            let started = start_operator_server(
+                Some(preferred),
+                false,
+                None,
+                None,
+                ADMIN_SERVE_START_DEADLINE,
+            )?;
             persist_started_port(control_state_dir, existing_profile.as_ref(), &started);
             started
         }
@@ -563,9 +573,9 @@ mod tests {
     /// Serve binding once and reporting back leaves no gap to lose.
     #[test]
     fn concurrent_starts_with_no_preference_both_come_up() {
-        let first = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
             .expect("first operator server should come up");
-        let second = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+        let second = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
             .expect("second operator server should come up");
         assert_ne!(
             first.bound_addr, second.bound_addr,
@@ -579,10 +589,11 @@ mod tests {
     /// `SO_REUSEADDR` let two servers silently share one address.
     #[test]
     fn occupied_preference_falls_back_instead_of_failing() {
-        let first = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
             .expect("first operator server should come up");
         let second = start_operator_server(
             Some(first.bound_addr),
+            false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
@@ -591,6 +602,30 @@ mod tests {
         assert_ne!(
             first.bound_addr, second.bound_addr,
             "the second start must land on a different, genuinely free port"
+        );
+    }
+
+    /// The mirror image of the fallback test above: `explicit = true` means the
+    /// caller (a real `symforge setup --port N`) DEMANDED this exact port, so an
+    /// occupied one must fail loudly (FR-002/003), not silently substitute a
+    /// different port that then gets persisted to config behind the operator's
+    /// back. `start_operator_server` used to hardcode `explicit_listen: false`
+    /// unconditionally, which made this indistinguishable from a soft preference.
+    #[test]
+    fn explicit_demand_fails_loudly_instead_of_falling_back() {
+        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
+            .expect("first operator server should come up");
+
+        let result = start_operator_server(
+            Some(first.bound_addr),
+            true,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        );
+        assert!(
+            result.is_err(),
+            "an explicit demand for an occupied port must fail loudly, not fall back: {result:?}"
         );
     }
 
@@ -614,8 +649,14 @@ mod tests {
         // loopback open), then confirm both the start helper's descriptor and a
         // standalone reachability probe agree it is serving.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let desc = start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
-            .expect("operator server should become reachable");
+        let desc = start_operator_server(
+            Some(preferred),
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("operator server should become reachable");
 
         assert!(desc.reachable);
         assert!(desc.bound_addr.ip().is_loopback());
@@ -659,9 +700,14 @@ mod tests {
     fn run_admin_reuses_running_server_on_profile_port() {
         // A real server is running; the profile points at its port.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running =
-            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
-                .expect("operator server should come up");
+        let running = start_operator_server(
+            Some(preferred),
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("operator server should come up");
         let running_port = running.bound_addr.port();
 
         let project = tempfile::tempdir().expect("temp project");
@@ -737,9 +783,14 @@ mod tests {
     #[test]
     fn run_admin_no_open_does_not_open_browser() {
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running =
-            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
-                .expect("operator server should come up");
+        let running = start_operator_server(
+            Some(preferred),
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("operator server should come up");
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
@@ -837,9 +888,14 @@ mod tests {
         // path must NOT block: another process owns the server, so admin exits 0
         // after opening the dashboard (required behavior #1).
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let running =
-            start_operator_server(Some(preferred), None, None, ADMIN_SERVE_START_DEADLINE)
-                .expect("operator server should come up");
+        let running = start_operator_server(
+            Some(preferred),
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("operator server should come up");
 
         let project = tempfile::tempdir().expect("temp project");
         let home = tempfile::tempdir().expect("temp home");
