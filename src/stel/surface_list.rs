@@ -128,6 +128,35 @@ mod tests {
         );
     }
 
+    /// `project` and `working_directory` are routing fields the daemon supplies
+    /// or peeks before decode. They must stay OUT of the advertised compact
+    /// schema (A-025 byte budget) while still deserializing — unhiding either
+    /// one silently blows the budget, and dropping deserialization silently
+    /// sends the edit to the wrong repository.
+    #[test]
+    fn routing_fields_are_schema_hidden_but_still_deserialized() {
+        let edit = compact_surface_tools()
+            .into_iter()
+            .find(|t| t.name == CompactSurfaceTool::SymforgeEdit.as_str())
+            .expect("symforge_edit compact surface tool");
+        let schema = serde_json::to_string(&edit.input_schema).expect("schema serializes");
+        for field in ["project", "working_directory"] {
+            assert!(
+                !schema.contains(field),
+                "{field} must stay hidden from the compact symforge_edit schema"
+            );
+        }
+
+        let request: crate::stel::StelEditRequest = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "project": "sibling-repo",
+            "working_directory": "/tmp/worktree",
+        }))
+        .expect("routing fields must still deserialize");
+        assert_eq!(request.project.as_deref(), Some("sibling-repo"));
+        assert_eq!(request.working_directory.as_deref(), Some("/tmp/worktree"));
+    }
+
     #[test]
     fn symforge_edit_schema_under_a025_budget() {
         let bytes = symforge_edit_schema_bytes();

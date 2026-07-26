@@ -134,6 +134,14 @@ impl SymforgeCallInput {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StelEditRequest {
     pub path: String,
+    // Open project id/alias (never a path); omitted selects the session home.
+    // Hidden from the compact schema (A-025 byte budget) like
+    // `working_directory` below, but still deserialized: the daemon peeks this
+    // field to route the call before decode, so single-project routing works
+    // without advertising an advanced field on the token-sensitive surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     /// New source. For replace: the FULL item (signature + body), flush-left
