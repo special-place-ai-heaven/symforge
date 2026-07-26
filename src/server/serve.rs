@@ -49,6 +49,15 @@ pub struct ServeArgs {
     /// Name of an env var holding the API key (`--api-key-env`); used only when
     /// `api_key` is `None`.
     pub api_key_env: Option<String>,
+    /// Optional one-shot report of the address this run actually bound.
+    ///
+    /// A background starter otherwise cannot learn the bound address without
+    /// pre-binding a port itself, dropping the listener, and asking this run to
+    /// re-bind the same number — a gap in which any other process can take it.
+    /// Sending the address from inside `run`, once the listener is live, closes
+    /// that gap: the caller is TOLD, never guesses. Send failures are ignored
+    /// (the caller stopped caring), so this never affects serving.
+    pub bound_addr_tx: Option<std::sync::mpsc::SyncSender<SocketAddr>>,
 }
 
 impl Default for ServeArgs {
@@ -58,6 +67,7 @@ impl Default for ServeArgs {
             explicit_listen: false,
             api_key: None,
             api_key_env: None,
+            bound_addr_tx: None,
         }
     }
 }
@@ -150,14 +160,45 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
 /// fan-out), set non-blocking, bind, listen with backlog 1024, then hand the
 /// std socket to tokio. Unlike the sidecar (which always binds `:0`), this
 /// honors the operator-chosen port from `--listen` (and `:0` for tests).
+///
+/// Use this for an address the caller has already DECIDED on. To discover a free
+/// port, use [`bind_listener_exclusive`] — `SO_REUSEADDR` makes this function
+/// succeed on a port another `SO_REUSEADDR` socket already holds, so it cannot
+/// answer "is this port free?".
 pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    bind_listener_with(addr, true)
+}
+
+/// Bind a listener that fails when the port is already held (US1 free-port scan).
+///
+/// Identical to [`bind_listener`] except `SO_REUSEADDR` is left OFF, which is
+/// what makes an occupied port report `AddrInUse` instead of silently sharing.
+/// On Windows two sockets share a port only when BOTH set `SO_REUSEADDR`; on
+/// Linux the flag never lets a second socket bind an actively listening port.
+/// Omitting it therefore yields honest occupancy detection on both.
+///
+/// This is the primitive the free-port scan needs: without it, two starters both
+/// naming the same port both "succeed" and the second silently shadows the
+/// first — the OS then delivers connections to only one of them, arbitrarily.
+/// The returned listener is served on directly, so there is no drop-and-rebind
+/// gap for another process to win.
+pub fn bind_listener_exclusive(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    bind_listener_with(addr, false)
+}
+
+fn bind_listener_with(
+    addr: SocketAddr,
+    reuse_address: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
+    if reuse_address {
+        socket.set_reuse_address(true)?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -200,12 +241,16 @@ pub(crate) fn operator_port_candidates() -> impl Iterator<Item = u16> {
 pub fn probe_free_listener(
     preferred: Option<SocketAddr>,
 ) -> std::io::Result<tokio::net::TcpListener> {
+    // Every bind on this path is EXCLUSIVE (no `SO_REUSEADDR`): the question
+    // being asked is "is this port free?", and a reusing bind answers it wrongly
+    // by succeeding on a port another reusing socket already holds. Two starters
+    // would then share an address and the OS would deliver to one arbitrarily.
     if let Some(addr) = preferred {
         // Explicit ephemeral (`:0`) is honored verbatim.
         if addr.port() == 0 {
-            return bind_listener(addr);
+            return bind_listener_exclusive(addr);
         }
-        if let Ok(listener) = bind_listener(addr) {
+        if let Ok(listener) = bind_listener_exclusive(addr) {
             return Ok(listener);
         }
     }
@@ -213,7 +258,7 @@ pub fn probe_free_listener(
     // operator port in the corporate-friendly ranges. NEVER an OS ephemeral port.
     for port in operator_port_candidates() {
         let addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
-        if let Ok(listener) = bind_listener(addr) {
+        if let Ok(listener) = bind_listener_exclusive(addr) {
             return Ok(listener);
         }
     }
@@ -447,6 +492,13 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
         .local_addr()
         .map_err(|source| ServeError::Bind { addr, source })?;
 
+    // Report the live bound address to a background starter, if one asked. The
+    // listener is already bound here, so the caller learns the real address with
+    // no drop-and-rebind gap to lose. A closed receiver is not an error.
+    if let Some(tx) = args.bound_addr_tx.as_ref() {
+        let _ = tx.try_send(local_addr);
+    }
+
     // Build the /mcp router plus the /admin + /api/v1 router (006), merge them,
     // and layer Bearer auth + Origin gating in front (secure-default rule on
     // AuthConfig/AuthLayerState; P1-B Origin on OriginLayerState). Bearer auth
@@ -661,6 +713,7 @@ mod tests {
             explicit_listen: true,
             api_key: Some("inline-secret".to_string()),
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args)
             .await
@@ -704,6 +757,7 @@ mod tests {
             explicit_listen: true,
             api_key: None,
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args)
             .await
@@ -718,6 +772,7 @@ mod tests {
             explicit_listen: true,
             api_key: Some("k".to_string()),
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args).await.expect_err("bad --listen must error");
         assert!(matches!(err, ServeError::InvalidListen { .. }));

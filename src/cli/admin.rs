@@ -95,31 +95,27 @@ pub fn operator_server_reachable(addr: SocketAddr, timeout: Duration) -> bool {
 /// verified-free port, poll reachability, and return the live
 /// [`ServerSessionDescriptor`] (D3, E4).
 ///
-/// **Approach + limits.** `serve::run` binds its listener *internally* and then
-/// blocks in `axum::serve(...).await` until a shutdown signal, so it neither
-/// returns the bound address nor yields control. Rather than fork/reimplement
-/// serve, this helper:
+/// **Approach.** `serve::run` blocks in `axum::serve(...).await` until shutdown,
+/// so it never returns. This helper:
 ///
-/// 1. Selects a verified-free address up front via
-///    [`serve::probe_free_port`] (preferring `preferred`, else an OS-assigned
-///    ephemeral loopback port).
-/// 2. Spawns a dedicated **OS thread** that owns its own multi-thread tokio
-///    runtime and runs `serve::run` with `explicit_listen = true` bound to that
-///    exact address. `serve::run` sets `SO_REUSEADDR`, so the rebind into the
-///    just-probed port is robust against the tiny probe-then-bind window. The
-///    thread (and its server) live for the lifetime of the process — this is a
-///    start-on-demand helper, not a managed lifecycle (no shutdown handle is
-///    returned; stopping is process exit, matching D3's "no OS service unit"
-///    scope).
-/// 3. Polls [`operator_server_reachable`] on the chosen address until it serves
-///    or `deadline` elapses, returning the reachable descriptor (FR-020) or an
-///    error if it never came up.
+/// 1. Spawns a dedicated **OS thread** owning its own multi-thread tokio runtime,
+///    running `serve::run` with a `bound_addr_tx` channel. The thread (and its
+///    server) live for the lifetime of the process — this is a start-on-demand
+///    helper, not a managed lifecycle (no shutdown handle is returned; stopping
+///    is process exit, matching D3's "no OS service unit" scope).
+/// 2. Waits for `serve::run` to REPORT the address it bound, then confirms
+///    reachability before returning the descriptor (FR-020).
+///
+/// Selecting the port here — bind it, read the number, drop the listener, and
+/// ask serve to re-bind it — was a real defect, not a theoretical window. The
+/// gap was wide enough to lose in CI repeatedly, first on OS ephemeral ports
+/// and then on `8080`, the first operator candidate that every concurrent
+/// starter picks. Letting serve bind once and report back removes the gap
+/// rather than narrowing it: there is no interval in which the port is chosen
+/// but unowned.
 ///
 /// **Limit (documented):** there is no graceful-stop handle — the spawned server
-/// runs until the process exits. The probe-then-bind on step 1 has the documented
-/// small rebind window of [`serve::probe_free_port`]; `SO_REUSEADDR` plus the
-/// immediate rebind makes a steal vanishingly unlikely, and the reachability gate
-/// in step 3 means we never report a URL that did not actually come up.
+/// runs until the process exits.
 ///
 /// `api_key` / `api_key_env` are threaded straight into [`ServeArgs`] so a network
 /// bind can carry a key sourced from the environment (the wizard never passes an
@@ -130,29 +126,31 @@ pub fn start_operator_server(
     api_key_env: Option<String>,
     deadline: Duration,
 ) -> anyhow::Result<ServerSessionDescriptor> {
-    // Step 1: pick a verified-free address before spawning, so we know the bound
-    // address without needing serve::run to report it back. This runs on the
-    // CALLER's thread, which has no ambient tokio reactor, so we cannot use
-    // `serve::probe_free_port` here (it builds a `tokio::net::TcpListener`, which
-    // panics outside a runtime). Instead select the address with a reactor-free
-    // `std` bind — the same probe-then-bind decision logic, the same documented
-    // small rebind window; the real serve bind (inside the spawned runtime) still
-    // uses `bind_listener` with `SO_REUSEADDR`, which makes the rebind robust.
-    let bound_addr = select_free_addr_std(preferred)
-        .map_err(|e| anyhow::anyhow!("could not select a free operator-server port: {e}"))?;
-
-    // Step 2: run serve::run on its own thread + runtime, bound to that exact
-    // address. `explicit_listen = true` makes serve honor the address exactly
-    // (it would otherwise fall back on an occupied default — but we already
-    // verified this address is free).
+    // Step 1: let serve pick AND own the port. `explicit_listen` is true only for
+    // a concrete requested port; a `:0` (or absent) preference keeps serve's own
+    // `probe_free_listener` fallback, which binds once with no rebind gap. The
+    // caller never touches the port, so there is no interval in which it is
+    // chosen but unowned.
+    // No preference (or `:0`) means "any free port", NOT the default port:
+    // `bind_listener` sets SO_REUSEADDR, so two starters both naming 8787 would
+    // both "succeed" on the same address and the second would silently shadow
+    // the first. Leaving `explicit_listen` false routes those through serve's
+    // `probe_free_listener`, which scans for a genuinely free operator port.
+    let requested = preferred.map_or_else(
+        || crate::server::serve::DEFAULT_LISTEN.to_string(),
+        |addr| addr.to_string(),
+    );
+    let explicit_listen = preferred.is_some_and(|addr| addr.port() != 0);
+    let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
     let serve_args = ServeArgs {
-        listen: bound_addr.to_string(),
-        explicit_listen: true,
+        listen: requested,
+        explicit_listen,
         api_key,
         api_key_env,
+        bound_addr_tx: Some(bound_tx),
     };
     std::thread::Builder::new()
-        .name(format!("symforge-serve-{}", bound_addr.port()))
+        .name("symforge-serve".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -172,8 +170,14 @@ pub fn start_operator_server(
         })
         .map_err(|e| anyhow::anyhow!("could not spawn operator-server thread: {e}"))?;
 
-    // Step 3: poll reachability until the server answers or the deadline elapses.
+    // Step 2: wait to be TOLD the bound address, then confirm it serves. The
+    // report arrives once the listener is live, so the remaining poll only
+    // covers router/middleware setup, never a port that might never bind.
     let start = Instant::now();
+    let bound_addr = bound_rx.recv_timeout(deadline).map_err(|_| {
+        anyhow::anyhow!("operator server did not report a bound address within {deadline:?}")
+    })?;
+
     let probe_timeout = Duration::from_millis(250);
     let poll_interval = Duration::from_millis(50);
     while start.elapsed() < deadline {
@@ -186,33 +190,32 @@ pub fn start_operator_server(
     anyhow::bail!("operator server did not become reachable on {bound_addr} within {deadline:?}")
 }
 
-/// Select a verified-free loopback address using only `std` (no tokio reactor),
-/// preferring `preferred`. Mirrors the decision logic of `serve::probe_free_port`
-/// but with a plain `std::net::TcpListener` so it is callable from a synchronous
-/// CLI context (the caller of [`start_operator_server`] has no ambient runtime).
+/// Suggest a currently-free loopback address using only `std` (no tokio
+/// reactor), preferring `preferred`. Callable from a synchronous CLI context.
 ///
 /// Attempts to bind `preferred` (when non-zero); on success returns that address,
-/// on failure (the port is occupied) binds the first free
+/// on failure (the port is occupied) returns the first free
 /// [`serve::operator_port_candidates`] port (8000-8999 then 5000-5999) — never an
 /// OS-assigned ephemeral port, which corporate networks block (the 61850
 /// problem). An explicit `:0` `preferred` means "any free port" and is resolved
-/// from those same operator ranges — NOT as an OS ephemeral port, which this
-/// selector cannot safely return (see below). The probe listener is dropped
-/// before returning, so the same documented small rebind window as
-/// `serve::probe_free_port` applies — closed in practice by the `SO_REUSEADDR`
-/// rebind inside `serve::run` plus the step-3 reachability gate. Pub(crate) for
-/// setup wizard reuse.
+/// from those same operator ranges.
+///
+/// **This SUGGESTS a port; it does not reserve one.** The probe listener is
+/// dropped before returning, so the address can go stale — that is inherent to
+/// suggesting a value for a config file, which is the setup wizard's use. Do NOT
+/// use it to pick a port to then start a server on: that reintroduces the
+/// drop-then-rebind gap [`start_operator_server`] was fixed to remove. A starter
+/// should let `serve::run` bind and report its own address.
+///
+/// The probe uses a plain `std::net::TcpListener` (no `SO_REUSEADDR`), so an
+/// occupied port is detected honestly rather than silently shared.
 pub(crate) fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
     if let Some(addr) = preferred {
-        // `:0` asks for "any free port". Resolving it as an OS EPHEMERAL port is
-        // unsafe here, because this selector drops its listener and `serve::run`
-        // must re-bind that exact number: the ephemeral range is the one the OS
-        // is actively handing out to everything else, so on a loaded machine the
-        // port is frequently taken inside the gap and serve never comes up. Fall
-        // through to the operator-range scan instead — the same ranges
-        // `serve::probe_free_listener` restricts itself to, which are not
-        // handed out by the OS and so survive the rebind. `addr` may carry a
-        // non-loopback host, so honor its IP while picking the port.
+        // `:0` asks for "any free port", answered from the operator ranges
+        // rather than the OS ephemeral range — corporate networks routinely
+        // block ephemeral high ports (the 61850 problem), and this value is
+        // written into a config for later use. `addr` may carry a non-loopback
+        // host, so honor its IP while picking the port.
         if addr.port() != 0 {
             if let Ok(listener) = std::net::TcpListener::bind(addr) {
                 return listener.local_addr();
@@ -523,11 +526,9 @@ mod tests {
         assert_eq!(desc.bound_addr, addr);
     }
 
-    /// `select_free_addr_std` drops its probe listener and `serve::run` re-binds
-    /// the same number, so the port it returns must be one the OS does not hand
-    /// out on its own. Resolving `:0` to an OS ephemeral port broke exactly
-    /// that: on a loaded machine the port was taken inside the gap, serve never
-    /// bound, and the caller polled a dead socket until its deadline elapsed.
+    /// The suggested port is written into an operator config and used later, so
+    /// it must come from the ranges corporate networks permit — never an OS
+    /// ephemeral high port (the 61850 problem).
     #[test]
     fn select_free_addr_std_never_returns_an_ephemeral_port() {
         fn in_operator_range(port: u16) -> bool {
@@ -542,6 +543,22 @@ mod tests {
                 "selected port must be operator-range, not ephemeral: {addr}"
             );
         }
+    }
+
+    /// Two starters racing with no preference must both come up. Pre-selecting
+    /// the port here (bind, read, drop, ask serve to re-bind) made this fail:
+    /// both picked `8080`, the first operator candidate, and one lost the gap.
+    /// Serve binding once and reporting back leaves no gap to lose.
+    #[test]
+    fn concurrent_starts_with_no_preference_both_come_up() {
+        let first = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+            .expect("first operator server should come up");
+        let second = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+            .expect("second operator server should come up");
+        assert_ne!(
+            first.bound_addr, second.bound_addr,
+            "each start must own a distinct port"
+        );
     }
 
     #[test]
