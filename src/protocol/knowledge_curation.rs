@@ -941,6 +941,9 @@ fn apply_reviewed_mutation(
             validate_target_on_disk(repo_root, &target)?;
             validate_proposal_compatibility(&reviewed.proposal_action, entry)?;
             let entry = convert_entry(entry)?;
+            if let Some(target) = &entry.superseded_by {
+                validate_target_on_disk(repo_root, target)?;
+            }
             for evidence in &entry.evidence {
                 if !reviewed.proposal_evidence_ids.contains(&evidence.rule_id) {
                     return Err("Error: unreproduced_evidence; policy evidence is absent from the fresh review."
@@ -1040,16 +1043,20 @@ fn validate_proposal_compatibility(
         },
         RemediationAction::RelabelIntent
         | RemediationAction::Keep
-        | RemediationAction::NeedsReview => matches!(
-            entry.lifecycle,
-            KnowledgePolicyLifecycleInput::Unknown | KnowledgePolicyLifecycleInput::Proposed
-        ),
-        RemediationAction::Update => !matches!(
-            entry.lifecycle,
-            KnowledgePolicyLifecycleInput::Superseded
-                | KnowledgePolicyLifecycleInput::Archived
-                | KnowledgePolicyLifecycleInput::Historical
-        ),
+        | RemediationAction::NeedsReview => {
+            matches!(
+                entry.lifecycle,
+                KnowledgePolicyLifecycleInput::Unknown | KnowledgePolicyLifecycleInput::Proposed
+            ) && entry.superseded_by.is_none()
+        }
+        RemediationAction::Update => {
+            !matches!(
+                entry.lifecycle,
+                KnowledgePolicyLifecycleInput::Superseded
+                    | KnowledgePolicyLifecycleInput::Archived
+                    | KnowledgePolicyLifecycleInput::Historical
+            ) && entry.superseded_by.is_none()
+        }
     };
     if compatible {
         Ok(())
@@ -2229,6 +2236,100 @@ mod tests {
             &matching_entry,
         )
         .expect("matching reviewed successor remains authorized");
+    }
+
+    #[test]
+    fn non_successor_review_upsert_cannot_attach_successor_target() {
+        let successor = test_anchor("docs/current.md", &"c".repeat(64), 0, 12);
+        let entry = policy_entry_input(
+            KnowledgePolicyLifecycleInput::Unknown,
+            Some(anchor_target_input(&successor)),
+        );
+
+        let error = validate_proposal_compatibility(&RemediationAction::Keep, &entry)
+            .expect_err("keep reviews must not authorize successor edges");
+
+        assert!(error.contains("mutation_action_mismatch"), "{error}");
+    }
+
+    #[test]
+    fn supersede_upsert_rejects_stale_successor_unit_hash() {
+        let dir = tempfile::tempdir().expect("curation unit hash fixture");
+        let root = dir.path();
+        fs::create_dir_all(root.join("docs")).expect("docs dir");
+        let old_bytes = b"# Old\nretire me\n";
+        let current_bytes = b"# Current\nreplacement\n";
+        fs::write(root.join("docs/old.md"), old_bytes).expect("old knowledge");
+        fs::write(root.join("docs/current.md"), current_bytes).expect("current knowledge");
+        let old_len = u32::try_from(old_bytes.len()).expect("old byte length");
+        let current_len = u32::try_from(current_bytes.len()).expect("current byte length");
+        let old_hash = crate::hash::digest_hex(old_bytes);
+        let current_hash = crate::hash::digest_hex(current_bytes);
+        let reviewed_target = KnowledgePolicyTarget {
+            path: "docs/old.md".to_string(),
+            content_hash: old_hash,
+            unit_byte_range: Some(0..old_len),
+            unit_hash: Some(crate::hash::digest_hex(old_bytes)),
+        };
+        let successor = test_anchor("docs/current.md", &current_hash, 0, current_len);
+        let wrong_successor_unit_hash = "f".repeat(64);
+        assert_ne!(
+            wrong_successor_unit_hash,
+            crate::hash::digest_hex(current_bytes),
+            "fixture stale unit hash must differ from current bytes"
+        );
+        let action_id = "action-supersede".to_string();
+        let plan = CurationReviewPlan {
+            review_hash: "review".to_string(),
+            manifest_digest: "manifest".to_string(),
+            policy_digest: crate::hash::digest_hex(&[]),
+            publication_generation: 1,
+            source: successor.source.clone(),
+            actions: BTreeMap::from([(
+                action_id.clone(),
+                crate::protocol::knowledge_review::CurationReviewAction {
+                    action_id: action_id.clone(),
+                    target: reviewed_target.clone(),
+                    proposal_action: RemediationAction::MarkSuperseded {
+                        successor: successor.clone(),
+                    },
+                    proposal_evidence_ids: Vec::new(),
+                    unmet_preconditions: Vec::new(),
+                },
+            )]),
+        };
+        let action = KnowledgePolicyActionInput {
+            action_id,
+            mutation: KnowledgePolicyMutationInput::Upsert {
+                entry: KnowledgePolicyEntryInput {
+                    entry_id: "entry-stale-successor-hash".to_string(),
+                    target: target_input(&reviewed_target),
+                    lifecycle: KnowledgePolicyLifecycleInput::Superseded,
+                    authority_domain: None,
+                    superseded_by: Some(KnowledgePolicyTargetInput {
+                        path: successor.path.clone(),
+                        content_hash: successor.content_hash.clone(),
+                        unit_byte_range: Some([
+                            successor.byte_range.start,
+                            successor.byte_range.end,
+                        ]),
+                        unit_hash: Some(wrong_successor_unit_hash),
+                    }),
+                    evidence: Vec::new(),
+                    justification_code: "reviewed-supersession".to_string(),
+                },
+            },
+        };
+        let mut entries = BTreeMap::new();
+
+        let error = apply_reviewed_mutation(root, &plan, &action, &mut entries)
+            .expect_err("stale successor unit hashes must not be written");
+
+        assert!(error.contains("stale_target_guard"), "{error}");
+        assert!(
+            entries.is_empty(),
+            "rejected upsert must not mutate entries"
+        );
     }
 
     fn commit_file(root: &Path, relative_path: &str, bytes: &[u8], message: &str) {

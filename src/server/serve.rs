@@ -1,15 +1,10 @@
 //! `symforge serve` async entrypoint and socket binding.
 //!
-//! Phase-2 scope (this file): resolve the API key, compute loopback, enforce the
-//! secure-default refuse-to-start rule, and provide [`bind_listener`] (the
-//! socket2 + `SO_REUSEADDR` bind, mirroring [`crate::sidecar::server::spawn_sidecar`]).
-//!
-//! US1/T013-T016 will extend [`run`] to build the [`ServerRuntime`], mount the
-//! `/mcp` router + auth layer, print the attach URL, and run with graceful
-//! shutdown. For now [`run`] performs the secure-startup checks and returns
-//! `Ok(())` with a "not yet fully implemented" notice — the secure-default
-//! behavior (refuse-to-start, key resolution, loopback computation) is already
-//! real and exercised before any listener is opened.
+//! [`run`] resolves the API key, computes loopback, enforces the secure-default
+//! refuse-to-start rule, binds via [`bind_listener`]/[`probe_free_listener`],
+//! then builds the [`ServerRuntime`], mounts the `/mcp` + `/admin`/`/api/v1`
+//! routers behind Bearer auth and Origin gating, prints the attach URL, and
+//! serves until shutdown.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,7 +27,13 @@ use crate::watcher::WatcherInfo;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
 /// Resolved inputs for the `serve` subcommand.
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Clone`: `bound_addr_tx` is a `sync_channel(1)` rendezvous
+/// end. Cloning would let two `run()` calls share one channel — the second
+/// `try_send` after the first receiver already consumed its slot would be
+/// silently dropped, so the second call's caller would wait out its own
+/// deadline for an address that was never coming. One `ServeArgs`, one `run()`.
+#[derive(Debug)]
 pub struct ServeArgs {
     /// `HOST:PORT` to bind. `PORT=0` requests an OS-assigned port.
     pub listen: String,
@@ -49,6 +50,20 @@ pub struct ServeArgs {
     /// Name of an env var holding the API key (`--api-key-env`); used only when
     /// `api_key` is `None`.
     pub api_key_env: Option<String>,
+    /// Optional one-shot report of the address this run actually bound.
+    ///
+    /// A background starter otherwise cannot learn the bound address without
+    /// pre-binding a port itself, dropping the listener, and asking this run to
+    /// re-bind the same number — a gap in which any other process can take it.
+    /// Sending the address from inside `run`, once the listener is live, closes
+    /// that gap: the caller is TOLD, never guesses. Send failures are ignored
+    /// (the caller stopped caring), so this never affects serving.
+    ///
+    /// `Err` carries a bind failure (rendered, not the typed [`ServeError`] —
+    /// keeps this channel `Send`-simple) so a starter with an `explicit_listen`
+    /// occupied port learns that immediately instead of waiting out its full
+    /// deadline for a report that a bind error already prevented.
+    pub bound_addr_tx: Option<std::sync::mpsc::SyncSender<Result<SocketAddr, String>>>,
 }
 
 impl Default for ServeArgs {
@@ -58,6 +73,7 @@ impl Default for ServeArgs {
             explicit_listen: false,
             api_key: None,
             api_key_env: None,
+            bound_addr_tx: None,
         }
     }
 }
@@ -122,11 +138,6 @@ pub fn enforce_api_key_source_policy(
 }
 
 /// Whether a parsed bind address is loopback (`127.0.0.0/8` or `::1`).
-// REVIEW P3-D (deferred): `IpAddr::is_loopback()` is `false` for an IPv4-mapped
-// IPv6 loopback (`[::ffff:127.0.0.1]`). This is currently safe — with a key it
-// binds (fine); without a key it refuses (secure default). Optional future fix:
-// normalize an IPv4-mapped loopback to its IPv4 form before the policy check.
-/// Whether a parsed bind address is loopback (`127.0.0.0/8` or `::1`).
 ///
 /// P3-D (resolved): an IPv4-mapped IPv6 loopback (`[::ffff:127.0.0.1]`) is
 /// normalized to its IPv4 form before the check, so it is correctly treated as
@@ -142,14 +153,29 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
     ip.is_loopback()
 }
 
-/// Bind a [`tokio::net::TcpListener`] on `addr` with `SO_REUSEADDR`.
+/// Bind an EXCLUSIVE [`tokio::net::TcpListener`] on `addr` — no `SO_REUSEADDR`.
 ///
-/// Mirrors the socket setup in [`crate::sidecar::server::spawn_sidecar`]:
-/// create a `socket2::Socket`, set `SO_REUSEADDR` (so a TIME_WAIT socket on the
-/// chosen port does not block the bind under rapid restarts / parallel test
-/// fan-out), set non-blocking, bind, listen with backlog 1024, then hand the
-/// std socket to tokio. Unlike the sidecar (which always binds `:0`), this
-/// honors the operator-chosen port from `--listen` (and `:0` for tests).
+/// Mirrors the socket setup in [`crate::sidecar::server::spawn_sidecar`] except
+/// for the reuse flag: create a `socket2::Socket`, set non-blocking, bind,
+/// listen with backlog 1024, then hand the std socket to tokio.
+///
+/// `SO_REUSEADDR` is deliberately NOT set. It does not do what an earlier
+/// version of this function's doc comment claimed ("so a TIME_WAIT socket does
+/// not block the bind") — a *listening* socket is never in TIME_WAIT; only a
+/// closed connection enters that state, and this function is never used to
+/// rebind a just-closed connection's port. What the flag actually does is let
+/// TWO listening sockets share one address: on Windows, when both sides set it;
+/// on Linux, the flag does not permit that, but the asymmetry is exactly the
+/// trap — code that "works" on Linux with reuse on fails silently on Windows.
+///
+/// This was a real, shipped bug: `serve::run`'s EXPLICIT `--listen` path used a
+/// reuse-enabled bind, so a second `symforge serve --listen <occupied>` bound
+/// successfully, printed a healthy attach URL, and then accepted ZERO
+/// connections — every request kept going to the first server, with no error
+/// anywhere to explain it. An occupied port must fail loudly here; that is the
+/// whole contract of an explicit `--listen` (FR-002/003). Every caller in this
+/// codebase — the free-port scan AND the explicit-address bind — wants honest
+/// occupancy detection, so there is only one function.
 pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -157,7 +183,6 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -225,8 +250,9 @@ pub fn probe_free_listener(
 
 /// Resolve a verified-free [`SocketAddr`], preferring `preferred` (US1, D1).
 ///
-/// Wraps [`probe_free_listener`]: tries `preferred` via a real bind, else binds
-/// `127.0.0.1:0` for an OS-assigned port, and returns the listener's
+/// Wraps [`probe_free_listener`]: tries `preferred` via a real bind, else falls
+/// back to the first free operator-range port (never an OS ephemeral port —
+/// see [`operator_port_candidates`]), and returns the listener's
 /// `local_addr()`. The probe listener is dropped before returning, leaving a
 /// small rebind window — a second process could, in principle, grab the freed
 /// port between this call and the caller's rebind. Production serve uses
@@ -438,14 +464,35 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // address (no `--listen`) prefers `DEFAULT_LISTEN` but, if occupied, falls
     // back to an OS-assigned free port via `probe_free_listener` (which threads
     // the live listener through — no rebind window, no dead second listener).
-    let listener = if args.explicit_listen {
-        bind_listener(addr).map_err(|source| ServeError::Bind { addr, source })?
+    let bind_result = if args.explicit_listen {
+        bind_listener(addr)
     } else {
-        probe_free_listener(Some(addr)).map_err(|source| ServeError::Bind { addr, source })?
+        probe_free_listener(Some(addr))
+    }
+    .and_then(|listener| {
+        listener
+            .local_addr()
+            .map(|local_addr| (listener, local_addr))
+    });
+
+    // Report the outcome to a background starter, if one asked, BEFORE
+    // propagating a bind error with `?`. Without this, a starter waiting on
+    // `bound_addr_tx` for an occupied explicit `--listen` would see no send at
+    // all and sit out its full deadline, then report a misleading "did not
+    // report a bound address" timeout instead of the real "port occupied"
+    // error. A closed receiver (no starter waiting) is not an error either way.
+    let (listener, local_addr) = match bind_result {
+        Ok(pair) => pair,
+        Err(source) => {
+            if let Some(tx) = args.bound_addr_tx.as_ref() {
+                let _ = tx.try_send(Err(format!("failed to bind {addr}: {source}")));
+            }
+            return Err(ServeError::Bind { addr, source });
+        }
     };
-    let local_addr = listener
-        .local_addr()
-        .map_err(|source| ServeError::Bind { addr, source })?;
+    if let Some(tx) = args.bound_addr_tx.as_ref() {
+        let _ = tx.try_send(Ok(local_addr));
+    }
 
     // Build the /mcp router plus the /admin + /api/v1 router (006), merge them,
     // and layer Bearer auth + Origin gating in front (secure-default rule on
@@ -661,6 +708,7 @@ mod tests {
             explicit_listen: true,
             api_key: Some("inline-secret".to_string()),
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args)
             .await
@@ -704,6 +752,7 @@ mod tests {
             explicit_listen: true,
             api_key: None,
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args)
             .await
@@ -718,6 +767,7 @@ mod tests {
             explicit_listen: true,
             api_key: Some("k".to_string()),
             api_key_env: None,
+            bound_addr_tx: None,
         };
         let err = run(args).await.expect_err("bad --listen must error");
         assert!(matches!(err, ServeError::InvalidListen { .. }));
