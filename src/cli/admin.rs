@@ -114,6 +114,10 @@ pub fn operator_server_reachable(addr: SocketAddr, timeout: Duration) -> bool {
 /// rather than narrowing it: there is no interval in which the port is chosen
 /// but unowned.
 ///
+/// `preferred` is a **preference**, not a demand: a remembered port to land back
+/// on, or the default. When it is occupied, serve falls back to a free operator
+/// port rather than failing — the caller wanted *a* server, not that exact port.
+///
 /// **Limit (documented):** there is no graceful-stop handle — the spawned server
 /// runs until the process exits.
 ///
@@ -126,25 +130,25 @@ pub fn start_operator_server(
     api_key_env: Option<String>,
     deadline: Duration,
 ) -> anyhow::Result<ServerSessionDescriptor> {
-    // Step 1: let serve pick AND own the port. `explicit_listen` is true only for
-    // a concrete requested port; a `:0` (or absent) preference keeps serve's own
-    // `probe_free_listener` fallback, which binds once with no rebind gap. The
-    // caller never touches the port, so there is no interval in which it is
-    // chosen but unowned.
-    // No preference (or `:0`) means "any free port", NOT the default port:
-    // `bind_listener` sets SO_REUSEADDR, so two starters both naming 8787 would
-    // both "succeed" on the same address and the second would silently shadow
-    // the first. Leaving `explicit_listen` false routes those through serve's
-    // `probe_free_listener`, which scans for a genuinely free operator port.
+    // Step 1: let serve pick AND own the port — the caller never touches it, so
+    // there is no interval in which it is chosen but unowned.
+    //
+    // `explicit_listen` stays FALSE here on purpose. It means "the operator
+    // named this exact port, fail loudly if it is taken", and nobody on this
+    // path did: `preferred` is a *preference* — a remembered port to land back
+    // on, or the default — not a demand. Setting it true made an occupied
+    // preference a hard failure, which only looked survivable while
+    // `SO_REUSEADDR` was silently letting two servers share one address. False
+    // routes through `probe_free_listener`, which honors the preference when
+    // free and falls back to a genuinely free operator port when not.
     let requested = preferred.map_or_else(
         || crate::server::serve::DEFAULT_LISTEN.to_string(),
         |addr| addr.to_string(),
     );
-    let explicit_listen = preferred.is_some_and(|addr| addr.port() != 0);
     let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
     let serve_args = ServeArgs {
         listen: requested,
-        explicit_listen,
+        explicit_listen: false,
         api_key,
         api_key_env,
         bound_addr_tx: Some(bound_tx),
@@ -173,11 +177,19 @@ pub fn start_operator_server(
     // Step 2: wait to be TOLD the bound address, then confirm it serves. The
     // report arrives once the listener is live, so the remaining poll only
     // covers router/middleware setup, never a port that might never bind.
-    let start = Instant::now();
+    // `serve::run` loads the whole workspace index BEFORE it binds, so the wait
+    // for the address covers indexing as well as the bind — on a loaded machine
+    // that is the slow part. Give it the full deadline, then give reachability
+    // its own: sharing one budget would let a slow index consume the time the
+    // router needs to come up, failing a server that was going to work.
     let bound_addr = bound_rx.recv_timeout(deadline).map_err(|_| {
-        anyhow::anyhow!("operator server did not report a bound address within {deadline:?}")
+        anyhow::anyhow!(
+            "operator server did not report a bound address within {deadline:?} \
+             (index load + bind)"
+        )
     })?;
 
+    let start = Instant::now();
     let probe_timeout = Duration::from_millis(250);
     let poll_interval = Duration::from_millis(50);
     while start.elapsed() < deadline {
@@ -558,6 +570,27 @@ mod tests {
         assert_ne!(
             first.bound_addr, second.bound_addr,
             "each start must own a distinct port"
+        );
+    }
+
+    /// A `preferred` address is a PREFERENCE (a remembered port to land back on,
+    /// or the default) — never an operator demand. An occupied one must fall
+    /// back to a free port, not fail the start. This only looked fine while
+    /// `SO_REUSEADDR` let two servers silently share one address.
+    #[test]
+    fn occupied_preference_falls_back_instead_of_failing() {
+        let first = start_operator_server(None, None, None, ADMIN_SERVE_START_DEADLINE)
+            .expect("first operator server should come up");
+        let second = start_operator_server(
+            Some(first.bound_addr),
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+        )
+        .expect("an occupied preference must fall back, not fail");
+        assert_ne!(
+            first.bound_addr, second.bound_addr,
+            "the second start must land on a different, genuinely free port"
         );
     }
 
