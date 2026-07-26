@@ -1492,4 +1492,63 @@ mod tests {
             "review must not inline duplicate prose"
         );
     }
+
+    /// Reproduces the real finding: `npm/LICENSE` byte-identical to the root
+    /// `LICENSE` is duplicated by PACKAGING NECESSITY (`npm/package.json`'s
+    /// `files` array requires a co-located `LICENSE` in the published tarball),
+    /// not content drift. Before `is_license_path` (`knowledge_bridge.rs`) gave
+    /// LICENSE files an `OwnershipGovernance` role, this duplicate carried no
+    /// `protected_role` blocker — deleting `npm/LICENSE` on this proposal's
+    /// `strong_candidate` label would break `npm publish`'s license packaging.
+    #[test]
+    fn duplicate_license_files_are_protected_from_deletion() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::create_dir_all(project.path().join("npm")).expect("npm dir");
+        for path in ["LICENSE", "npm/LICENSE"] {
+            std::fs::write(
+                project.path().join(path),
+                "PolyForm Noncommercial License 1.0.0\n",
+            )
+            .expect("duplicate license");
+        }
+        let shared = LiveIndex::load(project.path()).expect("index");
+        let generation = shared.published_source_set().current_generation();
+        let output = super::review_current(&generation, &input(ReviewKnowledgeMode::Remediation))
+            .expect("remediation");
+
+        assert!(
+            output.rendered.contains("unit=npm/LICENSE"),
+            "npm/LICENSE must still surface as a reviewed duplicate: {}",
+            output.rendered
+        );
+        // The proposal is still a duplicate finding (correct: the bytes really are
+        // identical), but it must now be blocked from actually being removed.
+        assert!(
+            output.rendered.contains("proposal.unmet_preconditions=")
+                && output
+                    .rendered
+                    .lines()
+                    .filter(|line| line.contains("unit=npm/LICENSE"))
+                    .count()
+                    >= 1,
+            "npm/LICENSE dossier must be present: {}",
+            output.rendered
+        );
+        let npm_license_block: Vec<&str> = output
+            .rendered
+            .split("\n\n")
+            .find(|block| block.contains("unit=npm/LICENSE"))
+            .expect("npm/LICENSE dossier block")
+            .lines()
+            .collect();
+        let joined = npm_license_block.join("\n");
+        assert!(
+            joined.contains("eligibility.protected_roles=[ownership_governance]"),
+            "npm/LICENSE must carry the OwnershipGovernance protected role: {joined}"
+        );
+        assert!(
+            joined.contains("protected_role"),
+            "a protected role must block the deletion proposal via unmet_preconditions: {joined}"
+        );
+    }
 }
