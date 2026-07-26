@@ -193,6 +193,13 @@ pub fn build_edit_plan(request: &StelEditRequest) -> Result<StelPlan, EditValida
         args["working_directory"] = serde_json::json!(cwd);
     }
 
+    // Multi-project routing: the facade must forward its selector the same way
+    // the structural edit tools do, or a daemon-session edit aimed at an opened
+    // sibling project falls back to the session home repository.
+    if let Some(project) = &request.project {
+        args["project"] = serde_json::json!(project);
+    }
+
     Ok(StelPlan {
         plan_id: edit_plan_id(request),
         intent: IntentBucket::Edit,
@@ -366,6 +373,50 @@ mod tests {
                 plan.steps[0].tool
             );
         }
+    }
+
+    #[test]
+    fn build_edit_plan_forwards_project_selector() {
+        // Multi-project daemon safety: the compact facade must carry the same
+        // selector as the structural edit tools, or an edit aimed at an opened
+        // sibling project silently lands in the session home repository.
+        for op in [
+            None,
+            Some(StelEditOp::InsertAfter),
+            Some(StelEditOp::EditWithin),
+        ] {
+            let plan = build_edit_plan(&StelEditRequest {
+                path: "src/lib.rs".to_string(),
+                project: Some("sibling-repo".to_string()),
+                symbol: Some("helper".to_string()),
+                body: Some("fn helper() {}".to_string()),
+                old_text: Some("old".to_string()),
+                new_text: Some("new".to_string()),
+                op,
+                ..Default::default()
+            })
+            .expect("valid edit request");
+            assert_eq!(
+                plan.steps[0].args["project"], "sibling-repo",
+                "project must be forwarded into the {} plan args",
+                plan.steps[0].tool
+            );
+        }
+    }
+
+    #[test]
+    fn build_edit_plan_omits_project_when_absent() {
+        let plan = build_edit_plan(&StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            symbol: Some("helper".to_string()),
+            body: Some("fn helper() {}".to_string()),
+            ..Default::default()
+        })
+        .expect("valid edit request");
+        assert!(
+            plan.steps[0].args.get("project").is_none(),
+            "absent project must not appear in plan args"
+        );
     }
 
     #[test]

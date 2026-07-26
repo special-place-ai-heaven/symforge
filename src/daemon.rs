@@ -4381,6 +4381,7 @@ pub(crate) fn single_project_routed_tool(tool_name: &str) -> bool {
             | "batch_edit"
             | "batch_insert"
             | "batch_rename"
+            | "symforge_edit"
             | "curate_knowledge"
     )
 }
@@ -5612,6 +5613,30 @@ mod tests {
     use tokio::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// Every structural-edit surface must be single-project routed. The compact
+    /// `symforge_edit` facade was omitted from this list while the legacy edit
+    /// tools were covered, so its `project` selector was accepted and ignored:
+    /// an edit aimed at an opened sibling project fell back to the session home
+    /// and mutated the wrong repository when paths/symbols overlapped.
+    #[test]
+    fn every_structural_edit_tool_is_single_project_routed() {
+        for tool in [
+            "replace_symbol_body",
+            "edit_within_symbol",
+            "insert_symbol",
+            "delete_symbol",
+            "batch_edit",
+            "batch_insert",
+            "batch_rename",
+            "symforge_edit",
+        ] {
+            assert!(
+                single_project_routed_tool(tool),
+                "{tool} accepts a `project` selector but is not single-project routed"
+            );
+        }
+    }
 
     fn project_dir(name: &str) -> TempDir {
         let dir = TempDir::with_prefix(name).expect("temp dir");
