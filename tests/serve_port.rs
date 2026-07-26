@@ -47,6 +47,8 @@ use std::net::SocketAddr;
 use symforge::server::serve::{
     DEFAULT_LISTEN, bind_listener, probe_free_listener, probe_free_port,
 };
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
 
 /// Occupy a loopback port with a plain `std` listener (no `SO_REUSEADDR`) — the
 /// honest reproduction of a real squatter (`wslrelay` / another service).
@@ -178,6 +180,29 @@ async fn explicit_occupied_by_another_symforge_fails_loudly() {
     );
 
     drop(occupier);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_recently_closed_connection_rebinds() {
+    let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("initial serve bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let client = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to listener");
+        let mut byte = [0_u8; 1];
+        let _ = stream.read(&mut byte).await;
+    });
+
+    let (server_stream, _) = listener.accept().await.expect("accept client");
+    drop(server_stream); // server closes first, leaving its local port in TIME_WAIT.
+    drop(listener);
+    client.await.expect("client task");
+
+    let rebound = bind_listener(addr).expect("fixed serve port must rebind after a clean restart");
+    assert_eq!(rebound.local_addr().expect("local_addr"), addr);
 }
 
 #[test]

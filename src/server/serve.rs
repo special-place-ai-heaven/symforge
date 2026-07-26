@@ -153,29 +153,25 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
     ip.is_loopback()
 }
 
-/// Bind an EXCLUSIVE [`tokio::net::TcpListener`] on `addr` — no `SO_REUSEADDR`.
+/// Bind a [`tokio::net::TcpListener`] on `addr`.
 ///
 /// Mirrors the socket setup in [`crate::sidecar::server::spawn_sidecar`] except
-/// for the reuse flag: create a `socket2::Socket`, set non-blocking, bind,
-/// listen with backlog 1024, then hand the std socket to tokio.
+/// for the platform-specific address-reuse policy: create a `socket2::Socket`,
+/// set non-blocking, bind, listen with backlog 1024, then hand the std socket
+/// to tokio.
 ///
-/// `SO_REUSEADDR` is deliberately NOT set. It does not do what an earlier
-/// version of this function's doc comment claimed ("so a TIME_WAIT socket does
-/// not block the bind") — a *listening* socket is never in TIME_WAIT; only a
-/// closed connection enters that state, and this function is never used to
-/// rebind a just-closed connection's port. What the flag actually does is let
-/// TWO listening sockets share one address: on Windows, when both sides set it;
-/// on Linux, the flag does not permit that, but the asymmetry is exactly the
-/// trap — code that "works" on Linux with reuse on fails silently on Windows.
+/// On Unix, `SO_REUSEADDR` is set so a just-closed accepted connection in
+/// `TIME_WAIT` does not block an immediate restart on the same fixed serve
+/// port. Unix still rejects a second live listener on the same address. On
+/// Windows, `SO_REUSEADDR` is deliberately NOT set because it can let two
+/// listening sockets share one address when both sides opt in.
 ///
 /// This was a real, shipped bug: `serve::run`'s EXPLICIT `--listen` path used a
 /// reuse-enabled bind, so a second `symforge serve --listen <occupied>` bound
 /// successfully, printed a healthy attach URL, and then accepted ZERO
-/// connections — every request kept going to the first server, with no error
-/// anywhere to explain it. An occupied port must fail loudly here; that is the
-/// whole contract of an explicit `--listen` (FR-002/003). Every caller in this
-/// codebase — the free-port scan AND the explicit-address bind — wants honest
-/// occupancy detection, so there is only one function.
+/// connections on Windows — every request kept going to the first server, with
+/// no error anywhere to explain it. An occupied port must fail loudly here; that
+/// is the whole contract of an explicit `--listen` (FR-002/003).
 pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -183,6 +179,8 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;

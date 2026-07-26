@@ -342,6 +342,46 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
 }
 
 #[tokio::test]
+async fn symforge_edit_foreign_project_refuses_before_already_applied() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let original = "fn foo() { same }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-already-applied-local");
+
+    let result = dispatch_symforge_edit_result(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            project: Some("some-other-project".to_string()),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { same }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = tool_result_text(&result);
+
+    assert!(
+        output.contains("not available on this connection"),
+        "foreign selector must refuse before local already-applied success:\n{output}"
+    );
+    assert!(
+        !output.contains("already applied"),
+        "foreign selector must not be reported as a local no-op success:\n{output}"
+    );
+    assert_eq!(
+        outcome_class(&result),
+        "invalid_request",
+        "output:\n{output}"
+    );
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
+}
+
+#[tokio::test]
 async fn symforge_edit_preview_then_apply_writes_once() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");

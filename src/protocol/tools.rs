@@ -10865,6 +10865,11 @@ impl SymForgeServer {
             return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
                 .into_call_tool_result(error.message));
         }
+        if self.daemon_client.is_none()
+            && let Some(refusal) = self.foreign_project_refusal(request.project.as_deref())
+        {
+            return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+        }
 
         let apply = apply_requested(request);
         let mut resolved_symbol = None;
