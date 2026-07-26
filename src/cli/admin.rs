@@ -195,33 +195,53 @@ pub fn start_operator_server(
 /// on failure (the port is occupied) binds the first free
 /// [`serve::operator_port_candidates`] port (8000-8999 then 5000-5999) — never an
 /// OS-assigned ephemeral port, which corporate networks block (the 61850
-/// problem). An explicit `:0` `preferred` is honored verbatim. The probe listener
-/// is dropped before returning, so the same documented small rebind window as
+/// problem). An explicit `:0` `preferred` means "any free port" and is resolved
+/// from those same operator ranges — NOT as an OS ephemeral port, which this
+/// selector cannot safely return (see below). The probe listener is dropped
+/// before returning, so the same documented small rebind window as
 /// `serve::probe_free_port` applies — closed in practice by the `SO_REUSEADDR`
 /// rebind inside `serve::run` plus the step-3 reachability gate. Pub(crate) for
 /// setup wizard reuse.
 pub(crate) fn select_free_addr_std(preferred: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
     if let Some(addr) = preferred {
-        // `:0` requested explicitly → resolve the concrete OS-assigned port.
-        if addr.port() == 0 {
-            return std::net::TcpListener::bind(addr)?.local_addr();
-        }
-        if let Ok(listener) = std::net::TcpListener::bind(addr) {
-            return listener.local_addr();
+        // `:0` asks for "any free port". Resolving it as an OS EPHEMERAL port is
+        // unsafe here, because this selector drops its listener and `serve::run`
+        // must re-bind that exact number: the ephemeral range is the one the OS
+        // is actively handing out to everything else, so on a loaded machine the
+        // port is frequently taken inside the gap and serve never comes up. Fall
+        // through to the operator-range scan instead — the same ranges
+        // `serve::probe_free_listener` restricts itself to, which are not
+        // handed out by the OS and so survive the rebind. `addr` may carry a
+        // non-loopback host, so honor its IP while picking the port.
+        if addr.port() != 0 {
+            if let Ok(listener) = std::net::TcpListener::bind(addr) {
+                return listener.local_addr();
+            }
+        } else if let Some(resolved) = first_free_operator_addr(addr.ip()) {
+            return Ok(resolved);
         }
     }
     // Preferred occupied / no preference: first free operator port in the
     // corporate-friendly ranges, never an OS ephemeral port.
-    for port in crate::server::serve::operator_port_candidates() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        if let Ok(listener) = std::net::TcpListener::bind(addr) {
-            return listener.local_addr();
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AddrInUse,
-        "no free operator port available in 8000-8999 or 5000-5999",
-    ))
+    first_free_operator_addr(IpAddr::V4(Ipv4Addr::LOCALHOST)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "no free operator port available in 8000-8999 or 5000-5999",
+        )
+    })
+}
+
+/// First bindable operator-range address on `host`, or `None` if the ranges are
+/// exhausted. Restricted to [`serve::operator_port_candidates`] so the returned
+/// port is one the OS does not hand out on its own — the property that makes it
+/// survive this selector's drop-then-rebind gap.
+fn first_free_operator_addr(host: IpAddr) -> Option<SocketAddr> {
+    crate::server::serve::operator_port_candidates().find_map(|port| {
+        let addr = SocketAddr::new(host, port);
+        std::net::TcpListener::bind(addr)
+            .ok()
+            .and_then(|listener| listener.local_addr().ok())
+    })
 }
 
 /// Flags for `symforge admin` (see `contracts/admin-cli.md`).
@@ -501,6 +521,27 @@ mod tests {
         assert_eq!(desc.attach_url, "http://127.0.0.1:8787/mcp");
         assert!(desc.reachable);
         assert_eq!(desc.bound_addr, addr);
+    }
+
+    /// `select_free_addr_std` drops its probe listener and `serve::run` re-binds
+    /// the same number, so the port it returns must be one the OS does not hand
+    /// out on its own. Resolving `:0` to an OS ephemeral port broke exactly
+    /// that: on a loaded machine the port was taken inside the gap, serve never
+    /// bound, and the caller polled a dead socket until its deadline elapsed.
+    #[test]
+    fn select_free_addr_std_never_returns_an_ephemeral_port() {
+        fn in_operator_range(port: u16) -> bool {
+            (8000..=8999).contains(&port) || (5000..=5999).contains(&port)
+        }
+
+        let explicit_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        for preferred in [None, Some(explicit_any)] {
+            let addr = select_free_addr_std(preferred).expect("an operator port is free");
+            assert!(
+                in_operator_range(addr.port()),
+                "selected port must be operator-range, not ephemeral: {addr}"
+            );
+        }
     }
 
     #[test]
