@@ -1,0 +1,99 @@
+# Quickstart / Validation: Knowledge LLM Sift
+
+How to prove this slice works. Structures are in [data-model.md](data-model.md); decisions in
+[research.md](research.md). No implementation code here.
+
+## Prerequisites
+
+- Windows: artifacts go to `target/` on **E:** via the repo `.cargo/config.toml`. Do **not** set
+  `CARGO_TARGET_DIR` on the command line (an older handoff suggested `C:/symforge-target`, which
+  filled C:).
+- Run `cargo clean` after heavy local runs (CLAUDE.md Windows disk rule).
+
+## 1. Baseline capture (must happen BEFORE any code change)
+
+The slice's headline claims are *comparative*. Capture the "before" or they are unprovable.
+
+```powershell
+cargo test --test search_knowledge -- --test-threads=1
+```
+
+Record, for the release-please probe and the persistence-boundary probe:
+
+- total response **bytes**
+- **line number** of the first excerpt
+- response at `max_tokens=300` and `max_tokens=120`
+- `review_knowledge(mode=summary)` counts: `domain=unknown`, `voice=unknown`, `suppressed`
+
+2026-07-27 reference baseline (Kimi dogfood): total=5142, unknown domain=3894, voice unknown=3767,
+broken_anchor=2979, review_due=2163, duplicate_units=35, `suppressed`=0.
+
+## 2. Per-workstream gates
+
+Each workstream is RED → GREEN → VERIFY. A workstream is not done until its own tests pass **and**
+the previous workstreams' tests still pass.
+
+| WS | Red proof required first | Green criterion |
+|---|---|---|
+| **WS0** | Two-source fixture where per-source truncation returns `2 × limit` hits and two count sets. | Global top-N with one aggregate count set; real `worktree:`/`ref:` labels; contract tests 9 and 11 green. |
+| **WS1** | Existing CCR test shown to pass **vacuously** on mega-lines; new block-completeness assertion fails. | Answer-first blocks; excerpt by ~line 8; ≤60% baseline bytes; `max_tokens=300` → header + ≥1 complete block + handle; `max_tokens=120` → provenance + handle, zero partial blocks; CCR round-trip byte-identical; contract tests 3, 7, 18 green. |
+| **WS2** | Fixture asserting a no-evidence unit currently reports `Active`; overmatch fixture asserting `docs/special/x.md` currently classifies via `/spec`. | `Unknown` lifecycle without evidence; heading beats path; component tokens only; `suppressed` delta is **zero**; active `research/`+`docs/dogfood/` content still visible at `authority_scope=default`. |
+| **WS3** | Each new prose cue currently falls to `Explore`. | Cues route to `search_knowledge`; `find references to X`, `where is search_knowledge defined`, `retry policy in the client code` stay code-routed; generic `how does X work` unchanged. |
+| **WS4** | Real-corpus fixture where >2 hits from one file outrank a distinct-file canonical hit — **observed red**. | Distinct-file hit promoted; single-file corpus not underfilled; no hit dropped; one-term hits never promoted over full-coverage hits. |
+
+## 3. Contract gates (the frozen set)
+
+These must be green at the end and are the slice's non-negotiable floor:
+
+```powershell
+cargo test --test search_knowledge -- --test-threads=1
+```
+
+Covering frozen `contracts/search-knowledge.md` tests **3, 7, 8, 9, 11, 16, 18**:
+
+| # | What it protects |
+|---|---|
+| 3 | Prose hit carries exact path/line/heading/hash/generation |
+| 7 | Truncation retains complete provenance **and** a CCR handle |
+| 8 | Ranking is byte-for-byte deterministic over repeated equal generations |
+| 9 | Current worktree ranks ahead of a divergent ref **without hiding it** |
+| 11 | `source_scope=all` returns per-source generations/digest/coverage/freshness + worst overall |
+| 16 | Scope sets stay distinct; filtered matches yield `evidence_noncurrent`, not false no-evidence |
+| 18 | Link IDs + exact/declared-set/ambiguous/missing previews survive formatting, truncation, envelopes, CCR |
+
+## 4. Full verification gate (CLAUDE.md / Constitution VIII)
+
+```powershell
+cargo fmt --check
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets -- --test-threads=1
+cargo build --release
+cargo check --no-default-features --features embed   # Constitution VI (embed isolation)
+```
+
+No npm change in this slice, so `npm test` is not required.
+
+## 5. Manual dogfood (before/after, required)
+
+Re-run the Kimi probe battery against the built server and paste before/after into the PR:
+
+1. `search_knowledge("release please squash merge")` — the canonical policy (`CLAUDE.md`
+   §"Merging PRs") should be reachable, and the review brief that merely quotes it should not take
+   ranks 1–2 alone (WS4).
+2. `search_knowledge("why is shutdown not a persistence boundary")` — the contract's own example;
+   check same-file flooding is reduced.
+3. Both queries at `max_tokens=120` and `max_tokens=300`.
+
+**Measure**: response bytes, line number of the first excerpt, and whether any hit block is partial.
+Do **not** report a token-benchmark estimate — measure bytes and answer position.
+
+## 6. Cleanup
+
+```powershell
+cargo clean
+```
+
+Then confirm: branch committed, no unrelated files staged (note: `src/protocol/tools.rs` carries a
+pre-existing uncommitted foreign-project-refusal change and `tests/zz_repro_foreign_project.rs` is
+untracked — **both predate this slice and must not be swept into its commits**).
