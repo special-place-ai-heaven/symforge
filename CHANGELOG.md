@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.4...v8.16.5) (2026-07-27)
+
+
+### Bug Fixes
+
+* **update:** robust Windows self-update — never hang, swap while binary is live ([#480](https://github.com/special-place-ai-heaven/symforge/issues/480)) ([a022717](https://github.com/special-place-ai-heaven/symforge/commit/a0227179cf6f656fcc5f7eaa288175a661a10abd))
+
 ## [8.16.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.3...v8.16.4) (2026-07-26)
 
 
