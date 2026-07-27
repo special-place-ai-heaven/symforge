@@ -1106,45 +1106,14 @@ fn derive_native_authority_domain(
     heading_path: &[String],
     anchor: &KnowledgeAnchor,
 ) -> (AuthorityDomain, AuthorityDomainEvidence) {
-    let heading = heading_path
-        .last()
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-    let path_lower = path.to_ascii_lowercase();
-    let (domain, rule_id) = if heading.contains("current implementation")
-        || heading.contains("current behavior")
-        || path_lower.ends_with("readme.md")
-    {
-        (
-            AuthorityDomain::CurrentImplementation,
-            "authority-current-v1",
-        )
-    } else if heading.contains("intent")
-        || heading.contains("requirement")
-        || path_lower.contains("/spec")
-        || path_lower.contains("/design")
-        || path_lower.contains("/rfc")
-    {
-        (AuthorityDomain::NormativeIntent, "authority-intent-v1")
-    } else if heading.contains("decision") || path_lower.contains("/adr") {
-        (AuthorityDomain::Decision, "authority-decision-v1")
-    } else if heading.contains("operation")
-        || heading.contains("runbook")
-        || path_lower.contains("/ops/")
-    {
-        (AuthorityDomain::Operations, "authority-operations-v1")
-    } else if heading.contains("governance")
-        || heading.contains("security")
-        || path_lower.contains("governance")
-        || path_lower.ends_with("codeowners")
-    {
-        (AuthorityDomain::Governance, "authority-governance-v1")
-    } else if heading.contains("history")
-        || path_lower.contains("changelog")
-        || path_lower.contains("/archive/")
-    {
-        (AuthorityDomain::HistoricalRecord, "authority-history-v1")
-    } else {
+    // Heading evidence is what the document says about itself, so it is evaluated
+    // in full before any path convention is consulted. Mixing the two classes in
+    // one predicate let an earlier branch's path rule beat a later branch's
+    // heading rule -- a "Decision" section inside a README reported
+    // `CurrentImplementation`.
+    let Some((domain, rule_id)) =
+        heading_convention_domain(heading_path).or_else(|| path_convention_domain(path))
+    else {
         return (AuthorityDomain::Unknown, AuthorityDomainEvidence::Unknown);
     };
     (
@@ -1154,6 +1123,143 @@ fn derive_native_authority_domain(
             anchor: anchor.clone(),
         },
     )
+}
+
+/// Domains a path convention is allowed to assign.
+///
+/// `CurrentImplementation` is deliberately unrepresentable here: it is the only
+/// domain whose `DeterministicConflict` evidence derives voice `Suppressed` in
+/// [`derive_voice`], which removes a unit from the default and current retrieval
+/// scopes. A path convention is far too weak a signal to hide a document, so the
+/// type -- not a review comment -- keeps every path rule out of that domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathConventionDomain {
+    NormativeIntent,
+    Decision,
+    Operations,
+    Governance,
+    HistoricalRecord,
+}
+
+impl PathConventionDomain {
+    fn domain(self) -> AuthorityDomain {
+        match self {
+            Self::NormativeIntent => AuthorityDomain::NormativeIntent,
+            Self::Decision => AuthorityDomain::Decision,
+            Self::Operations => AuthorityDomain::Operations,
+            Self::Governance => AuthorityDomain::Governance,
+            Self::HistoricalRecord => AuthorityDomain::HistoricalRecord,
+        }
+    }
+}
+
+fn heading_convention_domain(heading_path: &[String]) -> Option<(AuthorityDomain, &'static str)> {
+    let heading = heading_path.last()?.to_ascii_lowercase();
+    if heading.contains("current implementation") || heading.contains("current behavior") {
+        Some((
+            AuthorityDomain::CurrentImplementation,
+            "authority-current-v1",
+        ))
+    } else if heading.contains("intent") || heading.contains("requirement") {
+        Some((AuthorityDomain::NormativeIntent, "authority-intent-v1"))
+    } else if heading.contains("decision") {
+        Some((AuthorityDomain::Decision, "authority-decision-v1"))
+    } else if heading.contains("operation") || heading.contains("runbook") {
+        Some((AuthorityDomain::Operations, "authority-operations-v1"))
+    } else if heading.contains("governance") || heading.contains("security") {
+        Some((AuthorityDomain::Governance, "authority-governance-v1"))
+    } else if heading.contains("history") {
+        Some((AuthorityDomain::HistoricalRecord, "authority-history-v1"))
+    } else {
+        None
+    }
+}
+
+fn path_convention_domain(path: &str) -> Option<(AuthorityDomain, &'static str)> {
+    let path_lower = path.replace('\\', "/").to_ascii_lowercase();
+    // Pre-WS2 rule, kept byte-identical: a README speaks for current behavior
+    // unless its own heading says otherwise. It is the one path rule that can
+    // reach `CurrentImplementation`, and narrowing or widening it would move
+    // units into or out of the suppressed voice.
+    if path_lower.ends_with("readme.md") {
+        return Some((
+            AuthorityDomain::CurrentImplementation,
+            "authority-current-v1",
+        ));
+    }
+    if let Some((domain, rule_id)) = agent_instruction_path_domain(&path_lower) {
+        return Some((domain.domain(), rule_id));
+    }
+    path_convention_token_domain(&path_lower).map(|(domain, rule_id)| (domain.domain(), rule_id))
+}
+
+/// Root agent-instruction files and the `.agent/` sidecar: live operating
+/// instructions for whoever is working in the repository. Matched exactly rather
+/// than by token, so `src/agents/notes.md` is not swept in.
+fn agent_instruction_path_domain(path_lower: &str) -> Option<(PathConventionDomain, &'static str)> {
+    let is_root_instruction =
+        !path_lower.contains('/') && matches!(path_lower, "agents.md" | "claude.md" | "gemini.md");
+    if is_root_instruction || path_lower.starts_with(".agent/") {
+        return Some((
+            PathConventionDomain::Operations,
+            "authority-path-agent-instructions-v1",
+        ));
+    }
+    None
+}
+
+/// Path conventions over whole path *tokens*, mirroring
+/// [`super::knowledge_bridge::path_convention_roles`]: split on `/`, then on every
+/// non-ASCII-alphanumeric character, lowercase, and match exact tokens. Substring
+/// matching classified `docs/special/report.md` as normative intent via `/spec`.
+///
+/// Rule order below is precedence and is stable: it preserves the pre-WS2 domain
+/// order (intent, decision, operations, governance, history) and places each new
+/// WS2 rule directly after the existing rule for the same domain.
+fn path_convention_token_domain(path_lower: &str) -> Option<(PathConventionDomain, &'static str)> {
+    let tokens = path_lower
+        .split('/')
+        .flat_map(|component| component.split(|character: char| !character.is_ascii_alphanumeric()))
+        .filter(|token| !token.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let has = |candidates: &[&str]| candidates.iter().any(|token| tokens.contains(token));
+
+    if has(&["spec", "specs", "design", "designs", "rfc", "rfcs"]) {
+        Some((PathConventionDomain::NormativeIntent, "authority-intent-v1"))
+    } else if has(&["plan", "plans", "roadmap"]) {
+        Some((
+            PathConventionDomain::NormativeIntent,
+            "authority-path-plan-v1",
+        ))
+    } else if has(&["adr", "adrs"]) {
+        Some((PathConventionDomain::Decision, "authority-decision-v1"))
+    } else if has(&["solution", "solutions"]) {
+        Some((
+            PathConventionDomain::Decision,
+            "authority-path-solutions-v1",
+        ))
+    } else if has(&["ops"]) {
+        Some((PathConventionDomain::Operations, "authority-operations-v1"))
+    } else if has(&["tasks", "handoff", "handover"]) {
+        Some((
+            PathConventionDomain::Operations,
+            "authority-path-task-ledger-v1",
+        ))
+    } else if has(&["governance", "codeowners"]) {
+        Some((PathConventionDomain::Governance, "authority-governance-v1"))
+    } else if has(&["changelog", "archive", "archived"]) {
+        Some((
+            PathConventionDomain::HistoricalRecord,
+            "authority-history-v1",
+        ))
+    } else if has(&["reviews", "dogfood", "research"]) {
+        Some((
+            PathConventionDomain::HistoricalRecord,
+            "authority-path-review-record-v1",
+        ))
+    } else {
+        None
+    }
 }
 
 fn evaluate_policy(live: &LiveIndex, units: &[AuthorityUnitState]) -> PolicyEvaluation {
