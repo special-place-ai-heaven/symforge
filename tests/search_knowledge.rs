@@ -287,7 +287,10 @@ async fn no_match_seam_keeps_its_exact_prefix_and_position() {
     );
     // Provenance still precedes it -- a no-match answer is a successful,
     // fully-attributed response, not an error.
-    assert!(output.contains("Trust:"), "no-match keeps its envelope: {output}");
+    assert!(
+        output.contains("Trust:"),
+        "no-match keeps its envelope: {output}"
+    );
     assert!(
         output.contains("Counts: overflow="),
         "no-match keeps its counts: {output}"
