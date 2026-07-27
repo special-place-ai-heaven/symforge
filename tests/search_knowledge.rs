@@ -191,6 +191,69 @@ fn assert_budgeted_knowledge_context(output: &str, require_trust: bool) {
     }
 }
 
+/// SIFT-WS1 (SC-001/SC-002). The slice's headline claims are "the answer is
+/// readable first" and "the envelope stops crowding it out". Both are asserted
+/// here rather than left to a manual post-release dogfood check, so they cannot
+/// silently regress.
+///
+/// Pre-slice baseline on this repository (commit 83b6b32, captured in
+/// specs/020-repository-knowledge-index/sift/quickstart.md): a 872-byte,
+/// 6-line envelope carrying two full 64-hex digests, then one ~700-1200 byte
+/// pipe-delimited mega-line per hit with the excerpt buried mid-line.
+#[tokio::test]
+async fn answer_arrives_before_provenance_and_the_envelope_stays_bounded() {
+    let fixture = KnowledgeFixture::new();
+    let output = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({
+                "query": "shutdown is not a safe persistence boundary",
+                "source_scope": "current",
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let blocks = hit_blocks(&output);
+    assert!(!blocks.is_empty(), "expected at least one hit: {output}");
+
+    // Answer-first: the excerpt is the third line of its block (location,
+    // heading, excerpt), never buried behind provenance.
+    for block in &blocks {
+        let excerpt_line = block
+            .iter()
+            .position(|line| line.trim_start().starts_with('"'))
+            .unwrap_or_else(|| panic!("no excerpt line in block:\n{}", block.join("\n")));
+        assert!(
+            excerpt_line <= 2,
+            "excerpt must arrive within the first 3 lines of its block, found at {excerpt_line}:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Bounded IDs: no envelope line may carry a full 64-hex digest. The
+    // pre-slice `Source:` line was ~300 chars because it printed two of them.
+    let envelope_end = output
+        .lines()
+        .position(|line| {
+            line.split_once(". ")
+                .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok())
+        })
+        .unwrap_or(output.lines().count());
+    for line in output.lines().take(envelope_end) {
+        let longest_hex = line
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest_hex < 64,
+            "envelope line still carries an unbounded 64-hex digest: {line}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn exact_hit_and_complete_no_match_preserve_captured_provenance() {
     let fixture = KnowledgeFixture::new();
