@@ -10540,6 +10540,15 @@ impl SymForgeServer {
         // cache-hit paths return BEFORE the serve loop — so a foreign selector
         // came back as a bound-project-grounded SUCCESS. Refuse up front on the
         // no-daemon path, where cross-project routing does not exist at all.
+        //
+        // Knowingly STILL OPEN, deliberately out of scope: the daemon-
+        // CONFIGURED-but-DEGRADED topology. There `daemon_client` is `Some`, so
+        // this guard does NOT fire, while `proxy_tool_call` returns `None` and
+        // execution falls back to the local index — so `preview: true` and the
+        // economics-bypass/cache-hit early returns can still answer
+        // `outcome_class: found` with a bound-project-grounded estimate for a
+        // foreign selector. Closing it means gating on the degraded flag too,
+        // not just on client presence.
         if self.daemon_client.is_none()
             && let Some(refusal) = self.foreign_project_refusal(facade_project.as_deref())
         {
@@ -10907,6 +10916,11 @@ impl SymForgeServer {
             return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
                 .into_call_tool_result(error.message));
         }
+        // Knowingly STILL OPEN, deliberately out of scope (same gap as the
+        // retrieve facade's guard): on the daemon-CONFIGURED-but-DEGRADED
+        // topology `daemon_client` is `Some`, so this does not fire, yet
+        // `proxy_tool_call` returns `None` and the edit runs against the local
+        // index. Closing it means gating on `daemon_degraded` too.
         if self.daemon_client.is_none()
             && let Some(refusal) = self.foreign_project_refusal(request.project.as_deref())
         {
@@ -30366,6 +30380,67 @@ mod tests {
         assert!(
             !text.contains("cross-project targeting is not routed"),
             "a blank `project` must not trip the cross-project refusal: {text}"
+        );
+
+        // The `foreign_project_refusal` guard short-circuits BEFORE the serve
+        // loop, which made the FOREIGN case above vacuous as coverage of the
+        // routing machinery: it never reaches the all-or-nothing routing check
+        // or the per-step `project` injection those lines exist for. A selector
+        // that RESOLVES TO THE BOUND project passes
+        // `selector_matches_bound_project`, so it passes the guard and does.
+        //
+        // Honest about what each half pins. Injecting the BOUND project name is
+        // semantically transparent — the primitives answer identically with or
+        // without it — so this first case pins that the serve loop is REACHED
+        // and serves, not the injected value. Deleting the injection block alone
+        // would not fail it.
+        let bound_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("test_project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(bound_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(
+            !text.contains("not available on this connection")
+                && !text.contains("cannot be routed through this plan"),
+            "a selector resolving to the BOUND project must be served, not refused: {text}"
+        );
+        assert!(
+            text.contains("thing"),
+            "the bound-project call must reach the serve loop and answer: {text}"
+        );
+
+        // The all-or-nothing routing check IS pinned: the impact intent plans the
+        // git-scoped `detect_impact`, which has no `project` input at all, so
+        // routing a selector into that plan would MIX projects. Refuse the whole
+        // call. Deleting that block fails this assertion.
+        let unroutable_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "blast radius of the recent changes".to_string(),
+                intent: Some(crate::stel::IntentBucket::Impact),
+                project: Some("test_project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(unroutable_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("cannot be routed through this plan") && text.contains("detect_impact"),
+            "an unroutable planned step must refuse the whole call, naming the step: {text}"
         );
     }
 
