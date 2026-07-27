@@ -35,8 +35,10 @@
 //!   test above structurally cannot reach: it binds the IDENTICAL address twice,
 //!   so it can never catch a `0.0.0.0:P` that silently shadows a live
 //!   `127.0.0.1:P` (the exact shape of the shipped dual-listener bug).
-//! * `bind_listener_reuse_address_matches_the_platform_gate` — the only guard on
-//!   the load-bearing `#[cfg(unix)]` gate; see the test's own comment.
+//! * `bind_listener_reuse_address_matches_the_platform_gate` — pins the platform
+//!   reuse policy. Guards removal of the `set_reuse_address` call on every
+//!   platform; does NOT guard removal of its `#[cfg(unix)]` attribute on CI. See
+//!   the test's own comment for exactly why.
 //! * `explicit_recently_closed_connection_rebinds` — Unix: a fixed serve port
 //!   rebinds after the previous process closed a connection first (the restart
 //!   `SO_REUSEADDR` exists for).
@@ -221,13 +223,31 @@ async fn explicit_wildcard_over_live_specific_still_fails_loudly() {
 
 #[tokio::test]
 async fn bind_listener_reuse_address_matches_the_platform_gate() {
-    // The `#[cfg(unix)]` gate on `set_reuse_address` is load-bearing: on Windows
-    // two reuse-enabled listeners CAN share one address, which is the
-    // dual-listener black hole (second serve binds, looks healthy, accepts zero
-    // connections). CI is ubuntu-only, so dropping that gate would leave CI
-    // green while silently reintroducing the Windows bug. This assertion is the
-    // guard, and the maintainer's Windows `cargo test --all-targets` is the only
-    // place its Windows half is ever exercised.
+    // Pins the platform reuse policy `bind_listener` implements: `SO_REUSEADDR`
+    // set on Unix (so a restart on a FIXED port is not blocked by a connection
+    // the previous process closed first), NOT set on Windows (where two
+    // reuse-enabled listeners CAN share one address — the dual-listener black
+    // hole: second serve binds, looks healthy, accepts zero connections).
+    //
+    // What this assertion DOES guard on CI: removal of the `set_reuse_address`
+    // call itself. On a unix runner that flips `reuse` to false while
+    // `cfg!(unix)` stays true, and the test fails. (On Windows the call is
+    // already cfg'd out, so there is nothing to remove and nothing to catch.)
+    //
+    // What it does NOT guard on CI: deleting the `#[cfg(unix)]` ATTRIBUTE while
+    // keeping the call — the change that actually reintroduces the shipped
+    // Windows bug. The expectation is written as `cfg!(unix)`, i.e. it MIRRORS
+    // the very gate it checks, so making reuse unconditional leaves
+    // `reuse == true == cfg!(unix)` and the test stays GREEN. Every CI runner
+    // for this file is unix (`ubuntu-latest`, plus the `darwin-serve-port`
+    // macos-latest job), so that holds on all of them. Verified by experiment:
+    // deleting the attribute fails this test on Windows with
+    // `left: true, right: false`, and only there.
+    //
+    // So: this test pins the policy, and the maintainer's Windows `cargo test`
+    // is the ONLY place the Windows half is ever enforced. Catching it in CI
+    // would need a Windows runner, or an assertion on the source gate rather
+    // than on `cfg!(unix)`; neither exists today.
     let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener");
     let reuse = socket2::SockRef::from(&listener)
         .reuse_address()
