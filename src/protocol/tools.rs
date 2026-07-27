@@ -10504,6 +10504,18 @@ impl SymForgeServer {
             );
         }
 
+        // Same ordering defect as `symforge_edit_stel_handler`: the per-step
+        // `project` injection below is the ONLY thing that lets the primitives
+        // refuse a foreign selector, but the preview and economics-bypass/
+        // cache-hit paths return BEFORE the serve loop — so a foreign selector
+        // came back as a bound-project-grounded SUCCESS. Refuse up front on the
+        // no-daemon path, where cross-project routing does not exist at all.
+        if self.daemon_client.is_none()
+            && let Some(refusal) = self.foreign_project_refusal(facade_project.as_deref())
+        {
+            return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+        }
+
         // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
         // filter, not a project selector. A `path:` that resolves outside the
         // bound project would silently match nothing (or, for an absolute path,
@@ -30169,10 +30181,12 @@ mod tests {
         );
 
         // Task 4 Step 5: a single `project` is ROUTED into the planned steps,
-        // not refused at the facade. On this single-project local server a
-        // FOREIGN selector surfaces the primitives' own per-step refusal
-        // (naming the bound project) — never the facade-level refusal, and
-        // never a silently-ignored selector.
+        // not refused with the cross-project message. On this no-daemon
+        // single-project server a FOREIGN selector is refused by the
+        // `foreign_project_refusal` guard naming the bound project (the same
+        // message the primitives emit per-step when a daemon IS present) —
+        // never the facade-level cross-project refusal, and never a
+        // silently-ignored selector.
         let project_call = SymforgeCallInput {
             request: StelRequest {
                 query: "where is thing defined".to_string(),
@@ -30217,6 +30231,47 @@ mod tests {
         assert!(
             !text.contains("cross-project targeting is not routed"),
             "a blank `project` must not trip the cross-project refusal: {text}"
+        );
+    }
+
+    /// The retrieve facade's foreign-project guard must fire BEFORE the early
+    /// returns that skip the serve loop's per-step `project` injection. Before
+    /// the fix, `preview: true` with a foreign selector returned
+    /// `outcome_class=found` plus an estimate grounded in the BOUND project —
+    /// a dishonest success in exactly the shape the guard exists to prevent.
+    #[tokio::test]
+    async fn symforge_facade_refuses_foreign_project_before_preview_estimate() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
+        let content = medium_test_source("pub fn thing() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let preview_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("totally-other-project".to_string()),
+                preview: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(preview_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("not available on this connection"),
+            "a foreign selector must refuse, not preview: {text}"
+        );
+        assert!(
+            !text.contains("predicted_net_vs_manual") && !text.contains("plan_id"),
+            "a refused call must not hand back a bound-project estimate: {text}"
         );
     }
 
