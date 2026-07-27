@@ -57,6 +57,37 @@ Observed defects, all reproduced in this single response:
 - **Unevidenced authority (WS2)**: `lifecycle=active domain=unknown … voice=unknown` on 6 of 10 hits —
   cost with no decision value, and `active` is asserted without evidence.
 
+### Measured WS2 authority movement — captured 2026-07-27
+
+Counted directly over the published `KnowledgeAuthorityView.records` — the same
+`generation.authority.records` collection `review_knowledge(mode=summary)` aggregates
+(`src/protocol/knowledge_review.rs:387`) — via a throwaway harness on this repository, before
+(`ffe91c0`) and after (`f183066`) the WS2 change. Identical corpus: 5304 units both times.
+
+| Count | Before | After | Delta |
+|---|---:|---:|---:|
+| `suppressed` | 0 | 0 | **0** (SC-006 gate) |
+| `history_only` | 130 | 130 | 0 |
+| `domain=unknown` | 4030 | 435 | −3595 |
+| `voice=unknown` | 3903 | 2427 | −1476 |
+| `voice=intent` | 523 | 2747 | +2224 |
+| `voice=needs_review` | 748 | 0 | −748 |
+| `voice=current` | 0 | 0 | 0 |
+
+Diagnostics, not gates:
+
+- `voice=needs_review` collapsing to 0 is the lifecycle change: `derive_voice` tests
+  `lifecycle == Unknown` before it reads the code-evidence display, so an unevidenced unit with
+  review-worthy evidence now reports `unknown` rather than `needs_review`. Both voices are
+  admitted by the `default` and `current` scopes, so nothing is hidden, but the review signal is
+  no longer distinguishable from absent classification.
+- `voice=intent` rising by 2224 is the path table: `plan`/`plans`/`roadmap`/`spec` units are now
+  normative intent. `intent` is admitted by `default` but **excluded from
+  `authority_scope=current`** by the frozen contract, so those units are visible by default and
+  deliberately absent from a `current`-scoped answer.
+- `history_only` is unchanged, so the new `research`/`dogfood`/`reviews`/`archived`
+  `HistoricalRecord` domain assignments did not move any unit into the history-only voice.
+
 ## 2. Per-workstream gates
 
 Each workstream is RED → GREEN → VERIFY. A workstream is not done until its own tests pass **and**

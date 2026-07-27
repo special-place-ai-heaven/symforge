@@ -125,23 +125,23 @@ real domain; nothing becomes `Suppressed`.
 
 ### RED
 
-- [ ] T033 [US3] Add a failing unit test in `src/live_index/knowledge_authority.rs` `#[cfg(test)]` asserting a unit with NO lifecycle evidence derives `KnowledgeLifecycle::Unknown` — today `derive_native_lifecycle` falls through to `(Active, LifecycleEvidence::None)` at line 1098. Record red
-- [ ] T034 [P] [US3] Add failing overmatch guards in `src/live_index/knowledge_authority.rs` `#[cfg(test)]`: `docs/special/report.md`, `docs/redesign/x.md`, and `docs/inspection/x.md` must NOT be classified by the `/spec` and `/design` substring rules at lines 1121-1122. Record red
-- [ ] T035 [P] [US3] Add a failing unit test asserting heading evidence takes precedence over a conflicting path convention in `src/live_index/knowledge_authority.rs`
-- [ ] T036 [P] [US3] Add failing per-rule tests in `src/live_index/knowledge_authority.rs` for each row of the WS2 table (root `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` + `.agent/` → Operations; `docs/solutions/` → Decision; `docs/reviews/`, `docs/dogfood/`, `research/` → HistoricalRecord; plan/plans/roadmap → NormativeIntent; tasks/handoff/handover → Operations; archive(d) → existing HistoricalRecord)
+- [x] T033 [US3] Add a failing unit test in `src/live_index/knowledge_authority.rs` `#[cfg(test)]` asserting a unit with NO lifecycle evidence derives `KnowledgeLifecycle::Unknown` — today `derive_native_lifecycle` falls through to `(Active, LifecycleEvidence::None)` at line 1098. Record red
+- [x] T034 [P] [US3] Add failing overmatch guards in `src/live_index/knowledge_authority.rs` `#[cfg(test)]`: `docs/special/report.md`, `docs/redesign/x.md`, and `docs/inspection/x.md` must NOT be classified by the `/spec` and `/design` substring rules at lines 1121-1122. Record red
+- [x] T035 [P] [US3] Add a failing unit test asserting heading evidence takes precedence over a conflicting path convention in `src/live_index/knowledge_authority.rs`
+- [x] T036 [P] [US3] Add failing per-rule tests in `src/live_index/knowledge_authority.rs` for each row of the WS2 table (root `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` + `.agent/` → Operations; `docs/solutions/` → Decision; `docs/reviews/`, `docs/dogfood/`, `research/` → HistoricalRecord; plan/plans/roadmap → NormativeIntent; tasks/handoff/handover → Operations; archive(d) → existing HistoricalRecord)
 
 ### GREEN
 
-- [ ] T037 [US3] Change `derive_native_lifecycle` in `src/live_index/knowledge_authority.rs:1068-1098` to return `(KnowledgeLifecycle::Unknown, LifecycleEvidence::None)` on the no-evidence fallthrough, and fix the two in-file tests that assert `Active` (lines ~2049, ~2220) ONLY where they relied on the unevidenced default — do not weaken a test that asserts an evidenced `Active`
-- [ ] T038 [US3] Reorder `derive_native_authority_domain` in `src/live_index/knowledge_authority.rs:1101+` so heading evidence is evaluated BEFORE path conventions
-- [ ] T039 [US3] Replace the substring path matching at `src/live_index/knowledge_authority.rs:1121-1140` with component tokenization mirroring `path_convention_roles` (`src/live_index/knowledge_bridge.rs:743-785`) — split on `/`, then on non-ASCII-alphanumeric, lowercase, exact token match — and implement the WS2 table with new stable rule IDs
-- [ ] T040 [US3] Assert by construction that NO new path rule emits `AuthorityDomain::CurrentImplementation` (its `DeterministicConflict → Suppressed` path at `knowledge_authority.rs:234`/`:1394` would hide units from default scope), and add a test that a `CLAUDE.md`-class unit under a simulated `DeterministicConflict` stays visible at `authority_scope=default`
+- [x] T037 [US3] Change `derive_native_lifecycle` in `src/live_index/knowledge_authority.rs:1068-1098` to return `(KnowledgeLifecycle::Unknown, LifecycleEvidence::None)` on the no-evidence fallthrough, and fix the two in-file tests that assert `Active` (lines ~2049, ~2220) ONLY where they relied on the unevidenced default — do not weaken a test that asserts an evidenced `Active`
+- [x] T038 [US3] Reorder `derive_native_authority_domain` in `src/live_index/knowledge_authority.rs:1101+` so heading evidence is evaluated BEFORE path conventions
+- [x] T039 [US3] Replace the substring path matching at `src/live_index/knowledge_authority.rs:1121-1140` with component tokenization mirroring `path_convention_roles` (`src/live_index/knowledge_bridge.rs:743-785`) — split on `/`, then on non-ASCII-alphanumeric, lowercase, exact token match — and implement the WS2 table with new stable rule IDs
+- [x] T040 [US3] Assert by construction that NO new path rule emits `AuthorityDomain::CurrentImplementation` (its `DeterministicConflict → Suppressed` path at `knowledge_authority.rs:234`/`:1394` would hide units from default scope), and add a test that a `CLAUDE.md`-class unit under a simulated `DeterministicConflict` stays visible at `authority_scope=default`
 
 ### VERIFY
 
-- [ ] T041 [US3] Run `cargo test --test search_knowledge -- --test-threads=1` plus `cargo test knowledge_authority`; confirm T033-T036 pass and frozen contract test 16 stays green
-- [ ] T042 [US3] Capture `review_knowledge(mode=summary)` after the change and assert `suppressed` delta versus the T002 baseline is EXACTLY zero (SC-006); record the `domain=unknown` / `voice=unknown` movement as a DIAGNOSTIC, not a gate
-- [ ] T043 [US3] Prove an active `research/` or `docs/dogfood/` measurement document is still returned under `authority_scope=default`
+- [x] T041 [US3] Run `cargo test --test search_knowledge -- --test-threads=1` plus `cargo test knowledge_authority`; confirm T033-T036 pass and frozen contract test 16 stays green
+- [x] T042 [US3] Capture `review_knowledge(mode=summary)` after the change and assert `suppressed` delta versus the T002 baseline is EXACTLY zero (SC-006); record the `domain=unknown` / `voice=unknown` movement as a DIAGNOSTIC, not a gate
+- [x] T043 [US3] Prove an active `research/` or `docs/dogfood/` measurement document is still returned under `authority_scope=default`
 
 **Checkpoint**: labels are true. No unit was hidden.
 
