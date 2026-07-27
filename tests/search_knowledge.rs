@@ -254,6 +254,46 @@ async fn answer_arrives_before_provenance_and_the_envelope_stays_bounded() {
     }
 }
 
+/// SIFT-WS1 (T023). `classify_search_knowledge_output` (tools.rs) keys on the
+/// literal `"\nNo match:"` to emit `OutcomeClass::EmptyResult`, and the STEL
+/// dependent-chain special case reads that same classification. The seam is a
+/// silent coupling: if a reformat moved or renamed it, typed no-match answers
+/// would be misclassified with nothing failing. Pin the exact prefix, its
+/// leading newline, and its position as the final line.
+#[tokio::test]
+async fn no_match_seam_keeps_its_exact_prefix_and_position() {
+    let fixture = KnowledgeFixture::new();
+    let output = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({"query": "orbital zebra lattice", "source_scope": "current"}),
+        )
+        .await;
+
+    assert!(
+        output.contains("\nNo match: "),
+        "outcome classifier keys on a leading-newline `No match: ` seam: {output}"
+    );
+    let last = output.lines().last().expect("non-empty response");
+    assert!(
+        last.starts_with("No match: "),
+        "the seam must be the final line so provenance precedes it: {output}"
+    );
+    assert_eq!(
+        output.matches("\nNo match: ").count(),
+        1,
+        "exactly one seam, or the classifier reads an ambiguous response: {output}"
+    );
+    // Provenance still precedes it -- a no-match answer is a successful,
+    // fully-attributed response, not an error.
+    assert!(output.contains("Trust:"), "no-match keeps its envelope: {output}");
+    assert!(
+        output.contains("Counts: overflow="),
+        "no-match keeps its counts: {output}"
+    );
+}
+
 #[tokio::test]
 async fn exact_hit_and_complete_no_match_preserve_captured_provenance() {
     let fixture = KnowledgeFixture::new();
