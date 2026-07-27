@@ -162,20 +162,33 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
 /// already implements exactly this platform reuse policy — for ONE reason: an
 /// explicit 1024 backlog, which std does not expose.
 ///
-/// On Unix, `SO_REUSEADDR` is set so a restart on a FIXED serve port is not
-/// blocked by a connection the previous process closed first. Measured on
-/// Linux, that covers `FIN_WAIT_2` (a peer that never closed) as well as
-/// `TIME_WAIT`. The flag is NOT self-sufficient: the bind only succeeds when
-/// the INCUMBENT socket set it too, so the FIRST restart after upgrading from
-/// a build without this flag can still fail `EADDRINUSE`, and only self-heals
-/// from the next restart on.
+/// On LINUX ONLY, `SO_REUSEADDR` is set so a restart on a FIXED serve port is
+/// not blocked by a connection the previous process closed first. Measured,
+/// that covers `FIN_WAIT_2` (a peer that never closed) as well as `TIME_WAIT`.
+/// The flag is NOT self-sufficient: the bind only succeeds when the INCUMBENT
+/// socket set it too, so the FIRST restart after upgrading from a build without
+/// this flag can still fail `EADDRINUSE`, and only self-heals from the next
+/// restart on.
 ///
-/// Unix still refuses a second LIVE listener on the same address — sharing a
+/// Linux still refuses a second LIVE listener on the same address — sharing a
 /// live port is `SO_REUSEPORT`'s job, not this flag's — so the explicit
-/// `--listen` loud-failure contract (FR-002/003) is intact. Verified on Linux
-/// for both an identical `127.0.0.1:P` and a `0.0.0.0:P` over a live
-/// `127.0.0.1:P`. macOS/BSD wildcard-vs-specific overlap is UNVERIFIED and is
-/// the residual risk here.
+/// `--listen` loud-failure contract (FR-002/003) is intact there. Verified for
+/// both an identical `127.0.0.1:P` and a `0.0.0.0:P` over a live `127.0.0.1:P`.
+///
+/// The gate is `target_os = "linux"` and NOT `unix` because macOS/BSD does NOT
+/// hold that second guarantee. Measured on `macos-latest` (CI job 89996269731):
+/// with the flag set, `bind_listener("0.0.0.0:P")` SUCCEEDS over a live
+/// `127.0.0.1:P`, so `explicit_wildcard_over_live_specific_still_fails_loudly`
+/// failed there. Classic BSD `SO_REUSEADDR` permits a wildcard/specific overlap
+/// even against a `TCP_LISTEN` incumbent. That is the same silent
+/// "binds, looks healthy, accepts nothing" shape as the Windows bug below, and
+/// it reaches the DEFAULT path — `bind_listener` is also the occupancy probe for
+/// [`probe_free_listener`], whose fallback scans common loopback ports.
+///
+/// Accepted consequence: macOS/BSD keeps the fixed-port restart limitation the
+/// flag would have fixed (`EADDRINUSE` until the remnant drains). That is a
+/// known gap, not an oversight; it matches `main`'s behavior on every platform
+/// before this change.
 ///
 /// On Windows, `SO_REUSEADDR` is deliberately NOT set: there it lets two
 /// listening sockets share one address when both sides opt in. That was a real,
@@ -190,7 +203,7 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;

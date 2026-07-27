@@ -26,9 +26,9 @@
 //!   an occupied port: no silent substitution (FR-002/003).
 //! * `explicit_occupied_by_another_symforge_fails_loudly` — the realistic
 //!   version of the above: the occupier is ALSO a `bind_listener` bind (a real
-//!   second `symforge serve --listen`), not a plain std squatter. On Windows
-//!   `bind_listener` sets no `SO_REUSEADDR` at all; on Unix it does, and a
-//!   second live listener on the same address is still refused there. The
+//!   second `symforge serve --listen`), not a plain std squatter. On Windows and
+//!   on macOS/BSD `bind_listener` sets no `SO_REUSEADDR` at all; on Linux it
+//!   does, and a second live listener on the same address is still refused. The
 //!   shipped bug was a reuse-enabled bind on Windows: the second serve bound,
 //!   reported healthy, and accepted zero connections.
 //! * `explicit_wildcard_over_live_specific_still_fails_loudly` — the overlap the
@@ -36,12 +36,13 @@
 //!   so it can never catch a `0.0.0.0:P` that silently shadows a live
 //!   `127.0.0.1:P` (the exact shape of the shipped dual-listener bug).
 //! * `bind_listener_reuse_address_matches_the_platform_gate` — pins the platform
-//!   reuse policy. Guards removal of the `set_reuse_address` call on every
-//!   platform; does NOT guard removal of its `#[cfg(unix)]` attribute on CI. See
-//!   the test's own comment for exactly why.
-//! * `explicit_recently_closed_connection_rebinds` — Unix: a fixed serve port
+//!   reuse policy (Linux only). Guards removal of the `set_reuse_address` call,
+//!   and — via the macos-latest runner — guards WIDENING the gate back to
+//!   `unix`. Does NOT guard deleting the gate outright on the running platform.
+//!   See the test's own comment.
+//! * `explicit_recently_closed_connection_rebinds` — Linux: a fixed serve port
 //!   rebinds after the previous process closed a connection first (the restart
-//!   `SO_REUSEADDR` exists for).
+//!   `SO_REUSEADDR` exists for). Not run on macOS/BSD, which does not set it.
 //! * `default_listen_constant_is_loopback_8787` — pins the historical default the
 //!   no-address path prefers.
 //!
@@ -207,6 +208,16 @@ async fn explicit_wildcard_over_live_specific_still_fails_loudly() {
     // ZERO connections). `serve::run` permits a non-loopback `--listen`
     // (`is_loopback_addr` only drives the API-key policy), so this is reachable,
     // not hypothetical. If reuse ever weakens overlap detection, this fails.
+    //
+    // Deliberately gated `unix`, NOT `target_os = "linux"`, even though the
+    // reuse flag is now Linux-only. That is what makes this a PERMANENT
+    // regression guard rather than a one-off probe: it passes on both Linux and
+    // Darwin today, and it FAILS on Darwin the moment anyone widens the gate in
+    // `bind_listener` back to `unix`. It has already caught exactly that — CI
+    // job 89996269731 (`darwin-serve-port`, macos-latest) failed this assertion
+    // with the flag set on all of unix, because classic BSD `SO_REUSEADDR`
+    // permits a wildcard/specific overlap against a live listener. So the
+    // macos-latest job is load-bearing; do not drop it.
     let specific = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener occupy");
     let port = specific.local_addr().expect("local_addr").port();
 
@@ -224,42 +235,45 @@ async fn explicit_wildcard_over_live_specific_still_fails_loudly() {
 #[tokio::test]
 async fn bind_listener_reuse_address_matches_the_platform_gate() {
     // Pins the platform reuse policy `bind_listener` implements: `SO_REUSEADDR`
-    // set on Unix (so a restart on a FIXED port is not blocked by a connection
-    // the previous process closed first), NOT set on Windows (where two
-    // reuse-enabled listeners CAN share one address — the dual-listener black
-    // hole: second serve binds, looks healthy, accepts zero connections).
+    // set on LINUX ONLY (so a restart on a FIXED port is not blocked by a
+    // connection the previous process closed first), NOT set on Windows (where
+    // two reuse-enabled listeners CAN share one address — the dual-listener
+    // black hole: second serve binds, looks healthy, accepts zero connections)
+    // and NOT on macOS/BSD (where it permits a wildcard/specific overlap against
+    // a live listener — measured, CI job 89996269731).
     //
-    // What this assertion DOES guard on CI: removal of the `set_reuse_address`
-    // call itself. On a unix runner that flips `reuse` to false while
-    // `cfg!(unix)` stays true, and the test fails. (On Windows the call is
-    // already cfg'd out, so there is nothing to remove and nothing to catch.)
+    // What this assertion DOES guard: removal of the `set_reuse_address` call.
+    // On a Linux runner that flips `reuse` to false while
+    // `cfg!(target_os = "linux")` stays true, and the test fails. It also now
+    // catches WIDENING the gate back to `unix`, because on the macos-latest
+    // runner `cfg!(target_os = "linux")` is FALSE while reuse would be true.
     //
-    // What it does NOT guard on CI: deleting the `#[cfg(unix)]` ATTRIBUTE while
-    // keeping the call — the change that actually reintroduces the shipped
-    // Windows bug. The expectation is written as `cfg!(unix)`, i.e. it MIRRORS
-    // the very gate it checks, so making reuse unconditional leaves
-    // `reuse == true == cfg!(unix)` and the test stays GREEN. Every CI runner
-    // for this file is unix (`ubuntu-latest`, plus the `darwin-serve-port`
-    // macos-latest job), so that holds on all of them. Verified by experiment:
-    // deleting the attribute fails this test on Windows with
-    // `left: true, right: false`, and only there.
+    // What it still does NOT guard: deleting the gate attribute entirely on the
+    // platform the test happens to be running on. The expectation MIRRORS the
+    // cfg it checks, so on Linux `reuse == true == cfg!(target_os = "linux")`
+    // either way. Windows is only ever exercised by the maintainer's local
+    // `cargo test`; verified by experiment there — deleting the attribute failed
+    // this test with `left: true, right: false`, and only on Windows.
     //
-    // So: this test pins the policy, and the maintainer's Windows `cargo test`
-    // is the ONLY place the Windows half is ever enforced. Catching it in CI
-    // would need a Windows runner, or an assertion on the source gate rather
-    // than on `cfg!(unix)`; neither exists today.
+    // So: Linux+Darwin CI now covers the widening mistake; the Windows half
+    // still rests on the local gate. Closing that would need a Windows runner or
+    // an assertion on the source text rather than on a `cfg!`.
     let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener");
     let reuse = socket2::SockRef::from(&listener)
         .reuse_address()
         .expect("read SO_REUSEADDR");
     assert_eq!(
         reuse,
-        cfg!(unix),
-        "SO_REUSEADDR must be set on Unix and NOT on Windows"
+        cfg!(target_os = "linux"),
+        "SO_REUSEADDR must be set on Linux ONLY — not Windows, not macOS/BSD"
     );
 }
 
-#[cfg(unix)]
+// Linux-only: this asserts the rebind SUCCEEDS, which is exactly the behavior
+// `SO_REUSEADDR` buys. macOS/BSD deliberately does not set the flag (it would
+// permit a wildcard/specific overlap — see `bind_listener`), so the rebind there
+// still fails until the remnant drains. That is the accepted macOS gap.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn explicit_recently_closed_connection_rebinds() {
     let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("initial serve bind");
