@@ -71,7 +71,11 @@ serde_json = "1.0"
 serde_yml = { package = "serde_yaml_ng", version = "0.10" }
 toml_edit = "0.25"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal", "test-util"] }
+# `net` and `io-util` are declared EXPLICITLY even though axum/hyper-util/reqwest
+# already unify them in: `tests/serve_port.rs` uses `tokio::net::TcpStream` and
+# `AsyncReadExt` directly, and a dependency change must not be able to break the
+# build with no local declaration to explain why.
+tokio = { version = "1.48", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "time", "sync", "signal", "test-util"] }
 postcard = { version = "1.1", features = ["use-std"] }
 axum = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }

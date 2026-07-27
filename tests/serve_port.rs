@@ -26,9 +26,20 @@
 //!   an occupied port: no silent substitution (FR-002/003).
 //! * `explicit_occupied_by_another_symforge_fails_loudly` — the realistic
 //!   version of the above: the occupier is ALSO a `bind_listener` bind (a real
-//!   second `symforge serve --listen`), not a plain std squatter. `bind_listener`
-//!   used to set `SO_REUSEADDR`, which let this pass silently — the second serve
-//!   would bind, report healthy, and accept zero connections.
+//!   second `symforge serve --listen`), not a plain std squatter. On Windows
+//!   `bind_listener` sets no `SO_REUSEADDR` at all; on Unix it does, and a
+//!   second live listener on the same address is still refused there. The
+//!   shipped bug was a reuse-enabled bind on Windows: the second serve bound,
+//!   reported healthy, and accepted zero connections.
+//! * `explicit_wildcard_over_live_specific_still_fails_loudly` — the overlap the
+//!   test above structurally cannot reach: it binds the IDENTICAL address twice,
+//!   so it can never catch a `0.0.0.0:P` that silently shadows a live
+//!   `127.0.0.1:P` (the exact shape of the shipped dual-listener bug).
+//! * `bind_listener_reuse_address_matches_the_platform_gate` — the only guard on
+//!   the load-bearing `#[cfg(unix)]` gate; see the test's own comment.
+//! * `explicit_recently_closed_connection_rebinds` — Unix: a fixed serve port
+//!   rebinds after the previous process closed a connection first (the restart
+//!   `SO_REUSEADDR` exists for).
 //! * `default_listen_constant_is_loopback_8787` — pins the historical default the
 //!   no-address path prefers.
 //!
@@ -50,12 +61,14 @@ use symforge::server::serve::{
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
-/// Occupy a loopback port with a plain `std` listener (no `SO_REUSEADDR`) — the
-/// honest reproduction of a real squatter (`wslrelay` / another service).
-/// `bind_listener` on the same port fails against this occupier regardless of
-/// its own reuse setting, so this occupier alone cannot prove `bind_listener`
-/// rejects an occupied port HONESTLY — see `occupy_with_bind_listener` below,
-/// which is the occupier that actually exercises that claim.
+/// Occupy a loopback port with a plain `std` listener — the honest reproduction
+/// of a real squatter (`wslrelay` / another service). Note that std DOES set
+/// `SO_REUSEADDR` on Unix; what makes this occupier exclusive is that it is
+/// actively LISTENING. `bind_listener` on the same port fails against it
+/// regardless of either side's reuse setting, so this occupier alone cannot
+/// prove `bind_listener` rejects an occupied port HONESTLY — see
+/// `occupy_with_bind_listener` below, which is the occupier that actually
+/// exercises that claim.
 fn occupy_a_port() -> (std::net::TcpListener, SocketAddr) {
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("exclusive occupy a loopback port");
@@ -180,6 +193,50 @@ async fn explicit_occupied_by_another_symforge_fails_loudly() {
     );
 
     drop(occupier);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_wildcard_over_live_specific_still_fails_loudly() {
+    // The overlap `explicit_occupied_by_another_symforge_fails_loudly` cannot
+    // reach: it binds the IDENTICAL address twice. Here the second bind is the
+    // WILDCARD `0.0.0.0:P` over a LIVE `127.0.0.1:P` — the exact shape of the
+    // shipped bug (second server binds, prints a healthy attach URL, accepts
+    // ZERO connections). `serve::run` permits a non-loopback `--listen`
+    // (`is_loopback_addr` only drives the API-key policy), so this is reachable,
+    // not hypothetical. If reuse ever weakens overlap detection, this fails.
+    let specific = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener occupy");
+    let port = specific.local_addr().expect("local_addr").port();
+
+    let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+    let result = bind_listener(wildcard);
+    assert!(
+        result.is_err(),
+        "a wildcard bind over a live specific bind_listener must fail loudly, \
+         not silently shadow it: {result:?}"
+    );
+
+    drop(specific);
+}
+
+#[tokio::test]
+async fn bind_listener_reuse_address_matches_the_platform_gate() {
+    // The `#[cfg(unix)]` gate on `set_reuse_address` is load-bearing: on Windows
+    // two reuse-enabled listeners CAN share one address, which is the
+    // dual-listener black hole (second serve binds, looks healthy, accepts zero
+    // connections). CI is ubuntu-only, so dropping that gate would leave CI
+    // green while silently reintroducing the Windows bug. This assertion is the
+    // guard, and the maintainer's Windows `cargo test --all-targets` is the only
+    // place its Windows half is ever exercised.
+    let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener");
+    let reuse = socket2::SockRef::from(&listener)
+        .reuse_address()
+        .expect("read SO_REUSEADDR");
+    assert_eq!(
+        reuse,
+        cfg!(unix),
+        "SO_REUSEADDR must be set on Unix and NOT on Windows"
+    );
 }
 
 #[cfg(unix)]
