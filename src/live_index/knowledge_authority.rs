@@ -2442,4 +2442,153 @@ content_hash = "hash"
                 .and_then(|version| version.commit.as_deref())
         );
     }
+
+    fn probe_anchor(path: &str) -> KnowledgeAnchor {
+        KnowledgeAnchor {
+            id: KnowledgeAnchorId {
+                path: path.to_string(),
+                content_hash: "probe-hash".to_string(),
+                start_byte: 0,
+            },
+            source: source(),
+            content_generation: 1,
+            path: path.to_string(),
+            content_hash: "probe-hash".to_string(),
+            byte_range: 0..1,
+            line_range: 1..2,
+        }
+    }
+
+    fn native_lifecycle(path: &str, body: &str) -> (KnowledgeLifecycle, LifecycleEvidence) {
+        derive_native_lifecycle(path, body.as_bytes(), &probe_anchor(path))
+    }
+
+    fn native_domain(path: &str, heading: &str) -> AuthorityDomain {
+        let heading_path = vec![heading.to_string()];
+        derive_native_authority_domain(path, &heading_path, &probe_anchor(path)).0
+    }
+
+    #[test]
+    fn lifecycle_without_evidence_is_unknown_not_active() {
+        let (lifecycle, evidence) =
+            native_lifecycle("docs/notes.md", "# Notes\nProse with no declared status.\n");
+        assert_eq!(lifecycle, KnowledgeLifecycle::Unknown);
+        assert_eq!(evidence, LifecycleEvidence::None);
+
+        let (declared, declared_evidence) =
+            native_lifecycle("docs/notes.md", "# Notes\nstatus: active\n");
+        assert_eq!(declared, KnowledgeLifecycle::Active);
+        assert!(matches!(
+            declared_evidence,
+            LifecycleEvidence::DeclaredSpan(_)
+        ));
+
+        let (archived, archive_evidence) = native_lifecycle("docs/archive/old.md", "# Old\n");
+        assert_eq!(archived, KnowledgeLifecycle::Archived);
+        assert!(matches!(
+            archive_evidence,
+            LifecycleEvidence::ArchivePathRule { .. }
+        ));
+    }
+
+    #[test]
+    fn path_conventions_never_match_word_interior_substrings() {
+        for path in [
+            "docs/special/report.md",
+            "docs/redesign/x.md",
+            "docs/inspection/x.md",
+        ] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::Unknown,
+                "{path} must not be classified by a substring of a path component"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_evidence_outranks_conflicting_path_convention() {
+        assert_eq!(
+            native_domain("docs/readme.md", "Decision"),
+            AuthorityDomain::Decision,
+            "a decision heading must outrank the readme path rule"
+        );
+        assert_eq!(
+            native_domain("docs/specs/thing.md", "History"),
+            AuthorityDomain::HistoricalRecord,
+            "a history heading must outrank the spec path rule"
+        );
+        assert_eq!(
+            native_domain("docs/plans/thing.md", "Runbook"),
+            AuthorityDomain::Operations,
+            "a runbook heading must outrank the plan path rule"
+        );
+    }
+
+    #[test]
+    fn ws2_agent_instruction_paths_are_operations() {
+        for path in ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".agent/notes.md"] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::Operations,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ws2_solutions_paths_are_decisions() {
+        assert_eq!(
+            native_domain("docs/solutions/fix-the-thing.md", "Notes"),
+            AuthorityDomain::Decision
+        );
+    }
+
+    #[test]
+    fn ws2_review_and_research_paths_are_historical_records() {
+        for path in [
+            "docs/reviews/pr-479.md",
+            "docs/dogfood/2026-07-27.md",
+            "research/measurement.md",
+        ] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::HistoricalRecord,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ws2_plan_paths_are_normative_intent() {
+        for path in ["docs/plan.md", "docs/plans/next.md", "docs/roadmap.md"] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::NormativeIntent,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ws2_task_and_handoff_paths_are_operations() {
+        for path in ["docs/tasks.md", "docs/handoff.md", "docs/handover.md"] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::Operations,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ws2_archive_paths_stay_historical_records() {
+        for path in ["docs/archive/old.md", "docs/archived/old.md"] {
+            assert_eq!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::HistoricalRecord,
+                "{path}"
+            );
+        }
+    }
 }
