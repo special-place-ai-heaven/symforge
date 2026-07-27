@@ -171,20 +171,36 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
         || text.starts_with("Index degraded:")
 }
 
-fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:") || text.starts_with("Error in ") || is_foreign_project_refusal(text)
+/// The ONE error-shape predicate for the whole protocol surface, read/write
+/// alike. `edit_tools.rs` used to keep a private copy of this function, which
+/// diverged the moment the project-refusal shapes were added here — so the seven
+/// structural edit tools reported a REFUSED edit as `success`/`found`. Shared
+/// (`pub(super)`) so a new shape can only ever be taught once.
+pub(super) fn is_error_output(text: &str) -> bool {
+    text.starts_with("Error:")
+        || text.starts_with("Error in ")
+        || is_foreign_project_refusal(text)
+        || is_local_cross_project_refusal(text)
 }
 
 /// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
 /// carries no `Error:` prefix, so without this a refusal that came back through
 /// DISPATCH rather than an early return classified as a SUCCESSFUL answer
-/// (`found`) — notably in `classify_symforge_edit_outcome`. Deliberately narrow:
-/// BOTH anchors must match, so no unrelated body is reclassified. The sibling
-/// `local_cross_project_refusal` shape ("Cross-project queries ... require the
-/// daemon") is left alone on purpose — same class of defect, different message,
-/// out of scope here.
+/// (`found`) — notably in `classify_symforge_edit_outcome` and in every
+/// `classify_edit_output` caller. Deliberately narrow: BOTH anchors must match,
+/// so no unrelated body is reclassified.
 fn is_foreign_project_refusal(text: &str) -> bool {
     text.starts_with("project '") && text.contains("is not available on this connection")
+}
+
+/// Sibling shape emitted by [`SymForgeServer::local_cross_project_refusal`] for
+/// a genuinely cross-project (`projects`, `*`, or foreign `project`) read on a
+/// transport with no daemon working set. Same defect as above and same fix: an
+/// honest refusal must not be reported as a successful answer. Narrow by
+/// anchoring the FULL opening clause at position 0: a rendered search hit or doc
+/// line that quotes the message is prefixed (`7: // ...`) and stays `Found`.
+fn is_local_cross_project_refusal(text: &str) -> bool {
+    text.starts_with("Cross-project queries (project/projects) require the daemon")
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
@@ -232,7 +248,8 @@ fn classify_get_file_content_output(text: &str) -> OutcomeClass {
     let body = strip_mode_annotation(text);
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Invalid get_file_content request:")
+    } else if is_error_output(text)
+        || text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
         || text.contains("[error:")
         || (body.starts_with("Chunk ") && body.contains(" out of range for "))
@@ -301,7 +318,8 @@ fn classify_search_knowledge_output(text: &str) -> OutcomeClass {
 fn classify_search_files_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Path search requires")
+    } else if is_error_output(text)
+        || text.starts_with("Path search requires")
         || text.starts_with("Path hint must not be empty")
         || text.starts_with("search_files")
     {
@@ -20674,6 +20692,11 @@ mod tests {
     /// Task 4: a local/embedded server is bound to ONE project. An explicit
     /// `project` selector that doesn't match refuses deterministically; a
     /// matching selector (bound project name) proceeds normally.
+    ///
+    /// This asserted only the message TEXT, so it looked like coverage while
+    /// pinning nothing about the reported outcome — `get_file_content` was
+    /// answering `outcome_class: found` for this refusal the whole time. The
+    /// outcome class is now asserted through the statused tool wrapper.
     #[tokio::test]
     async fn test_local_server_refuses_foreign_project_selector() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
@@ -20684,7 +20707,12 @@ mod tests {
             "project": "some-other-project"
         }))
         .expect("foreign input");
-        let refused = server.get_file_content(Parameters(foreign)).await;
+        // Through the STATUSED wrapper, so the reported outcome class is pinned
+        // alongside the message.
+        let refused_result =
+            serialized_tool_result(server.get_file_content_tool(Parameters(foreign)).await);
+        assert_tool_result_status(&refused_result, OutcomeClass::InvalidRequest);
+        let refused = tool_result_text(&refused_result);
         assert!(
             refused.contains("not available on this connection"),
             "foreign selector must refuse: {refused}"
@@ -20970,10 +20998,31 @@ mod tests {
             OutcomeClass::InvalidRequest,
             "a refusal must never be reported as a successful edit"
         );
-        assert_eq!(
-            super::classify_compact_tool_output("get_symbol", refusal),
-            OutcomeClass::InvalidRequest
-        );
+        // EVERY tool that can emit this refusal must classify it, including the
+        // two whose classifiers grew their own branch lists and never consulted
+        // `is_error_output` (`get_file_content`, `search_files`). Both feed
+        // `classify_compact_tool_output`, so a miss here fed a REFUSED step to
+        // the STEL chain as a SUCCESSFUL one.
+        for tool in [
+            "get_symbol",
+            "get_symbol_context",
+            "get_file_content",
+            "get_file_context",
+            "search_symbols",
+            "search_text",
+            "search_files",
+            "find_references",
+        ] {
+            assert_eq!(
+                super::classify_compact_tool_output(tool, refusal),
+                OutcomeClass::InvalidRequest,
+                "{tool} must classify a foreign-project refusal as an invalid request"
+            );
+            assert!(
+                !super::compact_tool_output_is_success(tool, refusal),
+                "{tool} must not admit a refusal into the STEL chain as a success"
+            );
+        }
 
         // Narrowness: both anchors are required, so ordinary bodies that merely
         // start with "project" or merely mention the phrase stay untouched.
@@ -20985,6 +21034,45 @@ mod tests {
             super::classify_compact_tool_output(
                 "get_symbol",
                 "1: // is not available on this connection\n2: ok"
+            ),
+            OutcomeClass::Found
+        );
+    }
+
+    /// The sibling refusal `local_cross_project_refusal` emits had the identical
+    /// defect: no `Error:` prefix, so every classifier fell through to `Found`
+    /// and a loud honest refusal was reported as a successful answer. Nothing
+    /// pinned its outcome class before this test — `tests/serve_http_attach.rs`
+    /// asserts only the message TEXT, and `daemon.rs` only asserts its ABSENCE
+    /// on the honored path — so classifying it costs no existing expectation.
+    #[test]
+    fn local_cross_project_refusal_classifies_as_invalid_request() {
+        let refusal = "Cross-project queries (project/projects) require the daemon: the \
+                       working set of open projects lives on the daemon transport, not on \
+                       the /mcp HTTP transport, stdio/embed, or while the daemon is \
+                       unreachable. Start the daemon to query across projects.";
+        // The tools that actually emit it, plus the shared default arm.
+        for tool in [
+            "search_symbols",
+            "search_text",
+            "find_references",
+            "get_file_content",
+            "search_files",
+            "some_unlisted_tool",
+        ] {
+            assert_eq!(
+                super::classify_compact_tool_output(tool, refusal),
+                OutcomeClass::InvalidRequest,
+                "{tool} must classify the cross-project refusal as an invalid request"
+            );
+        }
+
+        // Narrowness: both anchors are required, so a body that merely mentions
+        // the phrase (a source line, a doc hit) is untouched.
+        assert_eq!(
+            super::classify_compact_tool_output(
+                "search_text",
+                "7: // Cross-project queries (project/projects) require the daemon\n"
             ),
             OutcomeClass::Found
         );

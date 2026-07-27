@@ -14,7 +14,7 @@ use crate::protocol::{edit, edit_format, edit_hooks, format};
 use crate::watcher;
 
 use super::SymForgeServer;
-use super::tools::safe_repo_path_for_freshen;
+use super::tools::{is_error_output, is_index_unavailable_output, safe_repo_path_for_freshen};
 
 macro_rules! loading_guard {
     ($guard:expr) => {
@@ -271,16 +271,13 @@ fn statused_edit_tool_result(
     Ok(result.with_meta(Some(rmcp::model::Meta(meta))))
 }
 
-fn is_index_unavailable_output(text: &str) -> bool {
-    text.starts_with("Index not loaded.")
-        || text.starts_with("Index is loading")
-        || text.starts_with("Index degraded:")
-}
-
-fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:") || text.starts_with("Error in ")
-}
-
+/// Classify one structural-edit tool's output body.
+///
+/// Both error-shape predicates are the SHARED ones from `super::tools`, not
+/// local copies: this file used to keep byte-identical private duplicates, and
+/// when the project-refusal shapes were taught to the read-side copy, the write
+/// side silently kept classifying a refused edit as `Success` — `isError: false`
+/// for a write that never happened. One predicate, one place to teach a shape.
 fn classify_edit_output(text: &str, dry_run: bool) -> EditResultStatus {
     if is_index_unavailable_output(text) {
         EditResultStatus::InternalFailure
