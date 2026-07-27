@@ -22,6 +22,135 @@ const MAX_LIMIT: usize = 100;
 const MIN_PROVENANCE_TOKENS: u64 = 64;
 const MAX_IDS_PER_HIT: usize = 8;
 const MAX_BRIDGE_PREVIEWS_PER_HIT: usize = 4;
+/// Excerpt bound in Unicode CHARACTERS, not bytes (SIFT-WS1).
+const EXCERPT_MAX_CHARS: usize = 240;
+/// Shortest digest prefix ever displayed; extended on collision.
+const DIGEST_PREFIX_MIN: usize = 12;
+
+/// Bound a matched line to a readable window around the match.
+///
+/// SIFT-WS1 (T024). The excerpt used to be the whole matched line with no cap:
+/// dogfood captured a 1.5 KB Markdown table row as one hit's excerpt.
+///
+/// Operates on `char_indices` of the ORIGINAL line. The tempting
+/// implementation — lowercase the line, `find()` the match, slice the original
+/// at that byte offset — is wrong twice: `to_lowercase()` is not
+/// length-preserving for all Unicode, and a byte offset can land inside a
+/// multi-byte character and panic. Match location is therefore resolved in
+/// CHARACTER space and every cut lands on a character boundary.
+fn window_excerpt(line: &str, phrase: &str, terms: &[String]) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= EXCERPT_MAX_CHARS {
+        return line.to_string();
+    }
+
+    // Locate the match in character space via a lowercased char vector, so the
+    // index maps back onto `chars` one-for-one.
+    let lower: Vec<char> = line.chars().flat_map(|c| c.to_lowercase()).collect();
+    let lower_str: String = lower.iter().collect();
+    let find_chars = |needle: &str| -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        lower_str
+            .find(needle)
+            .map(|byte| lower_str[..byte].chars().count())
+    };
+    // `to_lowercase` can change char count (e.g. 'İ'), so a char index derived
+    // from the lowered string is only a hint. Clamp it into range.
+    let hint = find_chars(phrase)
+        .or_else(|| terms.iter().find_map(|term| find_chars(term)))
+        .unwrap_or(0)
+        .min(chars.len().saturating_sub(1));
+
+    let match_len = phrase.chars().count().max(1);
+    // Center the window on the match, then clamp to the line.
+    let half = EXCERPT_MAX_CHARS.saturating_sub(match_len) / 2;
+    let mut start = hint.saturating_sub(half);
+    let mut end = (start + EXCERPT_MAX_CHARS).min(chars.len());
+    start = end.saturating_sub(EXCERPT_MAX_CHARS);
+
+    // Snap outward-in to whitespace so a cut never splits a word.
+    if start > 0 {
+        let limit = (start + 32).min(end);
+        if let Some(offset) = (start..limit).find(|index| chars[*index].is_whitespace()) {
+            // Never snap past the match itself.
+            if offset < hint {
+                start = offset + 1;
+            }
+        }
+    }
+    if end < chars.len() {
+        let floor = end.saturating_sub(32).max(hint + match_len);
+        if let Some(offset) = (floor..end)
+            .rev()
+            .find(|index| chars[*index].is_whitespace())
+        {
+            end = offset;
+        }
+    }
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[start..end].iter());
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Per-response identifier abbreviation table (SIFT-WS1, T025).
+///
+/// Provenance vectors mix opaque content digests with SEMANTIC rule/policy IDs
+/// (`authority-history-v1`, `temporal-coverage-incomplete`). Abbreviating
+/// indiscriminately would corrupt the semantic ones, and a fixed 48-bit prefix
+/// is not collision-safe across thousands of units — so digests abbreviate to
+/// the shortest prefix, at least [`DIGEST_PREFIX_MIN`], that is unique across
+/// EVERY digest in the response. One length for the whole response, so the same
+/// digest never renders two ways in one answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DisplayIds {
+    digest_len: usize,
+}
+
+impl DisplayIds {
+    /// A digest is lowercase hex and long enough to be worth shortening.
+    /// Anything else — `authority-history-v1`, `role.path.plan-handoff.v1` —
+    /// is semantic and renders verbatim.
+    fn is_digest(id: &str) -> bool {
+        id.len() >= DIGEST_PREFIX_MIN
+            && id
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+    }
+
+    fn for_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let digests: Vec<&str> = ids.into_iter().filter(|id| Self::is_digest(id)).collect();
+        let longest = digests.iter().map(|id| id.len()).max().unwrap_or(0);
+        let mut digest_len = DIGEST_PREFIX_MIN;
+        while digest_len < longest {
+            let mut prefixes: Vec<&str> = digests.iter().map(|id| &id[..digest_len]).collect();
+            prefixes.sort_unstable();
+            let before = prefixes.len();
+            prefixes.dedup();
+            if prefixes.len() == before {
+                break;
+            }
+            digest_len += 1;
+        }
+        Self { digest_len }
+    }
+
+    fn render(&self, id: &str) -> String {
+        if Self::is_digest(id) && id.len() > self.digest_len {
+            id[..self.digest_len].to_string()
+        } else {
+            id.to_string()
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalizedQuery {
@@ -719,7 +848,9 @@ fn match_unit(
     Some(UnitMatch {
         line,
         line_range: base_line..base_line.saturating_add(unit_line_count),
-        excerpt,
+        // SIFT-WS1 (T024): bound the raw matched line to a readable window.
+        // Dogfood captured a 1.5 KB Markdown table row as one hit's excerpt.
+        excerpt: window_excerpt(&excerpt, &query.phrase, &query.terms),
         exact_phrase,
         heading_match,
         distinct_term_count,
@@ -817,9 +948,48 @@ fn bridge_previews(
         .collect();
     previews.sort();
     previews.dedup();
-    let omitted = previews.len().saturating_sub(MAX_BRIDGE_PREVIEWS_PER_HIT);
-    previews.truncate(MAX_BRIDGE_PREVIEWS_PER_HIT);
-    (previews, omitted)
+
+    // SIFT-WS1 (T026): pack by resolution class, reserving at least one slot
+    // for every class that is PRESENT, then fill the remaining global cap in
+    // class order. A flat `truncate` could drop an entire class -- and the
+    // frozen contract (§Successful response, test 18) requires bounded
+    // exact/declared-set/ambiguous/missing previews "when present". Missing and
+    // ambiguous anchors are a trust signal (a document's code links are
+    // broken), not noise to hide.
+    let class_of = |preview: &str| -> usize {
+        if preview.contains(":exact:") {
+            0
+        } else if preview.contains(":declared_set:") {
+            1
+        } else if preview.contains(":ambiguous:") {
+            2
+        } else {
+            3
+        }
+    };
+    let total = previews.len();
+    let mut by_class: [Vec<String>; 4] = Default::default();
+    for preview in previews {
+        by_class[class_of(&preview)].push(preview);
+    }
+    let present = by_class.iter().filter(|class| !class.is_empty()).count();
+    let mut selected: Vec<String> = Vec::new();
+    if present > 0 {
+        // Pass 1: one reserved slot per present class.
+        for class in by_class.iter_mut() {
+            if !class.is_empty() && selected.len() < MAX_BRIDGE_PREVIEWS_PER_HIT {
+                selected.push(class.remove(0));
+            }
+        }
+        // Pass 2: fill remaining capacity in class order.
+        for class in by_class.iter_mut() {
+            while !class.is_empty() && selected.len() < MAX_BRIDGE_PREVIEWS_PER_HIT {
+                selected.push(class.remove(0));
+            }
+        }
+    }
+    let omitted = total.saturating_sub(selected.len());
+    (selected, omitted)
 }
 
 /// One per-source identity line. A source whose envelope was withheld or that
@@ -876,6 +1046,28 @@ fn render_response(
     degraded: bool,
 ) -> String {
     let _ = query;
+    // SIFT-WS1 (T025): one abbreviation table for the WHOLE response, computed
+    // from every digest it will display, so a digest never renders two ways in
+    // one answer and colliding prefixes extend together.
+    let mut all_ids: Vec<&str> = Vec::new();
+    for source in sources {
+        if let Some(envelope) = source.envelope.as_ref() {
+            all_ids.push(envelope.source.source_id.as_str());
+            all_ids.push(envelope.manifest_digest.as_str());
+        }
+    }
+    for hit in hits {
+        all_ids.push(hit.content_hash.as_str());
+        all_ids.extend(hit.authority.finding_ids.iter().map(String::as_str));
+        all_ids.extend(hit.authority.provenance_ids.iter().map(String::as_str));
+        all_ids.extend(
+            hit.bridge_previews
+                .iter()
+                .filter_map(|preview| preview.split_once(':').map(|(id, _)| id)),
+        );
+    }
+    let ids = &DisplayIds::for_ids(all_ids);
+
     let overall_coverage = if degraded { "degraded" } else { "complete" };
     let path_scope = input.path_prefix.as_deref().unwrap_or("repository");
     let scope_label = source_scope_label(scope);
@@ -954,37 +1146,76 @@ fn render_response(
     }
 
     for (index, hit) in hits.iter().enumerate() {
-        output.push_str(&format!(
-            "\n{}. {}:{} | heading={} | excerpt=\"{}\" | source={} content_hash={} publication={} content={} line_range={}..{} | authority: lifecycle={} domain={} code={} voice={} coverage={} | finding_ids=[{}] omitted={} provenance_ids=[{}] omitted={} | bridge_previews=[{}] omitted={}",
-            index + 1,
-            hit.path,
-            hit.line,
-            if hit.heading_path.is_empty() {
-                "(no heading)".to_string()
-            } else {
-                hit.heading_path.join(" > ")
-            },
-            hit.excerpt,
-            hit.source_label,
-            hit.content_hash,
-            hit.publication_generation,
-            hit.content_generation,
-            hit.line_range.start,
-            hit.line_range.end,
-            hit.authority.lifecycle,
-            hit.authority.authority_domain,
-            hit.authority.code_evidence,
-            hit.authority.voice,
-            hit.authority.coverage,
-            hit.authority.finding_ids.join(","),
-            hit.authority.finding_ids_omitted,
-            hit.authority.provenance_ids.join(","),
-            hit.authority.provenance_ids_omitted,
-            hit.bridge_previews.join(" | "),
-            hit.bridge_previews_omitted,
-        ));
+        output.push_str(&render_hit_block(index + 1, hit, ids));
     }
     output
+}
+
+/// One indivisible, answer-first hit block (SIFT-WS1, T027).
+///
+/// Ordered so the answer arrives before the provenance chrome: location,
+/// heading breadcrumb, excerpt, then evidence. The previous single
+/// pipe-delimited mega-line cost ~250 tokens per hit and buried the excerpt
+/// mid-line, so reading hit 3 of 10 meant parsing thousands of tokens of
+/// provenance first.
+///
+/// Field NAMES are unchanged from the mega-line (`content_hash=`, `authority:`,
+/// `finding_ids=`, `bridge_previews=`, ...). Only the layout changed: agents
+/// and tests already parse these tokens, and renaming them would be churn on a
+/// frozen surface for no readability gain.
+///
+/// Budgeting treats this whole block as atomic -- see `budget_summary`.
+fn render_hit_block(ordinal: usize, hit: &KnowledgeHit, ids: &DisplayIds) -> String {
+    let heading = if hit.heading_path.is_empty() {
+        "(no heading)".to_string()
+    } else {
+        hit.heading_path.join(" > ")
+    };
+    let render_list = |values: &[String]| -> String {
+        values
+            .iter()
+            .map(|id| ids.render(id))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "\n{ordinal}. {} · {}:{}\n   {heading}\n   \"{}\"\n   source={} content_hash={} publication={} content={} line_range={}..{}\n   authority: lifecycle={} domain={} code={} voice={} coverage={}\n   finding_ids=[{}] omitted={} provenance_ids=[{}] omitted={}\n   bridge_previews=[{}] omitted={}",
+        hit.source_label,
+        hit.path,
+        hit.line,
+        hit.excerpt,
+        hit.source_label,
+        ids.render(&hit.content_hash),
+        hit.publication_generation,
+        hit.content_generation,
+        hit.line_range.start,
+        hit.line_range.end,
+        hit.authority.lifecycle,
+        hit.authority.authority_domain,
+        hit.authority.code_evidence,
+        hit.authority.voice,
+        hit.authority.coverage,
+        render_list(&hit.authority.finding_ids),
+        hit.authority.finding_ids_omitted,
+        render_list(&hit.authority.provenance_ids),
+        hit.authority.provenance_ids_omitted,
+        hit.bridge_previews
+            .iter()
+            .map(|preview| abbreviate_preview_ids(preview, ids))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        hit.bridge_previews_omitted,
+    )
+}
+
+/// Bridge previews are `<link-id>:<kind>:<resolution>` triples whose leading
+/// link ID is a digest. Abbreviate only that ID; the kind and resolution are
+/// semantic and stay verbatim.
+fn abbreviate_preview_ids(preview: &str, ids: &DisplayIds) -> String {
+    match preview.split_once(':') {
+        Some((id, rest)) => format!("{}:{rest}", ids.render(id)),
+        None => preview.to_string(),
+    }
 }
 
 fn significant_terms(query: &str) -> Vec<String> {
@@ -1342,6 +1573,144 @@ mod tests {
             limit: Some(limit),
             ..input(query)
         }
+    }
+
+    // ── SIFT-WS1 excerpt windowing ──────────────────────────────────────────
+
+    /// SIFT-WS1 (T020). Excerpts were the raw matched line with no cap:
+    /// dogfood captured a 1.5 KB Markdown table row as one hit's excerpt.
+    #[test]
+    fn excerpt_is_bounded_and_keeps_the_match_in_window() {
+        let row = format!(
+            "| {} | persistence boundary | {} |",
+            "filler ".repeat(120),
+            "tail ".repeat(120)
+        );
+        let windowed = window_excerpt(&row, "persistence boundary", &[]);
+        let chars = windowed.chars().count();
+        assert!(
+            chars <= EXCERPT_MAX_CHARS + 8,
+            "excerpt must be bounded, got {chars} chars"
+        );
+        assert!(
+            windowed.contains("persistence boundary"),
+            "the match must survive the window: {windowed}"
+        );
+        assert!(
+            windowed.len() < row.len(),
+            "a long row must actually shrink"
+        );
+    }
+
+    /// SIFT-WS1 (T020). Cuts land on CHARACTER boundaries. Byte offsets taken
+    /// from a lowercased copy are the landmine here: `to_lowercase()` is not
+    /// length-preserving and a byte index can split a multi-byte character.
+    #[test]
+    fn excerpt_cuts_on_character_boundaries_for_cjk_emoji_and_combining_marks() {
+        for filler in ["日本語テキスト", "🙂🚀🎉", "éécombining", "İIıi"] {
+            let line = format!(
+                "{} persistence boundary {}",
+                filler.repeat(60),
+                filler.repeat(60)
+            );
+            // Must not panic, and must remain valid UTF-8 by construction.
+            let windowed = window_excerpt(&line, "persistence boundary", &[]);
+            assert!(
+                windowed.chars().count() <= EXCERPT_MAX_CHARS + 8,
+                "bounded for {filler}: {windowed}"
+            );
+            assert!(
+                windowed.contains("persistence boundary"),
+                "match kept for {filler}: {windowed}"
+            );
+        }
+    }
+
+    /// SIFT-WS1 (T020). A short line is returned untouched — no ellipsis, no
+    /// churn on the common case.
+    #[test]
+    fn excerpt_leaves_short_lines_untouched() {
+        let line = "Shutdown is not a safe persistence boundary.";
+        assert_eq!(window_excerpt(line, "persistence boundary", &[]), line);
+    }
+
+    /// SIFT-WS1 (T020). A window that had to cut snaps to whitespace rather
+    /// than slicing a word in half.
+    #[test]
+    fn excerpt_snaps_to_whitespace_when_it_cuts() {
+        let line = format!(
+            "{}persistence boundary{}",
+            "alpha ".repeat(80),
+            " omega".repeat(80)
+        );
+        let windowed = window_excerpt(&line, "persistence boundary", &[]);
+        let trimmed = windowed.trim_start_matches('…').trim_end_matches('…');
+        assert!(
+            !trimmed.starts_with("lpha") && !trimmed.starts_with("pha"),
+            "leading cut must snap to a word boundary: {windowed}"
+        );
+    }
+
+    // ── SIFT-WS1 type-aware ID abbreviation ─────────────────────────────────
+
+    /// SIFT-WS1 (T021). Provenance vectors mix 64-hex digests with SEMANTIC
+    /// rule IDs (`authority-history-v1`, `temporal-coverage-incomplete`).
+    /// Abbreviating indiscriminately would corrupt the semantic ones.
+    #[test]
+    fn semantic_ids_render_verbatim_and_only_digests_abbreviate() {
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        let ids = vec![
+            digest_a.clone(),
+            digest_b.clone(),
+            "authority-history-v1".to_string(),
+            "temporal-coverage-incomplete".to_string(),
+            "role.path.plan-handoff.v1".to_string(),
+        ];
+        let display = DisplayIds::for_ids(ids.iter().map(String::as_str));
+
+        assert_eq!(
+            display.render("authority-history-v1"),
+            "authority-history-v1"
+        );
+        assert_eq!(
+            display.render("temporal-coverage-incomplete"),
+            "temporal-coverage-incomplete"
+        );
+        assert_eq!(
+            display.render("role.path.plan-handoff.v1"),
+            "role.path.plan-handoff.v1"
+        );
+        assert_eq!(display.render(&digest_a), "a".repeat(12));
+        assert_eq!(display.render(&digest_b), "b".repeat(12));
+    }
+
+    /// SIFT-WS1 (T021). A forced 12-hex collision must extend until unique --
+    /// a fixed 48-bit prefix is not collision-safe across thousands of units.
+    #[test]
+    fn forced_digest_prefix_collision_extends_until_unique() {
+        let shared = "c".repeat(12);
+        let left = format!("{shared}0{}", "d".repeat(51));
+        let right = format!("{shared}1{}", "e".repeat(51));
+        let display = DisplayIds::for_ids([left.as_str(), right.as_str()]);
+
+        let rendered_left = display.render(&left);
+        let rendered_right = display.render(&right);
+        assert_ne!(
+            rendered_left, rendered_right,
+            "colliding digests must not render identically"
+        );
+        assert!(
+            rendered_left.len() > 12,
+            "prefix must EXTEND past 12 on collision, got {rendered_left}"
+        );
+        assert_eq!(
+            rendered_left.len(),
+            rendered_right.len(),
+            "one length for the whole response, so a digest never renders two ways"
+        );
+        assert!(left.starts_with(&rendered_left));
+        assert!(right.starts_with(&rendered_right));
     }
 
     /// SIFT-WS0 (T007). The frozen contract ranks and limits across the
