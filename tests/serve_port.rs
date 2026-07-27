@@ -61,7 +61,10 @@ use std::net::SocketAddr;
 use symforge::server::serve::{
     DEFAULT_LISTEN, bind_listener, probe_free_listener, probe_free_port,
 };
-#[cfg(unix)]
+// Gate must match its ONLY consumer, `explicit_recently_closed_connection_rebinds`
+// (Linux-only). Gated `unix` it becomes an unused import on macOS, and this crate
+// is `warnings = "deny"` — which is exactly how it broke the darwin-serve-port job.
+#[cfg(target_os = "linux")]
 use tokio::io::AsyncReadExt;
 
 /// Occupy a loopback port with a plain `std` listener — the honest reproduction
