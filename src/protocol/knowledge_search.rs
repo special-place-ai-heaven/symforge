@@ -1012,12 +1012,10 @@ fn bridge_resolution_preview(resolution: &BridgeResolution) -> String {
 }
 
 fn code_anchor_label(anchor: &CodeAnchorId) -> String {
-    match anchor {
-        CodeAnchorId::File { path } => format!("file:{path}"),
-        CodeAnchorId::Symbol { symbol, start_line } => {
-            format!("symbol:{symbol:?}:{start_line}")
-        }
-    }
+    // SIFT-WS1 (T005): one shared rendering, defined next to the type. This
+    // previously used `{symbol:?}` and leaked Rust debug syntax into a frozen
+    // protocol surface.
+    anchor.label()
 }
 
 fn snake_debug(value: impl std::fmt::Debug) -> String {

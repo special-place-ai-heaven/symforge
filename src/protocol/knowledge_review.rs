@@ -1143,20 +1143,18 @@ fn bridge_resolution_label(resolution: &BridgeResolution) -> String {
 }
 
 fn code_anchor_label(anchor: &CodeAnchor) -> String {
-    let id = match &anchor.id {
-        crate::live_index::knowledge_bridge::CodeAnchorId::File { path } => {
-            format!("file:{path}")
-        }
-        crate::live_index::knowledge_bridge::CodeAnchorId::Symbol { symbol, start_line } => {
-            format!(
-                "symbol:{}::{}:{}@{start_line}",
-                symbol.path, symbol.name, symbol.kind
-            )
-        }
-    };
+    // SIFT-WS1 (T006): the anchor ID comes from the shared formatter so search
+    // and review cannot drift again. The review-only suffix uses explicit
+    // `key=value` tokens: the shared ID already contains `#` as its
+    // path/name separator, so the previous bare `{id}#{content_hash}` would
+    // now yield two `#` and be ambiguous to parse. `kind` moves to its own key
+    // rather than being dropped.
+    let mut label = anchor.id.label();
+    if let crate::live_index::knowledge_bridge::CodeAnchorId::Symbol { symbol, .. } = &anchor.id {
+        label.push_str(&format!(" kind={}", symbol.kind));
+    }
     format!(
-        "{}#{} lines={}..{} content_generation={}",
-        id,
+        "{label} hash={} lines={}..{} content_generation={}",
         anchor.content_hash,
         anchor.line_range.start,
         anchor.line_range.end,

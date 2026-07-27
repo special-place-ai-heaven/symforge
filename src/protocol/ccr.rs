@@ -225,8 +225,33 @@ fn mint_handle(tool_name: &str, formatted: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tool_name.hash(&mut hasher);
     formatted.hash(&mut hasher);
-    format!("{:012x}", hasher.finish() & 0xFFFF_FFFF_FFFF)
+    format!(
+        "{:0width$x}",
+        hasher.finish() & 0xFFFF_FFFF_FFFF,
+        width = CCR_HANDLE_HEX_WIDTH
+    )
 }
+
+/// Handle width minted by [`mint_handle`] over a 48-bit mask. This is what
+/// makes the CCR footer a fixed, reservable cost.
+const CCR_HANDLE_HEX_WIDTH: usize = 12;
+
+/// Byte budget a caller must reserve for the CCR footer when it pre-fits its
+/// own block-safe summary.
+///
+/// [`apply_ccr_overflow`] appends the footer AFTER the budget has been applied,
+/// so a summary packed to exactly `max_tokens * 4` overshoots its budget by the
+/// footer's width. A caller that packs whole indivisible records (rather than
+/// letting `enforce_token_budget` cut at an arbitrary line boundary) must
+/// therefore stop at `max_bytes - CCR_FOOTER_RESERVE_BYTES`.
+///
+/// Sized for the LONGER of the two rendered forms: the compact three-tool
+/// surface rewrites the footer through
+/// [`rewrite_footer_for_symforge_facade`], which substitutes a longer
+/// redemption instruction. Reserving the shorter form would let a compact
+/// result exceed its budget. `footer_reserve_covers_both_rendered_forms`
+/// pins both.
+pub const CCR_FOOTER_RESERVE_BYTES: usize = 112;
 
 /// If `summary` exceeds budget, store `full` and return summary + CCR footer.
 pub fn apply_ccr_overflow(
@@ -406,6 +431,47 @@ fn cap_file_matches(matches: &mut Vec<TextLineMatch>, query: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIFT-WS1 (T004): a caller that pre-fits a block-safe summary must know
+    /// how many bytes the footer will add AFTER budgeting. This pins
+    /// `CCR_FOOTER_RESERVE_BYTES` against the real rendered footer in BOTH
+    /// forms — the direct one and the longer compact-facade rewrite — so the
+    /// constant cannot silently drift when either string is edited.
+    #[test]
+    fn footer_reserve_covers_both_rendered_forms() {
+        let mut store = CcrStore::new();
+        let full = "x".repeat(4_000);
+        let summary = "s".repeat(10);
+        let rendered = apply_ccr_overflow(&mut store, "search_knowledge", summary.clone(), full, 1);
+
+        let direct_footer = rendered.len() - summary.len();
+        assert!(
+            direct_footer <= CCR_FOOTER_RESERVE_BYTES,
+            "direct footer is {direct_footer} bytes but reserve is {CCR_FOOTER_RESERVE_BYTES}"
+        );
+
+        let facade = rewrite_footer_for_symforge_facade(rendered.clone());
+        let facade_footer = facade.len() - summary.len();
+        assert!(
+            facade_footer <= CCR_FOOTER_RESERVE_BYTES,
+            "compact-facade footer is {facade_footer} bytes but reserve is \
+             {CCR_FOOTER_RESERVE_BYTES}; the facade rewrite is the longer form and must fit"
+        );
+        assert!(
+            facade_footer > direct_footer,
+            "facade rewrite must be the longer form; if this flips, the reserve is sized \
+             against the wrong string"
+        );
+        assert!(
+            rendered.contains("hash=\""),
+            "footer must still advertise a retrieval handle: {rendered}"
+        );
+        // The minted handle width is what makes the footer a fixed cost.
+        assert_eq!(
+            mint_handle("search_knowledge", "payload").len(),
+            CCR_HANDLE_HEX_WIDTH
+        );
+    }
 
     /// Recovered finding #8: a duplicate insert of identical content (same
     /// content-addressed handle) must not double-count `total_bytes` or the

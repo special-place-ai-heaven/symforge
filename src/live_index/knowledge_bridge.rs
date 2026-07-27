@@ -86,6 +86,31 @@ pub enum CodeAnchorId {
     Symbol { symbol: SymbolId, start_line: u32 },
 }
 
+impl CodeAnchorId {
+    /// The single agent-facing rendering of a resolved code anchor.
+    ///
+    /// SIFT-WS1 (T005). Both knowledge surfaces previously formatted this
+    /// themselves and had drifted: `search_knowledge` emitted
+    /// `format!("symbol:{symbol:?}:{line}")`, leaking Rust debug syntax
+    /// (`symbol:SymbolId { path: "…", name: "…", kind: Module }:8`) into a
+    /// frozen protocol surface, while `review_knowledge` emitted a third
+    /// shape. Rendering lives next to the type so a future variant cannot be
+    /// added without deciding how it displays.
+    ///
+    /// `#` separates path from symbol name; `:` prefixes the line. Callers
+    /// that append their own fields MUST use explicit `key=value` tokens
+    /// rather than another bare separator, or the result becomes ambiguous to
+    /// parse.
+    pub fn label(&self) -> String {
+        match self {
+            Self::File { path } => format!("file:{path}"),
+            Self::Symbol { symbol, start_line } => {
+                format!("symbol:{}#{}:{start_line}", symbol.path, symbol.name)
+            }
+        }
+    }
+}
+
 impl Ord for CodeAnchorId {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
@@ -1467,6 +1492,36 @@ mod tests {
     use super::*;
     use crate::domain::SourceId;
     use crate::live_index::{LiveIndex, SharedIndex};
+
+    /// SIFT-WS1 (T005): the shared anchor label must never emit Rust debug
+    /// syntax. `search_knowledge` used to render
+    /// `symbol:SymbolId { path: "…", name: "…", kind: Module }:8` straight into
+    /// a frozen protocol surface — observed live on this repository before the
+    /// fix.
+    #[test]
+    fn code_anchor_label_is_agent_readable_and_never_rust_debug() {
+        let file = CodeAnchorId::File {
+            path: "src/lib.rs".to_string(),
+        };
+        assert_eq!(file.label(), "file:src/lib.rs");
+
+        let symbol = CodeAnchorId::Symbol {
+            symbol: SymbolId {
+                path: "src/protocol/mod.rs".to_string(),
+                name: "explore".to_string(),
+                kind: crate::domain::SymbolKind::Module,
+            },
+            start_line: 8,
+        };
+        assert_eq!(symbol.label(), "symbol:src/protocol/mod.rs#explore:8");
+
+        for rendered in [file.label(), symbol.label()] {
+            assert!(
+                !rendered.contains('{') && !rendered.contains("SymbolId"),
+                "anchor label leaked Rust debug syntax: {rendered}"
+            );
+        }
+    }
 
     fn write(root: &Path, path: &str, content: &str) {
         let absolute = root.join(path);
