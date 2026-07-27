@@ -170,6 +170,32 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo clippy --no-default-features --features embed --target x86_64-unknown-linux-musl --lib -- -D warnings
 
+  darwin-serve-port:
+    needs: release-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml is the single source of truth for the toolchain
+      # version; rustup resolves it natively (channel + components).
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      # `bind_listener` sets SO_REUSEADDR under `#[cfg(unix)]`, and macOS
+      # arm64/x64 are published targets — but every other job is ubuntu-latest,
+      # so the Darwin half of that gate ships unverified. It matters because
+      # `bind_listener` is also the occupancy probe (`probe_free_listener`), so a
+      # permitted wildcard-vs-specific overlap would let symforge bind
+      # 127.0.0.1:8080 over a live wildcard-bound dev server (or bind, print a
+      # healthy attach URL, and accept zero connections) instead of failing
+      # loudly per FR-002/003. `tests/serve_port.rs` already encodes that
+      # contract — `explicit_wildcard_over_live_specific_still_fails_loudly` is a
+      # tautology on Linux and only has teeth here — it just had no Darwin
+      # runner. One test binary, not a macOS matrix: this is the narrowest thing
+      # that answers the question.
+      - name: Run serve port-binding tests on Darwin
+        run: cargo test --test serve_port -- --test-threads=1
+
   performance-smoke:
     needs: release-version
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
