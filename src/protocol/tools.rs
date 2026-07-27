@@ -172,7 +172,19 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
 }
 
 fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:") || text.starts_with("Error in ")
+    text.starts_with("Error:") || text.starts_with("Error in ") || is_foreign_project_refusal(text)
+}
+
+/// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
+/// carries no `Error:` prefix, so without this a refusal that came back through
+/// DISPATCH rather than an early return classified as a SUCCESSFUL answer
+/// (`found`) — notably in `classify_symforge_edit_outcome`. Deliberately narrow:
+/// BOTH anchors must match, so no unrelated body is reclassified. The sibling
+/// `local_cross_project_refusal` shape ("Cross-project queries ... require the
+/// daemon") is left alone on purpose — same class of defect, different message,
+/// out of scope here.
+fn is_foreign_project_refusal(text: &str) -> bool {
+    text.starts_with("project '") && text.contains("is not available on this connection")
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
@@ -20940,6 +20952,41 @@ mod tests {
                 "Error in find_references: project 'missing' is not open"
             ),
             OutcomeClass::InvalidRequest
+        );
+    }
+
+    /// `foreign_project_refusal`'s message has no `Error:` prefix, so a refusal
+    /// that reached a classifier through DISPATCH (rather than an early return)
+    /// was reported as a successful answer. Every `is_error_output` call site
+    /// maps to `InvalidRequest`, so recognizing the shape is correct everywhere.
+    #[test]
+    fn foreign_project_refusal_classifies_as_invalid_request() {
+        let refusal = "project 'other' is not available on this connection: this server is \
+                       bound to the single project 'test_project' (/tmp/repo). Explicit \
+                       project routing requires the daemon transport with the target \
+                       project opened via index_folder(path=...).";
+        assert_eq!(
+            SymForgeServer::classify_symforge_edit_outcome(refusal, true, refusal),
+            OutcomeClass::InvalidRequest,
+            "a refusal must never be reported as a successful edit"
+        );
+        assert_eq!(
+            super::classify_compact_tool_output("get_symbol", refusal),
+            OutcomeClass::InvalidRequest
+        );
+
+        // Narrowness: both anchors are required, so ordinary bodies that merely
+        // start with "project" or merely mention the phrase stay untouched.
+        assert_eq!(
+            super::classify_compact_tool_output("get_symbol", "project 'x' has 4 indexed files"),
+            OutcomeClass::Found
+        );
+        assert_eq!(
+            super::classify_compact_tool_output(
+                "get_symbol",
+                "1: // is not available on this connection\n2: ok"
+            ),
+            OutcomeClass::Found
         );
     }
 
