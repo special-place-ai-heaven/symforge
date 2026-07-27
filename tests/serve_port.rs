@@ -26,9 +26,23 @@
 //!   an occupied port: no silent substitution (FR-002/003).
 //! * `explicit_occupied_by_another_symforge_fails_loudly` — the realistic
 //!   version of the above: the occupier is ALSO a `bind_listener` bind (a real
-//!   second `symforge serve --listen`), not a plain std squatter. `bind_listener`
-//!   used to set `SO_REUSEADDR`, which let this pass silently — the second serve
-//!   would bind, report healthy, and accept zero connections.
+//!   second `symforge serve --listen`), not a plain std squatter. On Windows and
+//!   on macOS/BSD `bind_listener` sets no `SO_REUSEADDR` at all; on Linux it
+//!   does, and a second live listener on the same address is still refused. The
+//!   shipped bug was a reuse-enabled bind on Windows: the second serve bound,
+//!   reported healthy, and accepted zero connections.
+//! * `explicit_wildcard_over_live_specific_still_fails_loudly` — the overlap the
+//!   test above structurally cannot reach: it binds the IDENTICAL address twice,
+//!   so it can never catch a `0.0.0.0:P` that silently shadows a live
+//!   `127.0.0.1:P` (the exact shape of the shipped dual-listener bug).
+//! * `bind_listener_reuse_address_matches_the_platform_gate` — pins the platform
+//!   reuse policy (Linux only). Guards removal of the `set_reuse_address` call,
+//!   and — via the macos-latest runner — guards WIDENING the gate back to
+//!   `unix`. Does NOT guard deleting the gate outright on the running platform.
+//!   See the test's own comment.
+//! * `explicit_recently_closed_connection_rebinds` — Linux: a fixed serve port
+//!   rebinds after the previous process closed a connection first (the restart
+//!   `SO_REUSEADDR` exists for). Not run on macOS/BSD, which does not set it.
 //! * `default_listen_constant_is_loopback_8787` — pins the historical default the
 //!   no-address path prefers.
 //!
@@ -47,13 +61,20 @@ use std::net::SocketAddr;
 use symforge::server::serve::{
     DEFAULT_LISTEN, bind_listener, probe_free_listener, probe_free_port,
 };
+// Gate must match its ONLY consumer, `explicit_recently_closed_connection_rebinds`
+// (Linux-only). Gated `unix` it becomes an unused import on macOS, and this crate
+// is `warnings = "deny"` — which is exactly how it broke the darwin-serve-port job.
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncReadExt;
 
-/// Occupy a loopback port with a plain `std` listener (no `SO_REUSEADDR`) — the
-/// honest reproduction of a real squatter (`wslrelay` / another service).
-/// `bind_listener` on the same port fails against this occupier regardless of
-/// its own reuse setting, so this occupier alone cannot prove `bind_listener`
-/// rejects an occupied port HONESTLY — see `occupy_with_bind_listener` below,
-/// which is the occupier that actually exercises that claim.
+/// Occupy a loopback port with a plain `std` listener — the honest reproduction
+/// of a real squatter (`wslrelay` / another service). Note that std DOES set
+/// `SO_REUSEADDR` on Unix; what makes this occupier exclusive is that it is
+/// actively LISTENING. `bind_listener` on the same port fails against it
+/// regardless of either side's reuse setting, so this occupier alone cannot
+/// prove `bind_listener` rejects an occupied port HONESTLY — see
+/// `occupy_with_bind_listener` below, which is the occupier that actually
+/// exercises that claim.
 fn occupy_a_port() -> (std::net::TcpListener, SocketAddr) {
     let listener =
         std::net::TcpListener::bind("127.0.0.1:0").expect("exclusive occupy a loopback port");
@@ -178,6 +199,104 @@ async fn explicit_occupied_by_another_symforge_fails_loudly() {
     );
 
     drop(occupier);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_wildcard_over_live_specific_still_fails_loudly() {
+    // The overlap `explicit_occupied_by_another_symforge_fails_loudly` cannot
+    // reach: it binds the IDENTICAL address twice. Here the second bind is the
+    // WILDCARD `0.0.0.0:P` over a LIVE `127.0.0.1:P` — the exact shape of the
+    // shipped bug (second server binds, prints a healthy attach URL, accepts
+    // ZERO connections). `serve::run` permits a non-loopback `--listen`
+    // (`is_loopback_addr` only drives the API-key policy), so this is reachable,
+    // not hypothetical. If reuse ever weakens overlap detection, this fails.
+    //
+    // Deliberately gated `unix`, NOT `target_os = "linux"`, even though the
+    // reuse flag is now Linux-only. That is what makes this a PERMANENT
+    // regression guard rather than a one-off probe: it passes on both Linux and
+    // Darwin today, and it FAILS on Darwin the moment anyone widens the gate in
+    // `bind_listener` back to `unix`. It has already caught exactly that — CI
+    // job 89996269731 (`darwin-serve-port`, macos-latest) failed this assertion
+    // with the flag set on all of unix, because classic BSD `SO_REUSEADDR`
+    // permits a wildcard/specific overlap against a live listener. So the
+    // macos-latest job is load-bearing; do not drop it.
+    let specific = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener occupy");
+    let port = specific.local_addr().expect("local_addr").port();
+
+    let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+    let result = bind_listener(wildcard);
+    assert!(
+        result.is_err(),
+        "a wildcard bind over a live specific bind_listener must fail loudly, \
+         not silently shadow it: {result:?}"
+    );
+
+    drop(specific);
+}
+
+#[tokio::test]
+async fn bind_listener_reuse_address_matches_the_platform_gate() {
+    // Pins the platform reuse policy `bind_listener` implements: `SO_REUSEADDR`
+    // set on LINUX ONLY (so a restart on a FIXED port is not blocked by a
+    // connection the previous process closed first), NOT set on Windows (where
+    // two reuse-enabled listeners CAN share one address — the dual-listener
+    // black hole: second serve binds, looks healthy, accepts zero connections)
+    // and NOT on macOS/BSD (where it permits a wildcard/specific overlap against
+    // a live listener — measured, CI job 89996269731).
+    //
+    // What this assertion DOES guard: removal of the `set_reuse_address` call.
+    // On a Linux runner that flips `reuse` to false while
+    // `cfg!(target_os = "linux")` stays true, and the test fails. It also now
+    // catches WIDENING the gate back to `unix`, because on the macos-latest
+    // runner `cfg!(target_os = "linux")` is FALSE while reuse would be true.
+    //
+    // What it still does NOT guard: deleting the gate attribute entirely on the
+    // platform the test happens to be running on. The expectation MIRRORS the
+    // cfg it checks, so on Linux `reuse == true == cfg!(target_os = "linux")`
+    // either way. Windows is only ever exercised by the maintainer's local
+    // `cargo test`; verified by experiment there — deleting the attribute failed
+    // this test with `left: true, right: false`, and only on Windows.
+    //
+    // So: Linux+Darwin CI now covers the widening mistake; the Windows half
+    // still rests on the local gate. Closing that would need a Windows runner or
+    // an assertion on the source text rather than on a `cfg!`.
+    let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("bind_listener");
+    let reuse = socket2::SockRef::from(&listener)
+        .reuse_address()
+        .expect("read SO_REUSEADDR");
+    assert_eq!(
+        reuse,
+        cfg!(target_os = "linux"),
+        "SO_REUSEADDR must be set on Linux ONLY — not Windows, not macOS/BSD"
+    );
+}
+
+// Linux-only: this asserts the rebind SUCCEEDS, which is exactly the behavior
+// `SO_REUSEADDR` buys. macOS/BSD deliberately does not set the flag (it would
+// permit a wildcard/specific overlap — see `bind_listener`), so the rebind there
+// still fails until the remnant drains. That is the accepted macOS gap.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn explicit_recently_closed_connection_rebinds() {
+    let listener = bind_listener("127.0.0.1:0".parse().unwrap()).expect("initial serve bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let client = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to listener");
+        let mut byte = [0_u8; 1];
+        let _ = stream.read(&mut byte).await;
+    });
+
+    let (server_stream, _) = listener.accept().await.expect("accept client");
+    drop(server_stream); // server closes first, leaving its local port in TIME_WAIT.
+    drop(listener);
+    client.await.expect("client task");
+
+    let rebound = bind_listener(addr).expect("fixed serve port must rebind after a clean restart");
+    assert_eq!(rebound.local_addr().expect("local_addr"), addr);
 }
 
 #[test]

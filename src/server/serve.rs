@@ -153,29 +153,49 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
     ip.is_loopback()
 }
 
-/// Bind an EXCLUSIVE [`tokio::net::TcpListener`] on `addr` — no `SO_REUSEADDR`.
+/// Bind a [`tokio::net::TcpListener`] on `addr`.
 ///
 /// Mirrors the socket setup in [`crate::sidecar::server::spawn_sidecar`] except
-/// for the reuse flag: create a `socket2::Socket`, set non-blocking, bind,
-/// listen with backlog 1024, then hand the std socket to tokio.
+/// for the platform-specific address-reuse policy: create a `socket2::Socket`,
+/// set non-blocking, bind, listen with backlog 1024, then hand the std socket
+/// to tokio. `socket2` is kept over `std::net::TcpListener::bind` — which
+/// already implements exactly this platform reuse policy — for ONE reason: an
+/// explicit 1024 backlog, which std does not expose.
 ///
-/// `SO_REUSEADDR` is deliberately NOT set. It does not do what an earlier
-/// version of this function's doc comment claimed ("so a TIME_WAIT socket does
-/// not block the bind") — a *listening* socket is never in TIME_WAIT; only a
-/// closed connection enters that state, and this function is never used to
-/// rebind a just-closed connection's port. What the flag actually does is let
-/// TWO listening sockets share one address: on Windows, when both sides set it;
-/// on Linux, the flag does not permit that, but the asymmetry is exactly the
-/// trap — code that "works" on Linux with reuse on fails silently on Windows.
+/// On LINUX ONLY, `SO_REUSEADDR` is set so a restart on a FIXED serve port is
+/// not blocked by a connection the previous process closed first. Measured,
+/// that covers `FIN_WAIT_2` (a peer that never closed) as well as `TIME_WAIT`.
+/// The flag is NOT self-sufficient: the bind only succeeds when the INCUMBENT
+/// socket set it too, so the FIRST restart after upgrading from a build without
+/// this flag can still fail `EADDRINUSE`, and only self-heals from the next
+/// restart on.
 ///
-/// This was a real, shipped bug: `serve::run`'s EXPLICIT `--listen` path used a
-/// reuse-enabled bind, so a second `symforge serve --listen <occupied>` bound
+/// Linux still refuses a second LIVE listener on the same address — sharing a
+/// live port is `SO_REUSEPORT`'s job, not this flag's — so the explicit
+/// `--listen` loud-failure contract (FR-002/003) is intact there. Verified for
+/// both an identical `127.0.0.1:P` and a `0.0.0.0:P` over a live `127.0.0.1:P`.
+///
+/// The gate is `target_os = "linux"` and NOT `unix` because macOS/BSD does NOT
+/// hold that second guarantee. Measured on `macos-latest` (CI job 89996269731):
+/// with the flag set, `bind_listener("0.0.0.0:P")` SUCCEEDS over a live
+/// `127.0.0.1:P`, so `explicit_wildcard_over_live_specific_still_fails_loudly`
+/// failed there. Classic BSD `SO_REUSEADDR` permits a wildcard/specific overlap
+/// even against a `TCP_LISTEN` incumbent. That is the same silent
+/// "binds, looks healthy, accepts nothing" shape as the Windows bug below, and
+/// it reaches the DEFAULT path — `bind_listener` is also the occupancy probe for
+/// [`probe_free_listener`], whose fallback scans common loopback ports.
+///
+/// Accepted consequence: macOS/BSD keeps the fixed-port restart limitation the
+/// flag would have fixed (`EADDRINUSE` until the remnant drains). That is a
+/// known gap, not an oversight; it matches `main`'s behavior on every platform
+/// before this change.
+///
+/// On Windows, `SO_REUSEADDR` is deliberately NOT set: there it lets two
+/// listening sockets share one address when both sides opt in. That was a real,
+/// shipped bug — a second `symforge serve --listen <occupied>` bound
 /// successfully, printed a healthy attach URL, and then accepted ZERO
-/// connections — every request kept going to the first server, with no error
-/// anywhere to explain it. An occupied port must fail loudly here; that is the
-/// whole contract of an explicit `--listen` (FR-002/003). Every caller in this
-/// codebase — the free-port scan AND the explicit-address bind — wants honest
-/// occupancy detection, so there is only one function.
+/// connections, with every request still going to the first server and no error
+/// anywhere to explain it.
 pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -183,6 +203,8 @@ pub fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(target_os = "linux")]
+    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -797,13 +819,15 @@ mod tests {
         );
     }
 
-    /// Occupy a loopback port with an **exclusive** listener (plain `std` bind,
-    /// no `SO_REUSEADDR`) — the honest reproduction of a real squatter
-    /// (`wslrelay`/another service). A `bind_listener` (which sets `SO_REUSEADDR`)
-    /// on this same port then fails: on Windows two sockets only share a port if
-    /// BOTH set `SO_REUSEADDR`, and on Linux `SO_REUSEADDR` does not let a second
-    /// socket bind an actively listening port. Using a `bind_listener` occupier
-    /// here would (wrongly) let the probe *share* the port and never fall back.
+    /// Occupy a loopback port with an **exclusive** listener (plain `std` bind)
+    /// — the honest reproduction of a real squatter (`wslrelay`/another
+    /// service). What makes it exclusive is that it is actively LISTENING, not
+    /// its reuse flag: on Unix `std::net::TcpListener::bind` sets
+    /// `SO_REUSEADDR` itself, and a second bind of a live listening address is
+    /// refused there regardless (sharing a live port is `SO_REUSEPORT`'s job);
+    /// on Windows two sockets share a port only if BOTH set `SO_REUSEADDR`, and
+    /// [`bind_listener`] does not set it there. Either way the probe must fall
+    /// back rather than share.
     fn occupy_exclusive() -> (std::net::TcpListener, SocketAddr) {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("exclusive occupy a loopback port");

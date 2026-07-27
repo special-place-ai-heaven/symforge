@@ -171,8 +171,36 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
         || text.starts_with("Index degraded:")
 }
 
-fn is_error_output(text: &str) -> bool {
-    text.starts_with("Error:") || text.starts_with("Error in ")
+/// The ONE error-shape predicate for the whole protocol surface, read/write
+/// alike. `edit_tools.rs` used to keep a private copy of this function, which
+/// diverged the moment the project-refusal shapes were added here — so the seven
+/// structural edit tools reported a REFUSED edit as `success`/`found`. Shared
+/// (`pub(super)`) so a new shape can only ever be taught once.
+pub(super) fn is_error_output(text: &str) -> bool {
+    text.starts_with("Error:")
+        || text.starts_with("Error in ")
+        || is_foreign_project_refusal(text)
+        || is_local_cross_project_refusal(text)
+}
+
+/// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
+/// carries no `Error:` prefix, so without this a refusal that came back through
+/// DISPATCH rather than an early return classified as a SUCCESSFUL answer
+/// (`found`) — notably in `classify_symforge_edit_outcome` and in every
+/// `classify_edit_output` caller. Deliberately narrow: BOTH anchors must match,
+/// so no unrelated body is reclassified.
+fn is_foreign_project_refusal(text: &str) -> bool {
+    text.starts_with("project '") && text.contains("is not available on this connection")
+}
+
+/// Sibling shape emitted by [`SymForgeServer::local_cross_project_refusal`] for
+/// a genuinely cross-project (`projects`, `*`, or foreign `project`) read on a
+/// transport with no daemon working set. Same defect as above and same fix: an
+/// honest refusal must not be reported as a successful answer. Narrow by
+/// anchoring the FULL opening clause at position 0: a rendered search hit or doc
+/// line that quotes the message is prefixed (`7: // ...`) and stays `Found`.
+fn is_local_cross_project_refusal(text: &str) -> bool {
+    text.starts_with("Cross-project queries (project/projects) require the daemon")
 }
 
 fn classify_get_symbol_output(text: &str) -> OutcomeClass {
@@ -220,7 +248,8 @@ fn classify_get_file_content_output(text: &str) -> OutcomeClass {
     let body = strip_mode_annotation(text);
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Invalid get_file_content request:")
+    } else if is_error_output(text)
+        || text.starts_with("Invalid get_file_content request:")
         || text.starts_with("mode=")
         || text.contains("[error:")
         || (body.starts_with("Chunk ") && body.contains(" out of range for "))
@@ -289,7 +318,8 @@ fn classify_search_knowledge_output(text: &str) -> OutcomeClass {
 fn classify_search_files_output(text: &str) -> OutcomeClass {
     if is_index_unavailable_output(text) {
         OutcomeClass::InternalFailure
-    } else if text.starts_with("Path search requires")
+    } else if is_error_output(text)
+        || text.starts_with("Path search requires")
         || text.starts_with("Path hint must not be empty")
         || text.starts_with("search_files")
     {
@@ -10504,6 +10534,27 @@ impl SymForgeServer {
             );
         }
 
+        // Same ordering defect as `symforge_edit_stel_handler`: the per-step
+        // `project` injection below is the ONLY thing that lets the primitives
+        // refuse a foreign selector, but the preview and economics-bypass/
+        // cache-hit paths return BEFORE the serve loop — so a foreign selector
+        // came back as a bound-project-grounded SUCCESS. Refuse up front on the
+        // no-daemon path, where cross-project routing does not exist at all.
+        //
+        // Knowingly STILL OPEN, deliberately out of scope: the daemon-
+        // CONFIGURED-but-DEGRADED topology. There `daemon_client` is `Some`, so
+        // this guard does NOT fire, while `proxy_tool_call` returns `None` and
+        // execution falls back to the local index — so `preview: true` and the
+        // economics-bypass/cache-hit early returns can still answer
+        // `outcome_class: found` with a bound-project-grounded estimate for a
+        // foreign selector. Closing it means gating on the degraded flag too,
+        // not just on client presence.
+        if self.daemon_client.is_none()
+            && let Some(refusal) = self.foreign_project_refusal(facade_project.as_deref())
+        {
+            return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
+        }
+
         // Surface-honesty (012 D6 / contracts §3c): `path:` is a WITHIN-project
         // filter, not a project selector. A `path:` that resolves outside the
         // bound project would silently match nothing (or, for an absolute path,
@@ -10864,6 +10915,16 @@ impl SymForgeServer {
         if let Err(error) = crate::stel::edit_planner::validate_edit_request(request) {
             return Ok(ResultStatus::new(OutcomeClass::InvalidRequest)
                 .into_call_tool_result(error.message));
+        }
+        // Knowingly STILL OPEN, deliberately out of scope (same gap as the
+        // retrieve facade's guard): on the daemon-CONFIGURED-but-DEGRADED
+        // topology `daemon_client` is `Some`, so this does not fire, yet
+        // `proxy_tool_call` returns `None` and the edit runs against the local
+        // index. Closing it means gating on `daemon_degraded` too.
+        if self.daemon_client.is_none()
+            && let Some(refusal) = self.foreign_project_refusal(request.project.as_deref())
+        {
+            return statused_tool_result(refusal, OutcomeClass::InvalidRequest);
         }
 
         let apply = apply_requested(request);
@@ -20645,6 +20706,11 @@ mod tests {
     /// Task 4: a local/embedded server is bound to ONE project. An explicit
     /// `project` selector that doesn't match refuses deterministically; a
     /// matching selector (bound project name) proceeds normally.
+    ///
+    /// This asserted only the message TEXT, so it looked like coverage while
+    /// pinning nothing about the reported outcome — `get_file_content` was
+    /// answering `outcome_class: found` for this refusal the whole time. The
+    /// outcome class is now asserted through the statused tool wrapper.
     #[tokio::test]
     async fn test_local_server_refuses_foreign_project_selector() {
         let (key, file) = make_file("src/lib.rs", b"fn foo() {}", vec![]);
@@ -20655,7 +20721,12 @@ mod tests {
             "project": "some-other-project"
         }))
         .expect("foreign input");
-        let refused = server.get_file_content(Parameters(foreign)).await;
+        // Through the STATUSED wrapper, so the reported outcome class is pinned
+        // alongside the message.
+        let refused_result =
+            serialized_tool_result(server.get_file_content_tool(Parameters(foreign)).await);
+        assert_tool_result_status(&refused_result, OutcomeClass::InvalidRequest);
+        let refused = tool_result_text(&refused_result);
         assert!(
             refused.contains("not available on this connection"),
             "foreign selector must refuse: {refused}"
@@ -20923,6 +20994,101 @@ mod tests {
                 "Error in find_references: project 'missing' is not open"
             ),
             OutcomeClass::InvalidRequest
+        );
+    }
+
+    /// `foreign_project_refusal`'s message has no `Error:` prefix, so a refusal
+    /// that reached a classifier through DISPATCH (rather than an early return)
+    /// was reported as a successful answer. Every `is_error_output` call site
+    /// maps to `InvalidRequest`, so recognizing the shape is correct everywhere.
+    #[test]
+    fn foreign_project_refusal_classifies_as_invalid_request() {
+        let refusal = "project 'other' is not available on this connection: this server is \
+                       bound to the single project 'test_project' (/tmp/repo). Explicit \
+                       project routing requires the daemon transport with the target \
+                       project opened via index_folder(path=...).";
+        assert_eq!(
+            SymForgeServer::classify_symforge_edit_outcome(refusal, true, refusal),
+            OutcomeClass::InvalidRequest,
+            "a refusal must never be reported as a successful edit"
+        );
+        // EVERY tool that can emit this refusal must classify it, including the
+        // two whose classifiers grew their own branch lists and never consulted
+        // `is_error_output` (`get_file_content`, `search_files`). Both feed
+        // `classify_compact_tool_output`, so a miss here fed a REFUSED step to
+        // the STEL chain as a SUCCESSFUL one.
+        for tool in [
+            "get_symbol",
+            "get_symbol_context",
+            "get_file_content",
+            "get_file_context",
+            "search_symbols",
+            "search_text",
+            "search_files",
+            "find_references",
+        ] {
+            assert_eq!(
+                super::classify_compact_tool_output(tool, refusal),
+                OutcomeClass::InvalidRequest,
+                "{tool} must classify a foreign-project refusal as an invalid request"
+            );
+            assert!(
+                !super::compact_tool_output_is_success(tool, refusal),
+                "{tool} must not admit a refusal into the STEL chain as a success"
+            );
+        }
+
+        // Narrowness: both anchors are required, so ordinary bodies that merely
+        // start with "project" or merely mention the phrase stay untouched.
+        assert_eq!(
+            super::classify_compact_tool_output("get_symbol", "project 'x' has 4 indexed files"),
+            OutcomeClass::Found
+        );
+        assert_eq!(
+            super::classify_compact_tool_output(
+                "get_symbol",
+                "1: // is not available on this connection\n2: ok"
+            ),
+            OutcomeClass::Found
+        );
+    }
+
+    /// The sibling refusal `local_cross_project_refusal` emits had the identical
+    /// defect: no `Error:` prefix, so every classifier fell through to `Found`
+    /// and a loud honest refusal was reported as a successful answer. Nothing
+    /// pinned its outcome class before this test — `tests/serve_http_attach.rs`
+    /// asserts only the message TEXT, and `daemon.rs` only asserts its ABSENCE
+    /// on the honored path — so classifying it costs no existing expectation.
+    #[test]
+    fn local_cross_project_refusal_classifies_as_invalid_request() {
+        let refusal = "Cross-project queries (project/projects) require the daemon: the \
+                       working set of open projects lives on the daemon transport, not on \
+                       the /mcp HTTP transport, stdio/embed, or while the daemon is \
+                       unreachable. Start the daemon to query across projects.";
+        // The tools that actually emit it, plus the shared default arm.
+        for tool in [
+            "search_symbols",
+            "search_text",
+            "find_references",
+            "get_file_content",
+            "search_files",
+            "some_unlisted_tool",
+        ] {
+            assert_eq!(
+                super::classify_compact_tool_output(tool, refusal),
+                OutcomeClass::InvalidRequest,
+                "{tool} must classify the cross-project refusal as an invalid request"
+            );
+        }
+
+        // Narrowness: both anchors are required, so a body that merely mentions
+        // the phrase (a source line, a doc hit) is untouched.
+        assert_eq!(
+            super::classify_compact_tool_output(
+                "search_text",
+                "7: // Cross-project queries (project/projects) require the daemon\n"
+            ),
+            OutcomeClass::Found
         );
     }
 
@@ -30164,10 +30330,12 @@ mod tests {
         );
 
         // Task 4 Step 5: a single `project` is ROUTED into the planned steps,
-        // not refused at the facade. On this single-project local server a
-        // FOREIGN selector surfaces the primitives' own per-step refusal
-        // (naming the bound project) — never the facade-level refusal, and
-        // never a silently-ignored selector.
+        // not refused with the cross-project message. On this no-daemon
+        // single-project server a FOREIGN selector is refused by the
+        // `foreign_project_refusal` guard naming the bound project (the same
+        // message the primitives emit per-step when a daemon IS present) —
+        // never the facade-level cross-project refusal, and never a
+        // silently-ignored selector.
         let project_call = SymforgeCallInput {
             request: StelRequest {
                 query: "where is thing defined".to_string(),
@@ -30212,6 +30380,108 @@ mod tests {
         assert!(
             !text.contains("cross-project targeting is not routed"),
             "a blank `project` must not trip the cross-project refusal: {text}"
+        );
+
+        // The `foreign_project_refusal` guard short-circuits BEFORE the serve
+        // loop, which made the FOREIGN case above vacuous as coverage of the
+        // routing machinery: it never reaches the all-or-nothing routing check
+        // or the per-step `project` injection those lines exist for. A selector
+        // that RESOLVES TO THE BOUND project passes
+        // `selector_matches_bound_project`, so it passes the guard and does.
+        //
+        // Honest about what each half pins. Injecting the BOUND project name is
+        // semantically transparent — the primitives answer identically with or
+        // without it — so this first case pins that the serve loop is REACHED
+        // and serves, not the injected value. Deleting the injection block alone
+        // would not fail it.
+        let bound_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("test_project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(bound_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let text = tool_result_text(&serialized);
+        assert!(
+            !text.contains("not available on this connection")
+                && !text.contains("cannot be routed through this plan"),
+            "a selector resolving to the BOUND project must be served, not refused: {text}"
+        );
+        assert!(
+            text.contains("thing"),
+            "the bound-project call must reach the serve loop and answer: {text}"
+        );
+
+        // The all-or-nothing routing check IS pinned: the impact intent plans the
+        // git-scoped `detect_impact`, which has no `project` input at all, so
+        // routing a selector into that plan would MIX projects. Refuse the whole
+        // call. Deleting that block fails this assertion.
+        let unroutable_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "blast radius of the recent changes".to_string(),
+                intent: Some(crate::stel::IntentBucket::Impact),
+                project: Some("test_project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(unroutable_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("cannot be routed through this plan") && text.contains("detect_impact"),
+            "an unroutable planned step must refuse the whole call, naming the step: {text}"
+        );
+    }
+
+    /// The retrieve facade's foreign-project guard must fire BEFORE the early
+    /// returns that skip the serve loop's per-step `project` injection. Before
+    /// the fix, `preview: true` with a foreign selector returned
+    /// `outcome_class=found` plus an estimate grounded in the BOUND project —
+    /// a dishonest success in exactly the shape the guard exists to prevent.
+    #[tokio::test]
+    async fn symforge_facade_refuses_foreign_project_before_preview_estimate() {
+        use crate::stel::{StelRequest, SymforgeCallInput};
+
+        let sym = make_symbol("thing", SymbolKind::Function, 1, 1);
+        let content = medium_test_source("pub fn thing() {}");
+        let (key, file) = make_file("src/lib.rs", &content, vec![sym]);
+        let server = make_server(make_live_index_ready(vec![(key, file)]));
+        let _surface = EnvVarGuard::set("SYMFORGE_SURFACE", "compact");
+
+        let preview_call = SymforgeCallInput {
+            request: StelRequest {
+                query: "where is thing defined".to_string(),
+                project: Some("totally-other-project".to_string()),
+                preview: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = server
+            .symforge_facade_tool(Parameters(preview_call))
+            .await
+            .expect("facade dispatch");
+        let serialized = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_tool_result_status(&serialized, OutcomeClass::InvalidRequest);
+        let text = tool_result_text(&serialized);
+        assert!(
+            text.contains("not available on this connection"),
+            "a foreign selector must refuse, not preview: {text}"
+        );
+        assert!(
+            !text.contains("predicted_net_vs_manual") && !text.contains("plan_id"),
+            "a refused call must not hand back a bound-project estimate: {text}"
         );
     }
 

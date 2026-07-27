@@ -33,6 +33,15 @@ server = [
     "dep:notify",
     "dep:notify-debouncer-full",
     "dep:tracing-subscriber",
+    # Declared here, not on the always-on `tokio` entry, so the engine-only
+    # `embed` build does not gain them. Every `tokio::net` use in `src/` is
+    # `feature = "server"`-gated (daemon, sidecar/server, server/serve,
+    # protocol), and `io-util` is used only by `tests/serve_port.rs`, itself
+    # `#![cfg(feature = "server")]`. axum/hyper-util/reqwest already unify both
+    # in, but those are `server`-optional too, so the declaration must live at
+    # the same gate rather than rely on a transitive dependency's feature set.
+    "tokio/net",
+    "tokio/io-util",
 ]
 # Engine-only build for library embedders (e.g. AAP): parsing + live_index +
 # query + git, exposed via the `symforge::embed` facade. Compiles NONE of the
@@ -71,6 +80,8 @@ serde_json = "1.0"
 serde_yml = { package = "serde_yaml_ng", version = "0.10" }
 toml_edit = "0.25"
 thiserror = "2.0"
+# `net` and `io-util` are NOT here: they are server-only and are declared on the
+# `server` feature so the engine-only `embed` build does not compile them in.
 tokio = { version = "1.48", features = ["io-std", "macros", "rt-multi-thread", "time", "sync", "signal", "test-util"] }
 postcard = { version = "1.1", features = ["use-std"] }
 axum = { version = "0.8", optional = true }

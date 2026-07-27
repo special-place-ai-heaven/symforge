@@ -342,6 +342,105 @@ async fn symforge_edit_apply_already_applied_is_idempotent_without_rewrite() {
 }
 
 #[tokio::test]
+async fn symforge_edit_foreign_project_refuses_before_already_applied() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("compact");
+
+    let original = "fn foo() { same }\n";
+    let (dir, file_path) = temp_rust_repo(original);
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "edit-already-applied-local");
+
+    let result = dispatch_symforge_edit_result(
+        &server,
+        &StelEditRequest {
+            path: "src/lib.rs".to_string(),
+            project: Some("some-other-project".to_string()),
+            symbol: Some("foo".to_string()),
+            body: Some("fn foo() { same }".to_string()),
+            apply: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = tool_result_text(&result);
+
+    assert!(
+        output.contains("not available on this connection"),
+        "foreign selector must refuse before local already-applied success:\n{output}"
+    );
+    assert!(
+        !output.contains("already applied"),
+        "foreign selector must not be reported as a local no-op success:\n{output}"
+    );
+    assert_eq!(
+        outcome_class(&result),
+        "invalid_request",
+        "output:\n{output}"
+    );
+    assert_eq!(before, std::fs::read(&file_path).unwrap());
+}
+
+/// The same defect one layer down, on the DIRECT write surface. All seven
+/// structural edit tools classify through `classify_edit_output`, which read a
+/// SECOND, private copy of `is_error_output` in `edit_tools.rs` — so the refusal
+/// ("is not available", which does not contain "unavailable") missed every
+/// branch and fell through the final `else` to `Success`/`found`: an edit that
+/// never happened reported as done, with `isError: false`.
+///
+/// `replace_symbol_body` stands in for all seven: they share the one classifier,
+/// so pinning it here pins the shared predicate rather than one call site.
+#[tokio::test]
+async fn replace_symbol_body_foreign_project_refusal_is_invalid_request() {
+    let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
+    let _surface = stel_surface_env::set_symforge_surface("full");
+
+    let (dir, file_path) = temp_rust_repo("fn foo() { old }\n");
+    let before = std::fs::read(&file_path).expect("read file");
+    let server = server_for_repo(dir.path(), "replace-foreign-project");
+
+    let result = server
+        .dispatch_tool_result_for_tests(
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "name": "foo",
+                "new_body": "fn foo() { new }",
+                "project": "some-other-project",
+            }),
+        )
+        .await
+        .expect("replace_symbol_body dispatch");
+    let result = serde_json::to_value(&result).expect("serialize CallToolResult");
+    let output = tool_result_text(&result);
+
+    assert!(
+        output.contains("not available on this connection"),
+        "foreign selector must refuse the write:\n{output}"
+    );
+    assert_eq!(
+        outcome_class(&result),
+        "invalid_request",
+        "a refused edit must never classify as a successful write:\n{output}"
+    );
+    assert_eq!(
+        result["_meta"][RESULT_STATUS_META_KEY]["status"],
+        serde_json::json!("invalid_request"),
+        "output:\n{output}"
+    );
+    assert_eq!(
+        result["isError"],
+        serde_json::json!(true),
+        "a refused edit must be an MCP error result:\n{result}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(&file_path).unwrap(),
+        "a refused edit must leave the file bytes unchanged"
+    );
+}
+
+#[tokio::test]
 async fn symforge_edit_preview_then_apply_writes_once() {
     let _guard = stel_surface_env::COMPACT_ENV_LOCK.lock().await;
     let _surface = stel_surface_env::set_symforge_surface("compact");
