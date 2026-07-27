@@ -28,6 +28,35 @@ Record, for the release-please probe and the persistence-boundary probe:
 2026-07-27 reference baseline (Kimi dogfood): total=5142, unknown domain=3894, voice unknown=3767,
 broken_anchor=2979, review_due=2163, duplicate_units=35, `suppressed`=0.
 
+### Measured pre-slice baseline — captured 2026-07-27 at commit `83b6b32`
+
+Live `search_knowledge("release please squash merge", limit=10)` against this repository
+(publication=230, content=143). Raw capture: scratchpad `baseline-releaseplease.txt`.
+
+| Metric | Baseline | Target |
+|---|---|---|
+| Envelope before hit 1 | **872 bytes / 6 lines** | ≤ ~4 lines |
+| First excerpt line | 7 | ≤ ~8 **and answering** |
+| Rank of the canonical answer (`CLAUDE.md:39`) | **7 of 10** | top 3 |
+| Hit shape | 1 mega-line each, ~700–1200 bytes | 5-line block |
+| Distinct paths in 10 hits | **7** (3 files supply 6 hits) | ≥9 |
+
+Observed defects, all reproduced in this single response:
+
+- **Flooding (WS4)**: `KIMI-REVIEW-RESPONSE…md` ×2, `KIMI-REVIEW…md` ×2, `013-HANDOFF.md` ×2 — six of ten
+  hits from three files, pushing the canonical `CLAUDE.md` policy to rank 7 behind documents that
+  merely *quote* the query.
+- **Self-pollution (WS4)**: ranks 5 and 6 are `sift/quickstart.md` and `sift/spec.md` — files written
+  minutes earlier in this session, outranking the policy they describe.
+- **`SymbolId` debug leak (WS1.5)**: ranks 2 and 4 render
+  `symbol:SymbolId { path: "src/protocol/mod.rs", name: "explore", kind: Module }:8`.
+- **Table-row excerpts (WS1.6)**: ranks 3 and 4 have whole Markdown table rows as excerpts; rank 2's
+  excerpt begins mid-sentence with leading whitespace.
+- **Unbounded IDs (WS1.3)**: the `Source:` line carries two full 64-hex digests; `provenance_ids` and
+  `bridge_previews` render 64-hex IDs throughout.
+- **Unevidenced authority (WS2)**: `lifecycle=active domain=unknown … voice=unknown` on 6 of 10 hits —
+  cost with no decision value, and `active` is asserted without evidence.
+
 ## 2. Per-workstream gates
 
 Each workstream is RED → GREEN → VERIFY. A workstream is not done until its own tests pass **and**
