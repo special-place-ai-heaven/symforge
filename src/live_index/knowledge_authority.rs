@@ -1095,7 +1095,10 @@ fn derive_native_lifecycle(
             },
         );
     }
-    (KnowledgeLifecycle::Active, LifecycleEvidence::None)
+    // No declared status and no archive path: the lifecycle is genuinely unknown.
+    // Reporting `Active` here would assert a lifecycle with no evidence to cite,
+    // which the authority-hygiene contract forbids.
+    (KnowledgeLifecycle::Unknown, LifecycleEvidence::None)
 }
 
 fn derive_native_authority_domain(
@@ -2015,7 +2018,7 @@ content_hash = "hash"
         let (_root, shared) = fixture(&[
             (
                 "docs/mixed.md",
-                "# Current implementation\ncode_path = \"src/lib.rs\"\n\n# Broken current implementation\ncode_path = \"src/missing.rs\"\n\n# Intent\ncode_path = \"src/future.rs\"\n",
+                "# Current implementation\nstatus: active\ncode_path = \"src/lib.rs\"\n\n# Broken current implementation\nstatus: active\ncode_path = \"src/missing.rs\"\n\n# Intent\ncode_path = \"src/future.rs\"\n",
             ),
             ("src/lib.rs", "pub fn ready() {}\n"),
         ]);
@@ -2067,7 +2070,7 @@ content_hash = "hash"
         let (_root, shared) = fixture(&[
             (
                 "docs/current.md",
-                "# Current implementation\ncode_path = \"src/lib.rs\"\n",
+                "# Current implementation\nstatus: active\ncode_path = \"src/lib.rs\"\n",
             ),
             (
                 "docs/current-broken.md",
@@ -2087,7 +2090,7 @@ content_hash = "hash"
             ),
             (
                 "docs/ops/runbook.md",
-                "# Runbook\ncode_path = \"src/missing.rs\"\n",
+                "# Runbook\nstatus: active\ncode_path = \"src/missing.rs\"\n",
             ),
             (
                 "docs/archive/history.md",
