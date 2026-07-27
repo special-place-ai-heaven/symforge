@@ -2700,4 +2700,125 @@ content_hash = "hash"
             );
         }
     }
+
+    #[test]
+    fn no_path_convention_token_rule_claims_current_implementation() {
+        // `PathConventionDomain` cannot represent `CurrentImplementation`, so this
+        // is a type-level guarantee; the loop pins its observable consequence for
+        // every token the table recognizes. `readme.md` is excluded on purpose --
+        // it is the pre-WS2 rule this slice deliberately left untouched.
+        for path in [
+            "docs/spec/x.md",
+            "docs/specs/x.md",
+            "docs/design/x.md",
+            "docs/rfc/x.md",
+            "docs/plan.md",
+            "docs/plans/x.md",
+            "docs/roadmap.md",
+            "docs/adr/x.md",
+            "docs/solutions/x.md",
+            "ops/x.md",
+            "docs/tasks.md",
+            "docs/handoff.md",
+            "docs/handover.md",
+            "docs/governance.md",
+            ".github/codeowners",
+            "changelog.md",
+            "docs/archive/x.md",
+            "docs/archived/x.md",
+            "docs/reviews/x.md",
+            "docs/dogfood/x.md",
+            "research/x.md",
+            "agents.md",
+            "claude.md",
+            "gemini.md",
+            ".agent/x.md",
+        ] {
+            assert_ne!(
+                native_domain(path, "Notes"),
+                AuthorityDomain::CurrentImplementation,
+                "{path} must not reach the one domain that can be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_instruction_unit_under_deterministic_conflict_stays_visible_at_default_scope() {
+        let mut conflicting = facts();
+        conflicting
+            .deterministic_conflict_ids
+            .push("simulated-conflict".to_string());
+        let evidence = summarize_code_evidence(conflicting);
+        assert_eq!(evidence.display, CodeEvidenceDisplay::DeterministicConflict);
+
+        let domain = native_domain("CLAUDE.md", "Notes");
+        assert_eq!(domain, AuthorityDomain::Operations);
+        let voice = derive_voice(KnowledgeLifecycle::Unknown, domain, &evidence);
+        assert_ne!(voice, KnowledgeVoice::Suppressed);
+        // The default scope admits exactly these four voices
+        // (contracts/knowledge-authority-hygiene.md, "Retrieval voice").
+        assert!(
+            matches!(
+                voice,
+                KnowledgeVoice::Current
+                    | KnowledgeVoice::Intent
+                    | KnowledgeVoice::NeedsReview
+                    | KnowledgeVoice::Unknown
+            ),
+            "default scope must still admit {voice:?}"
+        );
+
+        // The hazard is real and domain-gated: identical evidence on a
+        // current-implementation unit does suppress.
+        assert_eq!(
+            derive_voice(
+                KnowledgeLifecycle::Unknown,
+                AuthorityDomain::CurrentImplementation,
+                &evidence
+            ),
+            KnowledgeVoice::Suppressed
+        );
+    }
+
+    #[test]
+    fn active_research_and_dogfood_measurements_stay_visible_at_default_scope() {
+        let (_root, shared) = fixture(&[
+            (
+                "research/measurement-2026-07-27.md",
+                "# Measurement\nstatus: active\nThe repository publishes 5304 authority units.\n",
+            ),
+            (
+                "docs/dogfood/2026-07-27.md",
+                "# Dogfood run\nstatus: active\nSix of ten hits came from three files.\n",
+            ),
+        ]);
+        let view = build(&shared, AuthorityLimits::default());
+        for path in [
+            "research/measurement-2026-07-27.md",
+            "docs/dogfood/2026-07-27.md",
+        ] {
+            let record = view
+                .records
+                .iter()
+                .find(|record| record.unit.path == path)
+                .unwrap_or_else(|| panic!("{path} produced no authority record"));
+            assert_eq!(
+                record.authority_domain,
+                AuthorityDomain::HistoricalRecord,
+                "{path}"
+            );
+            assert_eq!(record.lifecycle, KnowledgeLifecycle::Active, "{path}");
+            assert!(
+                matches!(
+                    record.voice,
+                    KnowledgeVoice::Current
+                        | KnowledgeVoice::Intent
+                        | KnowledgeVoice::NeedsReview
+                        | KnowledgeVoice::Unknown
+                ),
+                "{path} must stay in the default scope, got {:?}",
+                record.voice
+            );
+        }
+    }
 }
