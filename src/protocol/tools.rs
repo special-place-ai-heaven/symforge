@@ -5457,8 +5457,19 @@ impl SymForgeServer {
         }
 
         let source_set = self.index.published_source_set();
-        let output = super::knowledge_search::search_scoped(&source_set, &params.0);
-        self.apply_ccr_budget("search_knowledge", output, params.0.max_tokens)
+        // SIFT-WS1 (T029): hits are multi-line blocks now, so the generic
+        // line-boundary cut in `apply_ccr_budget` could keep `path:line` and
+        // drop the excerpt and provenance of the boundary hit -- proven by a
+        // budget sweep, and exactly what frozen contract test 7 forbids. Pass a
+        // pre-fitted block-safe summary instead. `rendered` (never the summary)
+        // is what CCR stores, so the handle resolves to the full document.
+        let output = super::knowledge_search::search_scoped_output(&source_set, &params.0);
+        self.apply_ccr_budget_with_summary(
+            "search_knowledge",
+            output.rendered,
+            output.budget_rendered,
+            params.0.max_tokens,
+        )
     }
 
     /// Audits repository-knowledge authority and hygiene from one immutable

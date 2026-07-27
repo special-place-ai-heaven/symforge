@@ -430,6 +430,96 @@ pub(crate) fn search_scoped(
     source_set: &PublishedSourceSet,
     input: &SearchKnowledgeInput,
 ) -> String {
+    search_scoped_output(source_set, input).rendered
+}
+
+/// The complete safe output plus a block-safe summary for budgeting.
+///
+/// Mirrors `ReviewKnowledgeOutput` so both knowledge tools budget the same way.
+/// `rendered` -- never `budget_rendered` -- is what CCR stores, so a retrieval
+/// handle always resolves to the full pre-truncation document.
+pub(crate) struct SearchKnowledgeOutput {
+    pub(crate) rendered: String,
+    pub(crate) budget_rendered: String,
+}
+
+pub(crate) fn search_scoped_output(
+    source_set: &PublishedSourceSet,
+    input: &SearchKnowledgeInput,
+) -> SearchKnowledgeOutput {
+    let rendered = search_scoped_rendered(source_set, input);
+    let budget_rendered = budget_summary(&rendered, input.max_tokens);
+    SearchKnowledgeOutput {
+        rendered,
+        budget_rendered,
+    }
+}
+
+/// Pack the header plus as many COMPLETE hit blocks as fit (SIFT-WS1, T028).
+///
+/// `apply_ccr_budget_with_summary` still runs `enforce_token_budget` on
+/// whatever summary it is handed, and that helper cuts at a line boundary --
+/// so a summary that is merely "block-aware" but over budget gets chopped
+/// mid-block anyway. The summary must therefore already FIT. It must also
+/// leave room for the retrieval footer, which `apply_ccr_overflow` appends
+/// AFTER budgeting: hence `CCR_FOOTER_RESERVE_BYTES`.
+fn budget_summary(rendered: &str, max_tokens: Option<u64>) -> String {
+    let Some(tokens) =
+        crate::protocol::ccr::resolve_tool_max_tokens("search_knowledge", max_tokens)
+            .filter(|tokens| *tokens > 0)
+    else {
+        return rendered.to_string();
+    };
+    let max_bytes = (tokens as usize).saturating_mul(4);
+    if rendered.len() <= max_bytes {
+        return rendered.to_string();
+    }
+    let budget = max_bytes.saturating_sub(crate::protocol::ccr::CCR_FOOTER_RESERVE_BYTES);
+
+    // Everything before the first block is the envelope: it carries the
+    // MUST-include provenance and is never split.
+    let is_block_start = |line: &str| {
+        line.split_once(". ")
+            .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok())
+    };
+    let lines: Vec<&str> = rendered.lines().collect();
+    let first_block = lines
+        .iter()
+        .position(|line| is_block_start(line))
+        .unwrap_or(lines.len());
+    let header = lines[..first_block].join("\n");
+    if header.len() >= budget {
+        // Provenance alone exceeds the budget: emit it and let the handle carry
+        // the rest. A partial envelope would be worse than a bounded one.
+        return header;
+    }
+
+    let mut out = header;
+    let mut block: Vec<&str> = Vec::new();
+    let flush = |block: &mut Vec<&str>, out: &mut String| -> bool {
+        if block.is_empty() {
+            return true;
+        }
+        let candidate = format!("\n{}", block.join("\n"));
+        block.clear();
+        if out.len() + candidate.len() <= budget {
+            out.push_str(&candidate);
+            true
+        } else {
+            false
+        }
+    };
+    for line in &lines[first_block..] {
+        if is_block_start(line) && !flush(&mut block, &mut out) {
+            return out;
+        }
+        block.push(line);
+    }
+    flush(&mut block, &mut out);
+    out
+}
+
+fn search_scoped_rendered(source_set: &PublishedSourceSet, input: &SearchKnowledgeInput) -> String {
     let query = match validate_input(input) {
         Ok(query) => query,
         Err(error) => return error,
@@ -566,7 +656,7 @@ fn extract_source(
             record.unit.byte_range.start,
             unit_text,
             &heading_path,
-            &query,
+            query,
         ) else {
             continue;
         };
@@ -995,7 +1085,12 @@ fn bridge_previews(
 /// One per-source identity line. A source whose envelope was withheld or that
 /// could not be read still gets a line — its absence must be visible, never
 /// silent — but never echoes guarded identity.
-fn render_source_line(source: &SourceHits, prefix: &str, overall_coverage: &str) -> String {
+fn render_source_line(
+    source: &SourceHits,
+    prefix: &str,
+    overall_coverage: &str,
+    ids: &DisplayIds,
+) -> String {
     let Some(envelope) = source.envelope.as_ref() else {
         let state = source.readiness.as_deref().unwrap_or("unavailable");
         return format!(
@@ -1019,16 +1114,21 @@ fn render_source_line(source: &SourceHits, prefix: &str, overall_coverage: &str)
             .unwrap_or("not_applicable"),
         snake_debug(envelope.source_version.working_tree)
     );
+    // SIFT-WS1: bounded IDs here too. This line carried two FULL 64-hex digests
+    // (~300 chars) and was the single largest item in the envelope, crowding
+    // hits out of small budgets entirely. The frozen contract's own example
+    // renders `hash=<bounded-id>`; full values stay resolvable through
+    // `review_knowledge`.
     format!(
         "{prefix}: source={} source_id={} source_version={source_version} publication={} \
          content={} freshness={} coverage={} manifest_digest={}",
         source.label,
-        envelope.source.source_id.as_str(),
+        ids.render(envelope.source.source_id.as_str()),
         envelope.publication_generation,
         envelope.content_generation,
         freshness_label(&envelope.freshness),
         coverage_label(envelope.coverage),
-        envelope.manifest_digest,
+        ids.render(&envelope.manifest_digest),
     )
 }
 
@@ -1116,7 +1216,7 @@ fn render_response(
         } else {
             "Source".to_string()
         };
-        output.push_str(&render_source_line(source, &prefix, overall_coverage));
+        output.push_str(&render_source_line(source, &prefix, overall_coverage, ids));
         output.push('\n');
     }
     output.push_str(&format!(
@@ -1660,7 +1760,7 @@ mod tests {
     fn semantic_ids_render_verbatim_and_only_digests_abbreviate() {
         let digest_a = "a".repeat(64);
         let digest_b = "b".repeat(64);
-        let ids = vec![
+        let ids = [
             digest_a.clone(),
             digest_b.clone(),
             "authority-history-v1".to_string(),

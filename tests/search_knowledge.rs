@@ -89,6 +89,61 @@ impl KnowledgeFixture {
     }
 }
 
+/// Sub-lines every complete `search_knowledge` hit block carries after
+/// SIFT-WS1. A block that shows some but not all of these was cut in half.
+const HIT_BLOCK_MARKERS: [&str; 4] = [
+    "content_hash=",
+    "authority:",
+    "finding_ids=",
+    "bridge_previews=",
+];
+
+/// Split a response into hit blocks: a block starts at `<n>. ` and runs to the
+/// next block start (or the CCR footer / end of output).
+fn hit_blocks(output: &str) -> Vec<Vec<&str>> {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in output.lines() {
+        let starts_block = line
+            .split_once(". ")
+            .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok());
+        if starts_block {
+            blocks.push(vec![line]);
+        } else if line == "---" || line.starts_with("CCR:") {
+            break;
+        } else if let Some(current) = blocks.last_mut() {
+            current.push(line);
+        }
+    }
+    blocks
+}
+
+fn complete_hit_blocks(output: &str) -> usize {
+    hit_blocks(output)
+        .iter()
+        .filter(|block| {
+            let text = block.join("\n");
+            HIT_BLOCK_MARKERS.iter().all(|marker| text.contains(marker))
+        })
+        .count()
+}
+
+/// Frozen contract test 7: truncation retains COMPLETE provenance. A hit block
+/// is atomic — budgeting may withhold it, but must never emit part of it.
+fn assert_no_partial_hit_block(output: &str) {
+    for block in hit_blocks(output) {
+        let text = block.join("\n");
+        let present = HIT_BLOCK_MARKERS
+            .iter()
+            .filter(|marker| text.contains(*marker))
+            .count();
+        assert!(
+            present == 0 || present == HIT_BLOCK_MARKERS.len(),
+            "partial hit block escaped budgeting ({present}/{} markers):\n{text}\n--- full ---\n{output}",
+            HIT_BLOCK_MARKERS.len()
+        );
+    }
+}
+
 fn assert_budgeted_knowledge_context(output: &str, require_trust: bool) {
     if require_trust {
         assert!(output.contains("Trust:"), "trust header missing: {output}");
@@ -574,12 +629,64 @@ async fn ccr_truncation_withholds_partial_hits_and_round_trips_full_safe_output(
         .nth(1)
         .and_then(|suffix| suffix.split('"').next())
         .expect("over-budget knowledge search must emit a CCR hash");
-    for line in capped.lines().filter(|line| line.contains("docs/")) {
-        assert!(line.contains("authority:"), "partial hit escaped: {line}");
-        assert!(line.contains("finding_ids="), "provenance missing: {line}");
+
+    // SIFT-WS1 (T019). The previous assertion was VACUOUS: it filtered lines
+    // containing "docs/" and required each to also contain "authority:", which
+    // only held because every hit was one line. At max_tokens=120 the response
+    // truncates to header-only, so the filter matched nothing and the loop
+    // asserted nothing at all. Now that a hit spans several lines, a naive
+    // line-boundary cut could keep `path:line` and drop the excerpt and
+    // provenance -- exactly what frozen contract test 7 forbids. Assert on
+    // whole BLOCKS instead.
+    assert_no_partial_hit_block(&capped);
+    assert_eq!(
+        complete_hit_blocks(&capped),
+        0,
+        "max_tokens=120 must return provenance and a handle, with no hit block at all: {capped}"
+    );
+
+    // A budget that CAN fit a hit must return whole ones, never a fragment.
+    let mid = fixture
+        .server
+        .dispatch_tool_for_tests(
+            "search_knowledge",
+            json!({
+                "query": "deterministic ranking",
+                "limit": 10,
+                "max_tokens": 300
+            }),
+        )
+        .await;
+    assert!(mid.contains("Trust:"), "header must survive: {mid}");
+    assert!(
+        mid.contains("hash=\""),
+        "a truncated response must carry a retrieval handle: {mid}"
+    );
+    assert_no_partial_hit_block(&mid);
+    assert!(
+        complete_hit_blocks(&mid) >= 1,
+        "max_tokens=300 must fit at least one COMPLETE hit block: {mid}"
+    );
+
+    // Sweep the budget across the whole range where a cut can land inside a
+    // block. A single spot-check would pass by luck; the guarantee is that NO
+    // budget can split a hit.
+    for budget in (120..=900).step_by(15) {
+        let swept = fixture
+            .server
+            .dispatch_tool_for_tests(
+                "search_knowledge",
+                json!({
+                    "query": "deterministic ranking",
+                    "limit": 10,
+                    "max_tokens": budget
+                }),
+            )
+            .await;
+        assert_no_partial_hit_block(&swept);
         assert!(
-            line.contains("bridge_previews="),
-            "bridge preview missing: {line}"
+            swept.contains("Trust:") || swept.contains("hash=\""),
+            "budget {budget} must still return provenance or a handle: {swept}"
         );
     }
 
