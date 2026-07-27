@@ -19,8 +19,18 @@
 
 use anyhow::{Context, bail};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use crate::domain::ControlStateDir;
+
+/// Hard ceiling on the npm swap so a locked-file retry can NEVER hang the
+/// terminal (the original Windows failure). Layer 2 (staging the running binary
+/// aside) normally frees npm's target path so the install finishes in seconds;
+/// this is the safety floor for when it does not. A plain const, not config: it
+/// only needs to be "longer than a healthy install, shorter than human patience".
+const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Poll cadence while waiting on the npm child.
+const NPM_INSTALL_POLL: Duration = Duration::from_millis(200);
 
 /// Map `(os, arch)` to the npm platform package that ships the native binary.
 /// Mirrors `SUPPORTED_TARGETS` in `npm/lib/resolve-binary.js`. `os` is
@@ -168,6 +178,11 @@ fn remove_orphan_durable_bin_at(control_state_dir: &crate::domain::ControlStateD
 /// Side effects of an update, injected so the orchestration is unit-testable
 /// without touching npm, the network, the daemon, or the filesystem.
 pub(crate) trait UpdateOps {
+    /// Sweep leftover `.old-*` staged binaries from a PRIOR Windows update (which
+    /// moves the running binary aside before the swap). A still-locked leftover
+    /// from a live old process is skipped and cleaned on a later run. Runs at the
+    /// START of update, best-effort. No-op on Unix. Returns summary lines.
+    fn sweep_stale_staging(&mut self) -> Vec<String>;
     /// Stop the running daemon before the binary swap + clear a dead sidecar
     /// record. Returns a human-readable summary of what was stopped.
     fn stop_processes(&mut self) -> String;
@@ -202,6 +217,10 @@ pub(crate) trait UpdateOps {
 struct RealUpdateOps;
 
 impl UpdateOps for RealUpdateOps {
+    fn sweep_stale_staging(&mut self) -> Vec<String> {
+        run_stale_sweep()
+    }
+
     fn stop_processes(&mut self) -> String {
         let mut stopped = Vec::new();
 
@@ -254,14 +273,39 @@ impl UpdateOps for RealUpdateOps {
     }
 
     fn npm_install(&mut self, program: &str, args: &[&str]) -> anyhow::Result<bool> {
-        let status = crate::process_util::hidden_command(program)
+        // Layer 2 (Windows): a running `.exe` cannot be OVERWRITTEN but CAN be
+        // moved aside — a rename needs only DELETE access (the rustup
+        // `self_replace` technique). Move THIS process's own binary out of npm's
+        // target path so npm installs a fresh binary into a now-FREE path; the
+        // running process keeps executing from the moved file (its image handle
+        // follows the file object). No-op on Unix, which overwrites in place.
+        let staged = stage_running_binary_aside();
+
+        // Layer 1: bounded wait. The blocking `.status()` this replaces spun
+        // forever when npm retried the locked file; spawn + poll `try_wait`
+        // against a deadline and kill the child on timeout, returning Ok(false)
+        // so the EXISTING graceful bail fires instead of hanging.
+        let mut child = crate::process_util::hidden_command(program)
             .args(args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .status()
+            .spawn()
             .with_context(|| format!("failed to start `{}`", invocation_text(program, args)))?;
-        Ok(status.success())
+        let success = wait_or_kill(
+            &mut child,
+            Instant::now() + NPM_INSTALL_TIMEOUT,
+            NPM_INSTALL_POLL,
+        )?;
+
+        // A failed or timed-out swap landed no new binary. Put our staged binary
+        // back at the install path so a failed update is a no-op there rather than
+        // an empty path (Unix staged nothing, so this is a no-op). On success the
+        // staged `.old` is left for the next run's sweep.
+        if !success {
+            restore_staged(staged);
+        }
+        Ok(success)
     }
 
     fn installed_version(&mut self) -> InstalledProbe {
@@ -337,6 +381,173 @@ impl UpdateOps for RealUpdateOps {
     }
 }
 
+/// A child process we can poll for completion and force-kill. The seam exists so
+/// [`wait_or_kill`]'s timeout logic is unit-testable with a fake that never
+/// exits, without spawning a real slow process.
+trait Waitable {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+}
+
+impl Waitable for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+}
+
+/// Poll `child` until it exits or `deadline` passes. On exit, return whether it
+/// succeeded; on timeout, kill it and return `Ok(false)` so the caller takes the
+/// existing graceful-bail path. The npm swap must NEVER block indefinitely — a
+/// locked-file retry loop was the original Windows hang.
+fn wait_or_kill<C: Waitable>(
+    child: &mut C,
+    deadline: Instant,
+    poll: Duration,
+) -> anyhow::Result<bool> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.try_wait(); // best-effort reap
+            return Ok(false);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// The dedicated stale-staging directory for moved-aside binaries: a sibling of
+/// the enclosing `node_modules` (i.e. `<npm-prefix>/.symforge-update-stale`).
+/// It is on the SAME volume as the binary (so a rename, never a cross-volume
+/// copy) and OUTSIDE the `symforge-windows-x64` package dir — npm may rimraf that
+/// whole dir on reinstall, and a still-locked `.old` inside it would EBUSY the
+/// rimraf. Returns `None` when the binary is not under a `node_modules` tree (a
+/// dev or PATH build), in which case staging is skipped and the timeout floor
+/// still guards against a hang.
+#[cfg(any(windows, test))]
+fn stale_staging_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    exe.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("node_modules"))
+        })
+        .and_then(std::path::Path::parent)
+        .map(|prefix| prefix.join(".symforge-update-stale"))
+}
+
+/// Best-effort delete of every staged leftover in `dir` (a prior update's
+/// moved-aside binaries). Uses `remove_file` only: a file still locked by a live
+/// old process errors and is silently skipped (cleaned on a later run once that
+/// process exits), and a stray subdirectory is left alone. A nonexistent `dir`
+/// is a no-op. Returns a summary line when anything was removed.
+#[cfg(any(windows, test))]
+fn sweep_stale_dir(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        vec![format!(
+            "swept {removed} stale staged binar{} from {}",
+            if removed == 1 { "y" } else { "ies" },
+            dir.display()
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Windows: move THIS process's running binary out of npm's target path to the
+/// stale-staging dir, so npm installs a fresh binary into a now-free path. The
+/// running process keeps executing from the moved file. Returns
+/// `(staged, original)` so a failed swap can be rolled back; `None` when there is
+/// nothing to stage or the move fails (npm then hits the still-occupied path and
+/// the timeout plus graceful bail handle it).
+#[cfg(windows)]
+fn stage_running_binary_aside() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let exe = std::env::current_exe().ok()?;
+    let stale_dir = stale_staging_dir(&exe)?;
+    std::fs::create_dir_all(&stale_dir).ok()?;
+    let staged = stale_dir.join(format!("symforge.exe.old-{}", stage_suffix()));
+    move_path_aside(&exe, &staged).ok()?;
+    Some((staged, exe))
+}
+
+/// Unix replaces a running binary in place (the open image keeps the old inode
+/// while the path takes the new file — same reason `stop_other_inscope_holders`
+/// is a no-op), so there is no locked path to free. Always `None`.
+#[cfg(not(windows))]
+fn stage_running_binary_aside() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    None
+}
+
+/// Roll a staged move back to its original install path after a failed or
+/// timed-out swap, so the update is a no-op there rather than an empty path.
+/// Best-effort.
+#[cfg(windows)]
+fn restore_staged(staged: Option<(std::path::PathBuf, std::path::PathBuf)>) {
+    if let Some((from, to)) = staged {
+        let _ = move_path_aside(&from, &to);
+    }
+}
+
+/// Unix never stages, so there is nothing to restore.
+#[cfg(not(windows))]
+fn restore_staged(_staged: Option<(std::path::PathBuf, std::path::PathBuf)>) {}
+
+/// Sweep leftover staged binaries from a PRIOR update, resolved from this
+/// process's own install location. Runs at the start of update, best-effort.
+#[cfg(windows)]
+fn run_stale_sweep() -> Vec<String> {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|exe| stale_staging_dir(&exe))
+    {
+        Some(dir) => sweep_stale_dir(&dir),
+        None => Vec::new(),
+    }
+}
+
+/// Unix never stages, so there is nothing to sweep.
+#[cfg(not(windows))]
+fn run_stale_sweep() -> Vec<String> {
+    Vec::new()
+}
+
+/// A random-enough suffix for a staged `.old-*` filename: pid + wall-clock nanos
+/// (no `rand` dependency needed — collisions only need avoiding across a rare
+/// concurrent or repeated update, and the sweep tolerates leftovers anyway).
+#[cfg(windows)]
+fn stage_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Move `src` to `dst`, freeing `src` for npm. `std::fs::rename` (which maps to
+/// `MoveFileExW`) handles the common case; on error fall back to an explicit
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`. A running `.exe` can be renamed
+/// aside (DELETE access) even though it cannot be overwritten.
+#[cfg(windows)]
+fn move_path_aside(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => windows_native::move_file_replace_existing(src, dst),
+    }
+}
+
 /// Resolve the global npm prefix via `npm prefix -g`, then derive the path of
 /// the `symforge` launcher npm installs there. On Windows the shim lives at the
 /// prefix root (`<prefix>/symforge.cmd`); on Unix it lives in `<prefix>/bin/symforge`.
@@ -386,6 +597,13 @@ pub(crate) fn orchestrate_update(
     arch: &str,
     ops: &mut impl UpdateOps,
 ) -> anyhow::Result<()> {
+    // Sweep leftover staged binaries from a prior Windows update before anything
+    // else (best-effort; a still-locked `.old` from a live old process is skipped
+    // and cleaned once that process exits). No-op on Unix.
+    for line in ops.sweep_stale_staging() {
+        eprintln!("symforge update: {line}");
+    }
+
     // Stop first: a live daemon holds the old binary (Windows file-lock) and
     // would keep serving stale behavior. It respawns lazily on next use.
     let stop_summary = ops.stop_processes();
@@ -800,6 +1018,42 @@ mod windows_native {
             .unwrap_or(entry.szExeFile.len());
         String::from_utf16_lossy(&entry.szExeFile[..end])
     }
+
+    /// Build a NUL-terminated UTF-16 buffer for a Win32 wide-string path arg.
+    fn to_wide(path: &std::path::Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// Move `src` to `dst` via `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` — the
+    /// fallback when `std::fs::rename` fails. Renaming a running `.exe` aside
+    /// needs only DELETE access, so it succeeds where an overwrite-in-place is
+    /// refused. Same-volume only (no `COPY_ALLOWED`): a locked image can be
+    /// renamed within its volume but never block-copied across one.
+    #[allow(unsafe_code)]
+    pub(super) fn move_file_replace_existing(
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+        let src_w = to_wide(src);
+        let dst_w = to_wide(dst);
+        // SAFETY: `src_w`/`dst_w` are NUL-terminated UTF-16 buffers that outlive
+        // this call; the PCWSTR wrappers only borrow their pointers for the
+        // duration of MoveFileExW. MOVEFILE_REPLACE_EXISTING is a valid flag; the
+        // call returns a Result we map into an io::Error.
+        unsafe {
+            MoveFileExW(
+                windows::core::PCWSTR(src_w.as_ptr()),
+                windows::core::PCWSTR(dst_w.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING,
+            )
+        }
+        .map_err(|e| std::io::Error::other(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -843,6 +1097,9 @@ mod tests {
     }
 
     impl UpdateOps for FakeOps {
+        fn sweep_stale_staging(&mut self) -> Vec<String> {
+            Vec::new()
+        }
         fn stop_processes(&mut self) -> String {
             self.stopped_before_install = self.install_calls.is_empty();
             "no running daemon found".to_string()
@@ -1378,6 +1635,136 @@ mod tests {
         assert!(!text.contains("powershell"));
         assert!(!text.contains("cmd /c"));
         assert!(!text.contains("executionpolicy"));
+    }
+
+    // ── Windows self-update robustness: timeout floor, move-aside staging, sweep ──
+
+    struct NeverExits {
+        kills: usize,
+    }
+    impl Waitable for NeverExits {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wait_or_kill_times_out_kills_the_child_and_returns_false() {
+        // The safety floor: a child that never exits must be killed at the
+        // deadline and reported as Ok(false) so the graceful bail fires — never a
+        // hang. A deadline already in the past trips on the first poll (no sleep).
+        let mut child = NeverExits { kills: 0 };
+        let result = wait_or_kill(
+            &mut child,
+            std::time::Instant::now(),
+            std::time::Duration::from_millis(1),
+        )
+        .expect("a timeout is Ok(false), not an error");
+        assert!(!result, "a timed-out swap must return Ok(false)");
+        assert_eq!(child.kills, 1, "the hung child must be killed exactly once");
+    }
+
+    #[test]
+    fn stale_staging_dir_is_prefix_sibling_outside_the_platform_package() {
+        // Forward slashes so the components parse identically on Windows and Unix.
+        let exe = std::path::Path::new(
+            "C:/Users/me/AppData/Roaming/npm/node_modules/symforge-windows-x64/bin/symforge.exe",
+        );
+        let dir = stale_staging_dir(exe).expect("an npm-installed exe yields a staging dir");
+        assert_eq!(
+            dir,
+            std::path::Path::new("C:/Users/me/AppData/Roaming/npm/.symforge-update-stale"),
+            "staging dir is the npm prefix's .symforge-update-stale"
+        );
+        // CRUCIAL: it lives OUTSIDE node_modules (a prefix-level sibling), so a
+        // reinstall's rimraf of symforge-windows-x64 never trips over a locked .old.
+        assert!(
+            !dir.starts_with("C:/Users/me/AppData/Roaming/npm/node_modules"),
+            "staging dir must NOT live inside node_modules: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn stale_staging_dir_is_none_for_a_non_node_modules_install() {
+        assert!(
+            stale_staging_dir(std::path::Path::new("/usr/local/bin/symforge")).is_none(),
+            "a non-npm install has no node_modules prefix to stage beside"
+        );
+        assert!(
+            stale_staging_dir(std::path::Path::new(
+                "E:/project/symforge/target/release/symforge.exe"
+            ))
+            .is_none(),
+            "a dev build is not under node_modules"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_dir_removes_leftovers_skips_unremovable_and_tolerates_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("symforge.exe.old-1"), b"a").unwrap();
+        std::fs::write(dir.join("symforge.exe.old-2"), b"b").unwrap();
+        // A subdirectory stands in for a still-locked entry: remove_file refuses a
+        // directory on every platform, so the sweep must SKIP it, not fail.
+        std::fs::create_dir(dir.join("locked-like-subdir")).unwrap();
+
+        let lines = sweep_stale_dir(dir);
+        assert!(!dir.join("symforge.exe.old-1").exists());
+        assert!(!dir.join("symforge.exe.old-2").exists());
+        assert!(
+            dir.join("locked-like-subdir").exists(),
+            "an unremovable entry must be skipped, not fail the sweep"
+        );
+        assert_eq!(lines.len(), 1, "one summary line: {lines:?}");
+        assert!(lines[0].contains("swept 2"), "{lines:?}");
+
+        // A nonexistent directory (no prior staging) is a silent no-op.
+        assert!(sweep_stale_dir(&dir.join("nope")).is_empty());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn staging_and_sweep_are_noops_on_unix() {
+        // Unix overwrites a running binary in place, so there is nothing to stage,
+        // restore, or sweep — every entry point is a no-op.
+        assert!(stage_running_binary_aside().is_none());
+        restore_staged(None);
+        assert!(run_stale_sweep().is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn move_file_replace_existing_ffi_moves_a_plain_file() {
+        // Exercises the load-bearing unsafe on a NON-running file (a live-binary
+        // swap can't be unit-tested; see the module SAFETY notes).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("staged.old-42");
+        std::fs::write(&src, b"payload").unwrap();
+        windows_native::move_file_replace_existing(&src, &dst).expect("FFI move succeeds");
+        assert!(!src.exists(), "the source path is freed after the move");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn move_path_aside_frees_the_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("symforge.exe");
+        let staged = tmp
+            .path()
+            .join(".symforge-update-stale")
+            .join("symforge.exe.old-1");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"binary").unwrap();
+        move_path_aside(&src, &staged).expect("move aside succeeds");
+        assert!(!src.exists(), "the install path is freed for npm");
+        assert!(staged.exists());
     }
 
     // Tests that mutate `SYMFORGE_HOME` serialize on this lock and rely on
