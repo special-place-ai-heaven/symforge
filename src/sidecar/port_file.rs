@@ -15,7 +15,7 @@
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::domain::ControlStateDir;
 
@@ -137,6 +137,8 @@ fn read_pid_at(dir: &Path) -> io::Result<u32> {
 // written.
 
 const SESSIONS_DIR: &str = "sessions";
+const DESCRIPTOR_SCAN_TIMEOUT: Duration = Duration::from_millis(100);
+const SIDECAR_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// OS-tagged descriptor filename for one adapter process, e.g.
 /// `sidecar.12345.windows.json`.
@@ -229,13 +231,36 @@ pub fn cleanup_own_descriptor_at(dir: &Path) {
     cleanup_descriptor_for_pid_at(dir, std::process::id());
 }
 
-/// Remove descriptors whose port no longer answers — the update/repair path's
-/// stale-record hygiene. Live descriptors are untouched.
+/// Remove descriptors whose process is gone or whose port no longer answers —
+/// the update/repair path's stale-record hygiene. Live descriptors are untouched.
 pub fn cleanup_stale_descriptors_at(dir: &Path, bind_host: &str) {
+    prune_dead_descriptor_files_at(dir);
     for descriptor in read_descriptors_at(dir) {
-        let alive = sidecar_port_is_alive(bind_host, descriptor.port).unwrap_or(false);
+        let alive = process_may_be_alive(descriptor.pid)
+            && sidecar_port_is_alive(bind_host, descriptor.port).unwrap_or(false);
         if !alive {
             cleanup_descriptor_for_pid_at(dir, descriptor.pid);
+        }
+    }
+}
+
+fn prune_dead_descriptor_files_at(dir: &Path) {
+    let os_suffix = format!(".{}.json", std::env::consts::OS);
+    let Ok(entries) = std::fs::read_dir(dir.join(SESSIONS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("sidecar."))
+            .and_then(|name| name.strip_suffix(&os_suffix))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !process_may_be_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -264,8 +289,8 @@ fn read_descriptors_at(dir: &Path) -> Vec<SessionDescriptor> {
 
 /// Select the best descriptor for `dir`: identity-validated (a descriptor
 /// naming a DIFFERENT project root than this dir's project is rejected, never
-/// "last writer wins"), live port first, then freshest `updated_at`, with a
-/// stable smallest-pid tie break.
+/// "last writer wins"), freshest first with a stable smallest-pid tie break,
+/// returning the first live port found inside the fixed hook-time budget.
 struct SelectedSidecar {
     status: SidecarStatus,
     session_id: Option<String>,
@@ -276,8 +301,10 @@ fn select_descriptor_status(
     bind_host: &str,
     expected_project_root: Option<&Path>,
 ) -> Option<SelectedSidecar> {
+    let scan_started = Instant::now();
+    prune_dead_descriptor_files_at(dir);
     let expected_root = expected_project_root.map(|root| root.display().to_string());
-    let mut candidates: Vec<(SessionDescriptor, bool)> = Vec::new();
+    let mut candidates = Vec::new();
     let mut rejected = 0usize;
     for descriptor in read_descriptors_at(dir) {
         if let (Some(declared), Some(expected)) =
@@ -287,8 +314,10 @@ fn select_descriptor_status(
             rejected += 1;
             continue;
         }
-        let alive = sidecar_port_is_alive(bind_host, descriptor.port).unwrap_or(false);
-        candidates.push((descriptor, alive));
+        if !process_may_be_alive(descriptor.pid) {
+            continue;
+        }
+        candidates.push(descriptor);
     }
     if candidates.is_empty() {
         return (rejected > 0).then(|| SelectedSidecar {
@@ -303,21 +332,18 @@ fn select_descriptor_status(
             session_id: None,
         });
     }
+
     candidates.sort_by(|a, b| {
-        b.1.cmp(&a.1) // alive first
-            .then(b.0.updated_at_unix_secs.cmp(&a.0.updated_at_unix_secs))
-            .then(a.0.pid.cmp(&b.0.pid))
+        b.updated_at_unix_secs
+            .cmp(&a.updated_at_unix_secs)
+            .then(a.pid.cmp(&b.pid))
     });
-    let (best, alive) = &candidates[0];
-    Some(SelectedSidecar {
+
+    let selected = |best: &SessionDescriptor, liveness| SelectedSidecar {
         status: SidecarStatus {
             pid: Some(best.pid),
             port: Some(best.port),
-            liveness: if *alive {
-                SidecarLiveness::Alive
-            } else {
-                SidecarLiveness::Dead
-            },
+            liveness,
             detail: Some(format!(
                 "descriptor sidecar.{} ({} candidate(s){})",
                 best.pid,
@@ -330,7 +356,76 @@ fn select_descriptor_status(
             )),
         },
         session_id: best.session_id.clone(),
-    })
+    };
+
+    let mut probed = 0usize;
+    for candidate in &candidates {
+        let remaining = DESCRIPTOR_SCAN_TIMEOUT.saturating_sub(scan_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let alive = sidecar_port_is_alive_with_timeout(bind_host, candidate.port, remaining)
+            .unwrap_or(false);
+        probed += 1;
+        if alive {
+            return Some(selected(candidate, SidecarLiveness::Alive));
+        }
+    }
+
+    if let Some(unprobed) = candidates.get(probed) {
+        Some(selected(unprobed, SidecarLiveness::Unknown))
+    } else {
+        Some(selected(&candidates[0], SidecarLiveness::Dead))
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn process_may_be_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+
+    // SAFETY: OpenProcess receives a PID from a parsed descriptor and requests
+    // synchronization-only access. Access-denied remains conservatively alive.
+    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            return error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0);
+        }
+    };
+    // SAFETY: `handle` is valid and was opened with synchronization access.
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: this is the single paired close for the handle opened above.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    wait != WAIT_OBJECT_0
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_may_be_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs existence/permission checking only and does not
+    // deliver a signal. ESRCH is the sole definitive "process is gone" result.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_may_be_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Case-tolerant, separator-tolerant root comparison (Windows paths).
@@ -405,8 +500,16 @@ fn sidecar_socket_addr(bind_host: &str, port: u16) -> io::Result<std::net::Socke
 }
 
 fn sidecar_port_is_alive(bind_host: &str, port: u16) -> io::Result<bool> {
+    sidecar_port_is_alive_with_timeout(bind_host, port, SIDECAR_PROBE_TIMEOUT)
+}
+
+fn sidecar_port_is_alive_with_timeout(
+    bind_host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<bool> {
     let sock_addr = sidecar_socket_addr(bind_host, port)?;
-    Ok(TcpStream::connect_timeout(&sock_addr, Duration::from_millis(200)).is_ok())
+    Ok(TcpStream::connect_timeout(&sock_addr, timeout).is_ok())
 }
 
 fn read_sidecar_status_for_root_at(
@@ -589,6 +692,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_reader_removes_dead_pid_descriptors_before_socket_probe() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind recycled probe port");
+        listener
+            .set_nonblocking(true)
+            .expect("make recycled probe listener nonblocking");
+        let recycled_port = listener.local_addr().expect("recycled probe addr").port();
+
+        for offset in 0..200 {
+            write_descriptor_for_pid_at(
+                dir,
+                u32::MAX - offset,
+                recycled_port,
+                Some("stale-session"),
+                None,
+            )
+            .expect("write dead-pid descriptor");
+        }
+
+        let scan_started = Instant::now();
+        let selected = select_descriptor_status(dir, "127.0.0.1", None);
+        let scan_elapsed = scan_started.elapsed();
+        assert!(
+            selected.is_none(),
+            "a reachable recycled port must not revive dead-pid descriptors"
+        );
+        assert!(
+            scan_elapsed < Duration::from_millis(300),
+            "200 dead-pid descriptors must remain inside the hook budget: {scan_elapsed:?}"
+        );
+        assert!(
+            read_descriptors_at(dir).is_empty(),
+            "dead-pid descriptors must be removed opportunistically"
+        );
+        let accept_error = listener
+            .accept()
+            .expect_err("dead-pid descriptors must be rejected before any socket probe");
+        assert_eq!(accept_error.kind(), io::ErrorKind::WouldBlock);
+    }
+
     /// Task 8: the reader selects a LIVE descriptor over a fresher dead one,
     /// and rejects a descriptor whose project-root identity does not match
     /// this directory's project instead of choosing last-writer.
@@ -606,33 +752,35 @@ mod tests {
                 let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead port");
                 l.local_addr().expect("dead addr").port()
             };
+            let live_pid = std::process::id();
+            let dead_pid = u32::MAX;
 
-            write_descriptor_for_pid_at(dir, 111, live_port, Some("session-live"), None)
+            write_descriptor_for_pid_at(dir, live_pid, live_port, Some("session-live"), None)
                 .expect("write live descriptor");
-            write_descriptor_for_pid_at(dir, 222, dead_port, Some("session-dead"), None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, Some("session-dead"), None)
                 .expect("write dead descriptor");
             // The dead one is FRESHER (rewrite bumps updated_at); force order by
             // rewriting it after the live one.
             std::thread::sleep(std::time::Duration::from_millis(1100));
-            write_descriptor_for_pid_at(dir, 222, dead_port, Some("session-dead"), None)
+            write_descriptor_for_pid_at(dir, dead_pid, dead_port, Some("session-dead"), None)
                 .expect("refresh dead descriptor");
 
             let status = read_sidecar_status_at(dir, "127.0.0.1");
             assert_eq!(status.liveness, SidecarLiveness::Alive);
             assert_eq!(
                 status.pid,
-                Some(111),
+                Some(live_pid),
                 "live beats fresher-but-dead: {status:?}"
             );
             assert_eq!(status.port, Some(live_port));
 
             // Identity validation: a descriptor claiming a DIFFERENT project
             // root is rejected, not last-writer-selected.
-            cleanup_descriptor_for_pid_at(dir, 111);
-            cleanup_descriptor_for_pid_at(dir, 222);
+            cleanup_descriptor_for_pid_at(dir, live_pid);
+            cleanup_descriptor_for_pid_at(dir, dead_pid);
             write_descriptor_for_pid_at(
                 dir,
-                333,
+                live_pid,
                 live_port,
                 Some("session-foreign"),
                 Some(std::path::Path::new("/somewhere/else/entirely")),
@@ -641,7 +789,7 @@ mod tests {
             let status = read_sidecar_status_at(dir, "127.0.0.1");
             assert_ne!(
                 status.pid,
-                Some(333),
+                Some(live_pid),
                 "foreign-root descriptor must be identity-rejected: {status:?}"
             );
             drop(listener);

@@ -2138,3 +2138,41 @@ tracked, not done.
 ### Review
 
 Pending root-cause proof, RED/GREEN evidence, and process-tree verification.
+
+---
+
+## Hook Stale-Descriptor Scan Fix (2026-07-28)
+
+### Plan
+
+- [x] Verify the report against the shared descriptor selector and all callers.
+- [x] Isolate the fix on `fix/hook-stale-descriptor-scan` from `origin/main`.
+- [x] Add a regression proving dead-PID descriptors are removed before any socket probe.
+- [x] Bound viable-descriptor probing while preserving deterministic live/newest selection.
+- [x] Run focused tests, formatting, compile checks, and the relevant hook/sidecar suites.
+
+### Evidence Log
+
+- Source-verified root cause: both hook endpoint resolution and verbose status route through
+  `select_descriptor_status`; it probes every project-compatible descriptor serially.
+- Scope decision: one-file fix in `src/sidecar/port_file.rs`; no new dependency or protocol.
+- RED: `test_reader_removes_dead_pid_descriptors_before_socket_probe` failed because a reachable
+  recycled port revived 32 impossible PIDs.
+- GREEN: the regression now exercises 200 dead-PID descriptors, requires zero socket probes,
+  requires opportunistic cleanup, and enforces a sub-300 ms selector bound.
+- Final focused gates: descriptor 15/15, hook 66/66, sidecar 113/113, `cargo fmt --check`,
+  `cargo check --all-targets`, and clippy with warnings denied all passed.
+- A debug-binary hook run against a temporary copy of the live descriptor set completed in
+  370/44/45 ms (three exits 0); the scratch copy was removed and live state was untouched.
+- Full serial library gate: 3043 passed, 1 failed, 4 ignored. The sole failure,
+  `test_index_folder_rebinds_repo_root_for_local_impact_analysis`, is order-dependent and outside
+  this seam: it passed alone (1/1), with all `test_index_folder_*` tests (7/7), and with the whole
+  `protocol::tools` module (442/442).
+
+### Review
+
+The hook timeout defect is closed at the shared selector: dead PIDs are rejected from filenames
+before JSON or TCP work, stale records are removed, viable candidates are probed newest-first with
+a fixed total budget, and the first live candidate returns immediately. A full endpoint-identity
+handshake remains separate protocol work; this fix closes dead-PID/port-reuse selection but does
+not claim to eliminate the narrower live-PID-reuse race.
