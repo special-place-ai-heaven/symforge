@@ -350,13 +350,15 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
 /// ending in `;`, `)` or an identifier byte is a finished statement and still
 /// terminates the walk, which is what keeps the ordinary next statement out.
 ///
-/// `,` is deliberately ABSENT: a trailing comma means the element ENDED, and
-/// following it walks a struct-literal field's exemption into the NEXT field's
-/// quoted value — a false positive this repository's own source produces. `/`
-/// is absent for the same reason in the other direction: a leading or trailing
-/// slash is far more often a comment than an operator.
+/// Three bytes are deliberately ABSENT, each for a measured false positive.
+/// `,` — a trailing comma means the element ENDED, and following it walks a
+/// struct-literal field's exemption into the NEXT field's quoted value. `/` —
+/// a leading or trailing slash is far more often a comment than an operator.
+/// `<`/`>` — a generic parameter list closes with `>`, so an unterminated
+/// declaration (`semi: false` TypeScript, Kotlin, Scala) would run the walk
+/// into the next line's unrelated string.
 fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
-    const CONTINUATION: &[u8] = b"+-*|&^%=<>.?:\\";
+    const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\";
     let trailing = window[..newline]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -369,19 +371,41 @@ fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
         || leading.is_some_and(|byte| CONTINUATION.contains(&byte))
 }
 
-/// Length of the bounded char literal opening at `at` (which holds `'`):
-/// opening quote, 1..=[`CHAR_LITERAL_MAX_CONTENT`] content bytes — a `\`
-/// escape counted with its escaped byte — then the closing quote. `None` when
-/// no closing quote lands inside the bound: a lifetime sigil, a contraction,
-/// an empty `''` pair, or a literal too long to be trusted.
+/// Length of the bounded char literal opening at `at` (which holds `'`), but
+/// ONLY when skipping it is necessary: opening quote, 1..=
+/// [`CHAR_LITERAL_MAX_CONTENT`] content bytes — a `\` escape counted with its
+/// escaped byte — a closing quote, AND at least one bracket among the content.
+///
+/// The bracket requirement is load-bearing, not an optimization. This skip
+/// exists for exactly one purpose: keep a genuine char literal's bracket out
+/// of the walk's `depth`. Skipping a bracket-free span buys nothing and costs
+/// everything, because `'` is a STRING delimiter in Python, JavaScript,
+/// TypeScript, Ruby and PHP — all code languages here. There the byte at `at`
+/// is usually a string's CLOSING quote, and the next `'` within the bound is
+/// the OPENING quote of the following argument (`', '` is a 2-byte gap). An
+/// unconditional skip jumps over that opening quote, and since the payload
+/// fence is only ever tested when the walk LANDS on a quote, the argument
+/// behind it — a real credential — is never fence-tested at all. Requiring a
+/// bracket keeps the skip to the case it was built for: a bracket-free gap
+/// falls through to the one-byte advance, so the next quote is always seen.
+///
+/// `None` when no closing quote lands inside the bound (a lifetime sigil, a
+/// contraction, an empty `''` pair, a literal too long to trust) or when the
+/// bounded content carries no bracket.
 fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
     let last_close = at + 1 + CHAR_LITERAL_MAX_CONTENT;
     let mut cursor = at + 1;
+    let mut carries_bracket = false;
     while cursor <= last_close {
         match window.get(cursor)? {
             b'\\' => cursor += 2,
-            b'\'' if cursor > at + 1 => return Some(cursor + 1 - at),
-            _ => cursor += 1,
+            b'\'' if cursor > at + 1 => {
+                return carries_bracket.then_some(cursor + 1 - at);
+            }
+            byte => {
+                carries_bracket |= matches!(byte, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+                cursor += 1;
+            }
         }
     }
     None

@@ -31916,6 +31916,60 @@ mod tests {
         );
     }
 
+    /// RED (S20). The bounded char-literal skip was reasoned about as a RUST
+    /// question — char literal versus lifetime sigil — but `'` is a first-class
+    /// STRING delimiter in Python, JavaScript, TypeScript, Ruby and PHP, all of
+    /// which are code languages here. There the byte the skip fires on is
+    /// usually a string's CLOSING quote, and the next `'` within the bound is
+    /// the OPENING quote of the following argument, because `', '` is a
+    /// two-byte gap. An unconditional bounded skip jumps clean over that
+    /// opening quote, and the payload fence is only ever tested when the walk
+    /// LANDS on a quote — so the credential behind it was never fence-tested
+    /// and the whole expression came back exempt.
+    ///
+    /// Measured before the bracket requirement: S20a and S20b CLEAN while
+    /// S20c — identical but for the FIRST argument's quote style — was
+    /// SENSITIVE, so the skip was provably the variable. S20d pins that a lone
+    /// single-quoted credential was never affected.
+    ///
+    /// The fix requires the skipped span to CARRY A BRACKET, which is the only
+    /// thing the skip was ever for (keeping a char literal's bracket out of
+    /// `depth`, rows S17a-S17d). A bracket-free gap now falls through to the
+    /// one-byte advance, so the next quote is always seen.
+    #[test]
+    fn oracle_b_single_quoted_string_arguments_must_not_hide_a_credential() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S20a python, two single-quoted arguments",
+                "src/probe.py",
+                format!("{token_kw} = compute_header('label', '{v}')\n"),
+            ),
+            (
+                "S20b javascript, two single-quoted arguments",
+                "src/probe.js",
+                format!("const {token_kw} = buildHeaders('auth', '{v}');\n"),
+            ),
+            (
+                "S20c control: first argument double-quoted",
+                "src/probe.py",
+                format!("{token_kw} = compute_header(\"label\", '{v}')\n"),
+            ),
+            (
+                "S20d control: lone single-quoted credential argument",
+                "src/probe.py",
+                format!("{token_kw} = compute_header('{v}')\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, true);
+        assert!(
+            off.is_empty(),
+            "a single-quoted argument hid a credential from the walk: {off:?}"
+        );
+    }
+
     /// RED (S18) + GREEN-CONTROL (G9). Open item H1, ruled: `is_placeholder`'s
     /// `${…}`/`{{…}}` branches tested the ENDS only — `starts_with("${") &&
     /// ends_with('}')` — so a capture BRACKETED by two placeholders satisfied
@@ -32044,6 +32098,11 @@ mod tests {
                     "let config = Config {{\n    {key_kw}: resolve_from_environment(),\n    \
                      banner_text: \"{v}\",\n}};\n"
                 ),
+            ),
+            (
+                "G10c a generic parameter list closing in > is not a continuation",
+                "src/probe.ts",
+                format!("let {key_kw}: Map<string, string>\nconst banner = \"{v}\";\n"),
             ),
         ];
 
