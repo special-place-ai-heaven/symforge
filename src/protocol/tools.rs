@@ -31970,6 +31970,88 @@ mod tests {
         );
     }
 
+    /// RED (S21) + GREEN-CONTROL (G11). The owner's principle, stated whole:
+    /// EVERY SUBSTANTIVE LITERAL RUN IN A CREDENTIAL-BOUND RIGHT-HAND SIDE IS
+    /// INSPECTED INDEPENDENTLY; PLACEHOLDER-ONLY EXPRESSIONS REMAIN EXEMPT.
+    ///
+    /// Three defects fell out of it, all fixed at the one boundary both
+    /// exemptions pass through rather than in either exemption separately:
+    ///
+    /// S21a — the placeholder branch `continue`d before the withdrawal walk
+    /// ever ran, so a lone placeholder in the FIRST operand of a concatenation
+    /// exempted the whole expression and the hardcoded literal in the second
+    /// operand was never inspected. The capture is exempt; the expression is
+    /// not. S21b is the same shape with no placeholder, so the placeholder is
+    /// provably the variable.
+    ///
+    /// S21c — a quote span was allowed to cover a line break, carrying the walk
+    /// past the depth-0 gate without it ever being consulted. A genuine char
+    /// literal never spans a line, so the skip now stops at `\n`.
+    ///
+    /// G11a/G11b — GitHub Actions writes ONE expression with nested braces, and
+    /// the interior-brace test had been rejecting it on every workflow file.
+    /// G11c pins adjacent expansions with no literal between them: that is a
+    /// placeholder-ONLY expression and stays exempt. G11 is what stops the S21
+    /// direction from being satisfied by simply refusing everything.
+    #[test]
+    fn oracle_b_placeholder_exempts_the_capture_not_the_expression() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let demoted: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S21a placeholder operand cannot exempt a concatenated literal",
+                "src/probe.py",
+                format!("{token_kw} = '${{DEPLOY_HOST}}' + '{v}'\n"),
+            ),
+            (
+                "S21b control: same shape with no placeholder",
+                "src/probe.py",
+                format!("{token_kw} = '{v}' + suffix_value\n"),
+            ),
+            (
+                "S21c a quote span must not cross a newline onto the next \
+                 line's opening fence",
+                "src/probe.py",
+                format!("{token_kw} = compute_header('(\n'{v}')\n"),
+            ),
+            (
+                "S21d placeholder groups bracketing a literal stay sensitive",
+                ".github/workflows/ci.yaml",
+                format!("{token_kw}: ${{{{ALPHA}}}}{v}${{{{OMEGA}}}}\n"),
+            ),
+            (
+                "S21e control: a bare literal in a workflow stays sensitive",
+                ".github/workflows/ci.yaml",
+                format!("{token_kw}: {v}\n"),
+            ),
+        ];
+        let clean: Vec<(&'static str, &str, String)> = vec![
+            (
+                "G11a github actions expression, no inner spaces",
+                ".github/workflows/ci.yaml",
+                format!("{token_kw}: ${{{{secrets.DEPLOY_TOKEN_NAME}}}}\n"),
+            ),
+            (
+                "G11b github actions expression, inner spaces",
+                ".github/workflows/ci.yaml",
+                format!("{token_kw}: ${{{{ secrets.DEPLOY_TOKEN_NAME }}}}\n"),
+            ),
+            (
+                "G11c adjacent expansions with no literal between them",
+                ".env",
+                format!("{token_kw}=${{ALPHA_PART}}${{OMEGA_PART}}\n"),
+            ),
+        ];
+
+        let off_demoted = oracle_rows_off_expectation(&demoted, true);
+        let off_clean = oracle_rows_off_expectation(&clean, false);
+        assert!(
+            off_demoted.is_empty() && off_clean.is_empty(),
+            "placeholder-scope rows off expectation: not demoted \
+             {off_demoted:?}, not clean {off_clean:?}"
+        );
+    }
+
     /// RED (S18) + GREEN-CONTROL (G9). Open item H1, ruled: `is_placeholder`'s
     /// `${…}`/`{{…}}` branches tested the ENDS only — `starts_with("${") &&
     /// ends_with('}')` — so a capture BRACKETED by two placeholders satisfied

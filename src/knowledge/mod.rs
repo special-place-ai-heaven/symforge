@@ -183,28 +183,68 @@ fn is_placeholder(value: &[u8]) -> bool {
             | "test-value"
     ) || normalized.starts_with("your_")
         || normalized.starts_with("your-")
-        || is_single_placeholder_group(&normalized, "${", "}")
-        || is_single_placeholder_group(&normalized, "{{", "}}")
+        || is_placeholder_only_expression(&normalized)
 }
 
-/// A capture that is WHOLLY one delimited placeholder group: `open`, at least
-/// one interior byte, `close`, and NO interior brace of either kind.
+/// A capture built ONLY of interpolation placeholder groups — one or more, back
+/// to back, with nothing substantive between them.
 ///
-/// Whole-capture, exactly as [`capture_is_single_interpolation`] is — never
-/// "starts with the opener and ends with the closer", which any capture
-/// BRACKETED by two placeholders satisfies while carrying a hardcoded literal
-/// between them (H1). The interior-brace test is what distinguishes the one
-/// group from the two: a lone `${VAR:-fallback}` or `{{name}}` keeps its
-/// exemption, `${A}<literal>${B}` loses it. This branch runs before the
-/// code-language gate, so the bracketing leak reached EVERY path class,
-/// config included.
-fn is_single_placeholder_group(value: &str, open: &str, close: &str) -> bool {
-    value.len() > open.len() + close.len()
-        && value.starts_with(open)
-        && value.ends_with(close)
-        && !value[open.len()..value.len() - close.len()]
-            .bytes()
-            .any(|byte| matches!(byte, b'{' | b'}'))
+/// Whole-capture, exactly as [`capture_is_single_interpolation`] is, and never
+/// "starts with the opener and ends with the closer": any capture BRACKETED by
+/// two placeholders satisfies that while carrying a hardcoded literal between
+/// them (H1), and this branch runs before the code-language gate, so that leak
+/// reached EVERY path class, config included.
+///
+/// Consuming a SEQUENCE rather than demanding a single group is what keeps
+/// `${A}${B}` — adjacent expansions with no literal anywhere — exempt, while
+/// `${A}<literal>${B}` is not: the literal is what fails to be consumed. Each
+/// group's interior must be brace-free, so a group can never swallow its
+/// neighbour.
+///
+/// Openers are tried LONGEST FIRST so GitHub Actions' `${{ … }}`, one logical
+/// expression with nested braces, is read as one group rather than as `${`
+/// leaving a stray brace behind.
+fn is_placeholder_only_expression(value: &str) -> bool {
+    const GROUPS: [(&str, &str); 3] = [("${{", "}}"), ("{{", "}}"), ("${", "}")];
+    let mut rest = value;
+    let mut matched_any = false;
+    'consume: while !rest.is_empty() {
+        for (open, close) in GROUPS {
+            let Some(interior) = rest.strip_prefix(open) else {
+                continue;
+            };
+            let Some(end) = interior.find(close) else {
+                continue;
+            };
+            if end == 0
+                || interior[..end]
+                    .bytes()
+                    .any(|byte| matches!(byte, b'{' | b'}'))
+            {
+                continue;
+            }
+            rest = &interior[end + close.len()..];
+            matched_any = true;
+            continue 'consume;
+        }
+        return false;
+    }
+    matched_any
+}
+
+/// Where to resume inspecting a right-hand side after a capture ends.
+///
+/// The rule's optional `["']?` consumes an OPENING quote, so the matching
+/// closing quote sits at `capture_end`. Stepping over it is what guarantees the
+/// walk begins outside that literal — starting ON it makes the walk read a
+/// closing quote as an opening one, and for a double-quoted literal the
+/// whole-literal skip then jumps to the NEXT literal's opening quote and blinds
+/// the payload fence behind it.
+fn right_hand_side_continuation(bytes: &[u8], capture_end: usize) -> usize {
+    match bytes.get(capture_end) {
+        Some(b'"' | b'\'' | b'`') => capture_end + 1,
+        _ => capture_end,
+    }
 }
 
 /// Stage 2 for [`CONTEXT_ASSIGNMENT_RULE_ID`], on CODE-language paths only.
@@ -308,39 +348,6 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
             .any(|byte| matches!(byte, b'{' | b'}'))
 }
 
-/// Withdrawal test for the code-expression exemption.
-///
-/// Walks the right-hand-side expression from `from` over AT MOST
-/// [`CONTEXT_ASSIGNMENT_SCAN_BOUND`] bytes, tracking `()`/`[]`/`{}` depth and
-/// skipping `"` and `` ` `` literals whole. Returns `true` — exemption
-/// WITHDRAWN — when any of:
-///   * a delimiter-fenced run of at least [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`]
-///     payload bytes appears anywhere in the window;
-///   * a `"` or `` ` `` literal opens in the window and never closes inside it;
-///   * the window is exhausted before the expression terminates at depth 0
-///     (UNBALANCED or OVER-BOUND — fail closed).
-///
-/// `'` is fence-tested like the other two and then skipped ONLY as a BOUNDED
-/// char literal: a closing `'` within [`CHAR_LITERAL_MAX_CONTENT`] content
-/// bytes (escapes counted) proves a genuine char literal, whose content —
-/// possibly a bracket — must stay invisible to `depth`. A `)` seen there
-/// underflows into the enclosing-group arm and CONSUMES the walk ahead of a
-/// real fenced payload, which fails OPEN (row S17a — the row that forced the
-/// bound). Without a nearby closing partner — a lifetime sigil, an apostrophe
-/// in a comment — it advances ONE byte, never a whole-literal skip: two such
-/// apostrophes would bracket, and hide, a quoted payload (row S16). The bound
-/// sits far below [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`], so the skip itself can
-/// never hide a fenced payload.
-///
-/// INVARIANT — this walk is NOT line-local, and must never be made line-local
-/// again. Inside an open bracket a `\n` never terminates; at depth 0 it
-/// terminates only when [`line_break_continues_expression`] finds no
-/// continuation operator on either side of the break. That is the entire
-/// point: rustfmt and black put long arguments on a continuation line — with
-/// an open bracket OR with a bare leading/trailing operator — and credentials
-/// are long, so a line-local test's false negatives are systematically aligned
-/// with the values this rule exists to catch.
-///
 /// Does the expression CONTINUE past a depth-0 line break at `newline`?
 ///
 /// True when the last non-whitespace byte before the break, or the first after
@@ -399,6 +406,10 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
     while cursor <= last_close {
         match window.get(cursor)? {
             b'\\' => cursor += 2,
+            // A genuine char literal never spans a line. Stopping here keeps
+            // the skip from swallowing a line break whole, which would carry
+            // the walk past the depth-0 gate without it ever being consulted.
+            b'\n' => return None,
             b'\'' if cursor > at + 1 => {
                 return carries_bracket.then_some(cursor + 1 - at);
             }
@@ -411,8 +422,52 @@ fn bounded_char_literal_len(window: &[u8], at: usize) -> Option<usize> {
     None
 }
 
-/// PRECONDITION — `from` is provably OUTSIDE any string literal, guaranteed by
-/// step 2 of [`assignment_is_code_expression`].
+/// Withdrawal test for the code-expression exemption.
+///
+/// Walks the right-hand-side expression from `from` over AT MOST
+/// [`CONTEXT_ASSIGNMENT_SCAN_BOUND`] bytes, tracking `()`/`[]`/`{}` depth and
+/// skipping `"` and `` ` `` literals whole. Returns `true` — exemption
+/// WITHDRAWN — when any of:
+///   * a delimiter-fenced run of at least [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`]
+///     payload bytes appears anywhere in the window;
+///   * a `"` or `` ` `` literal opens in the window and never closes inside it;
+///   * the window is exhausted before the expression terminates at depth 0
+///     (UNBALANCED or OVER-BOUND — fail closed).
+///
+/// `'` is fence-tested like the other two, then skipped only by
+/// [`bounded_char_literal_len`] — bounded, bracket-bearing, never across a
+/// line. Three rows fix those three conditions and none is negotiable: two
+/// unpaired apostrophes must not bracket and hide a payload (S16), a genuine
+/// char literal's bracket must stay invisible to `depth` or it underflows into
+/// the enclosing-group arm and consumes the walk ahead of a real payload
+/// (S17a), and a span must not cross a newline onto the next line's opening
+/// fence (S21c).
+///
+/// The safety argument is about the FENCE BYTE, not the payload run. An earlier
+/// version of this comment reasoned that the bound sits far below
+/// [`CONTEXT_ASSIGNMENT_MIN_PAYLOAD`] so the skip "can never hide a fenced
+/// payload" — false, and the cause of a real leak. The fence test only ever
+/// fires when the walk LANDS on a quote, so a skip never needs to cover the
+/// payload; stepping over its single opening quote is enough to blind the test
+/// completely. Any change here is measured against what the walk still SEES.
+///
+/// INVARIANT — this walk is NOT line-local, and must never be made line-local
+/// again. Inside an open bracket a `\n` never terminates; at depth 0 it
+/// terminates only when [`line_break_continues_expression`] finds no
+/// continuation operator on either side of the break. That is the entire
+/// point: rustfmt and black put long arguments on a continuation line — with
+/// an open bracket OR with a bare leading/trailing operator — and credentials
+/// are long, so a line-local test's false negatives are systematically aligned
+/// with the values this rule exists to catch.
+///
+/// PRECONDITION — `from` is provably OUTSIDE any string literal. Two callers
+/// establish it, and both must keep doing so: step 2 of
+/// [`assignment_is_code_expression`], which RETURNS rather than falling through
+/// when the match sits inside a literal; and the placeholder branch of
+/// [`scan_secret_bytes`], which resumes at
+/// [`right_hand_side_continuation`] — one byte past the quote the capture
+/// closed. Entering mid-literal reads that literal's CLOSING quote as an
+/// opening one and inverts quote parity for the whole window.
 fn expression_carries_quoted_payload(bytes: &[u8], from: usize) -> bool {
     let end = from
         .saturating_add(CONTEXT_ASSIGNMENT_SCAN_BOUND)
@@ -531,9 +586,20 @@ pub fn scan_secret_bytes(path: &str, bytes: &[u8]) -> SecretScan {
                 };
             };
             if rule.placeholders_allowed && is_placeholder(secret.as_bytes()) {
-                continue;
-            }
-            if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
+                // The CAPTURE is a placeholder — but that exempts the capture,
+                // not the expression it sits in. A placeholder in one operand
+                // must never license a hardcoded literal in another, so the
+                // rest of the right-hand side is still inspected, from just
+                // outside the literal this capture closed. Same withdrawal test
+                // the code-expression exemption answers to, applied at the one
+                // boundary both exemptions pass through.
+                if !expression_carries_quoted_payload(
+                    bytes,
+                    right_hand_side_continuation(bytes, secret.end()),
+                ) {
+                    continue;
+                }
+            } else if rule.id == CONTEXT_ASSIGNMENT_RULE_ID
                 && assignment_is_code_expression(path, bytes, secret.start(), secret.as_bytes())
             {
                 continue;
