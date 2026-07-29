@@ -179,8 +179,20 @@ pub(super) fn is_index_unavailable_output(text: &str) -> bool {
 pub(super) fn is_error_output(text: &str) -> bool {
     text.starts_with("Error:")
         || text.starts_with("Error in ")
+        || is_admission_refusal(text)
         || is_foreign_project_refusal(text)
         || is_local_cross_project_refusal(text)
+}
+
+/// An admission-gate refusal is an honest REFUSAL, not a successful read. Taught
+/// HERE rather than per-arm: `validate_file_syntax` has no classifier arm of its
+/// own, so its refusal fell through `classify_compact_tool_output`'s catch-all
+/// and reported a withheld file as a successful validation. Anchored at position
+/// 0 (not `contains`) so a body that merely QUOTES the phrase stays `Found`.
+/// Both refusal variants share this opening clause, so one anchor classifies
+/// both.
+fn is_admission_refusal(text: &str) -> bool {
+    text.starts_with("Content withheld by admission policy:")
 }
 
 /// The single-project refusal [`SymForgeServer::foreign_project_refusal`] emits
@@ -418,6 +430,7 @@ use crate::live_index::{
 };
 use crate::protocol::edit;
 use crate::protocol::format;
+use crate::protocol::read_gate;
 use crate::protocol::search_format;
 use crate::sidecar::handlers::{
     ImpactParams, OutlineParams, SymbolContextParams, impact_tool_text,
@@ -2763,18 +2776,20 @@ fn find_references_completeness_label(
 /// textually (bounded) and return a disclosure so the envelope never claims a
 /// completeness it does not have. Returns `None` when there is nothing to
 /// disclose (no size-demoted files, or none contain the name).
+///
+/// Candidate eligibility is decided by the caller from the typed manifest
+/// disposition (`LiveIndex::oversized_metadata_only_files`), NOT from the lossy
+/// `SkipReason` projection this used to filter on: that projection collapses
+/// security demotions into `SkipReason::UnsupportedLanguage`, so excluding them
+/// was an accident of mislabelling rather than a decision. Only size-demoted
+/// files are reference-relevant anyway — binary, lockfile, and artifact
+/// demotions cannot hold code references to the queried symbol.
 fn tier2_reference_disclosure(
-    skipped: &[crate::domain::index::SkippedFile],
+    candidates: &[(String, u64)],
+    live: &crate::live_index::LiveIndex,
     repo_root: Option<&std::path::Path>,
     name: &str,
 ) -> Option<String> {
-    use crate::domain::index::SkipReason;
-    // Only size-demoted files are reference-relevant: binary, lockfile, and
-    // artifact demotions cannot hold code references to the queried symbol.
-    let candidates: Vec<&crate::domain::index::SkippedFile> = skipped
-        .iter()
-        .filter(|f| f.reason() == Some(SkipReason::SizeThreshold))
-        .collect();
     if candidates.is_empty() || name.trim().is_empty() {
         return None;
     }
@@ -2794,7 +2809,7 @@ fn tier2_reference_disclosure(
     };
     let Some(root) = repo_root else {
         // No resolvable root: cannot sweep, but silence would be the lie.
-        let paths: Vec<&str> = candidates.iter().map(|f| f.path.as_str()).collect();
+        let paths: Vec<&str> = candidates.iter().map(|(path, _)| path.as_str()).collect();
         return Some(format!(
             "Tier-2 exclusion: {} first-party file(s) over the size threshold (1MB data / 4MB code) were NOT reference-scanned \
              (metadata-only) and could not be swept for \"{name}\" (no repo root): {}",
@@ -2805,19 +2820,23 @@ fn tier2_reference_disclosure(
     let mut matched: Vec<&str> = Vec::new();
     let mut unswept: Vec<&str> = Vec::new();
     let mut bytes_budget = MAX_SWEEP_BYTES;
-    for (i, file) in candidates.iter().enumerate() {
-        if i >= MAX_SWEEP_FILES || bytes_budget < file.size {
-            unswept.push(file.path.as_str());
+    for (i, (path, size)) in candidates.iter().enumerate() {
+        if i >= MAX_SWEEP_FILES || bytes_budget < *size {
+            unswept.push(path.as_str());
             continue;
         }
-        match std::fs::read(root.join(&file.path)) {
+        // The gate owns the read and re-classifies the current bytes, so a file
+        // the manifest still records as merely oversized cannot have a textual
+        // match disclosed once its bytes turn sensitive. The refusal itself is
+        // discarded: only the path reaches the response, via `unswept`.
+        match read_gate::admit_disk_read(live, path, &root.join(path)) {
             Ok(bytes) => {
                 bytes_budget = bytes_budget.saturating_sub(bytes.len() as u64);
                 if String::from_utf8_lossy(&bytes).contains(name) {
-                    matched.push(file.path.as_str());
+                    matched.push(path.as_str());
                 }
             }
-            Err(_) => unswept.push(file.path.as_str()),
+            Err(_) => unswept.push(path.as_str()),
         }
     }
     if matched.is_empty() && unswept.is_empty() {
@@ -2834,7 +2853,7 @@ fn tier2_reference_disclosure(
     }
     if !unswept.is_empty() {
         parts.push(format!(
-            "{} size-demoted Tier-2 file(s) not reference-scanned and not swept (budget): {}",
+            "{} size-demoted Tier-2 file(s) not reference-scanned and not swept (budget or policy): {}",
             unswept.len(),
             preview(&unswept),
         ));
@@ -8621,35 +8640,38 @@ impl SymForgeServer {
                         Err(_) => return format::not_found_file(&input.path),
                     };
                     if canon_path.is_file() {
-                        match std::fs::read(&canon_path) {
-                            Ok(content) => {
-                                let body = format::render_file_content_bytes(
-                                    &input.path,
-                                    &content,
-                                    options.content_context,
-                                );
-                                // Frecency bump — commitment tool. Raw-disk
-                                // fallback branch (non-indexed source files);
-                                // collection policy is resolved inside bump_frecency.
-                                self.bump_frecency(&[PathBuf::from(&input.path)]);
-                                // NUL-byte guard (raw-disk fallback branch):
-                                // mirror the indexed branch — warn after the cap.
-                                let capped = format::cap_file_content_output(format!(
-                                    "{}{}",
-                                    mode_annotation, body
-                                ));
-                                let with_warning =
-                                    format::append_nul_byte_warning(capped, &content);
-                                let max_tokens = Some(format::resolve_read_max_tokens(
-                                    explicit_max_tokens,
-                                    content.len(),
-                                ));
-                                return format::enforce_token_budget(with_warning, max_tokens);
-                            }
-                            Err(e) => {
-                                return format!("{} [error: could not read file: {e}]", input.path);
-                            }
-                        }
+                        // The gate owns this read: it classifies the exact buffer
+                        // it returns, so nothing below reopens the path.
+                        // `generation.live` is the same publication that produced
+                        // the index miss above — a fresh `self.index.read()` would
+                        // be a different snapshot.
+                        let content = match read_gate::admit_disk_read(
+                            generation.live.as_ref(),
+                            &input.path,
+                            &canon_path,
+                        ) {
+                            Ok(content) => content,
+                            Err(refusal) => return refusal,
+                        };
+                        let body = format::render_file_content_bytes(
+                            &input.path,
+                            &content,
+                            options.content_context,
+                        );
+                        // Frecency bump — commitment tool. Raw-disk
+                        // fallback branch (non-indexed source files);
+                        // collection policy is resolved inside bump_frecency.
+                        self.bump_frecency(&[PathBuf::from(&input.path)]);
+                        // NUL-byte guard (raw-disk fallback branch):
+                        // mirror the indexed branch — warn after the cap.
+                        let capped =
+                            format::cap_file_content_output(format!("{}{}", mode_annotation, body));
+                        let with_warning = format::append_nul_byte_warning(capped, &content);
+                        let max_tokens = Some(format::resolve_read_max_tokens(
+                            explicit_max_tokens,
+                            content.len(),
+                        ));
+                        return format::enforce_token_budget(with_warning, max_tokens);
                     }
                 }
                 // Suggest similar files from the index
@@ -8686,12 +8708,13 @@ impl SymForgeServer {
         let path_scope = search::PathScope::exact(&input.path);
         freshen_exact_path_for_targeted_retrieval(self, &path_scope);
 
-        let indexed_file = {
-            let guard = self.index.read();
-            // Skip loading_guard here — the disk-read fallback below does not
-            // need the index, so we should not block when the index is still loading.
-            guard.capture_shared_file(&input.path)
-        };
+        // Held across the fallback so the gate reads the recorded disposition off
+        // the SAME publication that produced the index miss. `SharedIndexHandle::read`
+        // is an `ArcSwap` load, not a lock, and nothing below awaits.
+        let index = self.index.read();
+        // Skip loading_guard here — the disk-read fallback below does not
+        // need the index, so we should not block when the index is still loading.
+        let indexed_file = index.capture_shared_file(&input.path);
         if let Some(file) = indexed_file {
             let output = format::validate_file_syntax_result(&input.path, file.as_ref());
             self.session_context.record_summary_output(
@@ -8723,9 +8746,13 @@ impl SymForgeServer {
             return format::not_found_file(&input.path);
         }
 
-        let bytes = match std::fs::read(&canon_path) {
+        // This lane reaches disk unconditionally and never re-consults the index
+        // for the fallback decision, so it gates the CURRENT bytes even when the
+        // manifest says `Indexed` (D3: the exemption is about where bytes come
+        // from). The gate owns the read; nothing below reopens the path.
+        let bytes = match read_gate::admit_disk_read(index.as_ref(), &input.path, &canon_path) {
             Ok(bytes) => bytes,
-            Err(e) => return format!("{} [error: could not read file: {e}]", input.path),
+            Err(refusal) => return refusal,
         };
         let classification = crate::domain::FileClassification::for_code_path(&input.path);
         let result = crate::parsing::process_file_with_classification(
@@ -8921,8 +8948,13 @@ impl SymForgeServer {
                 let tier2_disclosure = {
                     let repo_root = self.capture_repo_root();
                     let guard = self.index.read();
-                    let skipped = guard.compatibility_skipped_files();
-                    tier2_reference_disclosure(&skipped, repo_root.as_deref(), &input.name)
+                    let candidates = guard.oversized_metadata_only_files();
+                    tier2_reference_disclosure(
+                        &candidates,
+                        guard.as_ref(),
+                        repo_root.as_deref(),
+                        &input.name,
+                    )
                 };
                 let envelope = if !view.files.is_empty() {
                     let guard = self.index.read();
@@ -14055,8 +14087,10 @@ mod tests {
         let _env_guard = EnvVarGuard::set_path("SYMFORGE_HOME", daemon_home.path());
         // The daemon is fail-closed; pin a token so the direct open call and the
         // proxy client (which resolves the token via env) can authenticate.
-        let auth_token = "repo-map-proxy-test-token";
-        let _auth_guard = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", auth_token);
+        // Assembled at runtime so no credential-shaped literal enters this file;
+        // see `repository_source_is_clean_under_its_own_detector`.
+        let auth_token = ["repo-map-proxy-test-", "to", "ken"].concat();
+        let _auth_guard = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
         let project = TempDir::new().expect("project dir");
         fs::create_dir_all(project.path().join("src")).expect("src dir");
         fs::write(project.path().join("src").join("main.rs"), "fn main() {}\n")
@@ -14068,7 +14102,7 @@ mod tests {
         let base_url = format!("http://127.0.0.1:{}", handle.port);
         let opened = reqwest::Client::new()
             .post(format!("{base_url}/v1/sessions/open"))
-            .bearer_auth(auth_token)
+            .bearer_auth(&auth_token)
             .json(&crate::daemon::OpenProjectRequest {
                 project_root: project.path().display().to_string(),
                 client_name: "codex".to_string(),
@@ -30571,6 +30605,1814 @@ mod tests {
             redeemed_text.contains("docs/checkpoint-09.md")
                 && redeemed_text.contains("Checkpoint policy evidence marker 09"),
             "facade CCR redemption must return the full safe stored result: {redeemed_text}"
+        );
+    }
+
+    // ── Raw-read admission gate ──────────────────────────────────────────────
+    //
+    // Public-behavior coverage for the raw-read lanes that reopen a repository
+    // file from disk. Fixtures come from the REAL admission pipeline
+    // (`LiveIndex::load`) — the only route that produces genuine `SensitivePath`
+    // / `SensitiveContent` dispositions. `manifest_metadata_entry` maps *from*
+    // `SkipReason` and structurally cannot express them, so it is the wrong axis
+    // for the security rows and is used only for the Tier-2 sweep rows.
+
+    /// Fixture values are assembled at runtime from non-secret fragments so no
+    /// credential-shaped literal is ever committed. Peer copies live in the
+    /// `live_index::store`, `knowledge`, `analytics::store`,
+    /// `live_index::persist` and `live_index::knowledge_bridge` tests.
+    fn runtime_canary() -> String {
+        ["runtime", "-", "canary", "-", "segment"].concat()
+    }
+
+    const WITHHELD_REFUSAL_PREFIX: &str = "Content withheld by admission policy:";
+
+    /// Failure diagnostics for admission tests must not echo the response body:
+    /// on the pre-fix side that body IS the withheld file content. Report the
+    /// response SHAPE instead, never its bytes.
+    fn refusal_shape(text: &str) -> String {
+        let line = text.lines().next().unwrap_or("");
+        if line.starts_with(WITHHELD_REFUSAL_PREFIX) {
+            "withheld-refusal".to_string()
+        } else if line.starts_with("File not found:") {
+            "not-found".to_string()
+        } else if line.starts_with("Estimate for get_file_content") {
+            "estimate".to_string()
+        } else if line.starts_with("Syntax validation:") {
+            "syntax-report".to_string()
+        } else {
+            format!("<other, {} bytes, withheld>", text.len())
+        }
+    }
+
+    type ContentSelector = (&'static str, fn(&mut super::GetFileContentInput));
+
+    /// Every content selector `get_file_content` exposes. Shared by the refusal
+    /// sweep and by the R1/E1 estimate pairing so the two cannot drift.
+    const CONTENT_SELECTORS: &[ContentSelector] = &[
+        ("full read", |_input| {}),
+        ("start_line/end_line", |input| {
+            input.start_line = Some(1);
+            input.end_line = Some(1);
+        }),
+        ("offset/limit", |input| {
+            input.offset = Some(0);
+            input.limit = Some(10);
+        }),
+        ("around_line", |input| {
+            input.around_line = Some(1);
+        }),
+        ("around_match present", |input| {
+            input.around_match = Some("password".to_string());
+        }),
+        ("around_match absent", |input| {
+            // A "No matches for ..." answer is itself a content oracle, so the
+            // absent-needle case must refuse exactly like the present one.
+            input.around_match = Some("no-such-needle-marker".to_string());
+        }),
+        ("around_symbol", |input| {
+            input.around_symbol = Some("password".to_string());
+        }),
+        ("chunk_index + max_lines", |input| {
+            input.chunk_index = Some(1);
+            input.max_lines = Some(200);
+        }),
+    ];
+
+    /// Repo whose dispositions are produced by the real admission pipeline: two
+    /// `SensitivePath` files, one `SensitiveContent` file, one admitted
+    /// non-indexed lockfile, and one ordinary Tier-1 source file. Returns the
+    /// runtime canary so every row can assert it never escapes.
+    fn setup_admission_fixture() -> (TempDir, SymForgeServer, String) {
+        let canary = runtime_canary();
+        let sensitive_body = format!("{}={canary}\n", kw_password());
+        let (dir, server) = setup_loaded_edit_test(&[
+            (".env", sensitive_body.as_str()),
+            ("config/production.env", sensitive_body.as_str()),
+            ("config/settings.toml", sensitive_body.as_str()),
+            (
+                "package-lock.json",
+                "{\n  \"name\": \"demo\",\n  \"lockfileVersion\": 3\n}\n",
+            ),
+            ("src/lib.rs", "pub fn admitted_anchor() {}\n"),
+        ]);
+        (dir, server, canary)
+    }
+
+    /// Precondition: the path is ABSENT from the Tier-1 map and carries a typed
+    /// security disposition. Asserted first in every security row so a fixture
+    /// that silently stops being demoted fails loudly instead of passing
+    /// vacuously.
+    fn assert_security_demotion(server: &SymForgeServer, path: &str) {
+        let guard = server.index.read();
+        assert!(
+            guard.get_file(path).is_none(),
+            "{path} must be absent from the Tier-1 index map"
+        );
+        let entry = guard
+            .manifest_entries
+            .iter()
+            .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("{path} must remain cataloged"));
+        assert!(
+            matches!(
+                entry.disposition,
+                crate::domain::FileDisposition::MetadataOnly {
+                    reason: crate::domain::MetadataOnlyReason::SensitivePath { .. }
+                        | crate::domain::MetadataOnlyReason::SensitiveContent { .. }
+                }
+            ),
+            "{path} must carry a security disposition, got {:?}",
+            entry.disposition
+        );
+    }
+
+    async fn assert_content_refused(
+        server: &SymForgeServer,
+        canary: &str,
+        path: &str,
+        label: &str,
+        apply: fn(&mut super::GetFileContentInput),
+    ) {
+        let mut input = get_file_content_input(path);
+        apply(&mut input);
+        let serialized =
+            serialized_tool_result(server.get_file_content_tool(Parameters(input)).await);
+        let text = tool_result_text(&serialized);
+        // Content first: once this holds the body carries no fixture material,
+        // so the remaining diagnostics may quote it.
+        assert!(
+            !text.contains(canary),
+            "{label} on {path} leaked fixture content; response shape: {}",
+            refusal_shape(text)
+        );
+        assert!(
+            text.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "{label} on {path} must be refused by the admission gate; got: {text}"
+        );
+        assert_eq!(
+            serialized["_meta"][RESULT_STATUS_META_KEY]["outcome_class"],
+            serde_json::json!(OutcomeClass::InvalidRequest.as_str()),
+            "{label} on {path} must report an invalid-request outcome; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_demoted_file_refuses_every_get_file_content_selector() {
+        let (_dir, server, canary) = setup_admission_fixture();
+        assert_security_demotion(&server, ".env");
+        assert_security_demotion(&server, "config/settings.toml");
+
+        for (label, apply) in CONTENT_SELECTORS {
+            assert_content_refused(&server, &canary, ".env", label, *apply).await;
+        }
+        // Content-detected demotion, not path-detected: the same refusal.
+        assert_content_refused(
+            &server,
+            &canary,
+            "config/settings.toml",
+            "full read (content-detected)",
+            |_input| {},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn security_demoted_file_refuses_validate_file_syntax() {
+        let (_dir, server, canary) = setup_admission_fixture();
+        for path in ["config/settings.toml", "config/production.env"] {
+            assert_security_demotion(&server, path);
+            let text = server
+                .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                    project: None,
+                    path: path.to_string(),
+                }))
+                .await;
+            assert!(
+                !text.contains(canary.as_str()),
+                "{path} syntax validation leaked fixture content; response shape: {}",
+                refusal_shape(&text)
+            );
+            assert!(
+                text.starts_with(WITHHELD_REFUSAL_PREFIX),
+                "{path} syntax validation must be refused by the admission gate; got: {text}"
+            );
+            assert!(
+                !text.contains("Symbols extracted:"),
+                "{path} must not report parsed structure; got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn estimate_succeeds_for_demoted_file_while_content_selectors_refuse() {
+        // R1/E1: Tier-2 aggregate counts are an explicit Feature 020 contract, so
+        // estimation must keep SUCCEEDING for a security-demoted file. The pairing
+        // pins the contract in both directions — over-gating the estimate is a
+        // regression, and letting any selector through is the breach.
+        let (_dir, server, canary) = setup_admission_fixture();
+        assert_security_demotion(&server, ".env");
+
+        let mut estimate_input = get_file_content_input(".env");
+        estimate_input.estimate = Some(true);
+        let estimated = server.get_file_content(Parameters(estimate_input)).await;
+        assert!(
+            !estimated.contains(canary.as_str()),
+            "estimate leaked fixture content; response shape: {}",
+            refusal_shape(&estimated)
+        );
+        assert!(
+            estimated.starts_with("Estimate for get_file_content(path=\".env\")"),
+            "estimation must still succeed for a demoted file; got: {estimated}"
+        );
+        assert!(
+            estimated.contains("raw disk read; not indexed"),
+            "estimate must keep the documented not-indexed aggregate; got: {estimated}"
+        );
+
+        // Selectors must not influence estimates.
+        let mut selected_estimate = get_file_content_input(".env");
+        selected_estimate.estimate = Some(true);
+        selected_estimate.start_line = Some(2);
+        selected_estimate.end_line = Some(2);
+        let selected = server.get_file_content(Parameters(selected_estimate)).await;
+        assert_eq!(
+            selected, estimated,
+            "a benign selector must not change the estimate; got: {selected}"
+        );
+
+        // …while every content selector on that same file refuses.
+        for (label, apply) in CONTENT_SELECTORS {
+            assert_content_refused(&server, &canary, ".env", label, *apply).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_non_indexed_lockfile_still_serves_raw_disk_content() {
+        // The control that stops a refuse-everything gate from passing: a Tier-2
+        // lockfile is absent from the Tier-1 map, so it traverses the same
+        // raw-disk fallback and must be PERMITTED.
+        let (_dir, server, _canary) = setup_admission_fixture();
+        {
+            let guard = server.index.read();
+            assert!(
+                guard.get_file("package-lock.json").is_none(),
+                "the lockfile must be absent from the Tier-1 map so the fallback is exercised"
+            );
+        }
+        let result = server
+            .get_file_content(Parameters(get_file_content_input("package-lock.json")))
+            .await;
+        assert!(
+            result.contains("\"lockfileVersion\": 3"),
+            "an admitted non-indexed file must still be read; got: {result}"
+        );
+        assert!(
+            !result.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "an admitted file must not be refused; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_file_is_served_from_memory_without_reaching_the_gate() {
+        // D3 control: the exemption is about WHERE the bytes come from. Tier-1
+        // content is served out of the in-memory index and adds no read.
+        let (_dir, server, _canary) = setup_admission_fixture();
+        {
+            let guard = server.index.read();
+            assert!(
+                guard.get_file("src/lib.rs").is_some(),
+                "the anchor source file must be Tier-1 indexed"
+            );
+        }
+        let result = server
+            .get_file_content(Parameters(get_file_content_input("src/lib.rs")))
+            .await;
+        assert!(
+            result.contains("admitted_anchor"),
+            "indexed content must still be served from memory; got: {result}"
+        );
+        assert!(
+            !result.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "an indexed read must not be refused; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier2_sweep_withholds_file_whose_current_bytes_are_sensitive() {
+        // The manifest still records the file as merely oversized, but its
+        // CURRENT bytes carry a credential. Most-restrictive-wins (R2): the sweep
+        // must not disclose `contains(name)` against it.
+        let dir = tempfile::tempdir().unwrap();
+        let canary = runtime_canary();
+        let mut big = "x".repeat(1_100_000);
+        // Re-based off the bare keyword-equals line this fixture used to carry:
+        // on a CODE path that shape is now an exempted code expression, so the
+        // file would classify Clean and the rows below would prove nothing. A
+        // quoted opaque literal is the shape that stays demoted.
+        big.push_str(&format!(
+            "\nlet {} = \"{canary}\";\nlet r = PortRegistry::new();\n",
+            kw_password()
+        ));
+        std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+        // This test hand-builds its manifest (`SkipReason::SizeThreshold`), so
+        // `assert_security_demotion` does not apply. Assert the demotion directly:
+        // without this the re-base could silently move the vacuity instead of
+        // removing it — all three rows below pass on a file that is not sensitive.
+        assert!(
+            matches!(
+                crate::knowledge::classify_stable_content(
+                    "big.rs",
+                    crate::domain::IndexTargets::for_path(
+                        "big.rs",
+                        Some(&crate::domain::LanguageId::Rust),
+                    ),
+                    big.as_bytes(),
+                ),
+                crate::knowledge::StableContentAdmission::MetadataOnly(
+                    crate::domain::MetadataOnlyReason::SensitiveContent { .. }
+                )
+            ),
+            "big.rs must still be content-demoted on a CODE path, or the refusal rows below prove nothing"
+        );
+
+        let def = make_symbol("PortRegistry", SymbolKind::Struct, 1, 1);
+        let (key, file) = make_file("src/lib.rs", b"struct PortRegistry;\n", vec![def]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.manifest_entries = vec![manifest_metadata_entry(
+            "big.rs",
+            big.len() as u64,
+            crate::domain::index::SkipReason::SizeThreshold,
+        )];
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        let result = server
+            .find_references(Parameters(find_references_input("PortRegistry")))
+            .await;
+        assert!(
+            !result.contains(canary.as_str()),
+            "the sweep must not echo fixture content; response shape: {}",
+            refusal_shape(&result)
+        );
+        assert!(
+            !result.contains("appears textually in"),
+            "a file whose current bytes are sensitive must not have a textual match disclosed; got: {result}"
+        );
+        assert!(
+            result.contains("not reference-scanned and not swept"),
+            "the unswept clause must confess the file was not swept; got: {result}"
+        );
+        // The clause used to attribute every unswept file to "(budget)". A gate
+        // refusal now lands in the same bucket, so budget alone is a false
+        // cause — this file was refused by POLICY, with budget to spare.
+        assert!(
+            result.contains("(budget or policy)"),
+            "the unswept clause must not attribute a policy refusal to budget; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier2_sweep_never_names_a_security_demoted_file() {
+        // GUARD, not proof of the fix: today this file is excluded only because
+        // `compatibility_admission_decision` mislabels every security demotion as
+        // `SkipReason::UnsupportedLanguage` (SF-DOG-004). Explicit positive
+        // eligibility off the typed disposition must keep it excluded once that
+        // label is corrected.
+        let dir = tempfile::tempdir().unwrap();
+        let canary = runtime_canary();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/secrets.env"),
+            format!("{}={canary}\nlet r = PortRegistry::new();\n", kw_password()),
+        )
+        .unwrap();
+
+        let def = make_symbol("PortRegistry", SymbolKind::Struct, 1, 1);
+        let (key, file) = make_file("src/lib.rs", b"struct PortRegistry;\n", vec![def]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.manifest_entries = vec![crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "config/secrets.env".to_string(),
+                normalized_utf8: Some("config/secrets.env".to_string()),
+            },
+            size: 64,
+            language: None,
+            classification: crate::domain::FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitivePath {
+                    rule_id: "path.environment-credentials".to_string(),
+                },
+            },
+            content_hash: None,
+        }];
+        let server = make_server_with_root(index, Some(dir.path().to_path_buf()));
+
+        let result = server
+            .find_references(Parameters(find_references_input("PortRegistry")))
+            .await;
+        assert!(
+            !result.contains(canary.as_str()),
+            "the sweep must not echo fixture content; response shape: {}",
+            refusal_shape(&result)
+        );
+        assert!(
+            !result.contains("config/secrets.env"),
+            "a security-demoted file must never be named by the sweep; got: {result}"
+        );
+        assert!(
+            !result.contains("Tier-2 exclusion"),
+            "no eligible Tier-2 candidate means no disclosure; got: {result}"
+        );
+    }
+
+    // ── Bidirectional oracle set (detector precision + fail-closed disclosure) ─
+    //
+    // Authored BEFORE the fix. Rows marked RED are expected to fail against the
+    // current code; rows marked GREEN pin behavior the fix must not move. Every
+    // payload is assembled at runtime from non-secret fragments, so no
+    // credential-shaped literal enters the repository, and no failure message
+    // ever echoes a fixture body — only row ids and response SHAPES.
+
+    /// Opaque, non-credential payload: 19 bytes, none of them whitespace, quote
+    /// or `#`, so it satisfies the detector's `{8,}` value class exactly the way
+    /// a real credential would, without being one.
+    fn oracle_opaque() -> String {
+        ["oracle", "-", "opaque", "-", "value"].concat()
+    }
+
+    /// Non-secret ASCII marker embedded in undecodable fixtures so a disclosure
+    /// leak is provable without reproducing anything sensitive.
+    fn oracle_marker() -> String {
+        ["oracle", "-", "undecodable", "-", "marker"].concat()
+    }
+
+    /// The public admission contract: the same call the cold index, the watcher
+    /// and the raw-read gate all consult.
+    fn oracle_admission(path: &str, body: &str) -> crate::knowledge::StableContentAdmission {
+        let language = LanguageId::from_path(path);
+        let targets = crate::domain::IndexTargets::for_path(path, language.as_ref());
+        crate::knowledge::classify_stable_content(path, targets, body.as_bytes())
+    }
+
+    fn oracle_is_demoted(path: &str, body: &str) -> bool {
+        matches!(
+            oracle_admission(path, body),
+            crate::knowledge::StableContentAdmission::MetadataOnly(
+                crate::domain::MetadataOnlyReason::SensitiveContent { .. }
+            )
+        )
+    }
+
+    /// Bytes the v1 searchable-text decoder rejects, wrapped around `marker`.
+    fn oracle_undecodable_bytes(marker: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF_u8, 0xFE];
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes.extend_from_slice(&[0xFF_u8, 0xFE]);
+        bytes
+    }
+
+    // ── 7A. MUST BECOME CLEAN ────────────────────────────────────────────────
+
+    /// GREEN-CONTROL (C1–C7, C9, C11). Ordinary source expressions that satisfy
+    /// `KEY = VALUE` only because the value class accepts any 8+ non-space,
+    /// non-quote run. None of these can BE a credential: in code a credential is
+    /// a string LITERAL, and not one of these opens one. C1 is additionally the
+    /// interpolation carve-out's canary — it regresses to SENSITIVE the moment
+    /// that carve-out is missing or misplaced.
+    ///
+    /// C9 and C11 are the two REMAINING accepted false negatives, asserted CLEAN
+    /// DELIBERATELY: a code comment carrying `k=v`, and a bare `k=v` line in a
+    /// code file. An accepted false negative that no test pins is an unstated
+    /// one. Both now hold for a NEW pair of reasons — even quote parity to the
+    /// line start, so neither is "inside a literal", AND the bounded balanced
+    /// walk fully consumes the expression at depth 0 without finding a fenced
+    /// payload. Neither survives on the old line-local shortcut.
+    ///
+    /// CAVEAT on C9: quote parity is byte-wise, so a single apostrophe earlier on
+    /// the comment line flips it and the row goes SENSITIVE (fail-closed, but it
+    /// would move this row). Keep the fixture apostrophe-free.
+    ///
+    /// C8 and C10 LEFT this set — see
+    /// `oracle_b_credentials_embedded_in_literals_must_stay_content_demoted`
+    /// (S12b) and `oracle_b_wrapped_and_unconsumed_expressions_must_stay_content_demoted`
+    /// (S10). C11 remains the tripwire proving the `big.rs` fixture in
+    /// `tier2_sweep_withholds_file_whose_current_bytes_are_sensitive` would go
+    /// vacuous on a bare `k=v` line.
+    #[test]
+    fn oracle_a_code_expression_shapes_must_not_be_content_demoted() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let password_kw = kw_password();
+        let rows: Vec<(&str, &str, String)> = vec![
+            (
+                "C1 brace interpolation",
+                "src/probe.rs",
+                format!("let line = format!(\"{token_kw}={{canary}}\");\n"),
+            ),
+            (
+                "C2 type expression",
+                "src/probe.rs",
+                format!("stop_{token_kw}: Option<Arc<AtomicBool>>,\n"),
+            ),
+            (
+                "C3 associated call",
+                "src/probe.rs",
+                format!("let {token_kw} = PortRegistry::new();\n"),
+            ),
+            (
+                "C4 method/chained call",
+                "src/probe.rs",
+                format!("let {token_kw} = self.inner.clone();\n"),
+            ),
+            (
+                "C5 free function call",
+                "src/probe.rs",
+                format!("let {token_kw} = spawn_watcher(handle);\n"),
+            ),
+            (
+                "C6 member chain, no call",
+                "src/probe.rs",
+                format!("let {token_kw} = config.stop_flag;\n"),
+            ),
+            (
+                "C7 bare identifier",
+                "src/probe.rs",
+                format!("let {token_kw} = previous_value;\n"),
+            ),
+            (
+                "C9 code comment (accepted FN)",
+                "src/probe.rs",
+                format!("// {password_kw}={v}\n"),
+            ),
+            (
+                "C11 bare k=v line in a code file (accepted FN; big.rs tripwire)",
+                "big.rs",
+                format!("{password_kw}={v}\n"),
+            ),
+        ];
+
+        let still_demoted: Vec<&str> = rows
+            .iter()
+            .filter(|(_, path, body)| oracle_is_demoted(path, body))
+            .map(|(row, _, _)| *row)
+            .collect();
+        assert!(
+            still_demoted.is_empty(),
+            "these code-expression shapes are still content-demoted: {still_demoted:?}"
+        );
+    }
+
+    // ── 7B. MUST STAY SENSITIVE ──────────────────────────────────────────────
+
+    /// GREEN-GUARD (S1–S9). Credential-shaped assignments on CODE paths. S1–S4
+    /// survive because the value OPENS a quoted literal — step 1 of the stage-2
+    /// predicate, decided before either new check runs, which is what makes row
+    /// S1 immovable. S5–S9 survive because the bounded balanced walk still finds
+    /// a delimiter-fenced payload run in the right-hand-side expression. S7 is
+    /// the mandatory counter-oracle: a call expression wrapping a quoted opaque
+    /// literal must NOT be exempted, or the literal is never examined.
+    #[test]
+    fn oracle_b_credential_literal_shapes_stay_content_demoted_on_code_paths() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let password_kw = kw_password();
+        let rows: Vec<(&str, &str, String)> = vec![
+            (
+                "S1 snake_case, double-quoted",
+                "src/probe.rs",
+                format!("let api_key = \"{v}\";\n"),
+            ),
+            (
+                "S2 SCREAMING_SNAKE, double-quoted",
+                "src/probe.ts",
+                format!("const API_TOKEN = \"{v}\";\n"),
+            ),
+            (
+                "S3 camelCase, double-quoted",
+                "src/probe.ts",
+                format!("const clientSecret = \"{v}\";\n"),
+            ),
+            (
+                "S4 single-quoted",
+                "src/probe.ts",
+                format!("const token = '{v}';\n"),
+            ),
+            (
+                "S5 template literal",
+                "src/probe.ts",
+                format!("const {password_kw} = `{v}`;\n"),
+            ),
+            (
+                "S6 raw string literal",
+                "src/probe.go",
+                format!("password = `{v}`\n"),
+            ),
+            (
+                "S7 COUNTER-ORACLE: call wrapping a quoted literal",
+                "src/probe.py",
+                format!("{token_kw} = get_secret(\"{v}\")\n"),
+            ),
+            (
+                "S8 call with a quoted fallback",
+                "src/probe.rs",
+                format!("let {token_kw} = fetch().unwrap_or(\"{v}\");\n"),
+            ),
+            (
+                "S9 accepted over-fire: quoted env-var name",
+                "src/probe.py",
+                format!(
+                    "{} = os.environ[\"{}_NAME\"]\n",
+                    kw_key(),
+                    kw_key().to_ascii_uppercase()
+                ),
+            ),
+        ];
+
+        let not_demoted: Vec<&str> = rows
+            .iter()
+            .filter(|(_, path, body)| !oracle_is_demoted(path, body))
+            .map(|(row, _, _)| *row)
+            .collect();
+        assert!(
+            not_demoted.is_empty(),
+            "these credential-shaped rows lost their demotion: {not_demoted:?}"
+        );
+    }
+
+    /// GREEN-GUARD (G1–G4, G9–G11). These rows assert STAY DEMOTED, and they now
+    /// hold only because of the `is_code_language` gate and the rule-id scoping
+    /// of the stage-2 exemption — a safety property that must hold for a NEW
+    /// reason, not a control proving we did not over-refuse. Config, data and
+    /// markup paths stay STRICT (`KEY=VALUE` is their native credential syntax),
+    /// and the other four detector rules keep firing on CODE paths, which is what
+    /// bounds the accepted false negatives in 7A.
+    #[test]
+    fn oracle_b_non_code_paths_and_sibling_rules_stay_strict() {
+        let v = oracle_opaque();
+        let envelope = ["-----BEGIN RSA ", "PRIVATE KEY", "-----"].concat();
+        let rows: Vec<(&str, &str, String)> = vec![
+            ("G1 dotenv", ".env", format!("API_KEY={v}\n")),
+            ("G2 yaml", "config/app.yaml", format!("  password: {v}\n")),
+            (
+                "G3 toml",
+                "config/app.toml",
+                format!("password = \"{v}\"\n"),
+            ),
+            ("G4 markdown", "docs/guide.md", format!("password={v}\n")),
+            (
+                "G9 private-key envelope on a code path",
+                "src/probe.rs",
+                format!("let pem = \"{envelope}\";\n"),
+            ),
+            (
+                "G10 authorization header on a code path",
+                "src/probe.rs",
+                format!("let h = \"Authorization: Bearer {v}\";\n"),
+            ),
+            (
+                "G11 uri credentials on a code path",
+                "src/probe.rs",
+                format!("let u = \"https://user:{v}@host/path\";\n"),
+            ),
+        ];
+
+        let not_demoted: Vec<&str> = rows
+            .iter()
+            .filter(|(_, path, body)| !oracle_is_demoted(path, body))
+            .map(|(row, _, _)| *row)
+            .collect();
+        assert!(
+            not_demoted.is_empty(),
+            "these strict-by-design rows lost their demotion: {not_demoted:?}"
+        );
+    }
+
+    /// GREEN-GUARD (G5, G6) + GREEN-CONTROL (G7, G8). The guard surfaces scan
+    /// SYNTHETIC labels, not paths: `LanguageId::from_path` returns `None` for
+    /// both, so a code-language-gated exemption leaves them strict. That is
+    /// currently an ACCIDENT OF NAMING — G6 pins it, so renaming either label to
+    /// something ending `.rs` fails loudly instead of silently relaxing the
+    /// query/hit guards.
+    ///
+    /// G8 is re-based (MEDIUM-4): its old fixture was admitted by BOTH
+    /// `is_placeholder`'s `your_` branch AND the code-expression exemption, so
+    /// deleting the `your_` branch left it green and it no longer guarded the
+    /// property it names. A QUOTED template placeholder restores that — the value
+    /// OPENS a literal so stage 2 cannot admit it, and the capture starts with a
+    /// sigil so the single-interpolation carve-out cannot either. Only
+    /// `is_placeholder` can, which makes it load-bearing again, and the row
+    /// doubles as the carve-out's boundary pin. Shape mirrored by
+    /// `oracle_g8_rebase_target_quoted_template_placeholder_stays_admitted`.
+    #[test]
+    fn oracle_b_guard_surfaces_and_placeholder_suppression_are_unchanged() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+
+        // G5: the visible-field guard must still reject a credential-shaped field.
+        assert!(
+            crate::knowledge::guard_query(&format!("{token_kw}={v}")).is_err(),
+            "G5 the query guard must reject a credential-shaped field"
+        );
+
+        // G6: neither synthetic guard label may resolve to a language.
+        assert!(
+            LanguageId::from_path("external-field").is_none()
+                && LanguageId::from_path("analytics").is_none(),
+            "G6 the synthetic guard labels must not resolve to a language, or a \
+             code-language-gated exemption would silently relax the guard surfaces"
+        );
+
+        // G7/G8: placeholder suppression is preserved on both path classes.
+        assert!(
+            !oracle_is_demoted(
+                "notes.txt",
+                &format!("{}=your_api_key_here\n", kw_key().to_ascii_uppercase()),
+            ),
+            "G7 a documented placeholder must stay admitted on a text path"
+        );
+        assert!(
+            !oracle_is_demoted(
+                "src/probe.rs",
+                &format!("let {token_kw} = \"${{DEPLOY_ENV_NAME}}\";\n"),
+            ),
+            "G8 a quoted template placeholder must stay admitted on a code path, \
+             with is_placeholder as the only admitting branch"
+        );
+    }
+
+    /// GREEN-GUARD. The shape the `big.rs` fixture in
+    /// `tier2_sweep_withholds_file_whose_current_bytes_are_sensitive` must be
+    /// re-based onto once C11 lands: a quoted opaque literal beside an exempted
+    /// associated-call expression, both on a CODE path. Proving the demotion
+    /// here is what stops the re-based fixture from passing vacuously.
+    #[test]
+    fn oracle_rebase_target_shape_stays_content_demoted_on_a_code_path() {
+        let v = oracle_opaque();
+        let body = format!("let password = \"{v}\";\nlet r = PortRegistry::new();\n");
+        assert!(
+            oracle_is_demoted("big.rs", &body),
+            "the re-base target shape must remain content-demoted on a code path"
+        );
+    }
+
+    // ── 7C. GATE ROWS ────────────────────────────────────────────────────────
+
+    /// RED (D1). Undecodable bytes on a NON-code path: `classify_stable_content`
+    /// returns `UnsupportedTextEncoding`, which the gate PERMITS — disclosing
+    /// bytes the secret scanner never inspected.
+    #[tokio::test]
+    async fn oracle_d1_undecodable_bytes_on_a_non_code_path_are_refused() {
+        let repo = TempDir::new().expect("temp repo");
+        let marker = oracle_marker();
+        fs::write(
+            repo.path().join("blob.bin"),
+            oracle_undecodable_bytes(&marker),
+        )
+        .expect("write undecodable blob");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("blob.bin")))
+            .await;
+        assert!(
+            !out.contains(&marker),
+            "D1 disclosed unscanned bytes; response shape: {}",
+            refusal_shape(&out)
+        );
+        assert!(
+            out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "D1 unscannable bytes must be refused; response shape: {}",
+            refusal_shape(&out)
+        );
+    }
+
+    /// GREEN-GUARD (D2). The code-path twin of D1. It used to be the population
+    /// option (ii) structurally could not reach — `IndexTargets::for_path` yields
+    /// `Code` for every recognized code language, so `includes_knowledge()` was
+    /// false and the encoding branch never ran. Ruling 4 removed that gate at
+    /// publication time; this row keeps the READ lane pinned independently, since
+    /// the gate decides the refusal MESSAGE on its own buffer before the
+    /// classifier is consulted at all.
+    #[tokio::test]
+    async fn oracle_d2_undecodable_bytes_on_a_code_path_are_refused() {
+        let repo = TempDir::new().expect("temp repo");
+        let marker = oracle_marker();
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(
+            repo.path().join("src/blob.rs"),
+            oracle_undecodable_bytes(&marker),
+        )
+        .expect("write undecodable blob");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("src/blob.rs")))
+            .await;
+        assert!(
+            !out.contains(&marker),
+            "D2 disclosed unscanned bytes; response shape: {}",
+            refusal_shape(&out)
+        );
+        assert!(
+            out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "D2 unscannable bytes must be refused; response shape: {}",
+            refusal_shape(&out)
+        );
+    }
+
+    /// RED (D3). The same population through the OTHER gated lane. Parsing
+    /// unscanned bytes and reporting their structure is a disclosure too.
+    #[tokio::test]
+    async fn oracle_d3_validate_file_syntax_refuses_undecodable_bytes() {
+        let repo = TempDir::new().expect("temp repo");
+        let marker = oracle_marker();
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(
+            repo.path().join("src/blob.rs"),
+            oracle_undecodable_bytes(&marker),
+        )
+        .expect("write undecodable blob");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
+                path: "src/blob.rs".to_string(),
+            }))
+            .await;
+        assert!(
+            !out.contains(&marker),
+            "D3 disclosed unscanned bytes; response shape: {}",
+            refusal_shape(&out)
+        );
+        assert!(
+            out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "D3 unscannable bytes must be refused; response shape: {}",
+            refusal_shape(&out)
+        );
+    }
+
+    /// RED (D4). Refusing an over-budget file is CORRECT — the detector never
+    /// inspected it. The MESSAGE is the defect: today it claims the file is
+    /// "excluded by the repository's admission rules" and tells the caller to
+    /// reindex, which is both untrue and unactionable for a size-limit case.
+    /// The honest variant must also stay leak-free: no size, no threshold, no
+    /// digit of any kind.
+    #[tokio::test]
+    async fn oracle_d4_over_budget_file_refusal_message_is_honest() {
+        let repo = TempDir::new().expect("temp repo");
+        let body = "x".repeat(4 * 1024 * 1024 + 1);
+        fs::write(repo.path().join("oversized-blob.rs"), &body).expect("write oversized file");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("oversized-blob.rs")))
+            .await;
+        assert!(
+            out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "D4 an unscannable file must be refused; response shape: {}",
+            refusal_shape(&out)
+        );
+        assert!(
+            !out.contains("reindex the repository"),
+            "D4 a size-limit refusal must not claim reindexing will help; got: {out}"
+        );
+        assert!(
+            !out.chars().any(|character| character.is_ascii_digit()),
+            "D4 a refusal must not leak the size or the threshold; got: {out}"
+        );
+    }
+
+    /// GREEN-CONTROL. Fail-closed is about DISCLOSURE, not estimation: the
+    /// bucket-M estimate branch reads `fs::metadata` only and never calls the
+    /// gate, so the two populations D1–D4 newly deny must keep estimating.
+    /// `estimate_succeeds_for_demoted_file_while_content_selectors_refuse`
+    /// covers only the security-demoted population, not this one.
+    #[tokio::test]
+    async fn oracle_d_estimates_stay_permitted_for_unscannable_files() {
+        let repo = TempDir::new().expect("temp repo");
+        let marker = oracle_marker();
+        fs::write(
+            repo.path().join("blob.bin"),
+            oracle_undecodable_bytes(&marker),
+        )
+        .expect("write undecodable blob");
+        fs::write(
+            repo.path().join("oversized-blob.rs"),
+            "x".repeat(4 * 1024 * 1024 + 1),
+        )
+        .expect("write oversized file");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        for path in ["blob.bin", "oversized-blob.rs"] {
+            let mut input = get_file_content_input(path);
+            input.estimate = Some(true);
+            let out = server.get_file_content(Parameters(input)).await;
+            assert!(
+                !out.contains(&marker),
+                "{path} estimate leaked file bytes; response shape: {}",
+                refusal_shape(&out)
+            );
+            assert!(
+                out.starts_with("Estimate for get_file_content"),
+                "{path} estimation must stay permitted; response shape: {}",
+                refusal_shape(&out)
+            );
+        }
+    }
+
+    /// GREEN-CONTROL. The fail-closed check lands before
+    /// `classify_stable_content`, and a Git LFS pointer is valid UTF-8 well
+    /// under the scan budget, so it must not be swallowed by it. Without this a
+    /// refuse-everything fail-closed check would still pass D1–D4.
+    #[tokio::test]
+    async fn oracle_d_lfs_pointer_is_still_served_by_the_gate() {
+        let repo = TempDir::new().expect("temp repo");
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 42\n",
+            "0".repeat(64)
+        );
+        fs::write(repo.path().join("assets.model"), &pointer).expect("write pointer");
+        let server = make_server_with_root(
+            make_live_index_ready(vec![]),
+            Some(repo.path().to_path_buf()),
+        );
+
+        let out = server
+            .get_file_content(Parameters(get_file_content_input("assets.model")))
+            .await;
+        assert!(
+            !out.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "an LFS pointer must not be refused; response shape: {}",
+            refusal_shape(&out)
+        );
+    }
+
+    /// RED (D5). `validate_file_syntax` has no classifier arm, so its refusal
+    /// falls through `classify_compact_tool_output`'s catch-all and a withheld
+    /// file is reported as a SUCCESSFUL validation — including into the STEL
+    /// chain. Same class of defect as the `is_error_output` duplication.
+    #[test]
+    fn oracle_d5_validate_file_syntax_refusal_is_not_reported_as_a_success() {
+        let refusal =
+            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        assert_eq!(
+            super::classify_compact_tool_output("validate_file_syntax", &refusal),
+            OutcomeClass::InvalidRequest,
+            "a withheld-content refusal must not classify as a successful validation"
+        );
+        assert!(
+            !super::compact_tool_output_is_success("validate_file_syntax", &refusal),
+            "a withheld-content refusal must not be admitted into the STEL chain"
+        );
+    }
+
+    /// GREEN-GUARD (D6, D7). `get_file_content` already classifies the refusal —
+    /// it must keep doing so once the shape moves into the shared predicate, and
+    /// the ANCHORING property must survive the move: a body that merely QUOTES
+    /// the phrase mid-text is a successful read, not a refusal.
+    #[test]
+    fn oracle_d6_d7_withheld_refusal_is_classified_only_when_anchored() {
+        let refusal =
+            crate::protocol::format::content_withheld_by_admission("config/settings.toml");
+        assert_eq!(
+            super::classify_compact_tool_output("get_file_content", &refusal),
+            OutcomeClass::InvalidRequest,
+            "D6 get_file_content must classify the refusal as an invalid request"
+        );
+
+        let quoting = format!("7: // {refusal}\n");
+        for tool in ["get_file_content", "validate_file_syntax"] {
+            assert_eq!(
+                super::classify_compact_tool_output(tool, &quoting),
+                OutcomeClass::Found,
+                "D7 {tool} must keep a body that merely quotes the refusal classified as found"
+            );
+        }
+    }
+
+    // ── Round-3 oracle set ───────────────────────────────────────────────────
+    //
+    // Authored BEFORE the fix, same discipline as the block above: every fixture
+    // body is assembled at runtime from non-secret fragments, no failure message
+    // echoes a body, and rows are named by id and SHAPE only.
+
+    /// The rule's own keywords, assembled so that no source line in this file
+    /// spells a `keyword`-adjacent-`=` pair ahead of an 8-byte payload run.
+    /// Peers: `runtime_canary`, `oracle_opaque`.
+    fn kw_key() -> String {
+        ["api", "_", "key"].concat()
+    }
+
+    fn kw_token() -> String {
+        ["to", "ken"].concat()
+    }
+
+    fn kw_password() -> String {
+        ["pass", "word"].concat()
+    }
+
+    /// Collect the row ids whose demotion verdict is not the one asserted.
+    fn oracle_rows_off_expectation(
+        rows: &[(&'static str, &str, String)],
+        demoted: bool,
+    ) -> Vec<&'static str> {
+        rows.iter()
+            .filter(|(_, path, body)| oracle_is_demoted(path, body) != demoted)
+            .map(|(row, _, _)| *row)
+            .collect()
+    }
+
+    // ── 7A. STATED CEILINGS ──────────────────────────────────────────────────
+
+    /// GREEN-CONTROL (C12, C13). Two ceilings of the byte-wise stage-2
+    /// predicate, converted from UNSTATED false negatives into pinned ones.
+    ///
+    /// C12 (MEDIUM-3): alternately-delimited literals — an Elixir sigil, a Ruby
+    /// percent literal — carry none of the three delimiters the payload fence
+    /// recognizes, so no fenced run is ever found. Deciding them needs a
+    /// per-language sigil sub-lexer, which the design declines to build.
+    ///
+    /// C13: a literal OPENED ON A PRIOR LINE is invisible to a line-bounded
+    /// backward scan, and a Rust raw string yields a one-byte capture so the
+    /// rule produces no match at all. Both are pre-existing; neither widens.
+    #[test]
+    fn oracle_a_stated_false_negative_ceilings_stay_clean() {
+        let v = oracle_opaque();
+        let key_kw = kw_key();
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "C12a elixir sigil literal",
+                "src/probe.exs",
+                format!("{key_kw} = ~s({v})\n"),
+            ),
+            (
+                "C12b ruby percent literal",
+                "src/probe.rb",
+                format!("{key_kw} = %q[{v}]\n"),
+            ),
+            (
+                "C13a value inside a literal opened on a prior line",
+                "src/probe.py",
+                format!("BANNER = \"\"\"\n{key_kw}={v}\n\"\"\"\n"),
+            ),
+            (
+                "C13b rust raw-string right-hand side",
+                "src/probe.rs",
+                format!("let {key_kw} = r#\"{v}\"#;\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, false);
+        assert!(
+            off.is_empty(),
+            "these stated-ceiling rows are content-demoted: {off:?}"
+        );
+    }
+
+    // ── 7B. MUST STAY SENSITIVE (Rulings 2 and 3) ────────────────────────────
+
+    /// RED (S10, S11, S11b). Ruling 2: the stage-2 withdrawal test must scan the
+    /// BALANCED MULTILINE right-hand side within a fixed bound and REQUIRE FULL
+    /// CONSUMPTION, failing closed on unbalanced or over-bound input.
+    ///
+    /// S10 overturns row C10 of
+    /// `oracle_a_code_expression_shapes_must_not_be_content_demoted`: stopping at
+    /// the first newline is a FORMATTING distinction, not a semantic one —
+    /// rustfmt and black produce exactly this shape for long arguments, and
+    /// credentials are long, so the false negative is systematically aligned with
+    /// the values the rule exists to catch.
+    ///
+    /// S11 and S11b separate the two fail-closed arms so neither can be dropped
+    /// silently: S11 exhausts the window with an unclosed delimiter (nonzero
+    /// depth), S11b exhausts it at depth ZERO, so only the "window truncated
+    /// before the expression terminated" signal can refuse it.
+    #[test]
+    fn oracle_b_wrapped_and_unconsumed_expressions_must_stay_content_demoted() {
+        let v = oracle_opaque();
+        let key_kw = kw_key();
+        let token_kw = kw_token();
+        // Longer than the bounded right-hand-side window, and bracket-free, so
+        // the walk is still at depth zero when the window runs out.
+        let wide = "alpha_one + beta_two + gamma_three + delta_four + ".repeat(12);
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S10a formatter-wrapped call argument (python)",
+                "src/probe.py",
+                format!("{token_kw} = get_secret(\n    \"{v}\",\n)\n"),
+            ),
+            (
+                "S10b formatter-wrapped call argument (rust)",
+                "src/probe.rs",
+                format!("let {token_kw} = get_secret(\n    \"{v}\",\n);\n"),
+            ),
+            (
+                "S11 right-hand side opens a delimiter and never closes",
+                "src/probe.rs",
+                format!("let {key_kw} = compute_default(\n    alpha,\n    beta,\n"),
+            ),
+            (
+                "S11b right-hand side at depth zero but over the scan bound",
+                "src/probe.rs",
+                format!("let {key_kw} = {wide}omega_end;\nfn tail() {{}}\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, true);
+        assert!(
+            off.is_empty(),
+            "these unconsumed right-hand sides are not content-demoted: {off:?}"
+        );
+    }
+
+    /// RED (S12, S13). Ruling 3 / HIGH-1: a credential EMBEDDED IN A URL OR
+    /// CONNECTION STRING REMAINS SENSITIVE. Today stage 2 inspects only the byte
+    /// immediately before the value, so when the match sits inside a surrounding
+    /// string literal the opening quote precedes the KEYWORD and the exemption
+    /// never withdraws.
+    ///
+    /// S12b is the exact body that row C8 of
+    /// `oracle_a_code_expression_shapes_must_not_be_content_demoted` asserts
+    /// CLEAN today, so the two rows contradict each other until C8 is moved.
+    /// S13 is reachable by no other rule — `secret.uri-credentials` requires
+    /// userinfo, which a query parameter is not.
+    #[test]
+    fn oracle_b_credentials_embedded_in_literals_must_stay_content_demoted() {
+        let v = oracle_opaque();
+        let key_kw = kw_key();
+        let password_kw = kw_password();
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S12a connection-string literal (csharp)",
+                "src/probe.cs",
+                format!("var connection = \"Server=db;User Id=sa;{password_kw}={v};\";\n"),
+            ),
+            (
+                "S12b assignment embedded in a source string literal (rust)",
+                "src/probe.rs",
+                format!("assert!(!stored.contains(\"{password_kw}={v}\"));\n"),
+            ),
+            (
+                "S13 credential as a url query parameter",
+                "src/probe.rs",
+                format!("let endpoint = \"https://host.invalid/path?{key_kw}={v}\";\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, true);
+        assert!(
+            off.is_empty(),
+            "these embedded-literal credentials are not content-demoted: {off:?}"
+        );
+    }
+
+    /// RED (S14, S15). The owner's CONSTRAINT on Ruling 3's placeholder
+    /// carve-out: an interpolated placeholder in one position MUST NOT license a
+    /// hardcoded literal elsewhere in the same string.
+    ///
+    /// S14 is the greedy-capture path (the two are joined, so the capture is not
+    /// wholly a brace group). S15 is the independent-second-match path (the
+    /// first capture IS wholly a brace group and may be exempted; the second
+    /// keyword must still be judged on its own merits). A carve-out spelled as
+    /// "the capture CONTAINS a brace group" passes S15 and fails S14.
+    #[test]
+    fn oracle_b_placeholder_must_not_license_an_adjacent_literal() {
+        let v = oracle_opaque();
+        let key_kw = kw_key();
+        let token_kw = kw_token();
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S14 placeholder and literal joined in one string",
+                "src/probe.rs",
+                format!("let line = format!(\"{token_kw}={{deploy_env_name}}&{key_kw}={v}\");\n"),
+            ),
+            (
+                "S15 placeholder and literal space-separated in one string",
+                "src/probe.rs",
+                format!("let line = format!(\"{token_kw}={{deploy_env_name}} {key_kw}={v}\");\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, true);
+        assert!(
+            off.is_empty(),
+            "a placeholder licensed an adjacent hardcoded literal: {off:?}"
+        );
+    }
+
+    /// RED (S16). Blocker B1: the bounded balanced walk used to treat EVERY `'`
+    /// that failed the payload-fence test as a literal opener and jump to the
+    /// next identical byte. Two mis-paired apostrophes — a pair of lifetime
+    /// sigils here, an English contraction in a comment elsewhere — therefore
+    /// bracket the quoted credential and the walk steps clean over it, reaching
+    /// depth 0 and GRANTING the exemption. Fail-open.
+    ///
+    /// The three rows differ ONLY in apostrophe count, so the count is provably
+    /// the variable: zero already fenced, one already failed closed on an
+    /// unterminated literal, and two — and only two — leaked.
+    #[test]
+    fn oracle_b_apostrophe_pairs_must_not_bracket_a_payload_out_of_the_walk() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let rows: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S16a zero apostrophes (control)",
+                "src/probe.rs",
+                format!("let {token_kw} = Wrapper::build(\"{v}\", PhantomData);\n"),
+            ),
+            (
+                "S16b one apostrophe (control)",
+                "src/probe.rs",
+                format!("let {token_kw} = Wrapper::<'a>::build(\"{v}\", PhantomData);\n"),
+            ),
+            (
+                "S16c two apostrophes bracketing the payload",
+                "src/probe.rs",
+                format!("let {token_kw} = Wrapper::<'a>::build(\"{v}\", PhantomData::<&'b u8>);\n"),
+            ),
+        ];
+
+        let off = oracle_rows_off_expectation(&rows, true);
+        assert!(
+            off.is_empty(),
+            "apostrophes hid a quoted payload from the walk: {off:?}"
+        );
+    }
+
+    /// RED (S17a) + GREEN (S17b) + GREEN-CONTROL (S17c, S17d, S17e). Blocker
+    /// B2, found while verifying B1: the unconditional one-byte advance leaves
+    /// a char literal's content byte VISIBLE to the depth tracker. A `')'`
+    /// char literal therefore underflows `depth`, and the enclosing-group arm
+    /// reads that as "expression consumed" and GRANTS the exemption before the
+    /// real fenced payload is ever reached — fail-open. Measured before the
+    /// bounded-char-literal skip: S17a CLEAN while S17e, identical but for the
+    /// char literal, was SENSITIVE — the char literal was provably the
+    /// variable. The bounded skip closes S17a; S17c pins the precision the
+    /// bound restores (a benign `'{'` no longer inflates depth into a phantom
+    /// unbalance — it was demoted before the skip); S17d pins the benign
+    /// closing-bracket literal; S17b pins the payload fence firing regardless
+    /// of char-literal handling.
+    #[test]
+    fn oracle_b_char_literal_brackets_must_not_consume_the_walk() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let demoted: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S17a ')' char literal ahead of a fenced payload",
+                "src/probe.rs",
+                format!("let {token_kw} = compose_from(')').materialize(\"{v}\");\n"),
+            ),
+            (
+                "S17b '(' char literal ahead of a fenced payload",
+                "src/probe.rs",
+                format!("let {token_kw} = split_segments('(', \"{v}\");\n"),
+            ),
+            (
+                "S17e control for S17a with the char literal removed",
+                "src/probe.rs",
+                format!("let {token_kw} = compose_from(x).materialize(\"{v}\");\n"),
+            ),
+        ];
+        let clean: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S17c benign '{' char literal must not phantom-unbalance",
+                "src/probe.rs",
+                format!("let {token_kw} = wrap_segments('{{', source_text);\n"),
+            ),
+            (
+                "S17d benign ')' char literal stays clean",
+                "src/probe.rs",
+                format!("let {token_kw} = trim_matching(')', source_text);\n"),
+            ),
+        ];
+
+        let off_demoted = oracle_rows_off_expectation(&demoted, true);
+        let off_clean = oracle_rows_off_expectation(&clean, false);
+        assert!(
+            off_demoted.is_empty() && off_clean.is_empty(),
+            "char-literal rows off expectation: not demoted {off_demoted:?}, \
+             not clean {off_clean:?}"
+        );
+    }
+
+    /// RED (S18) + GREEN-CONTROL (G9). Open item H1, ruled: `is_placeholder`'s
+    /// `${…}`/`{{…}}` branches tested the ENDS only — `starts_with("${") &&
+    /// ends_with('}')` — so a capture BRACKETED by two placeholders satisfied
+    /// them while carrying a hardcoded literal between them, and because the
+    /// branch runs before the `is_code_language` gate the leak reached EVERY
+    /// path class, config included. Ruled fix: the whole-capture single-group
+    /// discipline `capture_is_single_interpolation` already has.
+    ///
+    /// S18 pins the three measured leaks, one per path class. G9 pins the
+    /// ruling's stated limit — a LONE group keeps its exemption, including a
+    /// shell default-expansion and a mustache default filter, whose literal
+    /// defaults were deliberately NOT made sensitive. Together they prove the
+    /// fix discriminates one group from two rather than deleting the branch.
+    #[test]
+    fn oracle_b_placeholders_must_not_bracket_a_hardcoded_literal() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let demoted: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S18a shell placeholders bracketing a literal (code path)",
+                "src/probe.rs",
+                format!("let {token_kw} = \"${{ALPHA}}{v}${{OMEGA}}\";\n"),
+            ),
+            (
+                "S18b shell placeholders bracketing a literal (env path)",
+                ".env",
+                format!("{token_kw}=${{ALPHA}}{v}${{OMEGA}}\n"),
+            ),
+            (
+                "S18c mustache placeholders bracketing a literal (yaml path)",
+                "config.yaml",
+                format!("{token_kw}: \"{{{{alpha}}}}{v}{{{{omega}}}}\"\n"),
+            ),
+        ];
+        let clean: Vec<(&'static str, &str, String)> = vec![
+            (
+                "G9a lone shell default-expansion stays admitted",
+                ".env",
+                format!("{token_kw}=${{DEPLOY_ENV_NAME:-{v}}}\n"),
+            ),
+            (
+                "G9b lone mustache default filter stays admitted",
+                "config.yaml",
+                format!("{token_kw}: \"{{{{deploy_env_name|default:{v}}}}}\"\n"),
+            ),
+            (
+                "G9c lone shell placeholder stays admitted on a code path",
+                "src/probe.rs",
+                format!("let {token_kw} = \"${{DEPLOY_ENV_NAME_VALUE}}\";\n"),
+            ),
+        ];
+
+        let off_demoted = oracle_rows_off_expectation(&demoted, true);
+        let off_clean = oracle_rows_off_expectation(&clean, false);
+        assert!(
+            off_demoted.is_empty() && off_clean.is_empty(),
+            "placeholder-group rows off expectation: not demoted \
+             {off_demoted:?}, not clean {off_clean:?}"
+        );
+    }
+
+    /// RED (S19) + GREEN-CONTROL (G10). Open item H2, ruled: the depth-0
+    /// newline arm terminated the withdrawal walk unconditionally, so a
+    /// formatter continuation that opens NO bracket — a method chain, a `??`
+    /// fallback, a `+` concatenation, a `\` continuation — was never entered.
+    /// Ruling 2's own rationale ("rustfmt and black PRODUCE that shape …
+    /// credentials are long") applies verbatim, and the walk's docstring
+    /// framed non-line-locality as an invariant it did not hold. Ruled fix:
+    /// continue past a depth-0 break only on a continuation operator.
+    ///
+    /// S19a–d are the four measured styles, covering both formatter
+    /// conventions (operator leading the next line, operator trailing the
+    /// previous one). S19e is the single-line control that was already
+    /// sensitive, so the line break alone is provably the variable.
+    ///
+    /// G10 is the precision control the narrow token set exists for: an
+    /// ordinary FINISHED statement must still terminate the walk, so the
+    /// following line's quoted value cannot withdraw the previous line's
+    /// exemption. G10b pins the `,` exclusion specifically — a trailing comma
+    /// ends a struct-literal field, and following it would walk one field's
+    /// exemption into the next field's value.
+    #[test]
+    fn oracle_b_formatter_continuations_must_stay_content_demoted() {
+        let v = oracle_opaque();
+        let token_kw = kw_token();
+        let key_kw = kw_key();
+        let demoted: Vec<(&'static str, &str, String)> = vec![
+            (
+                "S19a method-chain continuation (rust)",
+                "src/probe.rs",
+                format!(
+                    "let {token_kw} = credential_client\n    .fetch_secret_material(\"{v}\");\n"
+                ),
+            ),
+            (
+                "S19b nullish-fallback continuation (typescript)",
+                "src/probe.ts",
+                format!("const {token_kw} = readEnvValue()\n    ?? \"{v}\";\n"),
+            ),
+            (
+                "S19c concatenation continuation (java)",
+                "src/Probe.java",
+                format!("String {token_kw} = assembledPrefix\n    + \"{v}\";\n"),
+            ),
+            (
+                "S19d backslash continuation (python)",
+                "src/probe.py",
+                format!("{token_kw} = assembled_prefix \\\n    + \"{v}\"\n"),
+            ),
+            (
+                "S19e single-line control",
+                "src/probe.rs",
+                format!("let {token_kw} = credential_client.fetch_secret_material(\"{v}\");\n"),
+            ),
+        ];
+        let clean: Vec<(&'static str, &str, String)> = vec![
+            (
+                "G10a a finished statement must still end the walk",
+                "src/probe.rs",
+                format!("let {key_kw} = resolve_from_environment();\nlet banner = \"{v}\";\n"),
+            ),
+            (
+                "G10b a trailing comma ends a struct-literal field",
+                "src/probe.rs",
+                format!(
+                    "let config = Config {{\n    {key_kw}: resolve_from_environment(),\n    \
+                     banner_text: \"{v}\",\n}};\n"
+                ),
+            ),
+        ];
+
+        let off_demoted = oracle_rows_off_expectation(&demoted, true);
+        let off_clean = oracle_rows_off_expectation(&clean, false);
+        assert!(
+            off_demoted.is_empty() && off_clean.is_empty(),
+            "formatter-continuation rows off expectation: not demoted \
+             {off_demoted:?}, not clean {off_clean:?}"
+        );
+    }
+
+    /// GREEN-CONTROL. MEDIUM-4's re-base target for row G8. Today's G8 fixture
+    /// is admitted by BOTH `is_placeholder`'s `your_` branch AND the code-expression
+    /// exemption, so deleting the `your_` branch leaves it green — it no longer
+    /// guards the property it names. A QUOTED template placeholder restores that:
+    /// the value opens a literal, so stage 2 cannot admit it, and the capture
+    /// starts with a sigil, so the single-brace carve-out cannot admit it either.
+    /// Only `is_placeholder` can, which makes it load-bearing again.
+    #[test]
+    fn oracle_g8_rebase_target_quoted_template_placeholder_stays_admitted() {
+        let token_kw = kw_token();
+        let body = format!("let {token_kw} = \"${{DEPLOY_ENV_NAME}}\";\n");
+        assert!(
+            !oracle_is_demoted("src/probe.rs", &body),
+            "G8 re-base target: a quoted template placeholder must stay admitted \
+             on a code path, with is_placeholder as the only admitting branch"
+        );
+    }
+
+    // ── 7D. PUBLICATION AND MESSAGING ────────────────────────────────────────
+
+    /// RED (E1). Ruling 4. `classify_stable_content` gates its encoding check on
+    /// `IndexTargets::includes_knowledge()`, which is FALSE for every code
+    /// language, and the binary sniff clips at `BINARY_SNIFF_BYTES`. A code file
+    /// whose first invalid byte lands PAST that clip is therefore sniffed clean,
+    /// scanned bytewise, lossily parsed, and published into Tier-1 — then served
+    /// from memory through a lane the raw-read gate never sees.
+    ///
+    /// Shape-mirrors `non_utf8_text_is_catalog_only_without_lossy_evidence` in
+    /// `live_index::store`, which exercises only the Knowledge target.
+    #[test]
+    fn oracle_e1_invalid_utf8_past_the_sniff_window_is_catalog_only_on_a_code_path() {
+        let marker = oracle_marker();
+        let mut bytes = format!("// {}\n", "pad ".repeat(2_100)).into_bytes();
+        assert!(
+            bytes.len() > crate::domain::index::BINARY_SNIFF_BYTES,
+            "E1 fixture must place its first invalid byte beyond the binary sniff window"
+        );
+        bytes.extend_from_slice(b"pub fn oracle_e1_anchor() {}\n");
+        bytes.extend_from_slice(&[0xFF_u8, 0xFE]);
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes.push(b'\n');
+
+        // Anti-vacuity control, asserted BEFORE the two RED rows so it is proven
+        // now rather than after the fix: the same fixture minus its invalid tail
+        // is published normally, so the `is_none()` below cannot be satisfied by
+        // the path simply never being discovered.
+        let valid_prefix = bytes.len() - (2 + marker.len() + 1);
+        let control = TempDir::new().expect("temp control repo");
+        fs::create_dir_all(control.path().join("src")).expect("create src");
+        fs::write(control.path().join("src/blob.rs"), &bytes[..valid_prefix])
+            .expect("write control blob");
+        let control_shared = LiveIndex::load(control.path()).expect("E1 control must load");
+        assert!(
+            control_shared.read().get_file("src/blob.rs").is_some(),
+            "E1 control: the same fixture without its invalid tail must be published, \
+             or the demotion assertion below proves nothing"
+        );
+
+        let targets = crate::domain::IndexTargets::for_path("src/blob.rs", Some(&LanguageId::Rust));
+        assert!(
+            matches!(
+                crate::knowledge::classify_stable_content("src/blob.rs", targets, &bytes),
+                crate::knowledge::StableContentAdmission::MetadataOnly(
+                    crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
+                )
+            ),
+            "E1 the WHOLE byte buffer must be encoding-validated before Tier-1 publication"
+        );
+
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("src")).expect("create src");
+        fs::write(repo.path().join("src/blob.rs"), &bytes).expect("write blob");
+        let shared = LiveIndex::load(repo.path()).expect("E1 fixture must load");
+        let index = shared.read();
+        assert!(
+            index.get_file("src/blob.rs").is_none(),
+            "E1 unvalidated bytes must not be published into the in-memory index"
+        );
+    }
+
+    /// Derive the in-band indeterminate discriminator from production's own
+    /// collapse instead of hardcoding it: `classify_stable_content` maps every
+    /// `DetectorFailure` onto one reserved rule id carried inside
+    /// `SensitiveContent`, which is why Ruling 5 needs no new domain variant.
+    fn oracle_indeterminate_rule_id(reason: crate::knowledge::DetectorFailure) -> String {
+        match crate::knowledge::classify_stable_content_with(
+            "notes/probe.txt",
+            crate::domain::IndexTargets::Knowledge,
+            b"clean candidate",
+            |_path, _bytes| crate::knowledge::SecretScan::Indeterminate { reason },
+        ) {
+            crate::knowledge::StableContentAdmission::MetadataOnly(
+                crate::domain::MetadataOnlyReason::SensitiveContent { rule_ids, .. },
+            ) => rule_ids
+                .into_iter()
+                .next()
+                .expect("the collapse must carry exactly one reserved rule id"),
+            other => panic!("a detector failure must fail closed; got {other:?}"),
+        }
+    }
+
+    /// RED (E2). Ruling 5: all three `DetectorFailure` variants must reach the
+    /// HONEST refusal, not the one advising a reindex. Round 2 routed only the
+    /// resource-limit case, which the gate pre-empts on its own buffer before the
+    /// classifier ever runs; the other two collapse into `SensitiveContent` and
+    /// still carry the untrue advice.
+    ///
+    /// Driven against the gate directly rather than a tool entry point: the two
+    /// unreachable-by-construction variants (a process-global policy-compilation
+    /// failure, a missing capture group) cannot be produced at runtime, and a
+    /// server built over a hand-written manifest re-scouts its root and discards
+    /// the entry. The gate's MANIFEST arm is the reachable route, and it is the
+    /// arm Round 2 left untouched: a recorded `SensitiveContent` carrying the
+    /// reserved indeterminate id is written by the same collapse at cold load and
+    /// by the watcher, and it denies BEFORE any read.
+    #[test]
+    fn oracle_e2_indeterminate_detector_failure_refusal_is_honest() {
+        let policy =
+            oracle_indeterminate_rule_id(crate::knowledge::DetectorFailure::PolicyCompilation);
+        let internal = oracle_indeterminate_rule_id(crate::knowledge::DetectorFailure::Internal);
+        let limit = oracle_indeterminate_rule_id(crate::knowledge::DetectorFailure::ResourceLimit);
+        assert_eq!(
+            policy, internal,
+            "E2 every detector failure must collapse onto one reserved rule id"
+        );
+        assert_eq!(
+            policy, limit,
+            "E2 every detector failure must collapse onto one reserved rule id"
+        );
+
+        let repo = TempDir::new().expect("temp repo");
+        fs::create_dir_all(repo.path().join("notes")).expect("create notes");
+        let probe = repo.path().join("notes/probe.txt");
+        fs::write(&probe, "ordinary prose\n").expect("write probe file");
+
+        let mut live = make_live_index_ready(vec![]);
+        live.manifest_entries = vec![crate::domain::CatalogEntry {
+            path: crate::domain::CatalogPath {
+                public_id: "notes/probe.txt".to_string(),
+                normalized_utf8: Some("notes/probe.txt".to_string()),
+            },
+            size: 15,
+            language: None,
+            classification: crate::domain::FileClassification {
+                class: crate::domain::FileClass::Text,
+                is_generated: false,
+                is_test: false,
+                is_vendor: false,
+                is_config: false,
+            },
+            disposition: crate::domain::FileDisposition::MetadataOnly {
+                reason: crate::domain::MetadataOnlyReason::SensitiveContent {
+                    rule_ids: vec![policy],
+                    finding_count: 0,
+                },
+            },
+            content_hash: None,
+        }];
+
+        let refusal = crate::protocol::read_gate::admit_disk_read(&live, "notes/probe.txt", &probe)
+            .expect_err("E2 an indeterminate verdict must stay refused");
+        assert!(
+            refusal.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "E2 the refusal must keep the shared anchor; response shape: {}",
+            refusal_shape(&refusal)
+        );
+        assert!(
+            !refusal.contains("reindex the repository"),
+            "E2 an indeterminate verdict must not advise a reindex that cannot help; got: {refusal}"
+        );
+
+        // The anchor the honest variant must preserve: both refusal texts stay
+        // classified as admission refusals, so nothing keyed on that predicate
+        // regresses when the message is switched.
+        let unscanned = crate::protocol::format::content_withheld_unscanned("notes/probe.txt");
+        assert_eq!(
+            super::classify_compact_tool_output("get_file_content", &unscanned),
+            OutcomeClass::InvalidRequest,
+            "E2 the honest refusal must stay classified as an admission refusal"
+        );
+
+        // GREEN-GUARD, same test so it cannot drift from the row above: the fix
+        // must DISCRIMINATE on the reserved rule id, not switch every refusal to
+        // the honest wording. A path-rule exclusion really can be stale, so its
+        // recovery advice stays. Without this a blanket switch passes E2.
+        let path_rule = repo.path().join(".env");
+        fs::write(&path_rule, "ordinary prose\n").expect("write dotenv fixture");
+        let path_refusal = crate::protocol::read_gate::admit_disk_read(&live, ".env", &path_rule)
+            .expect_err("a path-rule exclusion must stay refused");
+        assert!(
+            path_refusal.contains("reindex the repository"),
+            "E2 a path-rule exclusion must keep its recovery advice; got: {path_refusal}"
+        );
+    }
+
+    /// RED (E3). Blocker H3. `edit::reindex_after_write` is a Tier-1
+    /// PUBLICATION route — it re-reads the file it just wrote and hands those
+    /// bytes to `update_file` — and it used to do so with no content
+    /// classification at all. An edit that INSERTS a credential therefore
+    /// republished it into Tier-1, where `get_file_content` serves it straight
+    /// out of memory without ever consulting the raw-read gate.
+    ///
+    /// Driven through a real `replace_symbol_body`, one of the ten call sites
+    /// that share that boundary, so only a fix AT the boundary makes it pass.
+    ///
+    /// The pre-edit assertion is the anti-vacuity control: the path really is
+    /// Tier-1 first, so its absence afterwards is the eviction and not a fixture
+    /// that was never indexed. The disk read-back is the second one: the edit
+    /// really did persist the value, so the refusal is a withholding decision
+    /// and not a failed write.
+    #[tokio::test]
+    async fn oracle_e3_post_edit_credential_cannot_be_republished_into_tier_1() {
+        let v = oracle_opaque();
+        let key_kw = kw_key();
+        let (_dir, server, file_path) =
+            setup_edit_test_with_fresh_mtime(b"fn target() {\n    let x = 1;\n}\n");
+
+        assert!(
+            server.index.read().get_file("src/lib.rs").is_some(),
+            "E3 control: the fixture must be Tier-1 BEFORE the edit, or its \
+             absence afterwards proves nothing"
+        );
+
+        let edited = server
+            .replace_symbol_body(Parameters(crate::protocol::edit::ReplaceSymbolBodyInput {
+                project: None,
+                path: "src/lib.rs".to_string(),
+                name: "target".to_string(),
+                kind: None,
+                symbol_line: None,
+                new_body: format!("fn target() {{\n    let {key_kw} = \"{v}\";\n}}"),
+                dry_run: None,
+                idempotency_key: None,
+                if_match: None,
+                working_directory: None,
+            }))
+            .await;
+        assert!(
+            edited.contains("replaced"),
+            "E3 the edit must be applied; response shape: {}",
+            refusal_shape(&edited)
+        );
+        assert!(
+            fs::read(&file_path)
+                .expect("read the edited file back")
+                .windows(v.len())
+                .any(|window| window == v.as_bytes()),
+            "E3 control: the edit must really have persisted the value to disk"
+        );
+
+        assert!(
+            server.index.read().get_file("src/lib.rs").is_none(),
+            "E3 post-edit sensitive content was republished into Tier-1"
+        );
+
+        let served = server
+            .get_file_content(Parameters(get_file_content_input("src/lib.rs")))
+            .await;
+        assert!(
+            !served.contains(v.as_str()),
+            "E3 the post-edit value was served; response shape: {}",
+            refusal_shape(&served)
+        );
+        assert!(
+            served.starts_with(WITHHELD_REFUSAL_PREFIX),
+            "E3 the post-edit read must be refused by the gate; response shape: {}",
+            refusal_shape(&served)
+        );
+    }
+
+    // ── 7E. RULING 1'S OWN PROOF ─────────────────────────────────────────────
+
+    /// Walk one tree, recording every file the detector does not call Clean.
+    /// Records `path`, a COUNT and RULE IDS only — never a matched line.
+    fn oracle_scan_tree(dir: &Path, root: &Path, findings: &mut Vec<String>) {
+        // A tripwire that SKIPS what it cannot read reports the same empty
+        // result as a clean tree, so every IO failure is recorded as a finding
+        // rather than swallowed: unreadable is unverified, never clean.
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                findings.push(format!(
+                    "{} [unreadable dir: {}]",
+                    dir.display(),
+                    error.kind()
+                ));
+                return;
+            }
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    findings.push(format!(
+                        "{} [unreadable entry: {}]",
+                        dir.display(),
+                        error.kind()
+                    ));
+                    continue;
+                }
+            };
+            if path.is_dir() {
+                oracle_scan_tree(&path, root, findings);
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    findings.push(format!("{} [unreadable: {}]", path.display(), error.kind()));
+                    continue;
+                }
+            };
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            match crate::knowledge::scan_secret_bytes(&relative, &bytes) {
+                crate::knowledge::SecretScan::Clean => {}
+                crate::knowledge::SecretScan::Sensitive {
+                    rule_ids,
+                    finding_count,
+                } => findings.push(format!("{relative} [{finding_count}] {rule_ids:?}")),
+                crate::knowledge::SecretScan::Indeterminate { reason } => {
+                    findings.push(format!("{relative} [indeterminate {reason:?}]"));
+                }
+            }
+        }
+    }
+
+    /// RED today, GREEN-GUARD after Ruling 1. The mechanical enforcement of the
+    /// owner's policy statement: TEST CODE RECEIVES THE SAME DETECTOR POLICY AS
+    /// PRODUCTION CODE. No region class, no path class, no test-only carve-out
+    /// anywhere in the detector — the repository's own fixtures are what change.
+    ///
+    /// It also fails loudly the next time someone writes a credential-shaped
+    /// fixture into this tree, which is the defect Ruling 1 exists to remove.
+    ///
+    /// SCOPE, stated rather than implied: `src/` and `tests/` — the compiled
+    /// crate. It is NOT a whole-repository sweep, and its green result is not
+    /// a claim about one. Non-compiled trees (`research/`, `docs/`, `specs/`,
+    /// `scripts/`, `npm/`, …) are outside it and DO still carry
+    /// detector-positive shapes; widening the walk would demand rewriting
+    /// captured research artifacts, which no ruling authorizes. Anyone reading
+    /// this test as repository-wide coverage is reading more than it proves.
+    #[test]
+    fn repository_source_is_clean_under_its_own_detector() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut findings: Vec<String> = Vec::new();
+        for tree in ["src", "tests"] {
+            oracle_scan_tree(&root.join(tree), root, &mut findings);
+        }
+        findings.sort();
+        assert!(
+            findings.is_empty(),
+            "{} repository source file(s) trip this repository's own detector: {findings:?}",
+            findings.len()
         );
     }
 }

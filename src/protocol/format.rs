@@ -3633,6 +3633,40 @@ pub fn path_outside_repo(path: &str) -> String {
     )
 }
 
+/// Refusal for a file the admission pipeline excluded from content disclosure.
+///
+/// Deliberately UNIFORM across every security exclusion: it names no rule id, no
+/// rule class, no finding count, no size, and no byte of the file. Whether the
+/// exclusion came from the path rule or from a content detector is the one
+/// content-derived bit a refusal could still leak, and the recovery action is
+/// identical either way, so the message does not distinguish them.
+pub fn content_withheld_by_admission(path: &str) -> String {
+    format!(
+        "Content withheld by admission policy: {path}. \
+         This file is excluded from content retrieval by the repository's \
+         admission rules; SymForge will not read, parse, or search it. \
+         If the exclusion is stale, reindex the repository (index_folder) and retry."
+    )
+}
+
+/// Refusal for a file the admission pipeline could not INSPECT at all — over the
+/// deterministic scan budget, or not decodable as searchable text.
+///
+/// Shares [`content_withheld_by_admission`]'s opening clause, so one anchored
+/// predicate classifies both and every contract keyed on that prefix keeps
+/// holding. Differs only in the recovery sentence: "reindex and retry" is not
+/// merely untrue for these files, it is unactionable — they refuse the same way
+/// on every read. Names no size, no threshold, no encoding, no rule id, no
+/// finding count, and no byte; the wording is identical for both causes, so it
+/// does not even distinguish which one applied.
+pub fn content_withheld_unscanned(path: &str) -> String {
+    format!(
+        "Content withheld by admission policy: {path}. \
+         SymForge could not inspect this file's contents and will not read, \
+         parse, or search it. Reindexing will not change this."
+    )
+}
+
 /// Richer "file not found" with suggested similar paths.
 /// Call this from tool handlers where the index is available.
 pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {

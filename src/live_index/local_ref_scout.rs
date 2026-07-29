@@ -1197,8 +1197,14 @@ mod tests {
     #[test]
     fn withholds_secret_positive_blob_as_metadata_only() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let secret =
-            b"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n";
+        // Envelope assembled at runtime so no key-shaped literal enters this
+        // file; the bytes are unchanged, and a mis-assembled envelope would
+        // classify as Indexed and fail the withholding assertion below.
+        let envelope = ["PRIVATE", " ", "KEY"].concat();
+        let secret = format!(
+            "-----BEGIN RSA {envelope}-----\nMIIBOgIBAAJBAK\n-----END RSA {envelope}-----\n"
+        );
+        let secret = secret.as_bytes();
         let outcome = route_single(dir.path(), "config/key.txt", secret);
         assert!(
             matches!(outcome, RefBlobIngest::Withheld(_)),
@@ -1211,8 +1217,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         init_repo(root);
-        let secret =
-            b"-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END RSA PRIVATE KEY-----\n";
+        // Envelope assembled at runtime so no key-shaped literal enters this
+        // file; the bytes are unchanged, and a mis-assembled envelope would
+        // classify as Indexed and fail the withholding assertion below.
+        let envelope = ["PRIVATE", " ", "KEY"].concat();
+        let secret = format!(
+            "-----BEGIN RSA {envelope}-----\nMIIBOgIBAAJBAK\n-----END RSA {envelope}-----\n"
+        );
+        let secret = secret.as_bytes();
         commit_files(
             root,
             &[

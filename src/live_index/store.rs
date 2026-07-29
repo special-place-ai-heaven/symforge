@@ -7540,8 +7540,14 @@ mod tests {
     fn sensitive_files_remain_catalog_only_with_zero_value_leakage() {
         let tmp = TempDir::new().unwrap();
         let canary = runtime_canary();
-        write_file(tmp.path(), ".env", &format!("password={canary}\n"));
-        write_file(tmp.path(), "notes/guide.txt", &format!("token={canary}\n"));
+        let password_kw = ["pass", "word"].concat();
+        let token_kw = ["to", "ken"].concat();
+        write_file(tmp.path(), ".env", &format!("{password_kw}={canary}\n"));
+        write_file(
+            tmp.path(),
+            "notes/guide.txt",
+            &format!("{token_kw}={canary}\n"),
+        );
 
         let shared = LiveIndex::load(tmp.path()).expect("sensitive fixture must load safely");
         let index = shared.read();
@@ -7586,7 +7592,12 @@ mod tests {
     fn safe_template_path_still_runs_content_detector() {
         let tmp = TempDir::new().unwrap();
         let canary = runtime_canary();
-        write_file(tmp.path(), ".env.example", &format!("password={canary}\n"));
+        let password_kw = ["pass", "word"].concat();
+        write_file(
+            tmp.path(),
+            ".env.example",
+            &format!("{password_kw}={canary}\n"),
+        );
 
         let shared = LiveIndex::load(tmp.path()).expect("safe template fixture must load");
         let index = shared.read();

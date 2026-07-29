@@ -401,6 +401,14 @@ fn append_response_suffix_to_first_summary(summaries: &mut Vec<String>, suffix: 
 /// INVARIANT: All derived index state is rebuilt from the persisted on-disk bytes,
 /// never from the in-memory buffer passed to `fs::write`. If the write partially
 /// fails or the OS buffers differently, the index will still reflect reality.
+///
+/// INVARIANT: this is a Tier-1 PUBLICATION route, so the bytes cross
+/// [`crate::knowledge::classify_stable_content`] before `update_file`, exactly
+/// as cold load and the watcher do. An edit can INTRODUCE a credential into a
+/// file that was clean when it was first published, and Tier-1 content is
+/// served straight out of memory with no further scan, so this is the only
+/// point at which post-edit bytes can still be stopped. Every caller inherits
+/// the check from here — do NOT re-home it into the call sites.
 pub(crate) fn reindex_after_write(
     index: &SharedIndex,
     abs_path: &Path,
@@ -426,6 +434,27 @@ pub(crate) fn reindex_after_write(
         "reindex_after_write: disk content differs from written buffer for {}",
         abs_path.display()
     );
+
+    // The publication boundary, on the SAME allocation that is published below:
+    // `on_disk` is classified here and then moved into `IndexedFile`, so no lane
+    // classifies one buffer and publishes another.
+    let targets = crate::domain::IndexTargets::for_path(relative_path, Some(&language));
+    if let crate::knowledge::StableContentAdmission::MetadataOnly(_) =
+        crate::knowledge::classify_stable_content(relative_path, targets, &on_disk)
+    {
+        // Same disposition cold load and the watcher take: a demoted verdict
+        // EVICTS the path from Tier-1 instead of publishing it. `remove_file`
+        // drops the resident content AND its manifest entry, so no stale
+        // `Indexed` claim survives to authorize the old bytes either. Reads then
+        // fall through to the raw-disk gate, which re-reads, re-classifies and
+        // refuses with the honest message.
+        drop(on_disk);
+        index.remove_file(relative_path);
+        tracing::warn!(
+            "reindex_after_write: {relative_path} withheld from the index by content policy"
+        );
+        return;
+    }
 
     let mtime_secs = std::fs::metadata(abs_path)
         .and_then(|m| m.modified())

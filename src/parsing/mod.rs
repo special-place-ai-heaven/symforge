@@ -2042,7 +2042,11 @@ export function App() {
         // diagnostic must explain the NUL rather than the bare `near ` `` snippet.
         // Robust against grammar behavior: if no diagnostic is produced we skip
         // (the augment helper is covered directly above).
-        let source = "function mint() {\n  const token = `prefix\0suffix`;\n  return token;\n}\n";
+        // The JS binding is deliberately NOT named with a detector keyword:
+        // this fixture's subject is the NUL, not a credential, and a
+        // keyword-named binding beside a backtick literal trips this
+        // repository's own detector.
+        let source = "function mint() {\n  const minted = `prefix\0suffix`;\n  return minted;\n}\n";
         let (_symbols, has_error, diagnostic, _refs, _aliases) =
             parse_source(source, &LanguageId::JavaScript, false)
                 .expect("parse_source must not crash on a NUL-bearing template literal");

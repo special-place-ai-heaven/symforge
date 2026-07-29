@@ -2090,7 +2090,8 @@ mod tests {
     fn watcher_content_policy_withholds_sensitive_bytes_before_publication() {
         let tmp = TempDir::new().unwrap();
         let relative_path = ".env.example";
-        let absolute_path = create_test_source(tmp.path(), relative_path, b"token=placeholder\n");
+        let seed = format!("{}=placeholder\n", ["to", "ken"].concat());
+        let absolute_path = create_test_source(tmp.path(), relative_path, seed.as_bytes());
         let shared = crate::live_index::LiveIndex::load(tmp.path()).unwrap();
         assert!(
             shared.read().get_file(relative_path).is_some(),

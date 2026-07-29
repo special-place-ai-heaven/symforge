@@ -3786,6 +3786,60 @@ mod tests {
         assert_eq!(metadata["reason"], "secret-policy-mismatch");
     }
 
+    /// Guards the v1 → v2 BUMP itself, which the sibling test above cannot:
+    /// it builds its mismatch symbolically as `SECRET_POLICY_VERSION + 1`, so
+    /// it passes at every constant value and says nothing about which values
+    /// are stale. This one names the LITERAL version shipped detectors wrote.
+    ///
+    /// Reverting the bump makes a v1 snapshot match the current policy again,
+    /// and manifests carrying verdicts from before the bounded right-hand-side
+    /// walk, the embedded-literal tightening and whole-buffer encoding
+    /// validation would be trusted — a stale `Indexed` disposition authorizing
+    /// bytes the current detector calls sensitive.
+    #[test]
+    fn snapshots_written_under_the_previous_secret_policy_are_refused() {
+        // Deliberately a LITERAL, not `SECRET_POLICY_VERSION - 1`: the guard is
+        // that THIS value is stale. Revert the bump and this snapshot matches
+        // the current policy, loads, and the assertion below fails.
+        const SUPERSEDED_SECRET_POLICY_VERSION: u32 = 1;
+
+        let tmp = TempDir::new().unwrap();
+        let mut snapshot = build_snapshot(
+            super::capture_snapshot_build_input(&make_live_index_with_files(Vec::new())),
+            tmp.path(),
+        );
+        snapshot.manifest = RepositoryManifest::new(
+            snapshot.manifest.schema_version,
+            snapshot.manifest.policy_version,
+            SUPERSEDED_SECRET_POLICY_VERSION,
+            snapshot.manifest.source.clone(),
+            snapshot.manifest.source_version.clone(),
+            snapshot.manifest.coverage,
+            snapshot.manifest.entries.clone(),
+            snapshot.manifest.issues.clone(),
+            snapshot.manifest.usage,
+        )
+        .unwrap();
+        snapshot.source_identity = super::capture_snapshot_source_identity(
+            tmp.path(),
+            snapshot.project_id.clone(),
+            snapshot.manifest.digest.clone(),
+            snapshot.source_identity.indexed_content_digest.clone(),
+        )
+        .unwrap();
+
+        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let dir = tmp.path().join(".symforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.bin"), &bytes).unwrap();
+
+        assert!(
+            load_snapshot(tmp.path()).is_none(),
+            "a snapshot carrying the superseded detector policy must force a \
+             cold re-scout rather than be trusted"
+        );
+    }
+
     #[test]
     fn runtime_canary_is_absent_from_serialized_snapshot() {
         let tmp = TempDir::new().unwrap();
