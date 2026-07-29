@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.6...v8.16.7) (2026-07-29)
+
+
+### Bug Fixes
+
+* bound stale sidecar descriptor scans ([827a8a3](https://github.com/special-place-ai-heaven/symforge/commit/827a8a32a4b7d4353774f67e4099c1ed9044ae7e))
+
 ## [8.16.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.5...v8.16.6) (2026-07-27)
 
 
