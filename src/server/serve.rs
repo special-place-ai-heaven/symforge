@@ -47,7 +47,7 @@ pub struct ServeArgs {
     pub explicit_listen: bool,
     /// Inline API key (`--api-key`).
     pub api_key: Option<String>,
-    /// Name of an env var holding the API key (`--api-key-env`); used only when
+    /// Name of an env var holding the API key (--api-key-env); used only when
     /// `api_key` is `None`.
     pub api_key_env: Option<String>,
     /// Optional one-shot report of the address this run actually bound.

@@ -357,15 +357,22 @@ fn capture_is_single_interpolation(value: &[u8]) -> bool {
 /// ending in `;`, `)` or an identifier byte is a finished statement and still
 /// terminates the walk, which is what keeps the ordinary next statement out.
 ///
-/// Three bytes are deliberately ABSENT, each for a measured false positive.
-/// `,` — a trailing comma means the element ENDED, and following it walks a
-/// struct-literal field's exemption into the NEXT field's quoted value. `/` —
-/// a leading or trailing slash is far more often a comment than an operator.
-/// `<`/`>` — a generic parameter list closes with `>`, so an unterminated
-/// declaration (`semi: false` TypeScript, Kotlin, Scala) would run the walk
-/// into the next line's unrelated string.
+/// Two bytes are deliberately ABSENT, each for a measured false positive.
+/// `/` — a leading or trailing slash is far more often a comment than an
+/// operator. `<`/`>` — a generic parameter list closes with `>`, so an
+/// unterminated declaration (`semi: false` TypeScript, Kotlin, Scala) would
+/// run the walk into the next line's unrelated string.
+///
+/// `,` is PRESENT (spec 023, decision D1): a trailing comma separates
+/// declarators and tuple elements as often as it ends one, and excluding it
+/// let a line break hide a credential in the next declarator — a measured
+/// false negative (C5). The reverse cost is accepted and pinned: a
+/// struct-literal field's exemption now walks into the NEXT field's quoted
+/// value (oracle row G10b, accepted regression). Every terminator heuristic
+/// keyed on this byte produced a credential leak, so the comma is a
+/// continuation, never a terminator.
 fn line_break_continues_expression(window: &[u8], newline: usize) -> bool {
-    const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\";
+    const CONTINUATION: &[u8] = b"+-*|&^%=.?:\\,";
     let trailing = window[..newline]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -1015,6 +1022,325 @@ mod tests {
         assert!(sensitive_path_rule("state/prod.tfstate").is_some());
         assert!(sensitive_path_rule(".env.example").is_none());
         assert!(sensitive_path_rule("docs/secret-design.md").is_none());
+    }
+
+    // ── D1 comma-continuation pinning matrix (spec 023 proposal v2 §6) ─────
+    //
+    // Row bodies are assembled at runtime so no keyword-plus-assignment shape
+    // enters this source file: the tripwire
+    // (`repository_source_is_clean_under_its_own_detector`) scans this file
+    // with the same detector. `v` is benign filler, never a real credential.
+    // Every placeholder capture exceeds the 8-byte floor so no row can read
+    // CLEAN for the vacuous no-match reason.
+
+    fn mx_token() -> String {
+        ["to", "ken"].concat()
+    }
+    fn mx_password() -> String {
+        ["pass", "word"].concat()
+    }
+    fn mx_apikey() -> String {
+        ["api", "key"].concat()
+    }
+    fn mx_deploy_token() -> String {
+        ["DEPLOY_TO", "KEN"].concat()
+    }
+    fn mx_fallback_token() -> String {
+        ["FALLBACK_TO", "KEN"].concat()
+    }
+    fn mx_value() -> String {
+        ["a-long-", "literal-", "value"].concat()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MxVerdict {
+        Clean,
+        Sensitive(u32),
+    }
+
+    /// (row id, path, body, expected verdict under V1 = D1 shipped).
+    fn matrix_d1_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
+        let token = mx_token();
+        let password = mx_password();
+        let apikey = mx_apikey();
+        let deploy_token = mx_deploy_token();
+        let fallback_token = mx_fallback_token();
+        let v = mx_value();
+        vec![
+            // C5 fix rows: a line break after a trailing comma must not end
+            // the walk when the next declarator carries a literal.
+            (
+                "C5a js multi-declarator across lines",
+                "src/probe.js",
+                [
+                    "const ",
+                    &token,
+                    " = \"placeholder\",\n      backup = \"",
+                    &v,
+                    "\";",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5b js multi-declarator one line control",
+                "src/probe.js",
+                [
+                    "const ",
+                    &token,
+                    " = \"placeholder\", backup = \"",
+                    &v,
+                    "\";",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "C5d rust multi-binding across lines",
+                "src/probe.rs",
+                [
+                    "let ",
+                    &token,
+                    " = \"placeholder\",\n    backup = \"",
+                    &v,
+                    "\";",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // G10b: the accepted D1 regression — the walk now follows the
+            // struct-literal field comma into the next field's value.
+            (
+                "G10b rust struct literal sibling field",
+                "src/probe.rs",
+                [
+                    "let config = Config {\n    ",
+                    &apikey,
+                    ": resolve_from_environment(),\n    banner_text: \"",
+                    &v,
+                    "\",\n};",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // D1-scan: a long post-D1 walk passes over a later independent
+            // match; the scanner must still find it (count pins resume).
+            (
+                "D1-scan consumed walk passes over later match",
+                "src/probe.js",
+                [
+                    "const ",
+                    &token,
+                    " = \"placeholder\",\n      a1 = \"x1\",\n      a2 = \"x2\",\n      a3 = \"x3\",\n      a4 = \"x4\";\nconst ",
+                    &password,
+                    " = \"",
+                    &v,
+                    "\";",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "P1 python tuple placeholder then literal",
+                "src/probe.py",
+                [&password, " = \"placeholder\", \"", &v, "\""].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "P4 python interpolation then literal",
+                "src/probe.py",
+                [
+                    &token,
+                    " = \"${{DEPLOY_HOST}}\", \"",
+                    &v,
+                    "\"",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "E2 python unquoted placeholder comma literal",
+                "src/probe.py",
+                [&password, " = placeholder, '", &v, "'"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // K rows: the walk is the only thing catching a non-keyword
+            // sibling; K1's sibling IS a keyword and finds two.
+            (
+                "K1 yaml apikey sibling two findings",
+                "config.yaml",
+                [
+                    "auth: {",
+                    &password,
+                    ": \"${CI_FALLBACK_TOKEN}\", ",
+                    &apikey,
+                    ": \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(2),
+            ),
+            (
+                "K2 yaml bearer sibling walk only",
+                "config.yaml",
+                [
+                    "auth: {",
+                    &password,
+                    ": \"${CI_FALLBACK_TOKEN}\", bearer: \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "K3 yaml credential sibling walk only",
+                "config.yaml",
+                [
+                    "auth: {",
+                    &password,
+                    ": \"${CI_FALLBACK_TOKEN}\", credential: \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "K4 yaml accesskey sibling walk only",
+                "config.yaml",
+                [
+                    "auth: {",
+                    &password,
+                    ": \"${CI_FALLBACK_TOKEN}\", accesskey: \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F5 env comma-joined list one key",
+                "deploy.env",
+                [
+                    &fallback_token,
+                    "=\"${CI_TOKEN}\", \"",
+                    &v,
+                    "\"",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F3 env one-comma evasion variant",
+                "deploy.env",
+                [
+                    &deploy_token,
+                    "=${CI_FALLBACK_TOKEN}, \"",
+                    &v,
+                    "\"",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "F3ctl env no-comma control",
+                "deploy.env",
+                [
+                    &deploy_token,
+                    "=${CI_FALLBACK_TOKEN} \"",
+                    &v,
+                    "\"",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // Config sibling false positives — accepted ceiling (proposal §5).
+            (
+                "Y1u yaml flow unquoted capture swallows comma",
+                "config.yaml",
+                ["{", &token, ": ${TOKEN_NAME}, banner: \"", &v, "\"}"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "Y1q yaml flow quoted sibling",
+                "config.yaml",
+                [
+                    "{",
+                    &token,
+                    ": \"${TOKEN_NAME}\", banner: \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            (
+                "A3 yaml note sibling walk coverage",
+                "config.yaml",
+                [
+                    "auth: {",
+                    &token,
+                    ": \"${TOKEN_NAME}\", note: \"",
+                    &v,
+                    "\"}",
+                ]
+                .concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // B1: bracketed arrays never match — stated blind spot.
+            (
+                "B1 toml bracketed array",
+                "config.toml",
+                [&apikey, " = [\"placeholder\", \"", &v, "\"]"].concat(),
+                MxVerdict::Clean,
+            ),
+            // Parity addendum (beyond spec §6, sizes the C1/C2 backstop and
+            // what the D4 mate check would close): unquoted capture before a
+            // fence; apostrophe inside a double-quoted placeholder literal.
+            (
+                "X3 js unquoted capture before fence",
+                "src/probe.js",
+                ["const ", &token, " = placeholder\"", &v, "\", \"x"].concat(),
+                MxVerdict::Clean,
+            ),
+            (
+                "X1 js apostrophe in placeholder literal",
+                "src/probe.js",
+                [
+                    "const ",
+                    &token,
+                    " = \"your-org's-token\", \"",
+                    &v,
+                    "\", \"x",
+                ]
+                .concat(),
+                MxVerdict::Clean,
+            ),
+        ]
+    }
+
+    #[test]
+    fn comma_continuation_d1_matrix_pins() {
+        let mut failures = Vec::new();
+        for (id, path, body, expected) in matrix_d1_rows() {
+            let actual = match scan_secret_bytes(path, body.as_bytes()) {
+                SecretScan::Clean => MxVerdict::Clean,
+                SecretScan::Sensitive { finding_count, .. } => MxVerdict::Sensitive(finding_count),
+                SecretScan::Indeterminate { reason } => {
+                    failures.push(format!("{id}: unexpected Indeterminate: {reason:?}"));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!("{id}: expected {expected:?}, got {actual:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "matrix rows off expectation: {failures:?}"
+        );
     }
 
     #[test]

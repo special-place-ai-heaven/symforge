@@ -32130,15 +32130,26 @@ mod tests {
     /// G10 is the precision control the narrow token set exists for: an
     /// ordinary FINISHED statement must still terminate the walk, so the
     /// following line's quoted value cannot withdraw the previous line's
-    /// exemption. G10b pins the `,` exclusion specifically — a trailing comma
-    /// ends a struct-literal field, and following it would walk one field's
-    /// exemption into the next field's value.
+    /// exemption. G10b once pinned the `,` exclusion; spec 023 decision D1
+    /// REVERSES it — a trailing comma separates declarators and tuple
+    /// elements as often as it ends one, and excluding it let a line break
+    /// hide a credential in the next declarator (C5, measured). The
+    /// struct-literal walk-through is the accepted price, so G10b now pins
+    /// that regression as ACCEPTED: the sibling field's value IS found.
     #[test]
     fn oracle_b_formatter_continuations_must_stay_content_demoted() {
         let v = oracle_opaque();
         let token_kw = kw_token();
         let key_kw = kw_key();
         let demoted: Vec<(&'static str, &str, String)> = vec![
+            (
+                "G10b struct-literal sibling found — accepted D1 regression",
+                "src/probe.rs",
+                format!(
+                    "let config = Config {{\n    {key_kw}: resolve_from_environment(),\n    \
+                     banner_text: \"{v}\",\n}};\n"
+                ),
+            ),
             (
                 "S19a method-chain continuation (rust)",
                 "src/probe.rs",
@@ -32172,14 +32183,6 @@ mod tests {
                 "G10a a finished statement must still end the walk",
                 "src/probe.rs",
                 format!("let {key_kw} = resolve_from_environment();\nlet banner = \"{v}\";\n"),
-            ),
-            (
-                "G10b a trailing comma ends a struct-literal field",
-                "src/probe.rs",
-                format!(
-                    "let config = Config {{\n    {key_kw}: resolve_from_environment(),\n    \
-                     banner_text: \"{v}\",\n}};\n"
-                ),
             ),
             (
                 "G10c a generic parameter list closing in > is not a continuation",
