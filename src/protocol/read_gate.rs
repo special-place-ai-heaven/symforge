@@ -12,6 +12,42 @@ use crate::domain::{FileDisposition, IndexTargets, LanguageId, MetadataOnlyReaso
 use crate::live_index::LiveIndex;
 use crate::protocol::format;
 
+/// Working-tree text for `relative_path`, admitted by [`admit_disk_read`].
+///
+/// The gated replacement for `GitRepo::file_from_workdir`, which reads the
+/// working tree with only a containment check. Three protocol lanes shared that
+/// ungated read and each disclosed a security-demoted file: the `search_text`
+/// untracked sweep (an anchored regex over the content recovers it character by
+/// character), `diff_symbols` in uncommitted mode, and `detect_impact` seeding
+/// from `WORKTREE` (both disclose symbol names and signatures).
+///
+/// The return shape deliberately MIRRORS `file_from_workdir` so refusal stays
+/// distinguishable from absence at every call site:
+///   * `Ok(None)` — not a regular file, or not valid UTF-8 (today's behaviour);
+///   * `Ok(Some(text))` — admitted content, the only bytes a lane may use;
+///   * `Err(message)` — REFUSED, carrying the caller-ready refusal. A lane that
+///     collapses this to "absent" is fail-closed and safe; a lane that renders
+///     a verdict about the file must say it was withheld rather than imply the
+///     file is empty.
+pub(crate) fn admit_worktree_text(
+    live: &LiveIndex,
+    repo: &crate::git::GitRepo,
+    relative_path: &str,
+) -> Result<Option<String>, String> {
+    let Some(workdir) = repo.workdir() else {
+        return Err("bare repository has no working directory".to_string());
+    };
+    let full_path = workdir.join(relative_path);
+    if !full_path.is_file() {
+        return Ok(None);
+    }
+    // The gate owns the read: it classifies the exact buffer it just read and
+    // returns it only on a permit, so no lane can classify one set of bytes and
+    // then render another.
+    let bytes = admit_disk_read(live, relative_path, &full_path)?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
 /// Read `canon_path` and return its bytes only if the file is admissible for
 /// content disclosure.
 ///

@@ -2450,11 +2450,17 @@ fn matching_untracked_paths_for_search_text(
         return Vec::new();
     };
 
+    // The caller's own regex is evaluated against this content, so an anchored
+    // pattern recovers a refused file character by character from nothing but
+    // which paths come back. The gate runs BEFORE any matching: a refusal drops
+    // the path from the sweep entirely, disclosing neither content nor
+    // existence-by-match.
+    let live = server.index.read();
     untracked_paths_not_in_index(server)
         .into_iter()
         .filter(|path| untracked_text_path_allowed(path, options))
         .filter(|path| {
-            repo.file_from_workdir(path)
+            crate::protocol::read_gate::admit_worktree_text(&live, &repo, path)
                 .ok()
                 .flatten()
                 .is_some_and(|content| {
@@ -3239,6 +3245,7 @@ fn render_diff_symbols_output(
     all_changed_files: usize,
     changed_files: &[&str],
     repo: &crate::git::GitRepo,
+    live: &crate::live_index::LiveIndex,
     compact: bool,
     summary_only: bool,
     path_prefix: Option<&str>,
@@ -3281,8 +3288,15 @@ fn render_diff_symbols_output(
         &scope_parts.join("; "),
         &search_paths_evidence(changed_files.iter().copied()),
     );
-    let output =
-        format::diff_symbols_result_view(base, target, changed_files, repo, compact, summary_only);
+    let output = format::diff_symbols_result_view(
+        base,
+        target,
+        changed_files,
+        repo,
+        live,
+        compact,
+        summary_only,
+    );
     format!("{envelope}\n\n{output}")
 }
 
@@ -7960,6 +7974,7 @@ impl SymForgeServer {
                                         "",
                                         &changed_refs,
                                         &repo,
+                                        &self.index.read(),
                                         true,
                                         false,
                                     );
@@ -8041,6 +8056,7 @@ impl SymForgeServer {
                                         "HEAD",
                                         &changed_refs,
                                         &repo,
+                                        &self.index.read(),
                                         true,
                                         false,
                                     );
@@ -8235,10 +8251,13 @@ impl SymForgeServer {
                     .file_at_ref(seed_base_ref, path)
                     .unwrap_or_default()
                     .unwrap_or_default();
-                let current_content = repo
-                    .file_from_workdir(path)
-                    .unwrap_or_default()
-                    .unwrap_or_default();
+                // Gated: a refusal collapses to "no current content", which
+                // seeds conservatively from the index rather than disclosing
+                // the demoted file's current symbol names or signatures.
+                let current_content =
+                    crate::protocol::read_gate::admit_worktree_text(&guard, &repo, path)
+                        .unwrap_or_default()
+                        .unwrap_or_default();
 
                 // Unsupported/config languages return None from the extractor;
                 // we cannot body-diff them, so fall back to seeding every
@@ -11972,6 +11991,7 @@ impl SymForgeServer {
             changed_files_owned.len(),
             &changed_files,
             &repo,
+            &self.index.read(),
             params.0.compact.unwrap_or(false),
             params.0.summary_only.unwrap_or(false),
             params.0.path_prefix.as_deref(),
@@ -29938,11 +29958,15 @@ mod tests {
 
         let repo = crate::git::GitRepo::open(dir.path()).expect("open git repo");
 
+        // Ref-to-ref mode never reads the working tree, so the index is not
+        // consulted; an empty one keeps this test about the omission note.
+        let live = make_live_index_ready(vec![]);
         let result = super::format::diff_symbols_result_view(
             "HEAD~1",
             "HEAD",
             &["a.rs", "b.rs"],
             &repo,
+            &live,
             true,
             false,
         );
@@ -30697,6 +30721,88 @@ mod tests {
             ("src/lib.rs", "pub fn admitted_anchor() {}\n"),
         ]);
         (dir, server, canary)
+    }
+
+    /// RED (FU-1). The three working-tree disclosure lanes — the `search_text`
+    /// untracked sweep, `diff_symbols` in uncommitted mode, and `detect_impact`
+    /// seeding from `WORKTREE` — all read through one function. This pins that
+    /// seam directly: a security-demoted file is REFUSED, and an ordinary file
+    /// is still served, so the gate is not simply refusing everything.
+    #[tokio::test]
+    async fn worktree_text_is_refused_for_a_security_demoted_file() {
+        let canary = runtime_canary();
+        let dir = init_git_repo();
+        std::fs::write(
+            dir.path().join(".env"),
+            format!("{}={canary}\n", kw_password()),
+        )
+        .expect("write demoted fixture");
+        std::fs::write(dir.path().join("src.rs"), "pub fn anchor() {}\n")
+            .expect("write admitted fixture");
+
+        let shared = crate::live_index::LiveIndex::load(dir.path()).expect("load index");
+        let live = shared.read();
+        let repo = crate::git::GitRepo::open(dir.path()).expect("open git repo");
+
+        // Anti-vacuity: the fixture really is demoted, so the refusal below is
+        // the gate acting and not a file that was never indexed.
+        assert!(
+            live.get_file(".env").is_none(),
+            "control: .env must be absent from the Tier-1 map"
+        );
+
+        let refused = crate::protocol::read_gate::admit_worktree_text(&live, &repo, ".env")
+            .expect_err("a security-demoted file must be refused from the working tree");
+        assert!(
+            !refused.contains(canary.as_str()),
+            "the refusal must not echo the withheld content"
+        );
+
+        let admitted = crate::protocol::read_gate::admit_worktree_text(&live, &repo, "src.rs")
+            .expect("an ordinary file must still be readable")
+            .expect("ordinary file must decode");
+        assert!(
+            admitted.contains("anchor"),
+            "GREEN-CONTROL: the gate must not refuse everything"
+        );
+    }
+
+    /// GREEN-GUARD (FU-1). The structural half of the same property: no
+    /// protocol lane may reach the UNGATED working-tree read directly.
+    ///
+    /// Behavioural tests only cover the three lanes that exist today; this
+    /// fails the moment a FOURTH one is written, which is how the original
+    /// three came to share an ungated read in the first place.
+    #[test]
+    fn no_protocol_lane_reads_the_working_tree_ungated() {
+        // Assembled at runtime so this scan does not match its OWN source, the
+        // way the repository-wide detector tripwire avoids the same trap.
+        let needle = [".file_from_", "workdir("].concat();
+        let protocol = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/protocol");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for entry in fs::read_dir(&protocol).expect("read src/protocol") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("read protocol source");
+            scanned += 1;
+            for (number, line) in text.lines().enumerate() {
+                if line.contains(needle.as_str()) {
+                    offenders.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+        assert!(scanned > 0, "control: the scan must actually read sources");
+        assert!(
+            offenders.is_empty(),
+            "these protocol lanes bypass the working-tree gate: {offenders:?}"
+        );
     }
 
     /// Precondition: the path is ABSENT from the Tier-1 map and carries a typed

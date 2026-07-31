@@ -279,6 +279,24 @@ impl GitRepo {
     ///
     /// Used for uncommitted-mode diffs where the target is the current working tree
     /// rather than a git ref.
+    /// The working directory this repository is checked out into, if any.
+    ///
+    /// Exposed so the disclosure gate can resolve a worktree path WITHOUT this
+    /// module taking a dependency on the index: every protocol lane that wants
+    /// working-tree bytes goes through
+    /// [`crate::protocol::read_gate::admit_worktree_text`], which needs the
+    /// same join [`Self::file_from_workdir`] performs.
+    pub fn workdir(&self) -> Option<&std::path::Path> {
+        self.repo.workdir()
+    }
+
+    /// UNGATED. Reads working-tree bytes with no admission check, so a file
+    /// demoted for security is served in full.
+    ///
+    /// Protocol lanes MUST NOT call this — use
+    /// [`crate::protocol::read_gate::admit_worktree_text`], which performs this
+    /// read behind the gate. This stays public only because the gate itself is
+    /// layered above `git` and cannot be called from here.
     pub fn file_from_workdir(&self, path: &str) -> Result<Option<String>, String> {
         let Some(workdir) = self.repo.workdir() else {
             return Err("bare repository has no working directory".to_string());

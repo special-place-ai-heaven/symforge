@@ -6403,11 +6403,17 @@ pub fn impact_footer(deps: usize, cochanges: &[String]) -> String {
 }
 
 /// Format symbol-level diff between two git refs.
+/// `live` is required because uncommitted mode reads the WORKING TREE, which is
+/// a disclosure lane: without it a security-demoted file's symbol names and
+/// signatures render straight into the diff. A refused file is reported as
+/// withheld rather than rendered as empty — rendering it empty would state,
+/// falsely, that every one of its symbols was removed.
 pub fn diff_symbols_result_view(
     base: &str,
     target: &str,
     changed_files: &[&str],
     repo: &crate::git::GitRepo,
+    live: &crate::live_index::LiveIndex,
     compact: bool,
     summary_only: bool,
 ) -> String {
@@ -6439,9 +6445,18 @@ pub fn diff_symbols_result_view(
         // working tree instead of a git ref (file_at_ref("") returns None,
         // which would make every symbol appear "removed").
         let target_content = if target.is_empty() {
-            repo.file_from_workdir(file_path)
-                .unwrap_or_default()
-                .unwrap_or_default()
+            match crate::protocol::read_gate::admit_worktree_text(live, repo, file_path) {
+                Ok(text) => text.unwrap_or_default(),
+                Err(_) => {
+                    // Withheld. Say so and move on: falling through with empty
+                    // content would render every symbol in the file as REMOVED,
+                    // which is a false claim about the file rather than a
+                    // refusal to describe it.
+                    lines.push(content_withheld_by_admission(file_path));
+                    lines.push(String::new());
+                    continue;
+                }
+            }
         } else {
             repo.file_at_ref(target, file_path)
                 .unwrap_or_default()
