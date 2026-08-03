@@ -32,7 +32,11 @@ pub fn decode_searchable_text(bytes: &[u8]) -> Result<DecodedText<'_>, std::str:
 /// consumption, embedded-literal tightening) and whole-buffer encoding
 /// validation now runs on code paths, so every manifest persisted under v1 is
 /// stale and must be re-scouted rather than trusted.
-pub const SECRET_POLICY_VERSION: u32 = 2;
+///
+/// Bumped to 3: the context-assignment rule now enters inline arrays and skips
+/// short leading elements (`key = ["dev", "<cred>"]`), so files a v2 manifest
+/// recorded as clean can carry findings under v3.
+pub const SECRET_POLICY_VERSION: u32 = 3;
 const SECRET_SCAN_MAX_BYTES: usize = crate::domain::index::METADATA_ONLY_CODE_BYTES as usize;
 /// The one reserved rule id every [`DetectorFailure`] collapses onto. Public so
 /// the disclosure gate can tell an indeterminate verdict — which a reindex
@@ -120,7 +124,16 @@ fn compile_secret_rules() -> Result<Vec<SecretRule>, DetectorFailure> {
         (
             CONTEXT_ASSIGNMENT_RULE_ID,
             &[b"key", b"secret", b"token", b"password", b"passwd", b"pwd"],
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret)[ \t]*[:=][ \t]*["']?([^\s"'#]{8,})"#,
+            // After the separator: an optional inline-array opener, then EITHER
+            // one-or-more short quoted elements (each under the capture floor,
+            // so they could never match on their own) followed by a mandatory
+            // opening quote, OR the plain optional quote. The mandatory quote
+            // after a skip is load-bearing: without it the capture lands on the
+            // next unquoted run past the comma — in a YAML flow mapping that is
+            // the NEXT KEY (`{token: "ab", environment: production}` would
+            // capture `environment:`), the exact false-positive class the FO-5
+            // ruling refuses. Zero skips keeps the historical shape byte-for-byte.
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret)[ \t]*[:=][ \t]*(?:\[[ \t]*)?(?:(?:["'][^"'\n]{0,7}["'][ \t]*,[ \t]*)+["']|["']?)([^\s"'#]{8,})"#,
             1,
             true,
         ),
@@ -1289,12 +1302,15 @@ mod tests {
                 .concat(),
                 MxVerdict::Sensitive(1),
             ),
-            // B1: bracketed arrays never match — stated blind spot.
+            // B1: bracketed arrays — the stated blind spot, closed by the
+            // inline-array capture (owner ruling 2026-08-03). The first
+            // substantive element sits in credential-bound position, exactly
+            // like the unbracketed comma-list form of this row.
             (
                 "B1 toml bracketed array",
                 "config.toml",
                 [&apikey, " = [\"placeholder\", \"", &v, "\"]"].concat(),
-                MxVerdict::Clean,
+                MxVerdict::Sensitive(1),
             ),
             // Parity addendum (beyond spec §6, sizes the C1/C2 backstop and
             // what the D4 mate check would close): unquoted capture before a
@@ -1340,6 +1356,108 @@ mod tests {
         assert!(
             failures.is_empty(),
             "matrix rows off expectation: {failures:?}"
+        );
+    }
+
+    /// (row id, path, body, expected verdict) for the inline-array capture
+    /// (owner ruling 2026-08-03, closes the bracketed-array ceiling).
+    ///
+    /// Every fixture is assembled at runtime from non-secret fragments; `v` is
+    /// benign filler. Each capture-bearing row's counterpart control proves the
+    /// row could fail (no vacuous CLEANs under the 8-byte floor).
+    fn bracketed_array_rows() -> Vec<(&'static str, &'static str, String, MxVerdict)> {
+        let token = mx_token();
+        let apikey = mx_apikey();
+        let deploy_token = mx_deploy_token();
+        let v = mx_value();
+        vec![
+            // AR1: opener alone — a single substantive element is captured.
+            (
+                "AR1 toml single-element array",
+                "config.toml",
+                [&apikey, " = [\"", &v, "\"]"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // AR2: a short leading element must not hide the credential — the
+            // skip group carries the capture past it.
+            (
+                "AR2 toml short-first element",
+                "config.toml",
+                [&apikey, " = [\"dev\", \"", &v, "\"]"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // AR3 control for AR1/AR2: nothing reaches the 8-byte floor, so the
+            // array machinery alone must not manufacture a finding.
+            (
+                "AR3 toml all-short elements",
+                "config.toml",
+                [&apikey, " = [\"dev\", \"shrt\"]"].concat(),
+                MxVerdict::Clean,
+            ),
+            // AR4: the false-positive guard the FO-5 ruling demands. After a
+            // skipped short element the capture MUST open with a quote —
+            // otherwise it would land on the next flow-mapping KEY.
+            (
+                "AR4 yaml flow-map key not captured",
+                "probe.yaml",
+                ["{", &token, ": \"ab\", environment: production}"].concat(),
+                MxVerdict::Clean,
+            ),
+            // AR5: a placeholder-only element stays exempt (H1 discipline
+            // composes with the array capture; ${DEPLOY_TOKEN} clears the floor
+            // so this row cannot pass for the vacuous no-match reason).
+            (
+                "AR5 toml placeholder-only element",
+                "config.toml",
+                [&apikey, " = [\"${", &deploy_token, "}\"]"].concat(),
+                MxVerdict::Clean,
+            ),
+            // AR6 control for AR5: a substantive element after the placeholder
+            // withdraws the exemption — the H1 payload walk crosses the comma.
+            (
+                "AR6 toml placeholder then payload",
+                "config.toml",
+                [&apikey, " = [\"${", &deploy_token, "}\", \"", &v, "\"]"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // AR7: on a code path the captured element is a QUOTED literal, so
+            // the code-expression exemption (unquoted RHS only) does not apply
+            // — same semantics as `let token = "literal"`. Measured 2026-08-03.
+            (
+                "AR7 js array on code path",
+                "src/probe.js",
+                ["const ", &token, " = [\"dev\", \"", &v, "\"];"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+            // AR8: YAML flow sequences are the same shape as TOML arrays.
+            (
+                "AR8 yaml flow sequence",
+                "probe.yaml",
+                [&token, ": [\"dev\", \"", &v, "\"]"].concat(),
+                MxVerdict::Sensitive(1),
+            ),
+        ]
+    }
+
+    #[test]
+    fn bracketed_array_capture_pins() {
+        let mut failures = Vec::new();
+        for (id, path, body, expected) in bracketed_array_rows() {
+            let actual = match scan_secret_bytes(path, body.as_bytes()) {
+                SecretScan::Clean => MxVerdict::Clean,
+                SecretScan::Sensitive { finding_count, .. } => MxVerdict::Sensitive(finding_count),
+                SecretScan::Indeterminate { reason } => {
+                    failures.push(format!("{id}: unexpected Indeterminate: {reason:?}"));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!("{id}: expected {expected:?}, got {actual:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "array rows off expectation: {failures:?}"
         );
     }
 

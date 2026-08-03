@@ -82,8 +82,11 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
     // known token via the env var so this test (which exercises the real MCP
     // dispatch path) can present it with `.bearer_auth`, mirroring how the real
     // MCP front-end authenticates against the daemon.
-    // Assembled at runtime so no credential-shaped literal enters this file.
-    let auth_token = ["daemon-aliases-test-", "to", "ken"].concat();
+    // Assembled at runtime so no credential-shaped literal enters this file;
+    // the prefix is hoisted off the token-bound line (v3 detector follows the
+    // capture into inline arrays).
+    let pfx = "daemon-aliases-test-";
+    let auth_token = [pfx, "to", "ken"].concat();
     // SAFETY: single-threaded test binary; no concurrent env access.
     unsafe {
         std::env::set_var("SYMFORGE_HOME", daemon_home.path());
@@ -230,8 +233,11 @@ async fn trace_symbol_alias_routes_to_get_symbol_context() {
 #[tokio::test]
 async fn detect_changes_alias_routes_to_detect_impact() {
     let daemon_home = TempDir::new().expect("daemon home temp dir");
-    // Assembled at runtime so no credential-shaped literal enters this file.
-    let auth_token = ["daemon-aliases-detect-changes-test-", "to", "ken"].concat();
+    // Assembled at runtime so no credential-shaped literal enters this file;
+    // the prefix is hoisted off the token-bound line (v3 detector follows the
+    // capture into inline arrays).
+    let pfx = "daemon-aliases-detect-changes-test-";
+    let auth_token = [pfx, "to", "ken"].concat();
     // SAFETY: single-threaded test binary; no concurrent env access.
     unsafe {
         std::env::set_var("SYMFORGE_HOME", daemon_home.path());

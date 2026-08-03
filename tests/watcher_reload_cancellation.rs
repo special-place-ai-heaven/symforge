@@ -230,8 +230,11 @@ fn index_folder_for_session_signals_token_before_drop() {
         let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "1");
         // The daemon is fail-closed and always requires a token; pin a known one
         // so the HTTP `index_folder` call below can authenticate.
-        // Assembled at runtime so no credential-shaped literal enters this file.
-        let auth_token = ["watcher-rebind-test-", "to", "ken"].concat();
+        // Assembled at runtime so no credential-shaped literal enters this file;
+        // the prefix is hoisted off the token-bound line (v3 detector follows
+        // the capture into inline arrays).
+        let pfx = "watcher-rebind-test-";
+        let auth_token = [pfx, "to", "ken"].concat();
         let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
         let project_a = TempDir::new().expect("project a");
         let project_b = TempDir::new().expect("project b");

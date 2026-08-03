@@ -328,8 +328,11 @@ async fn run_aap_smoke(idle: Duration) -> SmokeObservation {
     let _interval = EnvVarGuard::set("SYMFORGE_RECONCILE_INTERVAL", "30");
     // The daemon is fail-closed and always requires a token; pin a known one so
     // the HTTP `index_folder` calls below can authenticate.
-    // Assembled at runtime so no credential-shaped literal enters this file.
-    let auth_token = ["watcher-aap-smoke-", "to", "ken"].concat();
+    // Assembled at runtime so no credential-shaped literal enters this file;
+    // the prefix is hoisted off the token-bound line (v3 detector follows the
+    // capture into inline arrays).
+    let pfx = "watcher-aap-smoke-";
+    let auth_token = [pfx, "to", "ken"].concat();
     let _auth = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
 
     let root_a = build_fixture("aap_a");
