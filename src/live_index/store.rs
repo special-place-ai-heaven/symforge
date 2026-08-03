@@ -1095,6 +1095,12 @@ pub struct LiveIndex {
     pub(crate) loaded_at: Instant,
     /// Wall-clock time when index was last loaded. Used by what_changed tool.
     pub(crate) loaded_at_system: SystemTime,
+    /// Full in-memory build span: scout through admission+parse, trigram,
+    /// store setup, and derived-index rebuild. Does NOT include publication
+    /// (`new_with_scout_plan_and_code_signals` — manifest + bridge +
+    /// authority), which runs after this value is stamped and logs its own
+    /// span. Before 2026-08-03 this stopped at admission+parse and
+    /// under-reported the build by 60-65% on this repo.
     pub(crate) load_duration: Duration,
     pub(crate) cb_state: CircuitBreakerState,
     /// True when constructed with empty() and reload() has not been called.
@@ -1244,6 +1250,12 @@ impl SharedIndexHandle {
         scout_plan: Option<Arc<discovery::ScoutPlan>>,
         code_signals: Option<CodeSignalsSnapshot>,
     ) -> Self {
+        // Publication is a real startup phase, not an Arc wrap: manifest
+        // capture, the knowledge bridge, and published authority all walk the
+        // whole index. Measured at 12.4s of a 40s debug serve start on this
+        // repo — logged here because it runs AFTER "LiveIndex loaded" and
+        // would otherwise be the silent span between that line and serving.
+        let publication_started = Instant::now();
         let manifest = capture_published_manifest(&index, scout_plan.as_deref());
         let source = manifest
             .as_ref()
@@ -1325,6 +1337,10 @@ impl SharedIndexHandle {
             current_source_id,
             sources,
         });
+        info!(
+            "index publication (manifest + bridge + authority) in {:?}",
+            publication_started.elapsed()
+        );
         Self {
             live: ArcSwap::new(live),
             published_source_set: ArcSwap::new(published_source_set),
@@ -4016,25 +4032,40 @@ impl LiveIndex {
         let manifest_entries =
             manifest_entries_from_scout(&scout_plan, terminal_dispositions, &files)?;
 
-        let load_duration = start.elapsed();
+        // Phase timings from here on: measured on this repo (~900 files), the
+        // work BELOW this point was 60-65% of real startup while the old
+        // "LiveIndex loaded" line — logged here — claimed the load was done.
+        // `load_duration` is stamped at the END so the reported number covers
+        // the whole build, and each tail phase logs its own cost so a slow
+        // startup names its culprit instead of going silent.
+        let admit_parse_elapsed = start.elapsed();
         info!(
-            "LiveIndex loaded: {} files, {} symbols, {} manifest entries, {:?}",
+            "admission + parse complete: {} files, {} symbols, {} manifest entries, {:?}",
             files.len(),
             files.values().map(|f| f.symbols.len()).sum::<usize>(),
             manifest_entries.len(),
-            load_duration
+            admit_parse_elapsed
         );
 
+        let phase = Instant::now();
         let trigram_index = super::trigram::TrigramIndex::build_from_files(&files);
+        let trigram_elapsed = phase.elapsed();
+        info!("trigram index built in {:?}", trigram_elapsed);
+
+        let phase = Instant::now();
         let gitignore = discovery::load_gitignore(root);
         let coupling_store = project_state_dir
             .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir));
+        let stores_elapsed = phase.elapsed();
+        info!("gitignore + coupling store ready in {:?}", stores_elapsed);
 
         let mut index = LiveIndex {
             files,
             loaded_at: Instant::now(),
             loaded_at_system: SystemTime::now(),
-            load_duration,
+            // Placeholder — overwritten with the full span below, after the
+            // derived indices are rebuilt.
+            load_duration: Duration::ZERO,
             cb_state,
             is_empty: false,
             load_source: IndexLoadSource::FreshLoad,
@@ -4051,8 +4082,24 @@ impl LiveIndex {
             // later project switch invalidates it (root-mismatch reload).
             indexed_root: Some(normalize_root(root)),
         };
+        let phase = Instant::now();
         index.rebuild_reverse_index();
         index.rebuild_path_indices();
+        let derived_elapsed = phase.elapsed();
+
+        // The honest number: everything from scout to queryable-in-memory.
+        index.load_duration = start.elapsed();
+        info!(
+            "LiveIndex loaded: {} files, {} manifest entries, {:?} total \
+             (admission+parse {:?}, trigram {:?}, stores {:?}, derived indices {:?})",
+            index.files.len(),
+            index.manifest_entries.len(),
+            index.load_duration,
+            admit_parse_elapsed,
+            trigram_elapsed,
+            stores_elapsed,
+            derived_elapsed
+        );
 
         // Hook registration must be unconditional so a flag flipped after
         // boot still captures edits. The DB-touching reset-policy work is
@@ -4314,17 +4361,26 @@ impl LiveIndex {
         let manifest_entries =
             manifest_entries_from_scout(&scout_plan, terminal_dispositions, &new_files)?;
 
+        // Pre-build all derived indices outside any lock — and INSIDE the
+        // reported duration: same honesty rule as the fresh-load path, where
+        // this tail measured 60-65% of real startup.
+        let phase = Instant::now();
+        let derived = DerivedIndices::build_from_files(&new_files);
+        let derived_elapsed = phase.elapsed();
+        let gitignore = discovery::load_gitignore(root);
+        let coupling_store = project_state_dir
+            .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir));
+
         let load_duration = start.elapsed();
         info!(
-            "LiveIndex::build_reload_data done: {} files, {} symbols, {} manifest entries, {:?}",
+            "LiveIndex::build_reload_data done: {} files, {} symbols, {} manifest entries, \
+             {:?} total (derived indices {:?})",
             new_files.len(),
             new_files.values().map(|f| f.symbols.len()).sum::<usize>(),
             manifest_entries.len(),
-            load_duration
+            load_duration,
+            derived_elapsed
         );
-
-        // Pre-build all derived indices outside any lock.
-        let derived = DerivedIndices::build_from_files(&new_files);
 
         Ok(ReloadData {
             files: new_files,
@@ -4332,10 +4388,9 @@ impl LiveIndex {
             manifest_entries,
             cb_state: new_cb,
             load_duration,
-            gitignore: discovery::load_gitignore(root),
+            gitignore,
             derived,
-            coupling_store: project_state_dir
-                .and_then(|state_dir| super::coupling::init_coupling_store(root, state_dir)),
+            coupling_store,
             // Record the normalized root so the reloaded index advertises which
             // project it now serves (root-mismatch invalidation).
             indexed_root: normalize_root(root),

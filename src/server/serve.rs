@@ -492,13 +492,20 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     auth.refuse_to_start(is_loopback)?;
 
     // Load the shared index, then bind. Load before bind so an index failure does
-    // not leave a half-open listener.
+    // not leave a half-open listener. Both startup phases log their span: the
+    // gap between "LiveIndex loaded" and "listening" was measured at more than
+    // the load itself on this repo, and an unattributed slow phase is exactly
+    // what let the load-duration under-report go unnoticed.
+    let phase = std::time::Instant::now();
     let (index, repo_root, state_placement) = load_serve_index(args.workspace_root.as_deref())?;
+    tracing::info!("serve: index ready in {:?}", phase.elapsed());
     let control_state_dir: Option<ControlStateDir> =
         crate::paths::process_control_state_placement()
             .directory()
             .cloned();
+    let phase = std::time::Instant::now();
     let runtime = build_serve_runtime(index, repo_root, state_placement, auth.clone());
+    tracing::info!("serve: runtime built in {:?}", phase.elapsed());
 
     // US1 (FR-001/002/003): an explicit operator-chosen `--listen` is honored
     // exactly — an occupied port fails loudly (no substitution). The default
