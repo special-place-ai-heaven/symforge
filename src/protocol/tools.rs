@@ -32608,6 +32608,18 @@ mod tests {
                 }
             };
             if path.is_dir() {
+                // A directory carrying its own `.git` is CLONED third-party
+                // content, not source this repository authors. CI clones
+                // golden-replay corpora into `tests/fixtures/`, and one of them
+                // legitimately contains a database URL with credentials — a
+                // real finding about someone else's fixture that we can neither
+                // rewrite nor vendor a change into. Ruling 1's mandate is that
+                // THIS repository's own test code answers to the detector, so
+                // the exclusion is by authorship, not by path: it needs no
+                // maintenance as corpora come and go.
+                if path.join(".git").exists() {
+                    continue;
+                }
                 oracle_scan_tree(&path, root, findings);
                 continue;
             }
@@ -32644,9 +32656,11 @@ mod tests {
     /// It also fails loudly the next time someone writes a credential-shaped
     /// fixture into this tree, which is the defect Ruling 1 exists to remove.
     ///
-    /// SCOPE, stated rather than implied: `src/` and `tests/` — the compiled
-    /// crate. It is NOT a whole-repository sweep, and its green result is not
-    /// a claim about one. Non-compiled trees (`research/`, `docs/`, `specs/`,
+    /// SCOPE, stated rather than implied: source THIS repository authors, under
+    /// `src/` and `tests/`. Directories carrying their own `.git` are skipped as
+    /// cloned third-party content — CI clones golden-replay corpora into
+    /// `tests/fixtures/`, and this test is not a claim about them. It is NOT a
+    /// whole-repository sweep, and its green result is not a claim about one. Non-compiled trees (`research/`, `docs/`, `specs/`,
     /// `scripts/`, `npm/`, …) are outside it and DO still carry
     /// detector-positive shapes; widening the walk would demand rewriting
     /// captured research artifacts, which no ruling authorizes. Anyone reading
