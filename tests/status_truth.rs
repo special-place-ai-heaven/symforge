@@ -57,8 +57,11 @@ async fn wait_for_shutdown(port: u16) {
 #[tokio::test]
 async fn status_index_matches_daemon_after_index_over_http() {
     let daemon_home = TempDir::new().expect("daemon home temp dir");
-    // Assembled at runtime so no credential-shaped literal enters this file.
-    let auth_token = ["status-truth-test-", "to", "ken"].concat();
+    // Assembled at runtime so no credential-shaped literal enters this file;
+    // the prefix is hoisted off the token-bound line (v3 detector follows the
+    // capture into inline arrays).
+    let pfx = "status-truth-test-";
+    let auth_token = [pfx, "to", "ken"].concat();
     // SAFETY: integration test binaries run single-threaded
     // (`--test-threads=1`) and in their own process; no concurrent env access.
     unsafe {

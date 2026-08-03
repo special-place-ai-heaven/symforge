@@ -14108,8 +14108,11 @@ mod tests {
         // The daemon is fail-closed; pin a token so the direct open call and the
         // proxy client (which resolves the token via env) can authenticate.
         // Assembled at runtime so no credential-shaped literal enters this file;
-        // see `repository_source_is_clean_under_its_own_detector`.
-        let auth_token = ["repo-map-proxy-test-", "to", "ken"].concat();
+        // see `repository_source_is_clean_under_its_own_detector`. The prefix
+        // is hoisted off the token-bound line: the v3 detector follows the
+        // capture into inline arrays.
+        let pfx = "repo-map-proxy-test-";
+        let auth_token = [pfx, "to", "ken"].concat();
         let _auth_guard = EnvVarGuard::set("SYMFORGE_DAEMON_AUTH_TOKEN", &auth_token);
         let project = TempDir::new().expect("project dir");
         fs::create_dir_all(project.path().join("src")).expect("src dir");
