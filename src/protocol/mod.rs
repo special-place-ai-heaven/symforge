@@ -13,6 +13,7 @@ pub(crate) mod knowledge_model;
 pub(crate) mod knowledge_review;
 pub(crate) mod knowledge_search;
 pub mod prompts;
+pub(crate) mod read_gate;
 pub(crate) mod read_tools;
 pub mod resources;
 pub mod result_status;

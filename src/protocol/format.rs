@@ -3633,6 +3633,40 @@ pub fn path_outside_repo(path: &str) -> String {
     )
 }
 
+/// Refusal for a file the admission pipeline excluded from content disclosure.
+///
+/// Deliberately UNIFORM across every security exclusion: it names no rule id, no
+/// rule class, no finding count, no size, and no byte of the file. Whether the
+/// exclusion came from the path rule or from a content detector is the one
+/// content-derived bit a refusal could still leak, and the recovery action is
+/// identical either way, so the message does not distinguish them.
+pub fn content_withheld_by_admission(path: &str) -> String {
+    format!(
+        "Content withheld by admission policy: {path}. \
+         This file is excluded from content retrieval by the repository's \
+         admission rules; SymForge will not read, parse, or search it. \
+         If the exclusion is stale, reindex the repository (index_folder) and retry."
+    )
+}
+
+/// Refusal for a file the admission pipeline could not INSPECT at all — over the
+/// deterministic scan budget, or not decodable as searchable text.
+///
+/// Shares [`content_withheld_by_admission`]'s opening clause, so one anchored
+/// predicate classifies both and every contract keyed on that prefix keeps
+/// holding. Differs only in the recovery sentence: "reindex and retry" is not
+/// merely untrue for these files, it is unactionable — they refuse the same way
+/// on every read. Names no size, no threshold, no encoding, no rule id, no
+/// finding count, and no byte; the wording is identical for both causes, so it
+/// does not even distinguish which one applied.
+pub fn content_withheld_unscanned(path: &str) -> String {
+    format!(
+        "Content withheld by admission policy: {path}. \
+         SymForge could not inspect this file's contents and will not read, \
+         parse, or search it. Reindexing will not change this."
+    )
+}
+
 /// Richer "file not found" with suggested similar paths.
 /// Call this from tool handlers where the index is available.
 pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> String {
@@ -6369,11 +6403,17 @@ pub fn impact_footer(deps: usize, cochanges: &[String]) -> String {
 }
 
 /// Format symbol-level diff between two git refs.
+/// `live` is required because uncommitted mode reads the WORKING TREE, which is
+/// a disclosure lane: without it a security-demoted file's symbol names and
+/// signatures render straight into the diff. A refused file is reported as
+/// withheld rather than rendered as empty — rendering it empty would state,
+/// falsely, that every one of its symbols was removed.
 pub fn diff_symbols_result_view(
     base: &str,
     target: &str,
     changed_files: &[&str],
     repo: &crate::git::GitRepo,
+    live: &crate::live_index::LiveIndex,
     compact: bool,
     summary_only: bool,
 ) -> String {
@@ -6405,9 +6445,18 @@ pub fn diff_symbols_result_view(
         // working tree instead of a git ref (file_at_ref("") returns None,
         // which would make every symbol appear "removed").
         let target_content = if target.is_empty() {
-            repo.file_from_workdir(file_path)
-                .unwrap_or_default()
-                .unwrap_or_default()
+            match crate::protocol::read_gate::admit_worktree_text(live, repo, file_path) {
+                Ok(text) => text.unwrap_or_default(),
+                Err(_) => {
+                    // Withheld. Say so and move on: falling through with empty
+                    // content would render every symbol in the file as REMOVED,
+                    // which is a false claim about the file rather than a
+                    // refusal to describe it.
+                    lines.push(content_withheld_by_admission(file_path));
+                    lines.push(String::new());
+                    continue;
+                }
+            }
         } else {
             repo.file_at_ref(target, file_path)
                 .unwrap_or_default()

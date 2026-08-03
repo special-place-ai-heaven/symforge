@@ -326,7 +326,7 @@ pub fn run_wizard<S: SetupSink + ?Sized, B: BrowserOpener + ?Sized>(
     browser: &B,
 ) -> anyhow::Result<WizardOutcome> {
     let placement = crate::paths::process_control_state_placement();
-    run_wizard_with_control_state(args, ctx, sink, browser, placement.directory())
+    run_wizard_with_control_state(args, ctx, sink, browser, placement.directory(), None)
 }
 
 #[doc(hidden)]
@@ -336,6 +336,9 @@ pub fn run_wizard_with_control_state<S: SetupSink + ?Sized, B: BrowserOpener + ?
     sink: &mut S,
     browser: &B,
     control_state_dir: Option<&crate::domain::ControlStateDir>,
+    // Test seam: serve a small fixture root instead of CWD-discovering (and
+    // cold-scanning) the host checkout. Production (`run_wizard`) passes None.
+    workspace_root: Option<&std::path::Path>,
 ) -> anyhow::Result<WizardOutcome> {
     let registry = ctx.registry();
     let existing_profile = control_state_dir.and_then(OperatorSetupProfile::load);
@@ -447,6 +450,7 @@ pub fn run_wizard_with_control_state<S: SetupSink + ?Sized, B: BrowserOpener + ?
                 None,
                 None,
                 ADMIN_SERVE_START_DEADLINE,
+                workspace_root.map(std::path::Path::to_path_buf),
             )?);
         }
         let desc = session.as_ref().expect("session started or reused");
@@ -790,6 +794,7 @@ mod tests {
             &mut sink,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("setup should succeed");
 
@@ -863,6 +868,7 @@ mod tests {
             &mut sink,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("a decline is a clean no-op, not an error");
 
@@ -909,6 +915,7 @@ mod tests {
             &mut sink,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("server-mode setup should start a server when none runs");
         assert!(
@@ -959,12 +966,14 @@ mod tests {
         use crate::cli::browser::NoopBrowserOpener;
 
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let workspace = tempfile::tempdir().expect("temp workspace");
         let running = start_operator_server(
             Some(preferred),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("operator server should come up");
 
@@ -1000,6 +1009,7 @@ mod tests {
             &mut sink,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("server-mode setup should reuse the running server");
         assert!(

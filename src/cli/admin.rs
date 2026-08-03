@@ -134,12 +134,20 @@ pub fn operator_server_reachable(addr: SocketAddr, timeout: Duration) -> bool {
 /// then gets persisted to config under the operator's back. Pass `false` for a
 /// remembered/default port, where a caller wanting *a* server, not that exact
 /// one, expects a graceful fallback.
+///
+/// `workspace_root` overrides which tree the spawned server indexes. Production
+/// callers pass `None` (discover from the process CWD, as `symforge serve`
+/// does); tests pass a small fixture root, because `serve::run` indexes the
+/// whole workspace before binding and a cold scan of the host checkout can
+/// exceed `deadline` on a slow runner — failing bind/reuse assertions that
+/// have nothing to do with index contents.
 pub fn start_operator_server(
     preferred: Option<SocketAddr>,
     explicit: bool,
     api_key: Option<String>,
     api_key_env: Option<String>,
     deadline: Duration,
+    workspace_root: Option<std::path::PathBuf>,
 ) -> anyhow::Result<ServerSessionDescriptor> {
     // Step 1: let serve pick AND own the port — the caller never touches it, so
     // there is no interval in which it is chosen but unowned.
@@ -154,6 +162,7 @@ pub fn start_operator_server(
         api_key,
         api_key_env,
         bound_addr_tx: Some(bound_tx),
+        workspace_root,
     };
     std::thread::Builder::new()
         .name("symforge-serve".to_string())
@@ -408,7 +417,7 @@ pub fn run_admin<B: crate::cli::browser::BrowserOpener + ?Sized>(
     browser: &B,
 ) -> anyhow::Result<AdminOutcome> {
     let placement = crate::paths::process_control_state_placement();
-    run_admin_with_control_state(args, ctx, browser, placement.directory())
+    run_admin_with_control_state(args, ctx, browser, placement.directory(), None)
 }
 
 #[doc(hidden)]
@@ -417,6 +426,9 @@ pub fn run_admin_with_control_state<B: crate::cli::browser::BrowserOpener + ?Siz
     ctx: &crate::cli::setup::SetupContext,
     browser: &B,
     control_state_dir: Option<&crate::domain::ControlStateDir>,
+    // Test seam: serve a small fixture root instead of CWD-discovering (and
+    // cold-scanning) the host checkout. Production (`run_admin`) passes None.
+    workspace_root: Option<&std::path::Path>,
 ) -> anyhow::Result<AdminOutcome> {
     use crate::cli::operator_profile::OperatorSetupProfile;
 
@@ -449,6 +461,7 @@ pub fn run_admin_with_control_state<B: crate::cli::browser::BrowserOpener + ?Siz
                 None,
                 None,
                 ADMIN_SERVE_START_DEADLINE,
+                workspace_root.map(std::path::Path::to_path_buf),
             )?;
             persist_started_port(control_state_dir, existing_profile.as_ref(), &started);
             started
@@ -573,10 +586,25 @@ mod tests {
     /// Serve binding once and reporting back leaves no gap to lose.
     #[test]
     fn concurrent_starts_with_no_preference_both_come_up() {
-        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
-            .expect("first operator server should come up");
-        let second = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
-            .expect("second operator server should come up");
+        let workspace = empty_workspace();
+        let first = start_operator_server(
+            None,
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
+        )
+        .expect("first operator server should come up");
+        let second = start_operator_server(
+            None,
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
+        )
+        .expect("second operator server should come up");
         assert_ne!(
             first.bound_addr, second.bound_addr,
             "each start must own a distinct port"
@@ -589,14 +617,23 @@ mod tests {
     /// `SO_REUSEADDR` let two servers silently share one address.
     #[test]
     fn occupied_preference_falls_back_instead_of_failing() {
-        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
-            .expect("first operator server should come up");
+        let workspace = empty_workspace();
+        let first = start_operator_server(
+            None,
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
+        )
+        .expect("first operator server should come up");
         let second = start_operator_server(
             Some(first.bound_addr),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("an occupied preference must fall back, not fail");
         assert_ne!(
@@ -613,8 +650,16 @@ mod tests {
     /// unconditionally, which made this indistinguishable from a soft preference.
     #[test]
     fn explicit_demand_fails_loudly_instead_of_falling_back() {
-        let first = start_operator_server(None, false, None, None, ADMIN_SERVE_START_DEADLINE)
-            .expect("first operator server should come up");
+        let workspace = empty_workspace();
+        let first = start_operator_server(
+            None,
+            false,
+            None,
+            None,
+            ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
+        )
+        .expect("first operator server should come up");
 
         let result = start_operator_server(
             Some(first.bound_addr),
@@ -622,6 +667,7 @@ mod tests {
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         );
         assert!(
             result.is_err(),
@@ -649,12 +695,14 @@ mod tests {
         // loopback open), then confirm both the start helper's descriptor and a
         // standalone reachability probe agree it is serving.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let workspace = empty_workspace();
         let desc = start_operator_server(
             Some(preferred),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("operator server should become reachable");
 
@@ -692,6 +740,14 @@ mod tests {
         }
     }
 
+    /// A throwaway empty workspace root for spawned servers: nothing to index,
+    /// so the start covers bind behaviour, not a cold scan of the host checkout
+    /// (which exceeds `ADMIN_SERVE_START_DEADLINE` on a slow runner or a large
+    /// repository). The returned `TempDir` must outlive the start it feeds.
+    fn empty_workspace() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp workspace")
+    }
+
     fn control_over(home: &std::path::Path) -> crate::domain::ControlStateDir {
         crate::domain::ControlStateDir::new(home.join("control"))
     }
@@ -700,12 +756,14 @@ mod tests {
     fn run_admin_reuses_running_server_on_profile_port() {
         // A real server is running; the profile points at its port.
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let workspace = empty_workspace();
         let running = start_operator_server(
             Some(preferred),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("operator server should come up");
         let running_port = running.bound_addr.port();
@@ -730,6 +788,7 @@ mod tests {
             &ctx,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("admin should reuse the running server");
 
@@ -764,6 +823,7 @@ mod tests {
             &ctx,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("admin should start a server when none runs");
 
@@ -783,12 +843,14 @@ mod tests {
     #[test]
     fn run_admin_no_open_does_not_open_browser() {
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let workspace = empty_workspace();
         let running = start_operator_server(
             Some(preferred),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("operator server should come up");
 
@@ -812,6 +874,7 @@ mod tests {
             &ctx,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("admin --no-open should report without opening");
 
@@ -843,6 +906,7 @@ mod tests {
             &ctx,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("admin should start a server when none runs");
         assert!(!outcome.reused_server, "no server ran; must start one");
@@ -888,12 +952,14 @@ mod tests {
         // path must NOT block: another process owns the server, so admin exits 0
         // after opening the dashboard (required behavior #1).
         let preferred = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let workspace = empty_workspace();
         let running = start_operator_server(
             Some(preferred),
             false,
             None,
             None,
             ADMIN_SERVE_START_DEADLINE,
+            Some(workspace.path().to_path_buf()),
         )
         .expect("operator server should come up");
 
@@ -917,6 +983,7 @@ mod tests {
             &ctx,
             &browser,
             Some(&control),
+            Some(project.path()),
         )
         .expect("admin should reuse the running server");
         assert!(outcome.reused_server, "must reuse the running server");

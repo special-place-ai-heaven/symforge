@@ -47,7 +47,7 @@ pub struct ServeArgs {
     pub explicit_listen: bool,
     /// Inline API key (`--api-key`).
     pub api_key: Option<String>,
-    /// Name of an env var holding the API key (`--api-key-env`); used only when
+    /// Name of an env var holding the API key (--api-key-env); used only when
     /// `api_key` is `None`.
     pub api_key_env: Option<String>,
     /// Optional one-shot report of the address this run actually bound.
@@ -64,6 +64,15 @@ pub struct ServeArgs {
     /// occupied port learns that immediately instead of waiting out its full
     /// deadline for a report that a bind error already prevented.
     pub bound_addr_tx: Option<std::sync::mpsc::SyncSender<Result<SocketAddr, String>>>,
+    /// Explicit workspace root to index and serve, skipping CWD discovery.
+    ///
+    /// `None` (every production path) keeps [`crate::discovery::find_project_root`]
+    /// behaviour: walk up from the process CWD to the containing git root and
+    /// index that whole tree. Tests pass a small fixture root here so a bind /
+    /// reuse assertion does not pay for a cold scan of the host checkout —
+    /// which on a large repository or a slow runner exceeds the start deadline
+    /// even though nothing under test involves the index's contents.
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ServeArgs {
@@ -74,6 +83,7 @@ impl Default for ServeArgs {
             api_key: None,
             api_key_env: None,
             bound_addr_tx: None,
+            workspace_root: None,
         }
     }
 }
@@ -330,7 +340,9 @@ pub enum ServeError {
 /// safe root is found, serves over an empty index — `tools/list` still responds,
 /// and the operator can `index_folder` after attaching. Returns the index and
 /// the resolved root (for the STEL ledger store location and the project name).
-fn load_serve_index() -> Result<
+fn load_serve_index(
+    workspace_root: Option<&std::path::Path>,
+) -> Result<
     (
         SharedIndex,
         Option<std::path::PathBuf>,
@@ -338,7 +350,14 @@ fn load_serve_index() -> Result<
     ),
     ServeError,
 > {
-    match crate::discovery::find_project_root() {
+    // An explicit root answers the same question CWD discovery does — "which
+    // tree does this launch serve?" — so it is resolved through the SAME guard
+    // and binding path, never trusted blindly.
+    let discovered = match workspace_root {
+        Some(root) => Some(root.to_path_buf()),
+        None => crate::discovery::find_project_root(),
+    };
+    match discovered {
         Some(root) => {
             let RootResolution::Bound(binding) = crate::discovery::resolve_root_candidate(
                 &root,
@@ -474,7 +493,7 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
 
     // Load the shared index, then bind. Load before bind so an index failure does
     // not leave a half-open listener.
-    let (index, repo_root, state_placement) = load_serve_index()?;
+    let (index, repo_root, state_placement) = load_serve_index(args.workspace_root.as_deref())?;
     let control_state_dir: Option<ControlStateDir> =
         crate::paths::process_control_state_placement()
             .directory()
@@ -731,6 +750,7 @@ mod tests {
             api_key: Some("inline-secret".to_string()),
             api_key_env: None,
             bound_addr_tx: None,
+            workspace_root: None,
         };
         let err = run(args)
             .await
@@ -775,6 +795,7 @@ mod tests {
             api_key: None,
             api_key_env: None,
             bound_addr_tx: None,
+            workspace_root: None,
         };
         let err = run(args)
             .await
@@ -790,6 +811,7 @@ mod tests {
             api_key: Some("k".to_string()),
             api_key_env: None,
             bound_addr_tx: None,
+            workspace_root: None,
         };
         let err = run(args).await.expect_err("bad --listen must error");
         assert!(matches!(err, ServeError::InvalidListen { .. }));

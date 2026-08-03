@@ -44,6 +44,8 @@ impl ServeCliArgs {
             api_key: self.api_key,
             api_key_env: self.api_key_env,
             bound_addr_tx: None,
+            // The operator CLI always discovers the workspace from its CWD.
+            workspace_root: None,
         }
     }
 }

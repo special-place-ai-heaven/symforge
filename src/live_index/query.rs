@@ -1255,6 +1255,50 @@ impl LiveIndex {
         })
     }
 
+    /// Typed per-path admission disposition, read straight off the manifest.
+    ///
+    /// Deliberately NOT `capture_admission_tier_lookup_view`: that projects through
+    /// `compatibility_admission_decision`, which collapses seven `MetadataOnlyReason`
+    /// variants — including both security variants — into
+    /// `SkipReason::UnsupportedLanguage`. A security decision must never be taken on
+    /// that projection.
+    pub fn capture_file_disposition(
+        &self,
+        relative_path: &str,
+    ) -> Option<&crate::domain::FileDisposition> {
+        let path = normalize_path_query(relative_path);
+        self.manifest_entries
+            .iter()
+            .find(|entry| {
+                normalize_path_query(super::store::scouted_catalog_path(&entry.path)) == path
+            })
+            .map(|entry| &entry.disposition)
+    }
+
+    /// Paths eligible for the Tier-2 textual sweep: ONLY oversized first-party
+    /// files. Positive eligibility off the typed disposition — a security demotion
+    /// can never appear here regardless of what the legacy `SkipReason` projection
+    /// would have called it.
+    pub fn oversized_metadata_only_files(&self) -> Vec<(String, u64)> {
+        self.manifest_entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.disposition,
+                    crate::domain::FileDisposition::MetadataOnly {
+                        reason: crate::domain::MetadataOnlyReason::OversizedData
+                    }
+                )
+            })
+            .map(|entry| {
+                (
+                    super::store::scouted_catalog_path(&entry.path).to_string(),
+                    entry.size,
+                )
+            })
+            .collect()
+    }
+
     /// Capture a shared immutable file entry under the read lock.
     pub fn capture_shared_file(&self, relative_path: &str) -> Option<Arc<IndexedFile>> {
         self.files.get(relative_path).cloned()

@@ -99,6 +99,10 @@ Rust MCP server providing symbol-aware code and repository-knowledge navigation,
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests
+- `src/protocol/read_gate.rs` — The single admission gate for raw-disk content
+  reads. Every lane that reopens a file from disk (rather than serving bytes
+  already in the in-memory index) routes through `admit_disk_read`, which owns
+  the read and returns the buffer only on a permit verdict.
 - `src/protocol/format.rs` — Output formatters
 - `src/daemon.rs` — Daemon proxy with backward-compat aliases
 - `src/cli/init.rs` — Tool name list for client init

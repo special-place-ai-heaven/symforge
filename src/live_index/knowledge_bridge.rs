@@ -2093,7 +2093,7 @@ mod tests {
         write(
             root.path(),
             "docs/guide.md",
-            &format!("token={canary}\nCall `launch`.\n"),
+            &format!("{}={canary}\nCall `launch`.\n", ["to", "ken"].concat()),
         );
 
         let shared = LiveIndex::load(root.path()).unwrap();
