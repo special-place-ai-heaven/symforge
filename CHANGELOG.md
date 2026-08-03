@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.8](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.7...v8.16.8) (2026-08-03)
+
+
+### Bug Fixes
+
+* **023:** capture credentials inside inline arrays ([#486](https://github.com/special-place-ai-heaven/symforge/issues/486)) ([80cdb67](https://github.com/special-place-ai-heaven/symforge/commit/80cdb67e7038fb6b03cc6615291ff0dfe51d500c))
+* **023:** gate raw-disk and working-tree content disclosure ([#485](https://github.com/special-place-ai-heaven/symforge/issues/485)) ([114b793](https://github.com/special-place-ai-heaven/symforge/commit/114b79337d3d79a2213ccbebf15764cc0f50ed62))
+
 ## [8.16.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.6...v8.16.7) (2026-07-29)
 
 
