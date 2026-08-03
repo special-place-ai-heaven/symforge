@@ -38,12 +38,20 @@ fn control_state(home: &std::path::Path) -> symforge::domain::ControlStateDir {
 fn admin_reuses_running_server_on_profile_port() {
     // Start a real loopback server, then write a profile pointing at its port.
     let preferred = loopback(0);
-    // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
-    // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
-    // this is a generous upper bound, not the expected wait (warm start = seconds).
-    let running =
-        start_operator_server(Some(preferred), false, None, None, Duration::from_secs(60))
-            .expect("operator server should come up");
+    // 60s ceiling is a generous upper bound, not the expected wait: the server
+    // is pointed at an empty temp workspace, so there is no cold scan of the
+    // host checkout in the start path at all (a 10s variant flaked in CI back
+    // when the host tree was indexed on every start).
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let running = start_operator_server(
+        Some(preferred),
+        false,
+        None,
+        None,
+        Duration::from_secs(60),
+        Some(workspace.path().to_path_buf()),
+    )
+    .expect("operator server should come up");
     let running_port = running.bound_addr.port();
 
     let project = tempfile::tempdir().expect("temp project");
@@ -70,6 +78,7 @@ fn admin_reuses_running_server_on_profile_port() {
         &ctx,
         &browser,
         Some(&control),
+        Some(project.path()),
     )
     .expect("admin should reuse the running server");
 
@@ -116,6 +125,7 @@ fn admin_starts_server_when_none_running_and_persists_port() {
         &ctx,
         &browser,
         Some(&control),
+        Some(project.path()),
     )
     .expect("admin should start a server when none runs");
 
@@ -140,12 +150,20 @@ fn admin_starts_server_when_none_running_and_persists_port() {
 #[test]
 fn admin_no_open_skips_browser_but_still_reports_url() {
     let preferred = loopback(0);
-    // 60s ceiling: serve::run indexes the workspace on startup, which on a cold or
-    // loaded CI runner can exceed a tight deadline (a 10s variant flaked in CI);
-    // this is a generous upper bound, not the expected wait (warm start = seconds).
-    let running =
-        start_operator_server(Some(preferred), false, None, None, Duration::from_secs(60))
-            .expect("operator server should come up");
+    // 60s ceiling is a generous upper bound, not the expected wait: the server
+    // is pointed at an empty temp workspace, so there is no cold scan of the
+    // host checkout in the start path at all (a 10s variant flaked in CI back
+    // when the host tree was indexed on every start).
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let running = start_operator_server(
+        Some(preferred),
+        false,
+        None,
+        None,
+        Duration::from_secs(60),
+        Some(workspace.path().to_path_buf()),
+    )
+    .expect("operator server should come up");
 
     let project = tempfile::tempdir().expect("temp project");
     let home = tempfile::tempdir().expect("temp home");
@@ -171,6 +189,7 @@ fn admin_no_open_skips_browser_but_still_reports_url() {
         &ctx,
         &browser,
         Some(&control),
+        Some(project.path()),
     )
     .expect("admin --no-open should report the URL without opening");
 
