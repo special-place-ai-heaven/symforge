@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.16.9](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.8...v8.16.9) (2026-08-03)
+
+
+### Bug Fixes
+
+* **live-index:** report the full index build time and name every startup phase ([#488](https://github.com/special-place-ai-heaven/symforge/issues/488)) ([79053ab](https://github.com/special-place-ai-heaven/symforge/commit/79053ab9d6c11b243328684ecccbe9b44208067a))
+
 ## [8.16.8](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.7...v8.16.8) (2026-08-03)
 
 
