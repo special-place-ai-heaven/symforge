@@ -532,10 +532,13 @@ fn snapshot_source_identity_from_captured(
     }
 }
 
-fn verify_snapshot_source_identity(
-    snapshot: &IndexSnapshot,
-    project_root: &Path,
-) -> anyhow::Result<()> {
+/// The ROOT-INDEPENDENT half of snapshot verification: internal header
+/// consistency, canonical manifest-digest reconstruction, and the indexed
+/// content digest. Returns `(manifest_digest, indexed_content_digest)` on
+/// success. Shared by the same-root verifier below and the explicit portable
+/// import lane (which must verify integrity WITHOUT comparing path-derived
+/// identities).
+fn verify_snapshot_content_integrity(snapshot: &IndexSnapshot) -> anyhow::Result<(String, String)> {
     if snapshot.source_identity.project_id != snapshot.project_id {
         anyhow::bail!("snapshot header project identity disagrees with its placement identity");
     }
@@ -554,13 +557,20 @@ fn verify_snapshot_source_identity(
     if rebuilt_manifest.digest != snapshot.manifest.digest {
         anyhow::bail!("snapshot manifest digest failed canonical reconstruction");
     }
-    let manifest_digest = snapshot.manifest.digest.clone();
     let content_digest = indexed_content_digest(
         snapshot
             .files
             .iter()
             .map(|(path, file)| (path.as_str(), file.content.as_slice())),
     )?;
+    Ok((snapshot.manifest.digest.clone(), content_digest))
+}
+
+fn verify_snapshot_source_identity(
+    snapshot: &IndexSnapshot,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let (manifest_digest, content_digest) = verify_snapshot_content_integrity(snapshot)?;
     let current = capture_snapshot_source_identity(
         project_root,
         snapshot.project_id.clone(),
@@ -1088,7 +1098,19 @@ fn read_artifact_content_hash(metadata_path: &Path) -> Option<String> {
 /// postcard, version mismatch) quarantines the artifact under
 /// `.symforge/quarantine/artifacts/` and returns `None`, so the caller falls
 /// back to a full cold re-index (contract § Integrity failure).
-fn import_artifact(project_root: &Path, expected_project_id: &ProjectId) -> Option<IndexSnapshot> {
+/// A team artifact whose INTEGRITY has been verified (zstd decode, sidecar
+/// `content_hash`, postcard decode, snapshot format version, secret-policy
+/// version) but whose IDENTITY has not yet been adjudicated. The local lane
+/// (`import_artifact`) refuses foreign state; the explicit portable lane
+/// (`import_portable_snapshot`) rebinds it.
+struct VerifiedArtifact {
+    snapshot: IndexSnapshot,
+    artifact_path: std::path::PathBuf,
+    metadata_path: std::path::PathBuf,
+    compressed: Vec<u8>,
+}
+
+fn read_verified_artifact(project_root: &Path) -> Option<VerifiedArtifact> {
     let dir = paths::resolve_symforge_dir(project_root);
     let artifact_path = dir.join(ARTIFACT_FILENAME);
     let metadata_path = dir.join(ARTIFACT_METADATA_FILENAME);
@@ -1179,33 +1201,12 @@ fn import_artifact(project_root: &Path, expected_project_id: &ProjectId) -> Opti
             );
             None
         }
-        Ok(snapshot) if snapshot.version == CURRENT_VERSION => {
-            let identity_result = if &snapshot.project_id != expected_project_id {
-                Err(anyhow::anyhow!(
-                    "team artifact project {}, expected {}",
-                    snapshot.project_id.0,
-                    expected_project_id.0
-                ))
-            } else {
-                verify_snapshot_source_identity(&snapshot, project_root)
-            };
-            if let Err(error) = identity_result {
-                warn!(
-                    detail = %error,
-                    "team artifact source identity mismatch; quarantining foreign or stale state"
-                );
-                try_quarantine_bad_artifact(
-                    project_root,
-                    &artifact_path,
-                    &metadata_path,
-                    &compressed,
-                    "source-identity-mismatch",
-                    error.to_string(),
-                );
-                return None;
-            }
-            Some(snapshot)
-        }
+        Ok(snapshot) if snapshot.version == CURRENT_VERSION => Some(VerifiedArtifact {
+            snapshot,
+            artifact_path,
+            metadata_path,
+            compressed,
+        }),
         Ok(snapshot) => {
             warn!(
                 "team artifact snapshot version mismatch: got {}, expected {} — will cold re-index",
@@ -1237,6 +1238,181 @@ fn import_artifact(project_root: &Path, expected_project_id: &ProjectId) -> Opti
             None
         }
     }
+}
+
+fn import_artifact(project_root: &Path, expected_project_id: &ProjectId) -> Option<IndexSnapshot> {
+    let VerifiedArtifact {
+        snapshot,
+        artifact_path,
+        metadata_path,
+        compressed,
+    } = read_verified_artifact(project_root)?;
+
+    let identity_result = if &snapshot.project_id != expected_project_id {
+        Err(anyhow::anyhow!(
+            "team artifact project {}, expected {}",
+            snapshot.project_id.0,
+            expected_project_id.0
+        ))
+    } else {
+        verify_snapshot_source_identity(&snapshot, project_root)
+    };
+    if let Err(error) = identity_result {
+        warn!(
+            detail = %error,
+            "team artifact source identity mismatch; quarantining foreign or stale state"
+        );
+        try_quarantine_bad_artifact(
+            project_root,
+            &artifact_path,
+            &metadata_path,
+            &compressed,
+            "source-identity-mismatch",
+            error.to_string(),
+        );
+        return None;
+    }
+    Some(snapshot)
+}
+
+/// The provenance a caller CLAIMS for a portable snapshot import. The engine
+/// cannot verify this claim — the explicit opt-in in code (never data) is the
+/// guard, per the AAP trust addendum (2026-08-04).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortableSnapshotProvenance {
+    /// The artifact was baked HOST-side (image builder or pre-credential
+    /// clean-layer capture) into a layer that is read-only until this
+    /// boot-time import — nothing that ran inside the sandbox could have
+    /// produced or replaced it.
+    HostBakedImageLayer,
+}
+
+/// Restore-once guard for [`import_portable_snapshot`]: the trust model
+/// ("restore exactly once at boot") refuses ANY second attempt in-process,
+/// successful or not — a mid-life retry is exactly the re-import lane the
+/// embedder explicitly does not want (a sandboxed agent can replace the
+/// artifact in its own writable overlay after boot).
+static PORTABLE_IMPORT_ATTEMPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn reset_portable_import_guard_for_tests() {
+    PORTABLE_IMPORT_ATTEMPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// EXPLICIT opt-in import of a host-baked team artifact
+/// (`<root>/.symforge/index.bin.zst`) at a root DIFFERENT from the one it was
+/// built at — the sanctioned crossing of the anti-foreign-state identity gate
+/// (task #23; AAP rooms R3 warm start).
+///
+/// What stays enforced (everything content-derived):
+/// * artifact integrity — zstd decode, sidecar `content_hash`, postcard
+///   decode, snapshot format version, secret-policy version;
+/// * root-independent integrity — canonical manifest-digest reconstruction,
+///   indexed content digest, and both digests matching the baked header;
+/// * git drift — when the snapshot carries a git fingerprint, the RESTORING
+///   root's repository must exist and match on object format, tip object id,
+///   and reachable-history fingerprint (a stale bake or wrongly provisioned
+///   workspace is refused). A non-git snapshot has no disk-anchored
+///   fingerprint; post-restore drift there is the background verification's
+///   job, exactly as on the same-root lane.
+///
+/// What is rebound (everything path-derived): the project / repository /
+/// source identities move to the restoring root, so subsequent same-root
+/// loads, checkpoints, and retargets see a coherent local identity.
+///
+/// Refusals never quarantine the artifact here — it may live on a shared
+/// read-only layer that other sandboxes boot from; integrity-stage failures
+/// inside the shared reader keep their existing quarantine behavior (the
+/// rename simply fails and logs on a read-only filesystem).
+pub fn import_portable_snapshot(
+    project_root: &Path,
+    state_placement: &StatePlacement,
+    provenance: PortableSnapshotProvenance,
+) -> Option<IndexSnapshot> {
+    if PORTABLE_IMPORT_ATTEMPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        warn!(
+            "portable snapshot import refused: already attempted once in this process \
+             (restore-once policy)"
+        );
+        return None;
+    }
+    let PortableSnapshotProvenance::HostBakedImageLayer = provenance;
+
+    let (_state_dir, expected_project_id) =
+        resolved_snapshot_state(project_root, state_placement).ok()?;
+    let VerifiedArtifact { mut snapshot, .. } = read_verified_artifact(project_root)?;
+
+    let (manifest_digest, content_digest) = match verify_snapshot_content_integrity(&snapshot) {
+        Ok(digests) => digests,
+        Err(error) => {
+            warn!(detail = %error, "portable snapshot failed root-independent integrity; refusing");
+            return None;
+        }
+    };
+    if snapshot.source_identity.manifest_digest != manifest_digest
+        || snapshot.source_identity.indexed_content_digest != content_digest
+    {
+        warn!("portable snapshot header digests disagree with recomputation; refusing");
+        return None;
+    }
+
+    let current = match capture_snapshot_source_identity(
+        project_root,
+        expected_project_id.clone(),
+        manifest_digest,
+        content_digest,
+    ) {
+        Ok(current) => current,
+        Err(error) => {
+            warn!(detail = %error, "capturing restoring-root identity failed; refusing portable import");
+            return None;
+        }
+    };
+
+    match (
+        &snapshot.source_identity.repository_fingerprint,
+        &current.repository_fingerprint,
+    ) {
+        (
+            RepositoryFingerprint::Git {
+                object_format: baked_format,
+                tip_object_id: baked_tip,
+                reachable_history_fingerprint: baked_history,
+                ..
+            },
+            RepositoryFingerprint::Git {
+                object_format: current_format,
+                tip_object_id: current_tip,
+                reachable_history_fingerprint: current_history,
+                ..
+            },
+        ) => {
+            if baked_format != current_format
+                || baked_tip != current_tip
+                || baked_history != current_history
+            {
+                warn!(
+                    "portable snapshot's git fingerprint does not match the restoring \
+                     workspace (stale bake or wrong provisioning); refusing"
+                );
+                return None;
+            }
+        }
+        (RepositoryFingerprint::Git { .. }, _) => {
+            warn!(
+                "portable snapshot was git-fingerprinted but the restoring root has no \
+                 git repository; refusing"
+            );
+            return None;
+        }
+        (RepositoryFingerprint::NonGit { .. }, _) => {}
+    }
+
+    snapshot.project_id = expected_project_id;
+    snapshot.source_identity = current;
+    Some(snapshot)
 }
 
 fn quarantine_bad_artifact(
@@ -4803,6 +4979,132 @@ mod tests {
             head = repo.find_commit(oid).expect("find commit");
         }
         head.id().to_string()
+    }
+
+    /// Copy `src`'s tree into `dst` (test-only stand-in for baking a
+    /// workspace layer at a different root).
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).expect("create dst");
+        for entry in std::fs::read_dir(src).expect("read src") {
+            let entry = entry.expect("dir entry");
+            let target = dst.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy file");
+            }
+        }
+    }
+
+    /// Task #23: a host-baked artifact restores at a DIFFERENT root via the
+    /// explicit portable lane — path-derived identities rebound, files intact
+    /// — and the restore-once policy refuses a second in-process attempt.
+    #[test]
+    fn portable_import_rebinds_nongit_snapshot_across_roots() {
+        super::reset_portable_import_guard_for_tests();
+        let host = TempDir::new().expect("host root");
+        std::fs::write(host.path().join("lib.rs"), "pub fn baked() {}\n").expect("seed");
+        let shared = LiveIndex::load(host.path()).expect("host cold load");
+        export_artifact_legacy(&shared.read(), host.path()).expect("host bake");
+
+        let guest = TempDir::new().expect("guest root");
+        copy_tree(host.path(), guest.path());
+
+        let placement = project_local_placement(guest.path());
+        let snapshot = super::import_portable_snapshot(
+            guest.path(),
+            &placement,
+            super::PortableSnapshotProvenance::HostBakedImageLayer,
+        )
+        .expect("portable import must accept the moved bake");
+        let guest_id = crate::discovery::project_id_for_canonical_root(
+            &dunce::canonicalize(guest.path()).expect("canonical guest"),
+        );
+        assert_eq!(snapshot.project_id, guest_id, "identity rebound to guest");
+        assert_eq!(snapshot.source_identity.project_id, guest_id);
+        assert_eq!(snapshot.files.len(), 1);
+
+        // Restore-once: any second in-process attempt is refused.
+        assert!(
+            super::import_portable_snapshot(
+                guest.path(),
+                &placement,
+                super::PortableSnapshotProvenance::HostBakedImageLayer,
+            )
+            .is_none(),
+            "second portable import must be refused"
+        );
+    }
+
+    /// Task #23: the content-derived git fingerprint stays ENFORCED against
+    /// the restoring workspace — a bake restored into a workspace with a
+    /// different history (or none at all) is refused, never rebound.
+    #[test]
+    fn portable_import_refuses_git_fingerprint_drift() {
+        // Positive control first: same history moved wholesale restores.
+        super::reset_portable_import_guard_for_tests();
+        let host = TempDir::new().expect("host root");
+        init_repo_with_root_commit(host.path());
+        std::fs::write(host.path().join("lib.rs"), "pub fn baked() {}\n").expect("seed");
+        let shared = LiveIndex::load(host.path()).expect("host cold load");
+        export_artifact_legacy(&shared.read(), host.path()).expect("host bake");
+
+        let guest_same = TempDir::new().expect("guest same-history");
+        copy_tree(host.path(), guest_same.path());
+        assert!(
+            super::import_portable_snapshot(
+                guest_same.path(),
+                &project_local_placement(guest_same.path()),
+                super::PortableSnapshotProvenance::HostBakedImageLayer,
+            )
+            .is_some(),
+            "same git history at a new root must import"
+        );
+
+        // Different history: fresh repo (different root commit) at the guest.
+        // A FIXED-epoch signature, not `Signature::now` — the helper's empty
+        // tree + same author + same message mints an IDENTICAL commit SHA when
+        // both inits land in the same wall-clock second, which is no
+        // divergence at all.
+        super::reset_portable_import_guard_for_tests();
+        let guest_drift = TempDir::new().expect("guest drifted");
+        copy_tree(host.path(), guest_drift.path());
+        std::fs::remove_dir_all(guest_drift.path().join(".git")).expect("drop copied history");
+        {
+            let repo = git2::Repository::init(guest_drift.path()).expect("drift init");
+            let sig = git2::Signature::new("t", "t@x", &git2::Time::new(946_684_800, 0))
+                .expect("fixed-epoch sig");
+            let tree_id = {
+                let mut idx = repo.index().expect("index");
+                idx.write_tree().expect("write tree")
+            };
+            let tree = repo.find_tree(tree_id).expect("find tree");
+            git_test_helpers::commit_head_with_retry(&repo, &sig, &sig, "drifted root", &tree, &[]);
+        }
+        assert!(
+            super::import_portable_snapshot(
+                guest_drift.path(),
+                &project_local_placement(guest_drift.path()),
+                super::PortableSnapshotProvenance::HostBakedImageLayer,
+            )
+            .is_none(),
+            "diverged git history must refuse the bake"
+        );
+
+        // No repository at all: a git-fingerprinted bake needs one.
+        super::reset_portable_import_guard_for_tests();
+        let guest_bare = TempDir::new().expect("guest no-git");
+        copy_tree(host.path(), guest_bare.path());
+        std::fs::remove_dir_all(guest_bare.path().join(".git")).expect("drop history");
+        assert!(
+            super::import_portable_snapshot(
+                guest_bare.path(),
+                &project_local_placement(guest_bare.path()),
+                super::PortableSnapshotProvenance::HostBakedImageLayer,
+            )
+            .is_none(),
+            "git-fingerprinted bake without a workspace repository must refuse"
+        );
     }
 
     /// Initialize a repo at `root` with one root commit. Returns that SHA.
