@@ -335,21 +335,29 @@ pub enum ServeError {
 
 /// Build the in-process [`SharedIndex`] for serving.
 ///
-/// Resolves the project root (`discovery::find_project_root`) and loads it
-/// synchronously (the same `LiveIndex::load` the stdio local path uses). When no
-/// safe root is found, serves over an empty index — `tools/list` still responds,
-/// and the operator can `index_folder` after attaching. Returns the index and
-/// the resolved root (for the STEL ledger store location and the project name).
+/// Resolves the project root (`discovery::find_project_root`) and loads it —
+/// snapshot-first, exactly like the stdio local path (spec 026): a fresh
+/// `.symforge/index.bin` rehydrates in well under a second (no re-parsing),
+/// with the SAME staleness gate `persist::load_snapshot` applies everywhere
+/// and a background verification pass reconciling against current disk state.
+/// Only when no usable snapshot exists does serve pay the synchronous cold
+/// `LiveIndex::load` it always paid. When no safe root is found, serves over
+/// an empty index — `tools/list` still responds, and the operator can
+/// `index_folder` after attaching.
+///
+/// The fourth tuple element carries the snapshot's mtime map when the fast
+/// path was taken; the caller spawns `persist::background_verify` with it
+/// (this function is sync — it cannot spawn).
+type LoadedServeIndex = (
+    SharedIndex,
+    Option<std::path::PathBuf>,
+    Option<StatePlacement>,
+    Option<std::collections::HashMap<String, u64>>,
+);
+
 fn load_serve_index(
     workspace_root: Option<&std::path::Path>,
-) -> Result<
-    (
-        SharedIndex,
-        Option<std::path::PathBuf>,
-        Option<StatePlacement>,
-    ),
-    ServeError,
-> {
+) -> Result<LoadedServeIndex, ServeError> {
     // An explicit root answers the same question CWD discovery does — "which
     // tree does this launch serve?" — so it is resolved through the SAME guard
     // and binding path, never trusted blindly.
@@ -364,15 +372,51 @@ fn load_serve_index(
                 RootCandidateSource::LaunchCwd,
                 RootRequestMode::Automatic,
             ) else {
-                return Ok((LiveIndex::empty(), None, None));
+                return Ok((LiveIndex::empty(), None, None, None));
             };
             let state_placement = crate::discovery::resolve_state_placement(&binding);
             let root = binding.canonical_root;
+
+            // Fast path: rehydrate the persisted snapshot (staleness-gated
+            // inside `load_snapshot`) instead of re-parsing the tree.
+            if let Some(snapshot) =
+                crate::live_index::persist::load_snapshot(&root, &state_placement)
+            {
+                let file_count = snapshot.files.len();
+                let snapshot_mtimes: std::collections::HashMap<String, u64> = snapshot
+                    .files
+                    .iter()
+                    .map(|(path, file)| (path.clone(), file.mtime_secs))
+                    .collect();
+                let (live, code_signals) =
+                    crate::live_index::persist::snapshot_to_live_index_with_code_signals(
+                        snapshot, &root,
+                    );
+                tracing::info!(
+                    files = file_count,
+                    load_source = ?live.load_source(),
+                    snapshot_verify_state = ?live.snapshot_verify_state(),
+                    "serve: loaded serialized index from .symforge/index.bin"
+                );
+                let shared = crate::live_index::SharedIndexHandle::shared_for_state_placement_with_code_signals(
+                    live,
+                    &root,
+                    &state_placement,
+                    code_signals,
+                );
+                return Ok((
+                    shared,
+                    Some(root),
+                    Some(state_placement),
+                    Some(snapshot_mtimes),
+                ));
+            }
+
             let index = LiveIndex::load_for_state_placement(&root, &state_placement)
                 .map_err(|source| ServeError::IndexLoad { source })?;
-            Ok((index, Some(root), Some(state_placement)))
+            Ok((index, Some(root), Some(state_placement), None))
         }
-        None => Ok((LiveIndex::empty(), None, None)),
+        None => Ok((LiveIndex::empty(), None, None, None)),
     }
 }
 
@@ -497,8 +541,18 @@ pub async fn run(args: ServeArgs) -> Result<(), ServeError> {
     // the load itself on this repo, and an unattributed slow phase is exactly
     // what let the load-duration under-report go unnoticed.
     let phase = std::time::Instant::now();
-    let (index, repo_root, state_placement) = load_serve_index(args.workspace_root.as_deref())?;
+    let (index, repo_root, state_placement, snapshot_mtimes) =
+        load_serve_index(args.workspace_root.as_deref())?;
     tracing::info!("serve: index ready in {:?}", phase.elapsed());
+    // Spec 026: a snapshot-restored index reconciles against current disk
+    // state in the background (same verify pass the stdio path spawns); tools
+    // serve immediately with the honest SnapshotRestore/Pending trust labels.
+    if let (Some(mtimes), Some(root)) = (snapshot_mtimes, repo_root.clone()) {
+        let bg_index = index.clone();
+        tokio::spawn(async move {
+            crate::live_index::persist::background_verify(bg_index, root, mtimes).await;
+        });
+    }
     let control_state_dir: Option<ControlStateDir> =
         crate::paths::process_control_state_placement()
             .directory()
@@ -672,6 +726,40 @@ mod tests {
     /// Serializes process-env mutation across the env-dependent tests in this
     /// module (in addition to the suite-wide `--test-threads=1`).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Spec 026: serve restores from a fresh `.symforge/index.bin` instead of
+    /// re-parsing — the fast path returns a SnapshotRestore-labeled index plus
+    /// the mtime map the caller hands to `background_verify`. Without a
+    /// snapshot the cold path still loads (and returns no mtime map).
+    #[test]
+    fn load_serve_index_restores_snapshot_when_present() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        std::fs::create_dir(dir.path().join(".git")).expect("plant .git");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
+
+        // Cold path first: no snapshot on disk yet.
+        let (cold, root, placement, mtimes) =
+            load_serve_index(Some(dir.path())).expect("cold load");
+        assert!(mtimes.is_none(), "no snapshot => no verify map");
+        let root = root.expect("root bound");
+        let placement = placement.expect("state placement resolved");
+        assert_eq!(cold.read().file_count(), 1);
+
+        // Persist the checkpoint the daemon/stdio paths write.
+        crate::live_index::persist::checkpoint_shared_index(&cold, &root, &placement)
+            .expect("write snapshot");
+
+        // Warm path: the snapshot must be restored, not re-parsed.
+        let (warm, _, _, mtimes) = load_serve_index(Some(dir.path())).expect("warm load");
+        assert_eq!(
+            warm.read().load_source(),
+            crate::live_index::store::IndexLoadSource::SnapshotRestore,
+            "serve must rehydrate a fresh snapshot"
+        );
+        assert_eq!(warm.read().file_count(), 1);
+        let mtimes = mtimes.expect("snapshot restore returns the verify map");
+        assert!(mtimes.contains_key("lib.rs"), "mtime map keys: {mtimes:?}");
+    }
 
     #[test]
     fn resolve_api_key_prefers_inline_over_env() {
