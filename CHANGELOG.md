@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.20.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.19.0...v8.20.0) (2026-08-04)
+
+
+### Features
+
+* **embed:** explicit portable snapshot import with identity rebind ([#503](https://github.com/special-place-ai-heaven/symforge/issues/503)) ([0b49518](https://github.com/special-place-ai-heaven/symforge/commit/0b49518dc4741e207d2a4f40273ad5dd4b3e89c2))
+
 ## [8.19.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.18.1...v8.19.0) (2026-08-04)
 
 
