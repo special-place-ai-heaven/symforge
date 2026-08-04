@@ -268,7 +268,7 @@ fn statused_edit_tool_result(
     } else {
         rmcp::model::CallToolResult::success(content)
     };
-    Ok(result.with_meta(Some(rmcp::model::Meta(meta))))
+    Ok(result.with_meta(Some(rmcp::model::MetaObject(meta))))
 }
 
 /// Classify one structural-edit tool's output body.

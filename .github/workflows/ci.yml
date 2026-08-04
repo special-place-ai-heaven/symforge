@@ -69,6 +69,26 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check
 
+      - name: Assert single rmcp major (spec 025 FR-A4)
+        # Two rmcp majors in one graph produce identically-named, incompatible
+        # types. `cargo tree -d` cannot distinguish this (it lists any
+        # duplicated crate's subtrees), so parse the metadata instead.
+        run: |
+          python3 - <<'EOF'
+          import json, subprocess, sys
+          md = json.loads(subprocess.run(
+              ["cargo", "metadata", "--format-version", "1"],
+              capture_output=True, text=True, check=True).stdout)
+          majors = {}
+          for p in md["packages"]:
+              if p["name"] in ("rmcp", "rmcp-macros"):
+                  majors.setdefault(p["name"], set()).add(p["version"].split(".")[0])
+          bad = {k: sorted(v) for k, v in majors.items() if v != {"3"}}
+          if bad or len(majors) < 2:
+              sys.exit(f"rmcp major-version assertion failed: {majors}")
+          print(f"rmcp majors OK: { {k: sorted(v) for k, v in majors.items()} }")
+          EOF
+
       - name: Run cargo check
         run: cargo check
 

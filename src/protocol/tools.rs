@@ -13289,7 +13289,13 @@ mod tests {
     }
 
     fn serialized_tool_result<R: IntoCallToolResult>(result: R) -> serde_json::Value {
-        let result = result.into_call_tool_result().unwrap();
+        // INV-1/INV-5: the response enum stops at the trait boundary; this
+        // server emits Complete only, so the helper unwraps it (wildcard arm
+        // required — the enum is #[non_exhaustive]).
+        let result = match result.into_call_tool_result().unwrap() {
+            rmcp::model::CallToolResponse::Complete(result) => result,
+            other => panic!("server must emit Complete-only results, got {other:?}"),
+        };
         serde_json::to_value(&result).unwrap()
     }
 
