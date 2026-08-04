@@ -331,7 +331,7 @@ fn classify_ref_blob(entry: &RefBlobEntry, bytes: &[u8]) -> RefBlobRoute {
         StableContentAdmission::Admitted => {
             let classification =
                 FileClassification::for_indexed_path(&entry.relative_path, targets);
-            let language = entry.language.clone().unwrap_or(LanguageId::Text);
+            let language = entry.language.unwrap_or(LanguageId::Text);
             RefBlobRoute::Parse {
                 targets,
                 language,
@@ -444,7 +444,7 @@ fn route_catalog_files(catalog: &LocalRefCatalog, blobs: &RefBlobBytes) -> RefRo
         let key = (
             entry.object_id.clone(),
             classification,
-            language.clone(),
+            language,
             is_tsx,
             is_c_header,
         );

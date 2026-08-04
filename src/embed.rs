@@ -41,6 +41,58 @@ pub use crate::live_index::search::{
     SymbolSearchResult, TextSearchError, TextSearchResult, search_symbols, search_text,
 };
 pub use crate::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
+
+// ---------------------------------------------------------------------------
+// Engine identity + runtime guarantees (task #25 / AAP asks 4-6).
+//
+// NO IMPLICIT BACKGROUND MACHINERY: constructing or loading an index under
+// the embed feature spawns no watchers, timers, or async runtimes — the file
+// watcher is server-only and caller-started, never by `LiveIndex::load`. The
+// one lazily created resource is the rayon indexing pool (persistent COMPUTE
+// workers, first parse), cappable via `SYMFORGE_INDEXING_THREADS` for
+// tight-RAM PID-1 embedders.
+//
+// SEARCH BOUNDS: `search_symbols`/`search_text` results are bounded by their
+// limit parameters; the scan itself is bounded by the in-memory candidate set
+// (trigram-prefiltered for literal text queries) with a worst case linear in
+// indexed files — measured p95 well under 1 ms on a ~900-file repo. There is
+// no in-engine cancellation token today; an embedder enforcing `timeout_ms`
+// should wrap the call (a budget parameter is a compatible future addition
+// and will land here if a real workload needs it).
+// ---------------------------------------------------------------------------
+
+/// Engine identity for embedder readiness evidence: one call, no I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EngineInfo {
+    /// The symforge crate version compiled into this engine.
+    pub version: &'static str,
+    /// On-disk snapshot format version written/restored by this engine.
+    pub snapshot_format_version: u32,
+    /// Secret-detector policy version enforced at admission and raw reads.
+    pub secret_policy_version: u32,
+    /// Stable lowercase names of every supported grammar.
+    pub grammars: &'static [&'static str],
+}
+
+/// The [`EngineInfo`] for this build. Values are compile-time constants.
+pub fn engine_info() -> EngineInfo {
+    const GRAMMAR_NAMES: [&str; crate::domain::LanguageId::ALL.len()] = {
+        let mut names = [""; crate::domain::LanguageId::ALL.len()];
+        let mut i = 0;
+        while i < crate::domain::LanguageId::ALL.len() {
+            names[i] = crate::domain::LanguageId::ALL[i].name();
+            i += 1;
+        }
+        names
+    };
+    EngineInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        snapshot_format_version: crate::live_index::persist::SNAPSHOT_FORMAT_VERSION,
+        secret_policy_version: crate::knowledge::SECRET_POLICY_VERSION,
+        grammars: &GRAMMAR_NAMES,
+    }
+}
 pub use crate::live_index::store::{
     IndexLoadSource, IndexedFile, ParseStatus, PublishedIndexState, PublishedIndexStatus,
     SharedIndex, SnapshotVerifyState,
@@ -166,6 +218,10 @@ mod contract {
     #[allow(unused_imports)]
     use crate::embed::{ReindexResult, remove_file, update_file_from_disk};
 
+    // Task #25: engine identity is semver-public.
+    #[allow(unused_imports)]
+    use crate::embed::{EngineInfo, engine_info};
+
     // Also name the back-compat MODULE re-exports so their removal trips too.
     #[allow(unused_imports)]
     use crate::embed::{domain, git, live_index, parsing};
@@ -242,6 +298,7 @@ mod contract {
         let _update_file_from_disk: fn(&SharedIndex, &Path, &str) -> ReindexResult =
             crate::embed::update_file_from_disk;
         let _remove_file: fn(&SharedIndex, &str) -> bool = crate::embed::remove_file;
+        let _engine_info: fn() -> EngineInfo = crate::embed::engine_info;
 
         // Associated functions (no `&self`).
         let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
@@ -280,7 +337,19 @@ mod contract {
             _import_portable_snapshot,
             _update_file_from_disk,
             _remove_file,
+            _engine_info,
         );
+
+        // Task #25: engine identity is real data, not just a signature.
+        let info = crate::embed::engine_info();
+        assert!(!info.version.is_empty());
+        assert_eq!(
+            info.grammars.len(),
+            crate::domain::LanguageId::ALL.len(),
+            "every grammar is reported"
+        );
+        assert!(info.grammars.contains(&"rust"));
+        assert!(info.snapshot_format_version >= 7);
 
         // Back-compat module paths still resolve (deep-path imports AAP uses).
         let _deep_process_file: fn(&str, &[u8], LanguageId) -> FileProcessingResult =

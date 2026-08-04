@@ -1518,7 +1518,7 @@ mod tests {
         let mut map: HashMap<String, Arc<IndexedFile>> = HashMap::new();
         for (path, lang, sym) in files {
             let mut file = make_file_with_symbol(path, sym, &format!("fn {sym}() {{}}"));
-            file.language = lang.clone();
+            file.language = *lang;
             map.insert((*path).to_string(), Arc::new(file));
         }
         idx.trigram_index = crate::live_index::trigram::TrigramIndex::build_from_files(&map);

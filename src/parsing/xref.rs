@@ -2980,7 +2980,7 @@ export const Table = ({ rows }) => (\n\
         ];
 
         for (source, lang) in cases {
-            let (refs, _) = parse_and_extract(source, lang.clone());
+            let (refs, _) = parse_and_extract(source, *lang);
             assert!(
                 !refs.is_empty(),
                 "language {:?} should produce refs from non-trivial source, got none",
@@ -3007,7 +3007,7 @@ export const Table = ({ rows }) => (\n\
             LanguageId::Elixir,
         ];
         for lang in languages {
-            let (refs, alias_map) = parse_and_extract("", lang.clone());
+            let (refs, alias_map) = parse_and_extract("", lang);
             assert!(
                 refs.is_empty(),
                 "language {:?} should produce no refs from empty source",

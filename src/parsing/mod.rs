@@ -1892,7 +1892,7 @@ export function App() {
         ];
 
         for &(source, path, ref lang) in cases {
-            let result = process_file(path, source, lang.clone());
+            let result = process_file(path, source, *lang);
             assert_eq!(result.relative_path, path);
             assert_eq!(result.byte_len, source.len() as u64);
             assert!(!result.content_hash.is_empty());
@@ -1966,9 +1966,9 @@ export function App() {
         ];
 
         for &(source, path, ref lang) in cases {
-            let first = process_file(path, source, lang.clone());
-            let second = process_file(path, source, lang.clone());
-            let third = process_file(path, source, lang.clone());
+            let first = process_file(path, source, *lang);
+            let second = process_file(path, source, *lang);
+            let third = process_file(path, source, *lang);
             assert_eq!(
                 first, second,
                 "{path}: identical bytes must yield identical FileProcessingResult (run 1 vs 2)"

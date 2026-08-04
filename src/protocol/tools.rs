@@ -5385,7 +5385,7 @@ impl SymForgeServer {
                 text_options.path_scope = options.path_scope.clone();
                 text_options.noise_policy = options.noise_policy;
                 text_options.include_personal_tooling = options.include_personal_tooling;
-                text_options.language_filter = options.language_filter.clone();
+                text_options.language_filter = options.language_filter;
                 text_options.total_limit = 15;
                 text_options.max_per_file = 1;
                 search::search_text_with_options(
@@ -9892,7 +9892,7 @@ impl SymForgeServer {
                 options.path_scope = search::PathScope::Prefix(prefix.clone());
             }
             if let Some(ref lang) = lang_filter {
-                options.language_filter = Some(lang.clone());
+                options.language_filter = Some(*lang);
             }
             let result = search::search_text_with_options(&guard, Some(tq), None, false, &options);
             if let Ok(r) = result {
@@ -9973,7 +9973,7 @@ impl SymForgeServer {
                     options.path_scope = search::PathScope::Prefix(prefix.clone());
                 }
                 if let Some(ref lang) = lang_filter {
-                    options.language_filter = Some(lang.clone());
+                    options.language_filter = Some(*lang);
                 }
 
                 if let Ok(result) = search::search_text_with_options(

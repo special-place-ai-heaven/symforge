@@ -86,10 +86,42 @@ fn indexing_thread_stack_size() -> usize {
     }
 }
 
+/// Env override for the indexing pool's worker count. The pool is the ONLY
+/// background machinery an embed-feature index load creates (lazy, compute
+/// only — no watchers/timers/runtimes), so a tight-RAM PID-1 embedder can cap
+/// it explicitly. Invalid or zero values fall back to rayon's default.
+const INDEXING_THREADS_ENV: &str = "SYMFORGE_INDEXING_THREADS";
+
+fn indexing_thread_count() -> Option<usize> {
+    let raw = std::env::var(INDEXING_THREADS_ENV).ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(count) if count >= 1 => Some(count),
+        _ => {
+            warn!(
+                env = INDEXING_THREADS_ENV,
+                value = %raw,
+                "ignoring invalid indexing thread count; using rayon default"
+            );
+            None
+        }
+    }
+}
+
 fn indexing_thread_pool() -> &'static rayon::ThreadPool {
     INDEXING_THREAD_POOL.get_or_init(|| {
         let builder = rayon::ThreadPoolBuilder::new()
             .thread_name(|index| format!("symforge-index-{}", index));
+        let builder = match indexing_thread_count() {
+            Some(count) => {
+                info!(
+                    count,
+                    env = INDEXING_THREADS_ENV,
+                    "initializing indexing thread pool with explicit worker count"
+                );
+                builder.num_threads(count)
+            }
+            None => builder,
+        };
 
         #[cfg(windows)]
         let builder = {
@@ -3286,7 +3318,7 @@ fn catalog_entry_from_scout(
     CatalogEntry {
         path: scouted.path.clone(),
         size: scouted.stamp.size,
-        language: scouted.language.clone(),
+        language: scouted.language,
         classification: scouted.classification,
         disposition,
         content_hash,
@@ -3594,7 +3626,7 @@ fn project_scout_for_legacy_execution(plan: &discovery::ScoutPlan) -> LegacyExec
                     relative_path,
                     absolute_path,
                     file_size: entry.stamp.size,
-                    language: entry.language.clone(),
+                    language: entry.language,
                     classification: entry.classification,
                 });
             }
@@ -3808,7 +3840,7 @@ fn admit_and_parse_entries(
                         crate::domain::FileDisposition::MetadataOnly { reason },
                     );
                 }
-                let language = entry.language.clone().unwrap_or(LanguageId::Text);
+                let language = entry.language.unwrap_or(LanguageId::Text);
 
                 let mtime_secs = planned
                     .stamp
@@ -4489,7 +4521,7 @@ impl LiveIndex {
         let manifest_entry = CatalogEntry {
             path: catalog_path,
             size: file.byte_len,
-            language: Some(file.language.clone()),
+            language: Some(file.language),
             classification: file.classification,
             disposition: FileDisposition::Indexed {
                 targets,

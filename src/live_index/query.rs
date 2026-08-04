@@ -2607,7 +2607,7 @@ impl LiveIndex {
             .map(|(relative_path, file)| RepoOutlineFileView {
                 noise_class: NoisePolicy::classify_path(relative_path, gi_ref),
                 relative_path: relative_path.clone(),
-                language: file.language.clone(),
+                language: file.language,
                 symbol_count: file.symbols.len(),
             })
             .collect();
@@ -2958,7 +2958,7 @@ impl LiveIndex {
         // Resolve the logical module path for the target file.
         let module_path = resolve_module_path(target_path, &target_file.language);
 
-        let target_language = target_file.language.clone();
+        let target_language = target_file.language;
         let target_scope = declared_scope(target_file);
         let target_symbol_names: HashSet<&str> = target_file
             .symbols
