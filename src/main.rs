@@ -232,11 +232,14 @@ async fn run_mcp_server_async() -> anyhow::Result<()> {
     //
     // When `resolved_root` is `None` (home-CWD launchers such as Cursor, or a
     // forbidden/too-broad CWD) we deliberately do NOT pin anything: we fall
-    // through to the local empty-index startup and let the client's declared
-    // `roots` bind the workspace at `on_initialized`
-    // (`bind_workspace_from_client_roots`). Eagerly pinning a home/forbidden CWD
-    // is exactly the wrong-repo binding C4 fixes, so deferring on `None` is the
-    // fix, not a regression.
+    // through to the local empty-index startup. A legacy-lifecycle client's
+    // declared `roots` then bind the workspace at `on_initialized`
+    // (`bind_workspace_from_client_roots`); a modern 2026-07-28
+    // discover-lifecycle client never sends `notifications/initialized`, so it
+    // binds via `index_folder` instead, with the residual unbound case
+    // disclosed through `_meta` project evidence (spec 025 FR-319). Eagerly
+    // pinning a home/forbidden CWD is exactly the wrong-repo binding C4 fixes,
+    // so deferring on `None` is the fix, not a regression.
     if use_daemon && let Some(root) = resolved_root.clone() {
         match daemon::connect_or_spawn_session(&root, "mcp-stdio", Some(std::process::id())).await {
             Ok(session) => return run_remote_mcp_server_async(session).await,

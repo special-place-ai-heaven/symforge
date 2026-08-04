@@ -104,6 +104,28 @@ pub fn current_project_evidence() -> Option<ProjectEvidence> {
         .flatten()
 }
 
+/// FR-319 (spec 025): central evidence attachment at the trait-boundary seam.
+///
+/// Called on every `tools/call` and `resources/read` result AFTER the router /
+/// resource renderer returns. Single-writer rule: if the statused path
+/// (`into_call_tool_result`) already wrote [`PROJECT_EVIDENCE_META_KEY`], the
+/// result stays byte-identical. Otherwise the in-scope evidence is attached —
+/// or, when no workspace is bound, the explicit unbound marker
+/// `{"bound": false}`, so absence stays distinguishable from unbound.
+pub fn attach_project_evidence_meta(meta: &mut Option<MetaObject>) {
+    let meta = meta.get_or_insert_with(|| MetaObject(JsonObject::new()));
+    if meta.0.contains_key(PROJECT_EVIDENCE_META_KEY) {
+        return;
+    }
+    let value = match current_project_evidence().map(|e| serde_json::to_value(&e)) {
+        Some(Ok(value)) => value,
+        // Unbound (or unserializable — cannot happen for ProjectEvidence):
+        // disclose loudly rather than omitting the key.
+        _ => serde_json::json!({ "bound": false }),
+    };
+    meta.0.insert(PROJECT_EVIDENCE_META_KEY.to_string(), value);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultStatus {
     pub contract_version: u8,

@@ -139,9 +139,14 @@ impl SymForgeServer {
             .await
             .map_err(|error| McpError::invalid_params(error, None))?;
 
+        // FR-312 / INV-4 (spec 025): live per-workspace state behind bearer
+        // auth — never eligible for a shared cache, and any nonzero TTL would
+        // keep serving content the spec-023 admission gate has since refused.
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, uri.to_string()).with_mime_type("text/markdown"),
-        ]))
+        ])
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Private))
     }
 
     async fn render_resource_text(&self, request: ResourceRequest) -> Result<String, String> {
