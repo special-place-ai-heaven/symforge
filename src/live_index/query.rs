@@ -1471,6 +1471,59 @@ impl LiveIndex {
         });
         candidates.dedup();
 
+        // Coverage honesty (spec 021): when NO parsed file matches, sweep the
+        // Tier-2 metadata-only catalog with the same basename/substring rules
+        // before declaring absence. A Tier-2 path is real and addressable —
+        // "does not exist in indexed source paths" for one is a false denial
+        // (testpilot receipt: a 532 KB Tier-2 service file resolved by
+        // basename was reported nonexistent). Parsed candidates keep
+        // precedence; this fallback fires only when they are empty.
+        if candidates.is_empty() {
+            let basename_lower = basename.to_ascii_lowercase();
+            let mut tier2: Vec<(String, String)> = self
+                .metadata_only_skipped_paths()
+                .filter(|(path, _)| path_allowed(path))
+                .filter(|(path, _)| {
+                    let path_lower = path.to_ascii_lowercase();
+                    let path_basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
+                    path_basename == basename_lower
+                        || path_lower.ends_with(&normalized_hint_lower)
+                        || path_lower.contains(&normalized_hint_lower)
+                })
+                .map(|(path, reason)| (path.to_string(), reason))
+                .collect();
+            for component in dir_components {
+                let component_lower = component.to_ascii_lowercase();
+                tier2.retain(|(path, _)| {
+                    path.to_ascii_lowercase()
+                        .split('/')
+                        .any(|part| part == component_lower)
+                });
+            }
+            tier2.sort_by(|(left, _), (right, _)| {
+                left.len().cmp(&right.len()).then(left.cmp(right))
+            });
+            match tier2.len() {
+                0 => {}
+                1 => {
+                    let (path, reason) = tier2.pop().expect("single tier-2 candidate");
+                    return SearchFilesResolveView::ResolvedMetadataOnly { path, reason };
+                }
+                len => {
+                    let overflow_count = len.saturating_sub(RESOLVE_PATH_AMBIGUOUS_CAP);
+                    return SearchFilesResolveView::Ambiguous {
+                        hint: normalized_hint,
+                        matches: tier2
+                            .into_iter()
+                            .take(RESOLVE_PATH_AMBIGUOUS_CAP)
+                            .map(|(path, _)| path)
+                            .collect(),
+                        overflow_count,
+                    };
+                }
+            }
+        }
+
         match candidates.len() {
             0 => SearchFilesResolveView::NotFound {
                 hint: normalized_hint,
@@ -3960,6 +4013,54 @@ mod tests {
             SearchFilesResolveView::ResolvedMetadataOnly {
                 path: "backend/package-lock.json".to_string(),
                 reason: "lockfile".to_string(),
+            }
+        );
+    }
+
+    // Coverage honesty (spec 021 / testpilot receipt): resolve=true by BASENAME
+    // must also find a Tier-2 path when no parsed file matches — a real,
+    // addressable file must never be reported nonexistent just because the hint
+    // was not the full relative path.
+    #[test]
+    fn test_capture_search_files_resolve_view_resolves_tier2_by_basename() {
+        let mut index = make_index(vec![], false);
+        add_metadata_only_skip(
+            &mut index,
+            "src/app/services/recorder.service.ts",
+            SkipReason::SizeThreshold,
+        );
+
+        let view = index.capture_search_files_resolve_view("recorder.service.ts");
+
+        assert_eq!(
+            view,
+            SearchFilesResolveView::ResolvedMetadataOnly {
+                path: "src/app/services/recorder.service.ts".to_string(),
+                reason: SkipReason::SizeThreshold.to_string(),
+            }
+        );
+    }
+
+    // Parsed candidates keep precedence: a Tier-1 basename match wins over a
+    // Tier-2 path with the same basename (the fallback fires only when the
+    // parsed candidate set is empty).
+    #[test]
+    fn test_resolve_tier2_fallback_never_shadows_parsed_candidates() {
+        let mut index = make_index(
+            vec![(
+                "src/util.ts",
+                make_indexed_file("src/util.ts", vec![], ParseStatus::Parsed),
+            )],
+            false,
+        );
+        add_metadata_only_skip(&mut index, "dist/util.ts", SkipReason::GeneratedOutput);
+
+        let view = index.capture_search_files_resolve_view("util.ts");
+
+        assert_eq!(
+            view,
+            SearchFilesResolveView::Resolved {
+                path: "src/util.ts".to_string(),
             }
         );
     }

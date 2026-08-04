@@ -2663,6 +2663,7 @@ fn admission_tier_file_degradation_for_path(
         view.tier,
         view.reason,
         view.size,
+        !crate::protocol::read_gate::disk_read_would_refuse(index, &view.path, view.size),
     ))
 }
 
