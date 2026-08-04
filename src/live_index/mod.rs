@@ -16,6 +16,7 @@ pub(crate) mod qualified_usages;
 pub mod query;
 pub mod rank_signals;
 pub mod search;
+pub mod single_file;
 pub mod store;
 pub mod trigram;
 pub mod view;

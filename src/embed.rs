@@ -40,11 +40,21 @@ pub use crate::live_index::query::{SearchFilesTier, SearchFilesView};
 pub use crate::live_index::search::{
     SymbolSearchResult, TextSearchError, TextSearchResult, search_symbols, search_text,
 };
+pub use crate::live_index::single_file::{ReindexResult, remove_file, update_file_from_disk};
 pub use crate::live_index::store::{
     IndexLoadSource, IndexedFile, ParseStatus, PublishedIndexState, PublishedIndexStatus,
     SharedIndex, SnapshotVerifyState,
 };
 pub use crate::parsing::process_file;
+
+// ---------------------------------------------------------------------------
+// Per-file incremental update (task #24 / AAP ask 3): `update_file_from_disk`
+// re-indexes ONE file through the SAME admission seam the watcher and bulk
+// load use (scope exclusions, metadata-first scout, secret-content demotion,
+// hash-gated parse, generation-fenced publication); `remove_file` is the
+// fenced removal. An embedder's per-file reindex needs no parsing or store
+// internals — and cannot accidentally bypass admission.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Snapshot restore (task #22 / AAP ask 2a): the warm-start fast path.
@@ -152,6 +162,10 @@ mod contract {
         snapshot_to_live_index,
     };
 
+    // Task #24: the per-file incremental update seam is semver-public.
+    #[allow(unused_imports)]
+    use crate::embed::{ReindexResult, remove_file, update_file_from_disk};
+
     // Also name the back-compat MODULE re-exports so their removal trips too.
     #[allow(unused_imports)]
     use crate::embed::{domain, git, live_index, parsing};
@@ -225,6 +239,9 @@ mod contract {
             &StatePlacement,
             PortableSnapshotProvenance,
         ) -> Option<IndexSnapshot> = crate::embed::import_portable_snapshot;
+        let _update_file_from_disk: fn(&SharedIndex, &Path, &str) -> ReindexResult =
+            crate::embed::update_file_from_disk;
+        let _remove_file: fn(&SharedIndex, &str) -> bool = crate::embed::remove_file;
 
         // Associated functions (no `&self`).
         let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
@@ -261,6 +278,8 @@ mod contract {
             _snapshot_compatible,
             _snapshot_to_live_index,
             _import_portable_snapshot,
+            _update_file_from_disk,
+            _remove_file,
         );
 
         // Back-compat module paths still resolve (deep-path imports AAP uses).
