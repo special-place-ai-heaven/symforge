@@ -986,7 +986,7 @@ async fn handle_new_file_impact(
         for symbol in &file.symbols {
             *kind_counts.entry(symbol.kind.to_string()).or_insert(0) += 1;
         }
-        file.language.clone()
+        file.language
     };
 
     let mut kind_parts: Vec<String> = kind_counts

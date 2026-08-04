@@ -29,6 +29,11 @@ use crate::paths;
 use crate::domain::ParseDiagnostic;
 
 const CURRENT_VERSION: u32 = 7;
+
+/// The on-disk snapshot format version this engine writes and restores
+/// (embed `engine_info` reporting; a mismatched snapshot fails soft to a
+/// cold index, never a panic).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = CURRENT_VERSION;
 const INDEX_FILENAME: &str = "index.bin";
 const INDEX_TMP_FILENAME: &str = "index.bin.tmp";
 const INDEX_TMP_PREFIX: &str = "index.bin.tmp.";
@@ -2217,7 +2222,7 @@ fn build_snapshot(
             path.clone(),
             IndexedFileSnapshot {
                 relative_path: file.relative_path.clone(),
-                language: file.language.clone(),
+                language: file.language,
                 classification: file.classification,
                 content: file.content.clone(),
                 symbols: file.symbols.clone(),

@@ -374,11 +374,7 @@ where
                 {
                     return None;
                 }
-                Some((
-                    relative_path,
-                    entry.absolute_path.clone()?,
-                    entry.language.clone(),
-                ))
+                Some((relative_path, entry.absolute_path.clone()?, entry.language))
             })
             .collect();
         let removed_paths: Vec<(String, crate::domain::ScoutedEntry)> =

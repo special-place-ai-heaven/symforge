@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 #[derive(
-    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum LanguageId {
     Rust,
@@ -33,6 +33,66 @@ pub enum LanguageId {
 }
 
 impl LanguageId {
+    /// Every supported grammar, in declaration order (embed `engine_info`).
+    pub const ALL: [Self; 25] = [
+        Self::Rust,
+        Self::Python,
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Go,
+        Self::Java,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::Ruby,
+        Self::Php,
+        Self::Swift,
+        Self::Kotlin,
+        Self::Dart,
+        Self::Perl,
+        Self::Elixir,
+        Self::Json,
+        Self::Toml,
+        Self::Yaml,
+        Self::Markdown,
+        Self::Text,
+        Self::Env,
+        Self::Html,
+        Self::Css,
+        Self::Scss,
+    ];
+
+    /// Stable lowercase grammar name (embed `engine_info` reporting).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Swift => "swift",
+            Self::Kotlin => "kotlin",
+            Self::Dart => "dart",
+            Self::Perl => "perl",
+            Self::Elixir => "elixir",
+            Self::Json => "json",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Markdown => "markdown",
+            Self::Text => "text",
+            Self::Env => "env",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Scss => "scss",
+        }
+    }
+
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Some(Self::Rust),

@@ -1182,7 +1182,7 @@ pub fn search_text_with_options(
             case_sensitive: options.case_sensitive,
             whole_word: options.whole_word,
             path_scope: options.path_scope.clone(),
-            language_filter: options.language_filter.clone(),
+            language_filter: options.language_filter,
             glob: options.glob.clone(),
             exclude_glob: options.exclude_glob.clone(),
             search_scope: options.search_scope,
@@ -1399,7 +1399,7 @@ fn search_structural_with_compiler(
         .filter(|(path, file)| {
             file_matches_text_options(path, file, options, &compiled_globs, &targets_by_path)
         })
-        .map(|(path, file)| (path.clone(), file.language.clone()))
+        .map(|(path, file)| (path.clone(), file.language))
         .collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1417,7 +1417,7 @@ fn search_structural_with_compiler(
 
         let is_tsx = LanguageId::is_tsx_path(path);
         let compiled = compiled_patterns
-            .entry((lang.clone(), is_tsx, pattern.to_string()))
+            .entry((*lang, is_tsx, pattern.to_string()))
             .or_insert_with(|| compile_pattern(pattern, lang, is_tsx));
         let structural_matches = match compiled {
             Ok(compiled_pattern) => {
@@ -3991,7 +3991,7 @@ mod tests {
             pattern,
             &TextSearchOptions::default(),
             |pattern, lang, is_tsx| {
-                *compile_calls_by_language.entry(lang.clone()).or_default() += 1;
+                *compile_calls_by_language.entry(*lang).or_default() += 1;
                 crate::parsing::ast_grep::compile_structural_pattern(pattern, lang, is_tsx)
             },
         )

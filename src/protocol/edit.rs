@@ -520,8 +520,7 @@ pub(crate) fn rebase_edit_base_for_reroute(
             rebased: false,
         });
     }
-    let result =
-        crate::parsing::process_file(&file.relative_path, &target_bytes, file.language.clone());
+    let result = crate::parsing::process_file(&file.relative_path, &target_bytes, file.language);
     Ok(EditBase {
         file: std::sync::Arc::new(IndexedFile::from_parse_result(result, target_bytes)),
         rebased: true,
@@ -1896,7 +1895,7 @@ pub(crate) fn execute_batch_edit(
                 path: edit.path.clone(),
                 sym,
                 operation: i,
-                language: file.language.clone(),
+                language: file.language,
             });
         }
     }
@@ -1988,7 +1987,7 @@ pub(crate) fn execute_batch_edit(
             }
         }
 
-        let language = resolved[indices[0]].language.clone();
+        let language = resolved[indices[0]].language;
         let line_ending = detect_line_ending(&content);
         let mut file_summaries: Vec<String> = Vec::new();
 
@@ -2161,7 +2160,7 @@ pub(crate) fn execute_batch_edit(
                         &staged_file.abs_path,
                         &staged_file.path,
                         &on_disk,
-                        staged_file.language.clone(),
+                        staged_file.language,
                     );
                 }
                 Err(rb_err) => {
@@ -2200,7 +2199,7 @@ pub(crate) fn execute_batch_edit(
             &staged_file.abs_path,
             &staged_file.path,
             &staged_file.new_content,
-            staged_file.language.clone(),
+            staged_file.language,
         );
         let hook_ctx = super::edit_hooks::EditContext {
             relative_path: &staged_file.path,
@@ -2340,7 +2339,7 @@ pub(crate) fn execute_batch_rename(
         let abs_start = sym.byte_range.0 + name_offset as u32;
         let abs_end = abs_start + input.name.len() as u32;
         let owner = crate::live_index::enclosing_impl_owner(&file.symbols, sym.line_range.0);
-        ((abs_start, abs_end), file.language.clone(), owner)
+        ((abs_start, abs_end), file.language, owner)
     };
 
     // Phase 2: Find all references across the project. Carry each ref's
@@ -2695,9 +2694,9 @@ pub(crate) fn execute_batch_rename(
             last_start = Some(range.0);
         }
         let lang = if path == &input.path {
-            language.clone()
+            language
         } else {
-            file.language.clone()
+            file.language
         };
         let indexed_abs = match safe_repo_path(repo_root, path) {
             Ok(p) => p,
@@ -2761,13 +2760,7 @@ pub(crate) fn execute_batch_rename(
             // Re-read from disk and reindex to ensure index matches disk.
             match std::fs::read(&sf.abs_path) {
                 Ok(on_disk) => {
-                    reindex_after_write(
-                        index,
-                        &sf.abs_path,
-                        &sf.path,
-                        &on_disk,
-                        sf.language.clone(),
-                    );
+                    reindex_after_write(index, &sf.abs_path, &sf.path, &on_disk, sf.language);
                 }
                 Err(rb_err) => {
                     rollback_failures
@@ -2801,13 +2794,7 @@ pub(crate) fn execute_batch_rename(
     let mut files_updated = 0;
     let mut refs_updated = 0;
     for sf in &staged {
-        reindex_after_write(
-            index,
-            &sf.abs_path,
-            &sf.path,
-            &sf.new_content,
-            sf.language.clone(),
-        );
+        reindex_after_write(index, &sf.abs_path, &sf.path, &sf.new_content, sf.language);
         let hook_ctx = super::edit_hooks::EditContext {
             relative_path: &sf.path,
             indexed_absolute_path: &sf.resolved_target.indexed_path,
@@ -3009,7 +2996,7 @@ pub(crate) fn execute_batch_insert(
                 path: target.path.clone(),
                 sym,
                 operation: i,
-                language: file.language.clone(),
+                language: file.language,
             });
         }
     }
@@ -3136,7 +3123,7 @@ pub(crate) fn execute_batch_insert(
             abs_path: resolved_target.target_path.clone(),
             original: file.content.clone(),
             new_content: content,
-            language: resolved[indices[0]].language.clone(),
+            language: resolved[indices[0]].language,
             summaries: file_summaries,
             working_directory: per_file_working_directory,
             resolved_target,
@@ -3188,7 +3175,7 @@ pub(crate) fn execute_batch_insert(
                         &staged_file.abs_path,
                         &staged_file.path,
                         &on_disk,
-                        staged_file.language.clone(),
+                        staged_file.language,
                     );
                 }
                 Err(rb_err) => {
@@ -3226,7 +3213,7 @@ pub(crate) fn execute_batch_insert(
             &staged_file.abs_path,
             &staged_file.path,
             &staged_file.new_content,
-            staged_file.language.clone(),
+            staged_file.language,
         );
         let hook_ctx = super::edit_hooks::EditContext {
             relative_path: &staged_file.path,

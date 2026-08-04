@@ -290,7 +290,7 @@ impl LiveIndex {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .map(ToOwned::to_owned),
-                language: entry.language.clone(),
+                language: entry.language,
                 reason: decision.reason,
             });
         }
@@ -300,7 +300,7 @@ impl LiveIndex {
                 path: file.relative_path.clone(),
                 size: Some(file.byte_len),
                 extension: None,
-                language: Some(file.language.clone()),
+                language: Some(file.language),
                 reason: None,
             });
         }

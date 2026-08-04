@@ -63,13 +63,7 @@ where
     L: Into<Option<LanguageId>>,
 {
     let language = language.into();
-    match read_and_index(
-        relative_path,
-        abs_path,
-        shared,
-        language.clone(),
-        expected_gen,
-    ) {
+    match read_and_index(relative_path, abs_path, shared, language, expected_gen) {
         ReindexResult::NotFound => {}
         other => return other,
     }
@@ -77,13 +71,7 @@ where
     let delays_ms = [50u64, 200, 500];
     for delay_ms in delays_ms {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        match read_and_index(
-            relative_path,
-            abs_path,
-            shared,
-            language.clone(),
-            expected_gen,
-        ) {
+        match read_and_index(relative_path, abs_path, shared, language, expected_gen) {
             ReindexResult::NotFound => continue,
             other => return other,
         }
@@ -286,10 +274,7 @@ where
             _ => unreachable!("terminal scout decisions return before content ingestion"),
         };
 
-        let language = language
-            .clone()
-            .or_else(|| scouted.language.clone())
-            .unwrap_or(LanguageId::Text);
+        let language = language.or(scouted.language).unwrap_or(LanguageId::Text);
 
         let bytes = match stable_read(abs_path, &scouted.stamp) {
             crate::live_index::store::StableReadOutcome::Accepted { bytes, .. } => bytes,

@@ -963,7 +963,7 @@ impl SymForgeServer {
                 &resolved_path,
                 &params.0.path,
                 &new_content,
-                file.language.clone(),
+                file.language,
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
@@ -1179,7 +1179,7 @@ impl SymForgeServer {
                 &resolved_path,
                 &params.0.path,
                 &new_content,
-                file.language.clone(),
+                file.language,
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
@@ -1370,7 +1370,7 @@ impl SymForgeServer {
                 &resolved_path,
                 &params.0.path,
                 &new_content,
-                file.language.clone(),
+                file.language,
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
@@ -1745,7 +1745,7 @@ impl SymForgeServer {
                 &resolved_path,
                 &params.0.path,
                 &new_content,
-                file.language.clone(),
+                file.language,
             );
         }
         edit_hooks::after_commit(&hook_ctx, &resolved_path);
