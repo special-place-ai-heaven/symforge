@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.21.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.20.0...v8.21.0) (2026-08-04)
+
+
+### Features
+
+* **embed:** first-class per-file update/remove through the admission seam ([#505](https://github.com/special-place-ai-heaven/symforge/issues/505)) ([0355579](https://github.com/special-place-ai-heaven/symforge/commit/03555799751cbc86759ce864aa2c9e9c9e08072a))
+
 ## [8.20.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.19.0...v8.20.0) (2026-08-04)
 
 
