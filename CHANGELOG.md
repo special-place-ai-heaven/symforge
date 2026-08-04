@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.17.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.9...v8.17.0) (2026-08-04)
+
+
+### Features
+
+* **025:** migrate to rmcp 3.1.0 at protocol parity (PR-A) ([#494](https://github.com/special-place-ai-heaven/symforge/issues/494)) ([2206fbc](https://github.com/special-place-ai-heaven/symforge/commit/2206fbc3322377fb974f7571fcfe845a61bbfd0f))
+
 ## [8.16.9](https://github.com/special-place-ai-heaven/symforge/compare/v8.16.8...v8.16.9) (2026-08-03)
 
 
