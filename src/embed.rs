@@ -55,16 +55,21 @@ pub use crate::parsing::process_file;
 // snapshot, never a panic — so the embedder's fallback is always a cold
 // `LiveIndex::load`. `snapshot_compatible` is the readiness probe.
 //
-// NOTE (portability): a snapshot is bound to the canonical absolute root it
-// was written from (anti-foreign-state identity check). Restoring at a
-// DIFFERENT root or platform returns `None` today; the sanctioned opt-in
-// portable-import lane is tracked as task #23 and is NOT yet part of this
-// contract.
+// Cross-root restore (task #23): a raw snapshot stays bound to the canonical
+// absolute root it was written from (anti-foreign-state identity check), but
+// `import_portable_snapshot` is the sanctioned EXPLICIT opt-in for a
+// host-baked `index.bin.zst` artifact restored at a different root - every
+// content-derived check (integrity digests, git tip/history fingerprint
+// against the restoring workspace) stays enforced; only the path-derived
+// identities are rebound, and a second in-process attempt is refused
+// (restore-once). Bake the artifact host-side with
+// `live_index::persist::export_artifact` (deep path).
 // ---------------------------------------------------------------------------
 pub use crate::domain::StatePlacement;
 pub use crate::live_index::persist::{
-    IndexSnapshot, load_snapshot, load_snapshot_for_root, project_local_state_placement,
-    snapshot_compatible, snapshot_to_live_index,
+    IndexSnapshot, PortableSnapshotProvenance, import_portable_snapshot, load_snapshot,
+    load_snapshot_for_root, project_local_state_placement, snapshot_compatible,
+    snapshot_to_live_index,
 };
 
 // ---------------------------------------------------------------------------
@@ -142,8 +147,9 @@ mod contract {
     // contracted item so rename/removal/signature-drift trips compilation.
     #[allow(unused_imports)]
     use crate::embed::{
-        IndexSnapshot, StatePlacement, load_snapshot, load_snapshot_for_root,
-        project_local_state_placement, snapshot_compatible, snapshot_to_live_index,
+        IndexSnapshot, PortableSnapshotProvenance, StatePlacement, import_portable_snapshot,
+        load_snapshot, load_snapshot_for_root, project_local_state_placement, snapshot_compatible,
+        snapshot_to_live_index,
     };
 
     // Also name the back-compat MODULE re-exports so their removal trips too.
@@ -214,6 +220,11 @@ mod contract {
         let _snapshot_compatible: fn(&Path) -> bool = crate::embed::snapshot_compatible;
         let _snapshot_to_live_index: fn(IndexSnapshot, &Path) -> LiveIndex =
             crate::embed::snapshot_to_live_index;
+        let _import_portable_snapshot: fn(
+            &Path,
+            &StatePlacement,
+            PortableSnapshotProvenance,
+        ) -> Option<IndexSnapshot> = crate::embed::import_portable_snapshot;
 
         // Associated functions (no `&self`).
         let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
@@ -249,6 +260,7 @@ mod contract {
             _project_local_state_placement,
             _snapshot_compatible,
             _snapshot_to_live_index,
+            _import_portable_snapshot,
         );
 
         // Back-compat module paths still resolve (deep-path imports AAP uses).
