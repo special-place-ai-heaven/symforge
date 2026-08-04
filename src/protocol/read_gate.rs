@@ -48,6 +48,34 @@ pub(crate) fn admit_worktree_text(
     Ok(String::from_utf8(bytes).ok())
 }
 
+/// Predict — WITHOUT reading any bytes — whether [`admit_disk_read`] would
+/// refuse `relative_path`, from the same signals the gate checks before its
+/// read: the current path rule, the recorded disposition on the live
+/// publication, and (when known) the size against the scan limit.
+///
+/// Used to key advice text ("Use get_file_content for raw reads") on the
+/// gate's actual verdict, so no message ever points the caller at a read the
+/// gate is certain to refuse. Conservative by construction: it cannot see
+/// content that changed after publication, so a `false` here is advice, not
+/// authorization — the gate itself still decides on the exact bytes.
+pub(crate) fn disk_read_would_refuse(
+    live: &LiveIndex,
+    relative_path: &str,
+    size: Option<u64>,
+) -> bool {
+    if crate::knowledge::sensitive_path_rule(relative_path).is_some() {
+        return true;
+    }
+    if let Some(FileDisposition::MetadataOnly {
+        reason:
+            MetadataOnlyReason::SensitivePath { .. } | MetadataOnlyReason::SensitiveContent { .. },
+    }) = live.capture_file_disposition(relative_path)
+    {
+        return true;
+    }
+    size.is_some_and(|size| crate::knowledge::exceeds_scan_limit(size as usize))
+}
+
 /// Read `canon_path` and return its bytes only if the file is admissible for
 /// content disclosure.
 ///

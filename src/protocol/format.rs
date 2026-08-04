@@ -3682,10 +3682,16 @@ pub fn not_found_file_with_suggestions(path: &str, suggestions: &[String]) -> St
 /// admitted as Tier-2 (metadata-only) or Tier-3 (hard-skipped) rather than
 /// parsed. Distinct from `not_found_file`: the file is present on disk, so a
 /// bare "File not found" is wrong and confusing. This message names the tier,
-/// the skip reason, and the size, and points the caller at the documented
-/// escape hatch (`get_file_content` reads Tier-2 files raw from disk).
+/// the skip reason, and the size.
 ///
-/// Example (Tier 2):
+/// The recovery sentence is keyed on `raw_read_available` — whether the
+/// spec-023 read gate would PERMIT a `get_file_content` raw read of this path.
+/// Advising "Use get_file_content" for a path the gate refuses sends the
+/// caller into a guaranteed refusal loop (the Tier-2 UX contradiction,
+/// testpilot receipt 2026-08-03), so a gated path gets the honest withheld
+/// sentence instead.
+///
+/// Example (Tier 2, raw read available):
 ///   `Not indexed: package-lock.json is Tier 2 (metadata only) — reason:
 ///    lockfile, size 406 KB. Use get_file_content for raw reads if you need
 ///    the contents.`
@@ -3694,6 +3700,7 @@ pub fn not_indexed_skipped_file(
     tier: AdmissionTier,
     reason: Option<SkipReason>,
     size: Option<u64>,
+    raw_read_available: bool,
 ) -> String {
     let reason_str = reason
         .map(|r| r.to_string())
@@ -3707,14 +3714,25 @@ pub fn not_indexed_skipped_file(
             // but degrade gracefully rather than assert.
             not_found_file(path)
         }
-        AdmissionTier::MetadataOnly => format!(
+        AdmissionTier::MetadataOnly if raw_read_available => format!(
             "Not indexed: {path} is Tier 2 (metadata only) — reason: {reason_str}, size {size_str}. \
              Use get_file_content for raw reads if you need the contents."
         ),
-        AdmissionTier::HardSkip => format!(
+        AdmissionTier::MetadataOnly => format!(
+            "Not indexed: {path} is Tier 2 (metadata only) — reason: {reason_str}, size {size_str}. \
+             Its contents are withheld by the admission policy — get_file_content will refuse this \
+             file, so read it outside SymForge if you need the raw text."
+        ),
+        AdmissionTier::HardSkip if raw_read_available => format!(
             "Not indexed: {path} is Tier 3 (hard-skipped) — reason: {reason_str}, size {size_str}. \
              This file is not parsed or read; get_file_content may still read it raw if it is a \
              text file within the repository."
+        ),
+        AdmissionTier::HardSkip => format!(
+            "Not indexed: {path} is Tier 3 (hard-skipped) — reason: {reason_str}, size {size_str}. \
+             This file is not parsed or read, and its contents are withheld by the admission \
+             policy — get_file_content will refuse this file, so read it outside SymForge if you \
+             need the raw text."
         ),
     }
 }

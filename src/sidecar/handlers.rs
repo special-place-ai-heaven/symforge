@@ -915,11 +915,22 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
     // demoted one keeps the oversize refusal; `.bin` still reads as non-parser.
     let has_code_parser = crate::domain::LanguageId::from_path(path).is_some();
 
+    // Key the recovery sentence on the read gate's predicted verdict (spec-023):
+    // "Use get_file_content" must never point at a read the gate will refuse.
+    let raw_read_advice =
+        if crate::protocol::read_gate::disk_read_would_refuse(&state.index.read(), path, view.size)
+        {
+            "Its contents are withheld by the admission policy — get_file_content will refuse \
+         this file."
+        } else {
+            "Use get_file_content for raw reads."
+        };
+
     if has_code_parser {
         return format!(
             "Not indexed: {path} is {tier_label} — reason: {reason}, size {size_mb:.1} MB. \
              The admission gate applies to analyze_file_impact the same as bulk load \
-             and the watcher (no force-admit). Use get_file_content for raw reads."
+             and the watcher (no force-admit). {raw_read_advice}"
         );
     }
 
@@ -934,7 +945,7 @@ fn impact_skipped_text(state: &SidecarState, path: &str) -> String {
          Tier: {tier_label} — reason: {reason}, size {size_mb:.1} MB\n\
          Generation: {generation}\n\
          The file IS tracked (metadata only), not absent; impact/symbol analysis is \
-         unsupported for this file type. Use get_file_content for raw reads."
+         unsupported for this file type. {raw_read_advice}"
     )
 }
 

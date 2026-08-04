@@ -2802,6 +2802,7 @@ fn test_not_indexed_skipped_file_tier2_message() {
         AdmissionTier::MetadataOnly,
         Some(SkipReason::DependencyLockfile),
         Some(406 * 1024),
+        true,
     );
     assert_eq!(
         result,
@@ -2817,17 +2818,56 @@ fn test_not_indexed_skipped_file_tier3_message() {
         AdmissionTier::HardSkip,
         Some(SkipReason::SizeCeiling),
         Some(200 * 1024 * 1024),
+        false,
     );
     assert!(
         result.starts_with("Not indexed: big.bin is Tier 3 (hard-skipped) — reason: >100MB"),
         "Tier-3 message should name tier and reason; got: {result}"
+    );
+    // 200 MB exceeds the read gate's scan limit: the advice must be the honest
+    // withheld sentence, never a pointer at a read the gate will refuse.
+    assert!(
+        result.contains("get_file_content will refuse"),
+        "gated Tier-3 advice must be honest; got: {result}"
+    );
+    assert!(
+        !result.contains("may still read it raw"),
+        "gated Tier-3 advice must not promise a refused read; got: {result}"
+    );
+}
+
+#[test]
+fn test_not_indexed_skipped_file_tier2_withheld_advice() {
+    // A Tier-2 file the read gate would refuse (e.g. recorded sensitive-content
+    // demotion) must NOT be pointed at get_file_content — that advice loops the
+    // caller into a guaranteed refusal (the testpilot Tier-2 UX contradiction).
+    let result = not_indexed_skipped_file(
+        "src/app/recorder.service.ts",
+        AdmissionTier::MetadataOnly,
+        Some(SkipReason::SizeThreshold),
+        Some(532 * 1024),
+        false,
+    );
+    assert!(
+        result.contains("get_file_content will refuse"),
+        "gated Tier-2 advice must be honest; got: {result}"
+    );
+    assert!(
+        !result.contains("Use get_file_content for raw reads"),
+        "gated Tier-2 advice must not point at a refused read; got: {result}"
     );
 }
 
 #[test]
 fn test_not_indexed_skipped_file_handles_missing_metadata() {
     // Defensive: unknown reason/size must not panic and must render placeholders.
-    let result = not_indexed_skipped_file("vendor/x.lock", AdmissionTier::MetadataOnly, None, None);
+    let result = not_indexed_skipped_file(
+        "vendor/x.lock",
+        AdmissionTier::MetadataOnly,
+        None,
+        None,
+        true,
+    );
     assert!(result.contains("reason: skipped"), "got: {result}");
     assert!(result.contains("size unknown"), "got: {result}");
 }
