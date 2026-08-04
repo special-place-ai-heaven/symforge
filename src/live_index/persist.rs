@@ -1698,6 +1698,49 @@ pub fn load_snapshot(
     Some(snapshot)
 }
 
+/// The project-local state placement for `project_root`
+/// (`<canonical root>/.symforge`) — the placement every default single-project
+/// deployment writes its `index.bin` under.
+///
+/// Embedder-facing (spec: task #22, AAP ask 2a): an embedder holds only a
+/// project root; constructing a [`StatePlacement`] otherwise requires the
+/// discovery `RootBinding` machinery the embed surface deliberately omits.
+/// Errors only when the root cannot be canonicalized (missing directory).
+pub fn project_local_state_placement(project_root: &Path) -> anyhow::Result<StatePlacement> {
+    let canonical = dunce::canonicalize(project_root).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalizing project root {}: {}",
+            project_root.display(),
+            error
+        )
+    })?;
+    Ok(StatePlacement::ProjectLocal {
+        directory: crate::domain::ProjectStateDir::new(crate::paths::resolve_symforge_dir(
+            &canonical,
+        )),
+    })
+}
+
+/// [`load_snapshot`] against `project_root`'s project-local placement — the
+/// one-argument embedder entry point.
+pub fn load_snapshot_for_root(project_root: &Path) -> Option<IndexSnapshot> {
+    let placement = project_local_state_placement(project_root).ok()?;
+    load_snapshot(project_root, &placement)
+}
+
+/// Whether a usable snapshot exists for `project_root` (project-local
+/// placement): present, current format + secret-policy version, and matching
+/// project/source identity.
+///
+/// AAP ask 2a's fallback probe. This performs the FULL [`load_snapshot`]
+/// validation (a `true` here means the subsequent restore will succeed against
+/// unchanged disk state), so a caller about to restore should just call
+/// [`load_snapshot_for_root`] once and keep the snapshot instead of probing
+/// first — this probe is for readiness reporting, not a fast pre-check.
+pub fn snapshot_compatible(project_root: &Path) -> bool {
+    load_snapshot_for_root(project_root).is_some()
+}
+
 /// Rehydrate a `LiveIndex` from a persisted snapshot.
 ///
 /// `project_root` is the filesystem root the snapshot was taken from; it is
@@ -2257,6 +2300,31 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/git/test_helpers.rs"
         ));
+    }
+
+    /// Task #22 (embed snapshot export): the one-argument embedder entry
+    /// points round-trip — checkpoint, probe, restore, rehydrate — and the
+    /// probe is honest about absence.
+    #[test]
+    fn embedder_snapshot_helpers_round_trip() {
+        let dir = tempfile::TempDir::new().expect("fixture root");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn seeded() {}\n").expect("seed file");
+
+        // No snapshot yet: probe says incompatible, restore says None.
+        assert!(!super::snapshot_compatible(dir.path()));
+        assert!(super::load_snapshot_for_root(dir.path()).is_none());
+
+        let placement =
+            super::project_local_state_placement(dir.path()).expect("placement resolves");
+        let shared = crate::live_index::LiveIndex::load_for_state_placement(dir.path(), &placement)
+            .expect("cold load");
+        super::checkpoint_shared_index(&shared, dir.path(), &placement).expect("checkpoint");
+
+        assert!(super::snapshot_compatible(dir.path()));
+        let snapshot = super::load_snapshot_for_root(dir.path()).expect("snapshot restores");
+        let live = super::snapshot_to_live_index(snapshot, dir.path());
+        assert_eq!(live.file_count(), 1);
+        assert_eq!(live.load_source(), IndexLoadSource::SnapshotRestore);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
