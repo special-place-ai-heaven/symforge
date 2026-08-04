@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Meta};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
@@ -139,6 +139,6 @@ impl ResultStatus {
         } else {
             CallToolResult::success(content)
         };
-        result.with_meta(Some(Meta(meta)))
+        result.with_meta(Some(MetaObject(meta)))
     }
 }

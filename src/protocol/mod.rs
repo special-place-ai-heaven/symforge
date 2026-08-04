@@ -36,7 +36,7 @@ use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    ReadResourceRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ServerHandler, prompt_handler, tool_handler};
@@ -1507,10 +1507,19 @@ impl ServerHandler for SymForgeServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_
-    {
+    ) -> impl std::future::Future<
+        Output = Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData>,
+    > + Send
+    + '_ {
         let uri = request.uri;
-        async move { self.read_resource_uri(&uri).await }
+        // INV-1: the response enum exists only at this trait boundary; all
+        // internal resource logic (and the spec-023 admission gating it wraps)
+        // stays on `ReadResourceResult`.
+        async move {
+            self.read_resource_uri(&uri)
+                .await
+                .map(rmcp::model::ReadResourceResponse::Complete)
+        }
     }
 
     /// MCP `tools/call` dispatch with a central compact-surface gate (P1-A).
@@ -1531,7 +1540,7 @@ impl ServerHandler for SymForgeServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         surface_probe::enforce_compact_surface(request.name.as_ref())?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         // Task 7: bind the selected-project evidence slot for this dispatch,
@@ -1557,8 +1566,11 @@ impl ServerHandler for SymForgeServer {
         };
         Ok(ListToolsResult {
             tools,
-            meta: None,
-            next_cursor: None,
+            // FR-305 pinned struct shape: Complete is explicit, matching the
+            // upstream constructor default. Cache-hint fields stay None here
+            // (policy lands in PR-B; spec 025).
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            ..Default::default()
         })
     }
 

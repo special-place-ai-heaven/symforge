@@ -95,7 +95,7 @@ squash unless there's a specific reason not to.
 
 ## Architecture
 
-Rust MCP server providing symbol-aware code and repository-knowledge navigation, review, curation, and editing tools. The **default** MCP `tools/list` surface is the full **39-tool** surface (including `health_compact`, `search_knowledge`, `review_knowledge`, and `curate_knowledge`); the compact-3 surface (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
+Rust MCP server providing symbol-aware code and repository-knowledge navigation, review, curation, and editing tools. The **default** MCP `tools/list` surface is the full **40-tool** surface (as_of 2026-08-03; counting rule: `#[tool(` attribute sites — 33 in `tools.rs` + 7 in `edit_tools.rs` — equal to the 40 names in `SYMFORGE_TOOL_NAMES`; including `health_compact`, `search_knowledge`, `review_knowledge`, and `curate_knowledge`); the compact-3 surface (`symforge`, `symforge_edit`, `status`) is a documented opt-in escape hatch via `SYMFORGE_SURFACE=compact`, with backward-compat aliases for removed tools in `src/daemon.rs`. Resources and prompts are first-class protocol surfaces, not side notes.
 
 Key source files:
 - `src/protocol/tools.rs` — Tool handlers, input structs, tests

@@ -116,7 +116,9 @@ fn build_mcp_service(
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`; use its builders.
     let config = StreamableHttpServerConfig::default()
         // Stateless: serve each request directly (no MCP session handshake gate).
-        .with_stateful_mode(false)
+        // rmcp 3.x renamed the knob: it now governs only legacy-protocol
+        // sessions (2026-07-28 HTTP is always sessionless).
+        .with_legacy_session_mode(false)
         // Return application/json (single JSON-RPC response), not SSE framing.
         .with_json_response(true)
         // Preserve loopback DNS-rebinding defaults; additionally permit the
