@@ -26,6 +26,18 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.19.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.18.1...v8.19.0) (2026-08-04)
+
+
+### Features
+
+* **embed:** export the snapshot-restore fast path on the facade ([#501](https://github.com/special-place-ai-heaven/symforge/issues/501)) ([c413282](https://github.com/special-place-ai-heaven/symforge/commit/c413282f60c459fb6c2b2adc25b9f5373615a800))
+
+
+### Performance Improvements
+
+* **026:** restore the persisted snapshot on serve startup ([#500](https://github.com/special-place-ai-heaven/symforge/issues/500)) ([02c538e](https://github.com/special-place-ai-heaven/symforge/commit/02c538e2cdadbe5e7cf90950854b4596815b7276))
+
 ## [8.18.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.18.0...v8.18.1) (2026-08-04)
 
 
