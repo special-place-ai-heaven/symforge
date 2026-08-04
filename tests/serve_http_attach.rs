@@ -24,10 +24,11 @@
 //!
 //! The transport is stateless (`serve_directly`), so `tools/list` / `tools/call`
 //! are served without a prior MCP `initialize` handshake — exercising the real
-//! request/response path a remote client uses for each call. A full multi-message
-//! `initialize` + session-id handshake is not scripted here; the stateless path is
-//! the deliberate transport mode (documented in `mcp_http.rs`) and is what the
-//! integration surface depends on.
+//! request/response path a remote client uses for each call. Under MCP
+//! 2026-07-28 this handshake-free path is the spec'd discover lifecycle, not a
+//! shortcut: `tests/rmcp3_protocol.rs` (spec 025) drives the full
+//! discover-first surface, negotiation, and strict-metadata mixed-endpoint
+//! semantics; this file remains the attach/parity/bypass regression gate.
 #![cfg(feature = "server")]
 
 #[path = "support/stel_surface_env.rs"]

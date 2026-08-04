@@ -10,8 +10,9 @@
 //!
 //! ## Transport mode: stateless + JSON response
 //!
-//! [`StreamableHttpServerConfig`] is configured with `stateful_mode = false` and
-//! `json_response = true`:
+//! [`StreamableHttpServerConfig`] is configured with `legacy_session_mode =
+//! false`, `stateless_protocol_metadata_required = false` (pinned — FR-309,
+//! spec 025), and `json_response = true`:
 //!
 //! * **Stateless** — each request is served directly (`rmcp` calls
 //!   `serve_directly`, which skips the MCP `initialize` handshake enforcement),
@@ -20,7 +21,10 @@
 //!   [`crate::protocol::SymForgeServer`] `Arc`s, not in per-session MCP state, so
 //!   statelessness costs no parity: two requests hit the same index and the same
 //!   STEL ledger. This matches how the stdio dispatch is fundamentally one shared
-//!   `SymForgeServer` over one index.
+//!   `SymForgeServer` over one index. Under MCP 2026-07-28 the endpoint is
+//!   mixed by design: version-headered modern requests get strict metadata /
+//!   header-agreement validation; header-less legacy requests keep HTTP-200
+//!   JSON-RPC error semantics — never a transport-level rejection.
 //! * **JSON response** — a `tools/call` returns `Content-Type: application/json`
 //!   (a single JSON-RPC response) instead of `text/event-stream`, eliminating SSE
 //!   framing for simple request/response tools (allowed by the MCP Streamable HTTP
@@ -119,6 +123,14 @@ fn build_mcp_service(
         // rmcp 3.x renamed the knob: it now governs only legacy-protocol
         // sessions (2026-07-28 HTTP is always sessionless).
         .with_legacy_session_mode(false)
+        // FR-309 (spec 025): pin the strict-metadata posture explicitly even
+        // though `false` is 3.1.0's default — a future upstream default flip
+        // must not silently change the mixed endpoint. `false` keeps
+        // header-less legacy requests on HTTP-200 JSON-RPC error semantics;
+        // version-headered 2026-07-28 requests remain subject to modern
+        // request-metadata, header/body-agreement, and standard-header
+        // validation.
+        .with_stateless_protocol_metadata_required(false)
         // Return application/json (single JSON-RPC response), not SSE framing.
         .with_json_response(true)
         // Preserve loopback DNS-rebinding defaults; additionally permit the

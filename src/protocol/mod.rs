@@ -39,7 +39,7 @@ use rmcp::model::{
     ReadResourceRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
-use rmcp::{ServerHandler, prompt_handler, tool_handler};
+use rmcp::{ServerHandler, tool_handler};
 
 use crate::domain::{
     CapabilityStatus, CapabilityUnavailableReason, ControlStateDir, ProjectStateDir, StatePlacement,
@@ -1457,8 +1457,15 @@ impl SymForgeServer {
 ///
 /// The `#[tool_handler]` macro delegates tool dispatch to `self.tool_router`
 /// and supplies the `call_tool` / `list_tools` implementations automatically.
+///
+/// The prompt methods are hand-written (no `#[prompt_handler]`): unlike
+/// `#[tool_handler]`, which defers to a manually defined method, the 3.x
+/// `#[prompt_handler]` macro REPLACES a manual `list_prompts` in the annotated
+/// impl block with its generated body (rmcp-macros 3.1.0
+/// `prompt_handler.rs:85-87`), which would silently clobber the FR-310
+/// cache-hint override. `get_prompt`/`list_prompts` below carry the exact
+/// router delegation the macro would have generated.
 #[tool_handler(router = self.tool_router)]
-#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for SymForgeServer {
     fn get_info(&self) -> ServerInfo {
         // Override rmcp's `from_build_env` default, which expands
@@ -1478,16 +1485,38 @@ impl ServerHandler for SymForgeServer {
         ))
     }
 
+    /// FR-307 allow-list freeze (spec 025). rmcp 3.1.0's default already
+    /// returns `KNOWN_VERSIONS` including `V_2026_07_28`; this override pins
+    /// TODAY'S set explicitly so a future rmcp `"3.1"` semver update cannot
+    /// auto-advertise a protocol revision symforge has never tested. Protocol
+    /// exposure changes only by deliberate edit here. Extend, never shrink.
+    fn supported_protocol_versions(
+        &self,
+    ) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+        use rmcp::model::ProtocolVersion;
+        std::borrow::Cow::Borrowed(&[
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ])
+    }
+
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_
     {
-        std::future::ready(Ok(ListResourcesResult {
-            resources: self.resource_definitions(),
-            ..Default::default()
-        }))
+        // FR-310/FR-311: static list surface — constructor seeds
+        // `result_type: Some(COMPLETE)` (FR-305 pinned shape); 1h TTL, Public
+        // (`resource_definitions()` embeds no workspace data).
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            self.resource_definitions(),
+        )
+        .with_ttl_ms(3_600_000)
+        .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn list_resource_templates(
@@ -1497,10 +1526,13 @@ impl ServerHandler for SymForgeServer {
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>>
     + Send
     + '_ {
-        std::future::ready(Ok(ListResourceTemplatesResult {
-            resource_templates: self.resource_template_definitions(),
-            ..Default::default()
-        }))
+        // FR-310/FR-311: static list surface — same cache policy as
+        // `list_resources`.
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
+            self.resource_template_definitions(),
+        )
+        .with_ttl_ms(3_600_000)
+        .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn read_resource(
@@ -1515,10 +1547,19 @@ impl ServerHandler for SymForgeServer {
         // INV-1: the response enum exists only at this trait boundary; all
         // internal resource logic (and the spec-023 admission gating it wraps)
         // stays on `ReadResourceResult`.
+        //
+        // FR-319: resource reads never pass through `ResultStatus`, so project
+        // evidence is attached here at the seam, inside the same evidence
+        // scope `tools/call` uses (an inner daemon-proxied handler may
+        // overwrite the seeded local evidence with its receipt).
         async move {
-            self.read_resource_uri(&uri)
-                .await
-                .map(rmcp::model::ReadResourceResponse::Complete)
+            result_status::with_project_evidence_scope(self.local_project_evidence(), async {
+                self.read_resource_uri(&uri).await.map(|mut result| {
+                    result_status::attach_project_evidence_meta(&mut result.meta);
+                    rmcp::model::ReadResourceResponse::Complete(result)
+                })
+            })
+            .await
         }
     }
 
@@ -1547,10 +1588,23 @@ impl ServerHandler for SymForgeServer {
         // seeded with the LOCAL bound project; the daemon proxy layer
         // overwrites it with the daemon's receipt when it answers. Statused
         // results attach whatever is current at render time.
-        result_status::with_project_evidence_scope(
-            self.local_project_evidence(),
-            self.tool_router.call(tcc),
-        )
+        result_status::with_project_evidence_scope(self.local_project_evidence(), async {
+            let response = self.tool_router.call(tcc).await;
+            // FR-319 central evidence attachment (plan D1): statused results
+            // already attached evidence inside `into_call_tool_result`
+            // (single-writer wins — this seam never overwrites); plain-String
+            // tools gain it here, and an unbound server discloses the explicit
+            // unbound marker. Runs INSIDE the scope so a daemon receipt
+            // recorded during the call is what gets attached. Wildcard arm per
+            // FR-A2: this server only ever emits `Complete`.
+            response.map(|response| match response {
+                rmcp::model::CallToolResponse::Complete(mut result) => {
+                    result_status::attach_project_evidence_meta(&mut result.meta);
+                    rmcp::model::CallToolResponse::Complete(result)
+                }
+                other => other,
+            })
+        })
         .await
     }
 
@@ -1564,14 +1618,46 @@ impl ServerHandler for SymForgeServer {
             surface_probe::SurfaceProfile::Compact => crate::stel::compact_surface_tools(),
             _ => surface_probe::list_tools_for_profile(profile),
         };
-        Ok(ListToolsResult {
-            tools,
-            // FR-305 pinned struct shape: Complete is explicit, matching the
-            // upstream constructor default. Cache-hint fields stay None here
-            // (policy lands in PR-B; spec 025).
-            result_type: Some(rmcp::model::ResultType::COMPLETE),
-            ..Default::default()
-        })
+        // FR-305 pinned struct shape: the constructor seeds
+        // `result_type: Some(COMPLETE)`. FR-310/FR-311: 1h TTL, Public — the
+        // surface is fixed per-process (`SYMFORGE_SURFACE` is env-driven) and
+        // the INV-2 dispatch gate rejects off-surface calls, so a stale cached
+        // full list is harmless. Ordering is deterministic (router insertion
+        // order), verified by test (SC-313).
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(3_600_000)
+            .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    /// Hand-written prompt dispatch — identical to what `#[prompt_handler]`
+    /// would generate (see the impl-block doc comment for why the macro is not
+    /// used).
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
+        let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
+            self,
+            request.name,
+            request.arguments,
+            context,
+        );
+        self.prompt_router.get_prompt(prompt_context).await
+    }
+
+    /// Manual `list_prompts` override (FR-310): the macro body plus the
+    /// FR-311 static-list cache hints.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::ErrorData> {
+        Ok(
+            rmcp::model::ListPromptsResult::with_all_items(self.prompt_router.list_all())
+                .with_ttl_ms(3_600_000)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
+        )
     }
 
     /// React to the client's `notifications/initialized`.
@@ -1583,9 +1669,15 @@ impl ServerHandler for SymForgeServer {
     /// "index won't load" case for home-CWD launchers (Cursor). Precedence
     /// (`SYMFORGE_WORKSPACE_ROOT` > client roots > launch-CWD walk) is enforced
     /// inside [`Self::bind_workspace_from_client_roots`], which is a deliberate
-    /// no-op whenever startup already bound a root. Shared by both transports
-    /// because stdio and the HTTP `/mcp` serve path dispatch through the same
-    /// `ServerHandler`.
+    /// no-op whenever startup already bound a root.
+    ///
+    /// Scope (FR-316, spec 025): this hook fires only for stdio /
+    /// legacy-lifecycle clients that send `notifications/initialized`. The
+    /// stateless HTTP `/mcp` path serves requests directly with no handshake
+    /// enforcement, so this hook never runs there; modern discover-lifecycle
+    /// clients are bound by the fallback chain (`SYMFORGE_WORKSPACE_ROOT` >
+    /// `index_folder` > CWD walk), with the residual wrong-binding case
+    /// disclosed via `_meta` project evidence (FR-319).
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
         tracing::info!("client initialized");
         self.bind_workspace_from_client_roots(&context.peer).await;
