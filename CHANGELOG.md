@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.18.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.18.0...v8.18.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* make Tier-2 advice and resolve-mode honest about withheld content ([#497](https://github.com/special-place-ai-heaven/symforge/issues/497)) ([67d494a](https://github.com/special-place-ai-heaven/symforge/commit/67d494a29a3cd2d17862f09ba0509b3b9d562aad))
+
 ## [8.18.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.17.0...v8.18.0) (2026-08-04)
 
 
