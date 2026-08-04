@@ -47,6 +47,27 @@ pub use crate::live_index::store::{
 pub use crate::parsing::process_file;
 
 // ---------------------------------------------------------------------------
+// Snapshot restore (task #22 / AAP ask 2a): the warm-start fast path.
+//
+// `load_snapshot_for_root` (or the explicit-placement `load_snapshot`)
+// rehydrates a persisted `.symforge/index.bin` WITHOUT re-parsing; the loader
+// fails soft — `None` on a missing/corrupt/version-mismatched/foreign
+// snapshot, never a panic — so the embedder's fallback is always a cold
+// `LiveIndex::load`. `snapshot_compatible` is the readiness probe.
+//
+// NOTE (portability): a snapshot is bound to the canonical absolute root it
+// was written from (anti-foreign-state identity check). Restoring at a
+// DIFFERENT root or platform returns `None` today; the sanctioned opt-in
+// portable-import lane is tracked as task #23 and is NOT yet part of this
+// contract.
+// ---------------------------------------------------------------------------
+pub use crate::domain::StatePlacement;
+pub use crate::live_index::persist::{
+    IndexSnapshot, load_snapshot, load_snapshot_for_root, project_local_state_placement,
+    snapshot_compatible, snapshot_to_live_index,
+};
+
+// ---------------------------------------------------------------------------
 // STEL durable economics ledger + calibration (FR-001 embed durability).
 //
 // D3-ROOT extract-up: the durable per-project ledger store and the calibration
@@ -117,6 +138,14 @@ mod contract {
         StelLedgerEvent, StelLedgerStore, StoredLedgerRecord,
     };
 
+    // Task #22: the snapshot-restore fast path is semver-public. Name every
+    // contracted item so rename/removal/signature-drift trips compilation.
+    #[allow(unused_imports)]
+    use crate::embed::{
+        IndexSnapshot, StatePlacement, load_snapshot, load_snapshot_for_root,
+        project_local_state_placement, snapshot_compatible, snapshot_to_live_index,
+    };
+
     // Also name the back-compat MODULE re-exports so their removal trips too.
     #[allow(unused_imports)]
     use crate::embed::{domain, git, live_index, parsing};
@@ -153,6 +182,8 @@ mod contract {
         _assert_named::<SnapshotVerifyState>();
         _assert_named::<LiveIndex>();
         _assert_named::<GitRepo>();
+        _assert_named::<IndexSnapshot>();
+        _assert_named::<StatePlacement>();
 
         // --- Function / method contract: FULL-signature fn-pointer bindings. ---
         // A signature change (param type, arity, or return type) makes these
@@ -172,6 +203,17 @@ mod contract {
         ) -> Result<TextSearchResult, TextSearchError> = crate::embed::search_text;
         let _process_file: fn(&str, &[u8], LanguageId) -> FileProcessingResult =
             crate::embed::process_file;
+
+        // Snapshot restore (task #22) — full-signature bindings.
+        let _load_snapshot: fn(&Path, &StatePlacement) -> Option<IndexSnapshot> =
+            crate::embed::load_snapshot;
+        let _load_snapshot_for_root: fn(&Path) -> Option<IndexSnapshot> =
+            crate::embed::load_snapshot_for_root;
+        let _project_local_state_placement: fn(&Path) -> anyhow::Result<StatePlacement> =
+            crate::embed::project_local_state_placement;
+        let _snapshot_compatible: fn(&Path) -> bool = crate::embed::snapshot_compatible;
+        let _snapshot_to_live_index: fn(IndexSnapshot, &Path) -> LiveIndex =
+            crate::embed::snapshot_to_live_index;
 
         // Associated functions (no `&self`).
         let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
@@ -202,6 +244,11 @@ mod contract {
             _git_open,
             _git_file_at_ref,
             _git_changed_paths,
+            _load_snapshot,
+            _load_snapshot_for_root,
+            _project_local_state_placement,
+            _snapshot_compatible,
+            _snapshot_to_live_index,
         );
 
         // Back-compat module paths still resolve (deep-path imports AAP uses).
