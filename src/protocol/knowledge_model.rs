@@ -537,7 +537,10 @@ fn render_role_lane(
             continue;
         };
         let voice = record.map_or("unknown", |record| voice_label(record.voice));
-        let evidence_anchor = role_evidence_anchor(evidence);
+        // Was `role_evidence_anchor(evidence)`. RoleEvidence no longer carries
+        // an anchor because it was always a clone of this same `card.anchor`,
+        // so the rendered line is byte-identical.
+        let evidence_anchor = &card.anchor;
         lines.push(format!(
             "  {} {}:{} unit_id={}#{}:{} bytes={}..{} content_hash={} source={} generation={} voice={} evidence={} evidence_anchor={}#{}:{}@{}..{} overflow={}",
             role_label(role),
@@ -563,20 +566,10 @@ fn render_role_lane(
     }
 }
 
-fn role_evidence_anchor(
-    evidence: &RoleEvidence,
-) -> &crate::live_index::knowledge_bridge::KnowledgeAnchor {
-    match evidence {
-        RoleEvidence::DeclaredSpan(anchor)
-        | RoleEvidence::HeadingRule { anchor, .. }
-        | RoleEvidence::PathConvention { anchor, .. } => anchor,
-    }
-}
-
 fn card_candidate_key<'a>(candidate: &CardCandidate<'a>) -> (u8, &'a str, u32, u32) {
     (
         match candidate.1 {
-            RoleEvidence::DeclaredSpan(_) => 0,
+            RoleEvidence::DeclaredSpan => 0,
             RoleEvidence::HeadingRule { .. } => 1,
             RoleEvidence::PathConvention { .. } => 2,
         },
@@ -588,7 +581,7 @@ fn card_candidate_key<'a>(candidate: &CardCandidate<'a>) -> (u8, &'a str, u32, u
 
 fn role_evidence_label(evidence: &RoleEvidence) -> String {
     match evidence {
-        RoleEvidence::DeclaredSpan(_) => "declared_span".to_string(),
+        RoleEvidence::DeclaredSpan => "declared_span".to_string(),
         RoleEvidence::HeadingRule { rule_id, .. } => format!("heading:{rule_id}"),
         RoleEvidence::PathConvention { rule_id, .. } => format!("path:{rule_id}"),
     }
