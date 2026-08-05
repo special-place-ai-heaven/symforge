@@ -26,6 +26,14 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.0...v8.22.1) (2026-08-05)
+
+
+### Performance Improvements
+
+* **ci:** cache Rust builds and drop the redundant cargo check ([#512](https://github.com/special-place-ai-heaven/symforge/issues/512)) ([2484500](https://github.com/special-place-ai-heaven/symforge/commit/24845001b07d129b1f6ecf902cf92867618b6f70))
+* **surface:** drop inert schema bytes from tools/list ([#510](https://github.com/special-place-ai-heaven/symforge/issues/510)) ([1210d53](https://github.com/special-place-ai-heaven/symforge/commit/1210d53e00a22ef1c4a0750a808b13247bc596ae))
+
 ## [8.22.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.21.0...v8.22.0) (2026-08-04)
 
 
