@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.2...v8.22.3) (2026-08-05)
+
+
+### Performance Improvements
+
+* **ci:** drop rust-cache, it measured slower than no cache ([#515](https://github.com/special-place-ai-heaven/symforge/issues/515)) ([ad71301](https://github.com/special-place-ai-heaven/symforge/commit/ad71301bbbf8166250b62d9bf1396ab0d28c01fa))
+
 ## [8.22.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.1...v8.22.2) (2026-08-05)
 
 
