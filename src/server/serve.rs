@@ -458,19 +458,33 @@ fn build_serve_runtime(
     let project_state_dir = state_placement
         .as_ref()
         .and_then(|placement| placement.directory());
+    // Sub-phase timings. `serve: runtime built in` measures 2.8s on a
+    // genuinely-cold index but only ~22ms when the index came from a snapshot
+    // restore — a ~126x gap for what should be identical work. Two plausible
+    // causes were measured and REFUTED: it is not a concurrent snapshot write
+    // (the cold path spawns no background_verify at all), and it is not
+    // first-time sqlite creation (a second cold start with the databases
+    // already present still took 2.798s). Schema generation cannot explain it
+    // either, being byte-identical on both paths. Name each sub-phase so the
+    // next measurement points at the culprit instead of guessing again.
+    let phase = std::time::Instant::now();
     let ledger_store: Option<Arc<StelLedgerStore>> = project_state_dir.map(|state_dir| {
         Arc::new(StelLedgerStore::open(
             state_dir,
             format!("serve-{}", std::process::id()),
         ))
     });
+    tracing::info!("serve: runtime/ledger store in {:?}", phase.elapsed());
 
     // 006 G-039: the hashed product API-key store shares the exact same typed
     // project state owner. It cannot reconstruct placement from the source root.
+    let phase = std::time::Instant::now();
     let key_store: Option<Arc<ApiKeyStore>> =
         project_state_dir.map(|state_dir| Arc::new(ApiKeyStore::open(state_dir)));
+    tracing::info!("serve: runtime/key store in {:?}", phase.elapsed());
 
     let watcher_info = Arc::new(Mutex::new(WatcherInfo::default()));
+    let phase = std::time::Instant::now();
     let mut protocol = SymForgeServer::new_with_state_placement(
         Arc::clone(&index),
         project_name,
@@ -479,6 +493,7 @@ fn build_serve_runtime(
         state_placement,
         None,
     );
+    tracing::info!("serve: runtime/protocol server in {:?}", phase.elapsed());
     // Share the SAME store allocation with the dispatcher so durable
     // write-through (T028) and the runtime summary read (T029) use one path.
     if let Some(store) = ledger_store.as_ref() {
@@ -497,10 +512,12 @@ fn build_serve_runtime(
     // observes exactly the rows the dispatcher wrote — surviving restart.
     let runtime_store = ledger_store.map(|store| (*store).clone());
 
+    let phase = std::time::Instant::now();
     let mut runtime = ServerRuntime::build_runtime(index, protocol, governor, auth, runtime_store);
     if let Some(store) = key_store {
         runtime = runtime.with_key_store(store);
     }
+    tracing::info!("serve: runtime/server runtime in {:?}", phase.elapsed());
     runtime
 }
 
