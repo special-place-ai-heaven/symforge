@@ -52,17 +52,15 @@ pub enum KnowledgeRole {
     Other,
 }
 
+/// Why a card carries a role. Deliberately carries NO anchor: every variant
+/// used to clone one, but `roles_for_card` is always handed the very anchor its
+/// `KnowledgeCard` then stores, so the copy could never differ from
+/// `card.anchor`. Read the anchor from the card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoleEvidence {
-    DeclaredSpan(KnowledgeAnchor),
-    HeadingRule {
-        rule_id: String,
-        anchor: KnowledgeAnchor,
-    },
-    PathConvention {
-        rule_id: String,
-        anchor: KnowledgeAnchor,
-    },
+    DeclaredSpan,
+    HeadingRule { rule_id: String },
+    PathConvention { rule_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -638,7 +636,7 @@ fn derive_knowledge_cards(
             file,
             0..file.content.len(),
         );
-        let roles = roles_for_card(path, None, &anchor);
+        let roles = roles_for_card(path, None);
         return vec![KnowledgeCard { anchor, roles }];
     }
 
@@ -651,24 +649,19 @@ fn derive_knowledge_cards(
                 return None;
             }
             let anchor = knowledge_anchor(source, content_generation, path, file, start..end);
-            let roles = roles_for_card(path, unit.heading_path.last().map(String::as_str), &anchor);
+            let roles = roles_for_card(path, unit.heading_path.last().map(String::as_str));
             Some(KnowledgeCard { anchor, roles })
         })
         .collect()
 }
 
-fn roles_for_card(
-    path: &str,
-    heading: Option<&str>,
-    anchor: &KnowledgeAnchor,
-) -> Vec<(KnowledgeRole, RoleEvidence)> {
+fn roles_for_card(path: &str, heading: Option<&str>) -> Vec<(KnowledgeRole, RoleEvidence)> {
     let mut roles = BTreeMap::new();
     for (role, rule_id) in path_convention_roles(path) {
         roles
             .entry(role)
             .or_insert_with(|| RoleEvidence::PathConvention {
                 rule_id: rule_id.to_string(),
-                anchor: anchor.clone(),
             });
     }
     if let Some((role, rule_id)) = heading_rule(heading) {
@@ -676,14 +669,13 @@ fn roles_for_card(
             role,
             RoleEvidence::HeadingRule {
                 rule_id: rule_id.to_string(),
-                anchor: anchor.clone(),
             },
         );
     }
     if is_codeowners_path(path) {
         roles.insert(
             KnowledgeRole::OwnershipGovernance,
-            RoleEvidence::DeclaredSpan(anchor.clone()),
+            RoleEvidence::DeclaredSpan,
         );
     }
     if is_license_path(path) {
@@ -691,7 +683,6 @@ fn roles_for_card(
             KnowledgeRole::OwnershipGovernance,
             RoleEvidence::PathConvention {
                 rule_id: "role.path.license.v1".to_string(),
-                anchor: anchor.clone(),
             },
         );
     }
@@ -700,7 +691,6 @@ fn roles_for_card(
             KnowledgeRole::Other,
             RoleEvidence::PathConvention {
                 rule_id: "role.path.other.v1".to_string(),
-                anchor: anchor.clone(),
             },
         );
     }
@@ -1404,20 +1394,15 @@ fn knowledge_card_metadata_bytes(card: &KnowledgeCard) -> usize {
         .saturating_add(32);
     for (_, evidence) in &card.roles {
         bytes = bytes.saturating_add(std::mem::size_of::<KnowledgeRole>());
+        // Roles no longer carry an anchor (it was always a clone of
+        // `card.anchor`, already counted above), so only the rule_id is
+        // per-role weight now.
         match evidence {
-            RoleEvidence::DeclaredSpan(anchor) => {
-                bytes = bytes
-                    .saturating_add(anchor.path.len())
-                    .saturating_add(anchor.content_hash.len())
-                    .saturating_add(32);
+            RoleEvidence::DeclaredSpan => {
+                bytes = bytes.saturating_add(32);
             }
-            RoleEvidence::HeadingRule { rule_id, anchor }
-            | RoleEvidence::PathConvention { rule_id, anchor } => {
-                bytes = bytes
-                    .saturating_add(rule_id.len())
-                    .saturating_add(anchor.path.len())
-                    .saturating_add(anchor.content_hash.len())
-                    .saturating_add(32);
+            RoleEvidence::HeadingRule { rule_id } | RoleEvidence::PathConvention { rule_id } => {
+                bytes = bytes.saturating_add(rule_id.len()).saturating_add(32);
             }
         }
     }
@@ -1869,9 +1854,8 @@ mod tests {
             *role == KnowledgeRole::Architecture
                 && matches!(
                     evidence,
-                    RoleEvidence::HeadingRule { rule_id, anchor }
+                    RoleEvidence::HeadingRule { rule_id }
                         if rule_id == "role.heading.architecture.v1"
-                            && anchor.id == architecture.anchor.id
                 )
         }));
 
@@ -1886,18 +1870,16 @@ mod tests {
             *role == KnowledgeRole::Operations
                 && matches!(
                     evidence,
-                    RoleEvidence::HeadingRule { rule_id, anchor }
+                    RoleEvidence::HeadingRule { rule_id }
                         if rule_id == "role.heading.operations.v1"
-                            && anchor.id == operations.anchor.id
                 )
         }));
         assert!(operations.roles.iter().any(|(role, evidence)| {
             *role == KnowledgeRole::Architecture
                 && matches!(
                     evidence,
-                    RoleEvidence::PathConvention { rule_id, anchor }
+                    RoleEvidence::PathConvention { rule_id }
                         if rule_id == "role.path.architecture.v1"
-                            && anchor.id == operations.anchor.id
                 )
         }));
 
@@ -1928,9 +1910,8 @@ mod tests {
             *role == KnowledgeRole::Other
                 && matches!(
                     evidence,
-                    RoleEvidence::PathConvention { rule_id, anchor }
+                    RoleEvidence::PathConvention { rule_id }
                         if rule_id == "role.path.other.v1"
-                            && anchor.id == unclassified.anchor.id
                 )
         }));
 
@@ -1941,7 +1922,7 @@ mod tests {
             .expect("declared ownership card");
         assert!(declared_owner.roles.iter().any(|(role, evidence)| {
             *role == KnowledgeRole::OwnershipGovernance
-                && matches!(evidence, RoleEvidence::DeclaredSpan(anchor) if anchor.id == declared_owner.anchor.id)
+                && matches!(evidence, RoleEvidence::DeclaredSpan)
         }));
     }
 
@@ -1977,9 +1958,8 @@ mod tests {
                     *role == KnowledgeRole::OwnershipGovernance
                         && matches!(
                             evidence,
-                            RoleEvidence::PathConvention { rule_id, anchor }
+                            RoleEvidence::PathConvention { rule_id }
                                 if rule_id == "role.path.license.v1"
-                                    && anchor.id == card.anchor.id
                         )
                 }),
                 "{path} must get OwnershipGovernance via a path-convention rule, got: {:?}",
@@ -2163,5 +2143,29 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
+    }
+
+    /// Pins the win. RoleEvidence used to embed a full KnowledgeAnchor -- a
+    /// clone of the card's own -- so every role entry carried a duplicate of
+    /// its card's anchor. This asserts the anchor is gone from the variants and
+    /// that RoleEvidence stays far smaller than the anchor it used to copy,
+    /// turning a layout-derived estimate into a compiler-checked fact.
+    #[test]
+    fn role_evidence_no_longer_embeds_a_knowledge_anchor() {
+        use std::mem::size_of;
+
+        let evidence = size_of::<RoleEvidence>();
+        let anchor = size_of::<KnowledgeAnchor>();
+        assert!(
+            evidence < anchor,
+            "RoleEvidence ({evidence} B) must not carry a KnowledgeAnchor ({anchor} B)"
+        );
+        // A String is 24 B on 64-bit; the largest variant is one rule_id plus
+        // the discriminant, so anything approaching an anchor means a field
+        // crept back in.
+        assert!(
+            evidence <= 32,
+            "RoleEvidence grew to {evidence} B; an anchor or similar payload is back"
+        );
     }
 }
