@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.4...v8.22.5) (2026-08-05)
+
+
+### Performance Improvements
+
+* **serve:** name the sub-phases of serve runtime construction ([#521](https://github.com/special-place-ai-heaven/symforge/issues/521)) ([7f8d7fe](https://github.com/special-place-ai-heaven/symforge/commit/7f8d7fee6a7a4a9be7e3b86c232bacc1ce3c5ffd))
+
 ## [8.22.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.3...v8.22.4) (2026-08-05)
 
 
