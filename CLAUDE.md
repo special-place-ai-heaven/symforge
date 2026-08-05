@@ -12,9 +12,21 @@
 
 ## CI Gates
 
-- PR and push CI run version sync, `cargo fmt --check`, `cargo check`,
+- PR and push CI run version sync, `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
   `cargo build --release`, and npm tests.
+- The three Rust jobs (`rust`, `embed-build`, `embed-musl`) each use
+  `Swatinem/rust-cache@v2` under distinct `shared-key`s. This job is
+  compile-dominated (~27 min wall as_of 2026-08-05; the suite itself is
+  ~3.5 min), and it previously cached nothing.
+- CI runs `clippy --all-targets` WITHOUT a preceding `cargo check`: clippy is a
+  strict superset (same rustc checks, more lints, more targets) and cannot reuse
+  a `cargo check` pass, so running both compiled the graph twice for one answer.
+- `cargo build --release` is NOT droppable from PR CI: the tool-correctness
+  harness runs `verify-tools.cjs --bin target/release/symforge`.
+- One CI run per PR (`pull_request`); `push` runs fire only on `main` after a
+  merge. Verified 2026-08-05 against `gh run list` — feature-branch pushes do
+  not double-trigger.
 - Scheduled and manual CI additionally run ignored performance smoke coverage:
   `test_load_perf_1000_files` and `calibrate_current_repo_smoke`.
 - Full real-repo coupling calibration is operator-triggered with
