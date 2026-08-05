@@ -142,3 +142,23 @@ This file is the ONLY live-truth document in this repo; volatile claims carry an
 - Other docs are legacy pending triage — verify against code before believing them.
 - Durable decisions/lessons go to agentmemory with the `[symforge]` content prefix;
   session-start recall injects them automatically.
+
+### Never hand-write volatile state (binding, as_of 2026-08-05)
+
+Handover and campaign docs rot because volatile facts get TYPED into them. Reading
+`specs/024-optimization-backlog/HANDOVER-2026-08-04.md` one day after it was written
+turned up three already-stale claims: `origin/main is at 506fe30` (it was `78adcf3`),
+`aap-embedder-reverse-asks.md is UNCOMMITTED` (it had landed), and a worktree list
+that was true only at the moment of writing.
+
+Those are not documentation failures. They are facts that should never have been
+typed by hand. So:
+
+- **Do not write these into any doc**: git SHAs, branch/worktree lists, "X is
+  uncommitted", open PR numbers or their CI state, the current version.
+- **Generate them instead**: `pwsh scripts/campaign-state.ps1` (add `-Json` for a
+  machine-readable bootstrap). It reads git, `gh`, and `Cargo.toml` on
+  `origin/main`, and filters untracked files that are byte-identical to `main` —
+  stale-branch noise that otherwise reads as pending work.
+- **Docs keep the durable half**: protocol, task roster, measurements with their
+  method, gotchas, decisions. Cite the command for anything that moves.
