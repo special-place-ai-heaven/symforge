@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.2](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.1...v8.22.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* **hook:** stop asserting a symbol signal the body contradicts ([#513](https://github.com/special-place-ai-heaven/symforge/issues/513)) ([bddb924](https://github.com/special-place-ai-heaven/symforge/commit/bddb92485ae5519199e69f590edff1a34abc8f37))
+
 ## [8.22.1](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.0...v8.22.1) (2026-08-05)
 
 
