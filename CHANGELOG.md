@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.6](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.5...v8.22.6) (2026-08-05)
+
+
+### Performance Improvements
+
+* **persist:** name the warm-restore derived-index phases ([#522](https://github.com/special-place-ai-heaven/symforge/issues/522)) ([4ad0599](https://github.com/special-place-ai-heaven/symforge/commit/4ad05990616234dea8f20d3ca11ae9ff7b42d637))
+
 ## [8.22.5](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.4...v8.22.5) (2026-08-05)
 
 
