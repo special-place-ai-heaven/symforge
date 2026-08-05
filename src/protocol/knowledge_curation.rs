@@ -289,8 +289,20 @@ impl KnowledgeCurationCoordinator {
         state_placement: Option<&StatePlacement>,
         persistence_health: CapabilityStatus,
     ) -> Result<(), String> {
+        // This call is 99.2% of `serve: runtime built` on a genuinely-cold
+        // index (2.76s of 2.78s) yet ~free on a snapshot restore. On a fresh
+        // project `.symforge/` holds no curation dir, so the `replay_dir`
+        // early-return below fires and none of the recovery work runs — which
+        // means the whole cost is in the three calls above it. Name them.
+        let phase = std::time::Instant::now();
         let generation = index.published_source_set().current_generation();
+        tracing::info!("curation/published source set in {:?}", phase.elapsed());
+
+        let phase = std::time::Instant::now();
         let plan = curation_plan_current(&generation)?;
+        tracing::info!("curation/plan current in {:?}", phase.elapsed());
+
+        let phase = std::time::Instant::now();
         let state_dir = apply_capability(
             repo_root,
             state_placement,
@@ -298,9 +310,12 @@ impl KnowledgeCurationCoordinator {
             &plan.source.location,
         )
         .map_err(unavailable)?;
+        tracing::info!("curation/apply capability in {:?}", phase.elapsed());
+
         let curation_dir = state_dir.join(CURATION_STATE_DIR);
         let replay_dir = curation_dir.join(REPLAY_DIR);
         if !replay_dir.is_dir() {
+            tracing::info!("curation/no replay dir — early return");
             return Ok(());
         }
         self.probe_apply_directories(repo_root, &curation_dir)
