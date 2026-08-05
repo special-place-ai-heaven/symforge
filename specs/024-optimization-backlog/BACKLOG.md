@@ -11,6 +11,70 @@ Baseline: symforge repo, ~910 files / ~26k symbols, debug build on the dev
 box. Release is ~4-5x faster across the board; both matter (debug bounds the
 test-suite and dev loop, release bounds operators).
 
+## MEASURED MAP as_of 2026-08-05 — read this before the tables below
+
+The tables further down are the ORIGINAL estimates. Several of their rankings
+and stated causes were disproved by direct measurement on 2026-08-05 (release
+8.22.0, this repo, ~918-924 files). Every phase named here is now instrumented
+on `main`: run `symforge serve --listen 127.0.0.1:<port>` with `RUST_LOG=info`
+and read the log lines. For a genuinely-cold index use
+`git worktree add --detach` — a fresh worktree has no `.symforge/`, so it
+exercises the cold path without touching real project state.
+
+| phase | cold | warm (snapshot restore) | pays on |
+|---|---|---|---|
+| admission + parse | 4.93 / 6.10 / 6.25 / 7.20 s | — | cold only |
+| **index publication** | **1.88 – 3.09 s** | **1.80 – 2.05 s** | **BOTH** |
+| serve: runtime built | 2.77 – 2.94 s | 22 – 43 ms | cold only |
+| trigram | 493 – 557 ms | 452 ms | BOTH |
+| reverse index / path indices / file map | — | 19 ms / 1.4 ms / 0.5 ms | warm |
+| serve: index ready | 7.4 – 10.0 s | 2.90 – 4.92 s | |
+
+Publication splits as: **knowledge bridge (5,521 cards) 56.3%**, **manifest
+35.0%**, authority 8.2%, state capture + repo outline <0.4%.
+
+### Corrections to the tables below
+
+1. **Publication is the best remaining lever, and it is not its own item** — it
+   was folded into the admission+parse row as a cold-path residual. It is the
+   only phase costing seconds on BOTH paths, and warm is the common path since
+   spec 026 landed.
+2. **Row 3's stated cause is wrong.** It blames the tool/prompt router and
+   schema generation. Measured, the routers are **1.77 ms of a 2.78 s phase
+   (0.06%)**; the cost is `KnowledgeCurationCoordinator::recover_on_project_load`
+   at **99.2%**. "Lazy router / precomputed schemas" would have delivered ~1.8 ms.
+3. **Row 4 is under-ranked, not over-ranked.** The trigram also rebuilds on the
+   WARM path (`persist.rs` `snapshot_to_live_index`), so it is paid on EVERY
+   start — 452 ms, 95.5% of all derived-rebuild work. Do not close it as
+   not-worth-it on the cold number alone.
+4. **Row 2's ranking is correct** (~71% of cold index-ready) but it only pays on
+   a genuinely-cold FIRST index. Its metric also has ~46% run-to-run spread, so
+   any claim needs >=3 samples per side.
+5. **Row 5: caching was tried and reverted.** `Swatinem/rust-cache` measured
+   SLOWER (PR #512 added it, #515 reverted it). Removing the redundant
+   `cargo check` is the real win: 27m13s -> 24m58s mean, **-6.5%** over 3 samples
+   (the job has ~2 min of spread — quote means, not best runs). Also disproved:
+   the release build is NOT droppable (`verify-tools.cjs` consumes
+   `target/release/symforge`), and PRs do NOT double-trigger CI.
+6. **Row 6 was measured and closed.** Dependency compilation is 82% of a cold
+   worktree build (382.8 s cold vs 69.0 s warm-deps), but at ~5 min per worktree
+   that does not justify sccache forcing `CARGO_INCREMENTAL=0` on the warm loop.
+
+### Recommended next fix
+
+Make the knowledge bridge **incremental against the snapshot generation**. It
+rebuilds all 5,521 cards even on a warm restore, where the snapshot already
+carries the files they derive from. Needs **no snapshot format bump**, so unlike
+persisting the bridge it requires no AAP coordination.
+
+> **Do not unilaterally persist derived indices into the snapshot.** That is a
+> format bump; `engine_info` reports snapshot format v7 and AAP bakes snapshots
+> into room images through the semver-public embed facade. It needs their
+> handshake first, via a `docs/solutions/` brief.
+
+Correctness bar for any publication change: published data must stay
+byte-equivalent (full suite + golden replay).
+
 ## Measured — ready to fire, ranked by effort-to-win
 
 | # | target | measured cost | where | why this ranking |
