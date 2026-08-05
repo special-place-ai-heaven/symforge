@@ -1957,23 +1957,69 @@ async fn prompt_context_text(
 
     match (file_hint, symbol_hint) {
         (Some(file_hint), Some(name)) => {
-            let body = symbol_context_text(
+            // The symbol here came from loose prompt-token matching, so it is
+            // only evidence about THIS file if it actually resolves inside it.
+            // When it does not, symbol_context_text_for_generation renders the
+            // resolver's error as the body (`Err(error) => return Ok(error)`),
+            // and the injection asserts a confidence level and then reports
+            // "Symbol not found in <file>" — a claim contradicted by its own
+            // payload, landing in the agent's prompt on every submit.
+            //
+            // Observed: prompt mentioning `CLAUDE.md` plus the ordinary word
+            // "session" produced `high-confidence` + "Symbol not found in
+            // CLAUDE.md: session". The path hint was real; the symbol was a
+            // collision. Fall back to the file-only signal, which is exactly
+            // what this prompt would have produced without that collision.
+            // Only NotFound is a collision. Ambiguous means the symbol IS in
+            // the file under several candidates, and the existing rendering
+            // already reports that usefully -- so this guard must use the same
+            // resolver the renderer does, not a looser name comparison.
+            let source_authority = freshen_sidecar_path_if_stale(state, &file_hint.path);
+            let published = state.index.published_generation();
+            let symbol_is_in_file = published
+                .live
+                .as_ref()
+                .get_file(&file_hint.path)
+                .is_some_and(|file| {
+                    !matches!(
+                        crate::live_index::disambiguation::resolve_symbol_selector(
+                            file, &name, None, line_hint,
+                        ),
+                        crate::live_index::disambiguation::SymbolSelectorMatch::NotFound
+                    )
+                });
+            if symbol_is_in_file {
+                let body = symbol_context_text_for_generation(
+                    state,
+                    &published,
+                    &SymbolContextParams {
+                        name: name.clone(),
+                        file: None,
+                        path: Some(file_hint.path.clone()),
+                        symbol_kind: None,
+                        symbol_line: line_hint,
+                    },
+                    options,
+                    source_authority,
+                )?;
+                let (level, file_evidence) = describe_file_hint(&file_hint);
+                return Ok(format_prompt_context_signal(
+                    level,
+                    format!("{file_evidence}; symbol token `{name}` found in the index"),
+                    body,
+                ));
+            }
+            let body = outline_text(
                 state,
-                &SymbolContextParams {
-                    name: name.clone(),
-                    file: None,
-                    path: Some(file_hint.path.clone()),
-                    symbol_kind: None,
-                    symbol_line: line_hint,
+                &OutlineParams {
+                    path: file_hint.path.clone(),
+                    max_tokens: Some(160),
+                    sections: None,
                 },
                 options,
             )?;
-            let (level, file_evidence) = describe_file_hint(&file_hint);
-            return Ok(format_prompt_context_signal(
-                level,
-                format!("{file_evidence}; symbol token `{name}` found in the index"),
-                body,
-            ));
+            let (level, evidence) = describe_file_hint(&file_hint);
+            return Ok(format_prompt_context_signal(level, evidence, body));
         }
         (Some(file_hint), None) => {
             let body = outline_text(
@@ -4017,6 +4063,52 @@ mod tests {
         assert!(
             !result.contains("src/other.rs"),
             "exact selector should exclude unrelated same-name hits: {result}"
+        );
+    }
+
+    /// A prompt can name a real file AND contain a token that matches a symbol
+    /// living in a DIFFERENT file. The old code claimed a confidence level for
+    /// that pair and then rendered the resolver's error as the body, so the
+    /// injection contradicted itself with "Symbol not found in <file>" — on
+    /// every prompt submit. Observed live: `CLAUDE.md` + the ordinary word
+    /// "session". The file hint is still real, so fall back to its outline.
+    #[tokio::test]
+    async fn test_prompt_context_handler_symbol_collision_falls_back_to_file_outline() {
+        let target = make_indexed_file(
+            "src/db.rs",
+            vec![make_symbol("connect", SymbolKind::Function, 1, 1)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        // `hydrate_cache` exists in the index, but NOT in src/db.rs.
+        let elsewhere = make_indexed_file(
+            "src/other.rs",
+            vec![make_symbol("hydrate_cache", SymbolKind::Function, 1, 1)],
+            vec![],
+            ParseStatus::Parsed,
+        );
+        let state = make_state(vec![("src/db.rs", target), ("src/other.rs", elsewhere)]);
+
+        let result = prompt_context_handler(
+            State(state),
+            Query(PromptContextParams {
+                text: "look at src/db.rs hydrate_cache".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result.contains("Symbol not found"),
+            "a symbol collision must not be reported as a resolved signal: {result}"
+        );
+        assert!(
+            result.contains("src/db.rs"),
+            "the file hint is real and must still be honoured: {result}"
+        );
+        assert!(
+            result.contains("connect"),
+            "should fall back to the file outline, which names its own symbols: {result}"
         );
     }
 
