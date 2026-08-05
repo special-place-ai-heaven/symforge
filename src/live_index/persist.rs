@@ -1946,6 +1946,13 @@ pub fn snapshot_to_live_index_with_code_signals(
     let manifest_entries = manifest.entries;
     let mut files: HashMap<String, Arc<IndexedFile>> = HashMap::with_capacity(snapshot_files.len());
 
+    // Warm-restore phase timings. Spec 026 made snapshot restore the COMMON
+    // start path, but every derived index below is still rebuilt from scratch
+    // on it, and none of it was logged — so a warm start's ~1.1s (2.90s to
+    // index-ready minus 1.80s publication) was entirely unattributed. Name each
+    // phase, exactly as #488 did for the cold path and #521 for serve runtime
+    // construction, so the next decision targets a measurement.
+    let phase = Instant::now();
     for (path, snap_file) in snapshot_files {
         let indexed_file = IndexedFile {
             relative_path: snap_file.relative_path,
@@ -1964,7 +1971,15 @@ pub fn snapshot_to_live_index_with_code_signals(
         files.insert(path, Arc::new(indexed_file));
     }
 
+    tracing::info!(
+        "warm restore: file map rebuilt ({} files) in {:?}",
+        files.len(),
+        phase.elapsed()
+    );
+
+    let phase = Instant::now();
     let trigram_index = super::trigram::TrigramIndex::build_from_files(&files);
+    tracing::info!("warm restore: trigram index built in {:?}", phase.elapsed());
 
     let mut index = LiveIndex {
         files,
@@ -1987,8 +2002,20 @@ pub fn snapshot_to_live_index_with_code_signals(
         // project switch invalidates it the same way a freshly loaded one does.
         indexed_root: Some(normalize_root(project_root)),
     };
+    let phase = Instant::now();
     index.rebuild_reverse_index();
+    tracing::info!(
+        "warm restore: reverse index rebuilt in {:?}",
+        phase.elapsed()
+    );
+
+    let phase = Instant::now();
     index.rebuild_path_indices();
+    tracing::info!(
+        "warm restore: path indices rebuilt in {:?}",
+        phase.elapsed()
+    );
+
     (index, code_signals.into_published())
 }
 
