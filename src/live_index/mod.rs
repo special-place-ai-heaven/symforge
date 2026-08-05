@@ -1,6 +1,6 @@
 mod context_bundle;
 pub mod coupling;
-mod disambiguation;
+pub(crate) mod disambiguation;
 pub(crate) use disambiguation::enclosing_impl_owner;
 pub mod frecency;
 pub mod git_temporal;
