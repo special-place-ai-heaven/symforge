@@ -15,10 +15,13 @@
 - PR and push CI run version sync, `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
   `cargo build --release`, and npm tests.
-- The three Rust jobs (`rust`, `embed-build`, `embed-musl`) each use
-  `Swatinem/rust-cache@v2` under distinct `shared-key`s. This job is
-  compile-dominated (~27 min wall as_of 2026-08-05; the suite itself is
-  ~3.5 min), and it previously cached nothing.
+- The `rust` job is compile-dominated (~25 min wall as_of 2026-08-05; the suite
+  itself is ~3.5 min). **Do not add `Swatinem/rust-cache` back** — it was tried
+  and MEASURED SLOWER, then reverted. Warm restore: `rust` 24m57s → 25m36s,
+  `darwin-serve-port` 2m59s → 4m13s, `embed-build` 2m43s → 2m52s, `embed-musl`
+  flat. Four jobs, all neutral-to-worse. Restoring and re-saving this target
+  tree (25 tree-sitter C grammars, vendored libgit2, bundled sqlite) costs more
+  wall time on a disk-constrained runner than the compilation it avoids.
 - CI runs `clippy --all-targets` WITHOUT a preceding `cargo check`: clippy is a
   strict superset (same rustc checks, more lints, more targets) and cannot reuse
   a `cargo check` pass, so running both compiled the graph twice for one answer.
