@@ -79,3 +79,24 @@ migration is a broken build or, worse, silently changed transport semantics.
    tripwire, golden replay. For item 1, published-data byte-equivalence.
 4. One campaign, one worktree, one PR; cleanup on merge (targets + worktree
    + branch both ends).
+
+## Research result — serve snapshot restore (as_of 2026-08-04, /autoresearch pass)
+
+Measured with the installed release 8.17.0 on this repo (916 files, snapshot
+`.symforge/index.bin` 20 MB):
+
+- **Local stdio ALREADY restores**: `load_source=SnapshotRestore`, sidecar
+  listening ~3 s after process start; the ~2 min to a "Ready" status label is
+  the BACKGROUND snapshot verification (`snapshot_verify_state=Pending` →
+  verified), not the load — tools serve during it with honest trust labels.
+- **`symforge serve` NEVER calls `load_snapshot`** (`src/server/serve.rs` has
+  no `persist::` call site) — every serve start pays the full cold pipeline
+  (release: parse 4.60 s + runtime 3.59 s + publication 2.67 s + trigram
+  0.61 s ≈ 9.9 s to listening).
+- **Verdict**: wiring `persist::load_snapshot` (staleness-gated, the exact
+  daemon/stdio path) into serve startup converts ~9.9 s cold to ~3 s warm and
+  removes the 60 s-deadline fragility; the machinery, staleness checks, and
+  verify-in-background flow all exist and are proven on the stdio path. This
+  is the item-8/item-9 lever; parse-parallelism/mmap work only pays on the
+  genuinely-cold first index of a project.
+- Next: implementation speckit (spec 026) per the item-by-item protocol.
