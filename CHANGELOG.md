@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.4](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.3...v8.22.4) (2026-08-05)
+
+
+### Performance Improvements
+
+* **knowledge:** stop cloning each card's anchor into every role ([#517](https://github.com/special-place-ai-heaven/symforge/issues/517)) ([fa450c3](https://github.com/special-place-ai-heaven/symforge/commit/fa450c371aa2cca9c7b47c5f1a5ef4c7350e3500))
+
 ## [8.22.3](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.2...v8.22.3) (2026-08-05)
 
 
