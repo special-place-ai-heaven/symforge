@@ -171,6 +171,15 @@ pub fn list_tools_for_profile(profile: SurfaceProfile) -> Vec<Tool> {
             .list_all()
             .into_iter()
             .filter(|tool| tool.name.as_ref() != "symforge")
+            .map(|mut tool| {
+                // The `#[tool]` macro builds these schemas via schemars, so they
+                // carry the same inert `$schema` / `"default": null` bytes the
+                // compact surface strips in `schema_object`.
+                let mut schema = (*tool.input_schema).clone();
+                crate::stel::surface_list::strip_schema_noise(&mut schema);
+                tool.input_schema = Arc::new(schema);
+                tool
+            })
             .collect(),
         SurfaceProfile::Compact => compact_probe_tools(),
         SurfaceProfile::Meta => meta_probe_tools(),
