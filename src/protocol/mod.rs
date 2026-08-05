@@ -325,8 +325,13 @@ impl SymForgeServer {
                 reason: CapabilityUnavailableReason::PersistentStateUnavailable,
             }
         };
+        // This constructor is 99.1% of `serve: runtime built` on a cold index
+        // (2.91s of 2.94s) but is ~free when the index came from a snapshot
+        // restore. Only ONE thing in here takes the index, so name it: the
+        // routers below are static and would cost the same on both paths.
         let curation_coordinator =
             Arc::new(knowledge_curation::KnowledgeCurationCoordinator::default());
+        let phase = std::time::Instant::now();
         if let Some(root) = repo_root.as_deref()
             && let Err(error) = curation_coordinator.recover_on_project_load(
                 &index,
@@ -337,10 +342,19 @@ impl SymForgeServer {
         {
             tracing::warn!("knowledge curation startup recovery remained fail-closed: {error}");
         }
+        tracing::info!(
+            "serve: protocol/curation recover_on_project_load in {:?}",
+            phase.elapsed()
+        );
+
+        let phase = std::time::Instant::now();
+        let tool_router = Self::tool_router();
+        let prompt_router = Self::prompt_router();
+        tracing::info!("serve: protocol/routers in {:?}", phase.elapsed());
         Self {
             index,
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
+            tool_router,
+            prompt_router,
             project_name,
             watcher_info,
             watcher_handle: Arc::new(Mutex::new(None)),
