@@ -1289,6 +1289,10 @@ impl SharedIndexHandle {
         // would otherwise be the silent span between that line and serving.
         let publication_started = Instant::now();
         let manifest = capture_published_manifest(&index, scout_plan.as_deref());
+        info!(
+            "publication/manifest in {:?}",
+            publication_started.elapsed()
+        );
         let source = manifest
             .as_ref()
             .map(|manifest| Arc::new(manifest.source.clone()));
@@ -1320,8 +1324,23 @@ impl SharedIndexHandle {
         } else {
             FreshnessStatus::Current
         };
+        // Publication is the single largest startup phase on BOTH paths --
+        // measured 3.09s/1.88s cold and 2.05s/1.80s warm, against trigram
+        // 452ms and serve runtime construction 43ms on the same warm start.
+        // It was reported only as one aggregate number, so split it: the
+        // knowledge bridge rebuilds thousands of cards and forward links from
+        // scratch every start and is the prime suspect, but three of the four
+        // causes this backlog proposed for other phases turned out wrong, so
+        // name each component rather than assume.
+        let phase = Instant::now();
         let published_state = Arc::new(PublishedIndexState::capture(0, &index));
+        info!("publication/state capture in {:?}", phase.elapsed());
+
+        let phase = Instant::now();
         let published_repo_outline = Arc::new(index.capture_repo_outline_view());
+        info!("publication/repo outline in {:?}", phase.elapsed());
+
+        let phase = Instant::now();
         let bridge = source
             .as_deref()
             .map(|source| {
@@ -1333,6 +1352,13 @@ impl SharedIndexHandle {
                 ))
             })
             .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
+        info!(
+            "publication/knowledge bridge ({} cards) in {:?}",
+            bridge.cards.len(),
+            phase.elapsed()
+        );
+
+        let phase = Instant::now();
         let authority = build_published_authority(
             &index,
             source.as_deref(),
@@ -1342,6 +1368,7 @@ impl SharedIndexHandle {
             &code_signals,
             manifest.as_deref(),
         );
+        info!("publication/authority in {:?}", phase.elapsed());
         let live = Arc::new(index);
         let published_generation = Arc::new(PublishedGeneration {
             publication_generation: 0,
