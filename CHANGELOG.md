@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.8](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.7...v8.22.8) (2026-08-06)
+
+
+### Bug Fixes
+
+* **admission:** stop laundering policy exclusions into a language verdict ([#530](https://github.com/special-place-ai-heaven/symforge/issues/530)) ([6c987df](https://github.com/special-place-ai-heaven/symforge/commit/6c987df5d63db0c397e85beb2ed587ecaf325f36))
+
 ## [8.22.7](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.6...v8.22.7) (2026-08-05)
 
 
