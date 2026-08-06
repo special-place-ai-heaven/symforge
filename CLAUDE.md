@@ -16,12 +16,24 @@
   `cargo clippy --all-targets -- -D warnings`, the full Rust test suite,
   `cargo build --release`, and npm tests.
 - The `rust` job is compile-dominated (~25 min wall as_of 2026-08-05; the suite
-  itself is ~3.5 min). **Do not add `Swatinem/rust-cache` back** — it was tried
-  and MEASURED SLOWER, then reverted. Warm restore: `rust` 24m57s → 25m36s,
-  `darwin-serve-port` 2m59s → 4m13s, `embed-build` 2m43s → 2m52s, `embed-musl`
-  flat. Four jobs, all neutral-to-worse. Restoring and re-saving this target
-  tree (25 tree-sitter C grammars, vendored libgit2, bundled sqlite) costs more
-  wall time on a disk-constrained runner than the compilation it avoids.
+  itself is ~3.5 min). **Do not re-add the four-key `Swatinem/rust-cache`
+  configuration** — it was tried and MEASURED SLOWER, then reverted. Warm
+  restore: `rust` 24m57s -> 25m36s, `darwin-serve-port` 2m59s -> 4m13s,
+  `embed-build` 2m43s -> 2m52s, `embed-musl` flat. Four jobs, all
+  neutral-to-worse.
+  **The measurement stands; the explanation originally written here did not.**
+  It claimed archive I/O simply exceeds the compile it avoids. The action's own
+  README says caches are capped at **10 GB repo-wide, and exceeding that evicts
+  older entries** — and the reverted config used FOUR distinct `shared-key`s
+  (`symforge-rust`, `-embed`, `-embed-musl`, `-darwin`). Four dependency caches
+  for this dep tree plausibly blew that cap, so every run paid the save cost
+  while often getting a miss. That fits the data better than the original claim.
+  Also worth knowing before re-testing: rust-cache does **not** cache workspace
+  crates (it prunes them and sets `CARGO_INCREMENTAL=0` itself), so it caches
+  only dependencies — which here is the expensive part (25 tree-sitter C
+  grammars, vendored libgit2 via cmake, bundled sqlite).
+  **Untested and possibly viable:** a single shared-key across the ubuntu jobs,
+  or `cache-targets: false` (registry only). Neither was measured.
 - CI runs `clippy --all-targets` WITHOUT a preceding `cargo check`: clippy is a
   strict superset (same rustc checks, more lints, more targets) and cannot reuse
   a `cargo check` pass, so running both compiled the graph twice for one answer.
