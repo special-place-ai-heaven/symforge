@@ -2951,17 +2951,35 @@ impl SharedIndexHandle {
                 coverage: history_coverage,
             })
         };
-        let bridge = source
-            .as_deref()
-            .map(|source| {
-                Arc::new(build_knowledge_bridge(
-                    &live,
-                    source,
-                    content_generation,
-                    &BridgeLimits::default(),
-                ))
-            })
-            .unwrap_or_else(|| Arc::new(KnowledgeBridge::default()));
+        // The bridge is a pure function of (live content, source identity,
+        // content_generation) — `repeated_equal_generations_produce_identical_
+        // order_and_ids` pins exactly that determinism. On a retaining-content
+        // publish none of those three move, so rebuilding every card reproduces
+        // the value already held.
+        //
+        // Worth doing rather than filing as micro-optimization: publication is
+        // the dominant cost on BOTH the cold and warm paths, and the bridge is
+        // ~56% of publication (~5.5k cards on this repo). Every
+        // retaining-content publish — git temporal's two per startup, each
+        // freshness transition — was paying that in full for a result equal to
+        // the one it replaced.
+        //
+        // Same discipline as `code_signals` above, which already reuses its
+        // snapshot when its input is unchanged; the source-identity equality is
+        // belt-and-braces, since a content-preserving publish should not move
+        // the source either.
+        let bridge = match source.as_deref() {
+            Some(source) if !content_changed && previous.source.as_deref() == Some(source) => {
+                Arc::clone(&previous.bridge)
+            }
+            Some(source) => Arc::new(build_knowledge_bridge(
+                &live,
+                source,
+                content_generation,
+                &BridgeLimits::default(),
+            )),
+            None => Arc::new(KnowledgeBridge::default()),
+        };
         let authority = build_published_authority(
             &live,
             source.as_deref(),
