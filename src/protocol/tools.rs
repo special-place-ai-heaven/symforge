@@ -2787,8 +2787,10 @@ fn find_references_completeness_label(
 /// Candidate eligibility is decided by the caller from the typed manifest
 /// disposition (`LiveIndex::oversized_metadata_only_files`), NOT from the lossy
 /// `SkipReason` projection this used to filter on: that projection collapses
-/// security demotions into `SkipReason::UnsupportedLanguage`, so excluding them
-/// was an accident of mislabelling rather than a decision. Only size-demoted
+/// security demotions into the reason-free `SkipReason::PolicyWithheld` (it
+/// collapsed them into `SkipReason::UnsupportedLanguage` before the admission
+/// honesty fix), so excluding them was an accident of mislabelling rather than
+/// a decision. Only size-demoted
 /// files are reference-relevant anyway — binary, lockfile, and artifact
 /// demotions cannot hold code references to the queried symbol.
 fn tier2_reference_disclosure(

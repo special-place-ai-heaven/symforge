@@ -1258,10 +1258,10 @@ impl LiveIndex {
     /// Typed per-path admission disposition, read straight off the manifest.
     ///
     /// Deliberately NOT `capture_admission_tier_lookup_view`: that projects through
-    /// `compatibility_admission_decision`, which collapses seven `MetadataOnlyReason`
-    /// variants — including both security variants — into
-    /// `SkipReason::UnsupportedLanguage`. A security decision must never be taken on
-    /// that projection.
+    /// `compatibility_admission_decision`, which collapses both security variants
+    /// into the single reason-free `SkipReason::PolicyWithheld` and drops the
+    /// `rule_id` / `rule_ids` / `finding_count` a decision needs. A security
+    /// decision must never be taken on that projection.
     pub fn capture_file_disposition(
         &self,
         relative_path: &str,

@@ -1481,6 +1481,14 @@ pub enum SkipReason {
     /// so a secret-detector verdict on perfectly valid TypeScript or Rust was
     /// surfaced to callers as "unsupported language" — a positive, wrong claim
     /// about the file's language. This says only that policy applied.
+    ///
+    /// What it DOES disclose, stated plainly rather than claimed away: that the
+    /// demotion was a policy one rather than a technical one (encoding, LFS,
+    /// path shape, size). That bit is not new — `admit_disk_read` already
+    /// answers it for any path on request, splitting `content_withheld_by_admission`
+    /// from `content_withheld_unscanned` precisely because the recovery action
+    /// differs. This surfaces the same bit a tool call earlier; it does not
+    /// create it. The bit that stays hidden is path-rule vs content-detector.
     PolicyWithheld,
     /// The file's bytes are not decodable as searchable text. Distinct from
     /// [`SkipReason::UnsupportedLanguage`], which means the extension maps to no

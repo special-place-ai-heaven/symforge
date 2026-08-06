@@ -3441,9 +3441,15 @@ pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<A
                 // reported as "unsupported language".
                 MetadataOnlyReason::SensitivePath { .. }
                 | MetadataOnlyReason::SensitiveContent { .. } => SkipReason::PolicyWithheld,
-                // The rest are NOT content-derived, so naming them leaks
-                // nothing and the old collapse only misinformed.
+                // An LFS pointer IS decided from bytes, so naming it is not a
+                // "nothing was read" claim. What it discloses is only that the
+                // first <1KiB match the PUBLIC LFS pointer grammar — a format
+                // class, not file semantics — and the oid/size it carries stay
+                // off this surface.
                 MetadataOnlyReason::LfsPointer { .. } => SkipReason::LfsPointer,
+                // These three are decided from the PATH alone, before any byte
+                // is read, so naming them leaks nothing about contents and the
+                // old collapse only misinformed.
                 MetadataOnlyReason::PlatformPathCollision
                 | MetadataOnlyReason::UnsupportedPathEncoding
                 | MetadataOnlyReason::PathMetadataTooLarge => SkipReason::UnsupportedPath,
@@ -3491,10 +3497,31 @@ fn disposition_from_admission(decision: AdmissionDecision) -> crate::domain::Fil
                 // disposition->reason mapping for REPORTING and are never
                 // produced by the admission pipeline, so they cannot arrive
                 // here; mapped defensively rather than panicking.
+                //
+                // The fallback is itself a false claim — routing `PolicyWithheld`
+                // here would re-label a security demotion "undecodable text
+                // encoding", the same class of lie this commit removes. It is
+                // reachable only if a future caller feeds a display reason back
+                // in, so assert in debug (tests catch it) and stay defensive in
+                // release rather than panicking a live index load.
                 Some(SkipReason::UnsupportedTextEncoding)
                 | Some(SkipReason::PolicyWithheld)
                 | Some(SkipReason::LfsPointer)
-                | Some(SkipReason::UnsupportedPath) => MetadataOnlyReason::UnsupportedTextEncoding,
+                | Some(SkipReason::UnsupportedPath) => {
+                    debug_assert!(
+                        !matches!(
+                            decision.reason,
+                            Some(SkipReason::PolicyWithheld)
+                                | Some(SkipReason::LfsPointer)
+                                | Some(SkipReason::UnsupportedPath)
+                        ),
+                        "display-only SkipReason {:?} round-tripped into a \
+                         MetadataOnlyReason; it would resurface as a false \
+                         encoding verdict",
+                        decision.reason
+                    );
+                    MetadataOnlyReason::UnsupportedTextEncoding
+                }
                 // `None` means the reason was NOT RECORDED. It is not evidence
                 // of anything, so it keeps the neutral text-encoding bucket
                 // rather than being promoted into a substantive claim.
@@ -7724,6 +7751,65 @@ mod tests {
                 .windows(canary.len())
                 .any(|window| window == canary.as_bytes())
         );
+    }
+
+    /// The Display-level tests in `domain::index` pin the WORDING of
+    /// `PolicyWithheld`; they cannot catch a regression that stops producing it.
+    /// This asserts the production projection itself, on entries minted by a
+    /// real admission run: both security variants must reach
+    /// `SkipReason::PolicyWithheld`, and neither may reach
+    /// `SkipReason::UnsupportedLanguage` — the false language verdict that made
+    /// a detector hit on valid source look like a broken grammar.
+    #[test]
+    fn security_demotions_project_to_policy_withheld_not_a_language_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let canary = runtime_canary();
+        let password_kw = ["pass", "word"].concat();
+        let token_kw = ["to", "ken"].concat();
+        write_file(tmp.path(), ".env", &format!("{password_kw}={canary}\n"));
+        // A .rs path CANNOT match a sensitive path rule, so this entry can only
+        // be a content-detector demotion — the exact case TestPilot hit on
+        // valid TypeScript.
+        write_file(
+            tmp.path(),
+            "src/config.rs",
+            &format!("let {token_kw} = \"{canary}\";\n"),
+        );
+
+        let shared = LiveIndex::load(tmp.path()).expect("sensitive fixture must load safely");
+        let index = shared.read();
+
+        for path in [".env", "src/config.rs"] {
+            let entry = index
+                .manifest_entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+                .unwrap_or_else(|| panic!("{path} must remain cataloged"));
+            assert!(
+                matches!(
+                    entry.disposition,
+                    FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath { .. }
+                            | MetadataOnlyReason::SensitiveContent { .. }
+                    }
+                ),
+                "{path} must be a security demotion, got {:?}",
+                entry.disposition
+            );
+
+            let decision = compatibility_admission_decision(entry)
+                .unwrap_or_else(|| panic!("{path} is Tier-2, so it must project a decision"));
+            assert_eq!(
+                decision.reason,
+                Some(SkipReason::PolicyWithheld),
+                "{path} must project to PolicyWithheld"
+            );
+            assert_ne!(
+                decision.reason,
+                Some(SkipReason::UnsupportedLanguage),
+                "{path} must never be reported as a language problem"
+            );
+        }
     }
 
     #[test]
