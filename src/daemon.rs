@@ -3793,21 +3793,59 @@ async fn call_tool_handler(
             return Ok(message.into_response());
         }
     }
-    if matches!(tool_name.as_str(), "search_knowledge" | "review_knowledge") {
-        let (project, projects) = if tool_name == "search_knowledge" {
-            let input =
-                decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
-            if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
-                return Ok(message.into_response());
+    if matches!(
+        tool_name.as_str(),
+        "search_knowledge"
+            | "review_knowledge"
+            | "search_symbols"
+            | "search_text"
+            | "search_files"
+            | "find_references"
+    ) {
+        let (project, projects) = match tool_name.as_str() {
+            "search_knowledge" => {
+                let input =
+                    decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
+                    return Ok(message.into_response());
+                }
+                (input.project, input.projects)
             }
-            (input.project, input.projects)
-        } else {
-            let input =
-                decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
-            if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
-                return Ok(message.into_response());
+            "review_knowledge" => {
+                let input =
+                    decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
+                    return Ok(message.into_response());
+                }
+                (input.project, input.projects)
             }
-            (input.project, input.projects)
+            // The cross-project code-navigation verbs accept the SAME id/name
+            // selectors but carry different input types, and they are
+            // deliberately absent from `single_project_routed_tool`, so they
+            // never met `runtime_for_target` — the only name->id resolver in the
+            // tree. A project opened by `index_folder(add: true)`, whose receipt
+            // advertises `project_name`, was therefore denied as "project not
+            // open" when that same name was used as a selector.
+            //
+            // Read the selectors straight off the JSON rather than adding a
+            // typed arm per verb: the write-back below already edits this same
+            // object, and the knowledge validation above stays scoped to the
+            // knowledge verbs that require it.
+            _ => (
+                params
+                    .get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                params.get("projects").and_then(|value| {
+                    value.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                }),
+            ),
         };
 
         // `search_knowledge` owns both scalar and set-valued targeting, so it
@@ -4015,13 +4053,24 @@ async fn call_tool_handler(
         .await
     {
         Ok(Ok(mut result)) => {
-            // Task 7: full-surface `health`/`health_compact` gain the session's
-            // open-project inventory once MORE than one project is open — the
-            // full 39-tool surface can then list and select projects without the
-            // compact `status` tool. Single-project sessions stay byte-identical.
-            if matches!(tool_name_for_panic.as_str(), "health" | "health_compact")
-                && let Some(inventory) =
-                    state.render_session_project_inventory_if_multi(&session_id)
+            // Task 7: `health`/`health_compact` gain the session's open-project
+            // inventory once MORE than one project is open. Single-project
+            // sessions stay byte-identical.
+            //
+            // `status` is included for the same reason, not despite it: on the
+            // compact-3 surface `status` is the ONLY health verb an agent has,
+            // and every detail level except "projects" dispatches per-project
+            // against the immutable home — so a project opened by
+            // `index_folder(add: true)` was invisible BY CONSTRUCTION there. An
+            // additive open that reports success and then cannot be observed is
+            // the same silent-divergence class as an orphaned daemon.
+            // `status(detail="projects")` is intercepted before dispatch, so it
+            // never reaches here and cannot double-append.
+            if matches!(
+                tool_name_for_panic.as_str(),
+                "health" | "health_compact" | "status"
+            ) && let Some(inventory) =
+                state.render_session_project_inventory_if_multi(&session_id)
             {
                 result.push('\n');
                 result.push_str(&inventory);
