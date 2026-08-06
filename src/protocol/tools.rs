@@ -11369,6 +11369,12 @@ impl SymForgeServer {
         // divergence.
         ctx.daemon_env_surface = daemon_env_surface;
 
+        // Disclose an ORPHANED daemon: one that still answers but is no longer
+        // the daemon clients discover. `None` for the recorded daemon and for
+        // every non-daemon topology, so the line appears strictly on divergence
+        // — same discipline as the env-surface disclosure above.
+        ctx.orphaned_daemon_pid = crate::daemon::unrecorded_daemon_pid();
+
         let body = crate::stel::format_stel_status(request, &ctx);
         match reset_note {
             Some(note) => format!("{body}\n{note}"),

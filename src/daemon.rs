@@ -88,6 +88,12 @@ fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io:
         Err(e) => Err(e),
     }
 }
+/// Set once this process binds AS the daemon (see `spawn_daemon_at`, where it
+/// writes its own pid file). Only a bound daemon can become an orphan, so
+/// [`unrecorded_daemon_pid`] stays silent for every other topology — stdio,
+/// embed, and the MCP adapter front-end.
+static DAEMON_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
 const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
 /// Task 9: seconds a session may go without a heartbeat before the daemon
@@ -2550,6 +2556,14 @@ async fn stop_incompatible_recorded_daemon_at(
         return Ok(());
     }
 
+    // Tracks whether the incompatible daemon is CONFIRMED gone. Only then may
+    // its runtime records be removed: deleting them while it still runs makes it
+    // undiscoverable AND unstoppable — `stop_incompatible_recorded_daemon_at`
+    // returns early on a missing port file, so no later call can ever reap it —
+    // while it keeps serving its own index to every client already connected.
+    // The same reasoning is already written down for `DaemonStopOutcome::
+    // StopTimedOut`, which deliberately leaves the files in place.
+    let mut confirmed_gone = false;
     if let Ok(pid) = read_daemon_pid_file_at(control_state_dir) {
         if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
@@ -2558,7 +2572,15 @@ async fn stop_incompatible_recorded_daemon_at(
                     "failed to terminate incompatible symforge daemon automatically: {error}"
                 );
             }
-            wait_for_daemon_unhealthy(port).await;
+            confirmed_gone = wait_for_daemon_unhealthy(port).await;
+            if !confirmed_gone {
+                tracing::warn!(
+                    pid,
+                    port,
+                    "incompatible symforge daemon still answering after termination; \
+                     leaving its runtime records so it stays discoverable and stoppable"
+                );
+            }
         } else if !daemon_health_matches_recorded_pid(&health, pid) {
             match health.pid {
                 Some(health_pid) => {
@@ -2586,7 +2608,9 @@ async fn stop_incompatible_recorded_daemon_at(
         }
     }
 
-    cleanup_daemon_runtime_files_at(control_state_dir);
+    if confirmed_gone {
+        cleanup_daemon_runtime_files_at(control_state_dir);
+    }
     Ok(())
 }
 
@@ -2722,14 +2746,19 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-async fn wait_for_daemon_unhealthy(port: u16) {
+/// Wait for `port` to stop answering health checks. Returns whether it actually
+/// did: callers use this to decide if a daemon is CONFIRMED gone, and a timeout
+/// must never be mistaken for success — removing a live daemon's runtime records
+/// orphans it permanently.
+async fn wait_for_daemon_unhealthy(port: u16) -> bool {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         if !daemon_health_ok(port).await {
-            break;
+            return true;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+    !daemon_health_ok(port).await
 }
 
 fn try_acquire_start_lock_at(
@@ -3498,6 +3527,10 @@ pub async fn spawn_daemon_at(
     write_daemon_token_file_at(control_state_dir, &auth_token)?;
     write_daemon_port_file_at(control_state_dir, port)?;
     write_daemon_pid_file_at(control_state_dir, std::process::id())?;
+    // This process is now A daemon. Whether it is still THE recorded daemon is
+    // re-checked per `status` call — a later incompatible start can orphan us
+    // (see `unrecorded_daemon_pid`).
+    DAEMON_BOUND.store(true, std::sync::atomic::Ordering::Release);
 
     let state = Arc::new(DaemonState::with_token_at(
         auth_token,
@@ -5479,6 +5512,42 @@ fn read_daemon_pid_file_at(control_state_dir: &ControlStateDir) -> io::Result<u3
 
 pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
     read_daemon_port_file_at(process_control_state_dir()?)
+}
+
+/// This process's pid when it is a daemon that is NO LONGER the recorded one —
+/// an ORPHAN: still alive, still answering everyone already connected, but
+/// undiscoverable, so its index silently diverges from the daemon new clients
+/// reach.
+///
+/// Orphans are routine, not exotic. `stop_incompatible_recorded_daemon_at`
+/// cleans up the runtime files whether or not the incompatible daemon actually
+/// died — the safety gate refuses on a pid/executable mismatch, and
+/// `terminate_process` can simply fail — so the survivor keeps serving with no
+/// record pointing at it. Upgrading symforge is the common trigger, because the
+/// version check makes the running daemon "incompatible"; a session that
+/// updates several times can accumulate several orphans, each holding a full
+/// index.
+///
+/// Callers cannot otherwise tell which instance answered them, which is what
+/// makes this worth disclosing: an orphan's replies are internally consistent
+/// and confidently wrong about the world.
+///
+/// `None` for the recorded daemon and for every non-daemon process.
+pub(crate) fn unrecorded_daemon_pid() -> Option<u32> {
+    if !DAEMON_BOUND.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let me = std::process::id();
+    let recorded = process_control_state_dir()
+        .ok()
+        .and_then(|dir| read_daemon_pid_file_at(dir).ok());
+    match recorded {
+        Some(pid) if pid == me => None,
+        // Either another daemon owns the record, or the record is gone
+        // entirely (the cleanup-regardless path above). Both mean new clients
+        // cannot reach us.
+        _ => Some(me),
+    }
 }
 
 fn read_daemon_port_file_at(control_state_dir: &ControlStateDir) -> io::Result<u16> {
