@@ -282,6 +282,13 @@ impl KnowledgeCurationCoordinator {
     /// that project begins serving tool calls. Failures remain represented in
     /// the replay store and health surface; callers may keep read-only service
     /// available while curation stays fail-closed.
+    ///
+    /// One deliberate observability change came with the replay-directory probe
+    /// below: on a project with nothing to recover, a plan that WOULD have
+    /// errored is no longer computed, so its warning is no longer logged at
+    /// startup. Nothing consumed that plan on this path, and the same error
+    /// resurfaces on the first `review_knowledge` call, so this trades a
+    /// startup warning nothing acted on for ~3.8s of cold-start latency.
     pub(crate) fn recover_on_project_load(
         &self,
         index: &SharedIndex,
@@ -289,31 +296,63 @@ impl KnowledgeCurationCoordinator {
         state_placement: Option<&StatePlacement>,
         persistence_health: CapabilityStatus,
     ) -> Result<(), String> {
-        // This call is 99.2% of `serve: runtime built` on a genuinely-cold
-        // index (2.76s of 2.78s) yet ~free on a snapshot restore. On a fresh
-        // project `.symforge/` holds no curation dir, so the `replay_dir`
-        // early-return below fires and none of the recovery work runs — which
-        // means the whole cost is in the three calls above it. Name them.
         let phase = std::time::Instant::now();
         let generation = index.published_source_set().current_generation();
         tracing::info!("curation/published source set in {:?}", phase.elapsed());
 
-        let phase = std::time::Instant::now();
-        let plan = curation_plan_current(&generation)?;
-        tracing::info!("curation/plan current in {:?}", phase.elapsed());
+        // A project with no curation replay directory has nothing to recover,
+        // and answering that costs one `is_dir()` off the state placement.
+        //
+        // This used to sit AFTER `curation_plan_current`, which is ~3.8s on a
+        // genuinely-cold index — 99.9% of startup curation recovery, itself
+        // 99.2% of `serve: runtime built` — and whose only contribution here was
+        // `plan.source.location`, feeding a single
+        // `matches!(.., SourceLocation::WorkingTree { .. })` in
+        // `apply_capability`. So a full remediation review ran to completion and
+        // was then discarded because there was no replay directory to apply it
+        // to. Nothing is skipped by probing first: `apply_capability` CREATES
+        // nothing (five capability checks and two `fs::metadata` reads);
+        // directory creation lives in `prepare_mutation` and
+        // `probe_apply_directories`, both of which are still gated behind the
+        // replay-directory check below.
+        //
+        // The plan that actually guards recovery is the one taken INSIDE the
+        // lock, against the generation observed there — it is unchanged.
+        if let Some(directory) = state_placement.and_then(StatePlacement::directory)
+            && !directory
+                .as_path()
+                .join(CURATION_STATE_DIR)
+                .join(REPLAY_DIR)
+                .is_dir()
+        {
+            tracing::info!("curation/no replay dir — early return (probed)");
+            return Ok(());
+        }
+
+        // Identical to what the discarded plan carried: `curation_plan_current`
+        // clones this straight off the generation, and `capability_status`
+        // already resolves it exactly this way. Same absent-source error.
+        let source_location = generation
+            .source
+            .as_ref()
+            .map(|source| &source.location)
+            .ok_or_else(|| "Curation unavailable: source identity is absent.".to_string())?;
 
         let phase = std::time::Instant::now();
         let state_dir = apply_capability(
             repo_root,
             state_placement,
             persistence_health,
-            &plan.source.location,
+            source_location,
         )
         .map_err(unavailable)?;
         tracing::info!("curation/apply capability in {:?}", phase.elapsed());
 
         let curation_dir = state_dir.join(CURATION_STATE_DIR);
         let replay_dir = curation_dir.join(REPLAY_DIR);
+        // Re-checked against the RESOLVED state dir: the probe above is skipped
+        // when the placement carries no directory, and a replay dir can appear
+        // between the two checks.
         if !replay_dir.is_dir() {
             tracing::info!("curation/no replay dir — early return");
             return Ok(());
@@ -326,6 +365,8 @@ impl KnowledgeCurationCoordinator {
             .map_err(|error| durable_state_error(&error))?;
         let result = (|| {
             let generation = index.published_source_set().current_generation();
+            // The fail-closed re-validation, under the lock, against the
+            // generation observed inside it.
             let _plan = curation_plan_current(&generation)?;
             self.recover_pending_records(repo_root, &curation_dir, &replay_dir, &generation)
         })();
