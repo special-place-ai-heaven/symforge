@@ -2556,14 +2556,23 @@ async fn stop_incompatible_recorded_daemon_at(
         return Ok(());
     }
 
-    // Tracks whether the incompatible daemon is CONFIRMED gone. Only then may
-    // its runtime records be removed: deleting them while it still runs makes it
-    // undiscoverable AND unstoppable — `stop_incompatible_recorded_daemon_at`
-    // returns early on a missing port file, so no later call can ever reap it —
-    // while it keeps serving its own index to every client already connected.
-    // The same reasoning is already written down for `DaemonStopOutcome::
-    // StopTimedOut`, which deliberately leaves the files in place.
-    let mut confirmed_gone = false;
+    // Whether to clear the runtime record afterwards.
+    //
+    // Clearing it while the daemon is STILL ALIVE and identifiable orphans it:
+    // this function returns early on a missing port file, so no later call can
+    // ever reap it, and it keeps serving its own index to every client already
+    // connected — invisibly, because nothing in a response says which instance
+    // answered. The same reasoning is already written down for
+    // `DaemonStopOutcome::StopTimedOut`, which deliberately leaves the files in
+    // place.
+    //
+    // The default stays `true`, because a record we cannot act on is worse than
+    // no record: with no pid file (and health reporting no pid) the process is
+    // unidentifiable, so keeping the record makes it no more stoppable — it only
+    // makes every later call re-walk the same dead end. We withhold cleanup
+    // strictly for a daemon we tried to kill and failed, or deliberately
+    // declined to kill; those are live, identified, and worth keeping visible.
+    let mut clear_record = true;
     if let Ok(pid) = read_daemon_pid_file_at(control_state_dir) {
         if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
@@ -2572,8 +2581,8 @@ async fn stop_incompatible_recorded_daemon_at(
                     "failed to terminate incompatible symforge daemon automatically: {error}"
                 );
             }
-            confirmed_gone = wait_for_daemon_unhealthy(port).await;
-            if !confirmed_gone {
+            if !wait_for_daemon_unhealthy(port).await {
+                clear_record = false;
                 tracing::warn!(
                     pid,
                     port,
@@ -2582,6 +2591,7 @@ async fn stop_incompatible_recorded_daemon_at(
                 );
             }
         } else if !daemon_health_matches_recorded_pid(&health, pid) {
+            clear_record = false;
             match health.pid {
                 Some(health_pid) => {
                     tracing::warn!(
@@ -2598,6 +2608,7 @@ async fn stop_incompatible_recorded_daemon_at(
                 }
             }
         } else {
+            clear_record = false;
             tracing::warn!(
                 recorded_pid = pid,
                 daemon_pid = ?health.pid,
@@ -2608,7 +2619,7 @@ async fn stop_incompatible_recorded_daemon_at(
         }
     }
 
-    if confirmed_gone {
+    if clear_record {
         cleanup_daemon_runtime_files_at(control_state_dir);
     }
     Ok(())

@@ -2402,6 +2402,22 @@ async fn background_verify_with_hook<F>(
     // 3. Re-parse changed files. Reindexing routes through the watcher's
     //    admission path; embed has no watcher, so changed/new files are
     //    detected but not re-parsed here (reconciliation is server-only).
+    // Files the re-parse did NOT actually reconcile.
+    //
+    // `admit_and_index_single_path` can return `Skipped` (its publication CAS
+    // lost `MAX_PUBLICATION_ATTEMPTS` times), `ReadError`, or `NotFound` — none
+    // of which refresh the index. That result used to be discarded, so a FAILED
+    // re-parse was indistinguishable from a successful one, the file fell out of
+    // the mismatch set below, and freshness resolved to `Current` over rows that
+    // were never refreshed. Right file, pre-edit anchors, index reporting
+    // healthy — and `Current` is exactly what makes the result envelope collapse
+    // to its confident one-line form.
+    //
+    // Only `Reindexed` and `HashSkip` mean the file is genuinely in sync;
+    // everything else is folded back into the mismatch set so freshness degrades
+    // honestly instead of asserting a currency nothing established.
+    #[cfg(feature = "server")]
+    let mut unreconciled: Vec<String> = Vec::new();
     #[cfg(feature = "server")]
     {
         let to_reparse: Vec<String> = stat_result
@@ -2415,12 +2431,16 @@ async fn background_verify_with_hook<F>(
                 return;
             }
             let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            let _ = crate::watcher::admit_and_index_single_path(
+            match crate::watcher::admit_and_index_single_path(
                 rel_path,
                 &abs_path,
                 &index,
                 expected_gen,
-            );
+            ) {
+                crate::watcher::ReindexResult::Reindexed
+                | crate::watcher::ReindexResult::HashSkip => {}
+                _ => unreconciled.push(rel_path.clone()),
+            }
             if index.current_project_generation() != expected_gen {
                 return;
             }
@@ -2446,12 +2466,18 @@ async fn background_verify_with_hook<F>(
                 return;
             }
             let abs_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            let _ = crate::watcher::admit_and_index_single_path(
+            match crate::watcher::admit_and_index_single_path(
                 rel_path,
                 &abs_path,
                 &index,
                 expected_gen,
-            );
+            ) {
+                crate::watcher::ReindexResult::Reindexed
+                | crate::watcher::ReindexResult::HashSkip => {}
+                // Same reasoning as the changed/new loop above: a spot-check
+                // mismatch whose re-parse did not land is still a mismatch.
+                _ => unreconciled.push(rel_path.clone()),
+            }
             if index.current_project_generation() != expected_gen {
                 return;
             }
@@ -2469,6 +2495,21 @@ async fn background_verify_with_hook<F>(
         let mut mismatches = spot_mismatches;
         mismatches.extend(stat_result.changed);
         mismatches.extend(stat_result.new_files);
+        mismatches.sort();
+        mismatches.dedup();
+        mismatches
+    };
+
+    // Under `server` the re-parse above ran, but running is not succeeding: fold
+    // back everything it failed to reconcile. Previously this arm did not exist,
+    // on the assumption — stated in the comment above — that "under `server`
+    // those files were re-parsed above, so they are correctly not mismatches".
+    // That was an assumption, never a check, and `server` is a default feature,
+    // so the honest-degradation path existed only in builds nobody ships.
+    #[cfg(feature = "server")]
+    let spot_mismatches = {
+        let mut mismatches = spot_mismatches;
+        mismatches.extend(unreconciled);
         mismatches.sort();
         mismatches.dedup();
         mismatches
