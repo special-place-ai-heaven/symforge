@@ -368,21 +368,54 @@ impl ParseQuarantineSummary {
         let omitted = self
             .total_count
             .saturating_sub(self.display_offset.saturating_add(shown));
-        format!(
-            "total={} unexpected_partial={} expected_vendor_partial={} expected_generated_partial={} expected_test_fixture_partial={} expected_template_dsl_partial={} expected_framework_partial={} expected_language_partial={} failed={} showing={} offset={} omitted={}",
-            self.total_count,
-            self.unexpected_partial_count,
-            self.expected_vendor_partial_count,
-            self.expected_generated_partial_count,
-            self.expected_test_fixture_partial_count,
-            self.expected_template_dsl_partial_count,
-            self.expected_framework_partial_count,
-            self.expected_language_partial_count,
-            self.failed_count,
-            shown,
-            self.display_offset,
-            omitted,
-        )
+        // `total`, `unexpected_partial`, `failed` and the window fields are
+        // always reported: they are what a caller acts on, and a zero in any of
+        // them is itself the answer.
+        //
+        // The expected_* categories are not. They are almost always zero, and
+        // this header spent six of its twelve fields saying so — on this repo
+        // that is roughly half the line conveying nothing. Emit only the
+        // categories that actually have entries; an absent category means zero,
+        // exactly as it does for the summary line above.
+        let mut parts = vec![
+            format!("total={}", self.total_count),
+            format!("unexpected_partial={}", self.unexpected_partial_count),
+        ];
+        for (label, count) in [
+            (
+                "expected_vendor_partial",
+                self.expected_vendor_partial_count,
+            ),
+            (
+                "expected_generated_partial",
+                self.expected_generated_partial_count,
+            ),
+            (
+                "expected_test_fixture_partial",
+                self.expected_test_fixture_partial_count,
+            ),
+            (
+                "expected_template_dsl_partial",
+                self.expected_template_dsl_partial_count,
+            ),
+            (
+                "expected_framework_partial",
+                self.expected_framework_partial_count,
+            ),
+            (
+                "expected_language_partial",
+                self.expected_language_partial_count,
+            ),
+        ] {
+            if count > 0 {
+                parts.push(format!("{label}={count}"));
+            }
+        }
+        parts.push(format!("failed={}", self.failed_count));
+        parts.push(format!("showing={shown}"));
+        parts.push(format!("offset={}", self.display_offset));
+        parts.push(format!("omitted={omitted}"));
+        parts.join(" ")
     }
 
     /// Paths in the CURRENT display window. Used by the per-category health
@@ -2636,15 +2669,57 @@ pub fn health_report_from_stats_windowed(
     }
 
     if stats.partial_parse_count > 0 {
+        // `unexpected` is the ACTIONABLE category, so it is always stated —
+        // "0 unexpected" is precisely the reassurance an operator is scanning
+        // for, and suppressing it would make its absence ambiguous.
+        //
+        // The six expected_* buckets are a different case: they are almost
+        // always zero, and a zero there carries no information at all. On this
+        // repo the line spent five of its seven clauses saying nothing. Render
+        // only the buckets that actually fired, and drop the heuristic-label
+        // footnote entirely when none did — it explains labels that are not on
+        // screen.
+        let expected = [
+            ("expected vendor", stats.expected_vendor_partial_parse_count),
+            (
+                "expected generated",
+                stats.expected_generated_partial_parse_count,
+            ),
+            (
+                "expected test-fixture",
+                stats.expected_test_fixture_partial_parse_count,
+            ),
+            (
+                "expected template-DSL",
+                stats.expected_template_dsl_partial_parse_count,
+            ),
+            (
+                "expected framework",
+                stats.expected_framework_partial_parse_count,
+            ),
+            (
+                "expected language",
+                stats.expected_language_partial_parse_count,
+            ),
+        ];
+        let mut parts = vec![format!(
+            "{} unexpected",
+            stats.unexpected_partial_parse_count
+        )];
+        parts.extend(
+            expected
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(label, count)| format!("{count} {label}")),
+        );
+        let footnote = if expected.iter().any(|(_, count)| *count > 0) {
+            " (expected_* vendor/generated/test-fixture/template-DSL are heuristic path-based labels)"
+        } else {
+            ""
+        };
         output.push_str(&format!(
-            "\nPartial parse summary: {} unexpected, {} expected vendor, {} expected generated, {} expected test-fixture, {} expected template-DSL, {} expected framework, {} expected language (expected_* vendor/generated/test-fixture/template-DSL are heuristic path-based labels)",
-            stats.unexpected_partial_parse_count,
-            stats.expected_vendor_partial_parse_count,
-            stats.expected_generated_partial_parse_count,
-            stats.expected_test_fixture_partial_parse_count,
-            stats.expected_template_dsl_partial_parse_count,
-            stats.expected_framework_partial_parse_count,
-            stats.expected_language_partial_parse_count,
+            "\nPartial parse summary: {}{footnote}",
+            parts.join(", ")
         ));
     }
 
