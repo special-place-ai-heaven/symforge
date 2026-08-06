@@ -109,7 +109,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
+            "Parse/span quarantine registry: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
         ),
         "full health should summarize parse/span quarantine evidence: {full}"
     );
@@ -137,7 +137,7 @@ fn health_reports_parse_span_quarantine_registry() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
+            "Parse/span quarantine: total=5 unexpected_partial=1 expected_vendor_partial=1 expected_framework_partial=1 expected_language_partial=1 failed=1 showing=5 offset=0 omitted=0"
         ),
         "compact health should retain bounded quarantine counts: {compact}"
     );
@@ -181,7 +181,7 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 offset=0 omitted=2"
+            "Parse/span quarantine registry: total=12 unexpected_partial=12 failed=0 showing=10 offset=0 omitted=2"
         ),
         "full health should cap quarantine evidence and report omitted entries: {full}"
     );
@@ -203,7 +203,7 @@ fn health_parse_span_quarantine_registry_is_bounded() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=12 unexpected_partial=12 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=0 failed=0 showing=10 offset=0 omitted=2"
+            "Parse/span quarantine: total=12 unexpected_partial=12 failed=0 showing=10 offset=0 omitted=2"
         ),
         "compact health should expose the bounded quarantine count: {compact}"
     );
@@ -328,7 +328,7 @@ fn health_labels_angular_template_partial_as_expected_framework() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 offset=0 omitted=0"
+            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_framework_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "framework partial should be counted in its own bucket: {full}"
     );
@@ -357,7 +357,7 @@ fn health_labels_angular_template_partial_as_expected_framework() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=1 expected_language_partial=0 failed=0 showing=1 offset=0 omitted=0"
+            "Parse/span quarantine: total=1 unexpected_partial=0 expected_framework_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "compact health should carry the framework bucket count: {compact}"
     );
@@ -381,7 +381,7 @@ fn health_labels_typescript_import_type_array_partial_as_expected_language() {
     let full = health_report_from_published_state(&published, &watcher, 0);
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
+            "Parse/span quarantine registry: total=1 unexpected_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "language partial should be counted in its own bucket: {full}"
     );
@@ -410,7 +410,7 @@ fn health_labels_typescript_import_type_array_partial_as_expected_language() {
     let compact = health_report_compact_from_published_state(&published, &watcher, 0);
     assert!(
         compact.contains(
-            "Parse/span quarantine: total=1 unexpected_partial=0 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
+            "Parse/span quarantine: total=1 unexpected_partial=0 expected_language_partial=1 failed=0 showing=1 offset=0 omitted=0"
         ),
         "compact health should carry the language bucket count: {compact}"
     );
@@ -454,7 +454,7 @@ fn health_registry_total_accounts_for_every_partial_including_excused() {
     );
     assert!(
         full.contains(
-            "Parse/span quarantine registry: total=2 unexpected_partial=1 expected_vendor_partial=0 expected_generated_partial=0 expected_test_fixture_partial=0 expected_template_dsl_partial=0 expected_framework_partial=0 expected_language_partial=1 failed=0 showing=2 offset=0 omitted=0"
+            "Parse/span quarantine registry: total=2 unexpected_partial=1 expected_language_partial=1 failed=0 showing=2 offset=0 omitted=0"
         ),
         "registry total must equal the header partial count — no invisible partials: {full}"
     );
