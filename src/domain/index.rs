@@ -1470,6 +1470,29 @@ pub enum SkipReason {
     /// policy, and `SYMFORGE_INDEX_GENERATED_OUTPUT=1` opts back into full
     /// indexing. Non-git trees are unaffected (fail open: admit).
     GeneratedOutput,
+    /// The admission policy withheld this file. Deliberately NEUTRAL: it does
+    /// not say whether a path rule or a content detector applied, because that
+    /// is the one content-derived bit a disclosed reason could still leak — the
+    /// same property `format::content_withheld_by_admission` protects on the
+    /// read path.
+    ///
+    /// It exists because withholding a reason and ASSERTING A FALSE ONE are not
+    /// the same thing. These files previously reported `UnsupportedLanguage`,
+    /// so a secret-detector verdict on perfectly valid TypeScript or Rust was
+    /// surfaced to callers as "unsupported language" — a positive, wrong claim
+    /// about the file's language. This says only that policy applied.
+    PolicyWithheld,
+    /// The file's bytes are not decodable as searchable text. Distinct from
+    /// [`SkipReason::UnsupportedLanguage`], which means the extension maps to no
+    /// grammar: this one is about the ENCODING, and the language may well be
+    /// supported.
+    UnsupportedTextEncoding,
+    /// Path-shaped admission failures that are NOT content-derived: a platform
+    /// path collision, an undecodable path, or path metadata over the catalog
+    /// bound. Naming these leaks nothing about file contents.
+    UnsupportedPath,
+    /// The file is a Git LFS pointer, so its real bytes are not present locally.
+    LfsPointer,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -1482,6 +1505,10 @@ impl std::fmt::Display for SkipReason {
             SkipReason::DependencyLockfile => write!(f, "lockfile"),
             SkipReason::Untracked => write!(f, "untracked"),
             SkipReason::UnsupportedLanguage => write!(f, "unsupported language"),
+            SkipReason::PolicyWithheld => write!(f, "withheld by admission policy"),
+            SkipReason::UnsupportedTextEncoding => write!(f, "undecodable text encoding"),
+            SkipReason::UnsupportedPath => write!(f, "unsupported path"),
+            SkipReason::LfsPointer => write!(f, "git-lfs pointer"),
             SkipReason::GeneratedOutput => write!(
                 f,
                 "untracked generated output (SYMFORGE_INDEX_GENERATED_OUTPUT=1 to index)"
@@ -2248,5 +2275,60 @@ mod tests {
             }
         ));
         assert_eq!(old_manifest.digest, reworded_manifest.digest);
+    }
+
+    /// A security-policy exclusion must never be reported as a LANGUAGE verdict.
+    ///
+    /// Before this, seven distinct `MetadataOnlyReason`s — including BOTH
+    /// secret-detector outcomes — collapsed into `UnsupportedLanguage`, so a
+    /// detector hit on perfectly valid TypeScript or Rust was surfaced to
+    /// callers as "unsupported language". An external report hit exactly that
+    /// and reasonably concluded the language support was broken.
+    ///
+    /// Withholding a reason is defensible; asserting a false one is not.
+    #[test]
+    fn policy_withheld_never_claims_a_language_problem() {
+        let withheld = SkipReason::PolicyWithheld.to_string();
+        assert!(
+            !withheld.contains("language"),
+            "a policy exclusion must not be reported as a language problem, got: {withheld}"
+        );
+        assert!(
+            !withheld.contains("size") && !withheld.contains("MB"),
+            "and must not be reported as a size problem either, got: {withheld}"
+        );
+
+        // Neutral by design: it must not disclose WHICH policy applied, because
+        // path-rule vs content-detector is the one content-derived bit a
+        // disclosed reason could still leak.
+        for leak in ["path", "content", "secret", "detector", "rule"] {
+            assert!(
+                !withheld.contains(leak),
+                "policy refusal must stay neutral; leaked {leak:?} in: {withheld}"
+            );
+        }
+    }
+
+    /// The non-sensitive reasons are NOT content-derived, so naming them leaks
+    /// nothing — and each must be distinguishable from the others.
+    #[test]
+    fn non_sensitive_skip_reasons_are_distinct_and_honest() {
+        let encoding = SkipReason::UnsupportedTextEncoding.to_string();
+        let language = SkipReason::UnsupportedLanguage.to_string();
+        let path = SkipReason::UnsupportedPath.to_string();
+        let lfs = SkipReason::LfsPointer.to_string();
+
+        // An undecodable ENCODING is not an unsupported LANGUAGE.
+        assert_ne!(encoding, language);
+        assert!(encoding.contains("encoding"), "got: {encoding}");
+        assert!(path.contains("path"), "got: {path}");
+        assert!(lfs.contains("lfs"), "got: {lfs}");
+
+        let all = [&encoding, &language, &path, &lfs];
+        for (i, left) in all.iter().enumerate() {
+            for right in all.iter().skip(i + 1) {
+                assert_ne!(left, right, "skip reasons must not share wording");
+            }
+        }
     }
 }

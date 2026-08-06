@@ -1161,7 +1161,22 @@ fn scout_decision_for_discovered(
                 Some(SkipReason::DenylistedExtension)
                 | Some(SkipReason::Untracked)
                 | Some(SkipReason::GeneratedOutput) => MetadataOnlyReason::GeneratedOrVendor,
-                Some(SkipReason::UnsupportedLanguage) | Some(SkipReason::SizeCeiling) | None => {
+                // A >100MB ceiling skip is a SIZE fact and already has a
+                // correct home; it used to land in the text-encoding bucket and
+                // resurface as "unsupported language".
+                Some(SkipReason::SizeCeiling) => MetadataOnlyReason::OversizedData,
+                // Display-only reasons. These are minted by the
+                // disposition->reason mapping for REPORTING and are never
+                // produced by the admission pipeline, so they cannot arrive
+                // here; mapped defensively rather than panicking.
+                Some(SkipReason::UnsupportedTextEncoding)
+                | Some(SkipReason::PolicyWithheld)
+                | Some(SkipReason::LfsPointer)
+                | Some(SkipReason::UnsupportedPath) => MetadataOnlyReason::UnsupportedTextEncoding,
+                // `None` means the reason was NOT RECORDED. It is not evidence
+                // of anything, so it keeps the neutral text-encoding bucket
+                // rather than being promoted into a substantive claim.
+                Some(SkipReason::UnsupportedLanguage) | None => {
                     MetadataOnlyReason::UnsupportedTextEncoding
                 }
             },

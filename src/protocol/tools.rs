@@ -13154,7 +13154,11 @@ mod tests {
             SkipReason::DenylistedExtension
             | SkipReason::Untracked
             | SkipReason::GeneratedOutput => crate::domain::MetadataOnlyReason::GeneratedOrVendor,
-            SkipReason::UnsupportedLanguage => {
+            SkipReason::UnsupportedLanguage
+            | SkipReason::UnsupportedTextEncoding
+            | SkipReason::PolicyWithheld
+            | SkipReason::LfsPointer
+            | SkipReason::UnsupportedPath => {
                 crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
             }
         };
