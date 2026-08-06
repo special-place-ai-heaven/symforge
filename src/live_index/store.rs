@@ -3447,11 +3447,10 @@ pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<A
                 // class, not file semantics — and the oid/size it carries stay
                 // off this surface.
                 MetadataOnlyReason::LfsPointer { .. } => SkipReason::LfsPointer,
-                // These three are decided from the PATH alone, before any byte
-                // is read, so naming them leaks nothing about contents and the
-                // old collapse only misinformed.
-                MetadataOnlyReason::PlatformPathCollision
-                | MetadataOnlyReason::UnsupportedPathEncoding
+                // These two are decided from the PATH alone, before any byte is
+                // read, so naming them leaks nothing about contents and the old
+                // collapse only misinformed.
+                MetadataOnlyReason::UnsupportedPathEncoding
                 | MetadataOnlyReason::PathMetadataTooLarge => SkipReason::UnsupportedPath,
                 MetadataOnlyReason::UnsupportedTextEncoding => SkipReason::UnsupportedTextEncoding,
             },
