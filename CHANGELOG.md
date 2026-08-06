@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [8.22.9](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.8...v8.22.9) (2026-08-06)
+
+
+### Performance Improvements
+
+* **curation:** probe the replay dir before computing a curation plan ([#532](https://github.com/special-place-ai-heaven/symforge/issues/532)) ([031165a](https://github.com/special-place-ai-heaven/symforge/commit/031165a0a23ed5ba3d3d7a296f3fa080cc4c377a))
+
 ## [8.22.8](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.7...v8.22.8) (2026-08-06)
 
 
