@@ -13290,6 +13290,54 @@ mod tests {
         make_server_with_root(index, None)
     }
 
+    /// Wait until background publications have quiesced.
+    ///
+    /// `WatcherState::Active` is NOT a settled fixture. The fresh-instance
+    /// reconcile ends by spawning a fire-and-forget git-temporal computation
+    /// (the tail of `watcher::reconcile_for_cause_with`), and `Active` is set
+    /// immediately after that SPAWN — not after the task. The task then
+    /// publishes twice, `GitTemporalState::Computing` and then its result, via
+    /// `swap_and_publish_retaining_content`.
+    ///
+    /// Every publication mints a fresh `PublishedIndexState` Arc while
+    /// deliberately leaving `project_generation` AND `content_generation`
+    /// untouched. So a publication landing mid-test breaks `Arc::ptr_eq` on the
+    /// published state, and makes the CAS in `read_and_index_with_stable_read`
+    /// lose its race (4 losses → `ReindexResult::Skipped`), with no generation
+    /// counter moving to hint at why. Both failure modes are invisible to the
+    /// generation asserts sitting right next to them.
+    ///
+    /// Only reproducible under full-suite load: `#[tokio::test]` is a
+    /// current-thread runtime, so the git-temporal task is polled only while
+    /// the test awaits, and a saturated blocking pool stretches the git
+    /// subprocess into the assertion window.
+    ///
+    /// Waiting for the terminal git-temporal state is the same condition
+    /// `spawn_git_temporal_computation` itself uses to skip redundant work.
+    async fn settle_background_publications(server: &SymForgeServer) {
+        use crate::live_index::git_temporal::GitTemporalState;
+        for _ in 0..250 {
+            if matches!(
+                server.index.published_generation().code_signals.state,
+                GitTemporalState::Ready | GitTemporalState::Unavailable(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The terminal state is published by the call that finishes the work,
+        // but confirm the published Arc has actually stopped moving — that also
+        // covers any publisher other than git temporal.
+        for _ in 0..50 {
+            let before = Arc::as_ptr(&server.index.published_state());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if Arc::as_ptr(&server.index.published_state()) == before {
+                return;
+            }
+        }
+        panic!("background publications never quiesced");
+    }
+
     fn project_state(root: &std::path::Path) -> crate::domain::ProjectStateDir {
         crate::domain::ProjectStateDir::new(root.join(crate::paths::SYMFORGE_DIR_NAME))
     }
@@ -16057,6 +16105,10 @@ mod tests {
             crate::watcher_state::WatcherState::Active,
             "fixture watcher must be active before exercising failed handoff"
         );
+        // `Active` is not "settled": the reconcile that precedes it spawns a
+        // git-temporal task whose publications would otherwise land on top of
+        // the baseline captured below.
+        settle_background_publications(&server).await;
 
         let root_before = server.capture_repo_root();
         let generation_before = server.index.current_project_generation();
@@ -16165,6 +16217,9 @@ mod tests {
             index_result.contains("Indexed 1 files"),
             "index_folder should load the temp repo, got: {index_result}"
         );
+        // The reload above spawns git temporal; let it finish before the
+        // re-index below, whose publication CAS would otherwise lose to it.
+        settle_background_publications(&server).await;
 
         fs::write(&source_path, "pub fn new_name() {}\n").expect("write updated source");
         let outside = TempDir::new().expect("outside cwd");
@@ -16224,6 +16279,9 @@ mod tests {
             index_result.contains("Indexed 1 files"),
             "index_folder should load the temp repo, got: {index_result}"
         );
+        // Same race as the sibling test above: settle git temporal before the
+        // re-index this asserts on.
+        settle_background_publications(&server).await;
 
         fs::write(
             repo.path().join("src/lib.rs"),
