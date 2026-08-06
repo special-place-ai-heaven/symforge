@@ -1501,6 +1501,12 @@ pub enum SkipReason {
     UnsupportedPath,
     /// The file is a Git LFS pointer, so its real bytes are not present locally.
     LfsPointer,
+    /// The file could not be read to a stable result: an I/O failure, bytes that
+    /// changed underneath the read, or an aborted scan. Nothing was learned about
+    /// its language or contents, so this asserts only the read outcome. These
+    /// dispositions also used to surface as `UnsupportedLanguage`, which made an
+    /// I/O error look like a grammar SymForge does not support.
+    Unreadable,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -1517,6 +1523,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::UnsupportedTextEncoding => write!(f, "undecodable text encoding"),
             SkipReason::UnsupportedPath => write!(f, "unsupported path"),
             SkipReason::LfsPointer => write!(f, "git-lfs pointer"),
+            SkipReason::Unreadable => write!(f, "unreadable"),
             SkipReason::GeneratedOutput => write!(
                 f,
                 "untracked generated output (SYMFORGE_INDEX_GENERATED_OUTPUT=1 to index)"
@@ -2317,22 +2324,32 @@ mod tests {
         }
     }
 
-    /// The non-sensitive reasons are NOT content-derived, so naming them leaks
-    /// nothing — and each must be distinguishable from the others.
+    /// The non-sensitive reasons disclose no secret, so naming them is safe —
+    /// and each must be distinguishable from the others. (`LfsPointer` IS
+    /// decided from bytes, but it reveals only that the first <1KiB match the
+    /// PUBLIC LFS pointer grammar; the oid and size it carries never reach a
+    /// caller surface.)
     #[test]
     fn non_sensitive_skip_reasons_are_distinct_and_honest() {
         let encoding = SkipReason::UnsupportedTextEncoding.to_string();
         let language = SkipReason::UnsupportedLanguage.to_string();
         let path = SkipReason::UnsupportedPath.to_string();
         let lfs = SkipReason::LfsPointer.to_string();
+        let unreadable = SkipReason::Unreadable.to_string();
 
         // An undecodable ENCODING is not an unsupported LANGUAGE.
         assert_ne!(encoding, language);
         assert!(encoding.contains("encoding"), "got: {encoding}");
         assert!(path.contains("path"), "got: {path}");
         assert!(lfs.contains("lfs"), "got: {lfs}");
+        // A read that never produced stable bytes learned nothing about the
+        // language, so it must not claim one.
+        assert!(
+            !unreadable.contains("language"),
+            "an unreadable file must not be reported as a language problem, got: {unreadable}"
+        );
 
-        let all = [&encoding, &language, &path, &lfs];
+        let all = [&encoding, &language, &path, &lfs, &unreadable];
         for (i, left) in all.iter().enumerate() {
             for right in all.iter().skip(i + 1) {
                 assert_ne!(left, right, "skip reasons must not share wording");

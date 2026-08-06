@@ -3859,9 +3859,8 @@ mod tests {
             | SkipReason::UnsupportedTextEncoding
             | SkipReason::PolicyWithheld
             | SkipReason::LfsPointer
-            | SkipReason::UnsupportedPath => {
-                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
-            }
+            | SkipReason::UnsupportedPath
+            | SkipReason::Unreadable => crate::domain::MetadataOnlyReason::UnsupportedTextEncoding,
         };
         add_manifest_disposition(
             index,

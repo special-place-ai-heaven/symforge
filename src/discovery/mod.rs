@@ -1172,7 +1172,8 @@ fn scout_decision_for_discovered(
                 Some(SkipReason::UnsupportedTextEncoding)
                 | Some(SkipReason::PolicyWithheld)
                 | Some(SkipReason::LfsPointer)
-                | Some(SkipReason::UnsupportedPath) => MetadataOnlyReason::UnsupportedTextEncoding,
+                | Some(SkipReason::UnsupportedPath)
+                | Some(SkipReason::Unreadable) => MetadataOnlyReason::UnsupportedTextEncoding,
                 // `None` means the reason was NOT RECORDED. It is not evidence
                 // of anything, so it keeps the neutral text-encoding bucket
                 // rather than being promoted into a substantive claim.

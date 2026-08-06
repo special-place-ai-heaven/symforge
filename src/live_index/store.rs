@@ -3463,10 +3463,14 @@ pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<A
                 HardSkipReason::ArtifactType => SkipReason::DenylistedExtension,
             },
         ),
+        // An I/O failure, a file that changed mid-read, and an aborted scan are
+        // all "we never got stable bytes" — they say NOTHING about the language.
+        // Reporting them as `UnsupportedLanguage` was the same false diagnosis
+        // this projection used to make about security demotions.
         FileDisposition::Unreadable { .. }
         | FileDisposition::UnstableDuringRead
         | FileDisposition::AbortedCircuitBreaker => {
-            (AdmissionTier::MetadataOnly, SkipReason::UnsupportedLanguage)
+            (AdmissionTier::MetadataOnly, SkipReason::Unreadable)
         }
     };
     Some(AdmissionDecision::skip(tier, reason))
@@ -3507,13 +3511,15 @@ fn disposition_from_admission(decision: AdmissionDecision) -> crate::domain::Fil
                 Some(SkipReason::UnsupportedTextEncoding)
                 | Some(SkipReason::PolicyWithheld)
                 | Some(SkipReason::LfsPointer)
-                | Some(SkipReason::UnsupportedPath) => {
+                | Some(SkipReason::UnsupportedPath)
+                | Some(SkipReason::Unreadable) => {
                     debug_assert!(
                         !matches!(
                             decision.reason,
                             Some(SkipReason::PolicyWithheld)
                                 | Some(SkipReason::LfsPointer)
                                 | Some(SkipReason::UnsupportedPath)
+                                | Some(SkipReason::Unreadable)
                         ),
                         "display-only SkipReason {:?} round-tripped into a \
                          MetadataOnlyReason; it would resurface as a false \

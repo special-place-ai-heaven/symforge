@@ -13160,9 +13160,8 @@ mod tests {
             | SkipReason::UnsupportedTextEncoding
             | SkipReason::PolicyWithheld
             | SkipReason::LfsPointer
-            | SkipReason::UnsupportedPath => {
-                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
-            }
+            | SkipReason::UnsupportedPath
+            | SkipReason::Unreadable => crate::domain::MetadataOnlyReason::UnsupportedTextEncoding,
         };
         crate::domain::CatalogEntry {
             path: crate::domain::CatalogPath {
@@ -31095,11 +31094,12 @@ mod tests {
 
     #[tokio::test]
     async fn tier2_sweep_never_names_a_security_demoted_file() {
-        // GUARD, not proof of the fix: today this file is excluded only because
-        // `compatibility_admission_decision` mislabels every security demotion as
-        // `SkipReason::UnsupportedLanguage` (SF-DOG-004). Explicit positive
-        // eligibility off the typed disposition must keep it excluded once that
-        // label is corrected.
+        // GUARD, not proof of the fix (SF-DOG-004): exclusion must rest on
+        // explicit positive eligibility off the TYPED disposition, never on the
+        // `SkipReason` projection. It once rested on the projection by accident,
+        // back when that mislabelled every security demotion as
+        // `SkipReason::UnsupportedLanguage`; the label is now `PolicyWithheld`
+        // and this must still hold.
         let dir = tempfile::tempdir().unwrap();
         let canary = runtime_canary();
         std::fs::create_dir_all(dir.path().join("config")).unwrap();
