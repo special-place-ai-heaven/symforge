@@ -1258,10 +1258,10 @@ impl LiveIndex {
     /// Typed per-path admission disposition, read straight off the manifest.
     ///
     /// Deliberately NOT `capture_admission_tier_lookup_view`: that projects through
-    /// `compatibility_admission_decision`, which collapses seven `MetadataOnlyReason`
-    /// variants — including both security variants — into
-    /// `SkipReason::UnsupportedLanguage`. A security decision must never be taken on
-    /// that projection.
+    /// `compatibility_admission_decision`, which collapses both security variants
+    /// into the single reason-free `SkipReason::PolicyWithheld` and drops the
+    /// `rule_id` / `rule_ids` / `finding_count` a decision needs. A security
+    /// decision must never be taken on that projection.
     pub fn capture_file_disposition(
         &self,
         relative_path: &str,
@@ -3855,9 +3855,12 @@ mod tests {
             SkipReason::DenylistedExtension
             | SkipReason::Untracked
             | SkipReason::GeneratedOutput => crate::domain::MetadataOnlyReason::GeneratedOrVendor,
-            SkipReason::UnsupportedLanguage => {
-                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
-            }
+            SkipReason::UnsupportedLanguage
+            | SkipReason::UnsupportedTextEncoding
+            | SkipReason::PolicyWithheld
+            | SkipReason::LfsPointer
+            | SkipReason::UnsupportedPath
+            | SkipReason::Unreadable => crate::domain::MetadataOnlyReason::UnsupportedTextEncoding,
         };
         add_manifest_disposition(
             index,

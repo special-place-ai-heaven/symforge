@@ -2787,8 +2787,10 @@ fn find_references_completeness_label(
 /// Candidate eligibility is decided by the caller from the typed manifest
 /// disposition (`LiveIndex::oversized_metadata_only_files`), NOT from the lossy
 /// `SkipReason` projection this used to filter on: that projection collapses
-/// security demotions into `SkipReason::UnsupportedLanguage`, so excluding them
-/// was an accident of mislabelling rather than a decision. Only size-demoted
+/// security demotions into the reason-free `SkipReason::PolicyWithheld` (it
+/// collapsed them into `SkipReason::UnsupportedLanguage` before the admission
+/// honesty fix), so excluding them was an accident of mislabelling rather than
+/// a decision. Only size-demoted
 /// files are reference-relevant anyway — binary, lockfile, and artifact
 /// demotions cannot hold code references to the queried symbol.
 fn tier2_reference_disclosure(
@@ -13154,9 +13156,12 @@ mod tests {
             SkipReason::DenylistedExtension
             | SkipReason::Untracked
             | SkipReason::GeneratedOutput => crate::domain::MetadataOnlyReason::GeneratedOrVendor,
-            SkipReason::UnsupportedLanguage => {
-                crate::domain::MetadataOnlyReason::UnsupportedTextEncoding
-            }
+            SkipReason::UnsupportedLanguage
+            | SkipReason::UnsupportedTextEncoding
+            | SkipReason::PolicyWithheld
+            | SkipReason::LfsPointer
+            | SkipReason::UnsupportedPath
+            | SkipReason::Unreadable => crate::domain::MetadataOnlyReason::UnsupportedTextEncoding,
         };
         crate::domain::CatalogEntry {
             path: crate::domain::CatalogPath {
@@ -31089,11 +31094,12 @@ mod tests {
 
     #[tokio::test]
     async fn tier2_sweep_never_names_a_security_demoted_file() {
-        // GUARD, not proof of the fix: today this file is excluded only because
-        // `compatibility_admission_decision` mislabels every security demotion as
-        // `SkipReason::UnsupportedLanguage` (SF-DOG-004). Explicit positive
-        // eligibility off the typed disposition must keep it excluded once that
-        // label is corrected.
+        // GUARD, not proof of the fix (SF-DOG-004): exclusion must rest on
+        // explicit positive eligibility off the TYPED disposition, never on the
+        // `SkipReason` projection. It once rested on the projection by accident,
+        // back when that mislabelled every security demotion as
+        // `SkipReason::UnsupportedLanguage`; the label is now `PolicyWithheld`
+        // and this must still hold.
         let dir = tempfile::tempdir().unwrap();
         let canary = runtime_canary();
         std::fs::create_dir_all(dir.path().join("config")).unwrap();

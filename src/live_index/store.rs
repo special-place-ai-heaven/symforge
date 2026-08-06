@@ -3432,13 +3432,28 @@ pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<A
                         SkipReason::Untracked
                     }
                 }
+                // Sensitive path and sensitive content collapse together ON
+                // PURPOSE: which of the two applied is content-derived, and
+                // that is exactly the bit the read-path refusal also refuses to
+                // disclose. They no longer collapse into a LANGUAGE verdict —
+                // withholding the reason is defensible, asserting a false one
+                // is not, and a detector hit on valid TypeScript used to be
+                // reported as "unsupported language".
                 MetadataOnlyReason::SensitivePath { .. }
-                | MetadataOnlyReason::SensitiveContent { .. }
-                | MetadataOnlyReason::LfsPointer { .. }
-                | MetadataOnlyReason::PlatformPathCollision
+                | MetadataOnlyReason::SensitiveContent { .. } => SkipReason::PolicyWithheld,
+                // An LFS pointer IS decided from bytes, so naming it is not a
+                // "nothing was read" claim. What it discloses is only that the
+                // first <1KiB match the PUBLIC LFS pointer grammar — a format
+                // class, not file semantics — and the oid/size it carries stay
+                // off this surface.
+                MetadataOnlyReason::LfsPointer { .. } => SkipReason::LfsPointer,
+                // These three are decided from the PATH alone, before any byte
+                // is read, so naming them leaks nothing about contents and the
+                // old collapse only misinformed.
+                MetadataOnlyReason::PlatformPathCollision
                 | MetadataOnlyReason::UnsupportedPathEncoding
-                | MetadataOnlyReason::PathMetadataTooLarge
-                | MetadataOnlyReason::UnsupportedTextEncoding => SkipReason::UnsupportedLanguage,
+                | MetadataOnlyReason::PathMetadataTooLarge => SkipReason::UnsupportedPath,
+                MetadataOnlyReason::UnsupportedTextEncoding => SkipReason::UnsupportedTextEncoding,
             },
         ),
         FileDisposition::HardSkip { reason } => (
@@ -3448,10 +3463,14 @@ pub(super) fn compatibility_admission_decision(entry: &CatalogEntry) -> Option<A
                 HardSkipReason::ArtifactType => SkipReason::DenylistedExtension,
             },
         ),
+        // An I/O failure, a file that changed mid-read, and an aborted scan are
+        // all "we never got stable bytes" — they say NOTHING about the language.
+        // Reporting them as `UnsupportedLanguage` was the same false diagnosis
+        // this projection used to make about security demotions.
         FileDisposition::Unreadable { .. }
         | FileDisposition::UnstableDuringRead
         | FileDisposition::AbortedCircuitBreaker => {
-            (AdmissionTier::MetadataOnly, SkipReason::UnsupportedLanguage)
+            (AdmissionTier::MetadataOnly, SkipReason::Unreadable)
         }
     };
     Some(AdmissionDecision::skip(tier, reason))
@@ -3474,7 +3493,45 @@ fn disposition_from_admission(decision: AdmissionDecision) -> crate::domain::Fil
                 Some(SkipReason::DenylistedExtension)
                 | Some(SkipReason::GeneratedOutput)
                 | Some(SkipReason::Untracked) => MetadataOnlyReason::GeneratedOrVendor,
-                Some(SkipReason::UnsupportedLanguage) | Some(SkipReason::SizeCeiling) | None => {
+                // A >100MB ceiling skip is a SIZE fact and already has a
+                // correct home; it used to land in the text-encoding bucket and
+                // resurface as "unsupported language".
+                Some(SkipReason::SizeCeiling) => MetadataOnlyReason::OversizedData,
+                // Display-only reasons. These are minted by the
+                // disposition->reason mapping for REPORTING and are never
+                // produced by the admission pipeline, so they cannot arrive
+                // here; mapped defensively rather than panicking.
+                //
+                // The fallback is itself a false claim — routing `PolicyWithheld`
+                // here would re-label a security demotion "undecodable text
+                // encoding", the same class of lie this commit removes. It is
+                // reachable only if a future caller feeds a display reason back
+                // in, so assert in debug (tests catch it) and stay defensive in
+                // release rather than panicking a live index load.
+                Some(SkipReason::UnsupportedTextEncoding)
+                | Some(SkipReason::PolicyWithheld)
+                | Some(SkipReason::LfsPointer)
+                | Some(SkipReason::UnsupportedPath)
+                | Some(SkipReason::Unreadable) => {
+                    debug_assert!(
+                        !matches!(
+                            decision.reason,
+                            Some(SkipReason::PolicyWithheld)
+                                | Some(SkipReason::LfsPointer)
+                                | Some(SkipReason::UnsupportedPath)
+                                | Some(SkipReason::Unreadable)
+                        ),
+                        "display-only SkipReason {:?} round-tripped into a \
+                         MetadataOnlyReason; it would resurface as a false \
+                         encoding verdict",
+                        decision.reason
+                    );
+                    MetadataOnlyReason::UnsupportedTextEncoding
+                }
+                // `None` means the reason was NOT RECORDED. It is not evidence
+                // of anything, so it keeps the neutral text-encoding bucket
+                // rather than being promoted into a substantive claim.
+                Some(SkipReason::UnsupportedLanguage) | None => {
                     MetadataOnlyReason::UnsupportedTextEncoding
                 }
             },
@@ -7700,6 +7757,65 @@ mod tests {
                 .windows(canary.len())
                 .any(|window| window == canary.as_bytes())
         );
+    }
+
+    /// The Display-level tests in `domain::index` pin the WORDING of
+    /// `PolicyWithheld`; they cannot catch a regression that stops producing it.
+    /// This asserts the production projection itself, on entries minted by a
+    /// real admission run: both security variants must reach
+    /// `SkipReason::PolicyWithheld`, and neither may reach
+    /// `SkipReason::UnsupportedLanguage` — the false language verdict that made
+    /// a detector hit on valid source look like a broken grammar.
+    #[test]
+    fn security_demotions_project_to_policy_withheld_not_a_language_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let canary = runtime_canary();
+        let password_kw = ["pass", "word"].concat();
+        let token_kw = ["to", "ken"].concat();
+        write_file(tmp.path(), ".env", &format!("{password_kw}={canary}\n"));
+        // A .rs path CANNOT match a sensitive path rule, so this entry can only
+        // be a content-detector demotion — the exact case TestPilot hit on
+        // valid TypeScript.
+        write_file(
+            tmp.path(),
+            "src/config.rs",
+            &format!("let {token_kw} = \"{canary}\";\n"),
+        );
+
+        let shared = LiveIndex::load(tmp.path()).expect("sensitive fixture must load safely");
+        let index = shared.read();
+
+        for path in [".env", "src/config.rs"] {
+            let entry = index
+                .manifest_entries
+                .iter()
+                .find(|entry| entry.path.normalized_utf8.as_deref() == Some(path))
+                .unwrap_or_else(|| panic!("{path} must remain cataloged"));
+            assert!(
+                matches!(
+                    entry.disposition,
+                    FileDisposition::MetadataOnly {
+                        reason: MetadataOnlyReason::SensitivePath { .. }
+                            | MetadataOnlyReason::SensitiveContent { .. }
+                    }
+                ),
+                "{path} must be a security demotion, got {:?}",
+                entry.disposition
+            );
+
+            let decision = compatibility_admission_decision(entry)
+                .unwrap_or_else(|| panic!("{path} is Tier-2, so it must project a decision"));
+            assert_eq!(
+                decision.reason,
+                Some(SkipReason::PolicyWithheld),
+                "{path} must project to PolicyWithheld"
+            );
+            assert_ne!(
+                decision.reason,
+                Some(SkipReason::UnsupportedLanguage),
+                "{path} must never be reported as a language problem"
+            );
+        }
     }
 
     #[test]
