@@ -1436,7 +1436,21 @@ pub enum AdmissionTier {
 }
 
 /// Reason a file was placed in Tier 2 or Tier 3.
+///
+/// `#[non_exhaustive]`: this enum is reachable from the semver-public embed
+/// facade (`symforge::embed` re-exports the `domain` module wholesale), and it
+/// gains variants whenever admission learns to be more honest about WHY a file
+/// was demoted — five were added in one change alone. Without this, every such
+/// addition is a breaking change for any downstream crate that matches on it
+/// exhaustively. Adding it is a one-time break so that later additions are not.
+///
+/// Callers inside this crate are unaffected: `#[non_exhaustive]` constrains
+/// downstream crates only, so the exhaustive matches in `store.rs`,
+/// `discovery/mod.rs` and the test helpers still compile — and still fail the
+/// build when a new variant is added, which is exactly the guard that has
+/// caught missed mapping sites twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkipReason {
     SizeCeiling,
     DenylistedExtension,
