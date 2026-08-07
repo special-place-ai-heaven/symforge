@@ -140,6 +140,43 @@ Key source files:
 - `src/protocol/prompts.rs` — MCP prompt handlers
 - `src/protocol/result_status.rs` — Machine-readable outcome metadata
 
+## Reporting invariant (as_of 2026-08-07 — binding)
+
+**A component may not report success for an operation whose completion it did
+not observe.** Not "attempted", not "usually works", not "the code path that
+does it was called" — observed.
+
+This is not style. Six defects fixed on 2026-08-06 were one defect wearing
+different clothes, and every one of them shipped green:
+
+- `stop_incompatible_recorded_daemon_at` deleted a live daemon's port/pid
+  records on every branch — including the ones where the safety gate *refuses*
+  to terminate and where `terminate_process` fails. The survivor kept serving
+  its own index, undiscoverable and unstoppable.
+- Both re-parse loops did `let _ = admit_and_index_single_path(...)`, discarding
+  a result that can be `Skipped`/`ReadError`/`NotFound`, then asserted in a
+  comment that those files "were re-parsed above, so they are correctly not
+  mismatches".
+- `format_search_envelope` collapsed to the compact `Trust:` banner on a *string
+  comparison* against `"current index"` that every code-navigation caller passed
+  as a literal — asserting currency it never measured.
+- `index_folder(add:true)` advertised a `project_name` that no selector could
+  resolve.
+
+The recurring shape: **the thing that reports is not the thing that knows.** A
+caller that discards a return value, a formatter handed a literal instead of a
+measurement, a cleanup that runs on the refusal branches too — each produces a
+confident answer with nothing behind it. None of these are caught by tests that
+assert on the reported value, because the reported value is exactly what is
+wrong.
+
+When adding any status line, banner, envelope, or success return, answer in the
+PR: *what did this observe, and what does it emit when the observation fails?*
+If the answer is "it cannot fail", that is the claim under review.
+
+symforge's product is being trustworthy about what it knows. A wrong answer is
+recoverable; a confidently wrong answer is not.
+
 ## Tool Consolidation Pattern
 
 When merging tools A into B:
