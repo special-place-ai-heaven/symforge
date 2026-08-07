@@ -193,7 +193,29 @@ fn make_rust_file_with_refs(
     file
 }
 
-fn build_shared_index(files: Vec<IndexedFile>) -> SharedIndex {
+/// Build a Ready, source-BOUND `SharedIndex` at `root` — the shape a real
+/// serving index has.
+///
+/// Deliberately NOT `LiveIndex::empty()` + `add_file`: that construction leaves
+/// the index an unrooted bootstrap placeholder, which is the cold-start DEFECT
+/// shape, not a healthy index. Modelling every contract golden on it meant the
+/// goldens could not tell the two apart. `build_bootstrap_placeholder_index`
+/// below still builds that shape, for the one golden that is about it.
+fn build_shared_index(root: &Path, files: Vec<IndexedFile>) -> SharedIndex {
+    LiveIndex::from_indexed_files(
+        root,
+        files
+            .into_iter()
+            .map(|file| (file.relative_path.clone(), file))
+            .collect(),
+    )
+    .expect("tempdir root resolves")
+}
+
+/// The cold-start placeholder: an empty bootstrap index that admitted files
+/// before any load bound a root. Kept so one golden pins what the sidecar
+/// reports in exactly that state.
+fn build_bootstrap_placeholder_index(files: Vec<IndexedFile>) -> SharedIndex {
     let shared = LiveIndex::empty();
     {
         let mut guard = shared.write();
@@ -293,10 +315,13 @@ async fn test_health_contract_golden() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(vec![
-        make_rust_file_with_symbols("src/alpha.rs", vec![("alpha", SymbolKind::Function)]),
-        make_rust_file_with_symbols("src/beta.rs", vec![("beta", SymbolKind::Function)]),
-    ]);
+    let index = build_shared_index(
+        tmp.path(),
+        vec![
+            make_rust_file_with_symbols("src/alpha.rs", vec![("alpha", SymbolKind::Function)]),
+            make_rust_file_with_symbols("src/beta.rs", vec![("beta", SymbolKind::Function)]),
+        ],
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -316,6 +341,42 @@ async fn test_health_contract_golden() {
     restore_cwd(&original);
 }
 
+/// Second `/health` golden: the cold-start bootstrap placeholder that admitted
+/// files before any load bound a root.
+///
+/// This is the state the whole cold-start fix is about, and it must stay
+/// DISTINGUISHABLE from the healthy golden above. A regression that reports it
+/// `Ready` — the original defect — changes this golden, not the other one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_health_contract_golden_bootstrap_placeholder() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = CWD_LOCK.lock().await;
+    let original = stable_cwd();
+    std::env::set_current_dir(tmp.path()).unwrap();
+
+    let index = build_bootstrap_placeholder_index(vec![
+        make_rust_file_with_symbols("src/alpha.rs", vec![("alpha", SymbolKind::Function)]),
+        make_rust_file_with_symbols("src/beta.rs", vec![("beta", SymbolKind::Function)]),
+    ]);
+    let handle = spawn_sidecar(
+        Arc::clone(&index),
+        "127.0.0.1",
+        Some(tmp.path().to_path_buf()),
+        Some(control_state(tmp.path())),
+    )
+    .await
+    .expect("spawn_sidecar");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let body = raw_http_get(handle.port, "/health", "").expect("GET /health");
+    let normalized = normalize_health_json(&body);
+    assert_golden("health_bootstrap_placeholder.json", &normalized);
+
+    handle.shutdown_and_join().await;
+    restore_cwd(&original);
+}
+
 // ---------------------------------------------------------------------------
 // /stats — JSON contract (fresh-spawn zero state)
 // ---------------------------------------------------------------------------
@@ -328,7 +389,7 @@ async fn test_stats_contract_golden() {
     std::env::set_current_dir(tmp.path()).unwrap();
 
     // Empty index is fine — /stats is independent of index contents.
-    let index = build_shared_index(vec![]);
+    let index = build_shared_index(tmp.path(), vec![]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -360,13 +421,16 @@ async fn test_outline_contract_golden() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(vec![make_rust_file_with_symbols(
-        "src/lib.rs",
-        vec![
-            ("hello", SymbolKind::Function),
-            ("Config", SymbolKind::Struct),
-        ],
-    )]);
+    let index = build_shared_index(
+        tmp.path(),
+        vec![make_rust_file_with_symbols(
+            "src/lib.rs",
+            vec![
+                ("hello", SymbolKind::Function),
+                ("Config", SymbolKind::Struct),
+            ],
+        )],
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -410,10 +474,13 @@ async fn test_impact_edit_contract_golden() {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::write(src_dir.join("edit.rs"), medium_fixture_content()).unwrap();
 
-    let index = build_shared_index(vec![make_rust_file_with_symbols(
-        "src/edit.rs",
-        vec![("edited", SymbolKind::Function)],
-    )]);
+    let index = build_shared_index(
+        tmp.path(),
+        vec![make_rust_file_with_symbols(
+            "src/edit.rs",
+            vec![("edited", SymbolKind::Function)],
+        )],
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -472,7 +539,7 @@ async fn test_impact_new_file_contract_golden() {
     )
     .unwrap();
 
-    let index = build_shared_index(vec![]);
+    let index = build_shared_index(tmp.path(), vec![]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -510,7 +577,7 @@ async fn test_symbol_context_contract_golden() {
         vec![("caller", SymbolKind::Function)],
         vec![("do_thing", ReferenceKind::Call, 1)],
     );
-    let index = build_shared_index(vec![definer, caller]);
+    let index = build_shared_index(tmp.path(), vec![definer, caller]);
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -553,11 +620,14 @@ async fn test_repo_map_contract_golden() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(vec![
-        make_rust_file_with_symbols("src/alpha.rs", vec![("alpha", SymbolKind::Function)]),
-        make_rust_file_with_symbols("src/beta.rs", vec![("beta", SymbolKind::Function)]),
-        make_rust_file_with_symbols("src/gamma.rs", vec![("gamma", SymbolKind::Function)]),
-    ]);
+    let index = build_shared_index(
+        tmp.path(),
+        vec![
+            make_rust_file_with_symbols("src/alpha.rs", vec![("alpha", SymbolKind::Function)]),
+            make_rust_file_with_symbols("src/beta.rs", vec![("beta", SymbolKind::Function)]),
+            make_rust_file_with_symbols("src/gamma.rs", vec![("gamma", SymbolKind::Function)]),
+        ],
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",
@@ -595,10 +665,13 @@ async fn test_prompt_context_contract_golden() {
     let original = stable_cwd();
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let index = build_shared_index(vec![make_rust_file_with_symbols(
-        "src/lib.rs",
-        vec![("hello", SymbolKind::Function)],
-    )]);
+    let index = build_shared_index(
+        tmp.path(),
+        vec![make_rust_file_with_symbols(
+            "src/lib.rs",
+            vec![("hello", SymbolKind::Function)],
+        )],
+    );
     let handle = spawn_sidecar(
         Arc::clone(&index),
         "127.0.0.1",

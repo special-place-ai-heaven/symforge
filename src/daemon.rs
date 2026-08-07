@@ -4005,7 +4005,7 @@ async fn call_tool_handler(
             canonical_root: Some(normalized_path_string(&runtime.canonical_root)),
             generation: runtime.index.current_project_generation(),
             index_state: published.status_label().to_string(),
-            load_source: format!("{:?}", runtime.index.read().load_source()),
+            load_source: runtime.index.read().load_source().label().to_string(),
             index_files: published.file_count,
             index_symbols: published.symbol_count,
         })

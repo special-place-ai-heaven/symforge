@@ -109,6 +109,18 @@ pub use crate::parsing::process_file;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// In-memory construction (F7): `LiveIndex::from_indexed_files(root, files)` is
+// the route for an embedder whose `IndexedFile`s came from `process_file` +
+// `IndexedFile::from_parse_result` rather than from this process's filesystem
+// walk. It yields a Ready, source-BOUND index.
+//
+// `LiveIndex::empty()` + `add_file` is NOT that route and never was: the
+// resulting index has no `indexed_root`, so it never reports Ready and it
+// publishes knowledge unbound (`source=unknown`). Use `empty()` only as a
+// placeholder you will later `reload(root)`.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Snapshot restore (task #22 / AAP ask 2a): the warm-start fast path.
 //
 // `load_snapshot_for_root` (or the explicit-placement `load_snapshot`)
@@ -302,6 +314,10 @@ mod contract {
 
         // Associated functions (no `&self`).
         let _load: fn(&Path) -> anyhow::Result<SharedIndex> = LiveIndex::load;
+        let _from_indexed_files: fn(
+            &Path,
+            Vec<(String, IndexedFile)>,
+        ) -> anyhow::Result<SharedIndex> = LiveIndex::from_indexed_files;
         let _from_parse_result: fn(FileProcessingResult, Vec<u8>) -> IndexedFile =
             IndexedFile::from_parse_result;
         let _from_extension: fn(&str) -> Option<LanguageId> = LanguageId::from_extension;
@@ -323,6 +339,7 @@ mod contract {
             _search_text,
             _process_file,
             _load,
+            _from_indexed_files,
             _from_parse_result,
             _from_extension,
             _for_code_path,

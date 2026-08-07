@@ -124,14 +124,19 @@ function writeSnapshot(name, text) {
 async function startSession(READINESS_PROBE) {
   const proc = spawn(BIN, [], {
     cwd: FIXTURE,
-    stdio: ["pipe", "pipe", "ignore"],
+    // stderr INHERITED, not dropped: the daemon's own warnings are the evidence that
+    // explains a readiness/cold-start failure. Safe — tracing writes to stderr
+    // (src/observability.rs), and the JSON-RPC stream this harness parses is stdout-only.
+    stdio: ["pipe", "pipe", "inherit"],
     // symforge_edit REQUIRES the compact surface; read tools reached via probe relay.
     // Pin the root to the fixture (else find_project_root walks up to the parent
     // symforge repo and indexes 620 files, making every oracle mismatch). NO_DAEMON=1
     // keeps the index in-process so the pin holds.
     env: {
       ...process.env,
-      RUST_LOG: "off",
+      // "warn", not "off": a silenced index-publish warning is precisely what made the
+      // source-binding bug cost two days. Measured cost on a healthy run: one line.
+      RUST_LOG: "warn",
       SYMFORGE_SURFACE: "compact",
       SYMFORGE_NO_DAEMON: "1",
       SYMFORGE_WORKSPACE_ROOT: FIXTURE,
@@ -189,18 +194,41 @@ async function startSession(READINESS_PROBE) {
   proc.stdin.write(
     JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n"
   );
-  // Compact auto-indexes SYMFORGE_WORKSPACE_ROOT on startup (async). Poll until the
-  // index reports a NON-ZERO file count AND a known symbol is actually queryable —
-  // `index_files: 0` matches the loose old check but the fixture isn't searchable yet,
-  // which is the cold-start flake. Requiring a real hit makes readiness deterministic.
-  // ponytail: fixed 30-poll x 250ms ceiling (~7.5s); raise if a bigger fixture needs it.
+  // Compact auto-indexes SYMFORGE_WORKSPACE_ROOT on startup (async), and the
+  // PLACEHOLDER index it serves meanwhile can ALREADY report files: a targeted read
+  // admits files into the EmptyBootstrap index before the initial load has bound a
+  // source root. So `index_files > 0` opens the gate on an index with no source
+  // identity — measured on this fixture, 4 of 12 cold starts reported
+  // index_files>0 / index_state=Ready / load_source=EmptyBootstrap / generation=0 at
+  // poll 0, with the search probe hitting (the targeted read admitted the very file
+  // it needed). Gate on the per-call trust evidence in `_meta` instead: the real load
+  // must have PUBLISHED (load_source != EmptyBootstrap) and the published state must
+  // be Ready — then confirm a known symbol actually answers.
+  // Gate on `_meta`, not the status body's `index_ready:`. Since the cold-start fix
+  // `is_ready()` delegates to `index_state()`, so it is no longer DISHONEST here — but
+  // it is still the weaker signal: it is a rendered string, it does not carry
+  // `load_source`/`index_files`, and it is not what the daemon proxy forwards. The
+  // `_meta` evidence carries all three from whichever process actually served.
+  // ponytail: fixed 80-poll x 250ms ceiling (~20s of sleep); raise if a bigger fixture needs it.
+  const EVIDENCE_KEY = "symforge/project_evidence";
+  // Must match `IndexLoadSource::label()` (src/live_index/store.rs) exactly. That
+  // method is the ONE spelling shared by this gate, the `health` runtime line, and
+  // the `_meta` evidence. It used to be `format!("{:?}", ..)` here and snake_case in
+  // `health`, i.e. two spellings of one value compared against each other.
+  const EMPTY_BOOTSTRAP = "empty_bootstrap";
   let ready = false;
-  for (let i = 0; i < 30 && !ready; i++) {
-    const status = (await callTool("status", {})).text;
-    const files = (status.match(/index_files"?\s*:?\s*(\d+)/) || [])[1];
-    if (files && Number(files) > 0) {
+  let evidence = null;
+  for (let i = 0; i < 80 && !ready; i++) {
+    const status = await callTool("status", {});
+    evidence = (status.result && status.result._meta && status.result._meta[EVIDENCE_KEY]) || null;
+    const sourceBound =
+      !!evidence &&
+      evidence.index_state === "Ready" &&
+      evidence.load_source !== EMPTY_BOOTSTRAP &&
+      Number(evidence.index_files) > 0;
+    if (sourceBound) {
       if (!READINESS_PROBE) {
-        ready = true; // no known symbol to probe; non-zero count is the best signal
+        ready = true; // no known symbol to probe; a source-bound Ready generation is the signal
       } else {
         // Confirm the index actually answers before we trust it. Empty/error → wait.
         const probe = await callTool("search_symbols", { query: READINESS_PROBE });
@@ -209,7 +237,25 @@ async function startSession(READINESS_PROBE) {
     }
     if (!ready) await new Promise((r) => setTimeout(r, 250));
   }
-  if (!ready) throw new Error("index never became queryable (cold-start timeout)");
+  if (!ready) {
+    // LOUD and specific. Never fall through to a snapshot comparison against a
+    // half-loaded index: that renders as a content regression and sends the next
+    // session hunting the wrong bug. Exit 2 = the harness could not run (same code as
+    // a missing binary); exit 1 stays reserved for a REAL regression.
+    console.error(
+      "\n  HARNESS ABORT — the index never reached a source-bound Ready generation " +
+        "(80 polls x 250ms, ~20s of sleep).\n" +
+        `  last ${EVIDENCE_KEY}: ${JSON.stringify(evidence)}\n` +
+        `  Wanted index_state="Ready" with load_source!="${EMPTY_BOOTSTRAP}" and index_files>0.\n` +
+        `  load_source="${EMPTY_BOOTSTRAP}" => the real load never published (placeholder index).\n` +
+        '  {"bound":false} => no workspace bound; check SYMFORGE_WORKSPACE_ROOT / the fixture path.\n' +
+        "  null/absent evidence => the _meta key was NOT written at all. The server always writes\n" +
+        "    it (unbound emits {\"bound\":false}, never omission), so this means the _meta contract\n" +
+        "    changed; fix the gate, not the snapshots.\n"
+    );
+    proc.kill();
+    process.exit(2);
+  }
   return { callTool, close: () => proc.kill() };
 }
 
@@ -271,13 +317,27 @@ async function runCase(session, c) {
   return { verdict: "FAIL", reason: `unknown judge '${c.judge}'`, text };
 }
 
+// First N differing lines, not just one: a formatter change shifts a whole block and
+// the single first line rarely says which. The trailing count carries the real signal:
+// "5 of 137 differing" reads wholesale rewrite, a bare 1-line diff reads one value moved.
+// ponytail: N=5 is the knee — raise it only if a real failure needed more.
+const DIFF_LINES = 5;
 function firstDiff(a, b) {
   const al = (a || "").split("\n");
   const bl = (b || "").split("\n");
+  const shown = [];
+  let differing = 0;
   for (let i = 0; i < Math.max(al.length, bl.length); i++) {
-    if (al[i] !== bl[i]) return `  L${i + 1}\n   expected: ${JSON.stringify(bl[i])}\n   actual:   ${JSON.stringify(al[i])}`;
+    if (al[i] === bl[i]) continue;
+    differing++;
+    if (shown.length < DIFF_LINES) {
+      shown.push(`  L${i + 1}\n   expected: ${JSON.stringify(bl[i])}\n   actual:   ${JSON.stringify(al[i])}`);
+    }
   }
-  return "";
+  if (!differing) return "";
+  const more =
+    differing > shown.length ? `\n  ... ${shown.length} of ${differing} differing line(s) shown` : "";
+  return shown.join("\n") + more;
 }
 
 (async () => {

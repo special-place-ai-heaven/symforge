@@ -9,7 +9,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use rayon::prelude::*;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::knowledge_authority::{
     AuthorityLimits, AuthorityTemporalIndex, KnowledgeAuthorityView, build_knowledge_authority,
@@ -755,6 +755,22 @@ pub enum IndexLoadSource {
     SnapshotRestore,
 }
 
+impl IndexLoadSource {
+    /// Stable wire spelling, shared by the `health` runtime line, the
+    /// `symforge/project_evidence` `_meta` block, and `scripts/verify-tools.cjs`.
+    ///
+    /// Do NOT reintroduce `format!("{:?}", ..)` at any of those sites: the Debug
+    /// spelling (`EmptyBootstrap`) and this one (`empty_bootstrap`) then drift
+    /// apart across surfaces that are compared against each other.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EmptyBootstrap => "empty_bootstrap",
+            Self::FreshLoad => "fresh_load",
+            Self::SnapshotRestore => "snapshot_restore",
+        }
+    }
+}
+
 const SNAPSHOT_VERIFY_MISMATCH_PATH_LIMIT: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1007,8 +1023,53 @@ fn capture_published_manifest(
     live: &LiveIndex,
     scout_plan: Option<&discovery::ScoutPlan>,
 ) -> Option<Arc<RepositoryManifest>> {
-    let root = live.indexed_root.as_deref()?;
-    let canonical_root = dunce::canonicalize(root).ok()?;
+    let Some(root) = live.indexed_root.as_deref() else {
+        // An empty bootstrap index legitimately has no root yet. A POPULATED one
+        // publishing without a root is the unbound-knowledge defect: the manifest,
+        // source identity, source version and knowledge bridge are all silently
+        // dropped downstream, and the receipt prints `source=unknown`.
+        if !live.is_empty {
+            if live.load_source() == IndexLoadSource::EmptyBootstrap {
+                // A bootstrap placeholder admitting a file before a root is bound
+                // is already modelled by `index_state()` (health_view.rs), which
+                // reports Loading or Empty rather than Ready, so no answer is
+                // served off this generation. It fires on every publication in
+                // that window — measured at ~10 per healthy cold start — so
+                // warning here would train the reader to ignore the level that
+                // carries the real defect below.
+                //
+                // Deliberately NOT called "transient": `EmptyBootstrap` alone
+                // cannot tell a load that is coming from one that already failed
+                // (`main`'s cold-start reload logs that failure on its error
+                // branch; this site cannot see it).
+                // Claiming transience here would assert something this function
+                // never observed.
+                debug!(
+                    files = live.files.len(),
+                    local_empty_reason = live.local_empty_reason().is_some(),
+                    "bootstrap placeholder published with no indexed_root; guarded as not-Ready"
+                );
+            } else {
+                warn!(
+                    files = live.files.len(),
+                    load_source = live.load_source().label(),
+                    "publishing a non-empty index with no indexed_root; source identity unbound"
+                );
+            }
+        }
+        return None;
+    };
+    let canonical_root = match dunce::canonicalize(root) {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => {
+            warn!(
+                root = %root.display(),
+                %error,
+                "failed to canonicalize the indexed root; publishing without source identity"
+            );
+            return None;
+        }
+    };
     let project_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
     let captured = match super::persist::capture_repository_source(&canonical_root, &project_id) {
         Ok(captured) => captured,
@@ -4314,10 +4375,47 @@ impl LiveIndex {
         index
     }
 
+    /// Build a source-BOUND `SharedIndex` from already-parsed files held in
+    /// memory — the embedder route for `process_file` +
+    /// `IndexedFile::from_parse_result` output that never touched this process's
+    /// filesystem walk.
+    ///
+    /// Reaches `Ready` when `files` is non-empty. An empty `files` yields
+    /// `Empty`, which is correct and not a failure: `is_empty` is checked before
+    /// the bound-root logic in `index_state()`. Say "bound", not "Ready" — the
+    /// state depends on the argument.
+    ///
+    /// `root` is mandatory and must resolve. `LiveIndex::empty()` + `add_file`
+    /// cannot serve this purpose: it leaves `load_source == EmptyBootstrap` and
+    /// `indexed_root == None`, so `index_state()` never reaches Ready and
+    /// `capture_published_manifest` drops source identity. Canonicalizing here
+    /// fails CLOSED rather than publishing a `Ready` index whose knowledge would
+    /// publish unbound.
+    pub fn from_indexed_files(
+        root: &Path,
+        files: Vec<(String, IndexedFile)>,
+    ) -> anyhow::Result<SharedIndex> {
+        let canonical = dunce::canonicalize(root).map_err(|error| {
+            anyhow::anyhow!("index root {} does not resolve: {error}", root.display())
+        })?;
+        let mut index = Self::from_source_files(
+            files
+                .into_iter()
+                .map(|(path, file)| (path, Arc::new(file)))
+                .collect(),
+        );
+        index.indexed_root = Some(canonical);
+        Ok(SharedIndexHandle::shared(index))
+    }
+
     /// Create an empty `SharedIndex` with no files loaded.
     ///
     /// Used when `SYMFORGE_AUTO_INDEX=false`. The caller must call `reload()` to populate it.
     /// Returns `IndexState::Empty` and `is_ready() == false` until reloaded.
+    ///
+    /// NOT a construction route for an embedder holding parsed files: admitting
+    /// files into this placeholder leaves it `EmptyBootstrap` and rootless
+    /// forever. Use [`Self::from_indexed_files`] or `reload(root)` for that.
     pub fn empty() -> SharedIndex {
         SharedIndexHandle::shared(Self::empty_live_index())
     }
@@ -5862,7 +5960,9 @@ mod tests {
         );
         let after_add = shared.published_state();
         assert_eq!(after_add.generation, 1);
-        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        // Still an EmptyBootstrap index with no bound root: mutating it does not
+        // make it Ready, it makes it a placeholder that is still loading.
+        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
         assert_eq!(after_add.degraded_summary, None);
         assert_eq!(after_add.file_count, 1);
         assert_eq!(after_add.parsed_count, 1);
@@ -5873,7 +5973,9 @@ mod tests {
         shared.remove_file("src/new.rs");
         let after_remove = shared.published_state();
         assert_eq!(after_remove.generation, 2);
-        assert_eq!(after_remove.status, PublishedIndexStatus::Ready);
+        // `remove_file` never restores `is_empty`, so the index stays a
+        // non-empty-flagged, still-unbound bootstrap.
+        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
         assert_eq!(after_remove.degraded_summary, None);
         assert_eq!(after_remove.file_count, 0);
         assert_eq!(after_remove.symbol_count, 0);
@@ -6037,7 +6139,9 @@ mod tests {
 
         let after_add = shared.published_state();
         assert_eq!(after_add.generation, 1);
-        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        // Write-guard drop publishes, but an unbound EmptyBootstrap index that
+        // gained a file is Loading, not Ready (see index_state's guard).
+        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
         assert_eq!(after_add.degraded_summary, None);
         assert_eq!(after_add.file_count, 1);
 
@@ -6048,7 +6152,7 @@ mod tests {
 
         let after_remove = shared.published_state();
         assert_eq!(after_remove.generation, 2);
-        assert_eq!(after_remove.status, PublishedIndexStatus::Ready);
+        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
         assert_eq!(after_remove.degraded_summary, None);
         assert_eq!(after_remove.file_count, 0);
     }
@@ -6261,6 +6365,106 @@ mod tests {
         let shared = LiveIndex::empty();
         let index = shared.read();
         assert!(!index.is_ready(), "empty index should not be ready");
+    }
+
+    /// Regression: a file admitted into the empty bootstrap placeholder before the
+    /// initial load bound a root must NOT publish as Ready. Such an index has no
+    /// `indexed_root`, so `capture_published_manifest` returns None and knowledge
+    /// publishes unbound with `source=unknown`, while the tool guards wave the
+    /// request through.
+    #[test]
+    fn bootstrap_placeholder_that_admitted_a_file_is_loading_not_ready() {
+        let shared = LiveIndex::empty();
+        shared.update_file(
+            "src/admitted_before_load.rs".to_string(),
+            make_indexed_file_for_mutation("src/admitted_before_load.rs"),
+        );
+        assert_eq!(shared.read().index_state(), IndexState::Loading);
+    }
+
+    /// F7: the embed facade's in-memory construction path must yield an index
+    /// that is BOTH Ready and source-bound. Pinning both matters — a Ready but
+    /// rootless index is the unbound-knowledge defect wearing a green label, so
+    /// a fix that only relabels the placeholder must fail this test.
+    #[test]
+    fn from_indexed_files_is_ready_and_source_bound() {
+        let tmp = TempDir::new().unwrap();
+        let shared = LiveIndex::from_indexed_files(
+            tmp.path(),
+            vec![(
+                "src/lib.rs".to_string(),
+                make_indexed_file_for_mutation("src/lib.rs"),
+            )],
+        )
+        .expect("existing root");
+
+        assert_eq!(shared.read().index_state(), IndexState::Ready);
+        assert_eq!(shared.read().load_source(), IndexLoadSource::FreshLoad);
+        assert!(
+            shared.published_state().indexed_root.is_some(),
+            "an in-memory index built at a root records that root"
+        );
+        assert!(
+            shared.published_generation().source.is_some(),
+            "a rooted in-memory index publishes a bound source identity"
+        );
+
+        // The old construction is still not Ready and still unbound: this is a
+        // new route, not a weakening of the placeholder guard above.
+        let placeholder = LiveIndex::empty();
+        placeholder.update_file(
+            "src/lib.rs".to_string(),
+            make_indexed_file_for_mutation("src/lib.rs"),
+        );
+        assert_eq!(placeholder.read().index_state(), IndexState::Loading);
+        assert!(placeholder.published_generation().source.is_none());
+
+        // A root that does not resolve is refused, not published as Ready.
+        assert!(LiveIndex::from_indexed_files(&tmp.path().join("nope"), Vec::new()).is_err());
+    }
+
+    /// Counterpart to the test above: the no-root lane in `main` — the `else`
+    /// arm that calls `set_local_empty_reason` — spawns neither watcher nor
+    /// reload, so its placeholder can never leave
+    /// `EmptyBootstrap`. The sidecar can still populate it — `/impact` resolves
+    /// its root from the process CWD when the sidecar has none — and reporting
+    /// Loading there would pin every tool at "try again shortly" FOREVER and
+    /// hide `format::empty_index_recovery_hint`, the only message naming the
+    /// real recovery. `local_empty_reason` is the discriminator.
+    #[test]
+    fn unbound_no_root_placeholder_that_admitted_a_file_stays_empty_not_loading() {
+        let shared = LiveIndex::empty();
+        shared.set_local_empty_reason(Some("workspace is not bound".to_string()));
+        shared.update_file(
+            "src/admitted_via_sidecar.rs".to_string(),
+            make_indexed_file_for_mutation("src/admitted_via_sidecar.rs"),
+        );
+        assert_eq!(shared.read().index_state(), IndexState::Empty);
+    }
+
+    /// Q4: the assertions this branch flipped were the crate's only
+    /// mutation->status coverage, and flipping them vacated the contract they
+    /// also carried — that a mutation on a REAL rooted index leaves Ready alone.
+    /// Pinned explicitly so a future widening of the `EmptyBootstrap` guard
+    /// cannot pass by pinning everything to Loading.
+    #[test]
+    fn mutation_on_a_rooted_loaded_index_stays_ready() {
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "a.rs", "fn alpha() {}");
+
+        let shared = LiveIndex::empty();
+        {
+            let mut index = shared.write();
+            index.reload(tmp.path()).expect("reload should succeed");
+        }
+        assert_eq!(shared.published_state().status, PublishedIndexStatus::Ready);
+
+        shared.update_file(
+            "src/added_after_load.rs".to_string(),
+            make_indexed_file_for_mutation("src/added_after_load.rs"),
+        );
+        assert_eq!(shared.published_state().status, PublishedIndexStatus::Ready);
+        assert_eq!(shared.read().index_state(), IndexState::Ready);
     }
 
     #[test]
