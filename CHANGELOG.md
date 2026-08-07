@@ -26,6 +26,13 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.0.1](https://github.com/special-place-ai-heaven/symforge/compare/v10.0.0...v10.0.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* **live-index:** refuse Ready on a bootstrap placeholder with no bound root ([#541](https://github.com/special-place-ai-heaven/symforge/issues/541)) ([0949046](https://github.com/special-place-ai-heaven/symforge/commit/0949046f0d3d96d680fca9916f067540e9df7fb9))
+
 ## [10.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v9.0.0...v10.0.0) (2026-08-07)
 
 
