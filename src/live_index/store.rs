@@ -1007,8 +1007,30 @@ fn capture_published_manifest(
     live: &LiveIndex,
     scout_plan: Option<&discovery::ScoutPlan>,
 ) -> Option<Arc<RepositoryManifest>> {
-    let root = live.indexed_root.as_deref()?;
-    let canonical_root = dunce::canonicalize(root).ok()?;
+    let Some(root) = live.indexed_root.as_deref() else {
+        // An empty bootstrap index legitimately has no root yet. A POPULATED one
+        // publishing without a root is the unbound-knowledge defect: the manifest,
+        // source identity, source version and knowledge bridge are all silently
+        // dropped downstream, and the receipt prints `source=unknown`.
+        if !live.is_empty {
+            warn!(
+                files = live.files.len(),
+                "publishing a non-empty index with no indexed_root; source identity unbound"
+            );
+        }
+        return None;
+    };
+    let canonical_root = match dunce::canonicalize(root) {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => {
+            warn!(
+                root = %root.display(),
+                %error,
+                "failed to canonicalize the indexed root; publishing without source identity"
+            );
+            return None;
+        }
+    };
     let project_id = crate::discovery::project_id_for_canonical_root(&canonical_root);
     let captured = match super::persist::capture_repository_source(&canonical_root, &project_id) {
         Ok(captured) => captured,
@@ -5862,7 +5884,9 @@ mod tests {
         );
         let after_add = shared.published_state();
         assert_eq!(after_add.generation, 1);
-        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        // Still an EmptyBootstrap index with no bound root: mutating it does not
+        // make it Ready, it makes it a placeholder that is still loading.
+        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
         assert_eq!(after_add.degraded_summary, None);
         assert_eq!(after_add.file_count, 1);
         assert_eq!(after_add.parsed_count, 1);
@@ -5873,7 +5897,9 @@ mod tests {
         shared.remove_file("src/new.rs");
         let after_remove = shared.published_state();
         assert_eq!(after_remove.generation, 2);
-        assert_eq!(after_remove.status, PublishedIndexStatus::Ready);
+        // `remove_file` never restores `is_empty`, so the index stays a
+        // non-empty-flagged, still-unbound bootstrap.
+        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
         assert_eq!(after_remove.degraded_summary, None);
         assert_eq!(after_remove.file_count, 0);
         assert_eq!(after_remove.symbol_count, 0);
@@ -6037,7 +6063,9 @@ mod tests {
 
         let after_add = shared.published_state();
         assert_eq!(after_add.generation, 1);
-        assert_eq!(after_add.status, PublishedIndexStatus::Ready);
+        // Write-guard drop publishes, but an unbound EmptyBootstrap index that
+        // gained a file is Loading, not Ready (see index_state's guard).
+        assert_eq!(after_add.status, PublishedIndexStatus::Loading);
         assert_eq!(after_add.degraded_summary, None);
         assert_eq!(after_add.file_count, 1);
 
@@ -6048,7 +6076,7 @@ mod tests {
 
         let after_remove = shared.published_state();
         assert_eq!(after_remove.generation, 2);
-        assert_eq!(after_remove.status, PublishedIndexStatus::Ready);
+        assert_eq!(after_remove.status, PublishedIndexStatus::Loading);
         assert_eq!(after_remove.degraded_summary, None);
         assert_eq!(after_remove.file_count, 0);
     }
@@ -6261,6 +6289,21 @@ mod tests {
         let shared = LiveIndex::empty();
         let index = shared.read();
         assert!(!index.is_ready(), "empty index should not be ready");
+    }
+
+    /// Regression: a file admitted into the empty bootstrap placeholder before the
+    /// initial load bound a root must NOT publish as Ready. Such an index has no
+    /// `indexed_root`, so `capture_published_manifest` returns None and knowledge
+    /// publishes unbound with `source=unknown`, while the tool guards wave the
+    /// request through.
+    #[test]
+    fn bootstrap_placeholder_that_admitted_a_file_is_loading_not_ready() {
+        let shared = LiveIndex::empty();
+        shared.update_file(
+            "src/admitted_before_load.rs".to_string(),
+            make_indexed_file_for_mutation("src/admitted_before_load.rs"),
+        );
+        assert_eq!(shared.read().index_state(), IndexState::Loading);
     }
 
     #[test]

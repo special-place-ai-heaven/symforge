@@ -6,7 +6,9 @@ use crate::watcher_state::{WatcherInfo, WatcherState};
 
 use super::query::normalize_path_query;
 use super::search::{NoiseClass, NoisePolicy};
-use super::store::{IndexState, IndexedFile, LiveIndex, ParseStatus, SnapshotVerifyState};
+use super::store::{
+    IndexLoadSource, IndexState, IndexedFile, LiveIndex, ParseStatus, SnapshotVerifyState,
+};
 pub struct HealthStats {
     pub file_count: usize,
     pub symbol_count: usize,
@@ -319,23 +321,31 @@ impl LiveIndex {
     }
 
     /// `true` when the index has been loaded and the circuit breaker has NOT tripped.
+    ///
+    /// Delegates to [`Self::index_state`] so the two never disagree — an index the
+    /// tool guards refuse must not report itself ready in `status`.
     pub fn is_ready(&self) -> bool {
-        if self.is_empty {
-            return false;
-        }
-        if matches!(
-            self.snapshot_verify_state,
-            SnapshotVerifyState::Pending | SnapshotVerifyState::Running
-        ) {
-            return false;
-        }
-        !self.cb_state.is_tripped()
+        matches!(self.index_state(), IndexState::Ready)
     }
 
     /// Returns the current index state.
     pub fn index_state(&self) -> IndexState {
         if self.is_empty {
             return IndexState::Empty;
+        }
+        // A bootstrap placeholder that acquired files — targeted-retrieval
+        // freshening admits one before the detached initial load binds a root —
+        // has no `indexed_root`, so `capture_published_manifest` returns None,
+        // publication captures no source identity, and knowledge publishes
+        // unbound (`source=unknown`). It is not Ready; it is still loading.
+        //
+        // Gate on `load_source`, NOT on `indexed_root.is_none()`: the P1
+        // local-ref lane (`LiveIndex::from_source_files`, store.rs:4290) is
+        // legitimately rootless and publishes its own source identity
+        // unconditionally (store.rs:1568), so a root-based guard would pin that
+        // lane at Loading forever.
+        if self.load_source == IndexLoadSource::EmptyBootstrap {
+            return IndexState::Loading;
         }
         if matches!(
             self.snapshot_verify_state,
