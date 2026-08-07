@@ -324,7 +324,7 @@ Full list with defaults and bounds: [Runtime Model](https://github.com/special-p
 > [!WARNING]
 > Daemon and `serve` HTTP are local coordination surfaces, not remote production APIs. The default bind is loopback-only; a non-loopback `SYMFORGE_DAEMON_BIND` is rejected unless explicitly allowed, and that opt-in warns. `/health` stays unauthenticated so local readiness checks can discover the daemon, and reports only *whether* auth is required — never the token.
 
-**When a snapshot goes wrong:** `checkpoint_now(verify_after_write=true)` forces a byte-exact write and verification; `health` reports the load source, verification state, and mismatch paths; corrupt or version-incompatible snapshots are preserved under `.symforge/quarantine/index-snapshots/` rather than silently served. Rebuilding from source is deliberately explicit — run the serving process with `SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder`.
+**When a snapshot goes wrong:** `checkpoint_now(verify_after_write=true)` forces a byte-exact write and verification; `health` reports the load source, verification state, and mismatch paths; corrupt or version-incompatible snapshots are preserved under `.symforge/quarantine/index-snapshots/` rather than silently served. Rebuilding from source is deliberately explicit — run the serving process with `SYMFORGE_INDEX_FOLDER_RESET=1`, then call `index_folder`. No durable run IDs are exposed: recovery is a sequence you drive, not a job you poll.
 
 ## Develop
 
