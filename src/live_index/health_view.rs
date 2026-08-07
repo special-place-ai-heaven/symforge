@@ -340,24 +340,29 @@ impl LiveIndex {
         // unbound (`source=unknown`). It is not Ready; it is still loading.
         //
         // Gate on `load_source`, NOT on `indexed_root.is_none()`: the P1
-        // local-ref lane (`LiveIndex::from_source_files`, store.rs:4290) is
-        // legitimately rootless and publishes its own source identity
-        // unconditionally (store.rs:1568), so a root-based guard would pin that
+        // local-ref lane (`LiveIndex::from_source_files`) is legitimately
+        // rootless and builds its own source identity unconditionally
+        // (`build_ref_source_generation`), so a root-based guard would pin that
         // lane at Loading forever.
         if self.load_source == IndexLoadSource::EmptyBootstrap {
             // Two different placeholders share `EmptyBootstrap`, and only one of
-            // them has a load coming. The cold-start lane (main.rs:421-433)
-            // spawns a detached `reload_for_state_placement`, so Loading is true
-            // and transient. The no-root lane (main.rs:469-474) spawns NOTHING:
-            // `watcher_root` is None, so neither the watcher (main.rs:479) nor
-            // any reload ever runs, and `load_source` can never leave
+            // them has a load coming. The cold-start lane in `main` spawns a
+            // detached `reload_for_state_placement`, so Loading is true and
+            // transient. The no-root lane — `main`'s `else` arm, the one that
+            // calls `set_local_empty_reason` — spawns NOTHING: `watcher_root` is
+            // None, so the `if let Some(ref root) = watcher_root` guard never
+            // fires and no reload ever runs, so `load_source` can never leave
             // `EmptyBootstrap`. Reporting Loading there tells the agent to retry
             // something that never lands AND hides
             // `format::empty_index_recovery_hint` — the only message naming the
-            // real recovery. `local_empty_reason` is set exactly in that lane
-            // (main.rs:472) and cleared exactly where a real load arrives
-            // (`apply_reload_data`, store.rs:4565, adjacent to the `load_source`
-            // assignment at :4566), so it is the discriminator.
+            // real recovery. `local_empty_reason` is set exactly in that lane and
+            // cleared by `apply_reload_data` beside its `load_source` and
+            // `indexed_root` assignments, so it is the discriminator.
+            //
+            // Cited by NAME, not line number: the original versions of these
+            // comments were 50+ lines stale within one edit of being written. A
+            // citation that rots on the next insertion is decoration, not
+            // evidence. Symbol names survive edits and are greppable.
             return if self.local_empty_reason().is_some() {
                 IndexState::Empty
             } else {

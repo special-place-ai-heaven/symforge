@@ -1030,14 +1030,23 @@ fn capture_published_manifest(
         // dropped downstream, and the receipt prints `source=unknown`.
         if !live.is_empty {
             if live.load_source() == IndexLoadSource::EmptyBootstrap {
-                // The bootstrap placeholder admitting a file before its detached
-                // load binds a root is the EXPECTED transient this branch's
-                // `index_state()` guard already models (health_view.rs). It fires
-                // on every publication during that window — measured at ~10 per
-                // healthy cold start — so warning here would train the reader to
-                // ignore the level that carries the real defect below.
+                // A bootstrap placeholder admitting a file before a root is bound
+                // is already modelled by `index_state()` (health_view.rs), which
+                // reports Loading or Empty rather than Ready, so no answer is
+                // served off this generation. It fires on every publication in
+                // that window — measured at ~10 per healthy cold start — so
+                // warning here would train the reader to ignore the level that
+                // carries the real defect below.
+                //
+                // Deliberately NOT called "transient": `EmptyBootstrap` alone
+                // cannot tell a load that is coming from one that already failed
+                // (`main`'s cold-start reload logs that failure on its error
+                // branch; this site cannot see it).
+                // Claiming transience here would assert something this function
+                // never observed.
                 debug!(
                     files = live.files.len(),
+                    local_empty_reason = live.local_empty_reason().is_some(),
                     "bootstrap placeholder published with no indexed_root; guarded as not-Ready"
                 );
             } else {
@@ -4366,10 +4375,15 @@ impl LiveIndex {
         index
     }
 
-    /// Build a Ready, source-BOUND `SharedIndex` from already-parsed files held
-    /// in memory — the embedder route for `process_file` +
+    /// Build a source-BOUND `SharedIndex` from already-parsed files held in
+    /// memory — the embedder route for `process_file` +
     /// `IndexedFile::from_parse_result` output that never touched this process's
     /// filesystem walk.
+    ///
+    /// Reaches `Ready` when `files` is non-empty. An empty `files` yields
+    /// `Empty`, which is correct and not a failure: `is_empty` is checked before
+    /// the bound-root logic in `index_state()`. Say "bound", not "Ready" — the
+    /// state depends on the argument.
     ///
     /// `root` is mandatory and must resolve. `LiveIndex::empty()` + `add_file`
     /// cannot serve this purpose: it leaves `load_source == EmptyBootstrap` and
@@ -6409,8 +6423,9 @@ mod tests {
         assert!(LiveIndex::from_indexed_files(&tmp.path().join("nope"), Vec::new()).is_err());
     }
 
-    /// Counterpart to the test above: the no-root lane (main.rs:469-474) spawns
-    /// neither watcher nor reload, so its placeholder can never leave
+    /// Counterpart to the test above: the no-root lane in `main` — the `else`
+    /// arm that calls `set_local_empty_reason` — spawns neither watcher nor
+    /// reload, so its placeholder can never leave
     /// `EmptyBootstrap`. The sidecar can still populate it — `/impact` resolves
     /// its root from the process CWD when the sidecar has none — and reporting
     /// Loading there would pin every tool at "try again shortly" FOREVER and

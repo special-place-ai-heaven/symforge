@@ -14667,7 +14667,7 @@ mod tests {
     /// The wrongness is the instrument: it is the only way to observe WHICH lane
     /// answered `validate_file_syntax`. `mtime_secs` is pinned to the real disk
     /// mtime so the handler's own freshen (`freshen_file_if_stale` compares
-    /// exactly that, watcher/mod.rs:203-205) reports Fresh and leaves the planted
+    /// exactly that) reports Fresh and leaves the planted
     /// entry alone — otherwise the freshen would silently repair it and the test
     /// would pass under either lane.
     fn repo_with_disagreeing_index_entry(
