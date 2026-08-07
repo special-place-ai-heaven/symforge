@@ -100,6 +100,18 @@ pub struct StelStatusContext<'a> {
     /// connection: …)` disclosure line so a cross-process surface mismatch is
     /// never silent. `None` on same-env and direct serving.
     pub daemon_env_surface: Option<&'static str>,
+    /// Pid of the answering daemon, present ONLY when that daemon is no longer
+    /// the one recorded in the runtime files — an ORPHAN.
+    ///
+    /// An orphan still answers every client already connected to it, but new
+    /// clients discover a different daemon with a different index. Nothing else
+    /// in a response distinguishes the two: an orphan's replies are internally
+    /// consistent and confidently wrong about the world, which is strictly
+    /// worse than an error. Same reasoning as `project_root` above — a stale
+    /// binding must never read as a working one.
+    ///
+    /// `None` for the recorded daemon and for every non-daemon topology.
+    pub orphaned_daemon_pid: Option<u32>,
 }
 
 impl<'a> StelStatusContext<'a> {
@@ -136,6 +148,7 @@ impl<'a> StelStatusContext<'a> {
             calibration,
             durable_ledger: DurableLedgerState::Unavailable,
             daemon_env_surface: None,
+            orphaned_daemon_pid: None,
         }
     }
 
@@ -358,6 +371,22 @@ fn format_compact_status(ctx: &StelStatusContext<'_>) -> String {
             ),
         );
     }
+    // An orphaned daemon answers normally and looks healthy, so the ONLY way a
+    // caller can tell is if we say so. Inserted first (above the env-surface
+    // line) because it invalidates everything below it: the counts, the root
+    // and the index state are all true of THIS process and possibly of nothing
+    // else.
+    if let Some(pid) = ctx.orphaned_daemon_pid {
+        lines.insert(
+            2,
+            format!(
+                "daemon_instance: ORPHANED pid={pid} — this daemon is no longer the recorded one; \
+                 new clients reach a different daemon whose index may differ. Every figure below \
+                 describes THIS process only. Restart the client, or stop this pid, before \
+                 trusting anchors from it."
+            ),
+        );
+    }
     lines.join("\n")
 }
 
@@ -405,7 +434,34 @@ mod tests {
             calibration: summarize_calibration(&[]),
             durable_ledger: DurableLedgerState::Unavailable,
             daemon_env_surface: None,
+            orphaned_daemon_pid: None,
         }
+    }
+
+    /// An orphaned daemon answers normally and looks healthy from the outside,
+    /// so the disclosure line is the ONLY thing that can warn a caller. It must
+    /// appear exactly on divergence and never otherwise — a line that cried
+    /// wolf on every healthy status would be trained away immediately.
+    #[test]
+    fn orphaned_daemon_is_disclosed_and_silent_otherwise() {
+        let mut ctx = sample_context();
+        let healthy = format_stel_status(&StelStatusRequest::default(), &ctx);
+        assert!(
+            !healthy.contains("daemon_instance:"),
+            "the recorded daemon must not carry an orphan disclosure:\n{healthy}"
+        );
+
+        ctx.orphaned_daemon_pid = Some(41228);
+        let orphaned = format_stel_status(&StelStatusRequest::default(), &ctx);
+        assert!(
+            orphaned.contains("daemon_instance: ORPHANED pid=41228"),
+            "an orphaned daemon must name itself:\n{orphaned}"
+        );
+        assert!(
+            orphaned.contains("THIS process only"),
+            "the disclosure must invalidate the figures below it, not merely \
+             note the orphaning:\n{orphaned}"
+        );
     }
 
     #[test]

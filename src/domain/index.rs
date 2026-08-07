@@ -868,7 +868,14 @@ pub struct FileStamp {
     pub platform_id: Option<PlatformFileId>,
 }
 
+/// Why a file was admitted metadata-only (Tier 2).
+///
+/// `#[non_exhaustive]`: this is reachable from the semver-public embed facade
+/// and gains variants as admission learns to describe itself more precisely.
+/// Taking the break once keeps every later addition additive — the same
+/// reasoning applied to `SkipReason`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum MetadataOnlyReason {
     Lockfile,
     Binary,
@@ -885,7 +892,6 @@ pub enum MetadataOnlyReason {
         declared_oid: Option<String>,
         declared_size: Option<u64>,
     },
-    PlatformPathCollision,
     UnsupportedPathEncoding,
     PathMetadataTooLarge,
     UnsupportedTextEncoding,

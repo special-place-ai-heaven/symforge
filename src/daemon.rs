@@ -88,6 +88,12 @@ fn read_daemon_runtime(dir: &std::path::Path, tagged: &str, legacy: &str) -> io:
         Err(e) => Err(e),
     }
 }
+/// Set once this process binds AS the daemon (see `spawn_daemon_at`, where it
+/// writes its own pid file). Only a bound daemon can become an orphan, so
+/// [`unrecorded_daemon_pid`] stays silent for every other topology — stdio,
+/// embed, and the MCP adapter front-end.
+static DAEMON_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const DAEMON_BIND_ENV: &str = "SYMFORGE_DAEMON_BIND";
 const DAEMON_ALLOW_NON_LOOPBACK_ENV: &str = "SYMFORGE_DAEMON_ALLOW_NON_LOOPBACK";
 /// Task 9: seconds a session may go without a heartbeat before the daemon
@@ -2550,6 +2556,23 @@ async fn stop_incompatible_recorded_daemon_at(
         return Ok(());
     }
 
+    // Whether to clear the runtime record afterwards.
+    //
+    // Clearing it while the daemon is STILL ALIVE and identifiable orphans it:
+    // this function returns early on a missing port file, so no later call can
+    // ever reap it, and it keeps serving its own index to every client already
+    // connected — invisibly, because nothing in a response says which instance
+    // answered. The same reasoning is already written down for
+    // `DaemonStopOutcome::StopTimedOut`, which deliberately leaves the files in
+    // place.
+    //
+    // The default stays `true`, because a record we cannot act on is worse than
+    // no record: with no pid file (and health reporting no pid) the process is
+    // unidentifiable, so keeping the record makes it no more stoppable — it only
+    // makes every later call re-walk the same dead end. We withhold cleanup
+    // strictly for a daemon we tried to kill and failed, or deliberately
+    // declined to kill; those are live, identified, and worth keeping visible.
+    let mut clear_record = true;
     if let Ok(pid) = read_daemon_pid_file_at(control_state_dir) {
         if should_terminate_recorded_daemon(&health, identity, pid) {
             if let Err(error) = terminate_process(pid) {
@@ -2558,8 +2581,17 @@ async fn stop_incompatible_recorded_daemon_at(
                     "failed to terminate incompatible symforge daemon automatically: {error}"
                 );
             }
-            wait_for_daemon_unhealthy(port).await;
+            if !wait_for_daemon_unhealthy(port).await {
+                clear_record = false;
+                tracing::warn!(
+                    pid,
+                    port,
+                    "incompatible symforge daemon still answering after termination; \
+                     leaving its runtime records so it stays discoverable and stoppable"
+                );
+            }
         } else if !daemon_health_matches_recorded_pid(&health, pid) {
+            clear_record = false;
             match health.pid {
                 Some(health_pid) => {
                     tracing::warn!(
@@ -2576,6 +2608,7 @@ async fn stop_incompatible_recorded_daemon_at(
                 }
             }
         } else {
+            clear_record = false;
             tracing::warn!(
                 recorded_pid = pid,
                 daemon_pid = ?health.pid,
@@ -2586,7 +2619,9 @@ async fn stop_incompatible_recorded_daemon_at(
         }
     }
 
-    cleanup_daemon_runtime_files_at(control_state_dir);
+    if clear_record {
+        cleanup_daemon_runtime_files_at(control_state_dir);
+    }
     Ok(())
 }
 
@@ -2722,14 +2757,19 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-async fn wait_for_daemon_unhealthy(port: u16) {
+/// Wait for `port` to stop answering health checks. Returns whether it actually
+/// did: callers use this to decide if a daemon is CONFIRMED gone, and a timeout
+/// must never be mistaken for success — removing a live daemon's runtime records
+/// orphans it permanently.
+async fn wait_for_daemon_unhealthy(port: u16) -> bool {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         if !daemon_health_ok(port).await {
-            break;
+            return true;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+    !daemon_health_ok(port).await
 }
 
 fn try_acquire_start_lock_at(
@@ -3498,6 +3538,10 @@ pub async fn spawn_daemon_at(
     write_daemon_token_file_at(control_state_dir, &auth_token)?;
     write_daemon_port_file_at(control_state_dir, port)?;
     write_daemon_pid_file_at(control_state_dir, std::process::id())?;
+    // This process is now A daemon. Whether it is still THE recorded daemon is
+    // re-checked per `status` call — a later incompatible start can orphan us
+    // (see `unrecorded_daemon_pid`).
+    DAEMON_BOUND.store(true, std::sync::atomic::Ordering::Release);
 
     let state = Arc::new(DaemonState::with_token_at(
         auth_token,
@@ -3749,21 +3793,59 @@ async fn call_tool_handler(
             return Ok(message.into_response());
         }
     }
-    if matches!(tool_name.as_str(), "search_knowledge" | "review_knowledge") {
-        let (project, projects) = if tool_name == "search_knowledge" {
-            let input =
-                decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
-            if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
-                return Ok(message.into_response());
+    if matches!(
+        tool_name.as_str(),
+        "search_knowledge"
+            | "review_knowledge"
+            | "search_symbols"
+            | "search_text"
+            | "search_files"
+            | "find_references"
+    ) {
+        let (project, projects) = match tool_name.as_str() {
+            "search_knowledge" => {
+                let input =
+                    decode_params::<SearchKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                if let Err(message) = crate::protocol::knowledge_search::validate_input(&input) {
+                    return Ok(message.into_response());
+                }
+                (input.project, input.projects)
             }
-            (input.project, input.projects)
-        } else {
-            let input =
-                decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
-            if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
-                return Ok(message.into_response());
+            "review_knowledge" => {
+                let input =
+                    decode_params::<ReviewKnowledgeInput>(params.clone()).map_err(bad_request)?;
+                if let Err(message) = crate::protocol::knowledge_review::validate_input(&input) {
+                    return Ok(message.into_response());
+                }
+                (input.project, input.projects)
             }
-            (input.project, input.projects)
+            // The cross-project code-navigation verbs accept the SAME id/name
+            // selectors but carry different input types, and they are
+            // deliberately absent from `single_project_routed_tool`, so they
+            // never met `runtime_for_target` — the only name->id resolver in the
+            // tree. A project opened by `index_folder(add: true)`, whose receipt
+            // advertises `project_name`, was therefore denied as "project not
+            // open" when that same name was used as a selector.
+            //
+            // Read the selectors straight off the JSON rather than adding a
+            // typed arm per verb: the write-back below already edits this same
+            // object, and the knowledge validation above stays scoped to the
+            // knowledge verbs that require it.
+            _ => (
+                params
+                    .get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                params.get("projects").and_then(|value| {
+                    value.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                }),
+            ),
         };
 
         // `search_knowledge` owns both scalar and set-valued targeting, so it
@@ -3971,13 +4053,24 @@ async fn call_tool_handler(
         .await
     {
         Ok(Ok(mut result)) => {
-            // Task 7: full-surface `health`/`health_compact` gain the session's
-            // open-project inventory once MORE than one project is open — the
-            // full 39-tool surface can then list and select projects without the
-            // compact `status` tool. Single-project sessions stay byte-identical.
-            if matches!(tool_name_for_panic.as_str(), "health" | "health_compact")
-                && let Some(inventory) =
-                    state.render_session_project_inventory_if_multi(&session_id)
+            // Task 7: `health`/`health_compact` gain the session's open-project
+            // inventory once MORE than one project is open. Single-project
+            // sessions stay byte-identical.
+            //
+            // `status` is included for the same reason, not despite it: on the
+            // compact-3 surface `status` is the ONLY health verb an agent has,
+            // and every detail level except "projects" dispatches per-project
+            // against the immutable home — so a project opened by
+            // `index_folder(add: true)` was invisible BY CONSTRUCTION there. An
+            // additive open that reports success and then cannot be observed is
+            // the same silent-divergence class as an orphaned daemon.
+            // `status(detail="projects")` is intercepted before dispatch, so it
+            // never reaches here and cannot double-append.
+            if matches!(
+                tool_name_for_panic.as_str(),
+                "health" | "health_compact" | "status"
+            ) && let Some(inventory) =
+                state.render_session_project_inventory_if_multi(&session_id)
             {
                 result.push('\n');
                 result.push_str(&inventory);
@@ -5479,6 +5572,42 @@ fn read_daemon_pid_file_at(control_state_dir: &ControlStateDir) -> io::Result<u3
 
 pub(crate) fn read_daemon_port_file() -> io::Result<u16> {
     read_daemon_port_file_at(process_control_state_dir()?)
+}
+
+/// This process's pid when it is a daemon that is NO LONGER the recorded one —
+/// an ORPHAN: still alive, still answering everyone already connected, but
+/// undiscoverable, so its index silently diverges from the daemon new clients
+/// reach.
+///
+/// Orphans are routine, not exotic. `stop_incompatible_recorded_daemon_at`
+/// cleans up the runtime files whether or not the incompatible daemon actually
+/// died — the safety gate refuses on a pid/executable mismatch, and
+/// `terminate_process` can simply fail — so the survivor keeps serving with no
+/// record pointing at it. Upgrading symforge is the common trigger, because the
+/// version check makes the running daemon "incompatible"; a session that
+/// updates several times can accumulate several orphans, each holding a full
+/// index.
+///
+/// Callers cannot otherwise tell which instance answered them, which is what
+/// makes this worth disclosing: an orphan's replies are internally consistent
+/// and confidently wrong about the world.
+///
+/// `None` for the recorded daemon and for every non-daemon process.
+pub(crate) fn unrecorded_daemon_pid() -> Option<u32> {
+    if !DAEMON_BOUND.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let me = std::process::id();
+    let recorded = process_control_state_dir()
+        .ok()
+        .and_then(|dir| read_daemon_pid_file_at(dir).ok());
+    match recorded {
+        Some(pid) if pid == me => None,
+        // Either another daemon owns the record, or the record is gone
+        // entirely (the cleanup-regardless path above). Both mean new clients
+        // cannot reach us.
+        _ => Some(me),
+    }
 }
 
 fn read_daemon_port_file_at(control_state_dir: &ControlStateDir) -> io::Result<u16> {

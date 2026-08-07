@@ -1180,6 +1180,31 @@ fn context_source_authority_label(refreshed: bool) -> &'static str {
     }
 }
 
+/// The source-authority axis of a result envelope, MEASURED from the index's own
+/// freshness rather than asserted.
+///
+/// `format_search_envelope` collapses to the compact one-line `Trust:` banner
+/// exactly when authority is `"current index"`, and its own doc says any
+/// deviation must keep the loud six-line form so "degraded/stale/truncated
+/// results stay loud". That contract was unreachable on the code-navigation
+/// lane: every call site passed the literal `"current index"`, so a result could
+/// never be anything but confident — including one served from an index whose
+/// reconciliation against disk had failed or never run.
+///
+/// The rest of the envelope already works this way. The parse-state axis
+/// deliberately degrades (`"metadata-only (not parsed)"`, "instead of the
+/// misleading 'parsed'"), and the knowledge lane already gates its envelope on
+/// `FreshnessStatus`. This applies the same discipline to code navigation, which
+/// is the lane whose anchors an agent actually navigates by — a wrong line
+/// number in the right file is worse than a miss, because it is actionable.
+fn index_source_authority_label(freshness: &crate::domain::FreshnessStatus) -> &'static str {
+    match freshness {
+        crate::domain::FreshnessStatus::Current => "current index",
+        crate::domain::FreshnessStatus::Verifying => "index (verifying against disk)",
+        crate::domain::FreshnessStatus::Degraded { .. } => "index (UNVERIFIED against disk)",
+    }
+}
+
 fn context_bundle_completeness_label(
     view: &crate::live_index::ContextBundleFoundView,
     rendered: &str,
@@ -3359,7 +3384,7 @@ fn render_search_text_output(
                     auto_corrected_regex,
                     options.ranked,
                 ),
-                "current index",
+                index_source_authority_label(&server.index.freshness_status()),
                 search_parse_state_for_paths(
                     &guard,
                     result.files.iter().map(|file| file.path.as_str()),
@@ -5353,7 +5378,7 @@ impl SymForgeServer {
             let guard = self.index.read();
             Some(search_format::format_search_envelope(
                 search_symbols_match_type_label(&result, is_browse),
-                "current index",
+                index_source_authority_label(&self.index.freshness_status()),
                 search_parse_state_for_paths(
                     &guard,
                     result.hits.iter().map(|hit| hit.path.as_str()),
@@ -6039,7 +6064,7 @@ impl SymForgeServer {
                     let guard = self.index.read();
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        "current index",
+                        index_source_authority_label(&self.index.freshness_status()),
                         search_parse_state_for_paths(&guard, std::iter::once(path.as_str())),
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6055,7 +6080,7 @@ impl SymForgeServer {
                     // parse state honestly instead of the misleading "parsed".
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        "current index",
+                        index_source_authority_label(&self.index.freshness_status()),
                         "metadata-only (not parsed)",
                         &search_completeness_label(0, hidden_noise_count),
                         &search_files_scope_summary(
@@ -6074,7 +6099,7 @@ impl SymForgeServer {
                     let guard = self.index.read();
                     Some(search_format::format_search_envelope(
                         search_files_resolve_match_type_label(&view),
-                        "current index",
+                        index_source_authority_label(&self.index.freshness_status()),
                         search_parse_state_for_paths(
                             &guard,
                             matches.iter().map(std::string::String::as_str),
@@ -6504,12 +6529,17 @@ impl SymForgeServer {
                 };
                 Some(search_format::format_search_envelope(
                     search_files_match_type_label(&view),
+                    // The two composite labels already differ from the bare
+                    // "current index" sentinel, so they never collapse the
+                    // envelope; only the plain arm needed measuring. They do
+                    // still say "current" unconditionally — worth revisiting
+                    // once every lane derives its own prefix.
                     if rank_by_path_cochange {
                         "current index + optional coupling store"
                     } else if rank_by_frecency {
                         "current index + optional frecency history"
                     } else {
-                        "current index"
+                        index_source_authority_label(&self.index.freshness_status())
                     },
                     search_parse_state_for_paths(&guard, hits.iter().map(|hit| hit.path.as_str())),
                     &search_completeness_label(*overflow_count, hidden_noise_count),
@@ -8857,7 +8887,7 @@ impl SymForgeServer {
                 let guard = self.index.read();
                 Some(search_format::format_search_envelope(
                     find_references_match_type_label(input, mode),
-                    "current index",
+                    index_source_authority_label(&self.index.freshness_status()),
                     implementations_parse_state_for_paths(&guard, &view),
                     &implementations_completeness_label(&view, &limits),
                     &find_references_scope_summary(input, mode),
@@ -8987,7 +9017,7 @@ impl SymForgeServer {
                     }
                     Some(search_format::format_search_envelope(
                         find_references_match_type_label(input, mode),
-                        "current index",
+                        index_source_authority_label(&self.index.freshness_status()),
                         search_parse_state_for_paths(
                             &guard,
                             view.files.iter().map(|file| file.file_path.as_str()),
@@ -11368,6 +11398,12 @@ impl SymForgeServer {
         // same-env and direct serving so the disclosure line appears strictly on
         // divergence.
         ctx.daemon_env_surface = daemon_env_surface;
+
+        // Disclose an ORPHANED daemon: one that still answers but is no longer
+        // the daemon clients discover. `None` for the recorded daemon and for
+        // every non-daemon topology, so the line appears strictly on divergence
+        // — same discipline as the env-surface disclosure above.
+        ctx.orphaned_daemon_pid = crate::daemon::unrecorded_daemon_pid();
 
         let body = crate::stel::format_stel_status(request, &ctx);
         match reset_note {
