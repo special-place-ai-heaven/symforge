@@ -345,7 +345,24 @@ impl LiveIndex {
         // unconditionally (store.rs:1568), so a root-based guard would pin that
         // lane at Loading forever.
         if self.load_source == IndexLoadSource::EmptyBootstrap {
-            return IndexState::Loading;
+            // Two different placeholders share `EmptyBootstrap`, and only one of
+            // them has a load coming. The cold-start lane (main.rs:421-433)
+            // spawns a detached `reload_for_state_placement`, so Loading is true
+            // and transient. The no-root lane (main.rs:469-474) spawns NOTHING:
+            // `watcher_root` is None, so neither the watcher (main.rs:479) nor
+            // any reload ever runs, and `load_source` can never leave
+            // `EmptyBootstrap`. Reporting Loading there tells the agent to retry
+            // something that never lands AND hides
+            // `format::empty_index_recovery_hint` — the only message naming the
+            // real recovery. `local_empty_reason` is set exactly in that lane
+            // (main.rs:472) and cleared exactly where a real load arrives
+            // (`apply_reload_data`, store.rs:4565, adjacent to the `load_source`
+            // assignment at :4566), so it is the discriminator.
+            return if self.local_empty_reason().is_some() {
+                IndexState::Empty
+            } else {
+                IndexState::Loading
+            };
         }
         if matches!(
             self.snapshot_verify_state,

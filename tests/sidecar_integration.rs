@@ -76,7 +76,14 @@ fn make_rust_file(path: &str, fn_name: &str) -> IndexedFile {
     }
 }
 
-/// Build a `SharedIndex` using the public API (`LiveIndex::empty()` + `add_file`).
+/// Build a `SharedIndex` as an unrooted bootstrap placeholder
+/// (`LiveIndex::empty()` + `add_file`).
+///
+/// NOT the embedder construction route — that is `LiveIndex::from_indexed_files`
+/// (rooted, Ready). This shape is retained here only because these tests assert
+/// sidecar ENDPOINT behaviour, which does not consult index readiness. Anything
+/// asserting on index state must build a rooted index instead; see
+/// `tests/sidecar_contract.rs::build_shared_index`.
 fn build_shared_index(files: Vec<IndexedFile>) -> SharedIndex {
     let shared = LiveIndex::empty();
     {

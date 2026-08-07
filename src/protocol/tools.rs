@@ -7387,7 +7387,7 @@ impl SymForgeServer {
     ) -> Option<crate::protocol::result_status::ProjectEvidence> {
         let root = self.capture_repo_root();
         let published = self.index.published_state();
-        let load_source = format!("{:?}", self.index.read().load_source());
+        let load_source = self.index.read().load_source().label().to_string();
         Some(crate::protocol::result_status::ProjectEvidence {
             project_id: root
                 .as_deref()
@@ -8760,13 +8760,25 @@ impl SymForgeServer {
         let path_scope = search::PathScope::exact(&input.path);
         freshen_exact_path_for_targeted_retrieval(self, &path_scope);
 
-        // Held across the fallback so the gate reads the recorded disposition off
-        // the SAME publication that produced the index miss. `SharedIndexHandle::read`
-        // is an `ArcSwap` load, not a lock, and nothing below awaits.
-        let index = self.index.read();
-        // Skip loading_guard here — the disk-read fallback below does not
-        // need the index, so we should not block when the index is still loading.
-        let indexed_file = index.capture_shared_file(&input.path);
+        // One publication for the whole handler: the gate below reads the recorded
+        // disposition off the SAME publication that produced the index miss, and
+        // the trust decision here is taken on that same publication rather than a
+        // second, possibly newer, read.
+        let published = self.index.published_generation();
+        // No blanket loading_guard: the disk-read fallback below parses from disk
+        // and does not need the index, so a not-Ready index must not block this
+        // tool outright. But the indexed hit must not be TRUSTED either — the
+        // freshen above admits the requested file into a cold-start bootstrap
+        // placeholder with no bound root, so a "hit" here can be an entry this
+        // very call just created inside an index that is not yet a view of the
+        // repository. While not Ready, ignore the indexed entry and answer from
+        // the authoritative disk parse below.
+        let not_ready = loading_guard_message_from_published(&published.health);
+        let indexed_file = if not_ready.is_some() {
+            None
+        } else {
+            published.live.capture_shared_file(&input.path)
+        };
         if let Some(file) = indexed_file {
             let output = format::validate_file_syntax_result(&input.path, file.as_ref());
             self.session_context.record_summary_output(
@@ -8781,6 +8793,15 @@ impl SymForgeServer {
             .and_then(|ext| ext.to_str())
             .unwrap_or("");
         let Some(language) = LanguageId::from_extension(extension) else {
+            // A not-Ready index is why the indexed lane was skipped for a file the
+            // index may well know: `from_extension` is strictly weaker than the
+            // indexer's own `LanguageId::from_path`, which additionally classifies
+            // extensionless entry points such as README / LICENSE / .env. Blaming
+            // the extension here would be the misleading half of the same defect
+            // this fix exists to remove.
+            if let Some(message) = not_ready {
+                return message;
+            }
             return format!(
                 "Syntax validation unavailable for {}: unsupported or unknown file extension.",
                 input.path
@@ -8802,10 +8823,11 @@ impl SymForgeServer {
         // for the fallback decision, so it gates the CURRENT bytes even when the
         // manifest says `Indexed` (D3: the exemption is about where bytes come
         // from). The gate owns the read; nothing below reopens the path.
-        let bytes = match read_gate::admit_disk_read(index.as_ref(), &input.path, &canon_path) {
-            Ok(bytes) => bytes,
-            Err(refusal) => return refusal,
-        };
+        let bytes =
+            match read_gate::admit_disk_read(published.live.as_ref(), &input.path, &canon_path) {
+                Ok(bytes) => bytes,
+                Err(refusal) => return refusal,
+            };
         let classification = crate::domain::FileClassification::for_code_path(&input.path);
         let result = crate::parsing::process_file_with_classification(
             &input.path,
@@ -12831,6 +12853,43 @@ mod tests {
         );
     }
 
+    /// F4: `status`'s `index_ready` is protocol-visible and comes straight from
+    /// `LiveIndex::is_ready()`. The cold-start fix made `is_ready()` delegate to
+    /// `index_state()`, which changed this rendered line for the bootstrap
+    /// placeholder — and NOTHING pinned it.
+    ///
+    /// The pairing is the whole point: `index_files` > 0 next to
+    /// `index_ready: false`. That looks contradictory and is exactly right — the
+    /// placeholder HAS files (a targeted read admitted one) but has no bound
+    /// root, so it cannot answer as a view of the repository. A regression that
+    /// re-decouples `is_ready()` from `index_state()` re-reports `true` here and
+    /// fails this test.
+    #[test]
+    fn status_reports_index_not_ready_for_a_bootstrap_placeholder_that_admitted_a_file() {
+        let (key, file) = make_file("src/admitted_before_load.rs", b"fn core() {}", vec![]);
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        // The placeholder shape: files present, but the detached initial load has
+        // not published, so no root is bound.
+        index.load_source = crate::live_index::store::IndexLoadSource::EmptyBootstrap;
+        index.indexed_root = None;
+
+        let body = make_server(index).render_stel_status_body(&crate::stel::StelStatusRequest {
+            detail: Some(crate::stel::StelStatusDetail::Full),
+            reset_calibration: None,
+            connection_surface: None,
+        });
+
+        assert!(
+            body.contains("index_ready: false"),
+            "a rootless bootstrap placeholder must not advertise index_ready: true:\n{body}"
+        );
+        assert!(
+            body.contains("index_files: 1"),
+            "the placeholder really does hold the admitted file; that is what makes \
+             index_ready: false load-bearing rather than a trivial empty-index case:\n{body}"
+        );
+    }
+
     #[tokio::test]
     async fn status_serves_on_full_surface_without_corpus() {
         // Wave 1 Fix 4 (corpus-free proof): with SYMFORGE_SURFACE=full active,
@@ -14599,6 +14658,98 @@ mod tests {
         assert!(
             result.contains("Byte span: 28..41"),
             "file context should include the diagnostic byte span; got: {result}"
+        );
+    }
+
+    /// Build a repo with one clean-parsing file on disk, plus an index entry for
+    /// that same path carrying a DELIBERATELY WRONG `parse_status: Failed`.
+    ///
+    /// The wrongness is the instrument: it is the only way to observe WHICH lane
+    /// answered `validate_file_syntax`. `mtime_secs` is pinned to the real disk
+    /// mtime so the handler's own freshen (`freshen_file_if_stale` compares
+    /// exactly that, watcher/mod.rs:203-205) reports Fresh and leaves the planted
+    /// entry alone — otherwise the freshen would silently repair it and the test
+    /// would pass under either lane.
+    fn repo_with_disagreeing_index_entry(
+        load_source: crate::live_index::store::IndexLoadSource,
+    ) -> (TempDir, SymForgeServer) {
+        let repo = TempDir::new().expect("temp repo");
+        let src = repo.path().join("src");
+        fs::create_dir_all(&src).expect("create src");
+        let file_path = src.join("clean.rs");
+        fs::write(&file_path, b"pub fn clean() {}\n").expect("write clean rust");
+
+        let disk_mtime = fs::metadata(&file_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .expect("disk mtime");
+
+        let (key, mut file) = make_file("src/clean.rs", b"pub fn clean() {}\n", vec![]);
+        file.parse_status = ParseStatus::Failed {
+            error: "planted disagreement: the index says this file does not parse".to_string(),
+        };
+        file.mtime_secs = disk_mtime;
+
+        let mut index = make_live_index_ready(vec![(key, file)]);
+        index.load_source = load_source;
+
+        let server = make_server_with_root(index, Some(repo.path().to_path_buf()));
+        (repo, server)
+    }
+
+    /// The guard-sweep hole: `validate_file_syntax` freshens and then rendered
+    /// from the index with NO readiness gate, so it was the one read tool that
+    /// still answered off an index every other tool had just refused.
+    ///
+    /// A blanket `loading_guard!` would be the wrong fix — it would kill this
+    /// tool's documented ability to validate a config file from disk during a
+    /// cold start. The right fix is to distrust the INDEXED entry while not
+    /// Ready and answer from the authoritative disk parse.
+    #[tokio::test]
+    async fn validate_file_syntax_answers_from_disk_when_the_index_is_not_ready() {
+        let (_repo, server) = repo_with_disagreeing_index_entry(
+            crate::live_index::store::IndexLoadSource::EmptyBootstrap,
+        );
+
+        let result = server
+            .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
+                path: "src/clean.rs".to_string(),
+            }))
+            .await;
+
+        assert!(
+            !result.contains("Status: failed"),
+            "a not-Ready index must not be trusted for the parse verdict; the disk parse \
+             is authoritative here. got: {result}"
+        );
+        assert!(
+            result.contains("Status: ok"),
+            "the disk fallback must still answer (NOT refuse) — this tool validates \
+             config files during a cold start by design. got: {result}"
+        );
+    }
+
+    /// Control for the test above: on a Ready index the indexed entry is still
+    /// authoritative, so the planted verdict comes back. Without this, the fix
+    /// could silently have made the tool ignore the index entirely.
+    #[tokio::test]
+    async fn validate_file_syntax_still_trusts_the_index_when_ready() {
+        let (_repo, server) =
+            repo_with_disagreeing_index_entry(crate::live_index::store::IndexLoadSource::FreshLoad);
+
+        let result = server
+            .validate_file_syntax(Parameters(super::ValidateFileSyntaxInput {
+                project: None,
+                path: "src/clean.rs".to_string(),
+            }))
+            .await;
+
+        assert!(
+            result.contains("Status: failed"),
+            "a Ready index stays authoritative; the indexed lane must be unchanged. got: {result}"
         );
     }
 

@@ -497,11 +497,7 @@ pub struct RuntimeStatus {
 }
 
 fn index_load_source_label(load_source: IndexLoadSource) -> &'static str {
-    match load_source {
-        IndexLoadSource::EmptyBootstrap => "empty_bootstrap",
-        IndexLoadSource::FreshLoad => "fresh_load",
-        IndexLoadSource::SnapshotRestore => "snapshot_restore",
-    }
+    load_source.label()
 }
 
 fn index_state_label(status: &RuntimeStatus) -> &'static str {

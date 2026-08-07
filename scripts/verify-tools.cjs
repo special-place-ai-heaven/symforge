@@ -204,9 +204,18 @@ async function startSession(READINESS_PROBE) {
   // it needed). Gate on the per-call trust evidence in `_meta` instead: the real load
   // must have PUBLISHED (load_source != EmptyBootstrap) and the published state must
   // be Ready — then confirm a known symbol actually answers.
-  // Do NOT gate on the status body's `index_ready:` — that renders LiveIndex::is_ready().
+  // Gate on `_meta`, not the status body's `index_ready:`. Since the cold-start fix
+  // `is_ready()` delegates to `index_state()`, so it is no longer DISHONEST here — but
+  // it is still the weaker signal: it is a rendered string, it does not carry
+  // `load_source`/`index_files`, and it is not what the daemon proxy forwards. The
+  // `_meta` evidence carries all three from whichever process actually served.
   // ponytail: fixed 80-poll x 250ms ceiling (~20s of sleep); raise if a bigger fixture needs it.
   const EVIDENCE_KEY = "symforge/project_evidence";
+  // Must match `IndexLoadSource::label()` (src/live_index/store.rs) exactly. That
+  // method is the ONE spelling shared by this gate, the `health` runtime line, and
+  // the `_meta` evidence. It used to be `format!("{:?}", ..)` here and snake_case in
+  // `health`, i.e. two spellings of one value compared against each other.
+  const EMPTY_BOOTSTRAP = "empty_bootstrap";
   let ready = false;
   let evidence = null;
   for (let i = 0; i < 80 && !ready; i++) {
@@ -215,7 +224,7 @@ async function startSession(READINESS_PROBE) {
     const sourceBound =
       !!evidence &&
       evidence.index_state === "Ready" &&
-      evidence.load_source !== "EmptyBootstrap" &&
+      evidence.load_source !== EMPTY_BOOTSTRAP &&
       Number(evidence.index_files) > 0;
     if (sourceBound) {
       if (!READINESS_PROBE) {
@@ -237,9 +246,12 @@ async function startSession(READINESS_PROBE) {
       "\n  HARNESS ABORT — the index never reached a source-bound Ready generation " +
         "(80 polls x 250ms, ~20s of sleep).\n" +
         `  last ${EVIDENCE_KEY}: ${JSON.stringify(evidence)}\n` +
-        '  Wanted index_state="Ready" with load_source!="EmptyBootstrap" and index_files>0.\n' +
-        '  load_source="EmptyBootstrap" => the real load never published (placeholder index).\n' +
-        "  null/absent evidence => the _meta contract changed; fix the gate, not the snapshots.\n"
+        `  Wanted index_state="Ready" with load_source!="${EMPTY_BOOTSTRAP}" and index_files>0.\n` +
+        `  load_source="${EMPTY_BOOTSTRAP}" => the real load never published (placeholder index).\n` +
+        '  {"bound":false} => no workspace bound; check SYMFORGE_WORKSPACE_ROOT / the fixture path.\n' +
+        "  null/absent evidence => the _meta key was NOT written at all. The server always writes\n" +
+        "    it (unbound emits {\"bound\":false}, never omission), so this means the _meta contract\n" +
+        "    changed; fix the gate, not the snapshots.\n"
     );
     proc.kill();
     process.exit(2);
