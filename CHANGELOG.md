@@ -26,6 +26,18 @@ This log tracks only changes to the `embed` facade itself, so embedders can
 see at a glance what moved in their public coupling surface. General release
 notes remain in the per-version entries below.
 
+## [10.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v9.0.0...v10.0.0) (2026-08-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* report only work that was actually verified (daemon identity, trust envelope, reconciliation, project routing) ([#538](https://github.com/special-place-ai-heaven/symforge/issues/538))
+
+### Bug Fixes
+
+* **knowledge:** protect the whole legal-provenance family from deletion ([#539](https://github.com/special-place-ai-heaven/symforge/issues/539)) ([fdc5a7a](https://github.com/special-place-ai-heaven/symforge/commit/fdc5a7a663053b119f9a5c82009fdb401260cce3))
+* report only work that was actually verified (daemon identity, trust envelope, reconciliation, project routing) ([#538](https://github.com/special-place-ai-heaven/symforge/issues/538)) ([ec76c79](https://github.com/special-place-ai-heaven/symforge/commit/ec76c7944eaba50ead28c79b115bf06a79bf5f73))
+
 ## [9.0.0](https://github.com/special-place-ai-heaven/symforge/compare/v8.22.9...v9.0.0) (2026-08-06)
 
 
