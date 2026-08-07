@@ -207,6 +207,35 @@ This file is the ONLY live-truth document in this repo; volatile claims carry an
 - Durable decisions/lessons go to agentmemory with the `[symforge]` content prefix;
   session-start recall injects them automatically.
 
+### README.md and AGENTS.md are pinned by a test (as_of 2026-08-07 — binding)
+
+`repair_lifecycle_retirement_contract_documents_checkpoint_snapshot_workflow`
+(`tests/conformance.rs`) reads `AGENTS.md` and `README.md`, joins them, and asserts
+that seven exact phrases appear across the pair:
+
+```
+`repair_index` is intentionally retired
+`get_index_run` and `cancel_index_run` remain retired
+`checkpoint_now(verify_after_write=true)`
+`health` or `health_compact`
+`index_folder` reset
+`.symforge/quarantine/index-snapshots/`
+No durable run IDs are exposed
+```
+
+The test does not care WHICH of the two files carries a phrase, only that the joined
+text contains it. So moving a sentence between them is safe; deleting it is not, and
+neither is paraphrasing it.
+
+**Before restructuring either file, grep `tests/` for it.** This is not discoverable
+from the documents themselves — nothing in either file says it is load-bearing. The
+2026-08-07 README rewrite folded the Recovery section into Configuration and dropped
+"No durable run IDs are exposed", which lived only in the README; six of the seven
+phrases survived in `AGENTS.md`. CI went red 25 minutes later, on `main`.
+
+A docs edit is a code change when a test reads the docs. Run the suite, or at minimum
+replicate the assertion — the check is pure string containment and takes seconds.
+
 ### Never hand-write volatile state (binding, as_of 2026-08-05)
 
 Handover and campaign docs rot because volatile facts get TYPED into them. Reading
