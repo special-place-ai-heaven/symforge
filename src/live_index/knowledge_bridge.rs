@@ -1141,12 +1141,20 @@ fn is_codeowners_path(path: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("CODEOWNERS"))
 }
 
-/// Exact-filename match for `LICENSE` / `LICENSE.<ext>` (any case, e.g. `license.md`,
-/// `LICENSE.txt`), mirroring [`is_codeowners_path`]. A license file duplicated
-/// across paths (root + `npm/LICENSE`, or per-subpackage in a vendored tree) is
-/// duplicated by packaging/legal necessity, not content drift — deleting a copy
-/// can break `npm publish`'s license packaging or a vendored dependency's own
-/// license terms. This is a filename check, not a substring/token match: a doc
+/// Exact-filename match for a legal-provenance file / `<name>.<ext>` (any case,
+/// e.g. `license.md`, `LICENSE.txt`, `COPYING.LESSER`), mirroring
+/// [`is_codeowners_path`]. Such a file duplicated across paths (root +
+/// `npm/LICENSE`, or per-subpackage in a vendored tree) is duplicated by
+/// packaging/legal necessity, not content drift — deleting a copy can break
+/// `npm publish`'s license packaging, a vendored dependency's own license terms,
+/// or Apache-2.0 §4(d)'s requirement that `NOTICE` be redistributed.
+///
+/// The list covers the filenames the ecosystem actually ships: the dual-license
+/// pair Rust crates use (`LICENSE-APACHE` + `LICENSE-MIT`), GNU's `COPYING`,
+/// Apache's `NOTICE`, and `UNLICENSE`. `LICENSE` alone left every one of those
+/// unprotected, so a duplicated `LICENSE-APACHE` was still offered for deletion.
+///
+/// This is an exact-filename check, not a prefix/substring/token match: a doc
 /// that merely discusses licensing (e.g. `docs/license-notes.md`) must not match.
 fn is_license_path(path: &str) -> bool {
     let Some(stem) = Path::new(path)
@@ -1156,7 +1164,19 @@ fn is_license_path(path: &str) -> bool {
     else {
         return false;
     };
-    stem.eq_ignore_ascii_case("LICENSE") || stem.eq_ignore_ascii_case("LICENCE")
+    [
+        "LICENSE",
+        "LICENCE",
+        "LICENSE-APACHE",
+        "LICENSE-MIT",
+        "LICENCE-APACHE",
+        "LICENCE-MIT",
+        "COPYING",
+        "NOTICE",
+        "UNLICENSE",
+    ]
+    .iter()
+    .any(|candidate| stem.eq_ignore_ascii_case(candidate))
 }
 
 fn resolve_repo_path<'a>(
@@ -1943,11 +1963,34 @@ mod tests {
             ("LICENSE", "PolyForm Noncommercial License 1.0.0\n"),
             ("npm/LICENSE", "PolyForm Noncommercial License 1.0.0\n"),
             ("vendor/pkg/LICENSE.txt", "MIT License\n"),
+            // The rest of the legal-provenance family: the dual-license pair Rust
+            // crates ship, GNU's COPYING, Apache-2.0's mandatory NOTICE, and
+            // UNLICENSE. Each is duplicated across paths for the same packaging
+            // reason as LICENSE, and each was unprotected while only `LICENSE`
+            // matched.
+            ("LICENSE-APACHE", "Apache License 2.0\n"),
+            ("crates/inner/LICENSE-APACHE", "Apache License 2.0\n"),
+            ("LICENSE-MIT", "MIT License\n"),
+            ("COPYING", "GNU GPL v3\n"),
+            ("vendor/pkg/COPYING.LESSER", "GNU LGPL v3\n"),
+            ("NOTICE", "Portions copyright the contributors.\n"),
+            ("UNLICENSE", "This is free and unencumbered software.\n"),
             ("docs/license-notes.md", "# Licensing\nSee LICENSE.\n"),
         ]);
 
         let bridge = bridge(&shared);
-        for path in ["LICENSE", "npm/LICENSE", "vendor/pkg/LICENSE.txt"] {
+        for path in [
+            "LICENSE",
+            "npm/LICENSE",
+            "vendor/pkg/LICENSE.txt",
+            "LICENSE-APACHE",
+            "crates/inner/LICENSE-APACHE",
+            "LICENSE-MIT",
+            "COPYING",
+            "vendor/pkg/COPYING.LESSER",
+            "NOTICE",
+            "UNLICENSE",
+        ] {
             let card = bridge
                 .cards
                 .iter()
